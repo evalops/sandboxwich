@@ -11,6 +11,9 @@ RUN cargo build --release -p "${BIN}" \
 
 FROM debian:bookworm-slim AS runtime
 
+LABEL org.opencontainers.image.source="https://github.com/evalops/sandboxwich"
+LABEL org.opencontainers.image.description="Sandboxwich Rust service image"
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*

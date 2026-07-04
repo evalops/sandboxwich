@@ -1,0 +1,117 @@
+name: containers
+
+on:
+  pull_request:
+    paths:
+      - ".dockerignore"
+      - ".github/workflows/containers.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "Dockerfile"
+      - "crates/**"
+      - "deploy/runtime/ubuntu-dev/**"
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: evalops
+
+jobs:
+  service-images:
+    name: service image (${{ matrix.bin }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - bin: sandboxwich-api
+            image: sandboxwich-api
+          - bin: sandboxwich-worker
+            image: sandboxwich-worker
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Prepare image tags
+        id: tags
+        shell: bash
+        run: |
+          short_sha="${GITHUB_SHA::12}"
+          image="${REGISTRY}/${IMAGE_NAMESPACE}/${{ matrix.image }}"
+          {
+            echo "tags<<EOF"
+            echo "${image}:sha-${short_sha}"
+            if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
+              echo "${image}:latest"
+            fi
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+      - name: Build service image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          build-args: |
+            BIN=${{ matrix.bin }}
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/evalops/sandboxwich
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  runtime-image:
+    name: runtime image (ubuntu-dev)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Prepare image tags
+        id: tags
+        shell: bash
+        run: |
+          short_sha="${GITHUB_SHA::12}"
+          image="${REGISTRY}/${IMAGE_NAMESPACE}/sandboxwich-ubuntu-dev"
+          {
+            echo "tags<<EOF"
+            echo "${image}:sha-${short_sha}"
+            if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
+              echo "${image}:latest"
+            fi
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+      - name: Build runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: deploy/runtime/ubuntu-dev
+          file: deploy/runtime/ubuntu-dev/Dockerfile
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/evalops/sandboxwich
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=sandboxwich-ubuntu-dev
+          cache-to: type=gha,mode=max,scope=sandboxwich-ubuntu-dev
