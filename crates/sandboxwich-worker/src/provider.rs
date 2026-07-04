@@ -15,6 +15,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 pub const KUBERNETES_MUTATION_ENV: &str = "SANDBOXWICH_K8S_ENABLE_MUTATION";
+pub const SANDBOX_GUEST_IMAGE: &str = "ghcr.io/evalops/sandboxwich-ubuntu-dev:latest";
 
 pub trait SandboxProvider {
     fn capability_report(&self) -> ProviderCapabilityReport;
@@ -44,6 +45,7 @@ pub struct KubernetesDryRunProvider {
     namespace: String,
     storage_class: Option<String>,
     snapshot_class: Option<String>,
+    ssh_authorized_keys_secret: Option<String>,
 }
 
 impl KubernetesDryRunProvider {
@@ -58,7 +60,13 @@ impl KubernetesDryRunProvider {
             namespace: namespace.into(),
             storage_class,
             snapshot_class,
+            ssh_authorized_keys_secret: None,
         }
+    }
+
+    pub fn with_ssh_authorized_keys_secret(mut self, secret: Option<String>) -> Self {
+        self.ssh_authorized_keys_secret = secret;
+        self
     }
 
     fn labels(&self) -> BTreeMap<String, String> {
@@ -72,6 +80,9 @@ impl KubernetesDryRunProvider {
         }
         if let Some(snapshot_class) = &self.snapshot_class {
             labels.insert("snapshot_class".to_string(), snapshot_class.clone());
+        }
+        if let Some(secret) = &self.ssh_authorized_keys_secret {
+            labels.insert("ssh_authorized_keys_secret".to_string(), secret.clone());
         }
         labels
     }
@@ -87,11 +98,24 @@ impl KubernetesDryRunProvider {
             "podName": format!("sandboxwich-{}", sandbox_id),
             "storageClass": self.storage_class,
             "snapshotClass": self.snapshot_class,
+            "runtime": self.runtime_metadata(),
             "manifests": {
                 "pod": self.pod_manifest(sandbox_id),
                 "pvc": self.pvc_manifest(format!("sandboxwich-pvc-{sandbox_id}")),
+                "sshService": self.ssh_service_manifest(sandbox_id),
                 "desktopService": self.desktop_service_manifest(sandbox_id)
             }
+        })
+    }
+
+    fn runtime_metadata(&self) -> serde_json::Value {
+        json!({
+            "image": SANDBOX_GUEST_IMAGE,
+            "workspaceMount": "/workspace",
+            "sshPort": 22,
+            "desktopPort": 6080,
+            "sshAuthorizedKeysSecret": self.ssh_authorized_keys_secret,
+            "sshAuthorizedKeysSecretKey": "authorized_keys"
         })
     }
 
@@ -117,6 +141,43 @@ impl KubernetesDryRunProvider {
     }
 
     fn pod_manifest(&self, sandbox_id: SandboxId) -> serde_json::Value {
+        let mut volume_mounts = vec![json!({
+            "name": "workspace",
+            "mountPath": "/workspace"
+        })];
+        let mut volumes = vec![json!({
+            "name": "workspace",
+            "persistentVolumeClaim": {
+                "claimName": format!("sandboxwich-pvc-{sandbox_id}")
+            }
+        })];
+        let mut env = vec![json!({
+            "name": "SANDBOXWICH_WORKSPACE",
+            "value": "/workspace"
+        })];
+
+        if let Some(secret_name) = &self.ssh_authorized_keys_secret {
+            volume_mounts.push(json!({
+                "name": "ssh-authorized-keys",
+                "mountPath": "/run/sandboxwich/ssh",
+                "readOnly": true
+            }));
+            volumes.push(json!({
+                "name": "ssh-authorized-keys",
+                "secret": {
+                    "secretName": secret_name,
+                    "items": [{
+                        "key": "authorized_keys",
+                        "path": "authorized_keys"
+                    }]
+                }
+            }));
+            env.push(json!({
+                "name": "SANDBOXWICH_AUTHORIZED_KEYS_FILE",
+                "value": "/run/sandboxwich/ssh/authorized_keys"
+            }));
+        }
+
         json!({
             "apiVersion": "v1",
             "kind": "Pod",
@@ -124,22 +185,15 @@ impl KubernetesDryRunProvider {
             "spec": {
                 "containers": [{
                     "name": "sandbox",
-                    "image": "ghcr.io/evalops/sandboxwich-ubuntu-dev:latest",
+                    "image": SANDBOX_GUEST_IMAGE,
                     "ports": [
                         {"name": "ssh", "containerPort": 22},
                         {"name": "desktop", "containerPort": 6080}
                     ],
-                    "volumeMounts": [{
-                        "name": "workspace",
-                        "mountPath": "/workspace"
-                    }]
+                    "env": env,
+                    "volumeMounts": volume_mounts
                 }],
-                "volumes": [{
-                    "name": "workspace",
-                    "persistentVolumeClaim": {
-                        "claimName": format!("sandboxwich-pvc-{sandbox_id}")
-                    }
-                }]
+                "volumes": volumes
             }
         })
     }
@@ -165,6 +219,25 @@ impl KubernetesDryRunProvider {
             "kind": "PersistentVolumeClaim",
             "metadata": self.object_metadata(name, None),
             "spec": spec
+        })
+    }
+
+    fn ssh_service_manifest(&self, sandbox_id: SandboxId) -> serde_json::Value {
+        json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": self.object_metadata(format!("sandboxwich-ssh-{sandbox_id}"), Some(sandbox_id)),
+            "spec": {
+                "type": "ClusterIP",
+                "selector": {
+                    "sandboxwich.dev/sandbox-id": sandbox_id
+                },
+                "ports": [{
+                    "name": "ssh",
+                    "port": 22,
+                    "targetPort": "ssh"
+                }]
+            }
         })
     }
 
@@ -300,6 +373,7 @@ impl KubernetesApplyProvider {
             .dry_run
             .pvc_manifest(format!("sandboxwich-pvc-{sandbox_id}"));
         let provision_pod = self.dry_run.pod_manifest(sandbox_id);
+        let provision_ssh_service = self.dry_run.ssh_service_manifest(sandbox_id);
         let provision_service = self.dry_run.desktop_service_manifest(sandbox_id);
         let snapshot = self
             .dry_run
@@ -308,6 +382,7 @@ impl KubernetesApplyProvider {
             .dry_run
             .fork_pvc_manifest(child_sandbox_id, snapshot_id);
         let fork_pod = self.dry_run.pod_manifest(child_sandbox_id);
+        let fork_ssh_service = self.dry_run.ssh_service_manifest(child_sandbox_id);
         let fork_service = self.dry_run.desktop_service_manifest(child_sandbox_id);
         let exec_handoff = self.dry_run.exec_handoff(
             sandbox_id,
@@ -320,18 +395,22 @@ impl KubernetesApplyProvider {
         let apply_manifests = vec![
             provision_pvc.clone(),
             provision_pod.clone(),
+            provision_ssh_service.clone(),
             provision_service.clone(),
             snapshot.clone(),
             fork_pvc.clone(),
             fork_pod.clone(),
+            fork_ssh_service.clone(),
             fork_service.clone(),
         ];
         let cleanup_manifests = vec![
             fork_service,
+            fork_ssh_service,
             fork_pod,
             fork_pvc,
             snapshot,
             provision_service,
+            provision_ssh_service,
             provision_pod,
             provision_pvc,
         ];
@@ -623,9 +702,11 @@ impl SandboxProvider for KubernetesDryRunProvider {
                 "pvcCloneName": format!("sandboxwich-pvc-{}", child_sandbox_id),
                 "storageClass": self.storage_class,
                 "snapshotClass": self.snapshot_class,
+                "runtime": self.runtime_metadata(),
                 "manifests": {
                     "pvc": self.fork_pvc_manifest(child_sandbox_id, snapshot_id),
                     "pod": self.pod_manifest(child_sandbox_id),
+                    "sshService": self.ssh_service_manifest(child_sandbox_id),
                     "desktopService": self.desktop_service_manifest(child_sandbox_id)
                 }
             }),
@@ -684,7 +765,19 @@ mod tests {
         let provisioned = provider.provision(sandbox_id);
         assert_eq!(provisioned.metadata["mode"], "dry_run");
         assert_eq!(provisioned.metadata["operation"], "provision");
+        assert_eq!(
+            provisioned.metadata["runtime"]["image"],
+            SANDBOX_GUEST_IMAGE
+        );
         assert_eq!(provisioned.metadata["manifests"]["pod"]["kind"], "Pod");
+        assert_eq!(
+            provisioned.metadata["manifests"]["pod"]["spec"]["containers"][0]["image"],
+            SANDBOX_GUEST_IMAGE
+        );
+        assert_eq!(
+            provisioned.metadata["manifests"]["sshService"]["kind"],
+            "Service"
+        );
         assert_eq!(
             provisioned.metadata["manifests"]["desktopService"]["kind"],
             "Service"
@@ -718,6 +811,44 @@ mod tests {
         assert_eq!(
             fork.metadata["manifests"]["pvc"]["spec"]["dataSource"]["kind"],
             "VolumeSnapshot"
+        );
+        assert_eq!(fork.metadata["manifests"]["sshService"]["kind"], "Service");
+    }
+
+    #[test]
+    fn kubernetes_pod_mounts_authorized_keys_secret_by_reference() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_ssh_authorized_keys_secret(Some("sandboxwich-authorized-keys".to_string()));
+        let provisioned = provider.provision(SandboxId::new());
+        let pod = &provisioned.metadata["manifests"]["pod"];
+
+        assert_eq!(
+            provisioned.metadata["runtime"]["sshAuthorizedKeysSecret"],
+            "sandboxwich-authorized-keys"
+        );
+        assert!(
+            pod["spec"]["containers"][0]["volumeMounts"]
+                .as_array()
+                .expect("volume mounts should be an array")
+                .iter()
+                .any(|mount| mount["name"] == "ssh-authorized-keys"
+                    && mount["mountPath"] == "/run/sandboxwich/ssh"
+                    && mount["readOnly"] == true)
+        );
+        assert!(
+            pod["spec"]["volumes"]
+                .as_array()
+                .expect("volumes should be an array")
+                .iter()
+                .any(|volume| volume["name"] == "ssh-authorized-keys"
+                    && volume["secret"]["secretName"] == "sandboxwich-authorized-keys"
+                    && volume["secret"]["items"][0]["key"] == "authorized_keys")
+        );
+        assert!(
+            !serde_json::to_string(pod)
+                .expect("pod manifest should serialize")
+                .contains("ssh-rsa")
         );
     }
 
@@ -767,6 +898,12 @@ mod tests {
             manifest["kind"] == "PersistentVolumeClaim"
                 && manifest["spec"]["dataSource"]["kind"] == "VolumeSnapshot"
         }));
+        assert!(
+            plan.apply_manifests
+                .iter()
+                .any(|manifest| manifest["kind"] == "Service"
+                    && manifest["spec"]["ports"][0]["name"] == "ssh")
+        );
         assert_eq!(plan.cleanup_manifests.len(), plan.apply_manifests.len());
         assert!(
             !plan

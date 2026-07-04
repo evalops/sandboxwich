@@ -119,6 +119,9 @@ struct ProviderArgs {
 
     #[arg(long)]
     snapshot_class: Option<String>,
+
+    #[arg(long)]
+    ssh_authorized_keys_secret: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -369,6 +372,7 @@ fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
         args.storage_class,
         args.snapshot_class,
     )
+    .with_ssh_authorized_keys_secret(args.ssh_authorized_keys_secret)
 }
 
 fn apply_provider_from_args(args: ProviderApplyArgs) -> KubernetesApplyProvider {
