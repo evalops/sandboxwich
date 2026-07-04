@@ -1,8 +1,10 @@
 use anyhow::{Context, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use sandboxwich_core::{
     CommandListResponse, CommandRequest, CommandResponse, CreateSandboxRequest, EventListResponse,
-    JobListResponse, SandboxListResponse, SandboxResponse, WorkerListResponse,
+    GuestHealthResponse, GuestStatus, JobListResponse, RequestSshKeyRequest, SandboxListResponse,
+    SandboxResponse, SshKeyListResponse, SshKeyResponse, SshKeyStatus, UpdateGuestHealthRequest,
+    UpdateSshKeyStatusRequest, WorkerListResponse,
 };
 use uuid::Uuid;
 
@@ -30,6 +32,11 @@ enum Command {
     Command { command_id: Uuid },
     Workers,
     Jobs,
+    GuestHealth { sandbox_id: Uuid },
+    SetGuestHealth(SetGuestHealthArgs),
+    SshKeys { sandbox_id: Uuid },
+    AddSshKey(AddSshKeyArgs),
+    SetSshKeyStatus(SetSshKeyStatusArgs),
     Events { sandbox_id: Uuid },
 }
 
@@ -62,6 +69,59 @@ struct ExecArgs {
 
     #[arg(trailing_var_arg = true, required = true)]
     argv: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct SetGuestHealthArgs {
+    sandbox_id: Uuid,
+
+    #[arg(long, value_enum)]
+    status: GuestStatusArg,
+
+    #[arg(long)]
+    agent_version: Option<String>,
+
+    #[arg(long)]
+    message: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct AddSshKeyArgs {
+    sandbox_id: Uuid,
+
+    #[arg(long)]
+    public_key: String,
+
+    #[arg(long)]
+    principal: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct SetSshKeyStatusArgs {
+    ssh_key_id: Uuid,
+
+    #[arg(long, value_enum)]
+    status: SshKeyStatusArg,
+
+    #[arg(long)]
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum GuestStatusArg {
+    Pending,
+    Ready,
+    Unreachable,
+    Unhealthy,
+    Terminated,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum SshKeyStatusArg {
+    Requested,
+    Applied,
+    Failed,
+    Revoked,
 }
 
 #[tokio::main]
@@ -154,6 +214,55 @@ async fn main() -> anyhow::Result<()> {
             let response = client.get(format!("{api}/jobs")).send().await?;
             print_json::<JobListResponse>(response).await?;
         }
+        Command::GuestHealth { sandbox_id } => {
+            let response = client
+                .get(format!("{api}/sandboxes/{sandbox_id}/guest-health"))
+                .send()
+                .await?;
+            print_json::<GuestHealthResponse>(response).await?;
+        }
+        Command::SetGuestHealth(args) => {
+            let response = client
+                .post(format!("{api}/sandboxes/{}/guest-health", args.sandbox_id))
+                .json(&UpdateGuestHealthRequest {
+                    status: args.status.into(),
+                    agent_version: args.agent_version,
+                    checks: None,
+                    message: args.message,
+                })
+                .send()
+                .await?;
+            print_json::<GuestHealthResponse>(response).await?;
+        }
+        Command::SshKeys { sandbox_id } => {
+            let response = client
+                .get(format!("{api}/sandboxes/{sandbox_id}/ssh-keys"))
+                .send()
+                .await?;
+            print_json::<SshKeyListResponse>(response).await?;
+        }
+        Command::AddSshKey(args) => {
+            let response = client
+                .post(format!("{api}/sandboxes/{}/ssh-keys", args.sandbox_id))
+                .json(&RequestSshKeyRequest {
+                    public_key: args.public_key,
+                    principal: args.principal,
+                })
+                .send()
+                .await?;
+            print_json::<SshKeyResponse>(response).await?;
+        }
+        Command::SetSshKeyStatus(args) => {
+            let response = client
+                .post(format!("{api}/ssh-keys/{}/status", args.ssh_key_id))
+                .json(&UpdateSshKeyStatusRequest {
+                    status: args.status.into(),
+                    error: args.error,
+                })
+                .send()
+                .await?;
+            print_json::<SshKeyResponse>(response).await?;
+        }
         Command::Events { sandbox_id } => {
             let response = client
                 .get(format!("{api}/sandboxes/{sandbox_id}/events"))
@@ -164,6 +273,29 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+impl From<GuestStatusArg> for GuestStatus {
+    fn from(value: GuestStatusArg) -> Self {
+        match value {
+            GuestStatusArg::Pending => Self::Pending,
+            GuestStatusArg::Ready => Self::Ready,
+            GuestStatusArg::Unreachable => Self::Unreachable,
+            GuestStatusArg::Unhealthy => Self::Unhealthy,
+            GuestStatusArg::Terminated => Self::Terminated,
+        }
+    }
+}
+
+impl From<SshKeyStatusArg> for SshKeyStatus {
+    fn from(value: SshKeyStatusArg) -> Self {
+        match value {
+            SshKeyStatusArg::Requested => Self::Requested,
+            SshKeyStatusArg::Applied => Self::Applied,
+            SshKeyStatusArg::Failed => Self::Failed,
+            SshKeyStatusArg::Revoked => Self::Revoked,
+        }
+    }
 }
 
 async fn print_json<T>(response: reqwest::Response) -> anyhow::Result<()>

@@ -12,12 +12,15 @@ use chrono::{DateTime, Utc};
 use sandboxwich_core::{
     ClaimLeaseRequest, ClaimLeaseResponse, CommandId, CommandListResponse, CommandRequest,
     CommandResponse, CommandRun, CommandStatus, CompleteLeaseRequest, CreateJobRequest,
-    CreateSandboxRequest, ErrorEnvelope, EventId, EventListResponse, FailLeaseRequest,
-    HealthResponse, Job, JobId, JobKind, JobLease, JobListResponse, JobResponse, JobStatus,
-    LeaseId, LeaseResponse, LeaseStatus, PromptQueuedResponse, PromptRequest,
-    RegisterWorkerRequest, RenewLeaseRequest, Sandbox, SandboxEvent, SandboxEventKind, SandboxId,
-    SandboxListResponse, SandboxResponse, SandboxState, SnapshotId, Worker, WorkerCapability,
-    WorkerHeartbeatRequest, WorkerId, WorkerListResponse, WorkerResponse, WorkerStatus,
+    CreateSandboxRequest, ErrorEnvelope, EventId, EventListResponse, FailLeaseRequest, GuestHealth,
+    GuestHealthResponse, GuestStatus, HealthResponse, Job, JobId, JobKind, JobLease,
+    JobListResponse, JobResponse, JobStatus, LeaseId, LeaseResponse, LeaseStatus,
+    PromptQueuedResponse, PromptRequest, RegisterWorkerRequest, RenewLeaseRequest,
+    RequestSshKeyRequest, Sandbox, SandboxEvent, SandboxEventKind, SandboxId, SandboxListResponse,
+    SandboxResponse, SandboxState, SnapshotId, SshKey, SshKeyId, SshKeyListResponse,
+    SshKeyResponse, SshKeyStatus, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest, Worker,
+    WorkerCapability, WorkerHeartbeatRequest, WorkerId, WorkerListResponse, WorkerResponse,
+    WorkerStatus,
 };
 use serde_json::json;
 use sqlx::{
@@ -188,6 +191,28 @@ async fn ensure_postgres_constraints(db: &Database) -> anyhow::Result<()> {
             end if;
         end $$;
         "#,
+        r#"
+        do $$
+        begin
+            if not exists (
+                select 1 from pg_constraint where conname = 'guest_health_status_check'
+            ) then
+                alter table guest_health add constraint guest_health_status_check
+                    check (status in ('pending', 'ready', 'unreachable', 'unhealthy', 'terminated'));
+            end if;
+        end $$;
+        "#,
+        r#"
+        do $$
+        begin
+            if not exists (
+                select 1 from pg_constraint where conname = 'ssh_keys_status_check'
+            ) then
+                alter table ssh_keys add constraint ssh_keys_status_check
+                    check (status in ('requested', 'applied', 'failed', 'revoked'));
+            end if;
+        end $$;
+        "#,
     ] {
         sqlx::query(statement).execute(&db.pool).await?;
     }
@@ -341,6 +366,42 @@ async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
             select raise(abort, 'invalid lease status');
         end;
         "#,
+        r#"
+        create trigger if not exists validate_guest_health_status_insert
+        before insert on guest_health
+        for each row
+        when new.status not in ('pending', 'ready', 'unreachable', 'unhealthy', 'terminated')
+        begin
+            select raise(abort, 'invalid guest status');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_guest_health_status_update
+        before update of status on guest_health
+        for each row
+        when new.status not in ('pending', 'ready', 'unreachable', 'unhealthy', 'terminated')
+        begin
+            select raise(abort, 'invalid guest status');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_ssh_keys_status_insert
+        before insert on ssh_keys
+        for each row
+        when new.status not in ('requested', 'applied', 'failed', 'revoked')
+        begin
+            select raise(abort, 'invalid ssh key status');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_ssh_keys_status_update
+        before update of status on ssh_keys
+        for each row
+        when new.status not in ('requested', 'applied', 'failed', 'revoked')
+        begin
+            select raise(abort, 'invalid ssh key status');
+        end;
+        "#,
     ] {
         sqlx::query(statement).execute(&db.pool).await?;
     }
@@ -371,6 +432,15 @@ fn app(state: AppState) -> Router {
         .route("/leases/{lease_id}/renew", post(renew_lease))
         .route("/leases/{lease_id}/complete", post(complete_lease))
         .route("/leases/{lease_id}/fail", post(fail_lease))
+        .route(
+            "/sandboxes/{sandbox_id}/guest-health",
+            get(get_guest_health).post(update_guest_health),
+        )
+        .route(
+            "/sandboxes/{sandbox_id}/ssh-keys",
+            get(list_ssh_keys).post(request_ssh_key),
+        )
+        .route("/ssh-keys/{ssh_key_id}/status", post(update_ssh_key_status))
         .with_state(state)
 }
 
@@ -793,6 +863,141 @@ async fn list_jobs(State(state): State<AppState>) -> Result<Json<JobListResponse
     Ok(Json(JobListResponse { ok: true, jobs }))
 }
 
+async fn get_guest_health(
+    State(state): State<AppState>,
+    Path(sandbox_id): Path<Uuid>,
+) -> Result<Json<GuestHealthResponse>, ApiError> {
+    let sandbox_id = SandboxId(sandbox_id);
+    fetch_sandbox(&state.db, sandbox_id).await?;
+    let guest_health = fetch_guest_health(&state.db, sandbox_id)
+        .await?
+        .unwrap_or_else(|| GuestHealth {
+            sandbox_id,
+            status: GuestStatus::Pending,
+            last_probe_at: Utc::now(),
+            agent_version: None,
+            checks: json!({}),
+            message: Some("guest has not reported health yet".to_string()),
+        });
+
+    Ok(Json(GuestHealthResponse {
+        ok: true,
+        guest_health,
+    }))
+}
+
+async fn update_guest_health(
+    State(state): State<AppState>,
+    Path(sandbox_id): Path<Uuid>,
+    Json(request): Json<UpdateGuestHealthRequest>,
+) -> Result<Json<GuestHealthResponse>, ApiError> {
+    let sandbox_id = SandboxId(sandbox_id);
+    fetch_sandbox(&state.db, sandbox_id).await?;
+    let now = Utc::now();
+    let guest_health = GuestHealth {
+        sandbox_id,
+        status: request.status,
+        last_probe_at: now,
+        agent_version: request.agent_version,
+        checks: request.checks.unwrap_or_else(|| json!({})),
+        message: request.message,
+    };
+    upsert_guest_health(&state.db, &guest_health).await?;
+
+    Ok(Json(GuestHealthResponse {
+        ok: true,
+        guest_health,
+    }))
+}
+
+async fn request_ssh_key(
+    State(state): State<AppState>,
+    Path(sandbox_id): Path<Uuid>,
+    Json(request): Json<RequestSshKeyRequest>,
+) -> Result<Json<SshKeyResponse>, ApiError> {
+    if request.public_key.trim().is_empty() {
+        return Err(ApiError::bad_request("public_key is required"));
+    }
+    let sandbox_id = SandboxId(sandbox_id);
+    fetch_sandbox(&state.db, sandbox_id).await?;
+    let now = Utc::now();
+    let ssh_key = SshKey {
+        id: SshKeyId::new(),
+        sandbox_id,
+        public_key: request.public_key,
+        principal: request.principal.unwrap_or_else(|| "default".to_string()),
+        status: SshKeyStatus::Requested,
+        requested_at: now,
+        updated_at: now,
+        applied_at: None,
+        error: None,
+    };
+    insert_ssh_key(&state.db, &ssh_key).await?;
+
+    Ok(Json(SshKeyResponse { ok: true, ssh_key }))
+}
+
+async fn list_ssh_keys(
+    State(state): State<AppState>,
+    Path(sandbox_id): Path<Uuid>,
+) -> Result<Json<SshKeyListResponse>, ApiError> {
+    let sandbox_id = SandboxId(sandbox_id);
+    fetch_sandbox(&state.db, sandbox_id).await?;
+    let sql = format!(
+        "select id, sandbox_id, public_key, principal, status, requested_at, updated_at, applied_at, error
+         from ssh_keys
+         where sandbox_id = {}
+         order by requested_at asc, id asc",
+        state.db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .fetch_all(&state.db.pool)
+        .await?;
+    let ssh_keys = rows
+        .into_iter()
+        .map(row_to_ssh_key)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Json(SshKeyListResponse { ok: true, ssh_keys }))
+}
+
+async fn update_ssh_key_status(
+    State(state): State<AppState>,
+    Path(ssh_key_id): Path<Uuid>,
+    Json(request): Json<UpdateSshKeyStatusRequest>,
+) -> Result<Json<SshKeyResponse>, ApiError> {
+    let ssh_key_id = SshKeyId(ssh_key_id);
+    fetch_ssh_key(&state.db, ssh_key_id).await?;
+    let now = Utc::now();
+    let applied_at = if request.status == SshKeyStatus::Applied {
+        Some(now.to_rfc3339())
+    } else {
+        None
+    };
+    let sql = format!(
+        "update ssh_keys
+         set status = {}, updated_at = {}, applied_at = {}, error = {}
+         where id = {}",
+        state.db.placeholder(1),
+        state.db.placeholder(2),
+        state.db.placeholder(3),
+        state.db.placeholder(4),
+        state.db.placeholder(5)
+    );
+    sqlx::query(&sql)
+        .bind(ssh_key_status_to_str(&request.status))
+        .bind(now.to_rfc3339())
+        .bind(applied_at)
+        .bind(request.error)
+        .bind(ssh_key_id.to_string())
+        .execute(&state.db.pool)
+        .await?;
+    let ssh_key = fetch_ssh_key(&state.db, ssh_key_id).await?;
+
+    Ok(Json(SshKeyResponse { ok: true, ssh_key }))
+}
+
 async fn claim_lease(
     State(state): State<AppState>,
     Path(worker_id): Path<Uuid>,
@@ -1025,6 +1230,39 @@ async fn fetch_worker(db: &Database, worker_id: WorkerId) -> Result<Worker, ApiE
     row_to_worker(row)
 }
 
+async fn fetch_guest_health(
+    db: &Database,
+    sandbox_id: SandboxId,
+) -> Result<Option<GuestHealth>, ApiError> {
+    let sql = format!(
+        "select sandbox_id, status, last_probe_at, agent_version, checks, message
+         from guest_health
+         where sandbox_id = {}",
+        db.placeholder(1)
+    );
+    let row = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .fetch_optional(&db.pool)
+        .await?;
+    row.map(row_to_guest_health).transpose()
+}
+
+async fn fetch_ssh_key(db: &Database, ssh_key_id: SshKeyId) -> Result<SshKey, ApiError> {
+    let sql = format!(
+        "select id, sandbox_id, public_key, principal, status, requested_at, updated_at, applied_at, error
+         from ssh_keys
+         where id = {}",
+        db.placeholder(1)
+    );
+    let row = sqlx::query(&sql)
+        .bind(ssh_key_id.to_string())
+        .fetch_optional(&db.pool)
+        .await?
+        .ok_or_else(|| ApiError::not_found("ssh key not found"))?;
+
+    row_to_ssh_key(row)
+}
+
 async fn insert_sandbox(db: &Database, sandbox: &Sandbox) -> Result<(), ApiError> {
     let sql = format!(
         "insert into sandboxes
@@ -1045,6 +1283,74 @@ async fn insert_sandbox(db: &Database, sandbox: &Sandbox) -> Result<(), ApiError
                 .parent_snapshot_id
                 .map(|snapshot| snapshot.0.to_string()),
         )
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+async fn upsert_guest_health(db: &Database, guest_health: &GuestHealth) -> Result<(), ApiError> {
+    if fetch_guest_health(db, guest_health.sandbox_id)
+        .await?
+        .is_some()
+    {
+        let sql = format!(
+            "update guest_health
+             set status = {}, last_probe_at = {}, agent_version = {}, checks = {}, message = {}
+             where sandbox_id = {}",
+            db.placeholder(1),
+            db.placeholder(2),
+            db.placeholder(3),
+            db.placeholder(4),
+            db.placeholder(5),
+            db.placeholder(6)
+        );
+        sqlx::query(&sql)
+            .bind(guest_status_to_str(&guest_health.status))
+            .bind(guest_health.last_probe_at.to_rfc3339())
+            .bind(&guest_health.agent_version)
+            .bind(serde_json::to_string(&guest_health.checks)?)
+            .bind(&guest_health.message)
+            .bind(guest_health.sandbox_id.to_string())
+            .execute(&db.pool)
+            .await?;
+    } else {
+        let sql = format!(
+            "insert into guest_health
+             (sandbox_id, status, last_probe_at, agent_version, checks, message)
+             values ({})",
+            db.placeholders(6)
+        );
+        sqlx::query(&sql)
+            .bind(guest_health.sandbox_id.to_string())
+            .bind(guest_status_to_str(&guest_health.status))
+            .bind(guest_health.last_probe_at.to_rfc3339())
+            .bind(&guest_health.agent_version)
+            .bind(serde_json::to_string(&guest_health.checks)?)
+            .bind(&guest_health.message)
+            .execute(&db.pool)
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn insert_ssh_key(db: &Database, ssh_key: &SshKey) -> Result<(), ApiError> {
+    let sql = format!(
+        "insert into ssh_keys
+         (id, sandbox_id, public_key, principal, status, requested_at, updated_at, applied_at, error)
+         values ({})",
+        db.placeholders(9)
+    );
+    sqlx::query(&sql)
+        .bind(ssh_key.id.to_string())
+        .bind(ssh_key.sandbox_id.to_string())
+        .bind(&ssh_key.public_key)
+        .bind(&ssh_key.principal)
+        .bind(ssh_key_status_to_str(&ssh_key.status))
+        .bind(ssh_key.requested_at.to_rfc3339())
+        .bind(ssh_key.updated_at.to_rfc3339())
+        .bind(ssh_key.applied_at.map(|time| time.to_rfc3339()))
+        .bind(&ssh_key.error)
         .execute(&db.pool)
         .await?;
     Ok(())
@@ -1649,6 +1955,43 @@ fn row_to_worker(row: AnyRow) -> Result<Worker, ApiError> {
     })
 }
 
+fn row_to_guest_health(row: AnyRow) -> Result<GuestHealth, ApiError> {
+    let sandbox_id: String = row.try_get("sandbox_id")?;
+    let status: String = row.try_get("status")?;
+    let last_probe_at: String = row.try_get("last_probe_at")?;
+    let checks: String = row.try_get("checks")?;
+
+    Ok(GuestHealth {
+        sandbox_id: SandboxId(parse_uuid(&sandbox_id)?),
+        status: parse_guest_status(&status)?,
+        last_probe_at: parse_timestamp(&last_probe_at)?,
+        agent_version: row.try_get("agent_version")?,
+        checks: serde_json::from_str(&checks)?,
+        message: row.try_get("message")?,
+    })
+}
+
+fn row_to_ssh_key(row: AnyRow) -> Result<SshKey, ApiError> {
+    let id: String = row.try_get("id")?;
+    let sandbox_id: String = row.try_get("sandbox_id")?;
+    let status: String = row.try_get("status")?;
+    let requested_at: String = row.try_get("requested_at")?;
+    let updated_at: String = row.try_get("updated_at")?;
+    let applied_at: Option<String> = row.try_get("applied_at")?;
+
+    Ok(SshKey {
+        id: SshKeyId(parse_uuid(&id)?),
+        sandbox_id: SandboxId(parse_uuid(&sandbox_id)?),
+        public_key: row.try_get("public_key")?,
+        principal: row.try_get("principal")?,
+        status: parse_ssh_key_status(&status)?,
+        requested_at: parse_timestamp(&requested_at)?,
+        updated_at: parse_timestamp(&updated_at)?,
+        applied_at: applied_at.map(|time| parse_timestamp(&time)).transpose()?,
+        error: row.try_get("error")?,
+    })
+}
+
 fn row_to_event(row: AnyRow) -> Result<SandboxEvent, ApiError> {
     let id: String = row.try_get("id")?;
     let sandbox_id: String = row.try_get("sandbox_id")?;
@@ -1846,6 +2189,25 @@ fn lease_status_to_str(status: &LeaseStatus) -> &'static str {
     }
 }
 
+fn guest_status_to_str(status: &GuestStatus) -> &'static str {
+    match status {
+        GuestStatus::Pending => "pending",
+        GuestStatus::Ready => "ready",
+        GuestStatus::Unreachable => "unreachable",
+        GuestStatus::Unhealthy => "unhealthy",
+        GuestStatus::Terminated => "terminated",
+    }
+}
+
+fn ssh_key_status_to_str(status: &SshKeyStatus) -> &'static str {
+    match status {
+        SshKeyStatus::Requested => "requested",
+        SshKeyStatus::Applied => "applied",
+        SshKeyStatus::Failed => "failed",
+        SshKeyStatus::Revoked => "revoked",
+    }
+}
+
 fn parse_command_status(value: &str) -> Result<CommandStatus, ApiError> {
     match value {
         "queued" => Ok(CommandStatus::Queued),
@@ -1901,6 +2263,29 @@ fn parse_lease_status(value: &str) -> Result<LeaseStatus, ApiError> {
         "failed" => Ok(LeaseStatus::Failed),
         "expired" => Ok(LeaseStatus::Expired),
         _ => Err(ApiError::internal("database contains invalid lease status")),
+    }
+}
+
+fn parse_guest_status(value: &str) -> Result<GuestStatus, ApiError> {
+    match value {
+        "pending" => Ok(GuestStatus::Pending),
+        "ready" => Ok(GuestStatus::Ready),
+        "unreachable" => Ok(GuestStatus::Unreachable),
+        "unhealthy" => Ok(GuestStatus::Unhealthy),
+        "terminated" => Ok(GuestStatus::Terminated),
+        _ => Err(ApiError::internal("database contains invalid guest status")),
+    }
+}
+
+fn parse_ssh_key_status(value: &str) -> Result<SshKeyStatus, ApiError> {
+    match value {
+        "requested" => Ok(SshKeyStatus::Requested),
+        "applied" => Ok(SshKeyStatus::Applied),
+        "failed" => Ok(SshKeyStatus::Failed),
+        "revoked" => Ok(SshKeyStatus::Revoked),
+        _ => Err(ApiError::internal(
+            "database contains invalid ssh key status",
+        )),
     }
 }
 

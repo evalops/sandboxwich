@@ -8,9 +8,11 @@ use reqwest::StatusCode;
 use sandboxwich_core::{
     ClaimLeaseRequest, ClaimLeaseResponse, CommandListResponse, CommandRequest, CommandResponse,
     CommandStatus, CompleteLeaseRequest, CreateSandboxRequest, EventListResponse, FailLeaseRequest,
-    HealthResponse, Job, JobListResponse, JobStatus, LeaseResponse, RegisterWorkerRequest,
-    SandboxEventKind, SandboxListResponse, SandboxResponse, WorkerCapability,
-    WorkerHeartbeatRequest, WorkerListResponse, WorkerResponse,
+    GuestHealthResponse, GuestStatus, HealthResponse, Job, JobListResponse, JobStatus,
+    LeaseResponse, RegisterWorkerRequest, RequestSshKeyRequest, SandboxEventKind,
+    SandboxListResponse, SandboxResponse, SshKeyListResponse, SshKeyResponse, SshKeyStatus,
+    UpdateGuestHealthRequest, UpdateSshKeyStatusRequest, WorkerCapability, WorkerHeartbeatRequest,
+    WorkerListResponse, WorkerResponse,
 };
 use sqlx::any::AnyPoolOptions;
 use tempfile::TempDir;
@@ -87,6 +89,7 @@ async fn run_contract(server: TestServer) {
         &created.sandbox.id.to_string(),
     )
     .await;
+    assert_guest_health_and_ssh_key_lifecycle(&client, &server, &created).await;
 
     let worker: WorkerResponse = client
         .post(format!("{}/workers/register", server.base_url))
@@ -362,6 +365,106 @@ async fn run_contract(server: TestServer) {
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+async fn assert_guest_health_and_ssh_key_lifecycle(
+    client: &reqwest::Client,
+    server: &TestServer,
+    sandbox: &SandboxResponse,
+) {
+    let default_health: GuestHealthResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/guest-health",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(default_health.guest_health.status, GuestStatus::Pending);
+
+    let ready_health: GuestHealthResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/guest-health",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&UpdateGuestHealthRequest {
+            status: GuestStatus::Ready,
+            agent_version: Some("sandboxwich-agent/test".to_string()),
+            checks: Some(serde_json::json!({"exec": "ok"})),
+            message: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ready_health.guest_health.status, GuestStatus::Ready);
+
+    let requested_key: SshKeyResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/ssh-keys",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&RequestSshKeyRequest {
+            public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest sandboxwich".to_string(),
+            principal: Some("tester".to_string()),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(requested_key.ssh_key.status, SshKeyStatus::Requested);
+
+    let applied_key: SshKeyResponse = client
+        .post(format!(
+            "{}/ssh-keys/{}/status",
+            server.base_url, requested_key.ssh_key.id
+        ))
+        .json(&UpdateSshKeyStatusRequest {
+            status: SshKeyStatus::Applied,
+            error: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(applied_key.ssh_key.status, SshKeyStatus::Applied);
+    assert!(applied_key.ssh_key.applied_at.is_some());
+
+    let keys: SshKeyListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/ssh-keys",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        keys.ssh_keys
+            .iter()
+            .any(|seen| seen.id == requested_key.ssh_key.id)
+    );
 }
 
 async fn assert_retryable_failure_requeues_command(
@@ -670,6 +773,37 @@ async fn assert_database_rejects_invalid_typed_values(database_url: &str, sandbo
         .execute(&pool)
         .await;
     assert!(worker_result.is_err(), "invalid worker status was accepted");
+
+    let guest_health_result = sqlx::query(&insert_guest_health_sql(database_url))
+        .bind(sandbox_id)
+        .bind("not_real")
+        .bind(now)
+        .bind(Option::<String>::None)
+        .bind("{}")
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await;
+    assert!(
+        guest_health_result.is_err(),
+        "invalid guest status was accepted"
+    );
+
+    let ssh_key_result = sqlx::query(&insert_ssh_key_sql(database_url))
+        .bind(Uuid::now_v7().to_string())
+        .bind(sandbox_id)
+        .bind("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest")
+        .bind("tester")
+        .bind("not_real")
+        .bind(now)
+        .bind(now)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await;
+    assert!(
+        ssh_key_result.is_err(),
+        "invalid ssh key status was accepted"
+    );
 }
 
 fn insert_sandbox_sql(database_url: &str) -> String {
@@ -704,6 +838,23 @@ fn insert_worker_sql(database_url: &str) -> String {
          (id, name, status, provider, capabilities, labels, registered_at, last_heartbeat_at)
          values ({})",
         placeholders(database_url, 8)
+    )
+}
+
+fn insert_guest_health_sql(database_url: &str) -> String {
+    format!(
+        "insert into guest_health (sandbox_id, status, last_probe_at, agent_version, checks, message)
+         values ({})",
+        placeholders(database_url, 6)
+    )
+}
+
+fn insert_ssh_key_sql(database_url: &str) -> String {
+    format!(
+        "insert into ssh_keys
+         (id, sandbox_id, public_key, principal, status, requested_at, updated_at, applied_at, error)
+         values ({})",
+        placeholders(database_url, 9)
     )
 }
 

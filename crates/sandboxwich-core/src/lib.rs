@@ -158,6 +158,28 @@ impl fmt::Display for LeaseId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SshKeyId(pub Uuid);
+
+impl SshKeyId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for SshKeyId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for SshKeyId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxState {
@@ -481,6 +503,86 @@ pub struct AgentHealthResponse {
     pub ok: bool,
     pub agent: String,
     pub ready: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuestStatus {
+    Pending,
+    Ready,
+    Unreachable,
+    Unhealthy,
+    Terminated,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GuestHealth {
+    pub sandbox_id: SandboxId,
+    pub status: GuestStatus,
+    pub last_probe_at: DateTime<Utc>,
+    pub agent_version: Option<String>,
+    pub checks: serde_json::Value,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UpdateGuestHealthRequest {
+    pub status: GuestStatus,
+    pub agent_version: Option<String>,
+    pub checks: Option<serde_json::Value>,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GuestHealthResponse {
+    pub ok: bool,
+    pub guest_health: GuestHealth,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SshKeyStatus {
+    Requested,
+    Applied,
+    Failed,
+    Revoked,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SshKey {
+    pub id: SshKeyId,
+    pub sandbox_id: SandboxId,
+    pub public_key: String,
+    pub principal: String,
+    pub status: SshKeyStatus,
+    pub requested_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub applied_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RequestSshKeyRequest {
+    pub public_key: String,
+    pub principal: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UpdateSshKeyStatusRequest {
+    pub status: SshKeyStatus,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SshKeyResponse {
+    pub ok: bool,
+    pub ssh_key: SshKey,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SshKeyListResponse {
+    pub ok: bool,
+    pub ssh_keys: Vec<SshKey>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
