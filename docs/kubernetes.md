@@ -44,6 +44,31 @@ sandboxwich-worker provider-smoke \
 
 Use the dry-run output to validate control-plane wiring before granting a worker ServiceAccount any Kubernetes permissions. The smoke output includes Pod, PVC, Service, and VolumeSnapshot-shaped manifests under provider metadata, but the worker does not apply them.
 
+## Guarded Provider Apply
+
+The next provider path can render the exact `kubectl` plan for a non-production smoke run. It covers provision, exec handoff metadata, snapshot, fork from a `VolumeSnapshot`, and cleanup manifests. Planning never mutates a cluster.
+
+```sh
+sandboxwich-worker provider-apply-plan \
+  --cluster k3s-dev \
+  --namespace sandboxwich \
+  --storage-class local-path \
+  --snapshot-class local-path-snapshot
+```
+
+Applying is guarded by two switches:
+
+```sh
+SANDBOXWICH_K8S_ENABLE_MUTATION=1 sandboxwich-worker provider-apply-smoke \
+  --cluster k3s-dev \
+  --namespace sandboxwich \
+  --storage-class local-path \
+  --snapshot-class local-path-snapshot \
+  --confirm-apply
+```
+
+By default the smoke command deletes the resources it created with `kubectl delete --ignore-not-found -f -`. Use `--keep-resources` only when debugging a disposable namespace. Do not run the apply smoke against production-like namespaces. Grant the worker only namespace-scoped permissions for Pods, PVCs, Services, and VolumeSnapshots.
+
 ## Apply The API Manifests
 
 The starter manifests in `deploy/kubernetes/` expect a Secret named `sandboxwich-secrets` with `database-url`.
@@ -60,7 +85,6 @@ Do not commit the real database URL. Use your existing secret-management path fo
 ## Next Kubernetes Work
 
 - Add a long-running worker lease loop.
-- Turn the dry-run Kubernetes adapter into a real adapter that creates per-sandbox Pods or Jobs.
 - Add NetworkPolicy examples for sandbox egress control.
 - Add Helm or Kustomize overlays for k3s, staging, and production.
 - Add service accounts and RBAC once the provider adapter needs Kubernetes API access.
