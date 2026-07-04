@@ -92,6 +92,28 @@ impl fmt::Display for SnapshotId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WorkerId(pub Uuid);
+
+impl WorkerId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for WorkerId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for WorkerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxState {
@@ -218,6 +240,65 @@ pub struct SandboxEvent {
 pub struct EventListResponse {
     pub ok: bool,
     pub events: Vec<SandboxEvent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerStatus {
+    Registered,
+    Online,
+    Draining,
+    Offline,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerCapability {
+    ProvisionSandbox,
+    RunCommand,
+    Snapshot,
+    DesktopStream,
+    K8sPod,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Worker {
+    pub id: WorkerId,
+    pub name: String,
+    pub status: WorkerStatus,
+    pub provider: String,
+    pub capabilities: Vec<WorkerCapability>,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    pub registered_at: DateTime<Utc>,
+    pub last_heartbeat_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RegisterWorkerRequest {
+    pub name: String,
+    pub provider: String,
+    pub capabilities: Vec<WorkerCapability>,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkerHeartbeatRequest {
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkerResponse {
+    pub ok: bool,
+    pub worker: Worker,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkerListResponse {
+    pub ok: bool,
+    pub workers: Vec<Worker>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -7,7 +7,8 @@ use std::{
 use reqwest::StatusCode;
 use sandboxwich_core::{
     CommandListResponse, CommandRequest, CommandResponse, CreateSandboxRequest, EventListResponse,
-    HealthResponse, SandboxListResponse, SandboxResponse,
+    HealthResponse, RegisterWorkerRequest, SandboxListResponse, SandboxResponse, WorkerCapability,
+    WorkerHeartbeatRequest, WorkerListResponse, WorkerResponse,
 };
 use sqlx::any::AnyPoolOptions;
 use tempfile::TempDir;
@@ -84,6 +85,59 @@ async fn run_contract(server: TestServer) {
         &created.sandbox.id.to_string(),
     )
     .await;
+
+    let worker: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "k3s-worker-a".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![WorkerCapability::K8sPod, WorkerCapability::RunCommand],
+            labels: [("cluster".to_string(), "k3s-dev".to_string())].into(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(worker.worker.name, "k3s-worker-a");
+
+    let heartbeat: WorkerResponse = client
+        .post(format!(
+            "{}/workers/{}/heartbeat",
+            server.base_url, worker.worker.id
+        ))
+        .json(&WorkerHeartbeatRequest {
+            labels: [("node".to_string(), "k3s-node-1".to_string())].into(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(heartbeat.worker.last_heartbeat_at.is_some());
+
+    let workers: WorkerListResponse = client
+        .get(format!("{}/workers", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        workers
+            .workers
+            .iter()
+            .any(|seen| seen.id == worker.worker.id)
+    );
 
     let listed: SandboxListResponse = client
         .get(format!("{}/sandboxes", server.base_url))
@@ -310,6 +364,19 @@ async fn assert_database_rejects_invalid_typed_values(database_url: &str, sandbo
         .execute(&pool)
         .await;
     assert!(event_result.is_err(), "invalid event kind was accepted");
+
+    let worker_result = sqlx::query(&insert_worker_sql(database_url))
+        .bind(Uuid::now_v7().to_string())
+        .bind("invalid-worker")
+        .bind("not_real")
+        .bind("kubernetes")
+        .bind(r#"["k8s_pod"]"#)
+        .bind("{}")
+        .bind(now)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await;
+    assert!(worker_result.is_err(), "invalid worker status was accepted");
 }
 
 fn insert_sandbox_sql(database_url: &str) -> String {
@@ -335,6 +402,15 @@ fn insert_event_sql(database_url: &str) -> String {
         "insert into sandbox_events (id, sandbox_id, kind, data, created_at)
          values ({})",
         placeholders(database_url, 5)
+    )
+}
+
+fn insert_worker_sql(database_url: &str) -> String {
+    format!(
+        "insert into workers
+         (id, name, status, provider, capabilities, labels, registered_at, last_heartbeat_at)
+         values ({})",
+        placeholders(database_url, 8)
     )
 }
 

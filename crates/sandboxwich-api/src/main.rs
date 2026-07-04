@@ -12,8 +12,10 @@ use chrono::{DateTime, Utc};
 use sandboxwich_core::{
     CommandId, CommandListResponse, CommandRequest, CommandResponse, CommandRun, CommandStatus,
     CreateSandboxRequest, ErrorEnvelope, EventId, EventListResponse, HealthResponse,
-    PromptQueuedResponse, PromptRequest, Sandbox, SandboxEvent, SandboxEventKind, SandboxId,
-    SandboxListResponse, SandboxResponse, SandboxState, SnapshotId,
+    PromptQueuedResponse, PromptRequest, RegisterWorkerRequest, Sandbox, SandboxEvent,
+    SandboxEventKind, SandboxId, SandboxListResponse, SandboxResponse, SandboxState, SnapshotId,
+    Worker, WorkerCapability, WorkerHeartbeatRequest, WorkerId, WorkerListResponse, WorkerResponse,
+    WorkerStatus,
 };
 use serde_json::json;
 use sqlx::{
@@ -133,6 +135,17 @@ async fn ensure_postgres_constraints(db: &Database) -> anyhow::Result<()> {
             end if;
         end $$;
         "#,
+        r#"
+        do $$
+        begin
+            if not exists (
+                select 1 from pg_constraint where conname = 'workers_status_check'
+            ) then
+                alter table workers add constraint workers_status_check
+                    check (status in ('registered', 'online', 'draining', 'offline'));
+            end if;
+        end $$;
+        "#,
     ] {
         sqlx::query(statement).execute(&db.pool).await?;
     }
@@ -214,6 +227,24 @@ async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
             select raise(abort, 'invalid event kind');
         end;
         "#,
+        r#"
+        create trigger if not exists validate_workers_status_insert
+        before insert on workers
+        for each row
+        when new.status not in ('registered', 'online', 'draining', 'offline')
+        begin
+            select raise(abort, 'invalid worker status');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_workers_status_update
+        before update of status on workers
+        for each row
+        when new.status not in ('registered', 'online', 'draining', 'offline')
+        begin
+            select raise(abort, 'invalid worker status');
+        end;
+        "#,
     ] {
         sqlx::query(statement).execute(&db.pool).await?;
     }
@@ -236,6 +267,9 @@ fn app(state: AppState) -> Router {
         .route("/sandboxes/{sandbox_id}/prompt", post(queue_prompt))
         .route("/sandboxes/{sandbox_id}/events", get(list_events))
         .route("/commands/{command_id}", get(get_command))
+        .route("/workers", get(list_workers))
+        .route("/workers/register", post(register_worker))
+        .route("/workers/{worker_id}/heartbeat", post(heartbeat_worker))
         .with_state(state)
 }
 
@@ -519,6 +553,91 @@ async fn list_events(
     Ok(Json(EventListResponse { ok: true, events }))
 }
 
+async fn register_worker(
+    State(state): State<AppState>,
+    Json(request): Json<RegisterWorkerRequest>,
+) -> Result<Json<WorkerResponse>, ApiError> {
+    if request.name.trim().is_empty() {
+        return Err(ApiError::bad_request("worker name is required"));
+    }
+    if request.provider.trim().is_empty() {
+        return Err(ApiError::bad_request("worker provider is required"));
+    }
+    if request.capabilities.is_empty() {
+        return Err(ApiError::bad_request(
+            "worker must report at least one capability",
+        ));
+    }
+
+    let now = Utc::now();
+    let worker = Worker {
+        id: WorkerId::new(),
+        name: request.name,
+        status: WorkerStatus::Registered,
+        provider: request.provider,
+        capabilities: request.capabilities,
+        labels: request.labels,
+        registered_at: now,
+        last_heartbeat_at: None,
+    };
+    insert_worker(&state.db, &worker).await?;
+
+    Ok(Json(WorkerResponse { ok: true, worker }))
+}
+
+async fn heartbeat_worker(
+    State(state): State<AppState>,
+    Path(worker_id): Path<Uuid>,
+    Json(request): Json<WorkerHeartbeatRequest>,
+) -> Result<Json<WorkerResponse>, ApiError> {
+    let worker_id = WorkerId(worker_id);
+    fetch_worker(&state.db, worker_id).await?;
+    let now = Utc::now();
+    let labels = serde_json::to_string(&request.labels)?;
+    let sql = format!(
+        "update workers
+         set status = {}, last_heartbeat_at = {}, labels = {}
+         where id = {}",
+        state.db.placeholder(1),
+        state.db.placeholder(2),
+        state.db.placeholder(3),
+        state.db.placeholder(4)
+    );
+    let result = sqlx::query(&sql)
+        .bind(worker_status_to_str(&WorkerStatus::Online))
+        .bind(now.to_rfc3339())
+        .bind(labels.clone())
+        .bind(worker_id.to_string())
+        .execute(&state.db.pool)
+        .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("worker not found"));
+    }
+
+    insert_worker_heartbeat(&state.db, worker_id, &labels, now).await?;
+    let worker = fetch_worker(&state.db, worker_id).await?;
+
+    Ok(Json(WorkerResponse { ok: true, worker }))
+}
+
+async fn list_workers(State(state): State<AppState>) -> Result<Json<WorkerListResponse>, ApiError> {
+    let rows = sqlx::query(
+        "select id, name, status, provider, capabilities, labels, registered_at, last_heartbeat_at
+         from workers
+         order by registered_at asc, id asc",
+    )
+    .fetch_all(&state.db.pool)
+    .await?;
+
+    let workers = rows
+        .into_iter()
+        .map(row_to_worker)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Json(WorkerListResponse { ok: true, workers }))
+}
+
 async fn transition_sandbox(
     db: &Database,
     sandbox_id: SandboxId,
@@ -590,6 +709,22 @@ async fn fetch_command(db: &Database, command_id: CommandId) -> Result<CommandRu
         .ok_or_else(|| ApiError::not_found("command not found"))?;
 
     row_to_command(row)
+}
+
+async fn fetch_worker(db: &Database, worker_id: WorkerId) -> Result<Worker, ApiError> {
+    let sql = format!(
+        "select id, name, status, provider, capabilities, labels, registered_at, last_heartbeat_at
+         from workers
+         where id = {}",
+        db.placeholder(1)
+    );
+    let row = sqlx::query(&sql)
+        .bind(worker_id.to_string())
+        .fetch_optional(&db.pool)
+        .await?
+        .ok_or_else(|| ApiError::not_found("worker not found"))?;
+
+    row_to_worker(row)
 }
 
 async fn insert_sandbox(db: &Database, sandbox: &Sandbox) -> Result<(), ApiError> {
@@ -699,6 +834,48 @@ impl Database {
     }
 }
 
+async fn insert_worker(db: &Database, worker: &Worker) -> Result<(), ApiError> {
+    let sql = format!(
+        "insert into workers
+         (id, name, status, provider, capabilities, labels, registered_at, last_heartbeat_at)
+         values ({})",
+        db.placeholders(8)
+    );
+    sqlx::query(&sql)
+        .bind(worker.id.to_string())
+        .bind(&worker.name)
+        .bind(worker_status_to_str(&worker.status))
+        .bind(&worker.provider)
+        .bind(serde_json::to_string(&worker.capabilities)?)
+        .bind(serde_json::to_string(&worker.labels)?)
+        .bind(worker.registered_at.to_rfc3339())
+        .bind(worker.last_heartbeat_at.map(|time| time.to_rfc3339()))
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+async fn insert_worker_heartbeat(
+    db: &Database,
+    worker_id: WorkerId,
+    labels: &str,
+    created_at: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "insert into worker_heartbeats (id, worker_id, labels, created_at)
+         values ({})",
+        db.placeholders(4)
+    );
+    sqlx::query(&sql)
+        .bind(EventId::new().to_string())
+        .bind(worker_id.to_string())
+        .bind(labels)
+        .bind(created_at.to_rfc3339())
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
 fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
     let id: String = row.try_get("id")?;
     let state: String = row.try_get("state")?;
@@ -717,6 +894,28 @@ fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
         ttl_seconds: ttl_seconds.map(|ttl| ttl as u64),
         parent_snapshot_id: parent_snapshot_id
             .map(|snapshot| parse_uuid(&snapshot).map(SnapshotId))
+            .transpose()?,
+    })
+}
+
+fn row_to_worker(row: AnyRow) -> Result<Worker, ApiError> {
+    let id: String = row.try_get("id")?;
+    let status: String = row.try_get("status")?;
+    let capabilities: String = row.try_get("capabilities")?;
+    let labels: String = row.try_get("labels")?;
+    let registered_at: String = row.try_get("registered_at")?;
+    let last_heartbeat_at: Option<String> = row.try_get("last_heartbeat_at")?;
+
+    Ok(Worker {
+        id: WorkerId(parse_uuid(&id)?),
+        name: row.try_get("name")?,
+        status: parse_worker_status(&status)?,
+        provider: row.try_get("provider")?,
+        capabilities: serde_json::from_str::<Vec<WorkerCapability>>(&capabilities)?,
+        labels: serde_json::from_str(&labels)?,
+        registered_at: parse_timestamp(&registered_at)?,
+        last_heartbeat_at: last_heartbeat_at
+            .map(|time| parse_timestamp(&time))
             .transpose()?,
     })
 }
@@ -805,6 +1004,15 @@ fn command_status_to_str(status: &CommandStatus) -> &'static str {
     }
 }
 
+fn worker_status_to_str(status: &WorkerStatus) -> &'static str {
+    match status {
+        WorkerStatus::Registered => "registered",
+        WorkerStatus::Online => "online",
+        WorkerStatus::Draining => "draining",
+        WorkerStatus::Offline => "offline",
+    }
+}
+
 fn parse_command_status(value: &str) -> Result<CommandStatus, ApiError> {
     match value {
         "queued" => Ok(CommandStatus::Queued),
@@ -813,6 +1021,18 @@ fn parse_command_status(value: &str) -> Result<CommandStatus, ApiError> {
         "failed" => Ok(CommandStatus::Failed),
         _ => Err(ApiError::internal(
             "database contains invalid command status",
+        )),
+    }
+}
+
+fn parse_worker_status(value: &str) -> Result<WorkerStatus, ApiError> {
+    match value {
+        "registered" => Ok(WorkerStatus::Registered),
+        "online" => Ok(WorkerStatus::Online),
+        "draining" => Ok(WorkerStatus::Draining),
+        "offline" => Ok(WorkerStatus::Offline),
+        _ => Err(ApiError::internal(
+            "database contains invalid worker status",
         )),
     }
 }

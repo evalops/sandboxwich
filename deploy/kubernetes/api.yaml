@@ -1,0 +1,75 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sandboxwich
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandboxwich-api
+  namespace: sandboxwich
+  labels:
+    app.kubernetes.io/name: sandboxwich-api
+    app.kubernetes.io/part-of: sandboxwich
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sandboxwich-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sandboxwich-api
+        app.kubernetes.io/part-of: sandboxwich
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/evalops/sandboxwich-api:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SANDBOXWICH_BIND
+              value: 0.0.0.0:3217
+            - name: SANDBOXWICH_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sandboxwich-secrets
+                  key: database-url
+          ports:
+            - name: http
+              containerPort: 3217
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sandboxwich-api
+  namespace: sandboxwich
+  labels:
+    app.kubernetes.io/name: sandboxwich-api
+    app.kubernetes.io/part-of: sandboxwich
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: sandboxwich-api
+  ports:
+    - name: http
+      port: 3217
+      targetPort: http
