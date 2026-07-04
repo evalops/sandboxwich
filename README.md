@@ -43,9 +43,4 @@ By default the API writes to `sqlite://sandboxwich.db`. Override it with `SANDBO
 
 ## Roadmap
 
-1. Durable control-plane storage with SQLite for dev and Postgres for deployments.
-2. Worker leases and host registration.
-3. SSH key injection and command streaming.
-4. Snapshot inventory and fork planning.
-5. Desktop stream broker.
-6. Provider adapters for VM and microVM backends.
+See [ROADMAP.md](ROADMAP.md) for the current milestones.
