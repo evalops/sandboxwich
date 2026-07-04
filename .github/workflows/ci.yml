@@ -10,6 +10,20 @@ on:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: sandboxwich
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -17,3 +31,5 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo check --workspace
       - run: cargo test --workspace
+        env:
+          SANDBOXWICH_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/sandboxwich

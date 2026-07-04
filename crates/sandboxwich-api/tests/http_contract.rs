@@ -14,7 +14,7 @@ use tempfile::TempDir;
 struct TestServer {
     base_url: String,
     child: Child,
-    _data_dir: TempDir,
+    _data_dir: Option<TempDir>,
 }
 
 impl Drop for TestServer {
@@ -25,8 +25,27 @@ impl Drop for TestServer {
 }
 
 #[tokio::test]
-async fn lifecycle_command_and_event_contracts_work_over_http() {
-    let server = TestServer::start().await;
+async fn lifecycle_command_and_event_contracts_work_over_sqlite() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("sandboxwich-test.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    run_contract(server).await;
+}
+
+#[tokio::test]
+async fn lifecycle_command_and_event_contracts_work_over_postgres_when_configured() {
+    let Ok(database_url) = std::env::var("SANDBOXWICH_TEST_POSTGRES_URL") else {
+        return;
+    };
+
+    let server = TestServer::start(database_url, None).await;
+    run_contract(server).await;
+}
+
+async fn run_contract(server: TestServer) {
     let client = reqwest::Client::new();
 
     let health: HealthResponse = client
@@ -68,7 +87,12 @@ async fn lifecycle_command_and_event_contracts_work_over_http() {
         .json()
         .await
         .unwrap();
-    assert_eq!(listed.sandboxes.len(), 1);
+    assert!(
+        listed
+            .sandboxes
+            .iter()
+            .any(|sandbox| sandbox.id == created.sandbox.id)
+    );
 
     let command: CommandResponse = client
         .post(format!(
@@ -184,12 +208,7 @@ async fn lifecycle_command_and_event_contracts_work_over_http() {
 }
 
 impl TestServer {
-    async fn start() -> Self {
-        let data_dir = tempfile::tempdir().unwrap();
-        let database_url = format!(
-            "sqlite://{}",
-            data_dir.path().join("sandboxwich-test.db").display()
-        );
+    async fn start(database_url: String, data_dir: Option<TempDir>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let bind = listener.local_addr().unwrap();
         drop(listener);
