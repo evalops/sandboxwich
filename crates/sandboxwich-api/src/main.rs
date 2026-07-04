@@ -11,15 +11,18 @@ use axum::{
 use chrono::{DateTime, Utc};
 use sandboxwich_core::{
     ClaimLeaseRequest, ClaimLeaseResponse, CommandId, CommandListResponse, CommandRequest,
-    CommandResponse, CommandRun, CommandStatus, CompleteLeaseRequest, CreateJobRequest,
-    CreateSandboxRequest, CreateSnapshotRequest, ErrorEnvelope, EventId, EventListResponse,
-    FailLeaseRequest, GuestHealth, GuestHealthResponse, GuestStatus, HealthResponse, Job, JobId,
-    JobKind, JobLease, JobListResponse, JobResponse, JobStatus, LeaseId, LeaseResponse,
-    LeaseStatus, PromptQueuedResponse, PromptRequest, RegisterWorkerRequest, RenewLeaseRequest,
-    RequestSshKeyRequest, Sandbox, SandboxEvent, SandboxEventKind, SandboxId, SandboxListResponse,
-    SandboxResponse, SandboxState, Snapshot, SnapshotCleanupResponse, SnapshotId,
-    SnapshotListResponse, SnapshotResponse, SnapshotStatus, SshKey, SshKeyId, SshKeyListResponse,
-    SshKeyResponse, SshKeyStatus, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest, Worker,
+    CommandResponse, CommandRun, CommandStatus, CompleteLeaseRequest, CreateDesktopSessionRequest,
+    CreateJobRequest, CreateSandboxRequest, CreateSnapshotRequest, DesktopAccess,
+    DesktopAccessMode, DesktopAccessRequest, DesktopAccessResponse, DesktopSession,
+    DesktopSessionId, DesktopSessionListResponse, DesktopSessionResponse, DesktopSessionStatus,
+    ErrorEnvelope, EventId, EventListResponse, FailLeaseRequest, GuestHealth, GuestHealthResponse,
+    GuestStatus, HealthResponse, Job, JobId, JobKind, JobLease, JobListResponse, JobResponse,
+    JobStatus, LeaseId, LeaseResponse, LeaseStatus, PromptQueuedResponse, PromptRequest,
+    RegisterWorkerRequest, RenewLeaseRequest, RequestSshKeyRequest, Sandbox, SandboxEvent,
+    SandboxEventKind, SandboxId, SandboxListResponse, SandboxResponse, SandboxState, Snapshot,
+    SnapshotCleanupResponse, SnapshotId, SnapshotListResponse, SnapshotResponse, SnapshotStatus,
+    SshKey, SshKeyId, SshKeyListResponse, SshKeyResponse, SshKeyStatus,
+    UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest, Worker,
     WorkerCapability, WorkerHeartbeatRequest, WorkerId, WorkerListResponse, WorkerResponse,
     WorkerStatus,
 };
@@ -121,21 +124,22 @@ async fn ensure_postgres_constraints(db: &Database) -> anyhow::Result<()> {
         r#"
         do $$
         begin
-            if not exists (
-                select 1 from pg_constraint where conname = 'sandbox_events_kind_check'
-            ) then
-                alter table sandbox_events add constraint sandbox_events_kind_check
-                    check (kind in (
-                        'lifecycle_changed',
-                        'command_queued',
-                        'command_started',
-                        'command_output',
-                        'command_finished',
-                        'prompt_queued',
-                        'prompt_finished',
-                        'desktop_ready'
-                    ));
-            end if;
+            alter table sandbox_events drop constraint if exists sandbox_events_kind_check;
+            alter table sandbox_events add constraint sandbox_events_kind_check
+                check (kind in (
+                    'lifecycle_changed',
+                    'command_queued',
+                    'command_started',
+                    'command_output',
+                    'command_finished',
+                    'prompt_queued',
+                    'prompt_finished',
+                    'desktop_requested',
+                    'desktop_ready',
+                    'desktop_failed',
+                    'desktop_closed',
+                    'desktop_expired'
+                ));
         end $$;
         "#,
         r#"
@@ -215,6 +219,28 @@ async fn ensure_postgres_constraints(db: &Database) -> anyhow::Result<()> {
         do $$
         begin
             if not exists (
+                select 1 from pg_constraint where conname = 'desktop_sessions_status_check'
+            ) then
+                alter table desktop_sessions add constraint desktop_sessions_status_check
+                    check (status in ('pending', 'ready', 'failed', 'closed', 'expired'));
+            end if;
+        end $$;
+        "#,
+        r#"
+        do $$
+        begin
+            if not exists (
+                select 1 from pg_constraint where conname = 'desktop_sessions_access_mode_check'
+            ) then
+                alter table desktop_sessions add constraint desktop_sessions_access_mode_check
+                    check (access_mode in ('browser', 'vnc', 'rdp'));
+            end if;
+        end $$;
+        "#,
+        r#"
+        do $$
+        begin
+            if not exists (
                 select 1 from pg_constraint where conname = 'ssh_keys_status_check'
             ) then
                 alter table ssh_keys add constraint ssh_keys_status_check
@@ -236,6 +262,12 @@ async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
         "#,
         r#"
         drop trigger if exists validate_sandboxes_state_update;
+        "#,
+        r#"
+        drop trigger if exists validate_sandbox_events_kind_insert;
+        "#,
+        r#"
+        drop trigger if exists validate_sandbox_events_kind_update;
         "#,
         r#"
         create trigger if not exists validate_sandboxes_state_insert
@@ -285,7 +317,11 @@ async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
             'command_finished',
             'prompt_queued',
             'prompt_finished',
-            'desktop_ready'
+            'desktop_requested',
+            'desktop_ready',
+            'desktop_failed',
+            'desktop_closed',
+            'desktop_expired'
         )
         begin
             select raise(abort, 'invalid event kind');
@@ -303,7 +339,11 @@ async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
             'command_finished',
             'prompt_queued',
             'prompt_finished',
-            'desktop_ready'
+            'desktop_requested',
+            'desktop_ready',
+            'desktop_failed',
+            'desktop_closed',
+            'desktop_expired'
         )
         begin
             select raise(abort, 'invalid event kind');
@@ -418,6 +458,42 @@ async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
         end;
         "#,
         r#"
+        create trigger if not exists validate_desktop_sessions_status_insert
+        before insert on desktop_sessions
+        for each row
+        when new.status not in ('pending', 'ready', 'failed', 'closed', 'expired')
+        begin
+            select raise(abort, 'invalid desktop session status');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_desktop_sessions_status_update
+        before update of status on desktop_sessions
+        for each row
+        when new.status not in ('pending', 'ready', 'failed', 'closed', 'expired')
+        begin
+            select raise(abort, 'invalid desktop session status');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_desktop_sessions_access_mode_insert
+        before insert on desktop_sessions
+        for each row
+        when new.access_mode not in ('browser', 'vnc', 'rdp')
+        begin
+            select raise(abort, 'invalid desktop access mode');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_desktop_sessions_access_mode_update
+        before update of access_mode on desktop_sessions
+        for each row
+        when new.access_mode not in ('browser', 'vnc', 'rdp')
+        begin
+            select raise(abort, 'invalid desktop access mode');
+        end;
+        "#,
+        r#"
         create trigger if not exists validate_ssh_keys_status_insert
         before insert on ssh_keys
         for each row
@@ -455,11 +531,31 @@ fn app(state: AppState) -> Router {
             get(list_snapshots).post(create_snapshot),
         )
         .route(
+            "/sandboxes/{sandbox_id}/desktop",
+            get(list_desktop_sessions),
+        )
+        .route(
+            "/sandboxes/{sandbox_id}/desktop-sessions",
+            get(list_desktop_sessions).post(create_desktop_session),
+        )
+        .route(
             "/sandboxes/{sandbox_id}/commands",
             get(list_commands).post(queue_command),
         )
         .route("/sandboxes/{sandbox_id}/prompt", post(queue_prompt))
         .route("/sandboxes/{sandbox_id}/events", get(list_events))
+        .route(
+            "/desktop-sessions/{desktop_session_id}",
+            get(get_desktop_session),
+        )
+        .route(
+            "/desktop-sessions/{desktop_session_id}/status",
+            post(update_desktop_session_status),
+        )
+        .route(
+            "/desktop-sessions/{desktop_session_id}/access",
+            post(create_desktop_access),
+        )
         .route("/snapshots/cleanup", post(cleanup_snapshots))
         .route("/snapshots/{snapshot_id}", get(get_snapshot))
         .route("/commands/{command_id}", get(get_command))
@@ -721,6 +817,89 @@ async fn cleanup_snapshots(
         expired,
         archived_sandboxes_deleted,
     }))
+}
+
+async fn create_desktop_session(
+    State(state): State<AppState>,
+    Path(sandbox_id): Path<Uuid>,
+    Json(request): Json<CreateDesktopSessionRequest>,
+) -> Result<Json<DesktopSessionResponse>, ApiError> {
+    let sandbox_id = SandboxId(sandbox_id);
+    fetch_sandbox(&state.db, sandbox_id).await?;
+    let desktop_session = desktop_session_from_request(sandbox_id, request)?;
+    insert_desktop_session(&state.db, &desktop_session).await?;
+    insert_desktop_event(
+        &state.db,
+        &desktop_session,
+        SandboxEventKind::DesktopRequested,
+    )
+    .await?;
+
+    Ok(Json(DesktopSessionResponse {
+        ok: true,
+        desktop_session,
+    }))
+}
+
+async fn list_desktop_sessions(
+    State(state): State<AppState>,
+    Path(sandbox_id): Path<Uuid>,
+) -> Result<Json<DesktopSessionListResponse>, ApiError> {
+    let sandbox_id = SandboxId(sandbox_id);
+    fetch_sandbox(&state.db, sandbox_id).await?;
+    expire_due_desktop_sessions(&state.db).await?;
+    let desktop_sessions = list_desktop_sessions_for_sandbox(&state.db, sandbox_id).await?;
+    Ok(Json(DesktopSessionListResponse {
+        ok: true,
+        desktop_sessions,
+    }))
+}
+
+async fn get_desktop_session(
+    State(state): State<AppState>,
+    Path(desktop_session_id): Path<Uuid>,
+) -> Result<Json<DesktopSessionResponse>, ApiError> {
+    expire_due_desktop_sessions(&state.db).await?;
+    let desktop_session =
+        fetch_desktop_session(&state.db, DesktopSessionId(desktop_session_id)).await?;
+    Ok(Json(DesktopSessionResponse {
+        ok: true,
+        desktop_session,
+    }))
+}
+
+async fn update_desktop_session_status(
+    State(state): State<AppState>,
+    Path(desktop_session_id): Path<Uuid>,
+    Json(request): Json<UpdateDesktopSessionRequest>,
+) -> Result<Json<DesktopSessionResponse>, ApiError> {
+    let desktop_session_id = DesktopSessionId(desktop_session_id);
+    let current = fetch_desktop_session(&state.db, desktop_session_id).await?;
+    let updated = updated_desktop_session(current, request)?;
+    update_desktop_session(&state.db, &updated).await?;
+    insert_desktop_event(
+        &state.db,
+        &updated,
+        desktop_event_kind_for_status(&updated.status),
+    )
+    .await?;
+
+    Ok(Json(DesktopSessionResponse {
+        ok: true,
+        desktop_session: updated,
+    }))
+}
+
+async fn create_desktop_access(
+    State(state): State<AppState>,
+    Path(desktop_session_id): Path<Uuid>,
+    Json(request): Json<DesktopAccessRequest>,
+) -> Result<Json<DesktopAccessResponse>, ApiError> {
+    expire_due_desktop_sessions(&state.db).await?;
+    let desktop_session =
+        fetch_desktop_session(&state.db, DesktopSessionId(desktop_session_id)).await?;
+    let access = mint_desktop_access(&desktop_session, request.ttl_seconds)?;
+    Ok(Json(DesktopAccessResponse { ok: true, access }))
 }
 
 async fn queue_command(
@@ -1447,6 +1626,91 @@ fn ready_snapshot_from_request(
     })
 }
 
+fn desktop_session_from_request(
+    sandbox_id: SandboxId,
+    request: CreateDesktopSessionRequest,
+) -> Result<DesktopSession, ApiError> {
+    let now = Utc::now();
+    Ok(DesktopSession {
+        id: DesktopSessionId::new(),
+        sandbox_id,
+        status: DesktopSessionStatus::Pending,
+        broker: validate_broker(
+            request
+                .broker
+                .unwrap_or_else(|| "sandboxwich-broker".to_string()),
+        )?,
+        broker_url: sanitize_broker_url(request.broker_url)?,
+        access_mode: request.access_mode.unwrap_or(DesktopAccessMode::Browser),
+        connection_metadata: request.connection_metadata.unwrap_or_else(|| json!({})),
+        created_at: now,
+        updated_at: now,
+        expires_at: expires_at_from_ttl(now, request.ttl_seconds.or(Some(3600)))?,
+        error: None,
+    })
+}
+
+fn updated_desktop_session(
+    current: DesktopSession,
+    request: UpdateDesktopSessionRequest,
+) -> Result<DesktopSession, ApiError> {
+    let now = Utc::now();
+    let expires_at = match request.ttl_seconds {
+        Some(ttl) => expires_at_from_ttl(now, Some(ttl))?,
+        None => current.expires_at,
+    };
+    Ok(DesktopSession {
+        id: current.id,
+        sandbox_id: current.sandbox_id,
+        status: request.status,
+        broker: match request.broker {
+            Some(broker) => validate_broker(broker)?,
+            None => current.broker,
+        },
+        broker_url: match request.broker_url {
+            Some(broker_url) => sanitize_broker_url(Some(broker_url))?,
+            None => current.broker_url,
+        },
+        access_mode: request.access_mode.unwrap_or(current.access_mode),
+        connection_metadata: request
+            .connection_metadata
+            .unwrap_or(current.connection_metadata),
+        created_at: current.created_at,
+        updated_at: now,
+        expires_at,
+        error: request.error,
+    })
+}
+
+fn validate_broker(broker: String) -> Result<String, ApiError> {
+    let broker = broker.trim();
+    if broker.is_empty() {
+        return Err(ApiError::bad_request("desktop broker is required"));
+    }
+    Ok(broker.to_string())
+}
+
+fn sanitize_broker_url(value: Option<String>) -> Result<Option<String>, ApiError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim().trim_end_matches('/');
+    if value.is_empty() {
+        return Err(ApiError::bad_request("desktop broker_url cannot be empty"));
+    }
+    if !(value.starts_with("https://") || value.starts_with("http://")) {
+        return Err(ApiError::bad_request(
+            "desktop broker_url must start with http:// or https://",
+        ));
+    }
+    if value.contains('?') || value.contains('#') || value.contains('@') {
+        return Err(ApiError::bad_request(
+            "desktop broker_url must not include credentials, query, or fragment data",
+        ));
+    }
+    Ok(Some(value.to_string()))
+}
+
 fn expires_at_from_ttl(
     now: DateTime<Utc>,
     ttl_seconds: Option<u64>,
@@ -1650,6 +1914,227 @@ async fn sandbox_snapshot_is_referenced(
         .fetch_optional(&db.pool)
         .await?;
     Ok(row.is_some())
+}
+
+async fn insert_desktop_session(
+    db: &Database,
+    desktop_session: &DesktopSession,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "insert into desktop_sessions
+         (id, sandbox_id, status, broker, broker_url, access_mode, connection_metadata,
+          created_at, updated_at, expires_at, error)
+         values ({})",
+        db.placeholders(11)
+    );
+    sqlx::query(&sql)
+        .bind(desktop_session.id.to_string())
+        .bind(desktop_session.sandbox_id.to_string())
+        .bind(desktop_session_status_to_str(&desktop_session.status))
+        .bind(&desktop_session.broker)
+        .bind(&desktop_session.broker_url)
+        .bind(desktop_access_mode_to_str(&desktop_session.access_mode))
+        .bind(serde_json::to_string(&desktop_session.connection_metadata)?)
+        .bind(desktop_session.created_at.to_rfc3339())
+        .bind(desktop_session.updated_at.to_rfc3339())
+        .bind(desktop_session.expires_at.map(|time| time.to_rfc3339()))
+        .bind(&desktop_session.error)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+async fn fetch_desktop_session(
+    db: &Database,
+    desktop_session_id: DesktopSessionId,
+) -> Result<DesktopSession, ApiError> {
+    let sql = format!(
+        "select id, sandbox_id, status, broker, broker_url, access_mode, connection_metadata,
+                created_at, updated_at, expires_at, error
+         from desktop_sessions
+         where id = {}",
+        db.placeholder(1)
+    );
+    let row = sqlx::query(&sql)
+        .bind(desktop_session_id.to_string())
+        .fetch_optional(&db.pool)
+        .await?
+        .ok_or_else(|| ApiError::not_found("desktop session not found"))?;
+
+    row_to_desktop_session(row)
+}
+
+async fn list_desktop_sessions_for_sandbox(
+    db: &Database,
+    sandbox_id: SandboxId,
+) -> Result<Vec<DesktopSession>, ApiError> {
+    let sql = format!(
+        "select id, sandbox_id, status, broker, broker_url, access_mode, connection_metadata,
+                created_at, updated_at, expires_at, error
+         from desktop_sessions
+         where sandbox_id = {}
+         order by updated_at desc, created_at desc, id asc",
+        db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .fetch_all(&db.pool)
+        .await?;
+
+    rows.into_iter().map(row_to_desktop_session).collect()
+}
+
+async fn update_desktop_session(
+    db: &Database,
+    desktop_session: &DesktopSession,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "update desktop_sessions
+         set status = {}, broker = {}, broker_url = {}, access_mode = {},
+             connection_metadata = {}, updated_at = {}, expires_at = {}, error = {}
+         where id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4),
+        db.placeholder(5),
+        db.placeholder(6),
+        db.placeholder(7),
+        db.placeholder(8),
+        db.placeholder(9)
+    );
+    let result = sqlx::query(&sql)
+        .bind(desktop_session_status_to_str(&desktop_session.status))
+        .bind(&desktop_session.broker)
+        .bind(&desktop_session.broker_url)
+        .bind(desktop_access_mode_to_str(&desktop_session.access_mode))
+        .bind(serde_json::to_string(&desktop_session.connection_metadata)?)
+        .bind(desktop_session.updated_at.to_rfc3339())
+        .bind(desktop_session.expires_at.map(|time| time.to_rfc3339()))
+        .bind(&desktop_session.error)
+        .bind(desktop_session.id.to_string())
+        .execute(&db.pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("desktop session not found"));
+    }
+    Ok(())
+}
+
+async fn expire_due_desktop_sessions(db: &Database) -> Result<Vec<DesktopSession>, ApiError> {
+    let now = Utc::now();
+    let rows = sqlx::query(
+        "select id, sandbox_id, status, broker, broker_url, access_mode, connection_metadata,
+                created_at, updated_at, expires_at, error
+         from desktop_sessions
+         where status in ('pending', 'ready') and expires_at is not null
+         order by expires_at asc, id asc",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+
+    let mut expired = Vec::new();
+    for row in rows {
+        let mut desktop_session = row_to_desktop_session(row)?;
+        let Some(expires_at) = desktop_session.expires_at else {
+            continue;
+        };
+        if expires_at > now {
+            continue;
+        }
+        desktop_session.status = DesktopSessionStatus::Expired;
+        desktop_session.updated_at = now;
+        desktop_session.error = Some("desktop session expired".to_string());
+        update_desktop_session(db, &desktop_session).await?;
+        insert_desktop_event(db, &desktop_session, SandboxEventKind::DesktopExpired).await?;
+        expired.push(fetch_desktop_session(db, desktop_session.id).await?);
+    }
+
+    Ok(expired)
+}
+
+async fn insert_desktop_event(
+    db: &Database,
+    desktop_session: &DesktopSession,
+    kind: SandboxEventKind,
+) -> Result<SandboxEvent, ApiError> {
+    insert_event(
+        db,
+        desktop_session.sandbox_id,
+        kind,
+        json!({
+            "desktopSessionId": desktop_session.id,
+            "status": desktop_session.status,
+            "broker": desktop_session.broker,
+            "accessMode": desktop_session.access_mode,
+            "connectionMetadata": desktop_session.connection_metadata,
+            "expiresAt": desktop_session.expires_at,
+            "error": desktop_session.error
+        }),
+    )
+    .await
+}
+
+fn desktop_event_kind_for_status(status: &DesktopSessionStatus) -> SandboxEventKind {
+    match status {
+        DesktopSessionStatus::Pending => SandboxEventKind::DesktopRequested,
+        DesktopSessionStatus::Ready => SandboxEventKind::DesktopReady,
+        DesktopSessionStatus::Failed => SandboxEventKind::DesktopFailed,
+        DesktopSessionStatus::Closed => SandboxEventKind::DesktopClosed,
+        DesktopSessionStatus::Expired => SandboxEventKind::DesktopExpired,
+    }
+}
+
+fn mint_desktop_access(
+    desktop_session: &DesktopSession,
+    ttl_seconds: Option<u64>,
+) -> Result<DesktopAccess, ApiError> {
+    if desktop_session.status != DesktopSessionStatus::Ready {
+        return Err(ApiError::bad_request("desktop session is not ready"));
+    }
+
+    let now = Utc::now();
+    let ttl_seconds = ttl_seconds.unwrap_or(300);
+    if ttl_seconds == 0 {
+        return Err(ApiError::bad_request(
+            "desktop access ttl_seconds must be greater than 0",
+        ));
+    }
+    let ttl_seconds = ttl_seconds.min(900);
+    let mut expires_at = expires_at_from_ttl(now, Some(ttl_seconds))?
+        .ok_or_else(|| ApiError::internal("failed to calculate desktop access expiry"))?;
+    if let Some(session_expires_at) = desktop_session.expires_at {
+        if session_expires_at <= now {
+            return Err(ApiError::bad_request("desktop session has expired"));
+        }
+        if session_expires_at < expires_at {
+            expires_at = session_expires_at;
+        }
+    }
+
+    Ok(DesktopAccess {
+        session_id: desktop_session.id,
+        sandbox_id: desktop_session.sandbox_id,
+        broker: desktop_session.broker.clone(),
+        access_mode: desktop_session.access_mode.clone(),
+        access_url: desktop_access_url(desktop_session),
+        expires_at,
+        connection_metadata: desktop_session.connection_metadata.clone(),
+    })
+}
+
+fn desktop_access_url(desktop_session: &DesktopSession) -> String {
+    let mode = desktop_access_mode_to_str(&desktop_session.access_mode);
+    match &desktop_session.broker_url {
+        Some(broker_url) => format!(
+            "{broker_url}/sessions/{}/connect/{mode}",
+            desktop_session.id
+        ),
+        None => format!(
+            "sandboxwich://desktop/{}/connect/{mode}",
+            desktop_session.id
+        ),
+    }
 }
 
 async fn upsert_guest_health(db: &Database, guest_health: &GuestHealth) -> Result<(), ApiError> {
@@ -2490,6 +2975,31 @@ fn row_to_snapshot(row: AnyRow) -> Result<Snapshot, ApiError> {
     })
 }
 
+fn row_to_desktop_session(row: AnyRow) -> Result<DesktopSession, ApiError> {
+    let id: String = row.try_get("id")?;
+    let sandbox_id: String = row.try_get("sandbox_id")?;
+    let status: String = row.try_get("status")?;
+    let access_mode: String = row.try_get("access_mode")?;
+    let connection_metadata: String = row.try_get("connection_metadata")?;
+    let created_at: String = row.try_get("created_at")?;
+    let updated_at: String = row.try_get("updated_at")?;
+    let expires_at: Option<String> = row.try_get("expires_at")?;
+
+    Ok(DesktopSession {
+        id: DesktopSessionId(parse_uuid(&id)?),
+        sandbox_id: SandboxId(parse_uuid(&sandbox_id)?),
+        status: parse_desktop_session_status(&status)?,
+        broker: row.try_get("broker")?,
+        broker_url: row.try_get("broker_url")?,
+        access_mode: parse_desktop_access_mode(&access_mode)?,
+        connection_metadata: serde_json::from_str(&connection_metadata)?,
+        created_at: parse_timestamp(&created_at)?,
+        updated_at: parse_timestamp(&updated_at)?,
+        expires_at: expires_at.map(|time| parse_timestamp(&time)).transpose()?,
+        error: row.try_get("error")?,
+    })
+}
+
 fn row_to_worker(row: AnyRow) -> Result<Worker, ApiError> {
     let id: String = row.try_get("id")?;
     let status: String = row.try_get("status")?;
@@ -2699,6 +3209,24 @@ fn snapshot_status_to_str(status: &SnapshotStatus) -> &'static str {
     }
 }
 
+fn desktop_session_status_to_str(status: &DesktopSessionStatus) -> &'static str {
+    match status {
+        DesktopSessionStatus::Pending => "pending",
+        DesktopSessionStatus::Ready => "ready",
+        DesktopSessionStatus::Failed => "failed",
+        DesktopSessionStatus::Closed => "closed",
+        DesktopSessionStatus::Expired => "expired",
+    }
+}
+
+fn desktop_access_mode_to_str(access_mode: &DesktopAccessMode) -> &'static str {
+    match access_mode {
+        DesktopAccessMode::Browser => "browser",
+        DesktopAccessMode::Vnc => "vnc",
+        DesktopAccessMode::Rdp => "rdp",
+    }
+}
+
 fn command_status_to_str(status: &CommandStatus) -> &'static str {
     match status {
         CommandStatus::Queued => "queued",
@@ -2800,6 +3328,30 @@ fn parse_snapshot_status(value: &str) -> Result<SnapshotStatus, ApiError> {
     }
 }
 
+fn parse_desktop_session_status(value: &str) -> Result<DesktopSessionStatus, ApiError> {
+    match value {
+        "pending" => Ok(DesktopSessionStatus::Pending),
+        "ready" => Ok(DesktopSessionStatus::Ready),
+        "failed" => Ok(DesktopSessionStatus::Failed),
+        "closed" => Ok(DesktopSessionStatus::Closed),
+        "expired" => Ok(DesktopSessionStatus::Expired),
+        _ => Err(ApiError::internal(
+            "database contains invalid desktop session status",
+        )),
+    }
+}
+
+fn parse_desktop_access_mode(value: &str) -> Result<DesktopAccessMode, ApiError> {
+    match value {
+        "browser" => Ok(DesktopAccessMode::Browser),
+        "vnc" => Ok(DesktopAccessMode::Vnc),
+        "rdp" => Ok(DesktopAccessMode::Rdp),
+        _ => Err(ApiError::internal(
+            "database contains invalid desktop access mode",
+        )),
+    }
+}
+
 fn parse_worker_capability(value: &str) -> Result<WorkerCapability, ApiError> {
     match value {
         "provision_sandbox" => Ok(WorkerCapability::ProvisionSandbox),
@@ -2890,7 +3442,11 @@ fn event_kind_to_str(kind: &SandboxEventKind) -> &'static str {
         SandboxEventKind::CommandFinished => "command_finished",
         SandboxEventKind::PromptQueued => "prompt_queued",
         SandboxEventKind::PromptFinished => "prompt_finished",
+        SandboxEventKind::DesktopRequested => "desktop_requested",
         SandboxEventKind::DesktopReady => "desktop_ready",
+        SandboxEventKind::DesktopFailed => "desktop_failed",
+        SandboxEventKind::DesktopClosed => "desktop_closed",
+        SandboxEventKind::DesktopExpired => "desktop_expired",
     }
 }
 
@@ -2903,7 +3459,11 @@ fn parse_event_kind(value: &str) -> Result<SandboxEventKind, ApiError> {
         "command_finished" => Ok(SandboxEventKind::CommandFinished),
         "prompt_queued" => Ok(SandboxEventKind::PromptQueued),
         "prompt_finished" => Ok(SandboxEventKind::PromptFinished),
+        "desktop_requested" => Ok(SandboxEventKind::DesktopRequested),
         "desktop_ready" => Ok(SandboxEventKind::DesktopReady),
+        "desktop_failed" => Ok(SandboxEventKind::DesktopFailed),
+        "desktop_closed" => Ok(SandboxEventKind::DesktopClosed),
+        "desktop_expired" => Ok(SandboxEventKind::DesktopExpired),
         _ => Err(ApiError::internal("database contains invalid event kind")),
     }
 }

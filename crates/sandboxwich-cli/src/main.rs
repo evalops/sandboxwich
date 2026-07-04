@@ -1,11 +1,14 @@
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use sandboxwich_core::{
-    CommandListResponse, CommandRequest, CommandResponse, CreateSandboxRequest,
-    CreateSnapshotRequest, EventListResponse, GuestHealthResponse, GuestStatus, JobListResponse,
+    CommandListResponse, CommandRequest, CommandResponse, CreateDesktopSessionRequest,
+    CreateSandboxRequest, CreateSnapshotRequest, DesktopAccessMode, DesktopAccessRequest,
+    DesktopAccessResponse, DesktopSessionListResponse, DesktopSessionResponse,
+    DesktopSessionStatus, EventListResponse, GuestHealthResponse, GuestStatus, JobListResponse,
     RequestSshKeyRequest, SandboxListResponse, SandboxResponse, SnapshotCleanupResponse,
     SnapshotListResponse, SnapshotResponse, SshKeyListResponse, SshKeyResponse, SshKeyStatus,
-    UpdateGuestHealthRequest, UpdateSshKeyStatusRequest, WorkerListResponse,
+    UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest,
+    WorkerListResponse,
 };
 use uuid::Uuid;
 
@@ -32,6 +35,11 @@ enum Command {
     Snapshots { sandbox_id: Uuid },
     Snapshot { snapshot_id: Uuid },
     CleanupSnapshots,
+    CreateDesktop(CreateDesktopArgs),
+    Desktops { sandbox_id: Uuid },
+    Desktop { desktop_session_id: Uuid },
+    SetDesktopStatus(SetDesktopStatusArgs),
+    DesktopAccess(DesktopAccessArgs),
     Exec(ExecArgs),
     Commands { sandbox_id: Uuid },
     Command { command_id: Uuid },
@@ -74,6 +82,54 @@ struct CreateSnapshotArgs {
 
     #[arg(long)]
     label: Option<String>,
+
+    #[arg(long)]
+    ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+struct CreateDesktopArgs {
+    sandbox_id: Uuid,
+
+    #[arg(long)]
+    broker: Option<String>,
+
+    #[arg(long)]
+    broker_url: Option<String>,
+
+    #[arg(long, value_enum)]
+    access_mode: Option<DesktopAccessModeArg>,
+
+    #[arg(long)]
+    ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+struct SetDesktopStatusArgs {
+    desktop_session_id: Uuid,
+
+    #[arg(long, value_enum)]
+    status: DesktopSessionStatusArg,
+
+    #[arg(long)]
+    broker: Option<String>,
+
+    #[arg(long)]
+    broker_url: Option<String>,
+
+    #[arg(long, value_enum)]
+    access_mode: Option<DesktopAccessModeArg>,
+
+    #[arg(long)]
+    ttl_seconds: Option<u64>,
+
+    #[arg(long)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct DesktopAccessArgs {
+    desktop_session_id: Uuid,
 
     #[arg(long)]
     ttl_seconds: Option<u64>,
@@ -138,6 +194,22 @@ enum SshKeyStatusArg {
     Applied,
     Failed,
     Revoked,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum DesktopAccessModeArg {
+    Browser,
+    Vnc,
+    Rdp,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum DesktopSessionStatusArg {
+    Pending,
+    Ready,
+    Failed,
+    Closed,
+    Expired,
 }
 
 #[tokio::main]
@@ -229,6 +301,69 @@ async fn main() -> anyhow::Result<()> {
                 .send()
                 .await?;
             print_json::<SnapshotCleanupResponse>(response).await?;
+        }
+        Command::CreateDesktop(args) => {
+            let response = client
+                .post(format!(
+                    "{api}/sandboxes/{}/desktop-sessions",
+                    args.sandbox_id
+                ))
+                .json(&CreateDesktopSessionRequest {
+                    broker: args.broker,
+                    broker_url: args.broker_url,
+                    access_mode: args.access_mode.map(Into::into),
+                    connection_metadata: None,
+                    ttl_seconds: args.ttl_seconds,
+                })
+                .send()
+                .await?;
+            print_json::<DesktopSessionResponse>(response).await?;
+        }
+        Command::Desktops { sandbox_id } => {
+            let response = client
+                .get(format!("{api}/sandboxes/{sandbox_id}/desktop"))
+                .send()
+                .await?;
+            print_json::<DesktopSessionListResponse>(response).await?;
+        }
+        Command::Desktop { desktop_session_id } => {
+            let response = client
+                .get(format!("{api}/desktop-sessions/{desktop_session_id}"))
+                .send()
+                .await?;
+            print_json::<DesktopSessionResponse>(response).await?;
+        }
+        Command::SetDesktopStatus(args) => {
+            let response = client
+                .post(format!(
+                    "{api}/desktop-sessions/{}/status",
+                    args.desktop_session_id
+                ))
+                .json(&UpdateDesktopSessionRequest {
+                    status: args.status.into(),
+                    broker: args.broker,
+                    broker_url: args.broker_url,
+                    access_mode: args.access_mode.map(Into::into),
+                    connection_metadata: None,
+                    ttl_seconds: args.ttl_seconds,
+                    error: args.error,
+                })
+                .send()
+                .await?;
+            print_json::<DesktopSessionResponse>(response).await?;
+        }
+        Command::DesktopAccess(args) => {
+            let response = client
+                .post(format!(
+                    "{api}/desktop-sessions/{}/access",
+                    args.desktop_session_id
+                ))
+                .json(&DesktopAccessRequest {
+                    ttl_seconds: args.ttl_seconds,
+                })
+                .send()
+                .await?;
+            print_json::<DesktopAccessResponse>(response).await?;
         }
         Command::Exec(args) => {
             let response = client
@@ -344,6 +479,28 @@ impl From<SshKeyStatusArg> for SshKeyStatus {
             SshKeyStatusArg::Applied => Self::Applied,
             SshKeyStatusArg::Failed => Self::Failed,
             SshKeyStatusArg::Revoked => Self::Revoked,
+        }
+    }
+}
+
+impl From<DesktopAccessModeArg> for DesktopAccessMode {
+    fn from(value: DesktopAccessModeArg) -> Self {
+        match value {
+            DesktopAccessModeArg::Browser => Self::Browser,
+            DesktopAccessModeArg::Vnc => Self::Vnc,
+            DesktopAccessModeArg::Rdp => Self::Rdp,
+        }
+    }
+}
+
+impl From<DesktopSessionStatusArg> for DesktopSessionStatus {
+    fn from(value: DesktopSessionStatusArg) -> Self {
+        match value {
+            DesktopSessionStatusArg::Pending => Self::Pending,
+            DesktopSessionStatusArg::Ready => Self::Ready,
+            DesktopSessionStatusArg::Failed => Self::Failed,
+            DesktopSessionStatusArg::Closed => Self::Closed,
+            DesktopSessionStatusArg::Expired => Self::Expired,
         }
     }
 }

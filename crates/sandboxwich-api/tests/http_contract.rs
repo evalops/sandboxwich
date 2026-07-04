@@ -7,13 +7,15 @@ use std::{
 use reqwest::StatusCode;
 use sandboxwich_core::{
     ClaimLeaseRequest, ClaimLeaseResponse, CommandListResponse, CommandRequest, CommandResponse,
-    CommandStatus, CompleteLeaseRequest, CreateSandboxRequest, CreateSnapshotRequest,
-    EventListResponse, FailLeaseRequest, GuestHealthResponse, GuestStatus, HealthResponse, Job,
-    JobListResponse, JobStatus, LeaseResponse, RegisterWorkerRequest, RequestSshKeyRequest,
-    SandboxEventKind, SandboxListResponse, SandboxResponse, SandboxState, SnapshotCleanupResponse,
+    CommandStatus, CompleteLeaseRequest, CreateDesktopSessionRequest, CreateSandboxRequest,
+    CreateSnapshotRequest, DesktopAccessMode, DesktopAccessRequest, DesktopAccessResponse,
+    DesktopSessionListResponse, DesktopSessionResponse, DesktopSessionStatus, EventListResponse,
+    FailLeaseRequest, GuestHealthResponse, GuestStatus, HealthResponse, Job, JobListResponse,
+    JobStatus, LeaseResponse, RegisterWorkerRequest, RequestSshKeyRequest, SandboxEventKind,
+    SandboxListResponse, SandboxResponse, SandboxState, SnapshotCleanupResponse,
     SnapshotListResponse, SnapshotResponse, SnapshotStatus, SshKeyListResponse, SshKeyResponse,
-    SshKeyStatus, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest, WorkerCapability,
-    WorkerHeartbeatRequest, WorkerListResponse, WorkerResponse,
+    SshKeyStatus, UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest,
+    WorkerCapability, WorkerHeartbeatRequest, WorkerListResponse, WorkerResponse,
 };
 use sqlx::any::AnyPoolOptions;
 use tempfile::TempDir;
@@ -300,6 +302,7 @@ async fn run_contract(server: TestServer) {
 
     assert_retryable_failure_requeues_command(&client, &server, &created, &worker).await;
     assert_expired_lease_requeues_command(&client, &server, &created, &worker).await;
+    assert_desktop_session_lifecycle(&client, &server, &created).await;
     assert_snapshot_fork_and_cleanup_lifecycle(&client, &server, &created).await;
 
     let stopped: SandboxResponse = client
@@ -655,6 +658,230 @@ async fn assert_expired_lease_requeues_command(
     assert_eq!(fetched.command.status, CommandStatus::Queued);
 }
 
+async fn assert_desktop_session_lifecycle(
+    client: &reqwest::Client,
+    server: &TestServer,
+    sandbox: &SandboxResponse,
+) {
+    let rejected_secret_url = client
+        .post(format!(
+            "{}/sandboxes/{}/desktop-sessions",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&CreateDesktopSessionRequest {
+            broker: Some("k3s-broker".to_string()),
+            broker_url: Some("https://broker.example.test/connect?token=secret".to_string()),
+            access_mode: Some(DesktopAccessMode::Browser),
+            connection_metadata: None,
+            ttl_seconds: Some(300),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected_secret_url.status(), StatusCode::BAD_REQUEST);
+
+    let desktop: DesktopSessionResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/desktop-sessions",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&CreateDesktopSessionRequest {
+            broker: Some("k3s-broker".to_string()),
+            broker_url: Some("https://broker.example.test".to_string()),
+            access_mode: Some(DesktopAccessMode::Browser),
+            connection_metadata: Some(serde_json::json!({
+                "cluster": "k3s-dev",
+                "namespace": "sandboxwich-contract",
+                "service": "novnc"
+            })),
+            ttl_seconds: Some(600),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        desktop.desktop_session.status,
+        DesktopSessionStatus::Pending
+    );
+    assert_eq!(desktop.desktop_session.sandbox_id, sandbox.sandbox.id);
+
+    let discovery: DesktopSessionListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/desktop",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(discovery.desktop_sessions.iter().any(|seen| {
+        seen.id == desktop.desktop_session.id && seen.status == DesktopSessionStatus::Pending
+    }));
+    assert_no_access_url(&serde_json::to_value(&discovery).unwrap());
+
+    let not_ready = client
+        .post(format!(
+            "{}/desktop-sessions/{}/access",
+            server.base_url, desktop.desktop_session.id
+        ))
+        .json(&DesktopAccessRequest {
+            ttl_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(not_ready.status(), StatusCode::BAD_REQUEST);
+
+    let ready: DesktopSessionResponse = client
+        .post(format!(
+            "{}/desktop-sessions/{}/status",
+            server.base_url, desktop.desktop_session.id
+        ))
+        .json(&UpdateDesktopSessionRequest {
+            status: DesktopSessionStatus::Ready,
+            broker: None,
+            broker_url: None,
+            access_mode: None,
+            connection_metadata: Some(serde_json::json!({
+                "cluster": "k3s-dev",
+                "namespace": "sandboxwich-contract",
+                "service": "novnc",
+                "pod": "desktop-a"
+            })),
+            ttl_seconds: Some(600),
+            error: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ready.desktop_session.status, DesktopSessionStatus::Ready);
+
+    let fetched: DesktopSessionResponse = client
+        .get(format!(
+            "{}/desktop-sessions/{}",
+            server.base_url, desktop.desktop_session.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(fetched.desktop_session.id, desktop.desktop_session.id);
+    assert_no_access_url(&serde_json::to_value(&fetched).unwrap());
+
+    let access: DesktopAccessResponse = client
+        .post(format!(
+            "{}/desktop-sessions/{}/access",
+            server.base_url, desktop.desktop_session.id
+        ))
+        .json(&DesktopAccessRequest {
+            ttl_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(access.access.session_id, desktop.desktop_session.id);
+    assert_eq!(access.access.access_mode, DesktopAccessMode::Browser);
+    assert!(
+        access
+            .access
+            .access_url
+            .starts_with("https://broker.example.test/sessions/")
+    );
+
+    let events: EventListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/events",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(events.events.iter().any(|event| {
+        event.kind == SandboxEventKind::DesktopRequested
+            && event
+                .data
+                .get("desktopSessionId")
+                .and_then(|value| value.as_str())
+                == Some(&desktop.desktop_session.id.to_string())
+    }));
+    assert!(events.events.iter().any(|event| {
+        event.kind == SandboxEventKind::DesktopReady
+            && event
+                .data
+                .get("desktopSessionId")
+                .and_then(|value| value.as_str())
+                == Some(&desktop.desktop_session.id.to_string())
+    }));
+    for event in &events.events {
+        assert_no_access_url(&event.data);
+    }
+
+    let expiring: DesktopSessionResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/desktop-sessions",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&CreateDesktopSessionRequest {
+            broker: Some("k3s-broker".to_string()),
+            broker_url: None,
+            access_mode: Some(DesktopAccessMode::Vnc),
+            connection_metadata: None,
+            ttl_seconds: Some(0),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let discovered: DesktopSessionListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/desktop-sessions",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(discovered.desktop_sessions.iter().any(|seen| {
+        seen.id == expiring.desktop_session.id && seen.status == DesktopSessionStatus::Expired
+    }));
+}
+
 async fn assert_snapshot_fork_and_cleanup_lifecycle(
     client: &reqwest::Client,
     server: &TestServer,
@@ -969,6 +1196,26 @@ fn job_for_child_sandbox(jobs: &[Job], child_sandbox_id: &str) -> Job {
         .expect("expected fork job")
 }
 
+fn assert_no_access_url(value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            assert!(
+                !map.contains_key("access_url") && !map.contains_key("accessUrl"),
+                "secret-bearing access URL leaked into durable metadata: {value}"
+            );
+            for value in map.values() {
+                assert_no_access_url(value);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                assert_no_access_url(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl TestServer {
     async fn start(database_url: String, data_dir: Option<TempDir>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1018,6 +1265,8 @@ async fn assert_database_rejects_invalid_typed_values(database_url: &str, sandbo
 
     let invalid_sandbox_id = Uuid::now_v7().to_string();
     let invalid_snapshot_id = Uuid::now_v7().to_string();
+    let invalid_desktop_status_id = Uuid::now_v7().to_string();
+    let invalid_desktop_access_mode_id = Uuid::now_v7().to_string();
     let invalid_command_id = Uuid::now_v7().to_string();
     let invalid_event_id = Uuid::now_v7().to_string();
     let now = "2026-07-04T00:00:00Z";
@@ -1072,6 +1321,44 @@ async fn assert_database_rejects_invalid_typed_values(database_url: &str, sandbo
     assert!(
         snapshot_result.is_err(),
         "invalid snapshot status was accepted"
+    );
+
+    let desktop_status_result = sqlx::query(&insert_desktop_session_sql(database_url))
+        .bind(invalid_desktop_status_id)
+        .bind(sandbox_id)
+        .bind("not_real")
+        .bind("k3s-broker")
+        .bind(Option::<String>::None)
+        .bind("browser")
+        .bind("{}")
+        .bind(now)
+        .bind(now)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await;
+    assert!(
+        desktop_status_result.is_err(),
+        "invalid desktop session status was accepted"
+    );
+
+    let desktop_access_mode_result = sqlx::query(&insert_desktop_session_sql(database_url))
+        .bind(invalid_desktop_access_mode_id)
+        .bind(sandbox_id)
+        .bind("ready")
+        .bind("k3s-broker")
+        .bind(Option::<String>::None)
+        .bind("not_real")
+        .bind("{}")
+        .bind(now)
+        .bind(now)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await;
+    assert!(
+        desktop_access_mode_result.is_err(),
+        "invalid desktop access mode was accepted"
     );
 
     let event_result = sqlx::query(&insert_event_sql(database_url))
@@ -1153,6 +1440,16 @@ fn insert_snapshot_sql(database_url: &str) -> String {
          (id, sandbox_id, status, label, inventory, provider_metadata, created_at, ready_at, expires_at, error)
          values ({})",
         placeholders(database_url, 10)
+    )
+}
+
+fn insert_desktop_session_sql(database_url: &str) -> String {
+    format!(
+        "insert into desktop_sessions
+         (id, sandbox_id, status, broker, broker_url, access_mode, connection_metadata,
+          created_at, updated_at, expires_at, error)
+         values ({})",
+        placeholders(database_url, 11)
     )
 }
 

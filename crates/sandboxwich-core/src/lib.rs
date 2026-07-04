@@ -180,6 +180,28 @@ impl fmt::Display for SshKeyId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DesktopSessionId(pub Uuid);
+
+impl DesktopSessionId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for DesktopSessionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for DesktopSessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxState {
@@ -200,6 +222,24 @@ pub enum SnapshotStatus {
     Ready,
     Failed,
     Expired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopSessionStatus {
+    Pending,
+    Ready,
+    Failed,
+    Closed,
+    Expired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopAccessMode {
+    Browser,
+    Vnc,
+    Rdp,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -275,6 +315,75 @@ pub struct SnapshotCleanupResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DesktopSession {
+    pub id: DesktopSessionId,
+    pub sandbox_id: SandboxId,
+    pub status: DesktopSessionStatus,
+    pub broker: String,
+    pub broker_url: Option<String>,
+    pub access_mode: DesktopAccessMode,
+    pub connection_metadata: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CreateDesktopSessionRequest {
+    pub broker: Option<String>,
+    pub broker_url: Option<String>,
+    pub access_mode: Option<DesktopAccessMode>,
+    pub connection_metadata: Option<serde_json::Value>,
+    pub ttl_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UpdateDesktopSessionRequest {
+    pub status: DesktopSessionStatus,
+    pub broker: Option<String>,
+    pub broker_url: Option<String>,
+    pub access_mode: Option<DesktopAccessMode>,
+    pub connection_metadata: Option<serde_json::Value>,
+    pub ttl_seconds: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DesktopAccessRequest {
+    pub ttl_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DesktopAccess {
+    pub session_id: DesktopSessionId,
+    pub sandbox_id: SandboxId,
+    pub broker: String,
+    pub access_mode: DesktopAccessMode,
+    pub access_url: String,
+    pub expires_at: DateTime<Utc>,
+    pub connection_metadata: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DesktopSessionResponse {
+    pub ok: bool,
+    pub desktop_session: DesktopSession,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DesktopSessionListResponse {
+    pub ok: bool,
+    pub desktop_sessions: Vec<DesktopSession>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DesktopAccessResponse {
+    pub ok: bool,
+    pub access: DesktopAccess,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CommandRequest {
     pub argv: Vec<String>,
     pub cwd: Option<String>,
@@ -341,7 +450,11 @@ pub enum SandboxEventKind {
     CommandFinished,
     PromptQueued,
     PromptFinished,
+    DesktopRequested,
     DesktopReady,
+    DesktopFailed,
+    DesktopClosed,
+    DesktopExpired,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
