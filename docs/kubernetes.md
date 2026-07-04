@@ -39,10 +39,38 @@ sandboxwich-worker provider-health \
 
 sandboxwich-worker provider-smoke \
   --cluster k3s-dev \
-  --namespace sandboxwich
+  --namespace sandboxwich \
+  --ssh-authorized-keys-secret sandboxwich-authorized-keys
 ```
 
 Use the dry-run output to validate control-plane wiring before granting a worker ServiceAccount any Kubernetes permissions. The smoke output includes Pod, PVC, Service, and VolumeSnapshot-shaped manifests under provider metadata, but the worker does not apply them.
+
+## Guest Runtime Image
+
+The starter guest runtime lives in `deploy/runtime/ubuntu-dev/`. It is an Ubuntu image contract for sandbox Pods:
+
+- SSH daemon on port `22`.
+- noVNC desktop bridge on port `6080`.
+- Persistent workspace mounted at `/workspace`.
+- Optional authorized keys file mounted from a caller-owned Secret.
+- Development tooling installed from package repositories, including Git, Rust, Node/npm, GitHub CLI, Docker CLI/daemon packages, Python, tmux, and shell utilities.
+- Docker daemon startup is opt-in with `SANDBOXWICH_DOCKERD=1` because most clusters require explicit runtime policy for that.
+
+Build it locally or in your own registry pipeline:
+
+```sh
+docker build -t ghcr.io/evalops/sandboxwich-ubuntu-dev:latest \
+  deploy/runtime/ubuntu-dev
+```
+
+Do not bake user keys into the image. Create the key Secret outside git:
+
+```sh
+kubectl -n sandboxwich create secret generic sandboxwich-authorized-keys \
+  --from-file=authorized_keys=$HOME/.ssh/authorized_keys
+```
+
+The provider manifest only references the Secret by name. It expects the key `authorized_keys` and mounts it read-only at `/run/sandboxwich/ssh/authorized_keys`.
 
 ## Guarded Provider Apply
 
@@ -53,7 +81,8 @@ sandboxwich-worker provider-apply-plan \
   --cluster k3s-dev \
   --namespace sandboxwich \
   --storage-class local-path \
-  --snapshot-class local-path-snapshot
+  --snapshot-class local-path-snapshot \
+  --ssh-authorized-keys-secret sandboxwich-authorized-keys
 ```
 
 Applying is guarded by two switches:
@@ -64,10 +93,11 @@ SANDBOXWICH_K8S_ENABLE_MUTATION=1 sandboxwich-worker provider-apply-smoke \
   --namespace sandboxwich \
   --storage-class local-path \
   --snapshot-class local-path-snapshot \
+  --ssh-authorized-keys-secret sandboxwich-authorized-keys \
   --confirm-apply
 ```
 
-By default the smoke command deletes the resources it created with `kubectl delete --ignore-not-found -f -`. Use `--keep-resources` only when debugging a disposable namespace. Do not run the apply smoke against production-like namespaces. Grant the worker only namespace-scoped permissions for Pods, PVCs, Services, and VolumeSnapshots.
+By default the smoke command deletes the resources it created with `kubectl delete --ignore-not-found -f -`. Use `--keep-resources` only when debugging a disposable namespace. Do not run the apply smoke against production-like namespaces. Grant the worker only namespace-scoped permissions for Pods, PVCs, Services, and VolumeSnapshots. Secret creation should stay in your existing secret-management path.
 
 ## Apply The API Manifests
 
