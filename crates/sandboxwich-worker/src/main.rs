@@ -179,6 +179,9 @@ struct ProviderArgs {
     #[arg(long)]
     snapshot_class: Option<String>,
 
+    #[arg(long, env = "SANDBOXWICH_RUNTIME_IMAGE")]
+    runtime_image: Option<String>,
+
     #[arg(long)]
     ssh_authorized_keys_secret: Option<String>,
 }
@@ -424,6 +427,7 @@ fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
         non_empty(args.storage_class),
         non_empty(args.snapshot_class),
     )
+    .with_runtime_image(non_empty(args.runtime_image))
     .with_ssh_authorized_keys_secret(non_empty(args.ssh_authorized_keys_secret))
 }
 
