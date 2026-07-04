@@ -6,7 +6,7 @@ The name is dumb on purpose. The contracts should not be.
 
 ## What exists now
 
-- `sandboxwich-api`: HTTP control plane backed by a local SQLite database by default.
+- `sandboxwich-api`: HTTP control plane backed by SQLite for local dev or Postgres for shared deployments.
 - `sandboxwich-cli`: CLI for creating, listing, stopping, resuming, forking, running commands, and reading events.
 - `sandboxwich-core`: shared typed request/response/event contracts.
 - `sandboxwich-worker`: host-side worker placeholder.
@@ -31,7 +31,7 @@ cargo run -p sandboxwich-cli -- events <sandbox-id>
 
 By default the CLI talks to `http://127.0.0.1:3217`. Override it with `SANDBOXWICH_API`.
 
-By default the API writes to `sqlite://sandboxwich.db`. Override it with `SANDBOXWICH_DATABASE_URL`.
+By default the API writes to `sqlite://sandboxwich.db`. Override it with `SANDBOXWICH_DATABASE_URL`, for example `postgres://sandboxwich:secret@localhost:5432/sandboxwich`.
 
 ## Design principles
 
@@ -43,9 +43,9 @@ By default the API writes to `sqlite://sandboxwich.db`. Override it with `SANDBO
 
 ## Roadmap
 
-1. Persist state in Postgres.
-2. Add a real worker lease queue.
-3. Add SSH key injection and command streaming.
-4. Add disk snapshot/fork support.
-5. Add a desktop stream broker.
-6. Add provider adapters for VM and microVM backends.
+1. Durable control-plane storage with SQLite for dev and Postgres for deployments.
+2. Worker leases and host registration.
+3. SSH key injection and command streaming.
+4. Snapshot inventory and fork planning.
+5. Desktop stream broker.
+6. Provider adapters for VM and microVM backends.
