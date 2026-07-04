@@ -38,6 +38,7 @@ enum Command {
     Renew(RenewArgs),
     Complete(CompleteArgs),
     Fail(FailArgs),
+    Run(RunArgs),
     WorkOnce(WorkOnceArgs),
     WorkLoop(WorkLoopArgs),
 }
@@ -55,6 +56,33 @@ struct RegisterArgs {
 
     #[arg(long = "label", value_parser = parse_label)]
     label: Vec<(String, String)>,
+}
+
+#[derive(Debug, Args)]
+struct RunArgs {
+    #[arg(long)]
+    name: String,
+
+    #[arg(long = "provider", default_value = "kubernetes")]
+    worker_provider: String,
+
+    #[arg(long = "capability", value_enum)]
+    capability: Vec<CapabilityArg>,
+
+    #[arg(long = "label", value_parser = parse_label)]
+    label: Vec<(String, String)>,
+
+    #[arg(long)]
+    lease_seconds: Option<u64>,
+
+    #[arg(long, default_value_t = 1000)]
+    idle_sleep_ms: u64,
+
+    #[arg(long)]
+    max_iterations: Option<u64>,
+
+    #[command(flatten)]
+    provider: ProviderArgs,
 }
 
 #[derive(Debug, Args)]
@@ -96,6 +124,9 @@ struct WorkLoopArgs {
 
     #[arg(long)]
     max_iterations: Option<u64>,
+
+    #[arg(long = "label", value_parser = parse_label)]
+    label: Vec<(String, String)>,
 
     #[command(flatten)]
     provider: ProviderArgs,
@@ -268,29 +299,16 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&outcome)?);
         }
         Command::Register(args) => {
-            let capabilities = if args.capability.is_empty() {
-                vec![
-                    WorkerCapability::K8sPod,
-                    WorkerCapability::ProvisionSandbox,
-                    WorkerCapability::RunCommand,
-                    WorkerCapability::AgentPrompt,
-                    WorkerCapability::Snapshot,
-                    WorkerCapability::DesktopStream,
-                ]
-            } else {
-                args.capability.into_iter().map(to_capability).collect()
-            };
-            let response = client
-                .post(format!("{api}/workers/register"))
-                .json(&RegisterWorkerRequest {
-                    name: args.name,
-                    provider: args.provider,
-                    capabilities,
-                    labels: args.label.into_iter().collect(),
-                })
-                .send()
-                .await?;
-            print_json::<WorkerResponse>(response).await?;
+            let response = register_worker(
+                &client,
+                &api,
+                args.name,
+                args.provider,
+                capabilities_from_args(args.capability),
+                args.label.into_iter().collect(),
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
         }
         Command::Heartbeat(args) => {
             let response = client
@@ -341,6 +359,38 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             print_json::<LeaseResponse>(response).await?;
         }
+        Command::Run(args) => {
+            let labels: BTreeMap<_, _> = args.label.into_iter().collect();
+            let response = register_worker(
+                &client,
+                &api,
+                args.name,
+                args.worker_provider,
+                capabilities_from_args(args.capability),
+                labels.clone(),
+            )
+            .await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "registered": response.worker
+                }))?
+            );
+            work_loop(
+                &client,
+                &api,
+                WorkLoopArgs {
+                    worker_id: response.worker.id.0,
+                    lease_seconds: args.lease_seconds,
+                    idle_sleep_ms: args.idle_sleep_ms,
+                    max_iterations: args.max_iterations,
+                    label: labels.into_iter().collect(),
+                    provider: args.provider,
+                },
+            )
+            .await?;
+        }
         Command::WorkOnce(args) => {
             let provider = provider_from_args(args.provider);
             let response = claim(
@@ -371,10 +421,10 @@ fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
     KubernetesDryRunProvider::with_snapshot_class(
         args.cluster,
         args.namespace,
-        args.storage_class,
-        args.snapshot_class,
+        non_empty(args.storage_class),
+        non_empty(args.snapshot_class),
     )
-    .with_ssh_authorized_keys_secret(args.ssh_authorized_keys_secret)
+    .with_ssh_authorized_keys_secret(non_empty(args.ssh_authorized_keys_secret))
 }
 
 fn apply_provider_from_args(args: ProviderApplyArgs) -> KubernetesApplyProvider {
@@ -396,8 +446,44 @@ async fn claim(
     decode_json::<ClaimLeaseResponse>(response).await
 }
 
+async fn register_worker(
+    client: &reqwest::Client,
+    api: &str,
+    name: String,
+    provider: String,
+    capabilities: Vec<WorkerCapability>,
+    labels: BTreeMap<String, String>,
+) -> anyhow::Result<WorkerResponse> {
+    let response = client
+        .post(format!("{api}/workers/register"))
+        .json(&RegisterWorkerRequest {
+            name,
+            provider,
+            capabilities,
+            labels,
+        })
+        .send()
+        .await?;
+    decode_json::<WorkerResponse>(response).await
+}
+
+async fn heartbeat_worker(
+    client: &reqwest::Client,
+    api: &str,
+    worker_id: Uuid,
+    labels: BTreeMap<String, String>,
+) -> anyhow::Result<WorkerResponse> {
+    let response = client
+        .post(format!("{api}/workers/{worker_id}/heartbeat"))
+        .json(&WorkerHeartbeatRequest { labels })
+        .send()
+        .await?;
+    decode_json::<WorkerResponse>(response).await
+}
+
 async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> anyhow::Result<()> {
     let provider = provider_from_args(args.provider);
+    let labels: BTreeMap<_, _> = args.label.into_iter().collect();
     let mut iterations = 0_u64;
 
     loop {
@@ -409,6 +495,7 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
             break;
         }
         iterations += 1;
+        heartbeat_worker(client, api, args.worker_id, labels.clone()).await?;
 
         let response = claim(
             client,
@@ -655,6 +742,31 @@ fn uuid_from_payload(payload: &serde_json::Value, field: &'static str) -> anyhow
         .with_context(|| format!("job payload {field} is invalid"))
 }
 
+fn capabilities_from_args(capabilities: Vec<CapabilityArg>) -> Vec<WorkerCapability> {
+    if capabilities.is_empty() {
+        vec![
+            WorkerCapability::K8sPod,
+            WorkerCapability::ProvisionSandbox,
+            WorkerCapability::RunCommand,
+            WorkerCapability::AgentPrompt,
+            WorkerCapability::Snapshot,
+            WorkerCapability::DesktopStream,
+        ]
+    } else {
+        capabilities.into_iter().map(to_capability).collect()
+    }
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        if value.trim().is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    })
+}
+
 async fn print_json<T>(response: reqwest::Response) -> anyhow::Result<()>
 where
     T: serde::de::DeserializeOwned + serde::Serialize,
@@ -841,5 +953,26 @@ mod tests {
         .expect_err("missing sandboxId should fail");
 
         assert!(error.to_string().contains("sandboxId"));
+    }
+
+    #[test]
+    fn default_registration_capabilities_cover_supported_worker_jobs() {
+        let capabilities = capabilities_from_args(Vec::new());
+
+        assert!(capabilities.contains(&WorkerCapability::ProvisionSandbox));
+        assert!(capabilities.contains(&WorkerCapability::RunCommand));
+        assert!(capabilities.contains(&WorkerCapability::AgentPrompt));
+        assert!(capabilities.contains(&WorkerCapability::Snapshot));
+        assert!(capabilities.contains(&WorkerCapability::K8sPod));
+    }
+
+    #[test]
+    fn empty_provider_options_are_normalized_to_absent() {
+        assert_eq!(non_empty(None), None);
+        assert_eq!(non_empty(Some("   ".to_string())), None);
+        assert_eq!(
+            non_empty(Some("local-path".to_string())),
+            Some("local-path".to_string())
+        );
     }
 }

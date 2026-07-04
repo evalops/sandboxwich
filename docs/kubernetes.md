@@ -26,6 +26,12 @@ sandboxwich-worker --api http://sandboxwich-api:3217 heartbeat <worker-id> \
 Workers can process one lease or run continuously:
 
 ```sh
+sandboxwich-worker --api http://sandboxwich-api:3217 run \
+  --name k3s-worker-a \
+  --cluster k3s-dev \
+  --namespace sandboxwich \
+  --label cluster=k3s-dev
+
 sandboxwich-worker --api http://sandboxwich-api:3217 work-once <worker-id> \
   --cluster k3s-dev \
   --namespace sandboxwich
@@ -36,7 +42,7 @@ sandboxwich-worker --api http://sandboxwich-api:3217 work-loop <worker-id> \
   --idle-sleep-ms 1000
 ```
 
-Use `--max-iterations` for CI or non-production smoke runs. The worker dispatches by typed `JobKind` contracts and reports every lease through the API; it does not infer behavior from user-visible text.
+Use `run` in Kubernetes Deployments so the worker registers itself before entering the loop. Use `--max-iterations` for CI or non-production smoke runs. The worker dispatches by typed `JobKind` contracts and reports every lease through the API; it does not infer behavior from user-visible text.
 
 ## Provider Adapter Dry Run
 
@@ -112,7 +118,7 @@ SANDBOXWICH_K8S_ENABLE_MUTATION=1 sandboxwich-worker provider-apply-smoke \
   --confirm-apply
 ```
 
-By default the smoke command deletes the resources it created with `kubectl delete --ignore-not-found -f -`. Use `--keep-resources` only when debugging a disposable namespace. Do not run the apply smoke against production-like namespaces. Grant the worker only namespace-scoped permissions for Pods, PVCs, Services, and VolumeSnapshots. Secret creation should stay in your existing secret-management path.
+By default the smoke command deletes the resources it created with `kubectl delete --ignore-not-found -f -`. Use `--keep-resources` only when debugging a disposable namespace. Do not run the apply smoke against production-like namespaces. Grant the worker only namespace-scoped permissions for Pods, PVCs, Services, and VolumeSnapshots. `deploy/kubernetes/worker.yaml` includes a ServiceAccount, Role, RoleBinding, and worker Deployment example. Secret creation should stay in your existing secret-management path.
 
 ## Apply The API Manifests
 

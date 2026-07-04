@@ -1,0 +1,105 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sandboxwich-worker
+  namespace: sandboxwich
+  labels:
+    app.kubernetes.io/name: sandboxwich-worker
+    app.kubernetes.io/part-of: sandboxwich
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sandboxwich-worker
+  namespace: sandboxwich
+  labels:
+    app.kubernetes.io/name: sandboxwich-worker
+    app.kubernetes.io/part-of: sandboxwich
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "pods/exec", "services", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sandboxwich-worker
+  namespace: sandboxwich
+  labels:
+    app.kubernetes.io/name: sandboxwich-worker
+    app.kubernetes.io/part-of: sandboxwich
+subjects:
+  - kind: ServiceAccount
+    name: sandboxwich-worker
+    namespace: sandboxwich
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sandboxwich-worker
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandboxwich-worker
+  namespace: sandboxwich
+  labels:
+    app.kubernetes.io/name: sandboxwich-worker
+    app.kubernetes.io/part-of: sandboxwich
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sandboxwich-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sandboxwich-worker
+        app.kubernetes.io/part-of: sandboxwich
+    spec:
+      serviceAccountName: sandboxwich-worker
+      containers:
+        - name: worker
+          image: ghcr.io/evalops/sandboxwich-worker:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SANDBOXWICH_API
+              value: http://sandboxwich-api:3217
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: SANDBOXWICH_CLUSTER
+              value: k3s-dev
+            - name: SANDBOXWICH_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SANDBOXWICH_STORAGE_CLASS
+              value: local-path
+            - name: SANDBOXWICH_SNAPSHOT_CLASS
+              value: ""
+            - name: SANDBOXWICH_SSH_AUTHORIZED_KEYS_SECRET
+              value: ""
+          command: ["/bin/sh", "-lc"]
+          args:
+            - >
+              sandboxwich-worker run
+              --name "$POD_NAME"
+              --provider kubernetes
+              --cluster "$SANDBOXWICH_CLUSTER"
+              --namespace "$SANDBOXWICH_NAMESPACE"
+              --storage-class "$SANDBOXWICH_STORAGE_CLASS"
+              --snapshot-class "$SANDBOXWICH_SNAPSHOT_CLASS"
+              --ssh-authorized-keys-secret "$SANDBOXWICH_SSH_AUTHORIZED_KEYS_SECRET"
+              --label cluster="$SANDBOXWICH_CLUSTER"
+              --label pod="$POD_NAME"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1
+              memory: 512Mi
