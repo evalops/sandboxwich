@@ -1,8 +1,11 @@
+mod provider;
+
 use std::{collections::BTreeMap, process::Command as ProcessCommand};
 
 use anyhow::{Context, bail};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use provider::{KubernetesDryRunProvider, SandboxProvider};
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse,
     CompleteLeaseRequest, FailLeaseRequest, JobKind, LeaseResponse, RegisterWorkerRequest,
@@ -25,6 +28,9 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Capabilities,
+    ProviderCapabilities(ProviderArgs),
+    ProviderHealth(ProviderArgs),
+    ProviderSmoke(ProviderArgs),
     Register(RegisterArgs),
     Heartbeat(HeartbeatArgs),
     Claim(ClaimArgs),
@@ -98,6 +104,18 @@ struct FailArgs {
     retry: bool,
 }
 
+#[derive(Debug, Args)]
+struct ProviderArgs {
+    #[arg(long, default_value = "k3s-dev")]
+    cluster: String,
+
+    #[arg(long, default_value = "sandboxwich")]
+    namespace: String,
+
+    #[arg(long)]
+    storage_class: Option<String>,
+}
+
 #[derive(Clone, Debug, ValueEnum)]
 enum CapabilityArg {
     ProvisionSandbox,
@@ -127,6 +145,46 @@ async fn main() -> anyhow::Result<()> {
                         "desktop_stream",
                         "k8s_pod"
                     ]
+                }))?
+            );
+        }
+        Command::ProviderCapabilities(args) => {
+            let provider = provider_from_args(args);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&provider.capability_report())?
+            );
+        }
+        Command::ProviderHealth(args) => {
+            let provider = provider_from_args(args);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&provider.health_report())?
+            );
+        }
+        Command::ProviderSmoke(args) => {
+            let provider = provider_from_args(args);
+            let sandbox_id = sandboxwich_core::SandboxId::new();
+            let child_sandbox_id = sandboxwich_core::SandboxId::new();
+            let snapshot_id = sandboxwich_core::SnapshotId::new();
+            let exec = provider.exec_handoff(
+                sandbox_id,
+                AgentCommandRequest {
+                    argv: vec!["echo".to_string(), "sandboxwich".to_string()],
+                    cwd: None,
+                    env: BTreeMap::new(),
+                },
+            );
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "provider": provider.capability_report(),
+                    "health": provider.health_report(),
+                    "provision": provider.provision(sandbox_id),
+                    "exec": exec,
+                    "snapshot": provider.create_snapshot(sandbox_id, snapshot_id),
+                    "fork": provider.fork(sandbox_id, child_sandbox_id, snapshot_id)
                 }))?
             );
         }
@@ -242,6 +300,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
+    KubernetesDryRunProvider::new(args.cluster, args.namespace, args.storage_class)
 }
 
 async fn claim(

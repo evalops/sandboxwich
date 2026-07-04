@@ -23,6 +23,27 @@ sandboxwich-worker --api http://sandboxwich-api:3217 heartbeat <worker-id> \
   --label node=k3s-node-1
 ```
 
+## Provider Adapter Dry Run
+
+The first provider adapter is a Kubernetes-shaped dry run. It reports the same typed capabilities and provider metadata that a k3s worker will use, but it does not call the Kubernetes API or mutate Pods, PVCs, VolumeSnapshots, Services, or Secrets.
+
+```sh
+sandboxwich-worker provider-capabilities \
+  --cluster k3s-dev \
+  --namespace sandboxwich \
+  --storage-class local-path
+
+sandboxwich-worker provider-health \
+  --cluster k3s-dev \
+  --namespace sandboxwich
+
+sandboxwich-worker provider-smoke \
+  --cluster k3s-dev \
+  --namespace sandboxwich
+```
+
+Use the dry-run output to validate control-plane wiring before granting a worker ServiceAccount any Kubernetes permissions.
+
 ## Apply The API Manifests
 
 The starter manifests in `deploy/kubernetes/` expect a Secret named `sandboxwich-secrets` with `database-url`.
@@ -39,7 +60,7 @@ Do not commit the real database URL. Use your existing secret-management path fo
 ## Next Kubernetes Work
 
 - Add a long-running worker lease loop.
-- Add a Kubernetes provider adapter that creates per-sandbox Pods or Jobs.
+- Turn the dry-run Kubernetes adapter into a real adapter that creates per-sandbox Pods or Jobs.
 - Add NetworkPolicy examples for sandbox egress control.
 - Add Helm or Kustomize overlays for k3s, staging, and production.
 - Add service accounts and RBAC once the provider adapter needs Kubernetes API access.

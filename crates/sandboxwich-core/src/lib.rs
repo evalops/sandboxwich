@@ -671,6 +671,55 @@ pub struct AgentHealthResponse {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ProviderHealthStatus {
+    Healthy,
+    Degraded,
+    Unhealthy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderCapabilityReport {
+    pub provider: String,
+    pub capabilities: Vec<WorkerCapability>,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderHealthReport {
+    pub provider: String,
+    pub status: ProviderHealthStatus,
+    pub checked_at: DateTime<Utc>,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderSandboxHandle {
+    pub provider: String,
+    pub sandbox_id: SandboxId,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderSnapshotHandle {
+    pub provider: String,
+    pub snapshot_id: SnapshotId,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderForkHandle {
+    pub provider: String,
+    pub parent_sandbox_id: SandboxId,
+    pub child_sandbox_id: SandboxId,
+    pub snapshot_id: SnapshotId,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GuestStatus {
     Pending,
     Ready,
