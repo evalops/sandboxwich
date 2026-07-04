@@ -1,8 +1,8 @@
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
 use sandboxwich_core::{
-    CommandRequest, CommandResponse, CreateSandboxRequest, EventListResponse, SandboxListResponse,
-    SandboxResponse,
+    CommandListResponse, CommandRequest, CommandResponse, CreateSandboxRequest, EventListResponse,
+    SandboxListResponse, SandboxResponse,
 };
 use uuid::Uuid;
 
@@ -26,6 +26,8 @@ enum Command {
     Resume { sandbox_id: Uuid },
     Fork(ForkArgs),
     Exec(ExecArgs),
+    Commands { sandbox_id: Uuid },
+    Command { command_id: Uuid },
     Events { sandbox_id: Uuid },
 }
 
@@ -124,6 +126,20 @@ async fn main() -> anyhow::Result<()> {
                     cwd: None,
                     env: Default::default(),
                 })
+                .send()
+                .await?;
+            print_json::<CommandResponse>(response).await?;
+        }
+        Command::Commands { sandbox_id } => {
+            let response = client
+                .get(format!("{api}/sandboxes/{sandbox_id}/commands"))
+                .send()
+                .await?;
+            print_json::<CommandListResponse>(response).await?;
+        }
+        Command::Command { command_id } => {
+            let response = client
+                .get(format!("{api}/commands/{command_id}"))
                 .send()
                 .await?;
             print_json::<CommandResponse>(response).await?;

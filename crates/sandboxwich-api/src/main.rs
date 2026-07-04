@@ -10,10 +10,10 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use sandboxwich_core::{
-    CommandId, CommandRequest, CommandResponse, CommandRun, CommandStatus, CreateSandboxRequest,
-    ErrorEnvelope, EventId, EventListResponse, HealthResponse, PromptQueuedResponse, PromptRequest,
-    Sandbox, SandboxEvent, SandboxEventKind, SandboxId, SandboxListResponse, SandboxResponse,
-    SandboxState, SnapshotId,
+    CommandId, CommandListResponse, CommandRequest, CommandResponse, CommandRun, CommandStatus,
+    CreateSandboxRequest, ErrorEnvelope, EventId, EventListResponse, HealthResponse,
+    PromptQueuedResponse, PromptRequest, Sandbox, SandboxEvent, SandboxEventKind, SandboxId,
+    SandboxListResponse, SandboxResponse, SandboxState, SnapshotId,
 };
 use serde_json::json;
 use sqlx::{
@@ -75,9 +75,13 @@ fn app(state: AppState) -> Router {
         .route("/sandboxes/{sandbox_id}/stop", post(stop_sandbox))
         .route("/sandboxes/{sandbox_id}/resume", post(resume_sandbox))
         .route("/sandboxes/{sandbox_id}/fork", post(fork_sandbox))
-        .route("/sandboxes/{sandbox_id}/commands", post(queue_command))
+        .route(
+            "/sandboxes/{sandbox_id}/commands",
+            get(list_commands).post(queue_command),
+        )
         .route("/sandboxes/{sandbox_id}/prompt", post(queue_prompt))
         .route("/sandboxes/{sandbox_id}/events", get(list_events))
+        .route("/commands/{command_id}", get(get_command))
         .with_state(state)
 }
 
@@ -272,6 +276,39 @@ async fn queue_command(
     Ok(Json(CommandResponse { ok: true, command }))
 }
 
+async fn list_commands(
+    State(state): State<AppState>,
+    Path(sandbox_id): Path<Uuid>,
+) -> Result<Json<CommandListResponse>, ApiError> {
+    let sandbox_id = SandboxId(sandbox_id);
+    fetch_sandbox(&state.pool, sandbox_id).await?;
+
+    let mut query = QueryBuilder::<Any>::new(
+        "select id, sandbox_id, status, argv, cwd, exit_code, stdout, stderr, created_at, finished_at
+         from commands
+         where sandbox_id = ",
+    );
+    query
+        .push_bind(sandbox_id.to_string())
+        .push(" order by created_at asc, id asc");
+
+    let rows = query.build().fetch_all(&state.pool).await?;
+    let commands = rows
+        .into_iter()
+        .map(row_to_command)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Json(CommandListResponse { ok: true, commands }))
+}
+
+async fn get_command(
+    State(state): State<AppState>,
+    Path(command_id): Path<Uuid>,
+) -> Result<Json<CommandResponse>, ApiError> {
+    let command = fetch_command(&state.pool, CommandId(command_id)).await?;
+    Ok(Json(CommandResponse { ok: true, command }))
+}
+
 async fn queue_prompt(
     State(state): State<AppState>,
     Path(sandbox_id): Path<Uuid>,
@@ -376,6 +413,22 @@ async fn fetch_sandbox(pool: &AnyPool, sandbox_id: SandboxId) -> Result<Sandbox,
         .ok_or_else(|| ApiError::not_found("sandbox not found"))?;
 
     row_to_sandbox(row)
+}
+
+async fn fetch_command(pool: &AnyPool, command_id: CommandId) -> Result<CommandRun, ApiError> {
+    let mut query = QueryBuilder::<Any>::new(
+        "select id, sandbox_id, status, argv, cwd, exit_code, stdout, stderr, created_at, finished_at
+         from commands
+         where id = ",
+    );
+    query.push_bind(command_id.0.to_string());
+    let row = query
+        .build()
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| ApiError::not_found("command not found"))?;
+
+    row_to_command(row)
 }
 
 async fn insert_sandbox(pool: &AnyPool, sandbox: &Sandbox) -> Result<(), ApiError> {
@@ -515,6 +568,28 @@ fn row_to_event(row: AnyRow) -> Result<SandboxEvent, ApiError> {
     })
 }
 
+fn row_to_command(row: AnyRow) -> Result<CommandRun, ApiError> {
+    let id: String = row.try_get("id")?;
+    let sandbox_id: String = row.try_get("sandbox_id")?;
+    let status: String = row.try_get("status")?;
+    let argv: String = row.try_get("argv")?;
+    let created_at: String = row.try_get("created_at")?;
+    let finished_at: Option<String> = row.try_get("finished_at")?;
+
+    Ok(CommandRun {
+        id: CommandId(parse_uuid(&id)?),
+        sandbox_id: SandboxId(parse_uuid(&sandbox_id)?),
+        status: parse_command_status(&status)?,
+        argv: serde_json::from_str(&argv)?,
+        cwd: row.try_get("cwd")?,
+        exit_code: row.try_get("exit_code")?,
+        stdout: row.try_get("stdout")?,
+        stderr: row.try_get("stderr")?,
+        created_at: parse_timestamp(&created_at)?,
+        finished_at: finished_at.map(|time| parse_timestamp(&time)).transpose()?,
+    })
+}
+
 fn parse_uuid(value: &str) -> Result<Uuid, ApiError> {
     Uuid::parse_str(value).map_err(|_| ApiError::internal("database contains invalid uuid"))
 }
@@ -558,6 +633,18 @@ fn command_status_to_str(status: &CommandStatus) -> &'static str {
         CommandStatus::Running => "running",
         CommandStatus::Finished => "finished",
         CommandStatus::Failed => "failed",
+    }
+}
+
+fn parse_command_status(value: &str) -> Result<CommandStatus, ApiError> {
+    match value {
+        "queued" => Ok(CommandStatus::Queued),
+        "running" => Ok(CommandStatus::Running),
+        "finished" => Ok(CommandStatus::Finished),
+        "failed" => Ok(CommandStatus::Failed),
+        _ => Err(ApiError::internal(
+            "database contains invalid command status",
+        )),
     }
 }
 

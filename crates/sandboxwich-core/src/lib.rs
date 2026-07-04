@@ -155,6 +155,12 @@ pub struct CommandResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CommandListResponse {
+    pub ok: bool,
+    pub commands: Vec<CommandRun>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PromptRequest {
     pub instructions: String,
     pub engine: Option<String>,
