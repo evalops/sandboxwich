@@ -1,0 +1,6 @@
+target/
+.git/
+.github/
+*.db
+*.sqlite
+Dockerfile
