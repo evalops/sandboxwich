@@ -11,10 +11,11 @@ use sandboxwich_core::{
     CreateSnapshotRequest, DesktopAccessMode, DesktopAccessRequest, DesktopAccessResponse,
     DesktopSessionListResponse, DesktopSessionResponse, DesktopSessionStatus, EventListResponse,
     FailLeaseRequest, GuestHealthResponse, GuestStatus, HealthResponse, Job, JobListResponse,
-    JobStatus, LeaseResponse, RegisterWorkerRequest, RequestSshKeyRequest, SandboxEventKind,
-    SandboxListResponse, SandboxResponse, SandboxState, SnapshotCleanupResponse,
-    SnapshotListResponse, SnapshotResponse, SnapshotStatus, SshKeyListResponse, SshKeyResponse,
-    SshKeyStatus, UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest,
+    JobStatus, LeaseResponse, PromptQueuedResponse, PromptRequest, RegisterWorkerRequest,
+    RequestSshKeyRequest, SandboxEventKind, SandboxListResponse, SandboxResponse, SandboxState,
+    SnapshotCleanupResponse, SnapshotListResponse, SnapshotResponse, SnapshotStatus,
+    SshAccessRequest, SshAccessResponse, SshKeyListResponse, SshKeyResponse, SshKeyStatus,
+    UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest,
     WorkerCapability, WorkerHeartbeatRequest, WorkerListResponse, WorkerResponse,
 };
 use sqlx::any::AnyPoolOptions;
@@ -302,6 +303,7 @@ async fn run_contract(server: TestServer) {
 
     assert_retryable_failure_requeues_command(&client, &server, &created, &worker).await;
     assert_expired_lease_requeues_command(&client, &server, &created, &worker).await;
+    assert_prompt_job_lifecycle(&client, &server, &created).await;
     assert_desktop_session_lifecycle(&client, &server, &created).await;
     assert_snapshot_fork_and_cleanup_lifecycle(&client, &server, &created).await;
 
@@ -400,7 +402,14 @@ async fn assert_guest_health_and_ssh_key_lifecycle(
         .json(&UpdateGuestHealthRequest {
             status: GuestStatus::Ready,
             agent_version: Some("sandboxwich-agent/test".to_string()),
-            checks: Some(serde_json::json!({"exec": "ok"})),
+            checks: Some(serde_json::json!({
+                "exec": {"status": "ok"},
+                "ssh": {
+                    "host": "127.0.0.1",
+                    "port": 2222,
+                    "username": "ubuntu"
+                }
+            })),
             message: None,
         })
         .send()
@@ -470,6 +479,32 @@ async fn assert_guest_health_and_ssh_key_lifecycle(
             .iter()
             .any(|seen| seen.id == requested_key.ssh_key.id)
     );
+
+    let ssh_access: SshAccessResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/ssh-access",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&SshAccessRequest {
+            principal: Some("tester".to_string()),
+            ttl_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ssh_access.ssh_access.host, "127.0.0.1");
+    assert_eq!(ssh_access.ssh_access.port, 2222);
+    assert_eq!(ssh_access.ssh_access.username, "ubuntu");
+    assert_eq!(
+        ssh_access.ssh_access.command,
+        "ssh -p 2222 ubuntu@127.0.0.1"
+    );
+    assert_eq!(ssh_access.ssh_access.scp_command_prefix, "scp -P 2222");
 }
 
 async fn assert_retryable_failure_requeues_command(
@@ -656,6 +691,131 @@ async fn assert_expired_lease_requeues_command(
         .await
         .unwrap();
     assert_eq!(fetched.command.status, CommandStatus::Queued);
+}
+
+async fn assert_prompt_job_lifecycle(
+    client: &reqwest::Client,
+    server: &TestServer,
+    sandbox: &SandboxResponse,
+) {
+    let prompt_worker: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "prompt-worker".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![WorkerCapability::AgentPrompt],
+            labels: [("cluster".to_string(), "k3s-dev".to_string())].into(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let prompt: PromptQueuedResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/prompt",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&PromptRequest {
+            instructions: "summarize the workspace".to_string(),
+            engine: Some("dry-run".to_string()),
+            model: None,
+            effort: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(prompt.event.kind, SandboxEventKind::PromptQueued);
+
+    let jobs: JobListResponse = client
+        .get(format!("{}/jobs", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let prompt_job = job_for_prompt(&jobs.jobs, &prompt.event.id.to_string());
+    assert_eq!(prompt_job.status, JobStatus::Queued);
+
+    let claimed: ClaimLeaseResponse = client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, prompt_worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claimed
+        .lease
+        .expect("expected prompt worker to claim prompt job");
+    assert_eq!(lease.job.id, prompt_job.id);
+
+    let completed: LeaseResponse = client
+        .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
+        .json(&CompleteLeaseRequest {
+            result: Some(serde_json::json!({
+                "output": "workspace summary"
+            })),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(completed.lease.job.status, JobStatus::Succeeded);
+
+    let events: EventListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/events",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(events.events.iter().any(|event| {
+        event.kind == SandboxEventKind::PromptStarted
+            && event
+                .data
+                .get("promptEventId")
+                .and_then(|value| value.as_str())
+                == Some(&prompt.event.id.to_string())
+    }));
+    assert!(events.events.iter().any(|event| {
+        event.kind == SandboxEventKind::PromptFinished
+            && event
+                .data
+                .get("promptEventId")
+                .and_then(|value| value.as_str())
+                == Some(&prompt.event.id.to_string())
+    }));
 }
 
 async fn assert_desktop_session_lifecycle(
@@ -1194,6 +1354,18 @@ fn job_for_child_sandbox(jobs: &[Job], child_sandbox_id: &str) -> Job {
         })
         .cloned()
         .expect("expected fork job")
+}
+
+fn job_for_prompt(jobs: &[Job], prompt_event_id: &str) -> Job {
+    jobs.iter()
+        .find(|job| {
+            job.payload
+                .get("promptEventId")
+                .and_then(|value| value.as_str())
+                == Some(prompt_event_id)
+        })
+        .cloned()
+        .expect("expected prompt job")
 }
 
 fn assert_no_access_url(value: &serde_json::Value) {

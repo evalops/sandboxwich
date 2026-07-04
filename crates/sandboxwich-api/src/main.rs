@@ -21,10 +21,10 @@ use sandboxwich_core::{
     RegisterWorkerRequest, RenewLeaseRequest, RequestSshKeyRequest, Sandbox, SandboxEvent,
     SandboxEventKind, SandboxId, SandboxListResponse, SandboxResponse, SandboxState, Snapshot,
     SnapshotCleanupResponse, SnapshotId, SnapshotListResponse, SnapshotResponse, SnapshotStatus,
-    SshKey, SshKeyId, SshKeyListResponse, SshKeyResponse, SshKeyStatus,
-    UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest, Worker,
-    WorkerCapability, WorkerHeartbeatRequest, WorkerId, WorkerListResponse, WorkerResponse,
-    WorkerStatus,
+    SshAccess, SshAccessRequest, SshAccessResponse, SshKey, SshKeyId, SshKeyListResponse,
+    SshKeyResponse, SshKeyStatus, UpdateDesktopSessionRequest, UpdateGuestHealthRequest,
+    UpdateSshKeyStatusRequest, Worker, WorkerCapability, WorkerHeartbeatRequest, WorkerId,
+    WorkerListResponse, WorkerResponse, WorkerStatus,
 };
 use serde_json::json;
 use sqlx::{
@@ -133,6 +133,7 @@ async fn ensure_postgres_constraints(db: &Database) -> anyhow::Result<()> {
                     'command_output',
                     'command_finished',
                     'prompt_queued',
+                    'prompt_started',
                     'prompt_finished',
                     'desktop_requested',
                     'desktop_ready',
@@ -165,6 +166,7 @@ async fn ensure_postgres_constraints(db: &Database) -> anyhow::Result<()> {
                         'stop_sandbox',
                         'resume_sandbox',
                         'run_command',
+                        'run_prompt',
                         'create_snapshot',
                         'fork_sandbox'
                     ));
@@ -316,6 +318,7 @@ async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
             'command_output',
             'command_finished',
             'prompt_queued',
+            'prompt_started',
             'prompt_finished',
             'desktop_requested',
             'desktop_ready',
@@ -338,6 +341,7 @@ async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
             'command_output',
             'command_finished',
             'prompt_queued',
+            'prompt_started',
             'prompt_finished',
             'desktop_requested',
             'desktop_ready',
@@ -371,7 +375,7 @@ async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
         create trigger if not exists validate_jobs_kind_insert
         before insert on jobs
         for each row
-        when new.kind not in ('provision_sandbox', 'stop_sandbox', 'resume_sandbox', 'run_command', 'create_snapshot', 'fork_sandbox')
+        when new.kind not in ('provision_sandbox', 'stop_sandbox', 'resume_sandbox', 'run_command', 'run_prompt', 'create_snapshot', 'fork_sandbox')
         begin
             select raise(abort, 'invalid job kind');
         end;
@@ -380,7 +384,7 @@ async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
         create trigger if not exists validate_jobs_kind_update
         before update of kind on jobs
         for each row
-        when new.kind not in ('provision_sandbox', 'stop_sandbox', 'resume_sandbox', 'run_command', 'create_snapshot', 'fork_sandbox')
+        when new.kind not in ('provision_sandbox', 'stop_sandbox', 'resume_sandbox', 'run_command', 'run_prompt', 'create_snapshot', 'fork_sandbox')
         begin
             select raise(abort, 'invalid job kind');
         end;
@@ -574,6 +578,10 @@ fn app(state: AppState) -> Router {
         .route(
             "/sandboxes/{sandbox_id}/ssh-keys",
             get(list_ssh_keys).post(request_ssh_key),
+        )
+        .route(
+            "/sandboxes/{sandbox_id}/ssh-access",
+            post(create_ssh_access),
         )
         .route("/ssh-keys/{ssh_key_id}/status", post(update_ssh_key_status))
         .with_state(state)
@@ -1025,6 +1033,32 @@ async fn queue_prompt(
         }),
     )
     .await?;
+    let now = Utc::now();
+    insert_job(
+        &state.db,
+        &Job {
+            id: JobId::new(),
+            kind: JobKind::RunPrompt,
+            status: JobStatus::Queued,
+            payload: json!({
+                "sandboxId": sandbox_id,
+                "promptEventId": event.id,
+                "instructions": request.instructions,
+                "engine": request.engine,
+                "model": request.model,
+                "effort": request.effort
+            }),
+            required_capability: WorkerCapability::AgentPrompt,
+            priority: 0,
+            attempts: 0,
+            max_attempts: 3,
+            scheduled_at: now,
+            created_at: now,
+            updated_at: now,
+            last_error: None,
+        },
+    )
+    .await?;
 
     Ok(Json(PromptQueuedResponse { ok: true, event }))
 }
@@ -1279,6 +1313,21 @@ async fn list_ssh_keys(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Json(SshKeyListResponse { ok: true, ssh_keys }))
+}
+
+async fn create_ssh_access(
+    State(state): State<AppState>,
+    Path(sandbox_id): Path<Uuid>,
+    Json(request): Json<SshAccessRequest>,
+) -> Result<Json<SshAccessResponse>, ApiError> {
+    let sandbox_id = SandboxId(sandbox_id);
+    fetch_sandbox(&state.db, sandbox_id).await?;
+    let guest_health = fetch_guest_health(&state.db, sandbox_id).await?;
+    let ssh_access = mint_ssh_access(sandbox_id, guest_health.as_ref(), request)?;
+    Ok(Json(SshAccessResponse {
+        ok: true,
+        ssh_access,
+    }))
 }
 
 async fn update_ssh_key_status(
@@ -2137,6 +2186,62 @@ fn desktop_access_url(desktop_session: &DesktopSession) -> String {
     }
 }
 
+fn mint_ssh_access(
+    sandbox_id: SandboxId,
+    guest_health: Option<&GuestHealth>,
+    request: SshAccessRequest,
+) -> Result<SshAccess, ApiError> {
+    let now = Utc::now();
+    let ttl_seconds = request.ttl_seconds.unwrap_or(300);
+    if ttl_seconds == 0 {
+        return Err(ApiError::bad_request(
+            "ssh access ttl_seconds must be greater than 0",
+        ));
+    }
+    let ttl_seconds = ttl_seconds.min(900);
+    let expires_at = expires_at_from_ttl(now, Some(ttl_seconds))?
+        .ok_or_else(|| ApiError::internal("failed to calculate ssh access expiry"))?;
+    let principal = request
+        .principal
+        .filter(|principal| !principal.trim().is_empty())
+        .unwrap_or_else(|| "sandboxwich".to_string());
+    let ssh = guest_health
+        .and_then(|health| health.checks.get("ssh"))
+        .and_then(|value| value.as_object());
+    let host = ssh
+        .and_then(|ssh| ssh.get("host"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("127.0.0.1")
+        .to_string();
+    let port = ssh
+        .and_then(|ssh| ssh.get("port"))
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u16::try_from(value).ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(22);
+    let username = ssh
+        .and_then(|ssh| ssh.get("username"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("ubuntu")
+        .to_string();
+
+    Ok(SshAccess {
+        sandbox_id,
+        host: host.clone(),
+        port,
+        username: username.clone(),
+        principal,
+        command: format!("ssh -p {port} {username}@{host}"),
+        scp_command_prefix: format!("scp -P {port}"),
+        expires_at,
+        connection_metadata: json!({
+            "source": "guest_health",
+            "guestStatus": guest_health.map(|health| &health.status),
+            "sandboxId": sandbox_id
+        }),
+    })
+}
+
 async fn upsert_guest_health(db: &Database, guest_health: &GuestHealth) -> Result<(), ApiError> {
     if fetch_guest_health(db, guest_health.sandbox_id)
         .await?
@@ -2555,6 +2660,25 @@ async fn apply_completed_job(
         JobKind::CreateSnapshot => {
             mark_snapshot_ready_from_job_result(db, snapshot_id_from_job(job)?, result).await?;
         }
+        JobKind::RunPrompt => {
+            let sandbox_id = sandbox_id_from_job(job)?;
+            let prompt_event_id = prompt_event_id_from_job(job)?;
+            let output = result
+                .get("output")
+                .or_else(|| result.get("stdout"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            insert_event(
+                db,
+                sandbox_id,
+                SandboxEventKind::PromptFinished,
+                json!({
+                    "promptEventId": prompt_event_id,
+                    "output": output
+                }),
+            )
+            .await?;
+        }
         JobKind::ForkSandbox => {
             let child_id = child_sandbox_id_from_job(job)?;
             let snapshot_id = snapshot_id_from_job(job)?;
@@ -2609,6 +2733,19 @@ async fn apply_claimed_job(db: &Database, job: &Job) -> Result<(), ApiError> {
                 snapshot_id_from_job(job)?,
                 SnapshotStatus::Pending,
                 None,
+            )
+            .await?;
+        }
+        JobKind::RunPrompt => {
+            let sandbox_id = sandbox_id_from_job(job)?;
+            let prompt_event_id = prompt_event_id_from_job(job)?;
+            insert_event(
+                db,
+                sandbox_id,
+                SandboxEventKind::PromptStarted,
+                json!({
+                    "promptEventId": prompt_event_id
+                }),
             )
             .await?;
         }
@@ -2673,6 +2810,21 @@ async fn apply_retryable_job(db: &Database, job: &Job, error: &str) -> Result<()
             )
             .await?;
         }
+        JobKind::RunPrompt => {
+            let sandbox_id = sandbox_id_from_job(job)?;
+            let prompt_event_id = prompt_event_id_from_job(job)?;
+            insert_event(
+                db,
+                sandbox_id,
+                SandboxEventKind::PromptQueued,
+                json!({
+                    "promptEventId": prompt_event_id,
+                    "reason": "retry",
+                    "error": error
+                }),
+            )
+            .await?;
+        }
         JobKind::ForkSandbox => {
             let child_id = child_sandbox_id_from_job(job)?;
             let snapshot_id = snapshot_id_from_job(job)?;
@@ -2727,6 +2879,20 @@ async fn apply_failed_job(db: &Database, job: &Job, error: &str) -> Result<(), A
                 snapshot_id_from_job(job)?,
                 SnapshotStatus::Failed,
                 Some(error),
+            )
+            .await?;
+        }
+        JobKind::RunPrompt => {
+            let sandbox_id = sandbox_id_from_job(job)?;
+            let prompt_event_id = prompt_event_id_from_job(job)?;
+            insert_event(
+                db,
+                sandbox_id,
+                SandboxEventKind::PromptFinished,
+                json!({
+                    "promptEventId": prompt_event_id,
+                    "error": error
+                }),
             )
             .await?;
         }
@@ -2796,6 +2962,15 @@ async fn mark_snapshot_ready_from_job_result(
 
 fn command_id_from_job(job: &Job) -> Result<CommandId, ApiError> {
     uuid_from_job_payload(job, "commandId", "run command job is missing command id").map(CommandId)
+}
+
+fn prompt_event_id_from_job(job: &Job) -> Result<EventId, ApiError> {
+    uuid_from_job_payload(
+        job,
+        "promptEventId",
+        "prompt job is missing prompt event id",
+    )
+    .map(EventId)
 }
 
 fn sandbox_id_from_job(job: &Job) -> Result<SandboxId, ApiError> {
@@ -3249,6 +3424,7 @@ fn worker_capability_to_str(capability: &WorkerCapability) -> &'static str {
     match capability {
         WorkerCapability::ProvisionSandbox => "provision_sandbox",
         WorkerCapability::RunCommand => "run_command",
+        WorkerCapability::AgentPrompt => "agent_prompt",
         WorkerCapability::Snapshot => "snapshot",
         WorkerCapability::DesktopStream => "desktop_stream",
         WorkerCapability::K8sPod => "k8s_pod",
@@ -3261,6 +3437,7 @@ fn job_kind_to_str(kind: &JobKind) -> &'static str {
         JobKind::StopSandbox => "stop_sandbox",
         JobKind::ResumeSandbox => "resume_sandbox",
         JobKind::RunCommand => "run_command",
+        JobKind::RunPrompt => "run_prompt",
         JobKind::CreateSnapshot => "create_snapshot",
         JobKind::ForkSandbox => "fork_sandbox",
     }
@@ -3356,6 +3533,7 @@ fn parse_worker_capability(value: &str) -> Result<WorkerCapability, ApiError> {
     match value {
         "provision_sandbox" => Ok(WorkerCapability::ProvisionSandbox),
         "run_command" => Ok(WorkerCapability::RunCommand),
+        "agent_prompt" => Ok(WorkerCapability::AgentPrompt),
         "snapshot" => Ok(WorkerCapability::Snapshot),
         "desktop_stream" => Ok(WorkerCapability::DesktopStream),
         "k8s_pod" => Ok(WorkerCapability::K8sPod),
@@ -3371,6 +3549,7 @@ fn parse_job_kind(value: &str) -> Result<JobKind, ApiError> {
         "stop_sandbox" => Ok(JobKind::StopSandbox),
         "resume_sandbox" => Ok(JobKind::ResumeSandbox),
         "run_command" => Ok(JobKind::RunCommand),
+        "run_prompt" => Ok(JobKind::RunPrompt),
         "create_snapshot" => Ok(JobKind::CreateSnapshot),
         "fork_sandbox" => Ok(JobKind::ForkSandbox),
         _ => Err(ApiError::internal("database contains invalid job kind")),
@@ -3441,6 +3620,7 @@ fn event_kind_to_str(kind: &SandboxEventKind) -> &'static str {
         SandboxEventKind::CommandOutput => "command_output",
         SandboxEventKind::CommandFinished => "command_finished",
         SandboxEventKind::PromptQueued => "prompt_queued",
+        SandboxEventKind::PromptStarted => "prompt_started",
         SandboxEventKind::PromptFinished => "prompt_finished",
         SandboxEventKind::DesktopRequested => "desktop_requested",
         SandboxEventKind::DesktopReady => "desktop_ready",
@@ -3458,6 +3638,7 @@ fn parse_event_kind(value: &str) -> Result<SandboxEventKind, ApiError> {
         "command_output" => Ok(SandboxEventKind::CommandOutput),
         "command_finished" => Ok(SandboxEventKind::CommandFinished),
         "prompt_queued" => Ok(SandboxEventKind::PromptQueued),
+        "prompt_started" => Ok(SandboxEventKind::PromptStarted),
         "prompt_finished" => Ok(SandboxEventKind::PromptFinished),
         "desktop_requested" => Ok(SandboxEventKind::DesktopRequested),
         "desktop_ready" => Ok(SandboxEventKind::DesktopReady),

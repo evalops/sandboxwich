@@ -5,8 +5,9 @@ use sandboxwich_core::{
     CreateSandboxRequest, CreateSnapshotRequest, DesktopAccessMode, DesktopAccessRequest,
     DesktopAccessResponse, DesktopSessionListResponse, DesktopSessionResponse,
     DesktopSessionStatus, EventListResponse, GuestHealthResponse, GuestStatus, JobListResponse,
-    RequestSshKeyRequest, SandboxListResponse, SandboxResponse, SnapshotCleanupResponse,
-    SnapshotListResponse, SnapshotResponse, SshKeyListResponse, SshKeyResponse, SshKeyStatus,
+    PromptQueuedResponse, PromptRequest, RequestSshKeyRequest, SandboxListResponse,
+    SandboxResponse, SnapshotCleanupResponse, SnapshotListResponse, SnapshotResponse,
+    SshAccessRequest, SshAccessResponse, SshKeyListResponse, SshKeyResponse, SshKeyStatus,
     UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest,
     WorkerListResponse,
 };
@@ -40,6 +41,9 @@ enum Command {
     Desktop { desktop_session_id: Uuid },
     SetDesktopStatus(SetDesktopStatusArgs),
     DesktopAccess(DesktopAccessArgs),
+    Ssh(SshAccessArgs),
+    Scp(SshAccessArgs),
+    Prompt(PromptArgs),
     Exec(ExecArgs),
     Commands { sandbox_id: Uuid },
     Command { command_id: Uuid },
@@ -133,6 +137,33 @@ struct DesktopAccessArgs {
 
     #[arg(long)]
     ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+struct SshAccessArgs {
+    sandbox_id: Uuid,
+
+    #[arg(long)]
+    principal: Option<String>,
+
+    #[arg(long)]
+    ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+struct PromptArgs {
+    sandbox_id: Uuid,
+
+    instructions: String,
+
+    #[arg(long)]
+    engine: Option<String>,
+
+    #[arg(long)]
+    model: Option<String>,
+
+    #[arg(long)]
+    effort: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -364,6 +395,30 @@ async fn main() -> anyhow::Result<()> {
                 .send()
                 .await?;
             print_json::<DesktopAccessResponse>(response).await?;
+        }
+        Command::Ssh(args) | Command::Scp(args) => {
+            let response = client
+                .post(format!("{api}/sandboxes/{}/ssh-access", args.sandbox_id))
+                .json(&SshAccessRequest {
+                    principal: args.principal,
+                    ttl_seconds: args.ttl_seconds,
+                })
+                .send()
+                .await?;
+            print_json::<SshAccessResponse>(response).await?;
+        }
+        Command::Prompt(args) => {
+            let response = client
+                .post(format!("{api}/sandboxes/{}/prompt", args.sandbox_id))
+                .json(&PromptRequest {
+                    instructions: args.instructions,
+                    engine: args.engine,
+                    model: args.model,
+                    effort: args.effort,
+                })
+                .send()
+                .await?;
+            print_json::<PromptQueuedResponse>(response).await?;
         }
         Command::Exec(args) => {
             let response = client

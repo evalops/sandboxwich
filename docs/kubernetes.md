@@ -42,7 +42,7 @@ sandboxwich-worker provider-smoke \
   --namespace sandboxwich
 ```
 
-Use the dry-run output to validate control-plane wiring before granting a worker ServiceAccount any Kubernetes permissions.
+Use the dry-run output to validate control-plane wiring before granting a worker ServiceAccount any Kubernetes permissions. The smoke output includes Pod, PVC, Service, and VolumeSnapshot-shaped manifests under provider metadata, but the worker does not apply them.
 
 ## Apply The API Manifests
 

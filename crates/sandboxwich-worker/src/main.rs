@@ -120,6 +120,7 @@ struct ProviderArgs {
 enum CapabilityArg {
     ProvisionSandbox,
     RunCommand,
+    AgentPrompt,
     Snapshot,
     DesktopStream,
     K8sPod,
@@ -141,6 +142,7 @@ async fn main() -> anyhow::Result<()> {
                     "capabilities": [
                         "provision_sandbox",
                         "run_command",
+                        "agent_prompt",
                         "snapshot",
                         "desktop_stream",
                         "k8s_pod"
@@ -284,6 +286,18 @@ async fn main() -> anyhow::Result<()> {
                         .await?;
                     print_json::<LeaseResponse>(response).await?;
                 }
+                JobKind::RunPrompt => {
+                    let response = client
+                        .post(format!("{api}/leases/{}/complete", lease.id))
+                        .json(&CompleteLeaseRequest {
+                            result: Some(json!({
+                                "output": prompt_output_from_payload(&lease.job.payload)?
+                            })),
+                        })
+                        .send()
+                        .await?;
+                    print_json::<LeaseResponse>(response).await?;
+                }
                 _ => {
                     let response = client
                         .post(format!("{api}/leases/{}/fail", lease.id))
@@ -379,6 +393,17 @@ fn execute_local_agent(request: AgentCommandRequest) -> anyhow::Result<AgentComm
     })
 }
 
+fn prompt_output_from_payload(payload: &serde_json::Value) -> anyhow::Result<String> {
+    let instructions = payload
+        .get("instructions")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("prompt job is missing instructions"))?;
+    Ok(format!(
+        "dry-run prompt accepted: {}",
+        instructions.lines().next().unwrap_or_default()
+    ))
+}
+
 async fn print_json<T>(response: reqwest::Response) -> anyhow::Result<()>
 where
     T: serde::de::DeserializeOwned + serde::Serialize,
@@ -408,6 +433,7 @@ fn to_capability(value: CapabilityArg) -> WorkerCapability {
     match value {
         CapabilityArg::ProvisionSandbox => WorkerCapability::ProvisionSandbox,
         CapabilityArg::RunCommand => WorkerCapability::RunCommand,
+        CapabilityArg::AgentPrompt => WorkerCapability::AgentPrompt,
         CapabilityArg::Snapshot => WorkerCapability::Snapshot,
         CapabilityArg::DesktopStream => WorkerCapability::DesktopStream,
         CapabilityArg::K8sPod => WorkerCapability::K8sPod,

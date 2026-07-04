@@ -384,6 +384,31 @@ pub struct DesktopAccessResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SshAccessRequest {
+    pub principal: Option<String>,
+    pub ttl_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SshAccess {
+    pub sandbox_id: SandboxId,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub principal: String,
+    pub command: String,
+    pub scp_command_prefix: String,
+    pub expires_at: DateTime<Utc>,
+    pub connection_metadata: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SshAccessResponse {
+    pub ok: bool,
+    pub ssh_access: SshAccess,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CommandRequest {
     pub argv: Vec<String>,
     pub cwd: Option<String>,
@@ -449,6 +474,7 @@ pub enum SandboxEventKind {
     CommandOutput,
     CommandFinished,
     PromptQueued,
+    PromptStarted,
     PromptFinished,
     DesktopRequested,
     DesktopReady,
@@ -486,6 +512,7 @@ pub enum WorkerStatus {
 pub enum WorkerCapability {
     ProvisionSandbox,
     RunCommand,
+    AgentPrompt,
     Snapshot,
     DesktopStream,
     K8sPod,
@@ -538,6 +565,7 @@ pub enum JobKind {
     StopSandbox,
     ResumeSandbox,
     RunCommand,
+    RunPrompt,
     CreateSnapshot,
     ForkSandbox,
 }

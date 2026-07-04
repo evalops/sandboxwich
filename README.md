@@ -26,8 +26,11 @@ In another shell:
 cargo run -p sandboxwich-cli -- new --name demo
 cargo run -p sandboxwich-cli -- list
 cargo run -p sandboxwich-cli -- exec <sandbox-id> -- echo hello
+cargo run -p sandboxwich-cli -- ssh <sandbox-id>
+cargo run -p sandboxwich-cli -- prompt <sandbox-id> "inspect the repo"
 cargo run -p sandboxwich-cli -- events <sandbox-id>
 cargo run -p sandboxwich-worker -- register --name k3s-worker-a --provider kubernetes
+cargo run -p sandboxwich-worker -- provider-smoke --cluster k3s-dev --namespace sandboxwich
 cargo run -p sandboxwich-cli -- workers
 ```
 

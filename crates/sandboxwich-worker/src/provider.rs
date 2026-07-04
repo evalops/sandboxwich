@@ -71,7 +71,114 @@ impl KubernetesDryRunProvider {
             "namespace": self.namespace,
             "sandboxId": sandbox_id,
             "podName": format!("sandboxwich-{}", sandbox_id),
-            "storageClass": self.storage_class
+            "storageClass": self.storage_class,
+            "manifests": {
+                "pod": self.pod_manifest(sandbox_id),
+                "pvc": self.pvc_manifest(format!("sandboxwich-pvc-{sandbox_id}")),
+                "desktopService": self.desktop_service_manifest(sandbox_id)
+            }
+        })
+    }
+
+    fn object_metadata(&self, name: String, sandbox_id: Option<SandboxId>) -> serde_json::Value {
+        let mut labels = serde_json::Map::from_iter([
+            (
+                "app.kubernetes.io/name".to_string(),
+                json!("sandboxwich-sandbox"),
+            ),
+            (
+                "app.kubernetes.io/managed-by".to_string(),
+                json!("sandboxwich"),
+            ),
+        ]);
+        if let Some(sandbox_id) = sandbox_id {
+            labels.insert("sandboxwich.dev/sandbox-id".to_string(), json!(sandbox_id));
+        }
+        json!({
+            "name": name,
+            "namespace": self.namespace,
+            "labels": labels
+        })
+    }
+
+    fn pod_manifest(&self, sandbox_id: SandboxId) -> serde_json::Value {
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": self.object_metadata(format!("sandboxwich-{sandbox_id}"), Some(sandbox_id)),
+            "spec": {
+                "containers": [{
+                    "name": "sandbox",
+                    "image": "ghcr.io/evalops/sandboxwich-ubuntu-dev:latest",
+                    "ports": [
+                        {"name": "ssh", "containerPort": 22},
+                        {"name": "desktop", "containerPort": 6080}
+                    ],
+                    "volumeMounts": [{
+                        "name": "workspace",
+                        "mountPath": "/workspace"
+                    }]
+                }],
+                "volumes": [{
+                    "name": "workspace",
+                    "persistentVolumeClaim": {
+                        "claimName": format!("sandboxwich-pvc-{sandbox_id}")
+                    }
+                }]
+            }
+        })
+    }
+
+    fn pvc_manifest(&self, name: String) -> serde_json::Value {
+        json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": self.object_metadata(name, None),
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": self.storage_class,
+                "resources": {
+                    "requests": {
+                        "storage": "40Gi"
+                    }
+                }
+            }
+        })
+    }
+
+    fn desktop_service_manifest(&self, sandbox_id: SandboxId) -> serde_json::Value {
+        json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": self.object_metadata(format!("sandboxwich-desktop-{sandbox_id}"), Some(sandbox_id)),
+            "spec": {
+                "type": "ClusterIP",
+                "selector": {
+                    "sandboxwich.dev/sandbox-id": sandbox_id
+                },
+                "ports": [{
+                    "name": "desktop",
+                    "port": 6080,
+                    "targetPort": "desktop"
+                }]
+            }
+        })
+    }
+
+    fn volume_snapshot_manifest(
+        &self,
+        sandbox_id: SandboxId,
+        snapshot_id: SnapshotId,
+    ) -> serde_json::Value {
+        json!({
+            "apiVersion": "snapshot.storage.k8s.io/v1",
+            "kind": "VolumeSnapshot",
+            "metadata": self.object_metadata(format!("sandboxwich-snapshot-{snapshot_id}"), Some(sandbox_id)),
+            "spec": {
+                "source": {
+                    "persistentVolumeClaimName": format!("sandboxwich-pvc-{sandbox_id}")
+                }
+            }
         })
     }
 }
@@ -84,6 +191,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
                 WorkerCapability::K8sPod,
                 WorkerCapability::ProvisionSandbox,
                 WorkerCapability::RunCommand,
+                WorkerCapability::AgentPrompt,
                 WorkerCapability::Snapshot,
                 WorkerCapability::DesktopStream,
             ],
@@ -153,7 +261,10 @@ impl SandboxProvider for KubernetesDryRunProvider {
                 "sandboxId": sandbox_id,
                 "snapshotId": snapshot_id,
                 "volumeSnapshotName": format!("sandboxwich-snapshot-{}", snapshot_id),
-                "storageClass": self.storage_class
+                "storageClass": self.storage_class,
+                "manifests": {
+                    "volumeSnapshot": self.volume_snapshot_manifest(sandbox_id, snapshot_id)
+                }
             }),
         }
     }
@@ -179,7 +290,12 @@ impl SandboxProvider for KubernetesDryRunProvider {
                 "childSandboxId": child_sandbox_id,
                 "snapshotId": snapshot_id,
                 "pvcCloneName": format!("sandboxwich-pvc-{}", child_sandbox_id),
-                "storageClass": self.storage_class
+                "storageClass": self.storage_class,
+                "manifests": {
+                    "pvc": self.pvc_manifest(format!("sandboxwich-pvc-{child_sandbox_id}")),
+                    "pod": self.pod_manifest(child_sandbox_id),
+                    "desktopService": self.desktop_service_manifest(child_sandbox_id)
+                }
             }),
         }
     }
@@ -209,6 +325,11 @@ mod tests {
                 .capabilities
                 .contains(&WorkerCapability::Snapshot)
         );
+        assert!(
+            capabilities
+                .capabilities
+                .contains(&WorkerCapability::AgentPrompt)
+        );
         assert_eq!(
             capabilities.labels.get("storage_class").map(String::as_str),
             Some("local-path")
@@ -229,6 +350,11 @@ mod tests {
         let provisioned = provider.provision(sandbox_id);
         assert_eq!(provisioned.metadata["mode"], "dry_run");
         assert_eq!(provisioned.metadata["operation"], "provision");
+        assert_eq!(provisioned.metadata["manifests"]["pod"]["kind"], "Pod");
+        assert_eq!(
+            provisioned.metadata["manifests"]["desktopService"]["kind"],
+            "Service"
+        );
 
         let exec = provider.exec_handoff(
             sandbox_id,
@@ -243,9 +369,17 @@ mod tests {
 
         let snapshot = provider.create_snapshot(sandbox_id, snapshot_id);
         assert_eq!(snapshot.metadata["operation"], "snapshot");
+        assert_eq!(
+            snapshot.metadata["manifests"]["volumeSnapshot"]["kind"],
+            "VolumeSnapshot"
+        );
 
         let fork = provider.fork(sandbox_id, child_sandbox_id, snapshot_id);
         assert_eq!(fork.metadata["operation"], "fork");
         assert_eq!(fork.provider, "kubernetes");
+        assert_eq!(
+            fork.metadata["manifests"]["pvc"]["kind"],
+            "PersistentVolumeClaim"
+        );
     }
 }
