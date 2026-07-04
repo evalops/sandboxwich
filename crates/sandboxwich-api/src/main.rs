@@ -17,7 +17,7 @@ use sandboxwich_core::{
 };
 use serde_json::json;
 use sqlx::{
-    Any, AnyPool, QueryBuilder, Row, Sqlite,
+    AnyPool, Row, Sqlite,
     any::{AnyPoolOptions, AnyRow},
     migrate::MigrateDatabase,
 };
@@ -26,7 +26,19 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 struct AppState {
+    db: Database,
+}
+
+#[derive(Clone)]
+struct Database {
     pool: AnyPool,
+    dialect: SqlDialect,
+}
+
+#[derive(Clone, Copy)]
+enum SqlDialect {
+    Postgres,
+    Sqlite,
 }
 
 #[tokio::main]
@@ -42,29 +54,31 @@ async fn main() -> anyhow::Result<()> {
 
     let database_url = std::env::var("SANDBOXWICH_DATABASE_URL")
         .unwrap_or_else(|_| "sqlite://sandboxwich.db".to_string());
-    let pool = connect_database(&database_url).await?;
-    sqlx::migrate!("./migrations").run(&pool).await?;
+    let db = connect_database(&database_url).await?;
+    sqlx::migrate!("./migrations").run(&db.pool).await?;
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, %database_url, "sandboxwich-api listening");
-    axum::serve(listener, app(AppState { pool }))
+    axum::serve(listener, app(AppState { db }))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
 }
 
-async fn connect_database(database_url: &str) -> anyhow::Result<AnyPool> {
+async fn connect_database(database_url: &str) -> anyhow::Result<Database> {
     sqlx::any::install_default_drivers();
-    if database_url.starts_with("sqlite:")
+    let dialect = SqlDialect::from_url(database_url)?;
+    if matches!(dialect, SqlDialect::Sqlite)
         && !Sqlite::database_exists(database_url).await.unwrap_or(false)
     {
         Sqlite::create_database(database_url).await?;
     }
 
-    Ok(AnyPoolOptions::new()
+    let pool = AnyPoolOptions::new()
         .max_connections(5)
         .connect(database_url)
-        .await?)
+        .await?;
+    Ok(Database { pool, dialect })
 }
 
 fn app(state: AppState) -> Router {
@@ -114,9 +128,9 @@ async fn create_sandbox(
         parent_snapshot_id: None,
     };
 
-    insert_sandbox(&state.pool, &sandbox).await?;
+    insert_sandbox(&state.db, &sandbox).await?;
     insert_event(
-        &state.pool,
+        &state.db,
         sandbox.id,
         SandboxEventKind::LifecycleChanged,
         json!({
@@ -137,7 +151,7 @@ async fn list_sandboxes(
          from sandboxes
          order by created_at asc",
     )
-    .fetch_all(&state.pool)
+    .fetch_all(&state.db.pool)
     .await?;
 
     let sandboxes = rows
@@ -155,7 +169,7 @@ async fn get_sandbox(
     State(state): State<AppState>,
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<SandboxResponse>, ApiError> {
-    let sandbox = fetch_sandbox(&state.pool, SandboxId(sandbox_id)).await?;
+    let sandbox = fetch_sandbox(&state.db, SandboxId(sandbox_id)).await?;
     Ok(Json(SandboxResponse { ok: true, sandbox }))
 }
 
@@ -164,7 +178,7 @@ async fn stop_sandbox(
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<SandboxResponse>, ApiError> {
     transition_sandbox(
-        &state.pool,
+        &state.db,
         SandboxId(sandbox_id),
         SandboxState::Archived,
         "stopped",
@@ -177,7 +191,7 @@ async fn resume_sandbox(
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<SandboxResponse>, ApiError> {
     transition_sandbox(
-        &state.pool,
+        &state.db,
         SandboxId(sandbox_id),
         SandboxState::Ready,
         "resumed",
@@ -190,7 +204,7 @@ async fn fork_sandbox(
     Path(sandbox_id): Path<Uuid>,
     Json(request): Json<CreateSandboxRequest>,
 ) -> Result<Json<SandboxResponse>, ApiError> {
-    let parent = fetch_sandbox(&state.pool, SandboxId(sandbox_id)).await?;
+    let parent = fetch_sandbox(&state.db, SandboxId(sandbox_id)).await?;
     let now = Utc::now();
     let child = Sandbox {
         id: SandboxId::new(),
@@ -205,9 +219,9 @@ async fn fork_sandbox(
         parent_snapshot_id: Some(SnapshotId::new()),
     };
 
-    insert_sandbox(&state.pool, &child).await?;
+    insert_sandbox(&state.db, &child).await?;
     insert_event(
-        &state.pool,
+        &state.db,
         child.id,
         SandboxEventKind::LifecycleChanged,
         json!({
@@ -234,7 +248,7 @@ async fn queue_command(
     }
 
     let sandbox_id = SandboxId(sandbox_id);
-    fetch_sandbox(&state.pool, sandbox_id).await?;
+    fetch_sandbox(&state.db, sandbox_id).await?;
 
     let now = Utc::now();
     let command = CommandRun {
@@ -250,9 +264,9 @@ async fn queue_command(
         finished_at: Some(now),
     };
 
-    insert_command(&state.pool, &command).await?;
+    insert_command(&state.db, &command).await?;
     insert_event(
-        &state.pool,
+        &state.db,
         sandbox_id,
         SandboxEventKind::CommandQueued,
         json!({
@@ -262,7 +276,7 @@ async fn queue_command(
     )
     .await?;
     insert_event(
-        &state.pool,
+        &state.db,
         sandbox_id,
         SandboxEventKind::CommandFinished,
         json!({
@@ -281,18 +295,19 @@ async fn list_commands(
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<CommandListResponse>, ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
-    fetch_sandbox(&state.pool, sandbox_id).await?;
+    fetch_sandbox(&state.db, sandbox_id).await?;
 
-    let mut query = QueryBuilder::<Any>::new(
+    let sql = format!(
         "select id, sandbox_id, status, argv, cwd, exit_code, stdout, stderr, created_at, finished_at
          from commands
-         where sandbox_id = ",
+         where sandbox_id = {}
+         order by created_at asc, id asc",
+        state.db.placeholder(1)
     );
-    query
-        .push_bind(sandbox_id.to_string())
-        .push(" order by created_at asc, id asc");
-
-    let rows = query.build().fetch_all(&state.pool).await?;
+    let rows = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .fetch_all(&state.db.pool)
+        .await?;
     let commands = rows
         .into_iter()
         .map(row_to_command)
@@ -305,7 +320,7 @@ async fn get_command(
     State(state): State<AppState>,
     Path(command_id): Path<Uuid>,
 ) -> Result<Json<CommandResponse>, ApiError> {
-    let command = fetch_command(&state.pool, CommandId(command_id)).await?;
+    let command = fetch_command(&state.db, CommandId(command_id)).await?;
     Ok(Json(CommandResponse { ok: true, command }))
 }
 
@@ -319,10 +334,10 @@ async fn queue_prompt(
     }
 
     let sandbox_id = SandboxId(sandbox_id);
-    fetch_sandbox(&state.pool, sandbox_id).await?;
+    fetch_sandbox(&state.db, sandbox_id).await?;
 
     let event = insert_event(
-        &state.pool,
+        &state.db,
         sandbox_id,
         SandboxEventKind::PromptQueued,
         json!({
@@ -342,17 +357,19 @@ async fn list_events(
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<EventListResponse>, ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
-    fetch_sandbox(&state.pool, sandbox_id).await?;
+    fetch_sandbox(&state.db, sandbox_id).await?;
 
-    let mut query = QueryBuilder::<Any>::new(
+    let sql = format!(
         "select id, sandbox_id, kind, data, created_at
          from sandbox_events
-         where sandbox_id = ",
+         where sandbox_id = {}
+         order by created_at asc, id asc",
+        state.db.placeholder(1)
     );
-    query
-        .push_bind(sandbox_id.to_string())
-        .push(" order by created_at asc, id asc");
-    let rows = query.build().fetch_all(&state.pool).await?;
+    let rows = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .fetch_all(&state.db.pool)
+        .await?;
 
     let events = rows
         .into_iter()
@@ -363,29 +380,33 @@ async fn list_events(
 }
 
 async fn transition_sandbox(
-    pool: &AnyPool,
+    db: &Database,
     sandbox_id: SandboxId,
     next_state: SandboxState,
     reason: &'static str,
 ) -> Result<Json<SandboxResponse>, ApiError> {
-    fetch_sandbox(pool, sandbox_id).await?;
+    fetch_sandbox(db, sandbox_id).await?;
     let now = Utc::now();
     let state = state_to_str(&next_state);
-    let mut query = QueryBuilder::<Any>::new("update sandboxes set state = ");
-    query
-        .push_bind(state)
-        .push(", updated_at = ")
-        .push_bind(now.to_rfc3339())
-        .push(" where id = ")
-        .push_bind(sandbox_id.to_string());
-    let result = query.build().execute(pool).await?;
+    let sql = format!(
+        "update sandboxes set state = {}, updated_at = {} where id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3)
+    );
+    let result = sqlx::query(&sql)
+        .bind(state)
+        .bind(now.to_rfc3339())
+        .bind(sandbox_id.to_string())
+        .execute(&db.pool)
+        .await?;
 
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found("sandbox not found"));
     }
 
     insert_event(
-        pool,
+        db,
         sandbox_id,
         SandboxEventKind::LifecycleChanged,
         json!({
@@ -395,108 +416,92 @@ async fn transition_sandbox(
     )
     .await?;
 
-    let sandbox = fetch_sandbox(pool, sandbox_id).await?;
+    let sandbox = fetch_sandbox(db, sandbox_id).await?;
     Ok(Json(SandboxResponse { ok: true, sandbox }))
 }
 
-async fn fetch_sandbox(pool: &AnyPool, sandbox_id: SandboxId) -> Result<Sandbox, ApiError> {
-    let mut query = QueryBuilder::<Any>::new(
+async fn fetch_sandbox(db: &Database, sandbox_id: SandboxId) -> Result<Sandbox, ApiError> {
+    let sql = format!(
         "select id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
-         where id = ",
+         where id = {}",
+        db.placeholder(1)
     );
-    query.push_bind(sandbox_id.to_string());
-    let row = query
-        .build()
-        .fetch_optional(pool)
+    let row = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .fetch_optional(&db.pool)
         .await?
         .ok_or_else(|| ApiError::not_found("sandbox not found"))?;
 
     row_to_sandbox(row)
 }
 
-async fn fetch_command(pool: &AnyPool, command_id: CommandId) -> Result<CommandRun, ApiError> {
-    let mut query = QueryBuilder::<Any>::new(
+async fn fetch_command(db: &Database, command_id: CommandId) -> Result<CommandRun, ApiError> {
+    let sql = format!(
         "select id, sandbox_id, status, argv, cwd, exit_code, stdout, stderr, created_at, finished_at
          from commands
-         where id = ",
+         where id = {}",
+        db.placeholder(1)
     );
-    query.push_bind(command_id.0.to_string());
-    let row = query
-        .build()
-        .fetch_optional(pool)
+    let row = sqlx::query(&sql)
+        .bind(command_id.0.to_string())
+        .fetch_optional(&db.pool)
         .await?
         .ok_or_else(|| ApiError::not_found("command not found"))?;
 
     row_to_command(row)
 }
 
-async fn insert_sandbox(pool: &AnyPool, sandbox: &Sandbox) -> Result<(), ApiError> {
-    let mut query = QueryBuilder::<Any>::new(
+async fn insert_sandbox(db: &Database, sandbox: &Sandbox) -> Result<(), ApiError> {
+    let sql = format!(
         "insert into sandboxes
          (id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id)
-         values (",
+         values ({})",
+        db.placeholders(8)
     );
-    query
-        .push_bind(sandbox.id.to_string())
-        .push(", ")
-        .push_bind(&sandbox.name)
-        .push(", ")
-        .push_bind(state_to_str(&sandbox.state))
-        .push(", ")
-        .push_bind(&sandbox.template)
-        .push(", ")
-        .push_bind(sandbox.created_at.to_rfc3339())
-        .push(", ")
-        .push_bind(sandbox.updated_at.to_rfc3339())
-        .push(", ")
-        .push_bind(sandbox.ttl_seconds.map(|ttl| ttl as i64))
-        .push(", ")
-        .push_bind(
+    sqlx::query(&sql)
+        .bind(sandbox.id.to_string())
+        .bind(&sandbox.name)
+        .bind(state_to_str(&sandbox.state))
+        .bind(&sandbox.template)
+        .bind(sandbox.created_at.to_rfc3339())
+        .bind(sandbox.updated_at.to_rfc3339())
+        .bind(sandbox.ttl_seconds.map(|ttl| ttl as i64))
+        .bind(
             sandbox
                 .parent_snapshot_id
                 .map(|snapshot| snapshot.0.to_string()),
         )
-        .push(")");
-
-    query.build().execute(pool).await?;
+        .execute(&db.pool)
+        .await?;
     Ok(())
 }
 
-async fn insert_command(pool: &AnyPool, command: &CommandRun) -> Result<(), ApiError> {
-    let mut query = QueryBuilder::<Any>::new(
+async fn insert_command(db: &Database, command: &CommandRun) -> Result<(), ApiError> {
+    let sql = format!(
         "insert into commands
          (id, sandbox_id, status, argv, cwd, exit_code, stdout, stderr, created_at, finished_at)
-         values (",
+         values ({})",
+        db.placeholders(10)
     );
-    query
-        .push_bind(command.id.0.to_string())
-        .push(", ")
-        .push_bind(command.sandbox_id.to_string())
-        .push(", ")
-        .push_bind(command_status_to_str(&command.status))
-        .push(", ")
-        .push_bind(serde_json::to_string(&command.argv)?)
-        .push(", ")
-        .push_bind(&command.cwd)
-        .push(", ")
-        .push_bind(command.exit_code)
-        .push(", ")
-        .push_bind(&command.stdout)
-        .push(", ")
-        .push_bind(&command.stderr)
-        .push(", ")
-        .push_bind(command.created_at.to_rfc3339())
-        .push(", ")
-        .push_bind(command.finished_at.map(|time| time.to_rfc3339()))
-        .push(")");
-
-    query.build().execute(pool).await?;
+    sqlx::query(&sql)
+        .bind(command.id.0.to_string())
+        .bind(command.sandbox_id.to_string())
+        .bind(command_status_to_str(&command.status))
+        .bind(serde_json::to_string(&command.argv)?)
+        .bind(&command.cwd)
+        .bind(command.exit_code)
+        .bind(&command.stdout)
+        .bind(&command.stderr)
+        .bind(command.created_at.to_rfc3339())
+        .bind(command.finished_at.map(|time| time.to_rfc3339()))
+        .execute(&db.pool)
+        .await?;
     Ok(())
 }
 
 async fn insert_event(
-    pool: &AnyPool,
+    db: &Database,
     sandbox_id: SandboxId,
     kind: SandboxEventKind,
     data: serde_json::Value,
@@ -509,25 +514,49 @@ async fn insert_event(
         created_at: Utc::now(),
     };
 
-    let mut query = QueryBuilder::<Any>::new(
+    let sql = format!(
         "insert into sandbox_events (id, sandbox_id, kind, data, created_at)
-         values (",
+         values ({})",
+        db.placeholders(5)
     );
-    query
-        .push_bind(event.id.0.to_string())
-        .push(", ")
-        .push_bind(event.sandbox_id.to_string())
-        .push(", ")
-        .push_bind(event_kind_to_str(&event.kind))
-        .push(", ")
-        .push_bind(serde_json::to_string(&event.data)?)
-        .push(", ")
-        .push_bind(event.created_at.to_rfc3339())
-        .push(")");
-
-    query.build().execute(pool).await?;
+    sqlx::query(&sql)
+        .bind(event.id.0.to_string())
+        .bind(event.sandbox_id.to_string())
+        .bind(event_kind_to_str(&event.kind))
+        .bind(serde_json::to_string(&event.data)?)
+        .bind(event.created_at.to_rfc3339())
+        .execute(&db.pool)
+        .await?;
 
     Ok(event)
+}
+
+impl SqlDialect {
+    fn from_url(database_url: &str) -> anyhow::Result<Self> {
+        if database_url.starts_with("sqlite:") {
+            return Ok(Self::Sqlite);
+        }
+        if database_url.starts_with("postgres:") || database_url.starts_with("postgresql:") {
+            return Ok(Self::Postgres);
+        }
+        anyhow::bail!("unsupported database URL scheme");
+    }
+}
+
+impl Database {
+    fn placeholder(&self, index: usize) -> String {
+        match self.dialect {
+            SqlDialect::Postgres => format!("${index}"),
+            SqlDialect::Sqlite => "?".to_string(),
+        }
+    }
+
+    fn placeholders(&self, count: usize) -> String {
+        (1..=count)
+            .map(|index| self.placeholder(index))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
