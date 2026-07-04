@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, process::Command as ProcessCommand};
 use anyhow::{Context, bail};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use provider::{KubernetesDryRunProvider, SandboxProvider};
+use provider::{KubernetesApplyProvider, KubernetesDryRunProvider, SandboxProvider};
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse,
     CompleteLeaseRequest, FailLeaseRequest, JobKind, LeaseResponse, RegisterWorkerRequest,
@@ -31,6 +31,8 @@ enum Command {
     ProviderCapabilities(ProviderArgs),
     ProviderHealth(ProviderArgs),
     ProviderSmoke(ProviderArgs),
+    ProviderApplyPlan(ProviderApplyArgs),
+    ProviderApplySmoke(ProviderApplyArgs),
     Register(RegisterArgs),
     Heartbeat(HeartbeatArgs),
     Claim(ClaimArgs),
@@ -114,6 +116,24 @@ struct ProviderArgs {
 
     #[arg(long)]
     storage_class: Option<String>,
+
+    #[arg(long)]
+    snapshot_class: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ProviderApplyArgs {
+    #[command(flatten)]
+    provider: ProviderArgs,
+
+    #[arg(long, default_value = "kubectl")]
+    kubectl: String,
+
+    #[arg(long, default_value_t = false)]
+    confirm_apply: bool,
+
+    #[arg(long, default_value_t = false)]
+    keep_resources: bool,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -189,6 +209,32 @@ async fn main() -> anyhow::Result<()> {
                     "fork": provider.fork(sandbox_id, child_sandbox_id, snapshot_id)
                 }))?
             );
+        }
+        Command::ProviderApplyPlan(args) => {
+            let provider = apply_provider_from_args(args);
+            let plan = provider.smoke_plan(
+                sandboxwich_core::SandboxId::new(),
+                sandboxwich_core::SandboxId::new(),
+                sandboxwich_core::SnapshotId::new(),
+            );
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        }
+        Command::ProviderApplySmoke(args) => {
+            let confirm_apply = args.confirm_apply;
+            let cleanup = !args.keep_resources;
+            let provider = apply_provider_from_args(args);
+            let plan = provider.smoke_plan(
+                sandboxwich_core::SandboxId::new(),
+                sandboxwich_core::SandboxId::new(),
+                sandboxwich_core::SnapshotId::new(),
+            );
+            let outcome = provider.apply_smoke(
+                plan,
+                confirm_apply,
+                KubernetesApplyProvider::mutation_enabled_from_env(),
+                cleanup,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&outcome)?);
         }
         Command::Register(args) => {
             let capabilities = if args.capability.is_empty() {
@@ -317,7 +363,16 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
-    KubernetesDryRunProvider::new(args.cluster, args.namespace, args.storage_class)
+    KubernetesDryRunProvider::with_snapshot_class(
+        args.cluster,
+        args.namespace,
+        args.storage_class,
+        args.snapshot_class,
+    )
+}
+
+fn apply_provider_from_args(args: ProviderApplyArgs) -> KubernetesApplyProvider {
+    KubernetesApplyProvider::new(provider_from_args(args.provider), args.kubectl)
 }
 
 async fn claim(
