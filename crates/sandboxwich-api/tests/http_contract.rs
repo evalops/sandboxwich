@@ -7,12 +7,13 @@ use std::{
 use reqwest::StatusCode;
 use sandboxwich_core::{
     ClaimLeaseRequest, ClaimLeaseResponse, CommandListResponse, CommandRequest, CommandResponse,
-    CommandStatus, CompleteLeaseRequest, CreateSandboxRequest, EventListResponse, FailLeaseRequest,
-    GuestHealthResponse, GuestStatus, HealthResponse, Job, JobListResponse, JobStatus,
-    LeaseResponse, RegisterWorkerRequest, RequestSshKeyRequest, SandboxEventKind,
-    SandboxListResponse, SandboxResponse, SshKeyListResponse, SshKeyResponse, SshKeyStatus,
-    UpdateGuestHealthRequest, UpdateSshKeyStatusRequest, WorkerCapability, WorkerHeartbeatRequest,
-    WorkerListResponse, WorkerResponse,
+    CommandStatus, CompleteLeaseRequest, CreateSandboxRequest, CreateSnapshotRequest,
+    EventListResponse, FailLeaseRequest, GuestHealthResponse, GuestStatus, HealthResponse, Job,
+    JobListResponse, JobStatus, LeaseResponse, RegisterWorkerRequest, RequestSshKeyRequest,
+    SandboxEventKind, SandboxListResponse, SandboxResponse, SandboxState, SnapshotCleanupResponse,
+    SnapshotListResponse, SnapshotResponse, SnapshotStatus, SshKeyListResponse, SshKeyResponse,
+    SshKeyStatus, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest, WorkerCapability,
+    WorkerHeartbeatRequest, WorkerListResponse, WorkerResponse,
 };
 use sqlx::any::AnyPoolOptions;
 use tempfile::TempDir;
@@ -299,6 +300,7 @@ async fn run_contract(server: TestServer) {
 
     assert_retryable_failure_requeues_command(&client, &server, &created, &worker).await;
     assert_expired_lease_requeues_command(&client, &server, &created, &worker).await;
+    assert_snapshot_fork_and_cleanup_lifecycle(&client, &server, &created).await;
 
     let stopped: SandboxResponse = client
         .post(format!(
@@ -653,6 +655,296 @@ async fn assert_expired_lease_requeues_command(
     assert_eq!(fetched.command.status, CommandStatus::Queued);
 }
 
+async fn assert_snapshot_fork_and_cleanup_lifecycle(
+    client: &reqwest::Client,
+    server: &TestServer,
+    sandbox: &SandboxResponse,
+) {
+    let snapshot: SnapshotResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/snapshots",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&CreateSnapshotRequest {
+            label: Some("contract-snapshot".to_string()),
+            inventory: Some(serde_json::json!({"paths": []})),
+            provider_metadata: Some(serde_json::json!({"provider": "contract"})),
+            ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(snapshot.snapshot.status, SnapshotStatus::Ready);
+    assert_eq!(snapshot.snapshot.sandbox_id, sandbox.sandbox.id);
+
+    let fetched_snapshot: SnapshotResponse = client
+        .get(format!(
+            "{}/snapshots/{}",
+            server.base_url, snapshot.snapshot.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(fetched_snapshot.snapshot.id, snapshot.snapshot.id);
+
+    let snapshots: SnapshotListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/snapshots",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        snapshots
+            .snapshots
+            .iter()
+            .any(|seen| seen.id == snapshot.snapshot.id)
+    );
+
+    let expiring: SnapshotResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/snapshots",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&CreateSnapshotRequest {
+            label: Some("expires-now".to_string()),
+            inventory: None,
+            provider_metadata: None,
+            ttl_seconds: Some(0),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let cleanup: SnapshotCleanupResponse = client
+        .post(format!("{}/snapshots/cleanup", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        cleanup
+            .expired
+            .iter()
+            .any(|seen| seen.id == expiring.snapshot.id)
+    );
+
+    let archived: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("cleanup-me".to_string()),
+            template: None,
+            ttl_seconds: Some(0),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    client
+        .post(format!(
+            "{}/sandboxes/{}/stop",
+            server.base_url, archived.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let cleanup: SnapshotCleanupResponse = client
+        .post(format!("{}/snapshots/cleanup", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(cleanup.archived_sandboxes_deleted >= 1);
+    let missing_archived = client
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, archived.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_archived.status(), StatusCode::NOT_FOUND);
+
+    let snapshot_worker: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "k3s-snapshot-worker".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![WorkerCapability::Snapshot],
+            labels: [("cluster".to_string(), "k3s-dev".to_string())].into(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let forked: SandboxResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/fork",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&CreateSandboxRequest {
+            name: Some("contract-child".to_string()),
+            template: None,
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(forked.sandbox.state, SandboxState::Planning);
+    let fork_snapshot_id = forked
+        .sandbox
+        .parent_snapshot_id
+        .expect("fork should point at a real snapshot");
+
+    let parent_snapshots: SnapshotListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/snapshots",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        parent_snapshots
+            .snapshots
+            .iter()
+            .any(|seen| { seen.id == fork_snapshot_id && seen.status == SnapshotStatus::Ready })
+    );
+
+    let jobs: JobListResponse = client
+        .get(format!("{}/jobs", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let fork_job = job_for_child_sandbox(&jobs.jobs, &forked.sandbox.id.to_string());
+    assert_eq!(fork_job.status, JobStatus::Queued);
+
+    let claimed: ClaimLeaseResponse = client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, snapshot_worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claimed
+        .lease
+        .expect("expected snapshot worker to claim fork job");
+    assert_eq!(lease.job.id, fork_job.id);
+
+    let provisioning_child: SandboxResponse = client
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, forked.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(provisioning_child.sandbox.state, SandboxState::Provisioning);
+
+    let completed: LeaseResponse = client
+        .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
+        .json(&CompleteLeaseRequest {
+            result: Some(serde_json::json!({
+                "providerMetadata": {
+                    "cluster": "k3s-dev",
+                    "namespace": "sandboxwich-contract"
+                }
+            })),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(completed.lease.job.status, JobStatus::Succeeded);
+
+    let ready_child: SandboxResponse = client
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, forked.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ready_child.sandbox.state, SandboxState::Ready);
+}
+
 fn job_for_command(jobs: &[Job], command_id: &str) -> Job {
     jobs.iter()
         .find(|job| {
@@ -663,6 +955,18 @@ fn job_for_command(jobs: &[Job], command_id: &str) -> Job {
         })
         .cloned()
         .expect("expected command job")
+}
+
+fn job_for_child_sandbox(jobs: &[Job], child_sandbox_id: &str) -> Job {
+    jobs.iter()
+        .find(|job| {
+            job.payload
+                .get("childSandboxId")
+                .and_then(|value| value.as_str())
+                == Some(child_sandbox_id)
+        })
+        .cloned()
+        .expect("expected fork job")
 }
 
 impl TestServer {
@@ -713,6 +1017,7 @@ async fn assert_database_rejects_invalid_typed_values(database_url: &str, sandbo
         .unwrap();
 
     let invalid_sandbox_id = Uuid::now_v7().to_string();
+    let invalid_snapshot_id = Uuid::now_v7().to_string();
     let invalid_command_id = Uuid::now_v7().to_string();
     let invalid_event_id = Uuid::now_v7().to_string();
     let now = "2026-07-04T00:00:00Z";
@@ -749,6 +1054,24 @@ async fn assert_database_rejects_invalid_typed_values(database_url: &str, sandbo
     assert!(
         command_result.is_err(),
         "invalid command status was accepted"
+    );
+
+    let snapshot_result = sqlx::query(&insert_snapshot_sql(database_url))
+        .bind(invalid_snapshot_id)
+        .bind(sandbox_id)
+        .bind("not_real")
+        .bind("invalid")
+        .bind("{}")
+        .bind("{}")
+        .bind(now)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await;
+    assert!(
+        snapshot_result.is_err(),
+        "invalid snapshot status was accepted"
     );
 
     let event_result = sqlx::query(&insert_event_sql(database_url))
@@ -819,6 +1142,15 @@ fn insert_command_sql(database_url: &str) -> String {
     format!(
         "insert into commands
          (id, sandbox_id, status, argv, cwd, exit_code, stdout, stderr, created_at, finished_at)
+         values ({})",
+        placeholders(database_url, 10)
+    )
+}
+
+fn insert_snapshot_sql(database_url: &str) -> String {
+    format!(
+        "insert into snapshots
+         (id, sandbox_id, status, label, inventory, provider_metadata, created_at, ready_at, expires_at, error)
          values ({})",
         placeholders(database_url, 10)
     )

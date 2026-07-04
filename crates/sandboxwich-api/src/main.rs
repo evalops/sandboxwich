@@ -12,12 +12,13 @@ use chrono::{DateTime, Utc};
 use sandboxwich_core::{
     ClaimLeaseRequest, ClaimLeaseResponse, CommandId, CommandListResponse, CommandRequest,
     CommandResponse, CommandRun, CommandStatus, CompleteLeaseRequest, CreateJobRequest,
-    CreateSandboxRequest, ErrorEnvelope, EventId, EventListResponse, FailLeaseRequest, GuestHealth,
-    GuestHealthResponse, GuestStatus, HealthResponse, Job, JobId, JobKind, JobLease,
-    JobListResponse, JobResponse, JobStatus, LeaseId, LeaseResponse, LeaseStatus,
-    PromptQueuedResponse, PromptRequest, RegisterWorkerRequest, RenewLeaseRequest,
+    CreateSandboxRequest, CreateSnapshotRequest, ErrorEnvelope, EventId, EventListResponse,
+    FailLeaseRequest, GuestHealth, GuestHealthResponse, GuestStatus, HealthResponse, Job, JobId,
+    JobKind, JobLease, JobListResponse, JobResponse, JobStatus, LeaseId, LeaseResponse,
+    LeaseStatus, PromptQueuedResponse, PromptRequest, RegisterWorkerRequest, RenewLeaseRequest,
     RequestSshKeyRequest, Sandbox, SandboxEvent, SandboxEventKind, SandboxId, SandboxListResponse,
-    SandboxResponse, SandboxState, SnapshotId, SshKey, SshKeyId, SshKeyListResponse,
+    SandboxResponse, SandboxState, Snapshot, SnapshotCleanupResponse, SnapshotId,
+    SnapshotListResponse, SnapshotResponse, SnapshotStatus, SshKey, SshKeyId, SshKeyListResponse,
     SshKeyResponse, SshKeyStatus, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest, Worker,
     WorkerCapability, WorkerHeartbeatRequest, WorkerId, WorkerListResponse, WorkerResponse,
     WorkerStatus,
@@ -101,12 +102,9 @@ async fn ensure_postgres_constraints(db: &Database) -> anyhow::Result<()> {
         r#"
         do $$
         begin
-            if not exists (
-                select 1 from pg_constraint where conname = 'sandboxes_state_check'
-            ) then
-                alter table sandboxes add constraint sandboxes_state_check
-                    check (state in ('provisioning', 'ready', 'running', 'idle', 'archiving', 'archived', 'error'));
-            end if;
+            alter table sandboxes drop constraint if exists sandboxes_state_check;
+            alter table sandboxes add constraint sandboxes_state_check
+                check (state in ('planning', 'provisioning', 'ready', 'running', 'idle', 'archiving', 'archived', 'error'));
         end $$;
         "#,
         r#"
@@ -206,6 +204,17 @@ async fn ensure_postgres_constraints(db: &Database) -> anyhow::Result<()> {
         do $$
         begin
             if not exists (
+                select 1 from pg_constraint where conname = 'snapshots_status_check'
+            ) then
+                alter table snapshots add constraint snapshots_status_check
+                    check (status in ('pending', 'ready', 'failed', 'expired'));
+            end if;
+        end $$;
+        "#,
+        r#"
+        do $$
+        begin
+            if not exists (
                 select 1 from pg_constraint where conname = 'ssh_keys_status_check'
             ) then
                 alter table ssh_keys add constraint ssh_keys_status_check
@@ -223,10 +232,16 @@ async fn ensure_postgres_constraints(db: &Database) -> anyhow::Result<()> {
 async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
     for statement in [
         r#"
+        drop trigger if exists validate_sandboxes_state_insert;
+        "#,
+        r#"
+        drop trigger if exists validate_sandboxes_state_update;
+        "#,
+        r#"
         create trigger if not exists validate_sandboxes_state_insert
         before insert on sandboxes
         for each row
-        when new.state not in ('provisioning', 'ready', 'running', 'idle', 'archiving', 'archived', 'error')
+        when new.state not in ('planning', 'provisioning', 'ready', 'running', 'idle', 'archiving', 'archived', 'error')
         begin
             select raise(abort, 'invalid sandbox state');
         end;
@@ -235,7 +250,7 @@ async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
         create trigger if not exists validate_sandboxes_state_update
         before update of state on sandboxes
         for each row
-        when new.state not in ('provisioning', 'ready', 'running', 'idle', 'archiving', 'archived', 'error')
+        when new.state not in ('planning', 'provisioning', 'ready', 'running', 'idle', 'archiving', 'archived', 'error')
         begin
             select raise(abort, 'invalid sandbox state');
         end;
@@ -385,6 +400,24 @@ async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
         end;
         "#,
         r#"
+        create trigger if not exists validate_snapshots_status_insert
+        before insert on snapshots
+        for each row
+        when new.status not in ('pending', 'ready', 'failed', 'expired')
+        begin
+            select raise(abort, 'invalid snapshot status');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_snapshots_status_update
+        before update of status on snapshots
+        for each row
+        when new.status not in ('pending', 'ready', 'failed', 'expired')
+        begin
+            select raise(abort, 'invalid snapshot status');
+        end;
+        "#,
+        r#"
         create trigger if not exists validate_ssh_keys_status_insert
         before insert on ssh_keys
         for each row
@@ -418,11 +451,17 @@ fn app(state: AppState) -> Router {
         .route("/sandboxes/{sandbox_id}/resume", post(resume_sandbox))
         .route("/sandboxes/{sandbox_id}/fork", post(fork_sandbox))
         .route(
+            "/sandboxes/{sandbox_id}/snapshots",
+            get(list_snapshots).post(create_snapshot),
+        )
+        .route(
             "/sandboxes/{sandbox_id}/commands",
             get(list_commands).post(queue_command),
         )
         .route("/sandboxes/{sandbox_id}/prompt", post(queue_prompt))
         .route("/sandboxes/{sandbox_id}/events", get(list_events))
+        .route("/snapshots/cleanup", post(cleanup_snapshots))
+        .route("/snapshots/{snapshot_id}", get(get_snapshot))
         .route("/commands/{command_id}", get(get_command))
         .route("/workers", get(list_workers))
         .route("/workers/register", post(register_worker))
@@ -551,17 +590,36 @@ async fn fork_sandbox(
 ) -> Result<Json<SandboxResponse>, ApiError> {
     let parent = fetch_sandbox(&state.db, SandboxId(sandbox_id)).await?;
     let now = Utc::now();
+    let snapshot = Snapshot {
+        id: SnapshotId::new(),
+        sandbox_id: parent.id,
+        status: SnapshotStatus::Ready,
+        label: format!("fork-source-{}", now.timestamp_millis()),
+        inventory: json!({
+            "sourceSandboxId": parent.id,
+            "template": parent.template
+        }),
+        provider_metadata: json!({
+            "source": "fork_request"
+        }),
+        created_at: now,
+        ready_at: Some(now),
+        expires_at: expires_at_from_ttl(now, request.ttl_seconds)?,
+        error: None,
+    };
+    insert_snapshot(&state.db, &snapshot).await?;
+
     let child = Sandbox {
         id: SandboxId::new(),
         name: request
             .name
             .unwrap_or_else(|| format!("{}-fork", parent.name)),
-        state: SandboxState::Ready,
+        state: SandboxState::Planning,
         template: request.template.unwrap_or(parent.template),
         created_at: now,
         updated_at: now,
         ttl_seconds: request.ttl_seconds.or(parent.ttl_seconds),
-        parent_snapshot_id: Some(SnapshotId::new()),
+        parent_snapshot_id: Some(snapshot.id),
     };
 
     insert_sandbox(&state.db, &child).await?;
@@ -571,15 +629,97 @@ async fn fork_sandbox(
         SandboxEventKind::LifecycleChanged,
         json!({
             "state": child.state,
-            "reason": "forked",
-            "parentSandboxId": parent.id
+            "reason": "fork_planned",
+            "parentSandboxId": parent.id,
+            "parentSnapshotId": snapshot.id
         }),
+    )
+    .await?;
+    insert_job(
+        &state.db,
+        &Job {
+            id: JobId::new(),
+            kind: JobKind::ForkSandbox,
+            status: JobStatus::Queued,
+            payload: json!({
+                "parentSandboxId": parent.id,
+                "childSandboxId": child.id,
+                "snapshotId": snapshot.id
+            }),
+            required_capability: WorkerCapability::Snapshot,
+            priority: 0,
+            attempts: 0,
+            max_attempts: 3,
+            scheduled_at: now,
+            created_at: now,
+            updated_at: now,
+            last_error: None,
+        },
     )
     .await?;
 
     Ok(Json(SandboxResponse {
         ok: true,
         sandbox: child,
+    }))
+}
+
+async fn create_snapshot(
+    State(state): State<AppState>,
+    Path(sandbox_id): Path<Uuid>,
+    Json(request): Json<CreateSnapshotRequest>,
+) -> Result<Json<SnapshotResponse>, ApiError> {
+    let sandbox_id = SandboxId(sandbox_id);
+    fetch_sandbox(&state.db, sandbox_id).await?;
+    let snapshot = ready_snapshot_from_request(sandbox_id, request)?;
+    insert_snapshot(&state.db, &snapshot).await?;
+    insert_event(
+        &state.db,
+        sandbox_id,
+        SandboxEventKind::LifecycleChanged,
+        json!({
+            "reason": "snapshot_created",
+            "snapshotId": snapshot.id,
+            "snapshotStatus": snapshot.status
+        }),
+    )
+    .await?;
+
+    Ok(Json(SnapshotResponse { ok: true, snapshot }))
+}
+
+async fn list_snapshots(
+    State(state): State<AppState>,
+    Path(sandbox_id): Path<Uuid>,
+) -> Result<Json<SnapshotListResponse>, ApiError> {
+    let sandbox_id = SandboxId(sandbox_id);
+    fetch_sandbox(&state.db, sandbox_id).await?;
+    expire_due_snapshots(&state.db).await?;
+    let snapshots = list_snapshots_for_sandbox(&state.db, sandbox_id).await?;
+    Ok(Json(SnapshotListResponse {
+        ok: true,
+        snapshots,
+    }))
+}
+
+async fn get_snapshot(
+    State(state): State<AppState>,
+    Path(snapshot_id): Path<Uuid>,
+) -> Result<Json<SnapshotResponse>, ApiError> {
+    expire_due_snapshots(&state.db).await?;
+    let snapshot = fetch_snapshot(&state.db, SnapshotId(snapshot_id)).await?;
+    Ok(Json(SnapshotResponse { ok: true, snapshot }))
+}
+
+async fn cleanup_snapshots(
+    State(state): State<AppState>,
+) -> Result<Json<SnapshotCleanupResponse>, ApiError> {
+    let expired = expire_due_snapshots(&state.db).await?;
+    let archived_sandboxes_deleted = cleanup_archived_sandboxes(&state.db).await?;
+    Ok(Json(SnapshotCleanupResponse {
+        ok: true,
+        expired,
+        archived_sandboxes_deleted,
     }))
 }
 
@@ -1148,6 +1288,28 @@ async fn transition_sandbox(
     reason: &'static str,
 ) -> Result<Json<SandboxResponse>, ApiError> {
     fetch_sandbox(db, sandbox_id).await?;
+    let event_state = next_state.clone();
+    set_sandbox_state(
+        db,
+        sandbox_id,
+        next_state,
+        json!({
+            "state": event_state,
+            "reason": reason
+        }),
+    )
+    .await?;
+
+    let sandbox = fetch_sandbox(db, sandbox_id).await?;
+    Ok(Json(SandboxResponse { ok: true, sandbox }))
+}
+
+async fn set_sandbox_state(
+    db: &Database,
+    sandbox_id: SandboxId,
+    next_state: SandboxState,
+    event_data: serde_json::Value,
+) -> Result<(), ApiError> {
     let now = Utc::now();
     let state = state_to_str(&next_state);
     let sql = format!(
@@ -1171,15 +1333,10 @@ async fn transition_sandbox(
         db,
         sandbox_id,
         SandboxEventKind::LifecycleChanged,
-        json!({
-            "state": next_state,
-            "reason": reason
-        }),
+        event_data,
     )
     .await?;
-
-    let sandbox = fetch_sandbox(db, sandbox_id).await?;
-    Ok(Json(SandboxResponse { ok: true, sandbox }))
+    Ok(())
 }
 
 async fn fetch_sandbox(db: &Database, sandbox_id: SandboxId) -> Result<Sandbox, ApiError> {
@@ -1263,6 +1420,45 @@ async fn fetch_ssh_key(db: &Database, ssh_key_id: SshKeyId) -> Result<SshKey, Ap
     row_to_ssh_key(row)
 }
 
+fn ready_snapshot_from_request(
+    sandbox_id: SandboxId,
+    request: CreateSnapshotRequest,
+) -> Result<Snapshot, ApiError> {
+    let now = Utc::now();
+    let label = match request.label {
+        Some(label) if label.trim().is_empty() => {
+            return Err(ApiError::bad_request("snapshot label cannot be empty"));
+        }
+        Some(label) => label,
+        None => "manual-snapshot".to_string(),
+    };
+
+    Ok(Snapshot {
+        id: SnapshotId::new(),
+        sandbox_id,
+        status: SnapshotStatus::Ready,
+        label,
+        inventory: request.inventory.unwrap_or_else(|| json!({})),
+        provider_metadata: request.provider_metadata.unwrap_or_else(|| json!({})),
+        created_at: now,
+        ready_at: Some(now),
+        expires_at: expires_at_from_ttl(now, request.ttl_seconds)?,
+        error: None,
+    })
+}
+
+fn expires_at_from_ttl(
+    now: DateTime<Utc>,
+    ttl_seconds: Option<u64>,
+) -> Result<Option<DateTime<Utc>>, ApiError> {
+    let Some(ttl_seconds) = ttl_seconds else {
+        return Ok(None);
+    };
+    let ttl_seconds = i64::try_from(ttl_seconds)
+        .map_err(|_| ApiError::bad_request("ttl_seconds is too large"))?;
+    Ok(Some(now + chrono::Duration::seconds(ttl_seconds)))
+}
+
 async fn insert_sandbox(db: &Database, sandbox: &Sandbox) -> Result<(), ApiError> {
     let sql = format!(
         "insert into sandboxes
@@ -1286,6 +1482,174 @@ async fn insert_sandbox(db: &Database, sandbox: &Sandbox) -> Result<(), ApiError
         .execute(&db.pool)
         .await?;
     Ok(())
+}
+
+async fn insert_snapshot(db: &Database, snapshot: &Snapshot) -> Result<(), ApiError> {
+    let sql = format!(
+        "insert into snapshots
+         (id, sandbox_id, status, label, inventory, provider_metadata, created_at, ready_at, expires_at, error)
+         values ({})",
+        db.placeholders(10)
+    );
+    sqlx::query(&sql)
+        .bind(snapshot.id.to_string())
+        .bind(snapshot.sandbox_id.to_string())
+        .bind(snapshot_status_to_str(&snapshot.status))
+        .bind(&snapshot.label)
+        .bind(serde_json::to_string(&snapshot.inventory)?)
+        .bind(serde_json::to_string(&snapshot.provider_metadata)?)
+        .bind(snapshot.created_at.to_rfc3339())
+        .bind(snapshot.ready_at.map(|time| time.to_rfc3339()))
+        .bind(snapshot.expires_at.map(|time| time.to_rfc3339()))
+        .bind(&snapshot.error)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+async fn fetch_snapshot(db: &Database, snapshot_id: SnapshotId) -> Result<Snapshot, ApiError> {
+    let sql = format!(
+        "select id, sandbox_id, status, label, inventory, provider_metadata, created_at, ready_at, expires_at, error
+         from snapshots
+         where id = {}",
+        db.placeholder(1)
+    );
+    let row = sqlx::query(&sql)
+        .bind(snapshot_id.to_string())
+        .fetch_optional(&db.pool)
+        .await?
+        .ok_or_else(|| ApiError::not_found("snapshot not found"))?;
+
+    row_to_snapshot(row)
+}
+
+async fn list_snapshots_for_sandbox(
+    db: &Database,
+    sandbox_id: SandboxId,
+) -> Result<Vec<Snapshot>, ApiError> {
+    let sql = format!(
+        "select id, sandbox_id, status, label, inventory, provider_metadata, created_at, ready_at, expires_at, error
+         from snapshots
+         where sandbox_id = {}
+         order by created_at asc, id asc",
+        db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .fetch_all(&db.pool)
+        .await?;
+
+    rows.into_iter().map(row_to_snapshot).collect()
+}
+
+async fn expire_due_snapshots(db: &Database) -> Result<Vec<Snapshot>, ApiError> {
+    let now = Utc::now();
+    let rows = sqlx::query(
+        "select id, sandbox_id, status, label, inventory, provider_metadata, created_at, ready_at, expires_at, error
+         from snapshots
+         where status in ('pending', 'ready') and expires_at is not null
+         order by expires_at asc, id asc",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+
+    let mut expired = Vec::new();
+    for row in rows {
+        let snapshot = row_to_snapshot(row)?;
+        let Some(expires_at) = snapshot.expires_at else {
+            continue;
+        };
+        if expires_at > now {
+            continue;
+        }
+        update_snapshot_status(db, snapshot.id, SnapshotStatus::Expired, None).await?;
+        expired.push(fetch_snapshot(db, snapshot.id).await?);
+    }
+
+    Ok(expired)
+}
+
+async fn update_snapshot_status(
+    db: &Database,
+    snapshot_id: SnapshotId,
+    status: SnapshotStatus,
+    error: Option<&str>,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "update snapshots
+         set status = {}, error = {}
+         where id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3)
+    );
+    let result = sqlx::query(&sql)
+        .bind(snapshot_status_to_str(&status))
+        .bind(error)
+        .bind(snapshot_id.to_string())
+        .execute(&db.pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("snapshot not found"));
+    }
+    Ok(())
+}
+
+async fn cleanup_archived_sandboxes(db: &Database) -> Result<u64, ApiError> {
+    let rows = sqlx::query(
+        "select id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id
+         from sandboxes
+         where state = 'archived' and ttl_seconds is not null
+         order by updated_at asc, id asc",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+
+    let now = Utc::now();
+    let mut deleted = 0;
+    for row in rows {
+        let sandbox = row_to_sandbox(row)?;
+        let Some(ttl_seconds) = sandbox.ttl_seconds else {
+            continue;
+        };
+        let expires_at = expires_at_from_ttl(sandbox.updated_at, Some(ttl_seconds))?;
+        if expires_at.is_some_and(|expires_at| expires_at > now) {
+            continue;
+        }
+        if sandbox_snapshot_is_referenced(db, sandbox.id).await? {
+            continue;
+        }
+        let sql = format!(
+            "delete from sandboxes where id = {} and state = 'archived'",
+            db.placeholder(1)
+        );
+        let result = sqlx::query(&sql)
+            .bind(sandbox.id.to_string())
+            .execute(&db.pool)
+            .await?;
+        deleted += result.rows_affected();
+    }
+
+    Ok(deleted)
+}
+
+async fn sandbox_snapshot_is_referenced(
+    db: &Database,
+    sandbox_id: SandboxId,
+) -> Result<bool, ApiError> {
+    let sql = format!(
+        "select snapshots.id
+         from snapshots
+         join sandboxes on sandboxes.parent_snapshot_id = snapshots.id
+         where snapshots.sandbox_id = {}
+         limit 1",
+        db.placeholder(1)
+    );
+    let row = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .fetch_optional(&db.pool)
+        .await?;
+    Ok(row.is_some())
 }
 
 async fn upsert_guest_health(db: &Database, guest_health: &GuestHealth) -> Result<(), ApiError> {
@@ -1637,177 +2001,346 @@ async fn apply_completed_job(
     job: &Job,
     result: serde_json::Value,
 ) -> Result<(), ApiError> {
-    if job.kind != JobKind::RunCommand {
-        return Ok(());
+    match job.kind {
+        JobKind::RunCommand => {
+            let command_id = command_id_from_job(job)?;
+            let sandbox_id = sandbox_id_from_job(job)?;
+            let stdout = result
+                .get("stdout")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let stderr = result
+                .get("stderr")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let exit_code = result
+                .get("exitCode")
+                .or_else(|| result.get("exit_code"))
+                .and_then(|value| value.as_i64())
+                .map(|value| value as i32)
+                .or(Some(0));
+            update_command_from_lease_result(
+                db,
+                command_id,
+                CommandStatus::Finished,
+                stdout,
+                stderr,
+                exit_code,
+            )
+            .await?;
+            if !stdout.is_empty() {
+                insert_event(
+                    db,
+                    sandbox_id,
+                    SandboxEventKind::CommandOutput,
+                    json!({
+                        "commandId": command_id,
+                        "stream": "stdout",
+                        "chunk": stdout
+                    }),
+                )
+                .await?;
+            }
+            if !stderr.is_empty() {
+                insert_event(
+                    db,
+                    sandbox_id,
+                    SandboxEventKind::CommandOutput,
+                    json!({
+                        "commandId": command_id,
+                        "stream": "stderr",
+                        "chunk": stderr
+                    }),
+                )
+                .await?;
+            }
+            insert_event(
+                db,
+                sandbox_id,
+                SandboxEventKind::CommandFinished,
+                json!({
+                    "commandId": command_id,
+                    "exitCode": exit_code,
+                    "stdout": stdout,
+                    "stderr": stderr
+                }),
+            )
+            .await?;
+        }
+        JobKind::CreateSnapshot => {
+            mark_snapshot_ready_from_job_result(db, snapshot_id_from_job(job)?, result).await?;
+        }
+        JobKind::ForkSandbox => {
+            let child_id = child_sandbox_id_from_job(job)?;
+            let snapshot_id = snapshot_id_from_job(job)?;
+            let next_state = SandboxState::Ready;
+            set_sandbox_state(
+                db,
+                child_id,
+                next_state.clone(),
+                json!({
+                    "state": next_state,
+                    "reason": "fork_ready",
+                    "parentSnapshotId": snapshot_id
+                }),
+            )
+            .await?;
+        }
+        JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {}
     }
-    let command_id = command_id_from_job(job)?;
-    let sandbox_id = sandbox_id_from_job(job)?;
-    let stdout = result
-        .get("stdout")
-        .and_then(|value| value.as_str())
-        .unwrap_or("");
-    let stderr = result
-        .get("stderr")
-        .and_then(|value| value.as_str())
-        .unwrap_or("");
-    let exit_code = result
-        .get("exitCode")
-        .or_else(|| result.get("exit_code"))
-        .and_then(|value| value.as_i64())
-        .map(|value| value as i32)
-        .or(Some(0));
-    update_command_from_lease_result(
-        db,
-        command_id,
-        CommandStatus::Finished,
-        stdout,
-        stderr,
-        exit_code,
-    )
-    .await?;
-    if !stdout.is_empty() {
-        insert_event(
-            db,
-            sandbox_id,
-            SandboxEventKind::CommandOutput,
-            json!({
-                "commandId": command_id,
-                "stream": "stdout",
-                "chunk": stdout
-            }),
-        )
-        .await?;
-    }
-    if !stderr.is_empty() {
-        insert_event(
-            db,
-            sandbox_id,
-            SandboxEventKind::CommandOutput,
-            json!({
-                "commandId": command_id,
-                "stream": "stderr",
-                "chunk": stderr
-            }),
-        )
-        .await?;
-    }
-    insert_event(
-        db,
-        sandbox_id,
-        SandboxEventKind::CommandFinished,
-        json!({
-            "commandId": command_id,
-            "exitCode": exit_code,
-            "stdout": stdout,
-            "stderr": stderr
-        }),
-    )
-    .await?;
     Ok(())
 }
 
 async fn apply_claimed_job(db: &Database, job: &Job) -> Result<(), ApiError> {
-    if job.kind != JobKind::RunCommand {
-        return Ok(());
+    match job.kind {
+        JobKind::RunCommand => {
+            let command_id = command_id_from_job(job)?;
+            let sandbox_id = sandbox_id_from_job(job)?;
+            let sql = format!(
+                "update commands
+                 set status = {}
+                 where id = {}",
+                db.placeholder(1),
+                db.placeholder(2)
+            );
+            sqlx::query(&sql)
+                .bind(command_status_to_str(&CommandStatus::Running))
+                .bind(command_id.to_string())
+                .execute(&db.pool)
+                .await?;
+            insert_event(
+                db,
+                sandbox_id,
+                SandboxEventKind::CommandStarted,
+                json!({
+                    "commandId": command_id
+                }),
+            )
+            .await?;
+        }
+        JobKind::CreateSnapshot => {
+            update_snapshot_status(
+                db,
+                snapshot_id_from_job(job)?,
+                SnapshotStatus::Pending,
+                None,
+            )
+            .await?;
+        }
+        JobKind::ForkSandbox => {
+            let child_id = child_sandbox_id_from_job(job)?;
+            let snapshot_id = snapshot_id_from_job(job)?;
+            let next_state = SandboxState::Provisioning;
+            set_sandbox_state(
+                db,
+                child_id,
+                next_state.clone(),
+                json!({
+                    "state": next_state,
+                    "reason": "fork_provisioning",
+                    "parentSnapshotId": snapshot_id
+                }),
+            )
+            .await?;
+        }
+        JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {}
     }
-    let command_id = command_id_from_job(job)?;
-    let sandbox_id = sandbox_id_from_job(job)?;
-    let sql = format!(
-        "update commands
-         set status = {}
-         where id = {}",
-        db.placeholder(1),
-        db.placeholder(2)
-    );
-    sqlx::query(&sql)
-        .bind(command_status_to_str(&CommandStatus::Running))
-        .bind(command_id.to_string())
-        .execute(&db.pool)
-        .await?;
-    insert_event(
-        db,
-        sandbox_id,
-        SandboxEventKind::CommandStarted,
-        json!({
-            "commandId": command_id
-        }),
-    )
-    .await?;
     Ok(())
 }
 
 async fn apply_retryable_job(db: &Database, job: &Job, error: &str) -> Result<(), ApiError> {
-    if job.kind != JobKind::RunCommand {
-        return Ok(());
+    match job.kind {
+        JobKind::RunCommand => {
+            let command_id = command_id_from_job(job)?;
+            let sandbox_id = sandbox_id_from_job(job)?;
+            let sql = format!(
+                "update commands
+                 set status = {}, stderr = {}
+                 where id = {}",
+                db.placeholder(1),
+                db.placeholder(2),
+                db.placeholder(3)
+            );
+            sqlx::query(&sql)
+                .bind(command_status_to_str(&CommandStatus::Queued))
+                .bind(error)
+                .bind(command_id.to_string())
+                .execute(&db.pool)
+                .await?;
+            insert_event(
+                db,
+                sandbox_id,
+                SandboxEventKind::CommandQueued,
+                json!({
+                    "commandId": command_id,
+                    "reason": "retry",
+                    "error": error
+                }),
+            )
+            .await?;
+        }
+        JobKind::CreateSnapshot => {
+            update_snapshot_status(
+                db,
+                snapshot_id_from_job(job)?,
+                SnapshotStatus::Pending,
+                Some(error),
+            )
+            .await?;
+        }
+        JobKind::ForkSandbox => {
+            let child_id = child_sandbox_id_from_job(job)?;
+            let snapshot_id = snapshot_id_from_job(job)?;
+            let next_state = SandboxState::Planning;
+            set_sandbox_state(
+                db,
+                child_id,
+                next_state.clone(),
+                json!({
+                    "state": next_state,
+                    "reason": "fork_retry",
+                    "parentSnapshotId": snapshot_id,
+                    "error": error
+                }),
+            )
+            .await?;
+        }
+        JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {}
     }
-    let command_id = command_id_from_job(job)?;
-    let sandbox_id = sandbox_id_from_job(job)?;
-    let sql = format!(
-        "update commands
-         set status = {}, stderr = {}
-         where id = {}",
-        db.placeholder(1),
-        db.placeholder(2),
-        db.placeholder(3)
-    );
-    sqlx::query(&sql)
-        .bind(command_status_to_str(&CommandStatus::Queued))
-        .bind(error)
-        .bind(command_id.to_string())
-        .execute(&db.pool)
-        .await?;
-    insert_event(
-        db,
-        sandbox_id,
-        SandboxEventKind::CommandQueued,
-        json!({
-            "commandId": command_id,
-            "reason": "retry",
-            "error": error
-        }),
-    )
-    .await?;
     Ok(())
 }
 
 async fn apply_failed_job(db: &Database, job: &Job, error: &str) -> Result<(), ApiError> {
-    if job.kind != JobKind::RunCommand {
-        return Ok(());
+    match job.kind {
+        JobKind::RunCommand => {
+            let command_id = command_id_from_job(job)?;
+            let sandbox_id = sandbox_id_from_job(job)?;
+            update_command_from_lease_result(
+                db,
+                command_id,
+                CommandStatus::Failed,
+                "",
+                error,
+                None,
+            )
+            .await?;
+            insert_event(
+                db,
+                sandbox_id,
+                SandboxEventKind::CommandFinished,
+                json!({
+                    "commandId": command_id,
+                    "exitCode": null,
+                    "stderr": error
+                }),
+            )
+            .await?;
+        }
+        JobKind::CreateSnapshot => {
+            update_snapshot_status(
+                db,
+                snapshot_id_from_job(job)?,
+                SnapshotStatus::Failed,
+                Some(error),
+            )
+            .await?;
+        }
+        JobKind::ForkSandbox => {
+            let child_id = child_sandbox_id_from_job(job)?;
+            let snapshot_id = snapshot_id_from_job(job)?;
+            let next_state = SandboxState::Error;
+            set_sandbox_state(
+                db,
+                child_id,
+                next_state.clone(),
+                json!({
+                    "state": next_state,
+                    "reason": "fork_failed",
+                    "parentSnapshotId": snapshot_id,
+                    "error": error
+                }),
+            )
+            .await?;
+        }
+        JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {}
     }
-    let command_id = command_id_from_job(job)?;
-    let sandbox_id = sandbox_id_from_job(job)?;
-    update_command_from_lease_result(db, command_id, CommandStatus::Failed, "", error, None)
+    Ok(())
+}
+
+async fn mark_snapshot_ready_from_job_result(
+    db: &Database,
+    snapshot_id: SnapshotId,
+    result: serde_json::Value,
+) -> Result<(), ApiError> {
+    let snapshot = fetch_snapshot(db, snapshot_id).await?;
+    let inventory = result
+        .get("inventory")
+        .cloned()
+        .unwrap_or(snapshot.inventory);
+    let provider_metadata = result
+        .get("providerMetadata")
+        .or_else(|| result.get("provider_metadata"))
+        .cloned()
+        .unwrap_or(snapshot.provider_metadata);
+    let now = Utc::now();
+    let sql = format!(
+        "update snapshots
+         set status = {}, inventory = {}, provider_metadata = {}, ready_at = {}, error = {}
+         where id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4),
+        db.placeholder(5),
+        db.placeholder(6)
+    );
+    let result = sqlx::query(&sql)
+        .bind(snapshot_status_to_str(&SnapshotStatus::Ready))
+        .bind(serde_json::to_string(&inventory)?)
+        .bind(serde_json::to_string(&provider_metadata)?)
+        .bind(now.to_rfc3339())
+        .bind(Option::<String>::None)
+        .bind(snapshot_id.to_string())
+        .execute(&db.pool)
         .await?;
-    insert_event(
-        db,
-        sandbox_id,
-        SandboxEventKind::CommandFinished,
-        json!({
-            "commandId": command_id,
-            "exitCode": null,
-            "stderr": error
-        }),
-    )
-    .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("snapshot not found"));
+    }
     Ok(())
 }
 
 fn command_id_from_job(job: &Job) -> Result<CommandId, ApiError> {
-    let value = job
-        .payload
-        .get("commandId")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| ApiError::internal("run command job is missing command id"))?;
-    parse_uuid(value).map(CommandId)
+    uuid_from_job_payload(job, "commandId", "run command job is missing command id").map(CommandId)
 }
 
 fn sandbox_id_from_job(job: &Job) -> Result<SandboxId, ApiError> {
+    uuid_from_job_payload(job, "sandboxId", "run command job is missing sandbox id").map(SandboxId)
+}
+
+fn child_sandbox_id_from_job(job: &Job) -> Result<SandboxId, ApiError> {
+    uuid_from_job_payload(
+        job,
+        "childSandboxId",
+        "fork job is missing child sandbox id",
+    )
+    .map(SandboxId)
+}
+
+fn snapshot_id_from_job(job: &Job) -> Result<SnapshotId, ApiError> {
+    uuid_from_job_payload(job, "snapshotId", "snapshot job is missing snapshot id").map(SnapshotId)
+}
+
+fn uuid_from_job_payload(
+    job: &Job,
+    key: &'static str,
+    missing: &'static str,
+) -> Result<Uuid, ApiError> {
     let value = job
         .payload
-        .get("sandboxId")
+        .get(key)
         .and_then(|value| value.as_str())
-        .ok_or_else(|| ApiError::internal("run command job is missing sandbox id"))?;
-    parse_uuid(value).map(SandboxId)
+        .ok_or_else(|| ApiError::internal(missing))?;
+    parse_uuid(value)
 }
 
 async fn insert_event(
@@ -1930,6 +2463,30 @@ fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
         parent_snapshot_id: parent_snapshot_id
             .map(|snapshot| parse_uuid(&snapshot).map(SnapshotId))
             .transpose()?,
+    })
+}
+
+fn row_to_snapshot(row: AnyRow) -> Result<Snapshot, ApiError> {
+    let id: String = row.try_get("id")?;
+    let sandbox_id: String = row.try_get("sandbox_id")?;
+    let status: String = row.try_get("status")?;
+    let inventory: String = row.try_get("inventory")?;
+    let provider_metadata: String = row.try_get("provider_metadata")?;
+    let created_at: String = row.try_get("created_at")?;
+    let ready_at: Option<String> = row.try_get("ready_at")?;
+    let expires_at: Option<String> = row.try_get("expires_at")?;
+
+    Ok(Snapshot {
+        id: SnapshotId(parse_uuid(&id)?),
+        sandbox_id: SandboxId(parse_uuid(&sandbox_id)?),
+        status: parse_snapshot_status(&status)?,
+        label: row.try_get("label")?,
+        inventory: serde_json::from_str(&inventory)?,
+        provider_metadata: serde_json::from_str(&provider_metadata)?,
+        created_at: parse_timestamp(&created_at)?,
+        ready_at: ready_at.map(|time| parse_timestamp(&time)).transpose()?,
+        expires_at: expires_at.map(|time| parse_timestamp(&time)).transpose()?,
+        error: row.try_get("error")?,
     })
 }
 
@@ -2106,6 +2663,7 @@ fn parse_timestamp(value: &str) -> Result<DateTime<Utc>, ApiError> {
 
 fn state_to_str(state: &SandboxState) -> &'static str {
     match state {
+        SandboxState::Planning => "planning",
         SandboxState::Provisioning => "provisioning",
         SandboxState::Ready => "ready",
         SandboxState::Running => "running",
@@ -2118,6 +2676,7 @@ fn state_to_str(state: &SandboxState) -> &'static str {
 
 fn parse_state(value: &str) -> Result<SandboxState, ApiError> {
     match value {
+        "planning" => Ok(SandboxState::Planning),
         "provisioning" => Ok(SandboxState::Provisioning),
         "ready" => Ok(SandboxState::Ready),
         "running" => Ok(SandboxState::Running),
@@ -2128,6 +2687,15 @@ fn parse_state(value: &str) -> Result<SandboxState, ApiError> {
         _ => Err(ApiError::internal(
             "database contains invalid sandbox state",
         )),
+    }
+}
+
+fn snapshot_status_to_str(status: &SnapshotStatus) -> &'static str {
+    match status {
+        SnapshotStatus::Pending => "pending",
+        SnapshotStatus::Ready => "ready",
+        SnapshotStatus::Failed => "failed",
+        SnapshotStatus::Expired => "expired",
     }
 }
 
@@ -2216,6 +2784,18 @@ fn parse_command_status(value: &str) -> Result<CommandStatus, ApiError> {
         "failed" => Ok(CommandStatus::Failed),
         _ => Err(ApiError::internal(
             "database contains invalid command status",
+        )),
+    }
+}
+
+fn parse_snapshot_status(value: &str) -> Result<SnapshotStatus, ApiError> {
+    match value {
+        "pending" => Ok(SnapshotStatus::Pending),
+        "ready" => Ok(SnapshotStatus::Ready),
+        "failed" => Ok(SnapshotStatus::Failed),
+        "expired" => Ok(SnapshotStatus::Expired),
+        _ => Err(ApiError::internal(
+            "database contains invalid snapshot status",
         )),
     }
 }

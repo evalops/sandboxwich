@@ -183,6 +183,7 @@ impl fmt::Display for SshKeyId {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxState {
+    Planning,
     Provisioning,
     Ready,
     Running,
@@ -190,6 +191,15 @@ pub enum SandboxState {
     Archiving,
     Archived,
     Error,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotStatus {
+    Pending,
+    Ready,
+    Failed,
+    Expired,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -221,6 +231,47 @@ pub struct SandboxResponse {
 pub struct SandboxListResponse {
     pub ok: bool,
     pub sandboxes: Vec<Sandbox>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub id: SnapshotId,
+    pub sandbox_id: SandboxId,
+    pub status: SnapshotStatus,
+    pub label: String,
+    pub inventory: serde_json::Value,
+    pub provider_metadata: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+    pub ready_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CreateSnapshotRequest {
+    pub label: Option<String>,
+    pub inventory: Option<serde_json::Value>,
+    pub provider_metadata: Option<serde_json::Value>,
+    pub ttl_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotResponse {
+    pub ok: bool,
+    pub snapshot: Snapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotListResponse {
+    pub ok: bool,
+    pub snapshots: Vec<Snapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotCleanupResponse {
+    pub ok: bool,
+    pub expired: Vec<Snapshot>,
+    pub archived_sandboxes_deleted: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

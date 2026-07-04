@@ -1,10 +1,11 @@
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use sandboxwich_core::{
-    CommandListResponse, CommandRequest, CommandResponse, CreateSandboxRequest, EventListResponse,
-    GuestHealthResponse, GuestStatus, JobListResponse, RequestSshKeyRequest, SandboxListResponse,
-    SandboxResponse, SshKeyListResponse, SshKeyResponse, SshKeyStatus, UpdateGuestHealthRequest,
-    UpdateSshKeyStatusRequest, WorkerListResponse,
+    CommandListResponse, CommandRequest, CommandResponse, CreateSandboxRequest,
+    CreateSnapshotRequest, EventListResponse, GuestHealthResponse, GuestStatus, JobListResponse,
+    RequestSshKeyRequest, SandboxListResponse, SandboxResponse, SnapshotCleanupResponse,
+    SnapshotListResponse, SnapshotResponse, SshKeyListResponse, SshKeyResponse, SshKeyStatus,
+    UpdateGuestHealthRequest, UpdateSshKeyStatusRequest, WorkerListResponse,
 };
 use uuid::Uuid;
 
@@ -27,6 +28,10 @@ enum Command {
     Stop { sandbox_id: Uuid },
     Resume { sandbox_id: Uuid },
     Fork(ForkArgs),
+    CreateSnapshot(CreateSnapshotArgs),
+    Snapshots { sandbox_id: Uuid },
+    Snapshot { snapshot_id: Uuid },
+    CleanupSnapshots,
     Exec(ExecArgs),
     Commands { sandbox_id: Uuid },
     Command { command_id: Uuid },
@@ -58,6 +63,17 @@ struct ForkArgs {
 
     #[arg(long)]
     name: Option<String>,
+
+    #[arg(long)]
+    ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+struct CreateSnapshotArgs {
+    sandbox_id: Uuid,
+
+    #[arg(long)]
+    label: Option<String>,
 
     #[arg(long)]
     ttl_seconds: Option<u64>,
@@ -179,6 +195,40 @@ async fn main() -> anyhow::Result<()> {
                 .send()
                 .await?;
             print_json::<SandboxResponse>(response).await?;
+        }
+        Command::CreateSnapshot(args) => {
+            let response = client
+                .post(format!("{api}/sandboxes/{}/snapshots", args.sandbox_id))
+                .json(&CreateSnapshotRequest {
+                    label: args.label,
+                    inventory: None,
+                    provider_metadata: None,
+                    ttl_seconds: args.ttl_seconds,
+                })
+                .send()
+                .await?;
+            print_json::<SnapshotResponse>(response).await?;
+        }
+        Command::Snapshots { sandbox_id } => {
+            let response = client
+                .get(format!("{api}/sandboxes/{sandbox_id}/snapshots"))
+                .send()
+                .await?;
+            print_json::<SnapshotListResponse>(response).await?;
+        }
+        Command::Snapshot { snapshot_id } => {
+            let response = client
+                .get(format!("{api}/snapshots/{snapshot_id}"))
+                .send()
+                .await?;
+            print_json::<SnapshotResponse>(response).await?;
+        }
+        Command::CleanupSnapshots => {
+            let response = client
+                .post(format!("{api}/snapshots/cleanup"))
+                .send()
+                .await?;
+            print_json::<SnapshotCleanupResponse>(response).await?;
         }
         Command::Exec(args) => {
             let response = client
