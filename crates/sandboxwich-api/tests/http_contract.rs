@@ -9,10 +9,13 @@ use sandboxwich_core::{
     CommandListResponse, CommandRequest, CommandResponse, CreateSandboxRequest, EventListResponse,
     HealthResponse, SandboxListResponse, SandboxResponse,
 };
+use sqlx::any::AnyPoolOptions;
 use tempfile::TempDir;
+use uuid::Uuid;
 
 struct TestServer {
     base_url: String,
+    database_url: String,
     child: Child,
     _data_dir: Option<TempDir>,
 }
@@ -76,6 +79,11 @@ async fn run_contract(server: TestServer) {
         .await
         .unwrap();
     assert_eq!(created.sandbox.name, "contract-test");
+    assert_database_rejects_invalid_typed_values(
+        &server.database_url,
+        &created.sandbox.id.to_string(),
+    )
+    .await;
 
     let listed: SandboxListResponse = client
         .get(format!("{}/sandboxes", server.base_url))
@@ -214,7 +222,7 @@ impl TestServer {
         drop(listener);
 
         let mut child = Command::new(env!("CARGO_BIN_EXE_sandboxwich-api"))
-            .env("SANDBOXWICH_DATABASE_URL", database_url)
+            .env("SANDBOXWICH_DATABASE_URL", &database_url)
             .env("SANDBOXWICH_BIND", bind.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -228,6 +236,7 @@ impl TestServer {
                 if response.status().is_success() {
                     return Self {
                         base_url,
+                        database_url,
                         child,
                         _data_dir: data_dir,
                     };
@@ -243,4 +252,101 @@ impl TestServer {
         let _ = child.wait();
         panic!("server did not become healthy");
     }
+}
+
+async fn assert_database_rejects_invalid_typed_values(database_url: &str, sandbox_id: &str) {
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(database_url)
+        .await
+        .unwrap();
+
+    let invalid_sandbox_id = Uuid::now_v7().to_string();
+    let invalid_command_id = Uuid::now_v7().to_string();
+    let invalid_event_id = Uuid::now_v7().to_string();
+    let now = "2026-07-04T00:00:00Z";
+
+    let sandbox_result = sqlx::query(&insert_sandbox_sql(database_url))
+        .bind(invalid_sandbox_id)
+        .bind("invalid")
+        .bind("not_real")
+        .bind("ubuntu-dev")
+        .bind(now)
+        .bind(now)
+        .bind(120_i64)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await;
+    assert!(
+        sandbox_result.is_err(),
+        "invalid sandbox state was accepted"
+    );
+
+    let command_result = sqlx::query(&insert_command_sql(database_url))
+        .bind(invalid_command_id)
+        .bind(sandbox_id)
+        .bind("not_real")
+        .bind(r#"["echo","nope"]"#)
+        .bind(Option::<String>::None)
+        .bind(Option::<i32>::None)
+        .bind("")
+        .bind("")
+        .bind(now)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await;
+    assert!(
+        command_result.is_err(),
+        "invalid command status was accepted"
+    );
+
+    let event_result = sqlx::query(&insert_event_sql(database_url))
+        .bind(invalid_event_id)
+        .bind(sandbox_id)
+        .bind("not_real")
+        .bind("{}")
+        .bind(now)
+        .execute(&pool)
+        .await;
+    assert!(event_result.is_err(), "invalid event kind was accepted");
+}
+
+fn insert_sandbox_sql(database_url: &str) -> String {
+    format!(
+        "insert into sandboxes
+         (id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id)
+         values ({})",
+        placeholders(database_url, 8)
+    )
+}
+
+fn insert_command_sql(database_url: &str) -> String {
+    format!(
+        "insert into commands
+         (id, sandbox_id, status, argv, cwd, exit_code, stdout, stderr, created_at, finished_at)
+         values ({})",
+        placeholders(database_url, 10)
+    )
+}
+
+fn insert_event_sql(database_url: &str) -> String {
+    format!(
+        "insert into sandbox_events (id, sandbox_id, kind, data, created_at)
+         values ({})",
+        placeholders(database_url, 5)
+    )
+}
+
+fn placeholders(database_url: &str, count: usize) -> String {
+    (1..=count)
+        .map(|index| {
+            if database_url.starts_with("postgres:") || database_url.starts_with("postgresql:") {
+                format!("${index}")
+            } else {
+                "?".to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }

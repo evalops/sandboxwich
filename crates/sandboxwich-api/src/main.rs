@@ -56,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "sqlite://sandboxwich.db".to_string());
     let db = connect_database(&database_url).await?;
     sqlx::migrate!("./migrations").run(&db.pool).await?;
+    ensure_database_constraints(&db).await?;
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, %database_url, "sandboxwich-api listening");
@@ -79,6 +80,145 @@ async fn connect_database(database_url: &str) -> anyhow::Result<Database> {
         .connect(database_url)
         .await?;
     Ok(Database { pool, dialect })
+}
+
+async fn ensure_database_constraints(db: &Database) -> anyhow::Result<()> {
+    match db.dialect {
+        SqlDialect::Postgres => ensure_postgres_constraints(db).await,
+        SqlDialect::Sqlite => ensure_sqlite_constraints(db).await,
+    }
+}
+
+async fn ensure_postgres_constraints(db: &Database) -> anyhow::Result<()> {
+    for statement in [
+        r#"
+        do $$
+        begin
+            if not exists (
+                select 1 from pg_constraint where conname = 'sandboxes_state_check'
+            ) then
+                alter table sandboxes add constraint sandboxes_state_check
+                    check (state in ('provisioning', 'ready', 'running', 'idle', 'archiving', 'archived', 'error'));
+            end if;
+        end $$;
+        "#,
+        r#"
+        do $$
+        begin
+            if not exists (
+                select 1 from pg_constraint where conname = 'commands_status_check'
+            ) then
+                alter table commands add constraint commands_status_check
+                    check (status in ('queued', 'running', 'finished', 'failed'));
+            end if;
+        end $$;
+        "#,
+        r#"
+        do $$
+        begin
+            if not exists (
+                select 1 from pg_constraint where conname = 'sandbox_events_kind_check'
+            ) then
+                alter table sandbox_events add constraint sandbox_events_kind_check
+                    check (kind in (
+                        'lifecycle_changed',
+                        'command_queued',
+                        'command_started',
+                        'command_output',
+                        'command_finished',
+                        'prompt_queued',
+                        'prompt_finished',
+                        'desktop_ready'
+                    ));
+            end if;
+        end $$;
+        "#,
+    ] {
+        sqlx::query(statement).execute(&db.pool).await?;
+    }
+
+    Ok(())
+}
+
+async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
+    for statement in [
+        r#"
+        create trigger if not exists validate_sandboxes_state_insert
+        before insert on sandboxes
+        for each row
+        when new.state not in ('provisioning', 'ready', 'running', 'idle', 'archiving', 'archived', 'error')
+        begin
+            select raise(abort, 'invalid sandbox state');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_sandboxes_state_update
+        before update of state on sandboxes
+        for each row
+        when new.state not in ('provisioning', 'ready', 'running', 'idle', 'archiving', 'archived', 'error')
+        begin
+            select raise(abort, 'invalid sandbox state');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_commands_status_insert
+        before insert on commands
+        for each row
+        when new.status not in ('queued', 'running', 'finished', 'failed')
+        begin
+            select raise(abort, 'invalid command status');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_commands_status_update
+        before update of status on commands
+        for each row
+        when new.status not in ('queued', 'running', 'finished', 'failed')
+        begin
+            select raise(abort, 'invalid command status');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_sandbox_events_kind_insert
+        before insert on sandbox_events
+        for each row
+        when new.kind not in (
+            'lifecycle_changed',
+            'command_queued',
+            'command_started',
+            'command_output',
+            'command_finished',
+            'prompt_queued',
+            'prompt_finished',
+            'desktop_ready'
+        )
+        begin
+            select raise(abort, 'invalid event kind');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_sandbox_events_kind_update
+        before update of kind on sandbox_events
+        for each row
+        when new.kind not in (
+            'lifecycle_changed',
+            'command_queued',
+            'command_started',
+            'command_output',
+            'command_finished',
+            'prompt_queued',
+            'prompt_finished',
+            'desktop_ready'
+        )
+        begin
+            select raise(abort, 'invalid event kind');
+        end;
+        "#,
+    ] {
+        sqlx::query(statement).execute(&db.pool).await?;
+    }
+
+    Ok(())
 }
 
 fn app(state: AppState) -> Router {
