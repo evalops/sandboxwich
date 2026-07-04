@@ -1,15 +1,14 @@
 mod provider;
 
-use std::{collections::BTreeMap, process::Command as ProcessCommand};
+use std::{collections::BTreeMap, time::Duration};
 
 use anyhow::{Context, bail};
-use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use provider::{KubernetesApplyProvider, KubernetesDryRunProvider, SandboxProvider};
 use sandboxwich_core::{
-    AgentCommandRequest, AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse,
-    CompleteLeaseRequest, FailLeaseRequest, JobKind, LeaseResponse, RegisterWorkerRequest,
-    RenewLeaseRequest, WorkerCapability, WorkerHeartbeatRequest, WorkerResponse,
+    AgentCommandRequest, ClaimLeaseRequest, ClaimLeaseResponse, CompleteLeaseRequest,
+    FailLeaseRequest, JobKind, LeaseResponse, RegisterWorkerRequest, RenewLeaseRequest,
+    WorkerCapability, WorkerHeartbeatRequest, WorkerResponse,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -39,7 +38,8 @@ enum Command {
     Renew(RenewArgs),
     Complete(CompleteArgs),
     Fail(FailArgs),
-    WorkOnce(ClaimArgs),
+    WorkOnce(WorkOnceArgs),
+    WorkLoop(WorkLoopArgs),
 }
 
 #[derive(Debug, Args)]
@@ -71,6 +71,34 @@ struct ClaimArgs {
 
     #[arg(long)]
     lease_seconds: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+struct WorkOnceArgs {
+    worker_id: Uuid,
+
+    #[arg(long)]
+    lease_seconds: Option<u64>,
+
+    #[command(flatten)]
+    provider: ProviderArgs,
+}
+
+#[derive(Debug, Args)]
+struct WorkLoopArgs {
+    worker_id: Uuid,
+
+    #[arg(long)]
+    lease_seconds: Option<u64>,
+
+    #[arg(long, default_value_t = 1000)]
+    idle_sleep_ms: u64,
+
+    #[arg(long)]
+    max_iterations: Option<u64>,
+
+    #[command(flatten)]
+    provider: ProviderArgs,
 }
 
 #[derive(Debug, Args)]
@@ -241,7 +269,14 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Register(args) => {
             let capabilities = if args.capability.is_empty() {
-                vec![WorkerCapability::K8sPod, WorkerCapability::RunCommand]
+                vec![
+                    WorkerCapability::K8sPod,
+                    WorkerCapability::ProvisionSandbox,
+                    WorkerCapability::RunCommand,
+                    WorkerCapability::AgentPrompt,
+                    WorkerCapability::Snapshot,
+                    WorkerCapability::DesktopStream,
+                ]
             } else {
                 args.capability.into_iter().map(to_capability).collect()
             };
@@ -307,58 +342,25 @@ async fn main() -> anyhow::Result<()> {
             print_json::<LeaseResponse>(response).await?;
         }
         Command::WorkOnce(args) => {
-            let response = claim(&client, &api, args).await?;
+            let provider = provider_from_args(args.provider);
+            let response = claim(
+                &client,
+                &api,
+                ClaimArgs {
+                    worker_id: args.worker_id,
+                    lease_seconds: args.lease_seconds,
+                },
+            )
+            .await?;
             let Some(lease) = response.lease else {
                 println!("{}", serde_json::to_string_pretty(&response)?);
                 return Ok(());
             };
-            match lease.job.kind {
-                JobKind::RunCommand => {
-                    let result =
-                        execute_local_agent(agent_request_from_payload(&lease.job.payload)?)?;
-                    let exit_code = result.exit_code.unwrap_or(1);
-                    let endpoint = if exit_code == 0 { "complete" } else { "fail" };
-                    let body = if exit_code == 0 {
-                        serde_json::to_value(CompleteLeaseRequest {
-                            result: Some(serde_json::to_value(&result)?),
-                        })?
-                    } else {
-                        serde_json::to_value(FailLeaseRequest {
-                            error: result.stderr.clone(),
-                            retry: false,
-                        })?
-                    };
-                    let response = client
-                        .post(format!("{api}/leases/{}/{endpoint}", lease.id))
-                        .json(&body)
-                        .send()
-                        .await?;
-                    print_json::<LeaseResponse>(response).await?;
-                }
-                JobKind::RunPrompt => {
-                    let response = client
-                        .post(format!("{api}/leases/{}/complete", lease.id))
-                        .json(&CompleteLeaseRequest {
-                            result: Some(json!({
-                                "output": prompt_output_from_payload(&lease.job.payload)?
-                            })),
-                        })
-                        .send()
-                        .await?;
-                    print_json::<LeaseResponse>(response).await?;
-                }
-                _ => {
-                    let response = client
-                        .post(format!("{api}/leases/{}/fail", lease.id))
-                        .json(&FailLeaseRequest {
-                            error: "worker does not implement this job kind yet".to_string(),
-                            retry: true,
-                        })
-                        .send()
-                        .await?;
-                    print_json::<LeaseResponse>(response).await?;
-                }
-            }
+            let response = handle_lease(&client, &api, lease, &provider).await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
+        Command::WorkLoop(args) => {
+            work_loop(&client, &api, args).await?;
         }
     }
 
@@ -394,6 +396,176 @@ async fn claim(
     decode_json::<ClaimLeaseResponse>(response).await
 }
 
+async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> anyhow::Result<()> {
+    let provider = provider_from_args(args.provider);
+    let mut iterations = 0_u64;
+
+    loop {
+        if args
+            .max_iterations
+            .map(|max_iterations| iterations >= max_iterations)
+            .unwrap_or(false)
+        {
+            break;
+        }
+        iterations += 1;
+
+        let response = claim(
+            client,
+            api,
+            ClaimArgs {
+                worker_id: args.worker_id,
+                lease_seconds: args.lease_seconds,
+            },
+        )
+        .await?;
+
+        let Some(lease) = response.lease else {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "iteration": iterations,
+                    "idle": true
+                }))?
+            );
+            if args
+                .max_iterations
+                .map(|max_iterations| iterations < max_iterations)
+                .unwrap_or(true)
+            {
+                tokio::time::sleep(Duration::from_millis(args.idle_sleep_ms)).await;
+            }
+            continue;
+        };
+
+        let response = handle_lease(client, api, lease, &provider).await?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "iteration": iterations,
+                "lease": response.lease
+            }))?
+        );
+    }
+
+    Ok(())
+}
+
+async fn handle_lease(
+    client: &reqwest::Client,
+    api: &str,
+    lease: sandboxwich_core::JobLease,
+    provider: &impl SandboxProvider,
+) -> anyhow::Result<LeaseResponse> {
+    match execute_job(&lease.job, provider) {
+        Ok(WorkerJobOutcome::Complete(result)) => {
+            let response = client
+                .post(format!("{api}/leases/{}/complete", lease.id))
+                .json(&CompleteLeaseRequest {
+                    result: Some(result),
+                })
+                .send()
+                .await?;
+            decode_json::<LeaseResponse>(response).await
+        }
+        Ok(WorkerJobOutcome::Fail { error, retry }) => {
+            let response = client
+                .post(format!("{api}/leases/{}/fail", lease.id))
+                .json(&FailLeaseRequest { error, retry })
+                .send()
+                .await?;
+            decode_json::<LeaseResponse>(response).await
+        }
+        Err(error) => {
+            let response = client
+                .post(format!("{api}/leases/{}/fail", lease.id))
+                .json(&FailLeaseRequest {
+                    error: error.to_string(),
+                    retry: false,
+                })
+                .send()
+                .await?;
+            decode_json::<LeaseResponse>(response).await
+        }
+    }
+}
+
+#[derive(Debug)]
+enum WorkerJobOutcome {
+    Complete(serde_json::Value),
+    Fail { error: String, retry: bool },
+}
+
+fn execute_job(
+    job: &sandboxwich_core::Job,
+    provider: &impl SandboxProvider,
+) -> anyhow::Result<WorkerJobOutcome> {
+    match job.kind {
+        JobKind::ProvisionSandbox => {
+            let sandbox_id = sandbox_id_from_payload(&job.payload)?;
+            let handle = provider.provision(sandbox_id);
+            Ok(WorkerJobOutcome::Complete(json!({
+                "provider": handle.provider,
+                "sandboxId": handle.sandbox_id,
+                "providerMetadata": handle.metadata
+            })))
+        }
+        JobKind::RunCommand => {
+            let sandbox_id = sandbox_id_from_payload(&job.payload)?;
+            let result =
+                provider.exec_handoff(sandbox_id, agent_request_from_payload(&job.payload)?);
+            if result.exit_code.unwrap_or(1) == 0 {
+                Ok(WorkerJobOutcome::Complete(serde_json::to_value(&result)?))
+            } else {
+                Ok(WorkerJobOutcome::Fail {
+                    error: result.stderr,
+                    retry: false,
+                })
+            }
+        }
+        JobKind::RunPrompt => Ok(WorkerJobOutcome::Complete(json!({
+            "output": prompt_output_from_payload(&job.payload)?
+        }))),
+        JobKind::CreateSnapshot => {
+            let sandbox_id = sandbox_id_from_payload(&job.payload)?;
+            let snapshot_id = snapshot_id_from_payload(&job.payload)?;
+            let handle = provider.create_snapshot(sandbox_id, snapshot_id);
+            Ok(WorkerJobOutcome::Complete(json!({
+                "inventory": {
+                    "sandboxId": sandbox_id,
+                    "snapshotId": snapshot_id,
+                    "provider": handle.provider
+                },
+                "providerMetadata": handle.metadata
+            })))
+        }
+        JobKind::ForkSandbox => {
+            let parent_sandbox_id = parent_sandbox_id_from_payload(&job.payload)?;
+            let child_sandbox_id = child_sandbox_id_from_payload(&job.payload)?;
+            let snapshot_id = snapshot_id_from_payload(&job.payload)?;
+            let handle = provider.fork(parent_sandbox_id, child_sandbox_id, snapshot_id);
+            Ok(WorkerJobOutcome::Complete(json!({
+                "provider": handle.provider,
+                "parentSandboxId": handle.parent_sandbox_id,
+                "childSandboxId": handle.child_sandbox_id,
+                "snapshotId": handle.snapshot_id,
+                "providerMetadata": handle.metadata
+            })))
+        }
+        JobKind::StopSandbox | JobKind::ResumeSandbox => {
+            let sandbox_id = sandbox_id_from_payload(&job.payload)?;
+            Ok(WorkerJobOutcome::Complete(json!({
+                "provider": "kubernetes",
+                "mode": "dry_run",
+                "operation": job.kind,
+                "sandboxId": sandbox_id
+            })))
+        }
+    }
+}
+
 fn parse_label(value: &str) -> Result<(String, String), String> {
     let Some((key, value)) = value.split_once('=') else {
         return Err("labels must be formatted as key=value".to_string());
@@ -427,31 +599,6 @@ fn agent_request_from_payload(payload: &serde_json::Value) -> anyhow::Result<Age
     Ok(AgentCommandRequest { argv, cwd, env })
 }
 
-fn execute_local_agent(request: AgentCommandRequest) -> anyhow::Result<AgentCommandResult> {
-    let Some((program, args)) = request.argv.split_first() else {
-        bail!("argv must contain at least one item");
-    };
-
-    let started_at = Utc::now();
-    let mut command = ProcessCommand::new(program);
-    command.args(args);
-    if let Some(cwd) = request.cwd {
-        command.current_dir(cwd);
-    }
-    command.envs(request.env);
-
-    let output = command.output().context("failed to execute command")?;
-    let finished_at = Utc::now();
-
-    Ok(AgentCommandResult {
-        exit_code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        started_at,
-        finished_at,
-    })
-}
-
 fn prompt_output_from_payload(payload: &serde_json::Value) -> anyhow::Result<String> {
     let instructions = payload
         .get("instructions")
@@ -461,6 +608,51 @@ fn prompt_output_from_payload(payload: &serde_json::Value) -> anyhow::Result<Str
         "dry-run prompt accepted: {}",
         instructions.lines().next().unwrap_or_default()
     ))
+}
+
+fn sandbox_id_from_payload(
+    payload: &serde_json::Value,
+) -> anyhow::Result<sandboxwich_core::SandboxId> {
+    Ok(sandboxwich_core::SandboxId(uuid_from_payload(
+        payload,
+        "sandboxId",
+    )?))
+}
+
+fn parent_sandbox_id_from_payload(
+    payload: &serde_json::Value,
+) -> anyhow::Result<sandboxwich_core::SandboxId> {
+    Ok(sandboxwich_core::SandboxId(uuid_from_payload(
+        payload,
+        "parentSandboxId",
+    )?))
+}
+
+fn child_sandbox_id_from_payload(
+    payload: &serde_json::Value,
+) -> anyhow::Result<sandboxwich_core::SandboxId> {
+    Ok(sandboxwich_core::SandboxId(uuid_from_payload(
+        payload,
+        "childSandboxId",
+    )?))
+}
+
+fn snapshot_id_from_payload(
+    payload: &serde_json::Value,
+) -> anyhow::Result<sandboxwich_core::SnapshotId> {
+    Ok(sandboxwich_core::SnapshotId(uuid_from_payload(
+        payload,
+        "snapshotId",
+    )?))
+}
+
+fn uuid_from_payload(payload: &serde_json::Value, field: &'static str) -> anyhow::Result<Uuid> {
+    payload
+        .get(field)
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("job payload is missing {field}"))?
+        .parse()
+        .with_context(|| format!("job payload {field} is invalid"))
 }
 
 async fn print_json<T>(response: reqwest::Response) -> anyhow::Result<()>
@@ -496,5 +688,158 @@ fn to_capability(value: CapabilityArg) -> WorkerCapability {
         CapabilityArg::Snapshot => WorkerCapability::Snapshot,
         CapabilityArg::DesktopStream => WorkerCapability::DesktopStream,
         CapabilityArg::K8sPod => WorkerCapability::K8sPod,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use sandboxwich_core::{Job, JobId, JobStatus, SandboxId, SnapshotId};
+
+    fn provider() -> KubernetesDryRunProvider {
+        KubernetesDryRunProvider::with_snapshot_class(
+            "k3s-ci",
+            "sandboxwich-ci",
+            Some("local-path".to_string()),
+            Some("local-path-snapshot".to_string()),
+        )
+    }
+
+    fn job(kind: JobKind, payload: serde_json::Value, capability: WorkerCapability) -> Job {
+        let now = Utc::now();
+        Job {
+            id: JobId::new(),
+            kind,
+            status: JobStatus::Leased,
+            payload,
+            required_capability: capability,
+            priority: 0,
+            attempts: 1,
+            max_attempts: 3,
+            scheduled_at: now,
+            created_at: now,
+            updated_at: now,
+            last_error: None,
+        }
+    }
+
+    fn completed_value(outcome: WorkerJobOutcome) -> serde_json::Value {
+        match outcome {
+            WorkerJobOutcome::Complete(value) => value,
+            WorkerJobOutcome::Fail { error, .. } => panic!("expected completion, got {error}"),
+        }
+    }
+
+    #[test]
+    fn dispatches_provision_job_to_provider_manifest() {
+        let sandbox_id = SandboxId::new();
+        let outcome = execute_job(
+            &job(
+                JobKind::ProvisionSandbox,
+                json!({ "sandboxId": sandbox_id }),
+                WorkerCapability::ProvisionSandbox,
+            ),
+            &provider(),
+        )
+        .expect("provision job should execute");
+        let value = completed_value(outcome);
+
+        assert_eq!(value["sandboxId"], json!(sandbox_id));
+        assert_eq!(value["providerMetadata"]["manifests"]["pod"]["kind"], "Pod");
+        assert_eq!(
+            value["providerMetadata"]["manifests"]["sshService"]["kind"],
+            "Service"
+        );
+    }
+
+    #[test]
+    fn dispatches_command_job_to_provider_exec_handoff() {
+        let sandbox_id = SandboxId::new();
+        let outcome = execute_job(
+            &job(
+                JobKind::RunCommand,
+                json!({
+                    "sandboxId": sandbox_id,
+                    "argv": ["echo", "hello"],
+                    "env": {}
+                }),
+                WorkerCapability::RunCommand,
+            ),
+            &provider(),
+        )
+        .expect("command job should execute");
+        let value = completed_value(outcome);
+
+        assert_eq!(value["exit_code"], 0);
+        assert!(
+            value["stdout"]
+                .as_str()
+                .expect("stdout should be a string")
+                .contains("\"operation\":\"exec\"")
+        );
+    }
+
+    #[test]
+    fn dispatches_snapshot_and_fork_jobs_to_provider_metadata() {
+        let sandbox_id = SandboxId::new();
+        let child_sandbox_id = SandboxId::new();
+        let snapshot_id = SnapshotId::new();
+        let provider = provider();
+
+        let snapshot = completed_value(
+            execute_job(
+                &job(
+                    JobKind::CreateSnapshot,
+                    json!({
+                        "sandboxId": sandbox_id,
+                        "snapshotId": snapshot_id
+                    }),
+                    WorkerCapability::Snapshot,
+                ),
+                &provider,
+            )
+            .expect("snapshot job should execute"),
+        );
+        assert_eq!(
+            snapshot["providerMetadata"]["manifests"]["volumeSnapshot"]["kind"],
+            "VolumeSnapshot"
+        );
+
+        let fork = completed_value(
+            execute_job(
+                &job(
+                    JobKind::ForkSandbox,
+                    json!({
+                        "parentSandboxId": sandbox_id,
+                        "childSandboxId": child_sandbox_id,
+                        "snapshotId": snapshot_id
+                    }),
+                    WorkerCapability::Snapshot,
+                ),
+                &provider,
+            )
+            .expect("fork job should execute"),
+        );
+        assert_eq!(fork["childSandboxId"], json!(child_sandbox_id));
+        assert_eq!(
+            fork["providerMetadata"]["manifests"]["pvc"]["spec"]["dataSource"]["kind"],
+            "VolumeSnapshot"
+        );
+    }
+
+    #[test]
+    fn dispatch_rejects_malformed_structured_payloads() {
+        let error = execute_job(
+            &job(
+                JobKind::RunCommand,
+                json!({ "argv": ["echo", "hello"] }),
+                WorkerCapability::RunCommand,
+            ),
+            &provider(),
+        )
+        .expect_err("missing sandboxId should fail");
+
+        assert!(error.to_string().contains("sandboxId"));
     }
 }
