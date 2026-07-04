@@ -114,6 +114,50 @@ impl fmt::Display for WorkerId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct JobId(pub Uuid);
+
+impl JobId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for JobId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for JobId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LeaseId(pub Uuid);
+
+impl LeaseId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for LeaseId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for LeaseId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxState {
@@ -299,6 +343,120 @@ pub struct WorkerResponse {
 pub struct WorkerListResponse {
     pub ok: bool,
     pub workers: Vec<Worker>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobKind {
+    ProvisionSandbox,
+    StopSandbox,
+    ResumeSandbox,
+    RunCommand,
+    CreateSnapshot,
+    ForkSandbox,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobStatus {
+    Queued,
+    Leased,
+    Succeeded,
+    Failed,
+    Dead,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseStatus {
+    Active,
+    Completed,
+    Failed,
+    Expired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Job {
+    pub id: JobId,
+    pub kind: JobKind,
+    pub status: JobStatus,
+    pub payload: serde_json::Value,
+    pub required_capability: WorkerCapability,
+    pub priority: i64,
+    pub attempts: i64,
+    pub max_attempts: i64,
+    pub scheduled_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct JobLease {
+    pub id: LeaseId,
+    pub job_id: JobId,
+    pub worker_id: WorkerId,
+    pub status: LeaseStatus,
+    pub attempt: i64,
+    pub leased_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
+    pub job: Job,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CreateJobRequest {
+    pub kind: JobKind,
+    pub payload: serde_json::Value,
+    pub required_capability: WorkerCapability,
+    pub priority: Option<i64>,
+    pub max_attempts: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClaimLeaseRequest {
+    pub lease_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RenewLeaseRequest {
+    pub lease_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompleteLeaseRequest {
+    pub result: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FailLeaseRequest {
+    pub error: String,
+    pub retry: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct JobResponse {
+    pub ok: bool,
+    pub job: Job,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct JobListResponse {
+    pub ok: bool,
+    pub jobs: Vec<Job>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LeaseResponse {
+    pub ok: bool,
+    pub lease: JobLease,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClaimLeaseResponse {
+    pub ok: bool,
+    pub lease: Option<JobLease>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

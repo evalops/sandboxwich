@@ -10,12 +10,14 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use sandboxwich_core::{
-    CommandId, CommandListResponse, CommandRequest, CommandResponse, CommandRun, CommandStatus,
-    CreateSandboxRequest, ErrorEnvelope, EventId, EventListResponse, HealthResponse,
-    PromptQueuedResponse, PromptRequest, RegisterWorkerRequest, Sandbox, SandboxEvent,
-    SandboxEventKind, SandboxId, SandboxListResponse, SandboxResponse, SandboxState, SnapshotId,
-    Worker, WorkerCapability, WorkerHeartbeatRequest, WorkerId, WorkerListResponse, WorkerResponse,
-    WorkerStatus,
+    ClaimLeaseRequest, ClaimLeaseResponse, CommandId, CommandListResponse, CommandRequest,
+    CommandResponse, CommandRun, CommandStatus, CompleteLeaseRequest, CreateJobRequest,
+    CreateSandboxRequest, ErrorEnvelope, EventId, EventListResponse, FailLeaseRequest,
+    HealthResponse, Job, JobId, JobKind, JobLease, JobListResponse, JobResponse, JobStatus,
+    LeaseId, LeaseResponse, LeaseStatus, PromptQueuedResponse, PromptRequest,
+    RegisterWorkerRequest, RenewLeaseRequest, Sandbox, SandboxEvent, SandboxEventKind, SandboxId,
+    SandboxListResponse, SandboxResponse, SandboxState, SnapshotId, Worker, WorkerCapability,
+    WorkerHeartbeatRequest, WorkerId, WorkerListResponse, WorkerResponse, WorkerStatus,
 };
 use serde_json::json;
 use sqlx::{
@@ -146,6 +148,46 @@ async fn ensure_postgres_constraints(db: &Database) -> anyhow::Result<()> {
             end if;
         end $$;
         "#,
+        r#"
+        do $$
+        begin
+            if not exists (
+                select 1 from pg_constraint where conname = 'jobs_kind_check'
+            ) then
+                alter table jobs add constraint jobs_kind_check
+                    check (kind in (
+                        'provision_sandbox',
+                        'stop_sandbox',
+                        'resume_sandbox',
+                        'run_command',
+                        'create_snapshot',
+                        'fork_sandbox'
+                    ));
+            end if;
+        end $$;
+        "#,
+        r#"
+        do $$
+        begin
+            if not exists (
+                select 1 from pg_constraint where conname = 'jobs_status_check'
+            ) then
+                alter table jobs add constraint jobs_status_check
+                    check (status in ('queued', 'leased', 'succeeded', 'failed', 'dead'));
+            end if;
+        end $$;
+        "#,
+        r#"
+        do $$
+        begin
+            if not exists (
+                select 1 from pg_constraint where conname = 'job_leases_status_check'
+            ) then
+                alter table job_leases add constraint job_leases_status_check
+                    check (status in ('active', 'completed', 'failed', 'expired'));
+            end if;
+        end $$;
+        "#,
     ] {
         sqlx::query(statement).execute(&db.pool).await?;
     }
@@ -245,6 +287,60 @@ async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
             select raise(abort, 'invalid worker status');
         end;
         "#,
+        r#"
+        create trigger if not exists validate_jobs_kind_insert
+        before insert on jobs
+        for each row
+        when new.kind not in ('provision_sandbox', 'stop_sandbox', 'resume_sandbox', 'run_command', 'create_snapshot', 'fork_sandbox')
+        begin
+            select raise(abort, 'invalid job kind');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_jobs_kind_update
+        before update of kind on jobs
+        for each row
+        when new.kind not in ('provision_sandbox', 'stop_sandbox', 'resume_sandbox', 'run_command', 'create_snapshot', 'fork_sandbox')
+        begin
+            select raise(abort, 'invalid job kind');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_jobs_status_insert
+        before insert on jobs
+        for each row
+        when new.status not in ('queued', 'leased', 'succeeded', 'failed', 'dead')
+        begin
+            select raise(abort, 'invalid job status');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_jobs_status_update
+        before update of status on jobs
+        for each row
+        when new.status not in ('queued', 'leased', 'succeeded', 'failed', 'dead')
+        begin
+            select raise(abort, 'invalid job status');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_job_leases_status_insert
+        before insert on job_leases
+        for each row
+        when new.status not in ('active', 'completed', 'failed', 'expired')
+        begin
+            select raise(abort, 'invalid lease status');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_job_leases_status_update
+        before update of status on job_leases
+        for each row
+        when new.status not in ('active', 'completed', 'failed', 'expired')
+        begin
+            select raise(abort, 'invalid lease status');
+        end;
+        "#,
     ] {
         sqlx::query(statement).execute(&db.pool).await?;
     }
@@ -270,6 +366,11 @@ fn app(state: AppState) -> Router {
         .route("/workers", get(list_workers))
         .route("/workers/register", post(register_worker))
         .route("/workers/{worker_id}/heartbeat", post(heartbeat_worker))
+        .route("/jobs", get(list_jobs).post(create_job))
+        .route("/workers/{worker_id}/leases/claim", post(claim_lease))
+        .route("/leases/{lease_id}/renew", post(renew_lease))
+        .route("/leases/{lease_id}/complete", post(complete_lease))
+        .route("/leases/{lease_id}/fail", post(fail_lease))
         .with_state(state)
 }
 
@@ -428,17 +529,40 @@ async fn queue_command(
     let command = CommandRun {
         id: CommandId::new(),
         sandbox_id,
-        status: CommandStatus::Finished,
+        status: CommandStatus::Queued,
         argv: request.argv,
         cwd: request.cwd,
-        exit_code: Some(0),
-        stdout: "dry-run: worker backend is not connected yet\n".to_string(),
+        exit_code: None,
+        stdout: String::new(),
         stderr: String::new(),
         created_at: now,
-        finished_at: Some(now),
+        finished_at: None,
     };
 
     insert_command(&state.db, &command).await?;
+    insert_job(
+        &state.db,
+        &Job {
+            id: JobId::new(),
+            kind: JobKind::RunCommand,
+            status: JobStatus::Queued,
+            payload: json!({
+                "sandboxId": sandbox_id,
+                "commandId": command.id,
+                "argv": command.argv,
+                "cwd": command.cwd,
+            }),
+            required_capability: WorkerCapability::RunCommand,
+            priority: 0,
+            attempts: 0,
+            max_attempts: 3,
+            scheduled_at: now,
+            created_at: now,
+            updated_at: now,
+            last_error: None,
+        },
+    )
+    .await?;
     insert_event(
         &state.db,
         sandbox_id,
@@ -449,18 +573,6 @@ async fn queue_command(
         }),
     )
     .await?;
-    insert_event(
-        &state.db,
-        sandbox_id,
-        SandboxEventKind::CommandFinished,
-        json!({
-            "commandId": command.id,
-            "exitCode": command.exit_code,
-            "stdout": command.stdout
-        }),
-    )
-    .await?;
-
     Ok(Json(CommandResponse { ok: true, command }))
 }
 
@@ -638,6 +750,190 @@ async fn list_workers(State(state): State<AppState>) -> Result<Json<WorkerListRe
     Ok(Json(WorkerListResponse { ok: true, workers }))
 }
 
+async fn create_job(
+    State(state): State<AppState>,
+    Json(request): Json<CreateJobRequest>,
+) -> Result<Json<JobResponse>, ApiError> {
+    let now = Utc::now();
+    let job = Job {
+        id: JobId::new(),
+        kind: request.kind,
+        status: JobStatus::Queued,
+        payload: request.payload,
+        required_capability: request.required_capability,
+        priority: request.priority.unwrap_or(0),
+        attempts: 0,
+        max_attempts: request.max_attempts.unwrap_or(3).max(1),
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+    };
+    insert_job(&state.db, &job).await?;
+    Ok(Json(JobResponse { ok: true, job }))
+}
+
+async fn list_jobs(State(state): State<AppState>) -> Result<Json<JobListResponse>, ApiError> {
+    expire_due_leases(&state.db).await?;
+    let rows = sqlx::query(
+        "select id, kind, status, payload, required_capability, priority, attempts, max_attempts,
+                scheduled_at, created_at, updated_at, last_error
+         from jobs
+         order by created_at asc, id asc",
+    )
+    .fetch_all(&state.db.pool)
+    .await?;
+    let jobs = rows
+        .into_iter()
+        .map(row_to_job)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Json(JobListResponse { ok: true, jobs }))
+}
+
+async fn claim_lease(
+    State(state): State<AppState>,
+    Path(worker_id): Path<Uuid>,
+    Json(request): Json<ClaimLeaseRequest>,
+) -> Result<Json<ClaimLeaseResponse>, ApiError> {
+    let worker = fetch_worker(&state.db, WorkerId(worker_id)).await?;
+    expire_due_leases(&state.db).await?;
+
+    let rows = sqlx::query(
+        "select id, kind, status, payload, required_capability, priority, attempts, max_attempts,
+                scheduled_at, created_at, updated_at, last_error
+         from jobs
+         where status = 'queued'
+         order by priority desc, scheduled_at asc, created_at asc, id asc
+         limit 25",
+    )
+    .fetch_all(&state.db.pool)
+    .await?;
+
+    for row in rows {
+        let job = row_to_job(row)?;
+        if !worker.capabilities.contains(&job.required_capability) {
+            continue;
+        }
+        if let Some(lease) =
+            try_claim_job(&state.db, worker.id, &job, request.lease_seconds).await?
+        {
+            return Ok(Json(ClaimLeaseResponse {
+                ok: true,
+                lease: Some(lease),
+            }));
+        }
+    }
+
+    Ok(Json(ClaimLeaseResponse {
+        ok: true,
+        lease: None,
+    }))
+}
+
+async fn renew_lease(
+    State(state): State<AppState>,
+    Path(lease_id): Path<Uuid>,
+    Json(request): Json<RenewLeaseRequest>,
+) -> Result<Json<LeaseResponse>, ApiError> {
+    let lease_id = LeaseId(lease_id);
+    let now = Utc::now();
+    let expires_at = now + chrono::Duration::seconds(request.lease_seconds.unwrap_or(60) as i64);
+    let sql = format!(
+        "update job_leases
+         set expires_at = {}
+         where id = {} and status = 'active'",
+        state.db.placeholder(1),
+        state.db.placeholder(2)
+    );
+    let result = sqlx::query(&sql)
+        .bind(expires_at.to_rfc3339())
+        .bind(lease_id.to_string())
+        .execute(&state.db.pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("active lease not found"));
+    }
+
+    let lease = fetch_lease(&state.db, lease_id).await?;
+    Ok(Json(LeaseResponse { ok: true, lease }))
+}
+
+async fn complete_lease(
+    State(state): State<AppState>,
+    Path(lease_id): Path<Uuid>,
+    Json(request): Json<CompleteLeaseRequest>,
+) -> Result<Json<LeaseResponse>, ApiError> {
+    let lease_id = LeaseId(lease_id);
+    let lease = fetch_lease(&state.db, lease_id).await?;
+    if lease.status != LeaseStatus::Active {
+        return Err(ApiError::bad_request("lease is not active"));
+    }
+
+    let now = Utc::now();
+    update_lease_status(&state.db, lease_id, LeaseStatus::Completed, Some(now), None).await?;
+    update_job_status(&state.db, lease.job_id, JobStatus::Succeeded, None, now).await?;
+    apply_completed_job(
+        &state.db,
+        &lease.job,
+        request.result.unwrap_or_else(|| json!({})),
+    )
+    .await?;
+
+    let lease = fetch_lease(&state.db, lease_id).await?;
+    Ok(Json(LeaseResponse { ok: true, lease }))
+}
+
+async fn fail_lease(
+    State(state): State<AppState>,
+    Path(lease_id): Path<Uuid>,
+    Json(request): Json<FailLeaseRequest>,
+) -> Result<Json<LeaseResponse>, ApiError> {
+    if request.error.trim().is_empty() {
+        return Err(ApiError::bad_request("error is required"));
+    }
+    let lease_id = LeaseId(lease_id);
+    let lease = fetch_lease(&state.db, lease_id).await?;
+    if lease.status != LeaseStatus::Active {
+        return Err(ApiError::bad_request("lease is not active"));
+    }
+
+    let now = Utc::now();
+    update_lease_status(
+        &state.db,
+        lease_id,
+        LeaseStatus::Failed,
+        Some(now),
+        Some(&request.error),
+    )
+    .await?;
+    let retry = request.retry && lease.job.attempts < lease.job.max_attempts;
+    if retry {
+        update_job_status(
+            &state.db,
+            lease.job_id,
+            JobStatus::Queued,
+            Some(&request.error),
+            now,
+        )
+        .await?;
+        apply_retryable_job(&state.db, &lease.job, &request.error).await?;
+    } else {
+        update_job_status(
+            &state.db,
+            lease.job_id,
+            JobStatus::Failed,
+            Some(&request.error),
+            now,
+        )
+        .await?;
+        apply_failed_job(&state.db, &lease.job, &request.error).await?;
+    }
+
+    let lease = fetch_lease(&state.db, lease_id).await?;
+    Ok(Json(LeaseResponse { ok: true, lease }))
+}
+
 async fn transition_sandbox(
     db: &Database,
     sandbox_id: SandboxId,
@@ -773,6 +1069,410 @@ async fn insert_command(db: &Database, command: &CommandRun) -> Result<(), ApiEr
         .execute(&db.pool)
         .await?;
     Ok(())
+}
+
+async fn insert_job(db: &Database, job: &Job) -> Result<(), ApiError> {
+    let sql = format!(
+        "insert into jobs
+         (id, kind, status, payload, required_capability, priority, attempts, max_attempts,
+          scheduled_at, created_at, updated_at, last_error)
+         values ({})",
+        db.placeholders(12)
+    );
+    sqlx::query(&sql)
+        .bind(job.id.to_string())
+        .bind(job_kind_to_str(&job.kind))
+        .bind(job_status_to_str(&job.status))
+        .bind(serde_json::to_string(&job.payload)?)
+        .bind(worker_capability_to_str(&job.required_capability))
+        .bind(job.priority)
+        .bind(job.attempts)
+        .bind(job.max_attempts)
+        .bind(job.scheduled_at.to_rfc3339())
+        .bind(job.created_at.to_rfc3339())
+        .bind(job.updated_at.to_rfc3339())
+        .bind(&job.last_error)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+async fn try_claim_job(
+    db: &Database,
+    worker_id: WorkerId,
+    job: &Job,
+    lease_seconds: Option<u64>,
+) -> Result<Option<JobLease>, ApiError> {
+    let now = Utc::now();
+    let attempt = job.attempts + 1;
+    let expires_at = now + chrono::Duration::seconds(lease_seconds.unwrap_or(60) as i64);
+    let sql = format!(
+        "update jobs
+         set status = {}, attempts = {}, updated_at = {}
+         where id = {} and status = 'queued'",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4)
+    );
+    let result = sqlx::query(&sql)
+        .bind(job_status_to_str(&JobStatus::Leased))
+        .bind(attempt)
+        .bind(now.to_rfc3339())
+        .bind(job.id.to_string())
+        .execute(&db.pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Ok(None);
+    }
+
+    let lease = JobLease {
+        id: LeaseId::new(),
+        job_id: job.id,
+        worker_id,
+        status: LeaseStatus::Active,
+        attempt,
+        leased_at: now,
+        expires_at,
+        completed_at: None,
+        error: None,
+        job: fetch_job(db, job.id).await?,
+    };
+    insert_lease(db, &lease).await?;
+    let lease = fetch_lease(db, lease.id).await?;
+    apply_claimed_job(db, &lease.job).await?;
+    Ok(Some(lease))
+}
+
+async fn insert_lease(db: &Database, lease: &JobLease) -> Result<(), ApiError> {
+    let sql = format!(
+        "insert into job_leases
+         (id, job_id, worker_id, status, attempt, leased_at, expires_at, completed_at, error)
+         values ({})",
+        db.placeholders(9)
+    );
+    sqlx::query(&sql)
+        .bind(lease.id.to_string())
+        .bind(lease.job_id.to_string())
+        .bind(lease.worker_id.to_string())
+        .bind(lease_status_to_str(&lease.status))
+        .bind(lease.attempt)
+        .bind(lease.leased_at.to_rfc3339())
+        .bind(lease.expires_at.to_rfc3339())
+        .bind(lease.completed_at.map(|time| time.to_rfc3339()))
+        .bind(&lease.error)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+async fn expire_due_leases(db: &Database) -> Result<(), ApiError> {
+    let now = Utc::now();
+    let rows = sqlx::query(
+        "select id, job_id, worker_id, status, attempt, leased_at, expires_at, completed_at, error
+         from job_leases
+         where status = 'active'
+         order by expires_at asc, id asc",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+
+    for row in rows {
+        let lease = row_to_lease_without_job(row)?;
+        if lease.expires_at > now {
+            continue;
+        }
+        let job = fetch_job(db, lease.job_id).await?;
+        let next_status = if job.attempts >= job.max_attempts {
+            JobStatus::Dead
+        } else {
+            JobStatus::Queued
+        };
+        update_lease_status(
+            db,
+            lease.id,
+            LeaseStatus::Expired,
+            Some(now),
+            Some("lease expired"),
+        )
+        .await?;
+        update_job_status(db, job.id, next_status, Some("lease expired"), now).await?;
+        if job.attempts >= job.max_attempts {
+            apply_failed_job(db, &job, "lease expired").await?;
+        } else {
+            apply_retryable_job(db, &job, "lease expired").await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn fetch_job(db: &Database, job_id: JobId) -> Result<Job, ApiError> {
+    let sql = format!(
+        "select id, kind, status, payload, required_capability, priority, attempts, max_attempts,
+                scheduled_at, created_at, updated_at, last_error
+         from jobs
+         where id = {}",
+        db.placeholder(1)
+    );
+    let row = sqlx::query(&sql)
+        .bind(job_id.to_string())
+        .fetch_optional(&db.pool)
+        .await?
+        .ok_or_else(|| ApiError::not_found("job not found"))?;
+    row_to_job(row)
+}
+
+async fn fetch_lease(db: &Database, lease_id: LeaseId) -> Result<JobLease, ApiError> {
+    let sql = format!(
+        "select id, job_id, worker_id, status, attempt, leased_at, expires_at, completed_at, error
+         from job_leases
+         where id = {}",
+        db.placeholder(1)
+    );
+    let row = sqlx::query(&sql)
+        .bind(lease_id.to_string())
+        .fetch_optional(&db.pool)
+        .await?
+        .ok_or_else(|| ApiError::not_found("lease not found"))?;
+    let lease = row_to_lease_without_job(row)?;
+    let job = fetch_job(db, lease.job_id).await?;
+    Ok(JobLease { job, ..lease })
+}
+
+async fn update_lease_status(
+    db: &Database,
+    lease_id: LeaseId,
+    status: LeaseStatus,
+    completed_at: Option<DateTime<Utc>>,
+    error: Option<&str>,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "update job_leases
+         set status = {}, completed_at = {}, error = {}
+         where id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4)
+    );
+    sqlx::query(&sql)
+        .bind(lease_status_to_str(&status))
+        .bind(completed_at.map(|time| time.to_rfc3339()))
+        .bind(error)
+        .bind(lease_id.to_string())
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+async fn update_job_status(
+    db: &Database,
+    job_id: JobId,
+    status: JobStatus,
+    error: Option<&str>,
+    updated_at: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "update jobs
+         set status = {}, last_error = {}, updated_at = {}
+         where id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4)
+    );
+    sqlx::query(&sql)
+        .bind(job_status_to_str(&status))
+        .bind(error)
+        .bind(updated_at.to_rfc3339())
+        .bind(job_id.to_string())
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+async fn update_command_from_lease_result(
+    db: &Database,
+    command_id: CommandId,
+    status: CommandStatus,
+    stdout: &str,
+    stderr: &str,
+    exit_code: Option<i32>,
+) -> Result<(), ApiError> {
+    let now = Utc::now();
+    let sql = format!(
+        "update commands
+         set status = {}, stdout = {}, stderr = {}, exit_code = {}, finished_at = {}
+         where id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4),
+        db.placeholder(5),
+        db.placeholder(6)
+    );
+    sqlx::query(&sql)
+        .bind(command_status_to_str(&status))
+        .bind(stdout)
+        .bind(stderr)
+        .bind(exit_code)
+        .bind(now.to_rfc3339())
+        .bind(command_id.to_string())
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+async fn apply_completed_job(
+    db: &Database,
+    job: &Job,
+    result: serde_json::Value,
+) -> Result<(), ApiError> {
+    if job.kind != JobKind::RunCommand {
+        return Ok(());
+    }
+    let command_id = command_id_from_job(job)?;
+    let sandbox_id = sandbox_id_from_job(job)?;
+    let stdout = result
+        .get("stdout")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let stderr = result
+        .get("stderr")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let exit_code = result
+        .get("exitCode")
+        .and_then(|value| value.as_i64())
+        .map(|value| value as i32)
+        .or(Some(0));
+    update_command_from_lease_result(
+        db,
+        command_id,
+        CommandStatus::Finished,
+        stdout,
+        stderr,
+        exit_code,
+    )
+    .await?;
+    insert_event(
+        db,
+        sandbox_id,
+        SandboxEventKind::CommandFinished,
+        json!({
+            "commandId": command_id,
+            "exitCode": exit_code,
+            "stdout": stdout,
+            "stderr": stderr
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn apply_claimed_job(db: &Database, job: &Job) -> Result<(), ApiError> {
+    if job.kind != JobKind::RunCommand {
+        return Ok(());
+    }
+    let command_id = command_id_from_job(job)?;
+    let sandbox_id = sandbox_id_from_job(job)?;
+    let sql = format!(
+        "update commands
+         set status = {}
+         where id = {}",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    sqlx::query(&sql)
+        .bind(command_status_to_str(&CommandStatus::Running))
+        .bind(command_id.to_string())
+        .execute(&db.pool)
+        .await?;
+    insert_event(
+        db,
+        sandbox_id,
+        SandboxEventKind::CommandStarted,
+        json!({
+            "commandId": command_id
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn apply_retryable_job(db: &Database, job: &Job, error: &str) -> Result<(), ApiError> {
+    if job.kind != JobKind::RunCommand {
+        return Ok(());
+    }
+    let command_id = command_id_from_job(job)?;
+    let sandbox_id = sandbox_id_from_job(job)?;
+    let sql = format!(
+        "update commands
+         set status = {}, stderr = {}
+         where id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3)
+    );
+    sqlx::query(&sql)
+        .bind(command_status_to_str(&CommandStatus::Queued))
+        .bind(error)
+        .bind(command_id.to_string())
+        .execute(&db.pool)
+        .await?;
+    insert_event(
+        db,
+        sandbox_id,
+        SandboxEventKind::CommandQueued,
+        json!({
+            "commandId": command_id,
+            "reason": "retry",
+            "error": error
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn apply_failed_job(db: &Database, job: &Job, error: &str) -> Result<(), ApiError> {
+    if job.kind != JobKind::RunCommand {
+        return Ok(());
+    }
+    let command_id = command_id_from_job(job)?;
+    let sandbox_id = sandbox_id_from_job(job)?;
+    update_command_from_lease_result(db, command_id, CommandStatus::Failed, "", error, None)
+        .await?;
+    insert_event(
+        db,
+        sandbox_id,
+        SandboxEventKind::CommandFinished,
+        json!({
+            "commandId": command_id,
+            "exitCode": null,
+            "stderr": error
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+fn command_id_from_job(job: &Job) -> Result<CommandId, ApiError> {
+    let value = job
+        .payload
+        .get("commandId")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| ApiError::internal("run command job is missing command id"))?;
+    parse_uuid(value).map(CommandId)
+}
+
+fn sandbox_id_from_job(job: &Job) -> Result<SandboxId, ApiError> {
+    let value = job
+        .payload
+        .get("sandboxId")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| ApiError::internal("run command job is missing sandbox id"))?;
+    parse_uuid(value).map(SandboxId)
 }
 
 async fn insert_event(
@@ -958,6 +1658,70 @@ fn row_to_command(row: AnyRow) -> Result<CommandRun, ApiError> {
     })
 }
 
+fn row_to_job(row: AnyRow) -> Result<Job, ApiError> {
+    let id: String = row.try_get("id")?;
+    let kind: String = row.try_get("kind")?;
+    let status: String = row.try_get("status")?;
+    let payload: String = row.try_get("payload")?;
+    let required_capability: String = row.try_get("required_capability")?;
+    let scheduled_at: String = row.try_get("scheduled_at")?;
+    let created_at: String = row.try_get("created_at")?;
+    let updated_at: String = row.try_get("updated_at")?;
+
+    Ok(Job {
+        id: JobId(parse_uuid(&id)?),
+        kind: parse_job_kind(&kind)?,
+        status: parse_job_status(&status)?,
+        payload: serde_json::from_str(&payload)?,
+        required_capability: parse_worker_capability(&required_capability)?,
+        priority: row.try_get("priority")?,
+        attempts: row.try_get("attempts")?,
+        max_attempts: row.try_get("max_attempts")?,
+        scheduled_at: parse_timestamp(&scheduled_at)?,
+        created_at: parse_timestamp(&created_at)?,
+        updated_at: parse_timestamp(&updated_at)?,
+        last_error: row.try_get("last_error")?,
+    })
+}
+
+fn row_to_lease_without_job(row: AnyRow) -> Result<JobLease, ApiError> {
+    let id: String = row.try_get("id")?;
+    let job_id: String = row.try_get("job_id")?;
+    let worker_id: String = row.try_get("worker_id")?;
+    let status: String = row.try_get("status")?;
+    let leased_at: String = row.try_get("leased_at")?;
+    let expires_at: String = row.try_get("expires_at")?;
+    let completed_at: Option<String> = row.try_get("completed_at")?;
+
+    Ok(JobLease {
+        id: LeaseId(parse_uuid(&id)?),
+        job_id: JobId(parse_uuid(&job_id)?),
+        worker_id: WorkerId(parse_uuid(&worker_id)?),
+        status: parse_lease_status(&status)?,
+        attempt: row.try_get("attempt")?,
+        leased_at: parse_timestamp(&leased_at)?,
+        expires_at: parse_timestamp(&expires_at)?,
+        completed_at: completed_at
+            .map(|time| parse_timestamp(&time))
+            .transpose()?,
+        error: row.try_get("error")?,
+        job: Job {
+            id: JobId::new(),
+            kind: JobKind::RunCommand,
+            status: JobStatus::Queued,
+            payload: json!({}),
+            required_capability: WorkerCapability::RunCommand,
+            priority: 0,
+            attempts: 0,
+            max_attempts: 1,
+            scheduled_at: Utc::now(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_error: None,
+        },
+    })
+}
+
 fn parse_uuid(value: &str) -> Result<Uuid, ApiError> {
     Uuid::parse_str(value).map_err(|_| ApiError::internal("database contains invalid uuid"))
 }
@@ -1013,6 +1777,46 @@ fn worker_status_to_str(status: &WorkerStatus) -> &'static str {
     }
 }
 
+fn worker_capability_to_str(capability: &WorkerCapability) -> &'static str {
+    match capability {
+        WorkerCapability::ProvisionSandbox => "provision_sandbox",
+        WorkerCapability::RunCommand => "run_command",
+        WorkerCapability::Snapshot => "snapshot",
+        WorkerCapability::DesktopStream => "desktop_stream",
+        WorkerCapability::K8sPod => "k8s_pod",
+    }
+}
+
+fn job_kind_to_str(kind: &JobKind) -> &'static str {
+    match kind {
+        JobKind::ProvisionSandbox => "provision_sandbox",
+        JobKind::StopSandbox => "stop_sandbox",
+        JobKind::ResumeSandbox => "resume_sandbox",
+        JobKind::RunCommand => "run_command",
+        JobKind::CreateSnapshot => "create_snapshot",
+        JobKind::ForkSandbox => "fork_sandbox",
+    }
+}
+
+fn job_status_to_str(status: &JobStatus) -> &'static str {
+    match status {
+        JobStatus::Queued => "queued",
+        JobStatus::Leased => "leased",
+        JobStatus::Succeeded => "succeeded",
+        JobStatus::Failed => "failed",
+        JobStatus::Dead => "dead",
+    }
+}
+
+fn lease_status_to_str(status: &LeaseStatus) -> &'static str {
+    match status {
+        LeaseStatus::Active => "active",
+        LeaseStatus::Completed => "completed",
+        LeaseStatus::Failed => "failed",
+        LeaseStatus::Expired => "expired",
+    }
+}
+
 fn parse_command_status(value: &str) -> Result<CommandStatus, ApiError> {
     match value {
         "queued" => Ok(CommandStatus::Queued),
@@ -1022,6 +1826,52 @@ fn parse_command_status(value: &str) -> Result<CommandStatus, ApiError> {
         _ => Err(ApiError::internal(
             "database contains invalid command status",
         )),
+    }
+}
+
+fn parse_worker_capability(value: &str) -> Result<WorkerCapability, ApiError> {
+    match value {
+        "provision_sandbox" => Ok(WorkerCapability::ProvisionSandbox),
+        "run_command" => Ok(WorkerCapability::RunCommand),
+        "snapshot" => Ok(WorkerCapability::Snapshot),
+        "desktop_stream" => Ok(WorkerCapability::DesktopStream),
+        "k8s_pod" => Ok(WorkerCapability::K8sPod),
+        _ => Err(ApiError::internal(
+            "database contains invalid worker capability",
+        )),
+    }
+}
+
+fn parse_job_kind(value: &str) -> Result<JobKind, ApiError> {
+    match value {
+        "provision_sandbox" => Ok(JobKind::ProvisionSandbox),
+        "stop_sandbox" => Ok(JobKind::StopSandbox),
+        "resume_sandbox" => Ok(JobKind::ResumeSandbox),
+        "run_command" => Ok(JobKind::RunCommand),
+        "create_snapshot" => Ok(JobKind::CreateSnapshot),
+        "fork_sandbox" => Ok(JobKind::ForkSandbox),
+        _ => Err(ApiError::internal("database contains invalid job kind")),
+    }
+}
+
+fn parse_job_status(value: &str) -> Result<JobStatus, ApiError> {
+    match value {
+        "queued" => Ok(JobStatus::Queued),
+        "leased" => Ok(JobStatus::Leased),
+        "succeeded" => Ok(JobStatus::Succeeded),
+        "failed" => Ok(JobStatus::Failed),
+        "dead" => Ok(JobStatus::Dead),
+        _ => Err(ApiError::internal("database contains invalid job status")),
+    }
+}
+
+fn parse_lease_status(value: &str) -> Result<LeaseStatus, ApiError> {
+    match value {
+        "active" => Ok(LeaseStatus::Active),
+        "completed" => Ok(LeaseStatus::Completed),
+        "failed" => Ok(LeaseStatus::Failed),
+        "expired" => Ok(LeaseStatus::Expired),
+        _ => Err(ApiError::internal("database contains invalid lease status")),
     }
 }
 

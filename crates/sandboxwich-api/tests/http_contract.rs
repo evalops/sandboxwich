@@ -6,9 +6,11 @@ use std::{
 
 use reqwest::StatusCode;
 use sandboxwich_core::{
-    CommandListResponse, CommandRequest, CommandResponse, CreateSandboxRequest, EventListResponse,
-    HealthResponse, RegisterWorkerRequest, SandboxListResponse, SandboxResponse, WorkerCapability,
-    WorkerHeartbeatRequest, WorkerListResponse, WorkerResponse,
+    ClaimLeaseRequest, ClaimLeaseResponse, CommandListResponse, CommandRequest, CommandResponse,
+    CommandStatus, CompleteLeaseRequest, CreateSandboxRequest, EventListResponse, FailLeaseRequest,
+    HealthResponse, Job, JobListResponse, JobStatus, LeaseResponse, RegisterWorkerRequest,
+    SandboxListResponse, SandboxResponse, WorkerCapability, WorkerHeartbeatRequest,
+    WorkerListResponse, WorkerResponse,
 };
 use sqlx::any::AnyPoolOptions;
 use tempfile::TempDir;
@@ -175,6 +177,90 @@ async fn run_contract(server: TestServer) {
         .await
         .unwrap();
     assert_eq!(command.command.argv, ["echo", "hello"]);
+    assert_eq!(command.command.status, CommandStatus::Queued);
+
+    let jobs: JobListResponse = client
+        .get(format!("{}/jobs", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let queued_job = job_for_command(&jobs.jobs, &command.command.id.to_string());
+    assert_eq!(queued_job.status, JobStatus::Queued);
+
+    let claimed: ClaimLeaseResponse = client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claimed.lease.expect("expected worker to claim command job");
+    assert_eq!(lease.job.id, queued_job.id);
+    assert_eq!(lease.job.status, JobStatus::Leased);
+
+    let running_command: CommandResponse = client
+        .get(format!(
+            "{}/commands/{}",
+            server.base_url, command.command.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(running_command.command.status, CommandStatus::Running);
+
+    let completed: LeaseResponse = client
+        .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
+        .json(&CompleteLeaseRequest {
+            result: Some(serde_json::json!({
+                "stdout": "hello\n",
+                "stderr": "",
+                "exitCode": 0
+            })),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(completed.lease.job.status, JobStatus::Succeeded);
+
+    let finished_command: CommandResponse = client
+        .get(format!(
+            "{}/commands/{}",
+            server.base_url, command.command.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(finished_command.command.status, CommandStatus::Finished);
+    assert_eq!(finished_command.command.stdout, "hello\n");
 
     let commands: CommandListResponse = client
         .get(format!(
@@ -206,6 +292,10 @@ async fn run_contract(server: TestServer) {
         .await
         .unwrap();
     assert_eq!(fetched_command.command.id, command.command.id);
+    assert_eq!(fetched_command.command.status, CommandStatus::Finished);
+
+    assert_retryable_failure_requeues_command(&client, &server, &created, &worker).await;
+    assert_expired_lease_requeues_command(&client, &server, &created, &worker).await;
 
     let stopped: SandboxResponse = client
         .post(format!(
@@ -267,6 +357,204 @@ async fn run_contract(server: TestServer) {
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+async fn assert_retryable_failure_requeues_command(
+    client: &reqwest::Client,
+    server: &TestServer,
+    sandbox: &SandboxResponse,
+    worker: &WorkerResponse,
+) {
+    let command: CommandResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/commands",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&CommandRequest {
+            argv: vec!["false".to_string()],
+            cwd: None,
+            env: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let claimed: ClaimLeaseResponse = client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claimed.lease.expect("expected retry test lease");
+    let failed: LeaseResponse = client
+        .post(format!("{}/leases/{}/fail", server.base_url, lease.id))
+        .json(&FailLeaseRequest {
+            error: "temporary failure".to_string(),
+            retry: true,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(failed.lease.job.status, JobStatus::Queued);
+
+    let fetched: CommandResponse = client
+        .get(format!(
+            "{}/commands/{}",
+            server.base_url, command.command.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(fetched.command.status, CommandStatus::Queued);
+
+    let claimed_again: ClaimLeaseResponse = client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let retry_lease = claimed_again.lease.expect("expected retry lease");
+    assert_eq!(retry_lease.job.id, lease.job.id);
+    let completed: LeaseResponse = client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, retry_lease.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(serde_json::json!({
+                "stdout": "retried\n",
+                "stderr": "",
+                "exitCode": 0
+            })),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(completed.lease.job.status, JobStatus::Succeeded);
+}
+
+async fn assert_expired_lease_requeues_command(
+    client: &reqwest::Client,
+    server: &TestServer,
+    sandbox: &SandboxResponse,
+    worker: &WorkerResponse,
+) {
+    let command: CommandResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/commands",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&CommandRequest {
+            argv: vec!["sleep".to_string(), "1".to_string()],
+            cwd: None,
+            env: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let claimed: ClaimLeaseResponse = client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(0),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(claimed.lease.is_some());
+
+    let jobs: JobListResponse = client
+        .get(format!("{}/jobs", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let expired_job = job_for_command(&jobs.jobs, &command.command.id.to_string());
+    assert_eq!(expired_job.status, JobStatus::Queued);
+
+    let fetched: CommandResponse = client
+        .get(format!(
+            "{}/commands/{}",
+            server.base_url, command.command.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(fetched.command.status, CommandStatus::Queued);
+}
+
+fn job_for_command(jobs: &[Job], command_id: &str) -> Job {
+    jobs.iter()
+        .find(|job| {
+            job.payload
+                .get("commandId")
+                .and_then(|value| value.as_str())
+                == Some(command_id)
+        })
+        .cloned()
+        .expect("expected command job")
 }
 
 impl TestServer {
