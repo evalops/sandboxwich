@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 pub const KUBERNETES_MUTATION_ENV: &str = "SANDBOXWICH_K8S_ENABLE_MUTATION";
-pub const SANDBOX_GUEST_IMAGE: &str = "ghcr.io/evalops/sandboxwich-ubuntu-dev:latest";
+pub const DEFAULT_SANDBOX_GUEST_IMAGE: &str = "ghcr.io/evalops/sandboxwich-ubuntu-dev:latest";
 
 pub trait SandboxProvider {
     fn capability_report(&self) -> ProviderCapabilityReport;
@@ -45,6 +45,7 @@ pub struct KubernetesDryRunProvider {
     namespace: String,
     storage_class: Option<String>,
     snapshot_class: Option<String>,
+    runtime_image: String,
     ssh_authorized_keys_secret: Option<String>,
 }
 
@@ -60,8 +61,16 @@ impl KubernetesDryRunProvider {
             namespace: namespace.into(),
             storage_class,
             snapshot_class,
+            runtime_image: DEFAULT_SANDBOX_GUEST_IMAGE.to_string(),
             ssh_authorized_keys_secret: None,
         }
+    }
+
+    pub fn with_runtime_image(mut self, image: Option<String>) -> Self {
+        if let Some(image) = image {
+            self.runtime_image = image;
+        }
+        self
     }
 
     pub fn with_ssh_authorized_keys_secret(mut self, secret: Option<String>) -> Self {
@@ -81,6 +90,7 @@ impl KubernetesDryRunProvider {
         if let Some(snapshot_class) = &self.snapshot_class {
             labels.insert("snapshot_class".to_string(), snapshot_class.clone());
         }
+        labels.insert("runtime_image".to_string(), self.runtime_image.clone());
         if let Some(secret) = &self.ssh_authorized_keys_secret {
             labels.insert("ssh_authorized_keys_secret".to_string(), secret.clone());
         }
@@ -110,7 +120,7 @@ impl KubernetesDryRunProvider {
 
     fn runtime_metadata(&self) -> serde_json::Value {
         json!({
-            "image": SANDBOX_GUEST_IMAGE,
+            "image": self.runtime_image,
             "workspaceMount": "/workspace",
             "sshPort": 22,
             "desktopPort": 6080,
@@ -185,7 +195,7 @@ impl KubernetesDryRunProvider {
             "spec": {
                 "containers": [{
                     "name": "sandbox",
-                    "image": SANDBOX_GUEST_IMAGE,
+                    "image": self.runtime_image,
                     "ports": [
                         {"name": "ssh", "containerPort": 22},
                         {"name": "desktop", "containerPort": 6080}
@@ -767,12 +777,12 @@ mod tests {
         assert_eq!(provisioned.metadata["operation"], "provision");
         assert_eq!(
             provisioned.metadata["runtime"]["image"],
-            SANDBOX_GUEST_IMAGE
+            DEFAULT_SANDBOX_GUEST_IMAGE
         );
         assert_eq!(provisioned.metadata["manifests"]["pod"]["kind"], "Pod");
         assert_eq!(
             provisioned.metadata["manifests"]["pod"]["spec"]["containers"][0]["image"],
-            SANDBOX_GUEST_IMAGE
+            DEFAULT_SANDBOX_GUEST_IMAGE
         );
         assert_eq!(
             provisioned.metadata["manifests"]["sshService"]["kind"],
@@ -813,6 +823,30 @@ mod tests {
             "VolumeSnapshot"
         );
         assert_eq!(fork.metadata["manifests"]["sshService"]["kind"], "Service");
+    }
+
+    #[test]
+    fn kubernetes_dry_run_uses_configured_runtime_image() {
+        let runtime_image = "ghcr.io/evalops/sandboxwich-ubuntu-dev:sha-test".to_string();
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_runtime_image(Some(runtime_image.clone()));
+
+        let capabilities = provider.capability_report();
+        assert_eq!(
+            capabilities.labels.get("runtime_image").map(String::as_str),
+            Some(runtime_image.as_str())
+        );
+
+        let provisioned = provider.provision(SandboxId::new());
+        assert_eq!(
+            provisioned.metadata["runtime"]["image"],
+            runtime_image.as_str()
+        );
+        assert_eq!(
+            provisioned.metadata["manifests"]["pod"]["spec"]["containers"][0]["image"],
+            runtime_image.as_str()
+        );
     }
 
     #[test]
