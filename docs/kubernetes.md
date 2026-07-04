@@ -23,6 +23,21 @@ sandboxwich-worker --api http://sandboxwich-api:3217 heartbeat <worker-id> \
   --label node=k3s-node-1
 ```
 
+Workers can process one lease or run continuously:
+
+```sh
+sandboxwich-worker --api http://sandboxwich-api:3217 work-once <worker-id> \
+  --cluster k3s-dev \
+  --namespace sandboxwich
+
+sandboxwich-worker --api http://sandboxwich-api:3217 work-loop <worker-id> \
+  --cluster k3s-dev \
+  --namespace sandboxwich \
+  --idle-sleep-ms 1000
+```
+
+Use `--max-iterations` for CI or non-production smoke runs. The worker dispatches by typed `JobKind` contracts and reports every lease through the API; it does not infer behavior from user-visible text.
+
 ## Provider Adapter Dry Run
 
 The first provider adapter is a Kubernetes-shaped dry run. It reports the same typed capabilities and provider metadata that a k3s worker will use, but it does not call the Kubernetes API or mutate Pods, PVCs, VolumeSnapshots, Services, or Secrets.
@@ -114,7 +129,6 @@ Do not commit the real database URL. Use your existing secret-management path fo
 
 ## Next Kubernetes Work
 
-- Add a long-running worker lease loop.
 - Add NetworkPolicy examples for sandbox egress control.
 - Add Helm or Kustomize overlays for k3s, staging, and production.
 - Add service accounts and RBAC once the provider adapter needs Kubernetes API access.

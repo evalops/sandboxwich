@@ -32,6 +32,7 @@ cargo run -p sandboxwich-cli -- events <sandbox-id>
 cargo run -p sandboxwich-worker -- register --name k3s-worker-a --provider kubernetes
 cargo run -p sandboxwich-worker -- provider-smoke --cluster k3s-dev --namespace sandboxwich
 cargo run -p sandboxwich-worker -- provider-apply-plan --cluster k3s-dev --namespace sandboxwich --ssh-authorized-keys-secret sandboxwich-authorized-keys
+cargo run -p sandboxwich-worker -- work-loop <worker-id> --max-iterations 1
 cargo run -p sandboxwich-cli -- workers
 ```
 
