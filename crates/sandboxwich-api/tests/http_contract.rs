@@ -9,8 +9,8 @@ use sandboxwich_core::{
     ClaimLeaseRequest, ClaimLeaseResponse, CommandListResponse, CommandRequest, CommandResponse,
     CommandStatus, CompleteLeaseRequest, CreateSandboxRequest, EventListResponse, FailLeaseRequest,
     HealthResponse, Job, JobListResponse, JobStatus, LeaseResponse, RegisterWorkerRequest,
-    SandboxListResponse, SandboxResponse, WorkerCapability, WorkerHeartbeatRequest,
-    WorkerListResponse, WorkerResponse,
+    SandboxEventKind, SandboxListResponse, SandboxResponse, WorkerCapability,
+    WorkerHeartbeatRequest, WorkerListResponse, WorkerResponse,
 };
 use sqlx::any::AnyPoolOptions;
 use tempfile::TempDir;
@@ -347,6 +347,11 @@ async fn run_contract(server: TestServer) {
         .await
         .unwrap();
     assert!(events.events.len() >= 5);
+    assert!(events.events.iter().any(|event| {
+        event.kind == SandboxEventKind::CommandOutput
+            && event.data.get("commandId").and_then(|value| value.as_str())
+                == Some(&command.command.id.to_string())
+    }));
 
     let missing = client
         .get(format!(

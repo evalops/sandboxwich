@@ -526,6 +526,7 @@ async fn queue_command(
     fetch_sandbox(&state.db, sandbox_id).await?;
 
     let now = Utc::now();
+    let env = request.env;
     let command = CommandRun {
         id: CommandId::new(),
         sandbox_id,
@@ -551,6 +552,7 @@ async fn queue_command(
                 "commandId": command.id,
                 "argv": command.argv,
                 "cwd": command.cwd,
+                "env": env,
             }),
             required_capability: WorkerCapability::RunCommand,
             priority: 0,
@@ -1344,6 +1346,7 @@ async fn apply_completed_job(
         .unwrap_or("");
     let exit_code = result
         .get("exitCode")
+        .or_else(|| result.get("exit_code"))
         .and_then(|value| value.as_i64())
         .map(|value| value as i32)
         .or(Some(0));
@@ -1356,6 +1359,32 @@ async fn apply_completed_job(
         exit_code,
     )
     .await?;
+    if !stdout.is_empty() {
+        insert_event(
+            db,
+            sandbox_id,
+            SandboxEventKind::CommandOutput,
+            json!({
+                "commandId": command_id,
+                "stream": "stdout",
+                "chunk": stdout
+            }),
+        )
+        .await?;
+    }
+    if !stderr.is_empty() {
+        insert_event(
+            db,
+            sandbox_id,
+            SandboxEventKind::CommandOutput,
+            json!({
+                "commandId": command_id,
+                "stream": "stderr",
+                "chunk": stderr
+            }),
+        )
+        .await?;
+    }
     insert_event(
         db,
         sandbox_id,

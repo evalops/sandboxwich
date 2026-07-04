@@ -1704,7 +1704,10 @@ name = "sandboxwich-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
+ "sandboxwich-core",
+ "serde",
  "serde_json",
 ]
 
@@ -1756,6 +1759,7 @@ name = "sandboxwich-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "reqwest",
  "sandboxwich-core",

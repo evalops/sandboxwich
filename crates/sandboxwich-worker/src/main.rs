@@ -1,9 +1,12 @@
+use std::{collections::BTreeMap, process::Command as ProcessCommand};
+
 use anyhow::{Context, bail};
+use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use sandboxwich_core::{
-    ClaimLeaseRequest, ClaimLeaseResponse, CompleteLeaseRequest, FailLeaseRequest, JobKind,
-    LeaseResponse, RegisterWorkerRequest, RenewLeaseRequest, WorkerCapability,
-    WorkerHeartbeatRequest, WorkerResponse,
+    AgentCommandRequest, AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse,
+    CompleteLeaseRequest, FailLeaseRequest, JobKind, LeaseResponse, RegisterWorkerRequest,
+    RenewLeaseRequest, WorkerCapability, WorkerHeartbeatRequest, WorkerResponse,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -202,28 +205,23 @@ async fn main() -> anyhow::Result<()> {
             };
             match lease.job.kind {
                 JobKind::RunCommand => {
-                    let argv = lease
-                        .job
-                        .payload
-                        .get("argv")
-                        .and_then(|value| value.as_array())
-                        .map(|items| {
-                            items
-                                .iter()
-                                .filter_map(|item| item.as_str())
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        })
-                        .unwrap_or_default();
+                    let result =
+                        execute_local_agent(agent_request_from_payload(&lease.job.payload)?)?;
+                    let exit_code = result.exit_code.unwrap_or(1);
+                    let endpoint = if exit_code == 0 { "complete" } else { "fail" };
+                    let body = if exit_code == 0 {
+                        serde_json::to_value(CompleteLeaseRequest {
+                            result: Some(serde_json::to_value(&result)?),
+                        })?
+                    } else {
+                        serde_json::to_value(FailLeaseRequest {
+                            error: result.stderr.clone(),
+                            retry: false,
+                        })?
+                    };
                     let response = client
-                        .post(format!("{api}/leases/{}/complete", lease.id))
-                        .json(&CompleteLeaseRequest {
-                            result: Some(json!({
-                                "stdout": format!("dry-run worker completed: {argv}\n"),
-                                "stderr": "",
-                                "exitCode": 0
-                            })),
-                        })
+                        .post(format!("{api}/leases/{}/{endpoint}", lease.id))
+                        .json(&body)
                         .send()
                         .await?;
                     print_json::<LeaseResponse>(response).await?;
@@ -269,6 +267,54 @@ fn parse_label(value: &str) -> Result<(String, String), String> {
         return Err("label key cannot be empty".to_string());
     }
     Ok((key.to_string(), value.to_string()))
+}
+
+fn agent_request_from_payload(payload: &serde_json::Value) -> anyhow::Result<AgentCommandRequest> {
+    let argv = payload
+        .get("argv")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("job payload is missing argv"))?;
+    let argv = serde_json::from_value(argv).context("job payload argv is invalid")?;
+    let cwd = match payload.get("cwd") {
+        Some(value) if !value.is_null() => {
+            Some(serde_json::from_value(value.clone()).context("job payload cwd is invalid")?)
+        }
+        _ => None,
+    };
+    let env = payload
+        .get("env")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .context("job payload env is invalid")?
+        .unwrap_or_else(BTreeMap::new);
+
+    Ok(AgentCommandRequest { argv, cwd, env })
+}
+
+fn execute_local_agent(request: AgentCommandRequest) -> anyhow::Result<AgentCommandResult> {
+    let Some((program, args)) = request.argv.split_first() else {
+        bail!("argv must contain at least one item");
+    };
+
+    let started_at = Utc::now();
+    let mut command = ProcessCommand::new(program);
+    command.args(args);
+    if let Some(cwd) = request.cwd {
+        command.current_dir(cwd);
+    }
+    command.envs(request.env);
+
+    let output = command.output().context("failed to execute command")?;
+    let finished_at = Utc::now();
+
+    Ok(AgentCommandResult {
+        exit_code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        started_at,
+        finished_at,
+    })
 }
 
 async fn print_json<T>(response: reqwest::Response) -> anyhow::Result<()>
