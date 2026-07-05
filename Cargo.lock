@@ -1730,6 +1730,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandboxwich-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "reqwest",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "sandboxwich-cli"
 version = "0.1.0"
 dependencies = [

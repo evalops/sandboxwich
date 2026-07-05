@@ -5,6 +5,7 @@
 ## Current Shape
 
 - Run `sandboxwich-api` as a Deployment.
+- Run `sandboxwich-api migrate` as a Job before or during rollouts.
 - Store state in Postgres through `SANDBOXWICH_DATABASE_URL`.
 - Expose the API with a ClusterIP Service.
 - Register workers with typed provider labels such as `provider=kubernetes` and capabilities such as `k8s_pod` and `run_command`.
@@ -165,6 +166,37 @@ deploy/kubernetes/homelab-smoke.sh
 
 The smoke checks API and worker rollouts, `/readyz`, `/metrics`, and a tenant-scoped sandbox list. It does not apply manifests or mutate sandbox resources.
 
+## Migrations And Startup
+
+The API binary has three operational modes:
+
+```sh
+sandboxwich-api migrate
+sandboxwich-api check-schema
+sandboxwich-api serve
+```
+
+`migrate` applies SQL migrations and reconciles typed database constraints. The
+constraint reconciler stores a deterministic fingerprint in the database, so a
+normal restart skips constraint DDL when the typed Rust variant contract has not
+changed. `check-schema` verifies that migrations and the constraint fingerprint
+are current without mutating the database.
+
+For k3s and Kubernetes, prefer a migration Job plus API pods with automatic
+migration disabled:
+
+```yaml
+env:
+  - name: SANDBOXWICH_AUTO_MIGRATE
+    value: "false"
+  - name: SANDBOXWICH_DATABASE_MAX_CONNECTIONS
+    value: "10"
+```
+
+This avoids multiple replicas racing to run migrations or rewrite constraints.
+Pods that start before the Job completes fail fast until the Deployment restarts
+them against a ready schema.
+
 ## Apply The API Manifests
 
 The starter manifests in `deploy/kubernetes/` expect a Secret named `sandboxwich-secrets` with `database-url`. Add `api-token` through your existing secret-management path when the API should require bearer auth.
@@ -179,8 +211,26 @@ kubectl apply -f deploy/kubernetes/
 
 Do not commit the real database URL or API token. Use your existing secret-management path for shared clusters.
 
+## Benchmarking
+
+`sandboxwich-bench` provides a repeatable local harness that does not require
+`ab`, `wrk`, or `hyperfine`:
+
+```sh
+cargo build -p sandboxwich-api -p sandboxwich-bench
+cargo run -p sandboxwich-bench -- all \
+  --api-bin target/debug/sandboxwich-api \
+  --runs 5 \
+  --requests 300 \
+  --seed-sandboxes 250
+```
+
+Use `sandboxwich-bench seed --database-url ...` to load larger Postgres datasets
+before measuring query plans or k3s service latency. CI uploads a benchmark
+report artifact on every PR and push; treat it as a trend report until the
+project has dedicated, quiet benchmark runners.
+
 ## Next Kubernetes Work
 
-- Add NetworkPolicy examples for sandbox egress control.
 - Add Helm or Kustomize overlays for k3s, staging, and production.
 - Add NetworkPolicy examples for Kubernetes API egress and sandbox egress control.

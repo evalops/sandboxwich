@@ -1,6 +1,7 @@
+---
 name: ci
 
-on:
+"on":
   pull_request:
   push:
 
@@ -29,4 +30,19 @@ jobs:
       - run: cargo check --workspace
       - run: cargo test --workspace
         env:
-          SANDBOXWICH_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/sandboxwich
+          SANDBOXWICH_TEST_POSTGRES_URL: >-
+            postgres://postgres:postgres@localhost:5432/sandboxwich
+      - run: cargo build -p sandboxwich-api -p sandboxwich-bench
+      - name: Generate benchmark report
+        run: |
+          cargo run -p sandboxwich-bench -- all \
+            --api-bin target/debug/sandboxwich-api \
+            --runs 5 \
+            --requests 300 \
+            --concurrency 25 \
+            --seed-sandboxes 250 \
+            > sandboxwich-benchmark-report.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sandboxwich-benchmark-report
+          path: sandboxwich-benchmark-report.md
