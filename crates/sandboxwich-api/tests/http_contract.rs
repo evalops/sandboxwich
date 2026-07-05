@@ -62,6 +62,38 @@ async fn lifecycle_command_and_event_contracts_work_over_postgres_when_configure
     run_contract(server).await;
 }
 
+#[tokio::test]
+async fn api_token_is_required_when_configured() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("sandboxwich-auth-test.db").display()
+    );
+    let server =
+        TestServer::start_with_auth(database_url, Some(data_dir), Some("test-token")).await;
+    let client = reqwest::Client::new();
+
+    let missing = client
+        .get(format!("{}/sandboxes", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+    let authorized: SandboxListResponse = client
+        .get(format!("{}/sandboxes", server.base_url))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(authorized.ok);
+}
+
 async fn run_contract(server: TestServer) {
     let client = reqwest::Client::new();
 
@@ -98,6 +130,8 @@ async fn run_contract(server: TestServer) {
         &created.sandbox.id.to_string(),
     )
     .await;
+    assert_eq!(created.sandbox.tenant_id, "default");
+    assert_tenant_boundaries_are_enforced(&client, &server, &created).await;
     assert_guest_health_and_ssh_key_lifecycle(&client, &server, &created).await;
 
     let worker: WorkerResponse = client
@@ -536,6 +570,87 @@ async fn run_contract(server: TestServer) {
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+async fn assert_tenant_boundaries_are_enforced(
+    client: &reqwest::Client,
+    server: &TestServer,
+    default_sandbox: &SandboxResponse,
+) {
+    let tenant_sandbox: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .header("x-sandboxwich-tenant", "tenant-b")
+        .json(&CreateSandboxRequest {
+            name: Some("tenant-b-sandbox".to_string()),
+            template: None,
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(tenant_sandbox.sandbox.tenant_id, "tenant-b");
+
+    let default_list: SandboxListResponse = client
+        .get(format!("{}/sandboxes", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        default_list
+            .sandboxes
+            .iter()
+            .any(|sandbox| sandbox.id == default_sandbox.sandbox.id)
+    );
+    assert!(
+        default_list
+            .sandboxes
+            .iter()
+            .all(|sandbox| sandbox.id != tenant_sandbox.sandbox.id)
+    );
+
+    let hidden = client
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, tenant_sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+
+    let tenant_list: SandboxListResponse = client
+        .get(format!("{}/sandboxes", server.base_url))
+        .header("x-sandboxwich-tenant", "tenant-b")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        tenant_list
+            .sandboxes
+            .iter()
+            .any(|sandbox| sandbox.id == tenant_sandbox.sandbox.id)
+    );
+    assert!(
+        tenant_list
+            .sandboxes
+            .iter()
+            .all(|sandbox| sandbox.id != default_sandbox.sandbox.id)
+    );
 }
 
 async fn assert_guest_health_and_ssh_key_lifecycle(
@@ -2182,22 +2297,37 @@ fn provider_resource(
 
 impl TestServer {
     async fn start(database_url: String, data_dir: Option<TempDir>) -> Self {
+        Self::start_with_auth(database_url, data_dir, None).await
+    }
+
+    async fn start_with_auth(
+        database_url: String,
+        data_dir: Option<TempDir>,
+        auth_token: Option<&str>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let bind = listener.local_addr().unwrap();
         drop(listener);
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_sandboxwich-api"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sandboxwich-api"));
+        command
             .env("SANDBOXWICH_DATABASE_URL", &database_url)
             .env("SANDBOXWICH_BIND", bind.to_string())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        if let Some(auth_token) = auth_token {
+            command.env("SANDBOXWICH_API_TOKEN", auth_token);
+        }
+        let mut child = command.spawn().unwrap();
 
         let base_url = format!("http://{bind}");
         let client = reqwest::Client::new();
         for _ in 0..100 {
-            if let Ok(response) = client.get(format!("{base_url}/healthz")).send().await {
+            let mut health_request = client.get(format!("{base_url}/healthz"));
+            if let Some(auth_token) = auth_token {
+                health_request = health_request.bearer_auth(auth_token);
+            }
+            if let Ok(response) = health_request.send().await {
                 if response.status().is_success() {
                     return Self {
                         base_url,

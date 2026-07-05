@@ -3,8 +3,9 @@ use std::net::SocketAddr;
 use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{Extension, Path, Request, State},
+    http::{StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -44,6 +45,13 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct AppState {
     db: Database,
+    auth_token: Option<String>,
+    default_tenant_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct TenantContext {
+    tenant_id: String,
 }
 
 #[derive(Clone)]
@@ -71,15 +79,29 @@ async fn main() -> anyhow::Result<()> {
 
     let database_url = std::env::var("SANDBOXWICH_DATABASE_URL")
         .unwrap_or_else(|_| "sqlite://sandboxwich.db".to_string());
+    let auth_token = std::env::var("SANDBOXWICH_API_TOKEN")
+        .ok()
+        .filter(|token| !token.trim().is_empty());
+    let default_tenant_id = std::env::var("SANDBOXWICH_DEFAULT_TENANT")
+        .ok()
+        .filter(|tenant| !tenant.trim().is_empty())
+        .unwrap_or_else(|| "default".to_string());
     let db = connect_database(&database_url).await?;
     sqlx::migrate!("./migrations").run(&db.pool).await?;
     ensure_database_constraints(&db).await?;
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, %database_url, "sandboxwich-api listening");
-    axum::serve(listener, app(AppState { db }))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app(AppState {
+            db,
+            auth_token,
+            default_tenant_id,
+        }),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
 }
 
@@ -688,7 +710,38 @@ fn app(state: AppState) -> Router {
             post(create_ssh_access),
         )
         .route("/ssh-keys/{ssh_key_id}/status", post(update_ssh_key_status))
-        .with_state(state)
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(state, auth_and_tenant))
+}
+
+async fn auth_and_tenant(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    if let Some(expected_token) = &state.auth_token {
+        let authorized = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|token| token == expected_token);
+        if !authorized {
+            return ApiError::unauthorized("valid bearer token is required").into_response();
+        }
+    }
+
+    let tenant_id = request
+        .headers()
+        .get("x-sandboxwich-tenant")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|tenant| !tenant.is_empty())
+        .unwrap_or(&state.default_tenant_id)
+        .to_string();
+    request.extensions_mut().insert(TenantContext { tenant_id });
+
+    next.run(request).await
 }
 
 async fn shutdown_signal() {
@@ -704,13 +757,56 @@ async fn healthz() -> Json<HealthResponse> {
     })
 }
 
+fn ensure_tenant(resource_tenant_id: &str, ctx: &TenantContext) -> Result<(), ApiError> {
+    if resource_tenant_id != ctx.tenant_id {
+        return Err(ApiError::not_found("resource not found"));
+    }
+    Ok(())
+}
+
+async fn ensure_sandbox_tenant(
+    db: &Database,
+    sandbox_id: SandboxId,
+    ctx: &TenantContext,
+) -> Result<Sandbox, ApiError> {
+    let sandbox = fetch_sandbox(db, sandbox_id).await?;
+    ensure_tenant(&sandbox.tenant_id, ctx)?;
+    Ok(sandbox)
+}
+
+async fn ensure_worker_tenant(
+    db: &Database,
+    worker_id: WorkerId,
+    ctx: &TenantContext,
+) -> Result<Worker, ApiError> {
+    let worker = fetch_worker(db, worker_id).await?;
+    ensure_tenant(&worker.tenant_id, ctx)?;
+    Ok(worker)
+}
+
+fn ensure_job_tenant(job: &Job, ctx: &TenantContext) -> Result<(), ApiError> {
+    ensure_tenant(&job.tenant_id, ctx)
+}
+
+async fn ensure_lease_tenant(
+    db: &Database,
+    lease_id: LeaseId,
+    ctx: &TenantContext,
+) -> Result<JobLease, ApiError> {
+    let lease = fetch_lease(db, lease_id).await?;
+    ensure_job_tenant(&lease.job, ctx)?;
+    Ok(lease)
+}
+
 async fn create_sandbox(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Json(request): Json<CreateSandboxRequest>,
 ) -> Result<Json<SandboxResponse>, ApiError> {
     let now = Utc::now();
     let sandbox = Sandbox {
         id: SandboxId::new(),
+        tenant_id: ctx.tenant_id.clone(),
         name: request.name.unwrap_or_else(|| "fresh-sandwich".to_string()),
         state: SandboxState::Ready,
         template: request.template.unwrap_or_else(|| "ubuntu-dev".to_string()),
@@ -737,14 +833,19 @@ async fn create_sandbox(
 
 async fn list_sandboxes(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
 ) -> Result<Json<SandboxListResponse>, ApiError> {
-    let rows = sqlx::query(
-        "select id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id
+    let sql = format!(
+        "select id, tenant_id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
+         where tenant_id = {}
          order by created_at asc",
-    )
-    .fetch_all(&state.db.pool)
-    .await?;
+        state.db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(&ctx.tenant_id)
+        .fetch_all(&state.db.pool)
+        .await?;
 
     let sandboxes = rows
         .into_iter()
@@ -759,18 +860,20 @@ async fn list_sandboxes(
 
 async fn get_sandbox(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<SandboxResponse>, ApiError> {
-    let sandbox = fetch_sandbox(&state.db, SandboxId(sandbox_id)).await?;
+    let sandbox = ensure_sandbox_tenant(&state.db, SandboxId(sandbox_id), &ctx).await?;
     Ok(Json(SandboxResponse { ok: true, sandbox }))
 }
 
 async fn list_runtime_resources(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<RuntimeResourceListResponse>, ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
-    fetch_sandbox(&state.db, sandbox_id).await?;
+    ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
     let resources = list_runtime_resources_for_sandbox(&state.db, sandbox_id).await?;
     Ok(Json(RuntimeResourceListResponse {
         ok: true,
@@ -780,8 +883,10 @@ async fn list_runtime_resources(
 
 async fn stop_sandbox(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<SandboxResponse>, ApiError> {
+    ensure_sandbox_tenant(&state.db, SandboxId(sandbox_id), &ctx).await?;
     transition_sandbox(
         &state.db,
         SandboxId(sandbox_id),
@@ -793,8 +898,10 @@ async fn stop_sandbox(
 
 async fn resume_sandbox(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<SandboxResponse>, ApiError> {
+    ensure_sandbox_tenant(&state.db, SandboxId(sandbox_id), &ctx).await?;
     transition_sandbox(
         &state.db,
         SandboxId(sandbox_id),
@@ -806,10 +913,11 @@ async fn resume_sandbox(
 
 async fn fork_sandbox(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
     Json(request): Json<CreateSandboxRequest>,
 ) -> Result<Json<SandboxResponse>, ApiError> {
-    let parent = fetch_sandbox(&state.db, SandboxId(sandbox_id)).await?;
+    let parent = ensure_sandbox_tenant(&state.db, SandboxId(sandbox_id), &ctx).await?;
     let now = Utc::now();
     let snapshot = Snapshot {
         id: SnapshotId::new(),
@@ -832,6 +940,7 @@ async fn fork_sandbox(
 
     let child = Sandbox {
         id: SandboxId::new(),
+        tenant_id: parent.tenant_id.clone(),
         name: request
             .name
             .unwrap_or_else(|| format!("{}-fork", parent.name)),
@@ -860,6 +969,7 @@ async fn fork_sandbox(
         &state.db,
         &Job {
             id: JobId::new(),
+            tenant_id: parent.tenant_id.clone(),
             kind: JobKind::CreateSnapshot,
             status: JobStatus::Queued,
             payload: json!({
@@ -886,11 +996,12 @@ async fn fork_sandbox(
 
 async fn create_snapshot(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
     Json(request): Json<CreateSnapshotRequest>,
 ) -> Result<Json<SnapshotResponse>, ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
-    fetch_sandbox(&state.db, sandbox_id).await?;
+    let sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
     let snapshot = pending_snapshot_from_request(sandbox_id, request)?;
     let scheduled_at = snapshot.created_at;
     insert_snapshot(&state.db, &snapshot).await?;
@@ -909,6 +1020,7 @@ async fn create_snapshot(
         &state.db,
         &Job {
             id: JobId::new(),
+            tenant_id: sandbox.tenant_id,
             kind: JobKind::CreateSnapshot,
             status: JobStatus::Queued,
             payload: json!({
@@ -932,10 +1044,11 @@ async fn create_snapshot(
 
 async fn list_snapshots(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<SnapshotListResponse>, ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
-    fetch_sandbox(&state.db, sandbox_id).await?;
+    ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
     expire_due_snapshots(&state.db).await?;
     let snapshots = list_snapshots_for_sandbox(&state.db, sandbox_id).await?;
     Ok(Json(SnapshotListResponse {
@@ -946,10 +1059,12 @@ async fn list_snapshots(
 
 async fn get_snapshot(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(snapshot_id): Path<Uuid>,
 ) -> Result<Json<SnapshotResponse>, ApiError> {
     expire_due_snapshots(&state.db).await?;
     let snapshot = fetch_snapshot(&state.db, SnapshotId(snapshot_id)).await?;
+    ensure_sandbox_tenant(&state.db, snapshot.sandbox_id, &ctx).await?;
     Ok(Json(SnapshotResponse { ok: true, snapshot }))
 }
 
@@ -970,11 +1085,12 @@ async fn cleanup_snapshots(
 
 async fn create_desktop_session(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
     Json(request): Json<CreateDesktopSessionRequest>,
 ) -> Result<Json<DesktopSessionResponse>, ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
-    fetch_sandbox(&state.db, sandbox_id).await?;
+    ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
     let desktop_session = desktop_session_from_request(sandbox_id, request)?;
     insert_desktop_session(&state.db, &desktop_session).await?;
     insert_desktop_event(
@@ -992,10 +1108,11 @@ async fn create_desktop_session(
 
 async fn list_desktop_sessions(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<DesktopSessionListResponse>, ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
-    fetch_sandbox(&state.db, sandbox_id).await?;
+    ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
     expire_due_desktop_sessions(&state.db).await?;
     let desktop_sessions = list_desktop_sessions_for_sandbox(&state.db, sandbox_id).await?;
     Ok(Json(DesktopSessionListResponse {
@@ -1006,11 +1123,13 @@ async fn list_desktop_sessions(
 
 async fn get_desktop_session(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(desktop_session_id): Path<Uuid>,
 ) -> Result<Json<DesktopSessionResponse>, ApiError> {
     expire_due_desktop_sessions(&state.db).await?;
     let desktop_session =
         fetch_desktop_session(&state.db, DesktopSessionId(desktop_session_id)).await?;
+    ensure_sandbox_tenant(&state.db, desktop_session.sandbox_id, &ctx).await?;
     Ok(Json(DesktopSessionResponse {
         ok: true,
         desktop_session,
@@ -1019,11 +1138,13 @@ async fn get_desktop_session(
 
 async fn update_desktop_session_status(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(desktop_session_id): Path<Uuid>,
     Json(request): Json<UpdateDesktopSessionRequest>,
 ) -> Result<Json<DesktopSessionResponse>, ApiError> {
     let desktop_session_id = DesktopSessionId(desktop_session_id);
     let current = fetch_desktop_session(&state.db, desktop_session_id).await?;
+    ensure_sandbox_tenant(&state.db, current.sandbox_id, &ctx).await?;
     let updated = updated_desktop_session(current, request)?;
     update_desktop_session(&state.db, &updated).await?;
     insert_desktop_event(
@@ -1041,18 +1162,21 @@ async fn update_desktop_session_status(
 
 async fn create_desktop_access(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(desktop_session_id): Path<Uuid>,
     Json(request): Json<DesktopAccessRequest>,
 ) -> Result<Json<DesktopAccessResponse>, ApiError> {
     expire_due_desktop_sessions(&state.db).await?;
     let desktop_session =
         fetch_desktop_session(&state.db, DesktopSessionId(desktop_session_id)).await?;
+    ensure_sandbox_tenant(&state.db, desktop_session.sandbox_id, &ctx).await?;
     let access = mint_desktop_access(&desktop_session, request.ttl_seconds)?;
     Ok(Json(DesktopAccessResponse { ok: true, access }))
 }
 
 async fn queue_command(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
     Json(request): Json<CommandRequest>,
 ) -> Result<Json<CommandResponse>, ApiError> {
@@ -1061,7 +1185,7 @@ async fn queue_command(
     }
 
     let sandbox_id = SandboxId(sandbox_id);
-    fetch_sandbox(&state.db, sandbox_id).await?;
+    let sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
 
     let now = Utc::now();
     let env = request.env;
@@ -1083,6 +1207,7 @@ async fn queue_command(
         &state.db,
         &Job {
             id: JobId::new(),
+            tenant_id: sandbox.tenant_id,
             kind: JobKind::RunCommand,
             status: JobStatus::Queued,
             payload: json!({
@@ -1118,10 +1243,11 @@ async fn queue_command(
 
 async fn list_commands(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<CommandListResponse>, ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
-    fetch_sandbox(&state.db, sandbox_id).await?;
+    ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
 
     let sql = format!(
         "select id, sandbox_id, status, argv, cwd, exit_code, stdout, stderr, created_at, finished_at
@@ -1144,24 +1270,29 @@ async fn list_commands(
 
 async fn get_command(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(command_id): Path<Uuid>,
 ) -> Result<Json<CommandResponse>, ApiError> {
     let command = fetch_command(&state.db, CommandId(command_id)).await?;
+    ensure_sandbox_tenant(&state.db, command.sandbox_id, &ctx).await?;
     Ok(Json(CommandResponse { ok: true, command }))
 }
 
 async fn list_command_output(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(command_id): Path<Uuid>,
 ) -> Result<Json<CommandOutputListResponse>, ApiError> {
     let command_id = CommandId(command_id);
-    fetch_command(&state.db, command_id).await?;
+    let command = fetch_command(&state.db, command_id).await?;
+    ensure_sandbox_tenant(&state.db, command.sandbox_id, &ctx).await?;
     let chunks = list_command_output_chunks(&state.db, command_id).await?;
     Ok(Json(CommandOutputListResponse { ok: true, chunks }))
 }
 
 async fn queue_prompt(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
     Json(request): Json<PromptRequest>,
 ) -> Result<Json<PromptQueuedResponse>, ApiError> {
@@ -1170,7 +1301,7 @@ async fn queue_prompt(
     }
 
     let sandbox_id = SandboxId(sandbox_id);
-    fetch_sandbox(&state.db, sandbox_id).await?;
+    let sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
 
     let event = insert_event(
         &state.db,
@@ -1189,6 +1320,7 @@ async fn queue_prompt(
         &state.db,
         &Job {
             id: JobId::new(),
+            tenant_id: sandbox.tenant_id,
             kind: JobKind::RunPrompt,
             status: JobStatus::Queued,
             payload: json!({
@@ -1216,10 +1348,11 @@ async fn queue_prompt(
 
 async fn list_events(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<EventListResponse>, ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
-    fetch_sandbox(&state.db, sandbox_id).await?;
+    ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
 
     let sql = format!(
         "select id, sandbox_id, kind, data, created_at
@@ -1252,6 +1385,7 @@ fn validate_max_concurrent_jobs(max_concurrent_jobs: u32) -> Result<u32, ApiErro
 
 async fn register_worker(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Json(request): Json<RegisterWorkerRequest>,
 ) -> Result<Json<WorkerResponse>, ApiError> {
     if request.name.trim().is_empty() {
@@ -1271,6 +1405,7 @@ async fn register_worker(
     let now = Utc::now();
     let worker = Worker {
         id: WorkerId::new(),
+        tenant_id: ctx.tenant_id,
         name: request.name,
         status: WorkerStatus::Registered,
         provider: request.provider,
@@ -1287,11 +1422,12 @@ async fn register_worker(
 
 async fn heartbeat_worker(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(worker_id): Path<Uuid>,
     Json(request): Json<WorkerHeartbeatRequest>,
 ) -> Result<Json<WorkerResponse>, ApiError> {
     let worker_id = WorkerId(worker_id);
-    fetch_worker(&state.db, worker_id).await?;
+    ensure_worker_tenant(&state.db, worker_id, &ctx).await?;
     let now = Utc::now();
     let labels = serde_json::to_string(&request.labels)?;
     let result = if let Some(max_concurrent_jobs) = request.max_concurrent_jobs {
@@ -1345,10 +1481,11 @@ async fn heartbeat_worker(
 
 async fn reconcile_runtime_resources(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(worker_id): Path<Uuid>,
     Json(request): Json<ReconcileRuntimeResourcesRequest>,
 ) -> Result<Json<ReconcileRuntimeResourcesResponse>, ApiError> {
-    let worker = fetch_worker(&state.db, WorkerId(worker_id)).await?;
+    let worker = ensure_worker_tenant(&state.db, WorkerId(worker_id), &ctx).await?;
     if worker.provider != request.provider {
         return Err(ApiError::bad_request(
             "runtime resource provider must match worker provider",
@@ -1380,14 +1517,21 @@ async fn reconcile_runtime_resources(
     }
 }
 
-async fn list_workers(State(state): State<AppState>) -> Result<Json<WorkerListResponse>, ApiError> {
-    let rows = sqlx::query(
-        "select id, name, status, provider, capabilities, max_concurrent_jobs, labels, registered_at, last_heartbeat_at
+async fn list_workers(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+) -> Result<Json<WorkerListResponse>, ApiError> {
+    let sql = format!(
+        "select id, tenant_id, name, status, provider, capabilities, max_concurrent_jobs, labels, registered_at, last_heartbeat_at
          from workers
+         where tenant_id = {}
          order by registered_at asc, id asc",
-    )
-    .fetch_all(&state.db.pool)
-    .await?;
+        state.db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(&ctx.tenant_id)
+        .fetch_all(&state.db.pool)
+        .await?;
 
     let workers = rows
         .into_iter()
@@ -1397,9 +1541,12 @@ async fn list_workers(State(state): State<AppState>) -> Result<Json<WorkerListRe
     Ok(Json(WorkerListResponse { ok: true, workers }))
 }
 
-async fn get_capacity(State(state): State<AppState>) -> Result<Json<CapacityResponse>, ApiError> {
+async fn get_capacity(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+) -> Result<Json<CapacityResponse>, ApiError> {
     expire_due_leases(&state.db).await?;
-    let workers = list_worker_capacities(&state.db).await?;
+    let workers = list_worker_capacities(&state.db, &ctx.tenant_id).await?;
     let total_max_concurrent_jobs = workers
         .iter()
         .map(|worker| worker.max_concurrent_jobs)
@@ -1418,11 +1565,13 @@ async fn get_capacity(State(state): State<AppState>) -> Result<Json<CapacityResp
 
 async fn create_job(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Json(request): Json<CreateJobRequest>,
 ) -> Result<Json<JobResponse>, ApiError> {
     let now = Utc::now();
     let job = Job {
         id: JobId::new(),
+        tenant_id: ctx.tenant_id,
         kind: request.kind,
         status: JobStatus::Queued,
         payload: request.payload,
@@ -1439,16 +1588,23 @@ async fn create_job(
     Ok(Json(JobResponse { ok: true, job }))
 }
 
-async fn list_jobs(State(state): State<AppState>) -> Result<Json<JobListResponse>, ApiError> {
+async fn list_jobs(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+) -> Result<Json<JobListResponse>, ApiError> {
     expire_due_leases(&state.db).await?;
-    let rows = sqlx::query(
-        "select id, kind, status, payload, required_capability, priority, attempts, max_attempts,
+    let sql = format!(
+        "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
          from jobs
+         where tenant_id = {}
          order by created_at asc, id asc",
-    )
-    .fetch_all(&state.db.pool)
-    .await?;
+        state.db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(&ctx.tenant_id)
+        .fetch_all(&state.db.pool)
+        .await?;
     let jobs = rows
         .into_iter()
         .map(row_to_job)
@@ -1459,10 +1615,11 @@ async fn list_jobs(State(state): State<AppState>) -> Result<Json<JobListResponse
 
 async fn get_guest_health(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<GuestHealthResponse>, ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
-    fetch_sandbox(&state.db, sandbox_id).await?;
+    ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
     let guest_health = fetch_guest_health(&state.db, sandbox_id)
         .await?
         .unwrap_or_else(|| GuestHealth {
@@ -1482,11 +1639,12 @@ async fn get_guest_health(
 
 async fn update_guest_health(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
     Json(request): Json<UpdateGuestHealthRequest>,
 ) -> Result<Json<GuestHealthResponse>, ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
-    fetch_sandbox(&state.db, sandbox_id).await?;
+    ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
     let now = Utc::now();
     let guest_health = GuestHealth {
         sandbox_id,
@@ -1506,6 +1664,7 @@ async fn update_guest_health(
 
 async fn request_ssh_key(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
     Json(request): Json<RequestSshKeyRequest>,
 ) -> Result<Json<SshKeyResponse>, ApiError> {
@@ -1513,7 +1672,7 @@ async fn request_ssh_key(
         return Err(ApiError::bad_request("public_key is required"));
     }
     let sandbox_id = SandboxId(sandbox_id);
-    fetch_sandbox(&state.db, sandbox_id).await?;
+    ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
     let now = Utc::now();
     let ssh_key = SshKey {
         id: SshKeyId::new(),
@@ -1533,10 +1692,11 @@ async fn request_ssh_key(
 
 async fn list_ssh_keys(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<SshKeyListResponse>, ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
-    fetch_sandbox(&state.db, sandbox_id).await?;
+    ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
     let sql = format!(
         "select id, sandbox_id, public_key, principal, status, requested_at, updated_at, applied_at, error
          from ssh_keys
@@ -1558,11 +1718,12 @@ async fn list_ssh_keys(
 
 async fn create_ssh_access(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
     Json(request): Json<SshAccessRequest>,
 ) -> Result<Json<SshAccessResponse>, ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
-    fetch_sandbox(&state.db, sandbox_id).await?;
+    ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
     let guest_health = fetch_guest_health(&state.db, sandbox_id).await?;
     let ssh_access = mint_ssh_access(sandbox_id, guest_health.as_ref(), request)?;
     Ok(Json(SshAccessResponse {
@@ -1573,11 +1734,13 @@ async fn create_ssh_access(
 
 async fn update_ssh_key_status(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(ssh_key_id): Path<Uuid>,
     Json(request): Json<UpdateSshKeyStatusRequest>,
 ) -> Result<Json<SshKeyResponse>, ApiError> {
     let ssh_key_id = SshKeyId(ssh_key_id);
-    fetch_ssh_key(&state.db, ssh_key_id).await?;
+    let ssh_key = fetch_ssh_key(&state.db, ssh_key_id).await?;
+    ensure_sandbox_tenant(&state.db, ssh_key.sandbox_id, &ctx).await?;
     let now = Utc::now();
     let applied_at = if request.status == SshKeyStatus::Applied {
         Some(now.to_rfc3339())
@@ -1609,11 +1772,12 @@ async fn update_ssh_key_status(
 
 async fn claim_lease(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(worker_id): Path<Uuid>,
     Json(request): Json<ClaimLeaseRequest>,
 ) -> Result<Json<ClaimLeaseResponse>, ApiError> {
     expire_due_leases(&state.db).await?;
-    let worker = fetch_worker(&state.db, WorkerId(worker_id)).await?;
+    let worker = ensure_worker_tenant(&state.db, WorkerId(worker_id), &ctx).await?;
     if !worker_has_capacity(&state.db, &worker).await? {
         return Ok(Json(ClaimLeaseResponse {
             ok: true,
@@ -1621,16 +1785,19 @@ async fn claim_lease(
         }));
     }
 
-    let rows = sqlx::query(
-        "select id, kind, status, payload, required_capability, priority, attempts, max_attempts,
+    let sql = format!(
+        "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
          from jobs
-         where status = 'queued'
+         where tenant_id = {} and status = 'queued'
          order by priority desc, scheduled_at asc, created_at asc, id asc
          limit 25",
-    )
-    .fetch_all(&state.db.pool)
-    .await?;
+        state.db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(&worker.tenant_id)
+        .fetch_all(&state.db.pool)
+        .await?;
 
     for row in rows {
         let job = row_to_job(row)?;
@@ -1655,10 +1822,12 @@ async fn claim_lease(
 
 async fn renew_lease(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(lease_id): Path<Uuid>,
     Json(request): Json<RenewLeaseRequest>,
 ) -> Result<Json<LeaseResponse>, ApiError> {
     let lease_id = LeaseId(lease_id);
+    ensure_lease_tenant(&state.db, lease_id, &ctx).await?;
     let now = Utc::now();
     let expires_at = now + chrono::Duration::seconds(request.lease_seconds.unwrap_or(60) as i64);
     let sql = format!(
@@ -1683,6 +1852,7 @@ async fn renew_lease(
 
 async fn append_lease_output(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(lease_id): Path<Uuid>,
     Json(request): Json<AppendCommandOutputRequest>,
 ) -> Result<Json<CommandOutputChunkResponse>, ApiError> {
@@ -1691,7 +1861,7 @@ async fn append_lease_output(
             "command output chunk cannot be empty",
         ));
     }
-    let lease = fetch_lease(&state.db, LeaseId(lease_id)).await?;
+    let lease = ensure_lease_tenant(&state.db, LeaseId(lease_id), &ctx).await?;
     if lease.status != LeaseStatus::Active {
         return Err(ApiError::bad_request("lease is not active"));
     }
@@ -1715,10 +1885,12 @@ async fn append_lease_output(
 
 async fn complete_lease(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(lease_id): Path<Uuid>,
     Json(request): Json<CompleteLeaseRequest>,
 ) -> Result<Json<LeaseResponse>, ApiError> {
     let lease_id = LeaseId(lease_id);
+    ensure_lease_tenant(&state.db, lease_id, &ctx).await?;
     let result = request
         .result
         .ok_or_else(|| ApiError::bad_request("completion result is required"))?;
@@ -1772,6 +1944,7 @@ async fn complete_lease_in_transaction(
 
 async fn fail_lease(
     State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
     Path(lease_id): Path<Uuid>,
     Json(request): Json<FailLeaseRequest>,
 ) -> Result<Json<LeaseResponse>, ApiError> {
@@ -1779,7 +1952,7 @@ async fn fail_lease(
         return Err(ApiError::bad_request("error is required"));
     }
     let lease_id = LeaseId(lease_id);
-    let lease = fetch_lease(&state.db, lease_id).await?;
+    let lease = ensure_lease_tenant(&state.db, lease_id, &ctx).await?;
     if lease.status != LeaseStatus::Active {
         return Err(ApiError::bad_request("lease is not active"));
     }
@@ -1917,7 +2090,7 @@ async fn set_sandbox_state_on_connection(
 
 async fn fetch_sandbox(db: &Database, sandbox_id: SandboxId) -> Result<Sandbox, ApiError> {
     let sql = format!(
-        "select id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id
+        "select id, tenant_id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where id = {}",
         db.placeholder(1)
@@ -2758,7 +2931,7 @@ async fn command_has_output_chunks_on_connection(
 
 async fn fetch_worker(db: &Database, worker_id: WorkerId) -> Result<Worker, ApiError> {
     let sql = format!(
-        "select id, name, status, provider, capabilities, max_concurrent_jobs, labels, registered_at, last_heartbeat_at
+        "select id, tenant_id, name, status, provider, capabilities, max_concurrent_jobs, labels, registered_at, last_heartbeat_at
          from workers
          where id = {}",
         db.placeholder(1)
@@ -2796,14 +2969,21 @@ async fn worker_has_capacity(db: &Database, worker: &Worker) -> Result<bool, Api
     Ok(active_leases < worker.max_concurrent_jobs)
 }
 
-async fn list_worker_capacities(db: &Database) -> Result<Vec<WorkerCapacity>, ApiError> {
-    let rows = sqlx::query(
-        "select id, name, status, provider, capabilities, max_concurrent_jobs, labels, registered_at, last_heartbeat_at
+async fn list_worker_capacities(
+    db: &Database,
+    tenant_id: &str,
+) -> Result<Vec<WorkerCapacity>, ApiError> {
+    let sql = format!(
+        "select id, tenant_id, name, status, provider, capabilities, max_concurrent_jobs, labels, registered_at, last_heartbeat_at
          from workers
+         where tenant_id = {}
          order by registered_at asc, id asc",
-    )
-    .fetch_all(&db.pool)
-    .await?;
+        db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(tenant_id)
+        .fetch_all(&db.pool)
+        .await?;
 
     let mut capacities = Vec::new();
     for row in rows {
@@ -2983,12 +3163,13 @@ fn expires_at_from_ttl(
 async fn insert_sandbox(db: &Database, sandbox: &Sandbox) -> Result<(), ApiError> {
     let sql = format!(
         "insert into sandboxes
-         (id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id)
+         (id, tenant_id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id)
          values ({})",
-        db.placeholders(8)
+        db.placeholders(9)
     );
     sqlx::query(&sql)
         .bind(sandbox.id.to_string())
+        .bind(&sandbox.tenant_id)
         .bind(&sandbox.name)
         .bind(state_to_str(&sandbox.state))
         .bind(&sandbox.template)
@@ -3293,7 +3474,7 @@ async fn dead_queued_snapshot_jobs(
     error: &str,
 ) -> Result<(), ApiError> {
     let rows = sqlx::query(
-        "select id, kind, status, payload, required_capability, priority, attempts, max_attempts,
+        "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
          from jobs
          where kind = 'create_snapshot' and status = 'queued'
@@ -3354,7 +3535,7 @@ async fn cleanup_archived_sandboxes(
     db: &Database,
 ) -> Result<ArchivedSandboxCleanupResult, ApiError> {
     let rows = sqlx::query(
-        "select id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id
+        "select id, tenant_id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where state = 'archived' and ttl_seconds is not null
          order by updated_at asc, id asc",
@@ -3801,13 +3982,14 @@ async fn insert_command(db: &Database, command: &CommandRun) -> Result<(), ApiEr
 async fn insert_job(db: &Database, job: &Job) -> Result<(), ApiError> {
     let sql = format!(
         "insert into jobs
-         (id, kind, status, payload, required_capability, priority, attempts, max_attempts,
+         (id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
           scheduled_at, created_at, updated_at, last_error)
          values ({})",
-        db.placeholders(12)
+        db.placeholders(13)
     );
     sqlx::query(&sql)
         .bind(job.id.to_string())
+        .bind(&job.tenant_id)
         .bind(job_kind_to_str(&job.kind))
         .bind(job_status_to_str(&job.status))
         .bind(serde_json::to_string(&job.payload)?)
@@ -3831,13 +4013,14 @@ async fn insert_job_on_connection(
 ) -> Result<(), ApiError> {
     let sql = format!(
         "insert into jobs
-         (id, kind, status, payload, required_capability, priority, attempts, max_attempts,
+         (id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
           scheduled_at, created_at, updated_at, last_error)
          values ({})",
-        db.placeholders(12)
+        db.placeholders(13)
     );
     sqlx::query(&sql)
         .bind(job.id.to_string())
+        .bind(&job.tenant_id)
         .bind(job_kind_to_str(&job.kind))
         .bind(job_status_to_str(&job.status))
         .bind(serde_json::to_string(&job.payload)?)
@@ -3966,7 +4149,7 @@ async fn expire_due_leases(db: &Database) -> Result<(), ApiError> {
 
 async fn fetch_job(db: &Database, job_id: JobId) -> Result<Job, ApiError> {
     let sql = format!(
-        "select id, kind, status, payload, required_capability, priority, attempts, max_attempts,
+        "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
          from jobs
          where id = {}",
@@ -3986,7 +4169,7 @@ async fn fetch_job_on_connection(
     job_id: JobId,
 ) -> Result<Job, ApiError> {
     let sql = format!(
-        "select id, kind, status, payload, required_capability, priority, attempts, max_attempts,
+        "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
          from jobs
          where id = {}",
@@ -4659,7 +4842,7 @@ async fn queue_forks_waiting_on_snapshot_on_connection(
     parent_sandbox_id: SandboxId,
 ) -> Result<(), ApiError> {
     let sql = format!(
-        "select id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id
+        "select id, tenant_id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where parent_snapshot_id = {} and state = 'planning'
          order by created_at asc, id asc",
@@ -4678,6 +4861,7 @@ async fn queue_forks_waiting_on_snapshot_on_connection(
             connection,
             &Job {
                 id: JobId::new(),
+                tenant_id: child.tenant_id.clone(),
                 kind: JobKind::ForkSandbox,
                 status: JobStatus::Queued,
                 payload: json!({
@@ -4860,12 +5044,13 @@ impl Database {
 async fn insert_worker(db: &Database, worker: &Worker) -> Result<(), ApiError> {
     let sql = format!(
         "insert into workers
-         (id, name, status, provider, capabilities, max_concurrent_jobs, labels, registered_at, last_heartbeat_at)
+         (id, tenant_id, name, status, provider, capabilities, max_concurrent_jobs, labels, registered_at, last_heartbeat_at)
          values ({})",
-        db.placeholders(9)
+        db.placeholders(10)
     );
     sqlx::query(&sql)
         .bind(worker.id.to_string())
+        .bind(&worker.tenant_id)
         .bind(&worker.name)
         .bind(worker_status_to_str(&worker.status))
         .bind(&worker.provider)
@@ -4910,6 +5095,7 @@ fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
 
     Ok(Sandbox {
         id: SandboxId(parse_uuid(&id)?),
+        tenant_id: row.try_get("tenant_id")?,
         name: row.try_get("name")?,
         state: parse_state(&state)?,
         template: row.try_get("template")?,
@@ -5035,6 +5221,7 @@ fn row_to_worker(row: AnyRow) -> Result<Worker, ApiError> {
 
     Ok(Worker {
         id: WorkerId(parse_uuid(&id)?),
+        tenant_id: row.try_get("tenant_id")?,
         name: row.try_get("name")?,
         status: parse_worker_status(&status)?,
         provider: row.try_get("provider")?,
@@ -5136,6 +5323,7 @@ fn row_to_job(row: AnyRow) -> Result<Job, ApiError> {
 
     Ok(Job {
         id: JobId(parse_uuid(&id)?),
+        tenant_id: row.try_get("tenant_id")?,
         kind: parse_job_kind(&kind)?,
         status: parse_job_status(&status)?,
         payload: serde_json::from_str(&payload)?,
@@ -5191,6 +5379,7 @@ fn row_to_lease_without_job(row: AnyRow) -> Result<JobLease, ApiError> {
         error: row.try_get("error")?,
         job: Job {
             id: JobId::new(),
+            tenant_id: "default".to_string(),
             kind: JobKind::RunCommand,
             status: JobStatus::Queued,
             payload: json!({}),
@@ -5631,6 +5820,14 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             code: "not_found",
+            message: message.into(),
+        }
+    }
+
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code: "unauthorized",
             message: message.into(),
         }
     }

@@ -398,6 +398,7 @@ pub struct RuntimeResource {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Sandbox {
     pub id: SandboxId,
+    pub tenant_id: String,
     pub name: String,
     pub state: SandboxState,
     pub template: String,
@@ -757,6 +758,7 @@ pub enum WorkerCapability {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Worker {
     pub id: WorkerId,
+    pub tenant_id: String,
     pub name: String,
     pub status: WorkerStatus,
     pub provider: String,
@@ -851,6 +853,7 @@ pub enum LeaseStatus {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Job {
     pub id: JobId,
+    pub tenant_id: String,
     pub kind: JobKind,
     pub status: JobStatus,
     pub payload: serde_json::Value,

@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, time::Duration};
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use provider::{KubernetesApplyProvider, KubernetesDryRunProvider, SandboxProvider};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse,
     CompleteLeaseRequest, FailLeaseRequest, JobKind, LeaseResponse, RegisterWorkerRequest,
@@ -19,6 +20,12 @@ use uuid::Uuid;
 struct Cli {
     #[arg(long, env = "SANDBOXWICH_API", default_value = "http://127.0.0.1:3217")]
     api: String,
+
+    #[arg(long, env = "SANDBOXWICH_API_TOKEN")]
+    api_token: Option<String>,
+
+    #[arg(long, env = "SANDBOXWICH_TENANT")]
+    tenant: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -323,7 +330,7 @@ impl SandboxProvider for RuntimeProvider {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let api = cli.api.trim_end_matches('/').to_string();
-    let client = reqwest::Client::new();
+    let client = build_client(cli.api_token.as_deref(), cli.tenant.as_deref())?;
 
     match cli.command {
         Command::Capabilities => {
@@ -537,6 +544,27 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn build_client(api_token: Option<&str>, tenant: Option<&str>) -> anyhow::Result<reqwest::Client> {
+    let mut headers = HeaderMap::new();
+    if let Some(api_token) = api_token.map(str::trim).filter(|token| !token.is_empty()) {
+        let value = format!("Bearer {api_token}");
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&value).context("invalid SANDBOXWICH_API_TOKEN")?,
+        );
+    }
+    if let Some(tenant) = tenant.map(str::trim).filter(|tenant| !tenant.is_empty()) {
+        headers.insert(
+            HeaderName::from_static("x-sandboxwich-tenant"),
+            HeaderValue::from_str(tenant).context("invalid SANDBOXWICH_TENANT")?,
+        );
+    }
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .context("failed to build HTTP client")
 }
 
 fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
@@ -969,6 +997,7 @@ mod tests {
         let now = Utc::now();
         Job {
             id: JobId::new(),
+            tenant_id: "default".to_string(),
             kind,
             status: JobStatus::Leased,
             payload,
