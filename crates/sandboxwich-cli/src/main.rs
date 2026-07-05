@@ -1,15 +1,15 @@
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use sandboxwich_core::{
-    CommandListResponse, CommandRequest, CommandResponse, CreateDesktopSessionRequest,
-    CreateSandboxRequest, CreateSnapshotRequest, DesktopAccessMode, DesktopAccessRequest,
-    DesktopAccessResponse, DesktopSessionListResponse, DesktopSessionResponse,
-    DesktopSessionStatus, EventListResponse, GuestHealthResponse, GuestStatus, JobListResponse,
-    PromptQueuedResponse, PromptRequest, RequestSshKeyRequest, RuntimeResourceListResponse,
-    SandboxListResponse, SandboxResponse, SnapshotCleanupResponse, SnapshotListResponse,
-    SnapshotResponse, SshAccessRequest, SshAccessResponse, SshKeyListResponse, SshKeyResponse,
-    SshKeyStatus, UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest,
-    WorkerListResponse,
+    CapacityResponse, CommandListResponse, CommandRequest, CommandResponse,
+    CreateDesktopSessionRequest, CreateSandboxRequest, CreateSnapshotRequest, DesktopAccessMode,
+    DesktopAccessRequest, DesktopAccessResponse, DesktopSessionListResponse,
+    DesktopSessionResponse, DesktopSessionStatus, EventListResponse, GuestHealthResponse,
+    GuestStatus, JobListResponse, PromptQueuedResponse, PromptRequest, RequestSshKeyRequest,
+    RuntimeResourceListResponse, SandboxListResponse, SandboxResponse, SnapshotCleanupResponse,
+    SnapshotListResponse, SnapshotResponse, SshAccessRequest, SshAccessResponse,
+    SshKeyListResponse, SshKeyResponse, SshKeyStatus, UpdateDesktopSessionRequest,
+    UpdateGuestHealthRequest, UpdateSshKeyStatusRequest, WorkerListResponse,
 };
 use uuid::Uuid;
 
@@ -49,6 +49,7 @@ enum Command {
     Commands { sandbox_id: Uuid },
     Command { command_id: Uuid },
     Workers,
+    Capacity,
     Jobs,
     GuestHealth { sandbox_id: Uuid },
     SetGuestHealth(SetGuestHealthArgs),
@@ -457,6 +458,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Workers => {
             let response = client.get(format!("{api}/workers")).send().await?;
             print_json::<WorkerListResponse>(response).await?;
+        }
+        Command::Capacity => {
+            let response = client.get(format!("{api}/capacity")).send().await?;
+            print_json::<CapacityResponse>(response).await?;
         }
         Command::Jobs => {
             let response = client.get(format!("{api}/jobs")).send().await?;
