@@ -435,7 +435,7 @@ async fn main() -> anyhow::Result<()> {
                 &api,
                 args.name,
                 args.provider,
-                capabilities_from_args(args.capability),
+                capabilities_from_args(args.capability, None),
                 args.label.into_iter().collect(),
                 args.max_concurrent_jobs,
             )
@@ -498,13 +498,15 @@ async fn main() -> anyhow::Result<()> {
             print_json::<LeaseResponse>(response).await?;
         }
         Command::Run(args) => {
+            let runtime_class_name = args.provider.provider.runtime_class_name.as_deref();
+            let capabilities = capabilities_from_args(args.capability, runtime_class_name);
             let labels: BTreeMap<_, _> = args.label.into_iter().collect();
             let response = register_worker(
                 &client,
                 &api,
                 args.name,
                 args.worker_provider,
-                capabilities_from_args(args.capability),
+                capabilities,
                 labels.clone(),
                 args.max_concurrent_jobs,
             )
@@ -923,16 +925,23 @@ fn uuid_from_payload(payload: &serde_json::Value, field: &'static str) -> anyhow
         .with_context(|| format!("job payload {field} is invalid"))
 }
 
-fn capabilities_from_args(capabilities: Vec<CapabilityArg>) -> Vec<WorkerCapability> {
+fn capabilities_from_args(
+    capabilities: Vec<CapabilityArg>,
+    runtime_class_name: Option<&str>,
+) -> Vec<WorkerCapability> {
     if capabilities.is_empty() {
-        vec![
+        let mut defaults = vec![
             WorkerCapability::K8sPod,
             WorkerCapability::ProvisionSandbox,
             WorkerCapability::RunCommand,
             WorkerCapability::AgentPrompt,
             WorkerCapability::Snapshot,
             WorkerCapability::DesktopStream,
-        ]
+        ];
+        if runtime_class_name.is_some_and(|value| !value.trim().is_empty()) {
+            defaults.push(WorkerCapability::GvisorSandbox);
+        }
+        defaults
     } else {
         capabilities.into_iter().map(to_capability).collect()
     }
@@ -1156,13 +1165,21 @@ mod tests {
 
     #[test]
     fn default_registration_capabilities_cover_supported_worker_jobs() {
-        let capabilities = capabilities_from_args(Vec::new());
+        let capabilities = capabilities_from_args(Vec::new(), None);
 
         assert!(capabilities.contains(&WorkerCapability::ProvisionSandbox));
         assert!(capabilities.contains(&WorkerCapability::RunCommand));
         assert!(capabilities.contains(&WorkerCapability::AgentPrompt));
         assert!(capabilities.contains(&WorkerCapability::Snapshot));
         assert!(capabilities.contains(&WorkerCapability::K8sPod));
+        assert!(!capabilities.contains(&WorkerCapability::GvisorSandbox));
+    }
+
+    #[test]
+    fn default_registration_capabilities_include_gvisor_when_runtime_class_is_configured() {
+        let capabilities = capabilities_from_args(Vec::new(), Some("gvisor"));
+
+        assert!(capabilities.contains(&WorkerCapability::GvisorSandbox));
     }
 
     #[test]

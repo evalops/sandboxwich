@@ -55,6 +55,7 @@ pub struct KubernetesDryRunProvider {
     snapshot_class: Option<String>,
     runtime_image: String,
     workspace_storage: String,
+    workspace_storage_override: bool,
     ssh_authorized_keys_secret: Option<String>,
     runtime_class_name: Option<String>,
     isolation_backend: String,
@@ -74,6 +75,7 @@ impl KubernetesDryRunProvider {
             snapshot_class,
             runtime_image: DEFAULT_SANDBOX_GUEST_IMAGE.to_string(),
             workspace_storage: "2Gi".to_string(),
+            workspace_storage_override: false,
             ssh_authorized_keys_secret: None,
             runtime_class_name: None,
             isolation_backend: "kubernetes".to_string(),
@@ -90,6 +92,7 @@ impl KubernetesDryRunProvider {
     pub fn with_workspace_storage(mut self, storage: Option<String>) -> Self {
         if let Some(storage) = storage {
             self.workspace_storage = storage;
+            self.workspace_storage_override = true;
         }
         self
     }
@@ -149,8 +152,9 @@ impl KubernetesDryRunProvider {
         sandbox_id: SandboxId,
         operation: &'static str,
         spec: &SandboxProvisionSpec,
-    ) -> serde_json::Value {
-        json!({
+    ) -> anyhow::Result<serde_json::Value> {
+        let network_policy = self.network_policy_manifest(sandbox_id, &spec.network_egress)?;
+        Ok(json!({
             "provider": "kubernetes",
             "mode": "dry_run",
             "operation": operation,
@@ -170,9 +174,9 @@ impl KubernetesDryRunProvider {
                 "pvc": self.pvc_manifest(format!("sandboxwich-pvc-{sandbox_id}"), Some(sandbox_id), &spec.memory_limit),
                 "sshService": self.ssh_service_manifest(sandbox_id),
                 "desktopService": self.desktop_service_manifest(sandbox_id),
-                "networkPolicy": self.network_policy_manifest(sandbox_id, &spec.network_egress)
+                "networkPolicy": network_policy
             }
-        })
+        }))
     }
 
     fn runtime_metadata(&self) -> serde_json::Value {
@@ -217,7 +221,7 @@ impl KubernetesDryRunProvider {
     }
 
     fn effective_workspace_storage(&self, memory_limit: &MemoryLimit) -> String {
-        if *memory_limit == MemoryLimit::OneG {
+        if self.workspace_storage_override {
             self.workspace_storage.clone()
         } else {
             memory_limit.disk_limit().to_string()
@@ -387,7 +391,8 @@ impl KubernetesDryRunProvider {
         &self,
         sandbox_id: SandboxId,
         network_egress: &NetworkEgress,
-    ) -> serde_json::Value {
+    ) -> anyhow::Result<serde_json::Value> {
+        Self::validate_network_policy_egress(network_egress)?;
         let egress = match network_egress {
             NetworkEgress::DenyAll => Vec::new(),
             NetworkEgress::AllowAll => vec![json!({})],
@@ -406,7 +411,7 @@ impl KubernetesDryRunProvider {
                 .collect(),
         };
 
-        json!({
+        Ok(json!({
             "apiVersion": "networking.k8s.io/v1",
             "kind": "NetworkPolicy",
             "metadata": self.object_metadata(format!("sandboxwich-egress-{sandbox_id}"), Some(sandbox_id)),
@@ -419,7 +424,7 @@ impl KubernetesDryRunProvider {
                 "policyTypes": ["Egress"],
                 "egress": egress
             }
-        })
+        }))
     }
 
     fn ssh_service_manifest(&self, sandbox_id: SandboxId) -> serde_json::Value {
@@ -778,7 +783,8 @@ impl KubernetesApplyProvider {
         let provision_pod = self.dry_run.pod_manifest(sandbox_id, &spec);
         let provision_network_policy = self
             .dry_run
-            .network_policy_manifest(sandbox_id, &spec.network_egress);
+            .network_policy_manifest(sandbox_id, &spec.network_egress)
+            .expect("default network egress should render");
         let provision_ssh_service = self.dry_run.ssh_service_manifest(sandbox_id);
         let provision_service = self.dry_run.desktop_service_manifest(sandbox_id);
         let snapshot = self
@@ -790,7 +796,8 @@ impl KubernetesApplyProvider {
         let fork_pod = self.dry_run.pod_manifest(child_sandbox_id, &spec);
         let fork_network_policy = self
             .dry_run
-            .network_policy_manifest(child_sandbox_id, &spec.network_egress);
+            .network_policy_manifest(child_sandbox_id, &spec.network_egress)
+            .expect("default network egress should render");
         let fork_ssh_service = self.dry_run.ssh_service_manifest(child_sandbox_id);
         let fork_service = self.dry_run.desktop_service_manifest(child_sandbox_id);
         let exec_handoff = self
@@ -961,8 +968,8 @@ impl KubernetesApplyProvider {
         &self,
         sandbox_id: SandboxId,
         spec: &SandboxProvisionSpec,
-    ) -> Vec<Value> {
-        vec![
+    ) -> anyhow::Result<Vec<Value>> {
+        Ok(vec![
             self.dry_run.pvc_manifest(
                 format!("sandboxwich-pvc-{sandbox_id}"),
                 Some(sandbox_id),
@@ -970,10 +977,10 @@ impl KubernetesApplyProvider {
             ),
             self.dry_run.pod_manifest(sandbox_id, spec),
             self.dry_run
-                .network_policy_manifest(sandbox_id, &spec.network_egress),
+                .network_policy_manifest(sandbox_id, &spec.network_egress)?,
             self.dry_run.ssh_service_manifest(sandbox_id),
             self.dry_run.desktop_service_manifest(sandbox_id),
-        ]
+        ])
     }
 
     fn wait_for_pod_ready(&self, sandbox_id: SandboxId) -> anyhow::Result<KubectlOutput> {
@@ -1152,7 +1159,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
             provider: "kubernetes".to_string(),
             sandbox_id,
             resources: self.sandbox_resources(sandbox_id, spec, RuntimeResourceStatus::Planned),
-            metadata: self.metadata(sandbox_id, "provision", spec),
+            metadata: self.metadata(sandbox_id, "provision", spec)?,
         })
     }
 
@@ -1223,6 +1230,8 @@ impl SandboxProvider for KubernetesDryRunProvider {
         spec: &SandboxProvisionSpec,
     ) -> anyhow::Result<ProviderForkHandle> {
         Self::validate_network_policy_egress(&spec.network_egress)?;
+        let network_policy =
+            self.network_policy_manifest(child_sandbox_id, &spec.network_egress)?;
         Ok(ProviderForkHandle {
             provider: "kubernetes".to_string(),
             parent_sandbox_id,
@@ -1255,7 +1264,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
                     "pod": self.pod_manifest(child_sandbox_id, spec),
                     "sshService": self.ssh_service_manifest(child_sandbox_id),
                     "desktopService": self.desktop_service_manifest(child_sandbox_id),
-                    "networkPolicy": self.network_policy_manifest(child_sandbox_id, &spec.network_egress)
+                    "networkPolicy": network_policy
                 }
             }),
         })
@@ -1305,7 +1314,7 @@ impl SandboxProvider for KubernetesApplyProvider {
     ) -> anyhow::Result<ProviderSandboxHandle> {
         KubernetesDryRunProvider::validate_network_policy_egress(&spec.network_egress)?;
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
-        let manifests = self.provision_manifests(sandbox_id, spec);
+        let manifests = self.provision_manifests(sandbox_id, spec)?;
         let apply = run_kubectl_documents(
             &self.kubectl,
             &self.kubectl_args("apply"),
@@ -1412,12 +1421,14 @@ impl SandboxProvider for KubernetesApplyProvider {
     ) -> anyhow::Result<ProviderForkHandle> {
         KubernetesDryRunProvider::validate_network_policy_egress(&spec.network_egress)?;
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
+        let network_policy = self
+            .dry_run
+            .network_policy_manifest(child_sandbox_id, &spec.network_egress)?;
         let manifests = vec![
             self.dry_run
                 .fork_pvc_manifest(child_sandbox_id, snapshot_id, &spec.memory_limit),
             self.dry_run.pod_manifest(child_sandbox_id, spec),
-            self.dry_run
-                .network_policy_manifest(child_sandbox_id, &spec.network_egress),
+            network_policy,
             self.dry_run.ssh_service_manifest(child_sandbox_id),
             self.dry_run.desktop_service_manifest(child_sandbox_id),
         ];
@@ -1627,6 +1638,25 @@ mod tests {
         assert_eq!(
             provisioned.metadata["manifests"]["pvc"]["spec"]["resources"]["requests"]["storage"],
             "2Gi"
+        );
+    }
+
+    #[test]
+    fn configured_workspace_storage_overrides_non_default_tier_disk_size() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_workspace_storage(Some("20Gi".to_string()));
+        let spec = SandboxProvisionSpec {
+            memory_limit: MemoryLimit::FourG,
+            network_egress: NetworkEgress::DenyAll,
+        };
+
+        let provisioned = provider
+            .provision(SandboxId::new(), &spec)
+            .expect("dry-run provision should succeed");
+        assert_eq!(
+            provisioned.metadata["manifests"]["pvc"]["spec"]["resources"]["requests"]["storage"],
+            "20Gi"
         );
     }
 
