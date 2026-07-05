@@ -42,6 +42,8 @@ By default the CLI talks to `http://127.0.0.1:3217`. Override it with `SANDBOXWI
 
 By default the API writes to `sqlite://sandboxwich.db`. Override it with `SANDBOXWICH_DATABASE_URL`, for example `postgres://sandboxwich:secret@localhost:5432/sandboxwich`.
 
+The API exposes `/healthz`, `/readyz`, and `/metrics`. Set `SANDBOXWICH_API_TOKEN` to require bearer auth on API and metrics requests; `/healthz` and `/readyz` remain probe-friendly for Kubernetes.
+
 Worker completions use typed result variants. Provider-created pods, PVCs, Services, and VolumeSnapshots are persisted as `runtime_resources` rows with constrained kind, purpose, and status columns; provider metadata is diagnostic compatibility data, not the durable source of runtime state.
 
 ## Design principles

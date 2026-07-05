@@ -34,12 +34,20 @@ spec:
                 secretKeyRef:
                   name: sandboxwich-secrets
                   key: database-url
+            - name: SANDBOXWICH_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sandboxwich-secrets
+                  key: api-token
+                  optional: true
+            - name: SANDBOXWICH_DEFAULT_TENANT
+              value: default
           ports:
             - name: http
               containerPort: 3217
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: http
             initialDelaySeconds: 2
             periodSeconds: 5
