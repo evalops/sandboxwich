@@ -40,6 +40,58 @@ pub fn build_api_client(
         .map_err(ApiClientBuildError::Build)
 }
 
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error("invalid {enum_name} variant {value:?}; expected one of {expected:?}")]
+pub struct DbVariantError {
+    pub enum_name: &'static str,
+    pub value: String,
+    pub expected: &'static [&'static str],
+}
+
+pub trait DbVariant: Sized {
+    const VALUES: &'static [&'static str];
+
+    fn as_db_str(&self) -> &'static str;
+    fn parse_db_str(value: &str) -> Result<Self, DbVariantError>;
+}
+
+macro_rules! db_variant_enum {
+    (
+        $(#[$meta:meta])*
+        pub enum $name:ident {
+            $($variant:ident => $value:literal),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum $name {
+            $($variant),+
+        }
+
+        impl DbVariant for $name {
+            const VALUES: &'static [&'static str] = &[$($value),+];
+
+            fn as_db_str(&self) -> &'static str {
+                match self {
+                    $(Self::$variant => $value),+
+                }
+            }
+
+            fn parse_db_str(value: &str) -> Result<Self, DbVariantError> {
+                match value {
+                    $($value => Ok(Self::$variant),)+
+                    _ => Err(DbVariantError {
+                        enum_name: stringify!($name),
+                        value: value.to_string(),
+                        expected: Self::VALUES,
+                    }),
+                }
+            }
+        }
+    };
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SandboxId(pub Uuid);
@@ -304,81 +356,81 @@ impl fmt::Display for CleanupRunId {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+db_variant_enum! {
 pub enum SandboxState {
-    Planning,
-    Provisioning,
-    Ready,
-    Running,
-    Idle,
-    Archiving,
-    Archived,
-    Error,
+    Planning => "planning",
+    Provisioning => "provisioning",
+    Ready => "ready",
+    Running => "running",
+    Idle => "idle",
+    Archiving => "archiving",
+    Archived => "archived",
+    Error => "error",
+}
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+db_variant_enum! {
 pub enum SnapshotStatus {
-    Pending,
-    Ready,
-    Failed,
-    Expired,
+    Pending => "pending",
+    Ready => "ready",
+    Failed => "failed",
+    Expired => "expired",
+}
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+db_variant_enum! {
 pub enum DesktopSessionStatus {
-    Pending,
-    Ready,
-    Failed,
-    Closed,
-    Expired,
+    Pending => "pending",
+    Ready => "ready",
+    Failed => "failed",
+    Closed => "closed",
+    Expired => "expired",
+}
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+db_variant_enum! {
 pub enum DesktopAccessMode {
-    Browser,
-    Vnc,
-    Rdp,
+    Browser => "browser",
+    Vnc => "vnc",
+    Rdp => "rdp",
+}
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+db_variant_enum! {
 pub enum RuntimeResourceKind {
-    Pod,
-    PersistentVolumeClaim,
-    Service,
-    VolumeSnapshot,
+    Pod => "pod",
+    PersistentVolumeClaim => "persistent_volume_claim",
+    Service => "service",
+    VolumeSnapshot => "volume_snapshot",
+}
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+db_variant_enum! {
 pub enum RuntimeResourcePurpose {
-    Runtime,
-    Workspace,
-    Ssh,
-    Desktop,
-    Snapshot,
+    Runtime => "runtime",
+    Workspace => "workspace",
+    Ssh => "ssh",
+    Desktop => "desktop",
+    Snapshot => "snapshot",
+}
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+db_variant_enum! {
 pub enum RuntimeResourceStatus {
-    Planned,
-    Applied,
-    Ready,
-    Failed,
-    Deleted,
+    Planned => "planned",
+    Applied => "applied",
+    Ready => "ready",
+    Failed => "failed",
+    Deleted => "deleted",
+}
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+db_variant_enum! {
 pub enum CleanupRunStatus {
-    Running,
-    Succeeded,
-    Failed,
+    Running => "running",
+    Succeeded => "succeeded",
+    Failed => "failed",
+}
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -654,20 +706,20 @@ pub struct CommandRequest {
     pub env: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+db_variant_enum! {
 pub enum CommandStatus {
-    Queued,
-    Running,
-    Finished,
-    Failed,
+    Queued => "queued",
+    Running => "running",
+    Finished => "finished",
+    Failed => "failed",
+}
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+db_variant_enum! {
 pub enum CommandOutputStream {
-    Stdout,
-    Stderr,
+    Stdout => "stdout",
+    Stderr => "stderr",
+}
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -738,22 +790,22 @@ pub struct PromptQueuedResponse {
     pub event: SandboxEvent,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+db_variant_enum! {
 pub enum SandboxEventKind {
-    LifecycleChanged,
-    CommandQueued,
-    CommandStarted,
-    CommandOutput,
-    CommandFinished,
-    PromptQueued,
-    PromptStarted,
-    PromptFinished,
-    DesktopRequested,
-    DesktopReady,
-    DesktopFailed,
-    DesktopClosed,
-    DesktopExpired,
+    LifecycleChanged => "lifecycle_changed",
+    CommandQueued => "command_queued",
+    CommandStarted => "command_started",
+    CommandOutput => "command_output",
+    CommandFinished => "command_finished",
+    PromptQueued => "prompt_queued",
+    PromptStarted => "prompt_started",
+    PromptFinished => "prompt_finished",
+    DesktopRequested => "desktop_requested",
+    DesktopReady => "desktop_ready",
+    DesktopFailed => "desktop_failed",
+    DesktopClosed => "desktop_closed",
+    DesktopExpired => "desktop_expired",
+}
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -771,24 +823,24 @@ pub struct EventListResponse {
     pub events: Vec<SandboxEvent>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+db_variant_enum! {
 pub enum WorkerStatus {
-    Registered,
-    Online,
-    Draining,
-    Offline,
+    Registered => "registered",
+    Online => "online",
+    Draining => "draining",
+    Offline => "offline",
+}
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+db_variant_enum! {
 pub enum WorkerCapability {
-    ProvisionSandbox,
-    RunCommand,
-    AgentPrompt,
-    Snapshot,
-    DesktopStream,
-    K8sPod,
+    ProvisionSandbox => "provision_sandbox",
+    RunCommand => "run_command",
+    AgentPrompt => "agent_prompt",
+    Snapshot => "snapshot",
+    DesktopStream => "desktop_stream",
+    K8sPod => "k8s_pod",
+}
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -860,35 +912,35 @@ pub struct CapacityResponse {
     pub total_available_slots: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+db_variant_enum! {
 pub enum JobKind {
-    ProvisionSandbox,
-    StopSandbox,
-    ResumeSandbox,
-    RunCommand,
-    RunPrompt,
-    CreateSnapshot,
-    ForkSandbox,
+    ProvisionSandbox => "provision_sandbox",
+    StopSandbox => "stop_sandbox",
+    ResumeSandbox => "resume_sandbox",
+    RunCommand => "run_command",
+    RunPrompt => "run_prompt",
+    CreateSnapshot => "create_snapshot",
+    ForkSandbox => "fork_sandbox",
+}
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+db_variant_enum! {
 pub enum JobStatus {
-    Queued,
-    Leased,
-    Succeeded,
-    Failed,
-    Dead,
+    Queued => "queued",
+    Leased => "leased",
+    Succeeded => "succeeded",
+    Failed => "failed",
+    Dead => "dead",
+}
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+db_variant_enum! {
 pub enum LeaseStatus {
-    Active,
-    Completed,
-    Failed,
-    Expired,
+    Active => "active",
+    Completed => "completed",
+    Failed => "failed",
+    Expired => "expired",
+}
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1000,12 +1052,12 @@ pub struct AgentHealthResponse {
     pub ready: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+db_variant_enum! {
 pub enum ProviderHealthStatus {
-    Healthy,
-    Degraded,
-    Unhealthy,
+    Healthy => "healthy",
+    Degraded => "degraded",
+    Unhealthy => "unhealthy",
+}
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1091,14 +1143,14 @@ pub enum WorkerJobResult {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+db_variant_enum! {
 pub enum GuestStatus {
-    Pending,
-    Ready,
-    Unreachable,
-    Unhealthy,
-    Terminated,
+    Pending => "pending",
+    Ready => "ready",
+    Unreachable => "unreachable",
+    Unhealthy => "unhealthy",
+    Terminated => "terminated",
+}
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1125,13 +1177,13 @@ pub struct GuestHealthResponse {
     pub guest_health: GuestHealth,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+db_variant_enum! {
 pub enum SshKeyStatus {
-    Requested,
-    Applied,
-    Failed,
-    Revoked,
+    Requested => "requested",
+    Applied => "applied",
+    Failed => "failed",
+    Revoked => "revoked",
+}
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1169,6 +1221,53 @@ pub struct SshKeyResponse {
 pub struct SshKeyListResponse {
     pub ok: bool,
     pub ssh_keys: Vec<SshKey>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::{Serialize, de::DeserializeOwned};
+    use std::{collections::BTreeSet, fmt::Debug};
+
+    fn assert_db_variant_contract<T>()
+    where
+        T: DbVariant + Serialize + DeserializeOwned + Debug + PartialEq,
+    {
+        let mut seen = BTreeSet::new();
+        for value in T::VALUES {
+            assert!(seen.insert(*value), "duplicate db variant value {value}");
+            let parsed = T::parse_db_str(value).expect("declared value must parse");
+            assert_eq!(parsed.as_db_str(), *value);
+            let json = serde_json::to_string(&parsed).expect("variant should serialize");
+            assert_eq!(json, format!("\"{value}\""));
+            let decoded: T = serde_json::from_str(&json).expect("variant should deserialize");
+            assert_eq!(decoded, parsed);
+        }
+        assert!(T::parse_db_str("__not_a_variant__").is_err());
+    }
+
+    #[test]
+    fn db_variants_round_trip_through_declared_values_and_json() {
+        assert_db_variant_contract::<SandboxState>();
+        assert_db_variant_contract::<SnapshotStatus>();
+        assert_db_variant_contract::<DesktopSessionStatus>();
+        assert_db_variant_contract::<DesktopAccessMode>();
+        assert_db_variant_contract::<RuntimeResourceKind>();
+        assert_db_variant_contract::<RuntimeResourcePurpose>();
+        assert_db_variant_contract::<RuntimeResourceStatus>();
+        assert_db_variant_contract::<CleanupRunStatus>();
+        assert_db_variant_contract::<CommandStatus>();
+        assert_db_variant_contract::<CommandOutputStream>();
+        assert_db_variant_contract::<SandboxEventKind>();
+        assert_db_variant_contract::<WorkerStatus>();
+        assert_db_variant_contract::<WorkerCapability>();
+        assert_db_variant_contract::<JobKind>();
+        assert_db_variant_contract::<JobStatus>();
+        assert_db_variant_contract::<LeaseStatus>();
+        assert_db_variant_contract::<ProviderHealthStatus>();
+        assert_db_variant_contract::<GuestStatus>();
+        assert_db_variant_contract::<SshKeyStatus>();
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
