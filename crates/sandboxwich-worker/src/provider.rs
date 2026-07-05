@@ -302,9 +302,9 @@ impl KubernetesDryRunProvider {
                 "securityContext".to_string(),
                 json!({
                     "runAsNonRoot": true,
-                    "runAsUser": 1000,
-                    "runAsGroup": 1000,
-                    "fsGroup": 1000,
+                    "runAsUser": 10001,
+                    "runAsGroup": 10001,
+                    "fsGroup": 10001,
                     "seccompProfile": {
                         "type": "RuntimeDefault"
                     }

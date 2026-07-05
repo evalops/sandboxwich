@@ -1,8 +1,8 @@
 FROM ubuntu:24.04
 
 ARG SANDBOX_USER=sandbox
-ARG SANDBOX_UID=1000
-ARG SANDBOX_GID=1000
+ARG SANDBOX_UID=10001
+ARG SANDBOX_GID=10001
 
 LABEL org.opencontainers.image.title="sandboxwich ubuntu development runtime"
 LABEL org.opencontainers.image.description="SSH and browser-desktop guest runtime for disposable development sandboxes"
