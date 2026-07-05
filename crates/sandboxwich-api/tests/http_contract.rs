@@ -6,10 +6,10 @@ use std::{
 
 use reqwest::StatusCode;
 use sandboxwich_core::{
-    AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse, CommandListResponse, CommandRequest,
-    CommandResponse, CommandStatus, CompleteLeaseRequest, CreateDesktopSessionRequest,
-    CreateJobRequest, CreateSandboxRequest, CreateSnapshotRequest, DesktopAccessMode,
-    DesktopAccessRequest, DesktopAccessResponse, DesktopSessionListResponse,
+    AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse, CleanupRunStatus,
+    CommandListResponse, CommandRequest, CommandResponse, CommandStatus, CompleteLeaseRequest,
+    CreateDesktopSessionRequest, CreateJobRequest, CreateSandboxRequest, CreateSnapshotRequest,
+    DesktopAccessMode, DesktopAccessRequest, DesktopAccessResponse, DesktopSessionListResponse,
     DesktopSessionResponse, DesktopSessionStatus, EventListResponse, FailLeaseRequest,
     GuestHealthResponse, GuestStatus, HealthResponse, Job, JobKind, JobListResponse, JobResponse,
     JobStatus, LeaseResponse, PromptQueuedResponse, PromptRequest, ProviderForkHandle,
@@ -315,7 +315,7 @@ async fn run_contract(server: TestServer) {
     assert_expired_lease_requeues_command(&client, &server, &created, &worker).await;
     assert_prompt_job_lifecycle(&client, &server, &created).await;
     assert_desktop_session_lifecycle(&client, &server, &created).await;
-    assert_snapshot_fork_and_cleanup_lifecycle(&client, &server, &created).await;
+    assert_snapshot_fork_and_cleanup_lifecycle(&client, &server, &created, &worker).await;
 
     let stopped: SandboxResponse = client
         .post(format!(
@@ -1358,6 +1358,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
     client: &reqwest::Client,
     server: &TestServer,
     sandbox: &SandboxResponse,
+    worker: &WorkerResponse,
 ) {
     let snapshot: SnapshotResponse = client
         .post(format!(
@@ -1451,6 +1452,9 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
             .iter()
             .any(|seen| seen.id == expiring.snapshot.id)
     );
+    assert_eq!(cleanup.cleanup_run.status, CleanupRunStatus::Succeeded);
+    assert!(cleanup.cleanup_run.finished_at.is_some());
+    assert!(cleanup.cleanup_run.expired_snapshots >= 1);
 
     let archived: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
@@ -1467,6 +1471,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .json()
         .await
         .unwrap();
+    assert_provision_job_persists_runtime_resources(client, server, &archived, worker).await;
     client
         .post(format!(
             "{}/sandboxes/{}/stop",
@@ -1488,6 +1493,18 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .await
         .unwrap();
     assert!(cleanup.archived_sandboxes_deleted >= 1);
+    assert!(cleanup.cleanup_run.archived_sandboxes_deleted >= 1);
+    assert!(
+        cleanup
+            .archived_sandboxes
+            .iter()
+            .any(|seen| seen.id == archived.sandbox.id)
+    );
+    assert!(cleanup.runtime_resources_deleted.iter().any(|resource| {
+        resource.sandbox_id == archived.sandbox.id
+            && resource.status == RuntimeResourceStatus::Deleted
+    }));
+    assert!(cleanup.cleanup_run.runtime_resources_deleted >= 1);
     let missing_archived = client
         .get(format!(
             "{}/sandboxes/{}",

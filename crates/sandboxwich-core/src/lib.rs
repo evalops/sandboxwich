@@ -224,6 +224,28 @@ impl fmt::Display for RuntimeResourceId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CleanupRunId(pub Uuid);
+
+impl CleanupRunId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for CleanupRunId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for CleanupRunId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxState {
@@ -291,6 +313,14 @@ pub enum RuntimeResourceStatus {
     Ready,
     Failed,
     Deleted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupRunStatus {
+    Running,
+    Succeeded,
+    Failed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -400,6 +430,19 @@ pub struct ReconcileRuntimeResourcesResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CleanupRun {
+    pub id: CleanupRunId,
+    pub status: CleanupRunStatus,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub expired_snapshots: u64,
+    pub archived_sandboxes_deleted: u64,
+    pub archived_sandboxes_skipped: u64,
+    pub runtime_resources_deleted: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub id: SnapshotId,
     pub sandbox_id: SandboxId,
@@ -436,8 +479,18 @@ pub struct SnapshotListResponse {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotCleanupResponse {
     pub ok: bool,
+    pub cleanup_run: CleanupRun,
     pub expired: Vec<Snapshot>,
     pub archived_sandboxes_deleted: u64,
+    pub archived_sandboxes: Vec<Sandbox>,
+    pub archived_sandboxes_skipped: Vec<ArchivedSandboxCleanupSkip>,
+    pub runtime_resources_deleted: Vec<RuntimeResource>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ArchivedSandboxCleanupSkip {
+    pub sandbox: Sandbox,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
