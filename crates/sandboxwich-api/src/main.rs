@@ -18,13 +18,15 @@ use sandboxwich_core::{
     ErrorEnvelope, EventId, EventListResponse, FailLeaseRequest, GuestHealth, GuestHealthResponse,
     GuestStatus, HealthResponse, Job, JobId, JobKind, JobLease, JobListResponse, JobResponse,
     JobStatus, LeaseId, LeaseResponse, LeaseStatus, PromptQueuedResponse, PromptRequest,
-    RegisterWorkerRequest, RenewLeaseRequest, RequestSshKeyRequest, Sandbox, SandboxEvent,
-    SandboxEventKind, SandboxId, SandboxListResponse, SandboxResponse, SandboxState, Snapshot,
+    ProviderRuntimeResource, RegisterWorkerRequest, RenewLeaseRequest, RequestSshKeyRequest,
+    RuntimeResource, RuntimeResourceId, RuntimeResourceKind, RuntimeResourceListResponse,
+    RuntimeResourcePurpose, RuntimeResourceStatus, Sandbox, SandboxEvent, SandboxEventKind,
+    SandboxId, SandboxListResponse, SandboxResponse, SandboxState, Snapshot,
     SnapshotCleanupResponse, SnapshotId, SnapshotListResponse, SnapshotResponse, SnapshotStatus,
     SshAccess, SshAccessRequest, SshAccessResponse, SshKey, SshKeyId, SshKeyListResponse,
     SshKeyResponse, SshKeyStatus, UpdateDesktopSessionRequest, UpdateGuestHealthRequest,
     UpdateSshKeyStatusRequest, Worker, WorkerCapability, WorkerHeartbeatRequest, WorkerId,
-    WorkerListResponse, WorkerResponse, WorkerStatus,
+    WorkerJobResult, WorkerListResponse, WorkerResponse, WorkerStatus,
 };
 use serde_json::json;
 use sqlx::{
@@ -247,6 +249,39 @@ async fn ensure_postgres_constraints(db: &Database) -> anyhow::Result<()> {
             ) then
                 alter table ssh_keys add constraint ssh_keys_status_check
                     check (status in ('requested', 'applied', 'failed', 'revoked'));
+            end if;
+        end $$;
+        "#,
+        r#"
+        do $$
+        begin
+            if not exists (
+                select 1 from pg_constraint where conname = 'runtime_resources_kind_check'
+            ) then
+                alter table runtime_resources add constraint runtime_resources_kind_check
+                    check (resource_kind in ('pod', 'persistent_volume_claim', 'service', 'volume_snapshot'));
+            end if;
+        end $$;
+        "#,
+        r#"
+        do $$
+        begin
+            if not exists (
+                select 1 from pg_constraint where conname = 'runtime_resources_purpose_check'
+            ) then
+                alter table runtime_resources add constraint runtime_resources_purpose_check
+                    check (purpose in ('runtime', 'workspace', 'ssh', 'desktop', 'snapshot'));
+            end if;
+        end $$;
+        "#,
+        r#"
+        do $$
+        begin
+            if not exists (
+                select 1 from pg_constraint where conname = 'runtime_resources_status_check'
+            ) then
+                alter table runtime_resources add constraint runtime_resources_status_check
+                    check (status in ('planned', 'applied', 'ready', 'failed', 'deleted'));
             end if;
         end $$;
         "#,
@@ -515,6 +550,60 @@ async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
             select raise(abort, 'invalid ssh key status');
         end;
         "#,
+        r#"
+        create trigger if not exists validate_runtime_resources_kind_insert
+        before insert on runtime_resources
+        for each row
+        when new.resource_kind not in ('pod', 'persistent_volume_claim', 'service', 'volume_snapshot')
+        begin
+            select raise(abort, 'invalid runtime resource kind');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_runtime_resources_kind_update
+        before update of resource_kind on runtime_resources
+        for each row
+        when new.resource_kind not in ('pod', 'persistent_volume_claim', 'service', 'volume_snapshot')
+        begin
+            select raise(abort, 'invalid runtime resource kind');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_runtime_resources_purpose_insert
+        before insert on runtime_resources
+        for each row
+        when new.purpose not in ('runtime', 'workspace', 'ssh', 'desktop', 'snapshot')
+        begin
+            select raise(abort, 'invalid runtime resource purpose');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_runtime_resources_purpose_update
+        before update of purpose on runtime_resources
+        for each row
+        when new.purpose not in ('runtime', 'workspace', 'ssh', 'desktop', 'snapshot')
+        begin
+            select raise(abort, 'invalid runtime resource purpose');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_runtime_resources_status_insert
+        before insert on runtime_resources
+        for each row
+        when new.status not in ('planned', 'applied', 'ready', 'failed', 'deleted')
+        begin
+            select raise(abort, 'invalid runtime resource status');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_runtime_resources_status_update
+        before update of status on runtime_resources
+        for each row
+        when new.status not in ('planned', 'applied', 'ready', 'failed', 'deleted')
+        begin
+            select raise(abort, 'invalid runtime resource status');
+        end;
+        "#,
     ] {
         sqlx::query(statement).execute(&db.pool).await?;
     }
@@ -527,6 +616,10 @@ fn app(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/sandboxes", get(list_sandboxes).post(create_sandbox))
         .route("/sandboxes/{sandbox_id}", get(get_sandbox))
+        .route(
+            "/sandboxes/{sandbox_id}/runtime-resources",
+            get(list_runtime_resources),
+        )
         .route("/sandboxes/{sandbox_id}/stop", post(stop_sandbox))
         .route("/sandboxes/{sandbox_id}/resume", post(resume_sandbox))
         .route("/sandboxes/{sandbox_id}/fork", post(fork_sandbox))
@@ -659,6 +752,19 @@ async fn get_sandbox(
 ) -> Result<Json<SandboxResponse>, ApiError> {
     let sandbox = fetch_sandbox(&state.db, SandboxId(sandbox_id)).await?;
     Ok(Json(SandboxResponse { ok: true, sandbox }))
+}
+
+async fn list_runtime_resources(
+    State(state): State<AppState>,
+    Path(sandbox_id): Path<Uuid>,
+) -> Result<Json<RuntimeResourceListResponse>, ApiError> {
+    let sandbox_id = SandboxId(sandbox_id);
+    fetch_sandbox(&state.db, sandbox_id).await?;
+    let resources = list_runtime_resources_for_sandbox(&state.db, sandbox_id).await?;
+    Ok(Json(RuntimeResourceListResponse {
+        ok: true,
+        resources,
+    }))
 }
 
 async fn stop_sandbox(
@@ -1445,15 +1551,13 @@ async fn complete_lease(
         return Err(ApiError::bad_request("lease is not active"));
     }
 
+    let result = request
+        .result
+        .ok_or_else(|| ApiError::bad_request("completion result is required"))?;
+    apply_completed_job(&state.db, &lease.job, result).await?;
     let now = Utc::now();
     update_lease_status(&state.db, lease_id, LeaseStatus::Completed, Some(now), None).await?;
     update_job_status(&state.db, lease.job_id, JobStatus::Succeeded, None, now).await?;
-    apply_completed_job(
-        &state.db,
-        &lease.job,
-        request.result.unwrap_or_else(|| json!({})),
-    )
-    .await?;
 
     let lease = fetch_lease(&state.db, lease_id).await?;
     Ok(Json(LeaseResponse { ok: true, lease }))
@@ -1581,6 +1685,240 @@ async fn fetch_sandbox(db: &Database, sandbox_id: SandboxId) -> Result<Sandbox, 
         .ok_or_else(|| ApiError::not_found("sandbox not found"))?;
 
     row_to_sandbox(row)
+}
+
+async fn list_runtime_resources_for_sandbox(
+    db: &Database,
+    sandbox_id: SandboxId,
+) -> Result<Vec<RuntimeResource>, ApiError> {
+    let sql = format!(
+        "select id, sandbox_id, snapshot_id, provider, resource_kind, purpose, resource_name,
+                namespace, status, cluster, storage_class, snapshot_class, storage_size,
+                runtime_image, service_port, target_port, source_snapshot_id, created_at,
+                updated_at, ready_at, deleted_at, error
+         from runtime_resources
+         where sandbox_id = {}
+         order by provider asc, namespace asc, resource_kind asc, purpose asc, resource_name asc",
+        db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .fetch_all(&db.pool)
+        .await?;
+
+    rows.into_iter().map(row_to_runtime_resource).collect()
+}
+
+async fn upsert_provider_runtime_resources(
+    db: &Database,
+    resources: &[ProviderRuntimeResource],
+) -> Result<(), ApiError> {
+    for resource in resources {
+        validate_provider_runtime_resource(resource)?;
+        let existing_id = fetch_runtime_resource_id(
+            db,
+            &resource.provider,
+            &resource.resource_kind,
+            &resource.namespace,
+            &resource.resource_name,
+        )
+        .await?;
+        if let Some(resource_id) = existing_id {
+            update_runtime_resource_from_provider(db, resource_id, resource).await?;
+        } else {
+            insert_runtime_resource_from_provider(db, resource).await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_provider_runtime_resource(resource: &ProviderRuntimeResource) -> Result<(), ApiError> {
+    if resource.provider.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "runtime resource provider is required",
+        ));
+    }
+    if resource.namespace.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "runtime resource namespace is required",
+        ));
+    }
+    if resource.resource_name.trim().is_empty() {
+        return Err(ApiError::bad_request("runtime resource name is required"));
+    }
+    if resource.service_port == Some(0) {
+        return Err(ApiError::bad_request(
+            "runtime resource service_port must be greater than 0",
+        ));
+    }
+    Ok(())
+}
+
+async fn fetch_runtime_resource_id(
+    db: &Database,
+    provider: &str,
+    resource_kind: &RuntimeResourceKind,
+    namespace: &str,
+    resource_name: &str,
+) -> Result<Option<RuntimeResourceId>, ApiError> {
+    let sql = format!(
+        "select id
+         from runtime_resources
+         where provider = {} and resource_kind = {} and namespace = {} and resource_name = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4)
+    );
+    let row = sqlx::query(&sql)
+        .bind(provider)
+        .bind(runtime_resource_kind_to_str(resource_kind))
+        .bind(namespace)
+        .bind(resource_name)
+        .fetch_optional(&db.pool)
+        .await?;
+    row.map(|row| {
+        let id: String = row.try_get("id")?;
+        Ok(RuntimeResourceId(parse_uuid(&id)?))
+    })
+    .transpose()
+}
+
+async fn insert_runtime_resource_from_provider(
+    db: &Database,
+    resource: &ProviderRuntimeResource,
+) -> Result<(), ApiError> {
+    let now = Utc::now();
+    let deleted_at = deleted_at_for_runtime_resource(&resource.status, now);
+    let sql = format!(
+        "insert into runtime_resources
+         (id, sandbox_id, snapshot_id, provider, resource_kind, purpose, resource_name, namespace,
+          status, cluster, storage_class, snapshot_class, storage_size, runtime_image, service_port,
+          target_port, source_snapshot_id, created_at, updated_at, ready_at, deleted_at, error)
+         values ({})",
+        db.placeholders(22)
+    );
+    sqlx::query(&sql)
+        .bind(RuntimeResourceId::new().to_string())
+        .bind(resource.sandbox_id.to_string())
+        .bind(
+            resource
+                .snapshot_id
+                .map(|snapshot_id| snapshot_id.to_string()),
+        )
+        .bind(&resource.provider)
+        .bind(runtime_resource_kind_to_str(&resource.resource_kind))
+        .bind(runtime_resource_purpose_to_str(&resource.purpose))
+        .bind(&resource.resource_name)
+        .bind(&resource.namespace)
+        .bind(runtime_resource_status_to_str(&resource.status))
+        .bind(&resource.cluster)
+        .bind(&resource.storage_class)
+        .bind(&resource.snapshot_class)
+        .bind(&resource.storage_size)
+        .bind(&resource.runtime_image)
+        .bind(resource.service_port.map(i64::from))
+        .bind(&resource.target_port)
+        .bind(
+            resource
+                .source_snapshot_id
+                .map(|snapshot_id| snapshot_id.to_string()),
+        )
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .bind(resource.ready_at.map(|time| time.to_rfc3339()))
+        .bind(deleted_at.map(|time| time.to_rfc3339()))
+        .bind(&resource.error)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+async fn update_runtime_resource_from_provider(
+    db: &Database,
+    resource_id: RuntimeResourceId,
+    resource: &ProviderRuntimeResource,
+) -> Result<(), ApiError> {
+    let now = Utc::now();
+    let deleted_at = deleted_at_for_runtime_resource(&resource.status, now);
+    let sql = format!(
+        "update runtime_resources
+         set sandbox_id = {}, snapshot_id = {}, provider = {}, resource_kind = {}, purpose = {},
+             resource_name = {}, namespace = {}, status = {}, cluster = {}, storage_class = {},
+             snapshot_class = {}, storage_size = {}, runtime_image = {}, service_port = {},
+             target_port = {}, source_snapshot_id = {}, updated_at = {}, ready_at = {},
+             deleted_at = {}, error = {}
+         where id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4),
+        db.placeholder(5),
+        db.placeholder(6),
+        db.placeholder(7),
+        db.placeholder(8),
+        db.placeholder(9),
+        db.placeholder(10),
+        db.placeholder(11),
+        db.placeholder(12),
+        db.placeholder(13),
+        db.placeholder(14),
+        db.placeholder(15),
+        db.placeholder(16),
+        db.placeholder(17),
+        db.placeholder(18),
+        db.placeholder(19),
+        db.placeholder(20),
+        db.placeholder(21)
+    );
+    let result = sqlx::query(&sql)
+        .bind(resource.sandbox_id.to_string())
+        .bind(
+            resource
+                .snapshot_id
+                .map(|snapshot_id| snapshot_id.to_string()),
+        )
+        .bind(&resource.provider)
+        .bind(runtime_resource_kind_to_str(&resource.resource_kind))
+        .bind(runtime_resource_purpose_to_str(&resource.purpose))
+        .bind(&resource.resource_name)
+        .bind(&resource.namespace)
+        .bind(runtime_resource_status_to_str(&resource.status))
+        .bind(&resource.cluster)
+        .bind(&resource.storage_class)
+        .bind(&resource.snapshot_class)
+        .bind(&resource.storage_size)
+        .bind(&resource.runtime_image)
+        .bind(resource.service_port.map(i64::from))
+        .bind(&resource.target_port)
+        .bind(
+            resource
+                .source_snapshot_id
+                .map(|snapshot_id| snapshot_id.to_string()),
+        )
+        .bind(now.to_rfc3339())
+        .bind(resource.ready_at.map(|time| time.to_rfc3339()))
+        .bind(deleted_at.map(|time| time.to_rfc3339()))
+        .bind(&resource.error)
+        .bind(resource_id.to_string())
+        .execute(&db.pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("runtime resource not found"));
+    }
+    Ok(())
+}
+
+fn deleted_at_for_runtime_resource(
+    status: &RuntimeResourceStatus,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    if *status == RuntimeResourceStatus::Deleted {
+        Some(now)
+    } else {
+        None
+    }
 }
 
 async fn fetch_command(db: &Database, command_id: CommandId) -> Result<CommandRun, ApiError> {
@@ -2589,26 +2927,15 @@ async fn update_command_from_lease_result(
 async fn apply_completed_job(
     db: &Database,
     job: &Job,
-    result: serde_json::Value,
+    result: WorkerJobResult,
 ) -> Result<(), ApiError> {
-    match job.kind {
-        JobKind::RunCommand => {
+    match (&job.kind, result) {
+        (JobKind::RunCommand, WorkerJobResult::RunCommand { result }) => {
             let command_id = command_id_from_job(job)?;
             let sandbox_id = sandbox_id_from_job(job)?;
-            let stdout = result
-                .get("stdout")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let stderr = result
-                .get("stderr")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let exit_code = result
-                .get("exitCode")
-                .or_else(|| result.get("exit_code"))
-                .and_then(|value| value.as_i64())
-                .map(|value| value as i32)
-                .or(Some(0));
+            let stdout = result.stdout.as_str();
+            let stderr = result.stderr.as_str();
+            let exit_code = result.exit_code.or(Some(0));
             update_command_from_lease_result(
                 db,
                 command_id,
@@ -2657,17 +2984,18 @@ async fn apply_completed_job(
             )
             .await?;
         }
-        JobKind::CreateSnapshot => {
-            mark_snapshot_ready_from_job_result(db, snapshot_id_from_job(job)?, result).await?;
+        (JobKind::CreateSnapshot, WorkerJobResult::CreateSnapshot { handle }) => {
+            let snapshot_id = snapshot_id_from_job(job)?;
+            if handle.snapshot_id != snapshot_id {
+                return Err(ApiError::bad_request(
+                    "snapshot completion result does not match job snapshot",
+                ));
+            }
+            mark_snapshot_ready_from_provider_handle(db, sandbox_id_from_job(job)?, handle).await?;
         }
-        JobKind::RunPrompt => {
+        (JobKind::RunPrompt, WorkerJobResult::RunPrompt { output }) => {
             let sandbox_id = sandbox_id_from_job(job)?;
             let prompt_event_id = prompt_event_id_from_job(job)?;
-            let output = result
-                .get("output")
-                .or_else(|| result.get("stdout"))
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
             insert_event(
                 db,
                 sandbox_id,
@@ -2679,9 +3007,19 @@ async fn apply_completed_job(
             )
             .await?;
         }
-        JobKind::ForkSandbox => {
+        (JobKind::ForkSandbox, WorkerJobResult::ForkSandbox { handle }) => {
+            let parent_id = parent_sandbox_id_from_job(job)?;
             let child_id = child_sandbox_id_from_job(job)?;
             let snapshot_id = snapshot_id_from_job(job)?;
+            if handle.parent_sandbox_id != parent_id
+                || handle.child_sandbox_id != child_id
+                || handle.snapshot_id != snapshot_id
+            {
+                return Err(ApiError::bad_request(
+                    "fork completion result does not match job payload",
+                ));
+            }
+            upsert_provider_runtime_resources(db, &handle.resources).await?;
             let next_state = SandboxState::Ready;
             set_sandbox_state(
                 db,
@@ -2695,7 +3033,46 @@ async fn apply_completed_job(
             )
             .await?;
         }
-        JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {}
+        (JobKind::ProvisionSandbox, WorkerJobResult::ProvisionSandbox { handle }) => {
+            let sandbox_id = sandbox_id_from_job(job)?;
+            if handle.sandbox_id != sandbox_id {
+                return Err(ApiError::bad_request(
+                    "provision completion result does not match job sandbox",
+                ));
+            }
+            upsert_provider_runtime_resources(db, &handle.resources).await?;
+            let next_state = SandboxState::Ready;
+            set_sandbox_state(
+                db,
+                sandbox_id,
+                next_state.clone(),
+                json!({
+                    "state": next_state,
+                    "reason": "provision_ready",
+                    "provider": handle.provider
+                }),
+            )
+            .await?;
+        }
+        (JobKind::StopSandbox, WorkerJobResult::StopSandbox { sandbox_id, .. }) => {
+            if sandbox_id != sandbox_id_from_job(job)? {
+                return Err(ApiError::bad_request(
+                    "stop completion result does not match job sandbox",
+                ));
+            }
+        }
+        (JobKind::ResumeSandbox, WorkerJobResult::ResumeSandbox { sandbox_id, .. }) => {
+            if sandbox_id != sandbox_id_from_job(job)? {
+                return Err(ApiError::bad_request(
+                    "resume completion result does not match job sandbox",
+                ));
+            }
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                "completion result kind does not match job kind",
+            ));
+        }
     }
     Ok(())
 }
@@ -2918,21 +3295,25 @@ async fn apply_failed_job(db: &Database, job: &Job, error: &str) -> Result<(), A
     Ok(())
 }
 
-async fn mark_snapshot_ready_from_job_result(
+async fn mark_snapshot_ready_from_provider_handle(
     db: &Database,
-    snapshot_id: SnapshotId,
-    result: serde_json::Value,
+    sandbox_id: SandboxId,
+    handle: sandboxwich_core::ProviderSnapshotHandle,
 ) -> Result<(), ApiError> {
+    let snapshot_id = handle.snapshot_id;
+    upsert_provider_runtime_resources(db, &handle.resources).await?;
     let snapshot = fetch_snapshot(db, snapshot_id).await?;
-    let inventory = result
-        .get("inventory")
-        .cloned()
-        .unwrap_or(snapshot.inventory);
-    let provider_metadata = result
-        .get("providerMetadata")
-        .or_else(|| result.get("provider_metadata"))
-        .cloned()
-        .unwrap_or(snapshot.provider_metadata);
+    let provider = handle.provider.clone();
+    let inventory = if snapshot.inventory == json!({}) {
+        json!({
+            "sandboxId": sandbox_id,
+            "snapshotId": snapshot_id,
+            "provider": provider
+        })
+    } else {
+        snapshot.inventory
+    };
+    let provider_metadata = handle.metadata;
     let now = Utc::now();
     let sql = format!(
         "update snapshots
@@ -2975,6 +3356,15 @@ fn prompt_event_id_from_job(job: &Job) -> Result<EventId, ApiError> {
 
 fn sandbox_id_from_job(job: &Job) -> Result<SandboxId, ApiError> {
     uuid_from_job_payload(job, "sandboxId", "run command job is missing sandbox id").map(SandboxId)
+}
+
+fn parent_sandbox_id_from_job(job: &Job) -> Result<SandboxId, ApiError> {
+    uuid_from_job_payload(
+        job,
+        "parentSandboxId",
+        "fork job is missing parent sandbox id",
+    )
+    .map(SandboxId)
 }
 
 fn child_sandbox_id_from_job(job: &Job) -> Result<SandboxId, ApiError> {
@@ -3123,6 +3513,53 @@ fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
         parent_snapshot_id: parent_snapshot_id
             .map(|snapshot| parse_uuid(&snapshot).map(SnapshotId))
             .transpose()?,
+    })
+}
+
+fn row_to_runtime_resource(row: AnyRow) -> Result<RuntimeResource, ApiError> {
+    let id: String = row.try_get("id")?;
+    let sandbox_id: String = row.try_get("sandbox_id")?;
+    let snapshot_id: Option<String> = row.try_get("snapshot_id")?;
+    let resource_kind: String = row.try_get("resource_kind")?;
+    let purpose: String = row.try_get("purpose")?;
+    let status: String = row.try_get("status")?;
+    let service_port: Option<i64> = row.try_get("service_port")?;
+    let source_snapshot_id: Option<String> = row.try_get("source_snapshot_id")?;
+    let created_at: String = row.try_get("created_at")?;
+    let updated_at: String = row.try_get("updated_at")?;
+    let ready_at: Option<String> = row.try_get("ready_at")?;
+    let deleted_at: Option<String> = row.try_get("deleted_at")?;
+
+    Ok(RuntimeResource {
+        id: RuntimeResourceId(parse_uuid(&id)?),
+        sandbox_id: SandboxId(parse_uuid(&sandbox_id)?),
+        snapshot_id: snapshot_id
+            .map(|snapshot_id| parse_uuid(&snapshot_id).map(SnapshotId))
+            .transpose()?,
+        provider: row.try_get("provider")?,
+        resource_kind: parse_runtime_resource_kind(&resource_kind)?,
+        purpose: parse_runtime_resource_purpose(&purpose)?,
+        resource_name: row.try_get("resource_name")?,
+        namespace: row.try_get("namespace")?,
+        status: parse_runtime_resource_status(&status)?,
+        cluster: row.try_get("cluster")?,
+        storage_class: row.try_get("storage_class")?,
+        snapshot_class: row.try_get("snapshot_class")?,
+        storage_size: row.try_get("storage_size")?,
+        runtime_image: row.try_get("runtime_image")?,
+        service_port: service_port
+            .map(u16::try_from)
+            .transpose()
+            .map_err(|_| ApiError::internal("database contains invalid service port"))?,
+        target_port: row.try_get("target_port")?,
+        source_snapshot_id: source_snapshot_id
+            .map(|snapshot_id| parse_uuid(&snapshot_id).map(SnapshotId))
+            .transpose()?,
+        created_at: parse_timestamp(&created_at)?,
+        updated_at: parse_timestamp(&updated_at)?,
+        ready_at: ready_at.map(|time| parse_timestamp(&time)).transpose()?,
+        deleted_at: deleted_at.map(|time| parse_timestamp(&time)).transpose()?,
+        error: row.try_get("error")?,
     })
 }
 
@@ -3402,6 +3839,35 @@ fn desktop_access_mode_to_str(access_mode: &DesktopAccessMode) -> &'static str {
     }
 }
 
+fn runtime_resource_kind_to_str(kind: &RuntimeResourceKind) -> &'static str {
+    match kind {
+        RuntimeResourceKind::Pod => "pod",
+        RuntimeResourceKind::PersistentVolumeClaim => "persistent_volume_claim",
+        RuntimeResourceKind::Service => "service",
+        RuntimeResourceKind::VolumeSnapshot => "volume_snapshot",
+    }
+}
+
+fn runtime_resource_purpose_to_str(purpose: &RuntimeResourcePurpose) -> &'static str {
+    match purpose {
+        RuntimeResourcePurpose::Runtime => "runtime",
+        RuntimeResourcePurpose::Workspace => "workspace",
+        RuntimeResourcePurpose::Ssh => "ssh",
+        RuntimeResourcePurpose::Desktop => "desktop",
+        RuntimeResourcePurpose::Snapshot => "snapshot",
+    }
+}
+
+fn runtime_resource_status_to_str(status: &RuntimeResourceStatus) -> &'static str {
+    match status {
+        RuntimeResourceStatus::Planned => "planned",
+        RuntimeResourceStatus::Applied => "applied",
+        RuntimeResourceStatus::Ready => "ready",
+        RuntimeResourceStatus::Failed => "failed",
+        RuntimeResourceStatus::Deleted => "deleted",
+    }
+}
+
 fn command_status_to_str(status: &CommandStatus) -> &'static str {
     match status {
         CommandStatus::Queued => "queued",
@@ -3525,6 +3991,44 @@ fn parse_desktop_access_mode(value: &str) -> Result<DesktopAccessMode, ApiError>
         "rdp" => Ok(DesktopAccessMode::Rdp),
         _ => Err(ApiError::internal(
             "database contains invalid desktop access mode",
+        )),
+    }
+}
+
+fn parse_runtime_resource_kind(value: &str) -> Result<RuntimeResourceKind, ApiError> {
+    match value {
+        "pod" => Ok(RuntimeResourceKind::Pod),
+        "persistent_volume_claim" => Ok(RuntimeResourceKind::PersistentVolumeClaim),
+        "service" => Ok(RuntimeResourceKind::Service),
+        "volume_snapshot" => Ok(RuntimeResourceKind::VolumeSnapshot),
+        _ => Err(ApiError::internal(
+            "database contains invalid runtime resource kind",
+        )),
+    }
+}
+
+fn parse_runtime_resource_purpose(value: &str) -> Result<RuntimeResourcePurpose, ApiError> {
+    match value {
+        "runtime" => Ok(RuntimeResourcePurpose::Runtime),
+        "workspace" => Ok(RuntimeResourcePurpose::Workspace),
+        "ssh" => Ok(RuntimeResourcePurpose::Ssh),
+        "desktop" => Ok(RuntimeResourcePurpose::Desktop),
+        "snapshot" => Ok(RuntimeResourcePurpose::Snapshot),
+        _ => Err(ApiError::internal(
+            "database contains invalid runtime resource purpose",
+        )),
+    }
+}
+
+fn parse_runtime_resource_status(value: &str) -> Result<RuntimeResourceStatus, ApiError> {
+    match value {
+        "planned" => Ok(RuntimeResourceStatus::Planned),
+        "applied" => Ok(RuntimeResourceStatus::Applied),
+        "ready" => Ok(RuntimeResourceStatus::Ready),
+        "failed" => Ok(RuntimeResourceStatus::Failed),
+        "deleted" => Ok(RuntimeResourceStatus::Deleted),
+        _ => Err(ApiError::internal(
+            "database contains invalid runtime resource status",
         )),
     }
 }

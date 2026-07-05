@@ -5,10 +5,10 @@ use sandboxwich_core::{
     CreateSandboxRequest, CreateSnapshotRequest, DesktopAccessMode, DesktopAccessRequest,
     DesktopAccessResponse, DesktopSessionListResponse, DesktopSessionResponse,
     DesktopSessionStatus, EventListResponse, GuestHealthResponse, GuestStatus, JobListResponse,
-    PromptQueuedResponse, PromptRequest, RequestSshKeyRequest, SandboxListResponse,
-    SandboxResponse, SnapshotCleanupResponse, SnapshotListResponse, SnapshotResponse,
-    SshAccessRequest, SshAccessResponse, SshKeyListResponse, SshKeyResponse, SshKeyStatus,
-    UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest,
+    PromptQueuedResponse, PromptRequest, RequestSshKeyRequest, RuntimeResourceListResponse,
+    SandboxListResponse, SandboxResponse, SnapshotCleanupResponse, SnapshotListResponse,
+    SnapshotResponse, SshAccessRequest, SshAccessResponse, SshKeyListResponse, SshKeyResponse,
+    SshKeyStatus, UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest,
     WorkerListResponse,
 };
 use uuid::Uuid;
@@ -29,6 +29,7 @@ enum Command {
     New(NewArgs),
     List,
     Get { sandbox_id: Uuid },
+    Resources { sandbox_id: Uuid },
     Stop { sandbox_id: Uuid },
     Resume { sandbox_id: Uuid },
     Fork(ForkArgs),
@@ -272,6 +273,13 @@ async fn main() -> anyhow::Result<()> {
                 .send()
                 .await?;
             print_json::<SandboxResponse>(response).await?;
+        }
+        Command::Resources { sandbox_id } => {
+            let response = client
+                .get(format!("{api}/sandboxes/{sandbox_id}/runtime-resources"))
+                .send()
+                .await?;
+            print_json::<RuntimeResourceListResponse>(response).await?;
         }
         Command::Stop { sandbox_id } => {
             let response = client

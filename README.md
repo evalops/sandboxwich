@@ -7,7 +7,7 @@ The name is dumb on purpose. The contracts should not be.
 ## What exists now
 
 - `sandboxwich-api`: HTTP control plane backed by SQLite for local dev or Postgres for shared deployments.
-- `sandboxwich-cli`: CLI for creating, listing, stopping, resuming, forking, running commands, and reading events.
+- `sandboxwich-cli`: CLI for creating, listing, stopping, resuming, forking, running commands, reading events, and inspecting runtime resources.
 - `sandboxwich-core`: shared typed request/response/event contracts.
 - `sandboxwich-worker`: host-side worker registration and heartbeat CLI.
 - `sandboxwich-agent`: guest-side agent placeholder.
@@ -29,6 +29,7 @@ cargo run -p sandboxwich-cli -- exec <sandbox-id> -- echo hello
 cargo run -p sandboxwich-cli -- ssh <sandbox-id>
 cargo run -p sandboxwich-cli -- prompt <sandbox-id> "inspect the repo"
 cargo run -p sandboxwich-cli -- events <sandbox-id>
+cargo run -p sandboxwich-cli -- resources <sandbox-id>
 cargo run -p sandboxwich-worker -- register --name k3s-worker-a --provider kubernetes
 cargo run -p sandboxwich-worker -- provider-smoke --cluster k3s-dev --namespace sandboxwich
 cargo run -p sandboxwich-worker -- provider-apply-plan --cluster k3s-dev --namespace sandboxwich --ssh-authorized-keys-secret sandboxwich-authorized-keys
@@ -40,6 +41,8 @@ cargo run -p sandboxwich-cli -- workers
 By default the CLI talks to `http://127.0.0.1:3217`. Override it with `SANDBOXWICH_API`.
 
 By default the API writes to `sqlite://sandboxwich.db`. Override it with `SANDBOXWICH_DATABASE_URL`, for example `postgres://sandboxwich:secret@localhost:5432/sandboxwich`.
+
+Worker completions use typed result variants. Provider-created pods, PVCs, Services, and VolumeSnapshots are persisted as `runtime_resources` rows with constrained kind, purpose, and status columns; provider metadata is diagnostic compatibility data, not the durable source of runtime state.
 
 ## Design principles
 

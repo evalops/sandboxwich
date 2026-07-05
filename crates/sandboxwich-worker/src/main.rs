@@ -6,9 +6,9 @@ use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use provider::{KubernetesApplyProvider, KubernetesDryRunProvider, SandboxProvider};
 use sandboxwich_core::{
-    AgentCommandRequest, ClaimLeaseRequest, ClaimLeaseResponse, CompleteLeaseRequest,
-    FailLeaseRequest, JobKind, LeaseResponse, RegisterWorkerRequest, RenewLeaseRequest,
-    WorkerCapability, WorkerHeartbeatRequest, WorkerResponse,
+    AgentCommandRequest, AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse,
+    CompleteLeaseRequest, FailLeaseRequest, JobKind, LeaseResponse, RegisterWorkerRequest,
+    RenewLeaseRequest, WorkerCapability, WorkerHeartbeatRequest, WorkerJobResult, WorkerResponse,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -440,14 +440,19 @@ async fn main() -> anyhow::Result<()> {
             print_json::<LeaseResponse>(response).await?;
         }
         Command::Complete(args) => {
+            let now = chrono::Utc::now();
             let response = client
                 .post(format!("{api}/leases/{}/complete", args.lease_id))
                 .json(&CompleteLeaseRequest {
-                    result: Some(json!({
-                        "stdout": args.stdout,
-                        "stderr": args.stderr,
-                        "exitCode": args.exit_code
-                    })),
+                    result: Some(WorkerJobResult::RunCommand {
+                        result: AgentCommandResult {
+                            exit_code: Some(args.exit_code),
+                            stdout: args.stdout,
+                            stderr: args.stderr,
+                            started_at: now,
+                            finished_at: now,
+                        },
+                    }),
                 })
                 .send()
                 .await?;
@@ -708,7 +713,7 @@ async fn handle_lease(
 
 #[derive(Debug)]
 enum WorkerJobOutcome {
-    Complete(serde_json::Value),
+    Complete(WorkerJobResult),
     Fail { error: String, retry: bool },
 }
 
@@ -720,18 +725,18 @@ fn execute_job(
         JobKind::ProvisionSandbox => {
             let sandbox_id = sandbox_id_from_payload(&job.payload)?;
             let handle = provider.provision(sandbox_id)?;
-            Ok(WorkerJobOutcome::Complete(json!({
-                "provider": handle.provider,
-                "sandboxId": handle.sandbox_id,
-                "providerMetadata": handle.metadata
-            })))
+            Ok(WorkerJobOutcome::Complete(
+                WorkerJobResult::ProvisionSandbox { handle },
+            ))
         }
         JobKind::RunCommand => {
             let sandbox_id = sandbox_id_from_payload(&job.payload)?;
             let result =
                 provider.exec_handoff(sandbox_id, agent_request_from_payload(&job.payload)?)?;
             if result.exit_code.unwrap_or(1) == 0 {
-                Ok(WorkerJobOutcome::Complete(serde_json::to_value(&result)?))
+                Ok(WorkerJobOutcome::Complete(WorkerJobResult::RunCommand {
+                    result,
+                }))
             } else {
                 Ok(WorkerJobOutcome::Fail {
                     error: result.stderr,
@@ -739,43 +744,39 @@ fn execute_job(
                 })
             }
         }
-        JobKind::RunPrompt => Ok(WorkerJobOutcome::Complete(json!({
-            "output": prompt_output_from_payload(&job.payload)?
-        }))),
+        JobKind::RunPrompt => Ok(WorkerJobOutcome::Complete(WorkerJobResult::RunPrompt {
+            output: prompt_output_from_payload(&job.payload)?,
+        })),
         JobKind::CreateSnapshot => {
             let sandbox_id = sandbox_id_from_payload(&job.payload)?;
             let snapshot_id = snapshot_id_from_payload(&job.payload)?;
             let handle = provider.create_snapshot(sandbox_id, snapshot_id)?;
-            Ok(WorkerJobOutcome::Complete(json!({
-                "inventory": {
-                    "sandboxId": sandbox_id,
-                    "snapshotId": snapshot_id,
-                    "provider": handle.provider
-                },
-                "providerMetadata": handle.metadata
-            })))
+            Ok(WorkerJobOutcome::Complete(
+                WorkerJobResult::CreateSnapshot { handle },
+            ))
         }
         JobKind::ForkSandbox => {
             let parent_sandbox_id = parent_sandbox_id_from_payload(&job.payload)?;
             let child_sandbox_id = child_sandbox_id_from_payload(&job.payload)?;
             let snapshot_id = snapshot_id_from_payload(&job.payload)?;
             let handle = provider.fork(parent_sandbox_id, child_sandbox_id, snapshot_id)?;
-            Ok(WorkerJobOutcome::Complete(json!({
-                "provider": handle.provider,
-                "parentSandboxId": handle.parent_sandbox_id,
-                "childSandboxId": handle.child_sandbox_id,
-                "snapshotId": handle.snapshot_id,
-                "providerMetadata": handle.metadata
-            })))
+            Ok(WorkerJobOutcome::Complete(WorkerJobResult::ForkSandbox {
+                handle,
+            }))
         }
-        JobKind::StopSandbox | JobKind::ResumeSandbox => {
+        JobKind::StopSandbox => {
             let sandbox_id = sandbox_id_from_payload(&job.payload)?;
-            Ok(WorkerJobOutcome::Complete(json!({
-                "provider": "kubernetes",
-                "mode": "dry_run",
-                "operation": job.kind,
-                "sandboxId": sandbox_id
-            })))
+            Ok(WorkerJobOutcome::Complete(WorkerJobResult::StopSandbox {
+                provider: "kubernetes".to_string(),
+                sandbox_id,
+            }))
+        }
+        JobKind::ResumeSandbox => {
+            let sandbox_id = sandbox_id_from_payload(&job.payload)?;
+            Ok(WorkerJobOutcome::Complete(WorkerJobResult::ResumeSandbox {
+                provider: "kubernetes".to_string(),
+                sandbox_id,
+            }))
         }
     }
 }
@@ -934,7 +935,9 @@ fn to_capability(value: CapabilityArg) -> WorkerCapability {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use sandboxwich_core::{Job, JobId, JobStatus, SandboxId, SnapshotId};
+    use sandboxwich_core::{
+        Job, JobId, JobStatus, RuntimeResourceKind, RuntimeResourcePurpose, SandboxId, SnapshotId,
+    };
 
     fn provider() -> KubernetesDryRunProvider {
         KubernetesDryRunProvider::with_snapshot_class(
@@ -963,7 +966,7 @@ mod tests {
         }
     }
 
-    fn completed_value(outcome: WorkerJobOutcome) -> serde_json::Value {
+    fn completed_result(outcome: WorkerJobOutcome) -> WorkerJobResult {
         match outcome {
             WorkerJobOutcome::Complete(value) => value,
             WorkerJobOutcome::Fail { error, .. } => panic!("expected completion, got {error}"),
@@ -982,14 +985,19 @@ mod tests {
             &provider(),
         )
         .expect("provision job should execute");
-        let value = completed_value(outcome);
+        let WorkerJobResult::ProvisionSandbox { handle } = completed_result(outcome) else {
+            panic!("expected provision result");
+        };
 
-        assert_eq!(value["sandboxId"], json!(sandbox_id));
-        assert_eq!(value["providerMetadata"]["manifests"]["pod"]["kind"], "Pod");
-        assert_eq!(
-            value["providerMetadata"]["manifests"]["sshService"]["kind"],
-            "Service"
-        );
+        assert_eq!(handle.sandbox_id, sandbox_id);
+        assert!(handle.resources.iter().any(|resource| {
+            resource.resource_kind == RuntimeResourceKind::Pod
+                && resource.purpose == RuntimeResourcePurpose::Runtime
+        }));
+        assert!(handle.resources.iter().any(|resource| {
+            resource.resource_kind == RuntimeResourceKind::Service
+                && resource.purpose == RuntimeResourcePurpose::Ssh
+        }));
     }
 
     #[test]
@@ -1008,15 +1016,12 @@ mod tests {
             &provider(),
         )
         .expect("command job should execute");
-        let value = completed_value(outcome);
+        let WorkerJobResult::RunCommand { result } = completed_result(outcome) else {
+            panic!("expected run command result");
+        };
 
-        assert_eq!(value["exit_code"], 0);
-        assert!(
-            value["stdout"]
-                .as_str()
-                .expect("stdout should be a string")
-                .contains("\"operation\":\"exec\"")
-        );
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.stdout.contains("\"operation\":\"exec\""));
     }
 
     #[test]
@@ -1026,7 +1031,7 @@ mod tests {
         let snapshot_id = SnapshotId::new();
         let provider = provider();
 
-        let snapshot = completed_value(
+        let snapshot = completed_result(
             execute_job(
                 &job(
                     JobKind::CreateSnapshot,
@@ -1040,12 +1045,15 @@ mod tests {
             )
             .expect("snapshot job should execute"),
         );
-        assert_eq!(
-            snapshot["providerMetadata"]["manifests"]["volumeSnapshot"]["kind"],
-            "VolumeSnapshot"
-        );
+        let WorkerJobResult::CreateSnapshot { handle: snapshot } = snapshot else {
+            panic!("expected create snapshot result");
+        };
+        assert!(snapshot.resources.iter().any(|resource| {
+            resource.resource_kind == RuntimeResourceKind::VolumeSnapshot
+                && resource.purpose == RuntimeResourcePurpose::Snapshot
+        }));
 
-        let fork = completed_value(
+        let fork = completed_result(
             execute_job(
                 &job(
                     JobKind::ForkSandbox,
@@ -1060,11 +1068,14 @@ mod tests {
             )
             .expect("fork job should execute"),
         );
-        assert_eq!(fork["childSandboxId"], json!(child_sandbox_id));
-        assert_eq!(
-            fork["providerMetadata"]["manifests"]["pvc"]["spec"]["dataSource"]["kind"],
-            "VolumeSnapshot"
-        );
+        let WorkerJobResult::ForkSandbox { handle: fork } = fork else {
+            panic!("expected fork result");
+        };
+        assert_eq!(fork.child_sandbox_id, child_sandbox_id);
+        assert!(fork.resources.iter().any(|resource| {
+            resource.resource_kind == RuntimeResourceKind::PersistentVolumeClaim
+                && resource.source_snapshot_id == Some(snapshot_id)
+        }));
     }
 
     #[test]

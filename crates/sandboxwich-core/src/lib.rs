@@ -202,6 +202,28 @@ impl fmt::Display for DesktopSessionId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RuntimeResourceId(pub Uuid);
+
+impl RuntimeResourceId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for RuntimeResourceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for RuntimeResourceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxState {
@@ -243,6 +265,83 @@ pub enum DesktopAccessMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeResourceKind {
+    Pod,
+    PersistentVolumeClaim,
+    Service,
+    VolumeSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeResourcePurpose {
+    Runtime,
+    Workspace,
+    Ssh,
+    Desktop,
+    Snapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeResourceStatus {
+    Planned,
+    Applied,
+    Ready,
+    Failed,
+    Deleted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderRuntimeResource {
+    pub sandbox_id: SandboxId,
+    pub snapshot_id: Option<SnapshotId>,
+    pub provider: String,
+    pub resource_kind: RuntimeResourceKind,
+    pub purpose: RuntimeResourcePurpose,
+    pub resource_name: String,
+    pub namespace: String,
+    pub status: RuntimeResourceStatus,
+    pub cluster: Option<String>,
+    pub storage_class: Option<String>,
+    pub snapshot_class: Option<String>,
+    pub storage_size: Option<String>,
+    pub runtime_image: Option<String>,
+    pub service_port: Option<u16>,
+    pub target_port: Option<String>,
+    pub source_snapshot_id: Option<SnapshotId>,
+    pub ready_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeResource {
+    pub id: RuntimeResourceId,
+    pub sandbox_id: SandboxId,
+    pub snapshot_id: Option<SnapshotId>,
+    pub provider: String,
+    pub resource_kind: RuntimeResourceKind,
+    pub purpose: RuntimeResourcePurpose,
+    pub resource_name: String,
+    pub namespace: String,
+    pub status: RuntimeResourceStatus,
+    pub cluster: Option<String>,
+    pub storage_class: Option<String>,
+    pub snapshot_class: Option<String>,
+    pub storage_size: Option<String>,
+    pub runtime_image: Option<String>,
+    pub service_port: Option<u16>,
+    pub target_port: Option<String>,
+    pub source_snapshot_id: Option<SnapshotId>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub ready_at: Option<DateTime<Utc>>,
+    pub deleted_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Sandbox {
     pub id: SandboxId,
     pub name: String,
@@ -271,6 +370,12 @@ pub struct SandboxResponse {
 pub struct SandboxListResponse {
     pub ok: bool,
     pub sandboxes: Vec<Sandbox>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeResourceListResponse {
+    pub ok: bool,
+    pub resources: Vec<RuntimeResource>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -640,7 +745,7 @@ pub struct RenewLeaseRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CompleteLeaseRequest {
-    pub result: Option<serde_json::Value>,
+    pub result: Option<WorkerJobResult>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -726,24 +831,66 @@ pub struct ProviderHealthReport {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProviderSandboxHandle {
     pub provider: String,
+    #[serde(alias = "sandboxId")]
     pub sandbox_id: SandboxId,
+    #[serde(default)]
+    pub resources: Vec<ProviderRuntimeResource>,
+    #[serde(default, alias = "providerMetadata")]
     pub metadata: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProviderSnapshotHandle {
     pub provider: String,
+    #[serde(alias = "snapshotId")]
     pub snapshot_id: SnapshotId,
+    #[serde(default)]
+    pub resources: Vec<ProviderRuntimeResource>,
+    #[serde(default, alias = "providerMetadata")]
     pub metadata: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProviderForkHandle {
     pub provider: String,
+    #[serde(alias = "parentSandboxId")]
     pub parent_sandbox_id: SandboxId,
+    #[serde(alias = "childSandboxId")]
     pub child_sandbox_id: SandboxId,
+    #[serde(alias = "snapshotId")]
     pub snapshot_id: SnapshotId,
+    #[serde(default)]
+    pub resources: Vec<ProviderRuntimeResource>,
+    #[serde(default, alias = "providerMetadata")]
     pub metadata: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkerJobResult {
+    ProvisionSandbox {
+        handle: ProviderSandboxHandle,
+    },
+    RunCommand {
+        result: AgentCommandResult,
+    },
+    RunPrompt {
+        output: String,
+    },
+    CreateSnapshot {
+        handle: ProviderSnapshotHandle,
+    },
+    ForkSandbox {
+        handle: ProviderForkHandle,
+    },
+    StopSandbox {
+        provider: String,
+        sandbox_id: SandboxId,
+    },
+    ResumeSandbox {
+        provider: String,
+        sandbox_id: SandboxId,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
