@@ -30,7 +30,7 @@ use sandboxwich_core::{
 };
 use serde_json::json;
 use sqlx::{
-    AnyPool, Row, Sqlite,
+    AnyConnection, AnyPool, Row, Sqlite,
     any::{AnyPoolOptions, AnyRow},
     migrate::MigrateDatabase,
 };
@@ -1546,21 +1546,55 @@ async fn complete_lease(
     Json(request): Json<CompleteLeaseRequest>,
 ) -> Result<Json<LeaseResponse>, ApiError> {
     let lease_id = LeaseId(lease_id);
-    let lease = fetch_lease(&state.db, lease_id).await?;
-    if lease.status != LeaseStatus::Active {
-        return Err(ApiError::bad_request("lease is not active"));
-    }
-
     let result = request
         .result
         .ok_or_else(|| ApiError::bad_request("completion result is required"))?;
-    apply_completed_job(&state.db, &lease.job, result).await?;
-    let now = Utc::now();
-    update_lease_status(&state.db, lease_id, LeaseStatus::Completed, Some(now), None).await?;
-    update_job_status(&state.db, lease.job_id, JobStatus::Succeeded, None, now).await?;
-
-    let lease = fetch_lease(&state.db, lease_id).await?;
+    let lease = complete_lease_in_transaction(&state.db, lease_id, result).await?;
     Ok(Json(LeaseResponse { ok: true, lease }))
+}
+
+async fn complete_lease_in_transaction(
+    db: &Database,
+    lease_id: LeaseId,
+    result: WorkerJobResult,
+) -> Result<JobLease, ApiError> {
+    let mut tx = db.pool.begin().await?;
+
+    let completed = async {
+        let lease = fetch_lease_on_connection(db, &mut *tx, lease_id).await?;
+        if lease.status != LeaseStatus::Active {
+            return Err(ApiError::bad_request("lease is not active"));
+        }
+
+        let now = Utc::now();
+        complete_active_lease_on_connection(db, &mut *tx, lease_id, now).await?;
+        apply_completed_job_on_connection(db, &mut *tx, &lease.job, result).await?;
+        update_job_status_on_connection(
+            db,
+            &mut *tx,
+            lease.job_id,
+            JobStatus::Succeeded,
+            None,
+            now,
+        )
+        .await?;
+
+        fetch_lease_on_connection(db, &mut *tx, lease_id).await
+    }
+    .await;
+
+    match completed {
+        Ok(lease) => {
+            tx.commit().await?;
+            Ok(lease)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = tx.rollback().await {
+                tracing::error!(%rollback_error, "failed to roll back lease completion");
+            }
+            Err(error)
+        }
+    }
 }
 
 async fn fail_lease(
@@ -1671,6 +1705,43 @@ async fn set_sandbox_state(
     Ok(())
 }
 
+async fn set_sandbox_state_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    sandbox_id: SandboxId,
+    next_state: SandboxState,
+    event_data: serde_json::Value,
+) -> Result<(), ApiError> {
+    let now = Utc::now();
+    let state = state_to_str(&next_state);
+    let sql = format!(
+        "update sandboxes set state = {}, updated_at = {} where id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3)
+    );
+    let result = sqlx::query(&sql)
+        .bind(state)
+        .bind(now.to_rfc3339())
+        .bind(sandbox_id.to_string())
+        .execute(&mut *connection)
+        .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("sandbox not found"));
+    }
+
+    insert_event_on_connection(
+        db,
+        connection,
+        sandbox_id,
+        SandboxEventKind::LifecycleChanged,
+        event_data,
+    )
+    .await?;
+    Ok(())
+}
+
 async fn fetch_sandbox(db: &Database, sandbox_id: SandboxId) -> Result<Sandbox, ApiError> {
     let sql = format!(
         "select id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id
@@ -1709,14 +1780,16 @@ async fn list_runtime_resources_for_sandbox(
     rows.into_iter().map(row_to_runtime_resource).collect()
 }
 
-async fn upsert_provider_runtime_resources(
+async fn upsert_provider_runtime_resources_on_connection(
     db: &Database,
+    connection: &mut AnyConnection,
     resources: &[ProviderRuntimeResource],
 ) -> Result<(), ApiError> {
     for resource in resources {
         validate_provider_runtime_resource(resource)?;
-        let existing_id = fetch_runtime_resource_id(
+        let existing_id = fetch_runtime_resource_id_on_connection(
             db,
+            connection,
             &resource.provider,
             &resource.resource_kind,
             &resource.namespace,
@@ -1724,9 +1797,15 @@ async fn upsert_provider_runtime_resources(
         )
         .await?;
         if let Some(resource_id) = existing_id {
-            update_runtime_resource_from_provider(db, resource_id, resource).await?;
+            update_runtime_resource_from_provider_on_connection(
+                db,
+                connection,
+                resource_id,
+                resource,
+            )
+            .await?;
         } else {
-            insert_runtime_resource_from_provider(db, resource).await?;
+            insert_runtime_resource_from_provider_on_connection(db, connection, resource).await?;
         }
     }
 
@@ -1755,8 +1834,9 @@ fn validate_provider_runtime_resource(resource: &ProviderRuntimeResource) -> Res
     Ok(())
 }
 
-async fn fetch_runtime_resource_id(
+async fn fetch_runtime_resource_id_on_connection(
     db: &Database,
+    connection: &mut AnyConnection,
     provider: &str,
     resource_kind: &RuntimeResourceKind,
     namespace: &str,
@@ -1776,7 +1856,7 @@ async fn fetch_runtime_resource_id(
         .bind(runtime_resource_kind_to_str(resource_kind))
         .bind(namespace)
         .bind(resource_name)
-        .fetch_optional(&db.pool)
+        .fetch_optional(&mut *connection)
         .await?;
     row.map(|row| {
         let id: String = row.try_get("id")?;
@@ -1785,8 +1865,9 @@ async fn fetch_runtime_resource_id(
     .transpose()
 }
 
-async fn insert_runtime_resource_from_provider(
+async fn insert_runtime_resource_from_provider_on_connection(
     db: &Database,
+    connection: &mut AnyConnection,
     resource: &ProviderRuntimeResource,
 ) -> Result<(), ApiError> {
     let now = Utc::now();
@@ -1830,13 +1911,14 @@ async fn insert_runtime_resource_from_provider(
         .bind(resource.ready_at.map(|time| time.to_rfc3339()))
         .bind(deleted_at.map(|time| time.to_rfc3339()))
         .bind(&resource.error)
-        .execute(&db.pool)
+        .execute(&mut *connection)
         .await?;
     Ok(())
 }
 
-async fn update_runtime_resource_from_provider(
+async fn update_runtime_resource_from_provider_on_connection(
     db: &Database,
+    connection: &mut AnyConnection,
     resource_id: RuntimeResourceId,
     resource: &ProviderRuntimeResource,
 ) -> Result<(), ApiError> {
@@ -1902,7 +1984,7 @@ async fn update_runtime_resource_from_provider(
         .bind(deleted_at.map(|time| time.to_rfc3339()))
         .bind(&resource.error)
         .bind(resource_id.to_string())
-        .execute(&db.pool)
+        .execute(&mut *connection)
         .await?;
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found("runtime resource not found"));
@@ -2168,6 +2250,26 @@ async fn fetch_snapshot(db: &Database, snapshot_id: SnapshotId) -> Result<Snapsh
     let row = sqlx::query(&sql)
         .bind(snapshot_id.to_string())
         .fetch_optional(&db.pool)
+        .await?
+        .ok_or_else(|| ApiError::not_found("snapshot not found"))?;
+
+    row_to_snapshot(row)
+}
+
+async fn fetch_snapshot_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    snapshot_id: SnapshotId,
+) -> Result<Snapshot, ApiError> {
+    let sql = format!(
+        "select id, sandbox_id, status, label, inventory, provider_metadata, created_at, ready_at, expires_at, error
+         from snapshots
+         where id = {}",
+        db.placeholder(1)
+    );
+    let row = sqlx::query(&sql)
+        .bind(snapshot_id.to_string())
+        .fetch_optional(&mut *connection)
         .await?
         .ok_or_else(|| ApiError::not_found("snapshot not found"))?;
 
@@ -2823,6 +2925,26 @@ async fn fetch_job(db: &Database, job_id: JobId) -> Result<Job, ApiError> {
     row_to_job(row)
 }
 
+async fn fetch_job_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    job_id: JobId,
+) -> Result<Job, ApiError> {
+    let sql = format!(
+        "select id, kind, status, payload, required_capability, priority, attempts, max_attempts,
+                scheduled_at, created_at, updated_at, last_error
+         from jobs
+         where id = {}",
+        db.placeholder(1)
+    );
+    let row = sqlx::query(&sql)
+        .bind(job_id.to_string())
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| ApiError::not_found("job not found"))?;
+    row_to_job(row)
+}
+
 async fn fetch_lease(db: &Database, lease_id: LeaseId) -> Result<JobLease, ApiError> {
     let sql = format!(
         "select id, job_id, worker_id, status, attempt, leased_at, expires_at, completed_at, error
@@ -2837,6 +2959,27 @@ async fn fetch_lease(db: &Database, lease_id: LeaseId) -> Result<JobLease, ApiEr
         .ok_or_else(|| ApiError::not_found("lease not found"))?;
     let lease = row_to_lease_without_job(row)?;
     let job = fetch_job(db, lease.job_id).await?;
+    Ok(JobLease { job, ..lease })
+}
+
+async fn fetch_lease_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    lease_id: LeaseId,
+) -> Result<JobLease, ApiError> {
+    let sql = format!(
+        "select id, job_id, worker_id, status, attempt, leased_at, expires_at, completed_at, error
+         from job_leases
+         where id = {}",
+        db.placeholder(1)
+    );
+    let row = sqlx::query(&sql)
+        .bind(lease_id.to_string())
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| ApiError::not_found("lease not found"))?;
+    let lease = row_to_lease_without_job(row)?;
+    let job = fetch_job_on_connection(db, connection, lease.job_id).await?;
     Ok(JobLease { job, ..lease })
 }
 
@@ -2866,6 +3009,34 @@ async fn update_lease_status(
     Ok(())
 }
 
+async fn complete_active_lease_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    lease_id: LeaseId,
+    completed_at: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "update job_leases
+         set status = {}, completed_at = {}, error = {}
+         where id = {} and status = 'active'",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4)
+    );
+    let result = sqlx::query(&sql)
+        .bind(lease_status_to_str(&LeaseStatus::Completed))
+        .bind(completed_at.to_rfc3339())
+        .bind(Option::<String>::None)
+        .bind(lease_id.to_string())
+        .execute(&mut *connection)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::bad_request("lease is not active"));
+    }
+    Ok(())
+}
+
 async fn update_job_status(
     db: &Database,
     job_id: JobId,
@@ -2888,6 +3059,33 @@ async fn update_job_status(
         .bind(updated_at.to_rfc3339())
         .bind(job_id.to_string())
         .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+async fn update_job_status_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    job_id: JobId,
+    status: JobStatus,
+    error: Option<&str>,
+    updated_at: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "update jobs
+         set status = {}, last_error = {}, updated_at = {}
+         where id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4)
+    );
+    sqlx::query(&sql)
+        .bind(job_status_to_str(&status))
+        .bind(error)
+        .bind(updated_at.to_rfc3339())
+        .bind(job_id.to_string())
+        .execute(&mut *connection)
         .await?;
     Ok(())
 }
@@ -2924,8 +3122,42 @@ async fn update_command_from_lease_result(
     Ok(())
 }
 
-async fn apply_completed_job(
+async fn update_command_from_lease_result_on_connection(
     db: &Database,
+    connection: &mut AnyConnection,
+    command_id: CommandId,
+    status: CommandStatus,
+    stdout: &str,
+    stderr: &str,
+    exit_code: Option<i32>,
+) -> Result<(), ApiError> {
+    let now = Utc::now();
+    let sql = format!(
+        "update commands
+         set status = {}, stdout = {}, stderr = {}, exit_code = {}, finished_at = {}
+         where id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4),
+        db.placeholder(5),
+        db.placeholder(6)
+    );
+    sqlx::query(&sql)
+        .bind(command_status_to_str(&status))
+        .bind(stdout)
+        .bind(stderr)
+        .bind(exit_code)
+        .bind(now.to_rfc3339())
+        .bind(command_id.to_string())
+        .execute(&mut *connection)
+        .await?;
+    Ok(())
+}
+
+async fn apply_completed_job_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
     job: &Job,
     result: WorkerJobResult,
 ) -> Result<(), ApiError> {
@@ -2936,8 +3168,9 @@ async fn apply_completed_job(
             let stdout = result.stdout.as_str();
             let stderr = result.stderr.as_str();
             let exit_code = result.exit_code.or(Some(0));
-            update_command_from_lease_result(
+            update_command_from_lease_result_on_connection(
                 db,
+                connection,
                 command_id,
                 CommandStatus::Finished,
                 stdout,
@@ -2946,8 +3179,9 @@ async fn apply_completed_job(
             )
             .await?;
             if !stdout.is_empty() {
-                insert_event(
+                insert_event_on_connection(
                     db,
+                    connection,
                     sandbox_id,
                     SandboxEventKind::CommandOutput,
                     json!({
@@ -2959,8 +3193,9 @@ async fn apply_completed_job(
                 .await?;
             }
             if !stderr.is_empty() {
-                insert_event(
+                insert_event_on_connection(
                     db,
+                    connection,
                     sandbox_id,
                     SandboxEventKind::CommandOutput,
                     json!({
@@ -2971,8 +3206,9 @@ async fn apply_completed_job(
                 )
                 .await?;
             }
-            insert_event(
+            insert_event_on_connection(
                 db,
+                connection,
                 sandbox_id,
                 SandboxEventKind::CommandFinished,
                 json!({
@@ -2991,13 +3227,20 @@ async fn apply_completed_job(
                     "snapshot completion result does not match job snapshot",
                 ));
             }
-            mark_snapshot_ready_from_provider_handle(db, sandbox_id_from_job(job)?, handle).await?;
+            mark_snapshot_ready_from_provider_handle_on_connection(
+                db,
+                connection,
+                sandbox_id_from_job(job)?,
+                handle,
+            )
+            .await?;
         }
         (JobKind::RunPrompt, WorkerJobResult::RunPrompt { output }) => {
             let sandbox_id = sandbox_id_from_job(job)?;
             let prompt_event_id = prompt_event_id_from_job(job)?;
-            insert_event(
+            insert_event_on_connection(
                 db,
+                connection,
                 sandbox_id,
                 SandboxEventKind::PromptFinished,
                 json!({
@@ -3019,10 +3262,12 @@ async fn apply_completed_job(
                     "fork completion result does not match job payload",
                 ));
             }
-            upsert_provider_runtime_resources(db, &handle.resources).await?;
+            upsert_provider_runtime_resources_on_connection(db, connection, &handle.resources)
+                .await?;
             let next_state = SandboxState::Ready;
-            set_sandbox_state(
+            set_sandbox_state_on_connection(
                 db,
+                connection,
                 child_id,
                 next_state.clone(),
                 json!({
@@ -3040,10 +3285,12 @@ async fn apply_completed_job(
                     "provision completion result does not match job sandbox",
                 ));
             }
-            upsert_provider_runtime_resources(db, &handle.resources).await?;
+            upsert_provider_runtime_resources_on_connection(db, connection, &handle.resources)
+                .await?;
             let next_state = SandboxState::Ready;
-            set_sandbox_state(
+            set_sandbox_state_on_connection(
                 db,
+                connection,
                 sandbox_id,
                 next_state.clone(),
                 json!({
@@ -3295,14 +3542,15 @@ async fn apply_failed_job(db: &Database, job: &Job, error: &str) -> Result<(), A
     Ok(())
 }
 
-async fn mark_snapshot_ready_from_provider_handle(
+async fn mark_snapshot_ready_from_provider_handle_on_connection(
     db: &Database,
+    connection: &mut AnyConnection,
     sandbox_id: SandboxId,
     handle: sandboxwich_core::ProviderSnapshotHandle,
 ) -> Result<(), ApiError> {
     let snapshot_id = handle.snapshot_id;
-    upsert_provider_runtime_resources(db, &handle.resources).await?;
-    let snapshot = fetch_snapshot(db, snapshot_id).await?;
+    upsert_provider_runtime_resources_on_connection(db, connection, &handle.resources).await?;
+    let snapshot = fetch_snapshot_on_connection(db, connection, snapshot_id).await?;
     let provider = handle.provider.clone();
     let inventory = if snapshot.inventory == json!({}) {
         json!({
@@ -3333,7 +3581,7 @@ async fn mark_snapshot_ready_from_provider_handle(
         .bind(now.to_rfc3339())
         .bind(Option::<String>::None)
         .bind(snapshot_id.to_string())
-        .execute(&db.pool)
+        .execute(&mut *connection)
         .await?;
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found("snapshot not found"));
@@ -3419,6 +3667,38 @@ async fn insert_event(
         .bind(serde_json::to_string(&event.data)?)
         .bind(event.created_at.to_rfc3339())
         .execute(&db.pool)
+        .await?;
+
+    Ok(event)
+}
+
+async fn insert_event_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    sandbox_id: SandboxId,
+    kind: SandboxEventKind,
+    data: serde_json::Value,
+) -> Result<SandboxEvent, ApiError> {
+    let event = SandboxEvent {
+        id: EventId::new(),
+        sandbox_id,
+        kind,
+        data,
+        created_at: Utc::now(),
+    };
+
+    let sql = format!(
+        "insert into sandbox_events (id, sandbox_id, kind, data, created_at)
+         values ({})",
+        db.placeholders(5)
+    );
+    sqlx::query(&sql)
+        .bind(event.id.0.to_string())
+        .bind(event.sandbox_id.to_string())
+        .bind(event_kind_to_str(&event.kind))
+        .bind(serde_json::to_string(&event.data)?)
+        .bind(event.created_at.to_rfc3339())
+        .execute(&mut *connection)
         .await?;
 
     Ok(event)
