@@ -1,6 +1,8 @@
 FROM ubuntu:24.04
 
 ARG SANDBOX_USER=sandbox
+ARG SANDBOX_UID=1000
+ARG SANDBOX_GID=1000
 
 LABEL org.opencontainers.image.title="sandboxwich ubuntu development runtime"
 LABEL org.opencontainers.image.description="SSH and browser-desktop guest runtime for disposable development sandboxes"
@@ -47,7 +49,11 @@ RUN apt-get update \
         zsh \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --create-home --shell /bin/bash "${SANDBOX_USER}" \
+RUN groupadd --gid "${SANDBOX_GID}" "${SANDBOX_USER}" \
+    && useradd --create-home --shell /bin/bash \
+        --uid "${SANDBOX_UID}" \
+        --gid "${SANDBOX_GID}" \
+        "${SANDBOX_USER}" \
     && printf '%s ALL=(ALL) NOPASSWD:ALL\n' "${SANDBOX_USER}" > /etc/sudoers.d/sandboxwich \
     && chmod 0440 /etc/sudoers.d/sandboxwich \
     && mkdir -p /run/sshd /run/sandboxwich/ssh /workspace \
