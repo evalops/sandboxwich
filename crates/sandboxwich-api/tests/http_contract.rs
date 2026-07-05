@@ -6,17 +6,20 @@ use std::{
 
 use reqwest::StatusCode;
 use sandboxwich_core::{
-    ClaimLeaseRequest, ClaimLeaseResponse, CommandListResponse, CommandRequest, CommandResponse,
-    CommandStatus, CompleteLeaseRequest, CreateDesktopSessionRequest, CreateSandboxRequest,
-    CreateSnapshotRequest, DesktopAccessMode, DesktopAccessRequest, DesktopAccessResponse,
-    DesktopSessionListResponse, DesktopSessionResponse, DesktopSessionStatus, EventListResponse,
-    FailLeaseRequest, GuestHealthResponse, GuestStatus, HealthResponse, Job, JobListResponse,
-    JobStatus, LeaseResponse, PromptQueuedResponse, PromptRequest, RegisterWorkerRequest,
-    RequestSshKeyRequest, SandboxEventKind, SandboxListResponse, SandboxResponse, SandboxState,
-    SnapshotCleanupResponse, SnapshotListResponse, SnapshotResponse, SnapshotStatus,
+    AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse, CommandListResponse, CommandRequest,
+    CommandResponse, CommandStatus, CompleteLeaseRequest, CreateDesktopSessionRequest,
+    CreateJobRequest, CreateSandboxRequest, CreateSnapshotRequest, DesktopAccessMode,
+    DesktopAccessRequest, DesktopAccessResponse, DesktopSessionListResponse,
+    DesktopSessionResponse, DesktopSessionStatus, EventListResponse, FailLeaseRequest,
+    GuestHealthResponse, GuestStatus, HealthResponse, Job, JobKind, JobListResponse, JobResponse,
+    JobStatus, LeaseResponse, PromptQueuedResponse, PromptRequest, ProviderForkHandle,
+    ProviderRuntimeResource, ProviderSandboxHandle, RegisterWorkerRequest, RequestSshKeyRequest,
+    RuntimeResourceKind, RuntimeResourceListResponse, RuntimeResourcePurpose,
+    RuntimeResourceStatus, SandboxEventKind, SandboxListResponse, SandboxResponse, SandboxState,
+    SnapshotCleanupResponse, SnapshotId, SnapshotListResponse, SnapshotResponse, SnapshotStatus,
     SshAccessRequest, SshAccessResponse, SshKeyListResponse, SshKeyResponse, SshKeyStatus,
     UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest,
-    WorkerCapability, WorkerHeartbeatRequest, WorkerListResponse, WorkerResponse,
+    WorkerCapability, WorkerHeartbeatRequest, WorkerJobResult, WorkerListResponse, WorkerResponse,
 };
 use sqlx::any::AnyPoolOptions;
 use tempfile::TempDir;
@@ -100,7 +103,11 @@ async fn run_contract(server: TestServer) {
         .json(&RegisterWorkerRequest {
             name: "k3s-worker-a".to_string(),
             provider: "kubernetes".to_string(),
-            capabilities: vec![WorkerCapability::K8sPod, WorkerCapability::RunCommand],
+            capabilities: vec![
+                WorkerCapability::K8sPod,
+                WorkerCapability::ProvisionSandbox,
+                WorkerCapability::RunCommand,
+            ],
             labels: [("cluster".to_string(), "k3s-dev".to_string())].into(),
         })
         .send()
@@ -147,6 +154,7 @@ async fn run_contract(server: TestServer) {
             .iter()
             .any(|seen| seen.id == worker.worker.id)
     );
+    assert_provision_job_persists_runtime_resources(&client, &server, &created, &worker).await;
 
     let listed: SandboxListResponse = client
         .get(format!("{}/sandboxes", server.base_url))
@@ -237,11 +245,7 @@ async fn run_contract(server: TestServer) {
     let completed: LeaseResponse = client
         .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
         .json(&CompleteLeaseRequest {
-            result: Some(serde_json::json!({
-                "stdout": "hello\n",
-                "stderr": "",
-                "exitCode": 0
-            })),
+            result: Some(command_result("hello\n", "", 0)),
         })
         .send()
         .await
@@ -507,6 +511,109 @@ async fn assert_guest_health_and_ssh_key_lifecycle(
     assert_eq!(ssh_access.ssh_access.scp_command_prefix, "scp -P 2222");
 }
 
+async fn assert_provision_job_persists_runtime_resources(
+    client: &reqwest::Client,
+    server: &TestServer,
+    sandbox: &SandboxResponse,
+    worker: &WorkerResponse,
+) {
+    let queued: JobResponse = client
+        .post(format!("{}/jobs", server.base_url))
+        .json(&CreateJobRequest {
+            kind: JobKind::ProvisionSandbox,
+            payload: serde_json::json!({
+                "sandboxId": sandbox.sandbox.id
+            }),
+            required_capability: WorkerCapability::ProvisionSandbox,
+            priority: Some(10),
+            max_attempts: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(queued.job.status, JobStatus::Queued);
+
+    let claimed: ClaimLeaseResponse = client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claimed
+        .lease
+        .expect("expected worker to claim provision job");
+    assert_eq!(lease.job.id, queued.job.id);
+
+    let completed: LeaseResponse = client
+        .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::ProvisionSandbox {
+                handle: ProviderSandboxHandle {
+                    provider: "kubernetes".to_string(),
+                    sandbox_id: sandbox.sandbox.id,
+                    resources: provision_resources(sandbox.sandbox.id),
+                    metadata: serde_json::json!({
+                        "diagnostic": "provider metadata is not the durable runtime source"
+                    }),
+                },
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(completed.lease.job.status, JobStatus::Succeeded);
+
+    let resources: RuntimeResourceListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/runtime-resources",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(resources.resources.iter().any(|resource| {
+        resource.resource_kind == RuntimeResourceKind::Pod
+            && resource.purpose == RuntimeResourcePurpose::Runtime
+            && resource.runtime_image.as_deref()
+                == Some("ghcr.io/evalops/sandboxwich-ubuntu-dev:test")
+    }));
+    assert!(resources.resources.iter().any(|resource| {
+        resource.resource_kind == RuntimeResourceKind::PersistentVolumeClaim
+            && resource.purpose == RuntimeResourcePurpose::Workspace
+            && resource.storage_size.as_deref() == Some("2Gi")
+    }));
+    assert!(resources.resources.iter().any(|resource| {
+        resource.resource_kind == RuntimeResourceKind::Service
+            && resource.purpose == RuntimeResourcePurpose::Ssh
+            && resource.service_port == Some(22)
+    }));
+}
+
 async fn assert_retryable_failure_requeues_command(
     client: &reqwest::Client,
     server: &TestServer,
@@ -604,11 +711,7 @@ async fn assert_retryable_failure_requeues_command(
             server.base_url, retry_lease.id
         ))
         .json(&CompleteLeaseRequest {
-            result: Some(serde_json::json!({
-                "stdout": "retried\n",
-                "stderr": "",
-                "exitCode": 0
-            })),
+            result: Some(command_result("retried\n", "", 0)),
         })
         .send()
         .await
@@ -773,9 +876,9 @@ async fn assert_prompt_job_lifecycle(
     let completed: LeaseResponse = client
         .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
         .json(&CompleteLeaseRequest {
-            result: Some(serde_json::json!({
-                "output": "workspace summary"
-            })),
+            result: Some(WorkerJobResult::RunPrompt {
+                output: "workspace summary".to_string(),
+            }),
         })
         .send()
         .await
@@ -1299,12 +1402,19 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
     let completed: LeaseResponse = client
         .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
         .json(&CompleteLeaseRequest {
-            result: Some(serde_json::json!({
-                "providerMetadata": {
-                    "cluster": "k3s-dev",
-                    "namespace": "sandboxwich-contract"
-                }
-            })),
+            result: Some(WorkerJobResult::ForkSandbox {
+                handle: ProviderForkHandle {
+                    provider: "kubernetes".to_string(),
+                    parent_sandbox_id: sandbox.sandbox.id,
+                    child_sandbox_id: forked.sandbox.id,
+                    snapshot_id: fork_snapshot_id,
+                    resources: fork_resources(forked.sandbox.id, fork_snapshot_id),
+                    metadata: serde_json::json!({
+                        "cluster": "k3s-dev",
+                        "namespace": "sandboxwich-contract"
+                    }),
+                },
+            }),
         })
         .send()
         .await
@@ -1330,6 +1440,25 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .await
         .unwrap();
     assert_eq!(ready_child.sandbox.state, SandboxState::Ready);
+
+    let child_resources: RuntimeResourceListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/runtime-resources",
+            server.base_url, forked.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(child_resources.resources.iter().any(|resource| {
+        resource.resource_kind == RuntimeResourceKind::PersistentVolumeClaim
+            && resource.purpose == RuntimeResourcePurpose::Workspace
+            && resource.source_snapshot_id == Some(fork_snapshot_id)
+    }));
 }
 
 fn job_for_command(jobs: &[Job], command_id: &str) -> Job {
@@ -1388,6 +1517,117 @@ fn assert_no_access_url(value: &serde_json::Value) {
     }
 }
 
+fn command_result(stdout: &str, stderr: &str, exit_code: i32) -> WorkerJobResult {
+    let now = chrono::Utc::now();
+    WorkerJobResult::RunCommand {
+        result: AgentCommandResult {
+            exit_code: Some(exit_code),
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            started_at: now,
+            finished_at: now,
+        },
+    }
+}
+
+fn provision_resources(sandbox_id: sandboxwich_core::SandboxId) -> Vec<ProviderRuntimeResource> {
+    vec![
+        provider_resource(
+            sandbox_id,
+            None,
+            RuntimeResourceKind::PersistentVolumeClaim,
+            RuntimeResourcePurpose::Workspace,
+            format!("sandboxwich-pvc-{sandbox_id}"),
+        ),
+        provider_resource(
+            sandbox_id,
+            None,
+            RuntimeResourceKind::Pod,
+            RuntimeResourcePurpose::Runtime,
+            format!("sandboxwich-{sandbox_id}"),
+        ),
+        provider_resource(
+            sandbox_id,
+            None,
+            RuntimeResourceKind::Service,
+            RuntimeResourcePurpose::Ssh,
+            format!("sandboxwich-ssh-{sandbox_id}"),
+        ),
+        provider_resource(
+            sandbox_id,
+            None,
+            RuntimeResourceKind::Service,
+            RuntimeResourcePurpose::Desktop,
+            format!("sandboxwich-desktop-{sandbox_id}"),
+        ),
+    ]
+}
+
+fn fork_resources(
+    sandbox_id: sandboxwich_core::SandboxId,
+    source_snapshot_id: SnapshotId,
+) -> Vec<ProviderRuntimeResource> {
+    provision_resources(sandbox_id)
+        .into_iter()
+        .map(|mut resource| {
+            if resource.resource_kind == RuntimeResourceKind::PersistentVolumeClaim {
+                resource.source_snapshot_id = Some(source_snapshot_id);
+            }
+            resource
+        })
+        .collect()
+}
+
+fn provider_resource(
+    sandbox_id: sandboxwich_core::SandboxId,
+    snapshot_id: Option<SnapshotId>,
+    resource_kind: RuntimeResourceKind,
+    purpose: RuntimeResourcePurpose,
+    resource_name: String,
+) -> ProviderRuntimeResource {
+    let mut resource = ProviderRuntimeResource {
+        sandbox_id,
+        snapshot_id,
+        provider: "kubernetes".to_string(),
+        resource_kind,
+        purpose,
+        resource_name,
+        namespace: "sandboxwich-contract".to_string(),
+        status: RuntimeResourceStatus::Ready,
+        cluster: Some("k3s-dev".to_string()),
+        storage_class: Some("local-path".to_string()),
+        snapshot_class: Some("local-path-snapshot".to_string()),
+        storage_size: None,
+        runtime_image: None,
+        service_port: None,
+        target_port: None,
+        source_snapshot_id: None,
+        ready_at: Some(chrono::Utc::now()),
+        error: None,
+    };
+
+    match &resource.purpose {
+        RuntimeResourcePurpose::Workspace => {
+            resource.storage_size = Some("2Gi".to_string());
+        }
+        RuntimeResourcePurpose::Runtime => {
+            resource.runtime_image =
+                Some("ghcr.io/evalops/sandboxwich-ubuntu-dev:test".to_string());
+        }
+        RuntimeResourcePurpose::Ssh => {
+            resource.service_port = Some(22);
+            resource.target_port = Some("ssh".to_string());
+        }
+        RuntimeResourcePurpose::Desktop => {
+            resource.service_port = Some(6080);
+            resource.target_port = Some("desktop".to_string());
+        }
+        RuntimeResourcePurpose::Snapshot => {}
+    }
+
+    resource
+}
+
 impl TestServer {
     async fn start(database_url: String, data_dir: Option<TempDir>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1441,6 +1681,9 @@ async fn assert_database_rejects_invalid_typed_values(database_url: &str, sandbo
     let invalid_desktop_access_mode_id = Uuid::now_v7().to_string();
     let invalid_command_id = Uuid::now_v7().to_string();
     let invalid_event_id = Uuid::now_v7().to_string();
+    let invalid_runtime_kind_id = Uuid::now_v7().to_string();
+    let invalid_runtime_purpose_id = Uuid::now_v7().to_string();
+    let invalid_runtime_status_id = Uuid::now_v7().to_string();
     let now = "2026-07-04T00:00:00Z";
 
     let sandbox_result = sqlx::query(&insert_sandbox_sql(database_url))
@@ -1586,6 +1829,96 @@ async fn assert_database_rejects_invalid_typed_values(database_url: &str, sandbo
         ssh_key_result.is_err(),
         "invalid ssh key status was accepted"
     );
+
+    let runtime_kind_result = sqlx::query(&insert_runtime_resource_sql(database_url))
+        .bind(invalid_runtime_kind_id)
+        .bind(sandbox_id)
+        .bind(Option::<String>::None)
+        .bind("kubernetes")
+        .bind("not_real")
+        .bind("runtime")
+        .bind("invalid-kind")
+        .bind("sandboxwich-contract")
+        .bind("ready")
+        .bind(Some("k3s-dev"))
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<i64>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(now)
+        .bind(now)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await;
+    assert!(
+        runtime_kind_result.is_err(),
+        "invalid runtime resource kind was accepted"
+    );
+
+    let runtime_purpose_result = sqlx::query(&insert_runtime_resource_sql(database_url))
+        .bind(invalid_runtime_purpose_id)
+        .bind(sandbox_id)
+        .bind(Option::<String>::None)
+        .bind("kubernetes")
+        .bind("pod")
+        .bind("not_real")
+        .bind("invalid-purpose")
+        .bind("sandboxwich-contract")
+        .bind("ready")
+        .bind(Some("k3s-dev"))
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<i64>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(now)
+        .bind(now)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await;
+    assert!(
+        runtime_purpose_result.is_err(),
+        "invalid runtime resource purpose was accepted"
+    );
+
+    let runtime_status_result = sqlx::query(&insert_runtime_resource_sql(database_url))
+        .bind(invalid_runtime_status_id)
+        .bind(sandbox_id)
+        .bind(Option::<String>::None)
+        .bind("kubernetes")
+        .bind("pod")
+        .bind("runtime")
+        .bind("invalid-status")
+        .bind("sandboxwich-contract")
+        .bind("not_real")
+        .bind(Some("k3s-dev"))
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<i64>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(now)
+        .bind(now)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await;
+    assert!(
+        runtime_status_result.is_err(),
+        "invalid runtime resource status was accepted"
+    );
 }
 
 fn insert_sandbox_sql(database_url: &str) -> String {
@@ -1656,6 +1989,17 @@ fn insert_ssh_key_sql(database_url: &str) -> String {
          (id, sandbox_id, public_key, principal, status, requested_at, updated_at, applied_at, error)
          values ({})",
         placeholders(database_url, 9)
+    )
+}
+
+fn insert_runtime_resource_sql(database_url: &str) -> String {
+    format!(
+        "insert into runtime_resources
+         (id, sandbox_id, snapshot_id, provider, resource_kind, purpose, resource_name, namespace,
+          status, cluster, storage_class, snapshot_class, storage_size, runtime_image, service_port,
+          target_port, source_snapshot_id, created_at, updated_at, ready_at, deleted_at, error)
+         values ({})",
+        placeholders(database_url, 22)
     )
 }
 

@@ -10,6 +10,7 @@ Goal: make the API state model durable, portable, and testable enough for worker
 - Keep SQLite for local development and Postgres for shared deployments.
 - Add command lookup and list APIs beyond the immediate queue response.
 - Add schema constraints for sandbox states, event kinds, and command statuses.
+- Persist runtime resources as typed database rows instead of provider JSON blobs.
 
 ## Milestone 2: Worker Leases
 
@@ -19,6 +20,7 @@ Goal: let workers safely claim, renew, finish, and retry work through durable le
 - Implement a durable lease queue for sandbox and command work.
 - Add lease timeout, retry, and ownership transitions.
 - Wire `sandboxwich-worker` to claim and report jobs.
+- Use typed worker completion results so job outcomes are matched by contract, not JSON shape.
 
 ## Milestone 3: Guest Agent Execution
 

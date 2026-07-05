@@ -8,7 +8,8 @@ use anyhow::{Context, bail};
 use chrono::Utc;
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, ProviderCapabilityReport, ProviderForkHandle,
-    ProviderHealthReport, ProviderHealthStatus, ProviderSandboxHandle, ProviderSnapshotHandle,
+    ProviderHealthReport, ProviderHealthStatus, ProviderRuntimeResource, ProviderSandboxHandle,
+    ProviderSnapshotHandle, RuntimeResourceKind, RuntimeResourcePurpose, RuntimeResourceStatus,
     SandboxId, SnapshotId, WorkerCapability,
 };
 use serde::Serialize;
@@ -341,6 +342,155 @@ impl KubernetesDryRunProvider {
             "metadata": self.object_metadata(format!("sandboxwich-snapshot-{snapshot_id}"), Some(sandbox_id)),
             "spec": spec
         })
+    }
+
+    fn sandbox_resources(
+        &self,
+        sandbox_id: SandboxId,
+        status: RuntimeResourceStatus,
+    ) -> Vec<ProviderRuntimeResource> {
+        vec![
+            self.workspace_pvc_resource(sandbox_id, status.clone(), None),
+            self.runtime_pod_resource(sandbox_id, status.clone()),
+            self.ssh_service_resource(sandbox_id, status.clone()),
+            self.desktop_service_resource(sandbox_id, status),
+        ]
+    }
+
+    fn fork_resources(
+        &self,
+        child_sandbox_id: SandboxId,
+        snapshot_id: SnapshotId,
+        status: RuntimeResourceStatus,
+    ) -> Vec<ProviderRuntimeResource> {
+        vec![
+            self.workspace_pvc_resource(child_sandbox_id, status.clone(), Some(snapshot_id)),
+            self.runtime_pod_resource(child_sandbox_id, status.clone()),
+            self.ssh_service_resource(child_sandbox_id, status.clone()),
+            self.desktop_service_resource(child_sandbox_id, status),
+        ]
+    }
+
+    fn snapshot_resources(
+        &self,
+        sandbox_id: SandboxId,
+        snapshot_id: SnapshotId,
+        status: RuntimeResourceStatus,
+    ) -> Vec<ProviderRuntimeResource> {
+        let mut resource = self.base_resource(
+            sandbox_id,
+            Some(snapshot_id),
+            RuntimeResourceKind::VolumeSnapshot,
+            RuntimeResourcePurpose::Snapshot,
+            format!("sandboxwich-snapshot-{snapshot_id}"),
+            status,
+        );
+        resource.snapshot_class = self.snapshot_class.clone();
+        vec![resource]
+    }
+
+    fn workspace_pvc_resource(
+        &self,
+        sandbox_id: SandboxId,
+        status: RuntimeResourceStatus,
+        source_snapshot_id: Option<SnapshotId>,
+    ) -> ProviderRuntimeResource {
+        let mut resource = self.base_resource(
+            sandbox_id,
+            None,
+            RuntimeResourceKind::PersistentVolumeClaim,
+            RuntimeResourcePurpose::Workspace,
+            format!("sandboxwich-pvc-{sandbox_id}"),
+            status,
+        );
+        resource.storage_class = self.storage_class.clone();
+        resource.storage_size = Some(self.workspace_storage.clone());
+        resource.source_snapshot_id = source_snapshot_id;
+        resource
+    }
+
+    fn runtime_pod_resource(
+        &self,
+        sandbox_id: SandboxId,
+        status: RuntimeResourceStatus,
+    ) -> ProviderRuntimeResource {
+        let mut resource = self.base_resource(
+            sandbox_id,
+            None,
+            RuntimeResourceKind::Pod,
+            RuntimeResourcePurpose::Runtime,
+            format!("sandboxwich-{sandbox_id}"),
+            status,
+        );
+        resource.runtime_image = Some(self.runtime_image.clone());
+        resource
+    }
+
+    fn ssh_service_resource(
+        &self,
+        sandbox_id: SandboxId,
+        status: RuntimeResourceStatus,
+    ) -> ProviderRuntimeResource {
+        let mut resource = self.base_resource(
+            sandbox_id,
+            None,
+            RuntimeResourceKind::Service,
+            RuntimeResourcePurpose::Ssh,
+            format!("sandboxwich-ssh-{sandbox_id}"),
+            status,
+        );
+        resource.service_port = Some(22);
+        resource.target_port = Some("ssh".to_string());
+        resource
+    }
+
+    fn desktop_service_resource(
+        &self,
+        sandbox_id: SandboxId,
+        status: RuntimeResourceStatus,
+    ) -> ProviderRuntimeResource {
+        let mut resource = self.base_resource(
+            sandbox_id,
+            None,
+            RuntimeResourceKind::Service,
+            RuntimeResourcePurpose::Desktop,
+            format!("sandboxwich-desktop-{sandbox_id}"),
+            status,
+        );
+        resource.service_port = Some(6080);
+        resource.target_port = Some("desktop".to_string());
+        resource
+    }
+
+    fn base_resource(
+        &self,
+        sandbox_id: SandboxId,
+        snapshot_id: Option<SnapshotId>,
+        resource_kind: RuntimeResourceKind,
+        purpose: RuntimeResourcePurpose,
+        resource_name: String,
+        status: RuntimeResourceStatus,
+    ) -> ProviderRuntimeResource {
+        ProviderRuntimeResource {
+            sandbox_id,
+            snapshot_id,
+            provider: "kubernetes".to_string(),
+            resource_kind,
+            purpose,
+            resource_name,
+            namespace: self.namespace.clone(),
+            status,
+            cluster: Some(self.cluster.clone()),
+            storage_class: None,
+            snapshot_class: None,
+            storage_size: None,
+            runtime_image: None,
+            service_port: None,
+            target_port: None,
+            source_snapshot_id: None,
+            ready_at: None,
+            error: None,
+        }
     }
 }
 
@@ -725,6 +875,17 @@ fn render_manifest_documents(manifests: &[Value]) -> anyhow::Result<String> {
     Ok(documents)
 }
 
+fn mark_resources(
+    resources: &mut [ProviderRuntimeResource],
+    status: RuntimeResourceStatus,
+    ready_at: Option<chrono::DateTime<Utc>>,
+) {
+    for resource in resources {
+        resource.status = status.clone();
+        resource.ready_at = ready_at;
+    }
+}
+
 impl SandboxProvider for KubernetesDryRunProvider {
     fn capability_report(&self) -> ProviderCapabilityReport {
         ProviderCapabilityReport {
@@ -757,6 +918,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
         Ok(ProviderSandboxHandle {
             provider: "kubernetes".to_string(),
             sandbox_id,
+            resources: self.sandbox_resources(sandbox_id, RuntimeResourceStatus::Planned),
             metadata: self.metadata(sandbox_id, "provision"),
         })
     }
@@ -794,6 +956,11 @@ impl SandboxProvider for KubernetesDryRunProvider {
         Ok(ProviderSnapshotHandle {
             provider: "kubernetes".to_string(),
             snapshot_id,
+            resources: self.snapshot_resources(
+                sandbox_id,
+                snapshot_id,
+                RuntimeResourceStatus::Planned,
+            ),
             metadata: json!({
                 "provider": "kubernetes",
                 "mode": "dry_run",
@@ -823,6 +990,11 @@ impl SandboxProvider for KubernetesDryRunProvider {
             parent_sandbox_id,
             child_sandbox_id,
             snapshot_id,
+            resources: self.fork_resources(
+                child_sandbox_id,
+                snapshot_id,
+                RuntimeResourceStatus::Planned,
+            ),
             metadata: json!({
                 "provider": "kubernetes",
                 "mode": "dry_run",
@@ -909,6 +1081,11 @@ impl SandboxProvider for KubernetesApplyProvider {
         }
 
         let mut handle = self.dry_run.provision(sandbox_id)?;
+        mark_resources(
+            &mut handle.resources,
+            RuntimeResourceStatus::Ready,
+            Some(Utc::now()),
+        );
         if let Some(metadata) = handle.metadata.as_object_mut() {
             metadata.insert("mode".to_string(), json!("apply"));
             metadata.insert("applyStatus".to_string(), json!(apply.status));
@@ -964,6 +1141,11 @@ impl SandboxProvider for KubernetesApplyProvider {
             );
         }
         let mut handle = self.dry_run.create_snapshot(sandbox_id, snapshot_id)?;
+        mark_resources(
+            &mut handle.resources,
+            RuntimeResourceStatus::Applied,
+            Some(Utc::now()),
+        );
         if let Some(metadata) = handle.metadata.as_object_mut() {
             metadata.insert("mode".to_string(), json!("apply"));
             metadata.insert("applyStatus".to_string(), json!(apply.status));
@@ -1010,6 +1192,11 @@ impl SandboxProvider for KubernetesApplyProvider {
         let mut handle = self
             .dry_run
             .fork(parent_sandbox_id, child_sandbox_id, snapshot_id)?;
+        mark_resources(
+            &mut handle.resources,
+            RuntimeResourceStatus::Ready,
+            Some(Utc::now()),
+        );
         if let Some(metadata) = handle.metadata.as_object_mut() {
             metadata.insert("mode".to_string(), json!("apply"));
             metadata.insert("applyStatus".to_string(), json!(apply.status));

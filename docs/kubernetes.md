@@ -7,7 +7,8 @@
 - Run `sandboxwich-api` as a Deployment.
 - Store state in Postgres through `SANDBOXWICH_DATABASE_URL`.
 - Expose the API with a ClusterIP Service.
-- Register workers with provider metadata such as `provider=kubernetes` and capabilities such as `k8s_pod` and `run_command`.
+- Register workers with typed provider labels such as `provider=kubernetes` and capabilities such as `k8s_pod` and `run_command`.
+- Persist provider-created Pods, PVCs, Services, and VolumeSnapshots in the `runtime_resources` table for controller cleanup and capacity accounting.
 
 The worker binary can register and heartbeat today:
 
@@ -60,7 +61,13 @@ SANDBOXWICH_K8S_ENABLE_MUTATION=1 sandboxwich-worker --api http://sandboxwich-ap
   --label cluster=k3s-dev
 ```
 
-Apply mode uses the pod ServiceAccount and `kubectl` to create the sandbox PVC, Pod, and Services in the worker namespace, waits for the sandbox Pod to become Ready, and executes command jobs with `kubectl exec` against the sandbox container. The double opt-in (`--confirm-apply` plus `SANDBOXWICH_K8S_ENABLE_MUTATION=1`) is intentional so a worker cannot mutate Kubernetes resources by accident.
+Apply mode uses the pod ServiceAccount and `kubectl` to create the sandbox PVC, Pod, and Services in the worker namespace, waits for the sandbox Pod to become Ready, records the runtime resources through the API, and executes command jobs with `kubectl exec` against the sandbox container. The double opt-in (`--confirm-apply` plus `SANDBOXWICH_K8S_ENABLE_MUTATION=1`) is intentional so a worker cannot mutate Kubernetes resources by accident.
+
+Inspect the persisted runtime view with:
+
+```sh
+sandboxwich-cli --api http://sandboxwich-api:3217 resources <sandbox-id>
+```
 
 ## Provider Adapter Dry Run
 
@@ -82,7 +89,7 @@ sandboxwich-worker provider-smoke \
   --ssh-authorized-keys-secret sandboxwich-authorized-keys
 ```
 
-Use the dry-run output to validate control-plane wiring before granting a worker ServiceAccount any Kubernetes permissions. The smoke output includes Pod, PVC, Service, and VolumeSnapshot-shaped manifests under provider metadata, but the worker does not apply them.
+Use the dry-run output to validate control-plane wiring before granting a worker ServiceAccount any Kubernetes permissions. The smoke output includes Pod, PVC, Service, and VolumeSnapshot-shaped manifests as diagnostics, while lease completion sends typed runtime-resource records to the API.
 
 ## Guest Runtime Image
 
