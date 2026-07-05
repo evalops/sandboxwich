@@ -13,7 +13,8 @@ use sandboxwich_core::{
     DesktopSessionResponse, DesktopSessionStatus, EventListResponse, FailLeaseRequest,
     GuestHealthResponse, GuestStatus, HealthResponse, Job, JobKind, JobListResponse, JobResponse,
     JobStatus, LeaseResponse, PromptQueuedResponse, PromptRequest, ProviderForkHandle,
-    ProviderRuntimeResource, ProviderSandboxHandle, RegisterWorkerRequest, RequestSshKeyRequest,
+    ProviderRuntimeResource, ProviderSandboxHandle, ReconcileRuntimeResourcesRequest,
+    ReconcileRuntimeResourcesResponse, RegisterWorkerRequest, RequestSshKeyRequest,
     RuntimeResourceKind, RuntimeResourceListResponse, RuntimeResourcePurpose,
     RuntimeResourceStatus, SandboxEventKind, SandboxListResponse, SandboxResponse, SandboxState,
     SnapshotCleanupResponse, SnapshotId, SnapshotListResponse, SnapshotResponse, SnapshotStatus,
@@ -155,6 +156,10 @@ async fn run_contract(server: TestServer) {
             .any(|seen| seen.id == worker.worker.id)
     );
     assert_provision_job_persists_runtime_resources(&client, &server, &created, &worker).await;
+    assert_runtime_resource_reconcile_marks_missing_resources_deleted(
+        &client, &server, &created, &worker,
+    )
+    .await;
     assert_failed_completion_rolls_back_lease_state(&client, &server, &created, &worker).await;
 
     let listed: SandboxListResponse = client
@@ -696,6 +701,126 @@ async fn assert_failed_completion_rolls_back_lease_state(
         .await
         .unwrap();
     assert_eq!(failed.lease.job.status, JobStatus::Failed);
+}
+
+async fn assert_runtime_resource_reconcile_marks_missing_resources_deleted(
+    client: &reqwest::Client,
+    server: &TestServer,
+    sandbox: &SandboxResponse,
+    worker: &WorkerResponse,
+) {
+    let mut observed = provision_resources(sandbox.sandbox.id);
+    observed.retain(|resource| {
+        resource.resource_kind != RuntimeResourceKind::Service
+            || resource.purpose == RuntimeResourcePurpose::Ssh
+    });
+    let reconciled: ReconcileRuntimeResourcesResponse = client
+        .post(format!(
+            "{}/workers/{}/runtime-resources/reconcile",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ReconcileRuntimeResourcesRequest {
+            provider: "kubernetes".to_string(),
+            namespace: "sandboxwich-contract".to_string(),
+            cluster: Some("k3s-dev".to_string()),
+            resources: observed,
+            mark_missing_deleted: true,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert!(reconciled.ok);
+    assert_eq!(reconciled.upserted.len(), 3);
+    assert!(reconciled.upserted.iter().all(|resource| {
+        resource.observed_at.is_some() && resource.last_reconciled_at.is_some()
+    }));
+    assert!(reconciled.deleted.iter().any(|resource| {
+        resource.resource_kind == RuntimeResourceKind::Service
+            && resource.purpose == RuntimeResourcePurpose::Desktop
+            && resource.status == RuntimeResourceStatus::Deleted
+            && resource.deleted_at.is_some()
+    }));
+
+    let resources: RuntimeResourceListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/runtime-resources",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(resources.resources.iter().any(|resource| {
+        resource.resource_kind == RuntimeResourceKind::Service
+            && resource.purpose == RuntimeResourcePurpose::Desktop
+            && resource.status == RuntimeResourceStatus::Deleted
+    }));
+
+    let mut edge_observed = provision_resources(sandbox.sandbox.id);
+    for resource in &mut edge_observed {
+        resource.cluster = Some("k3s-edge".to_string());
+    }
+    let edge_reconciled: ReconcileRuntimeResourcesResponse = client
+        .post(format!(
+            "{}/workers/{}/runtime-resources/reconcile",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ReconcileRuntimeResourcesRequest {
+            provider: "kubernetes".to_string(),
+            namespace: "sandboxwich-contract".to_string(),
+            cluster: Some("k3s-edge".to_string()),
+            resources: edge_observed,
+            mark_missing_deleted: false,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(edge_reconciled.upserted.len(), 4);
+    assert!(
+        edge_reconciled
+            .upserted
+            .iter()
+            .all(|resource| resource.cluster.as_deref() == Some("k3s-edge"))
+    );
+
+    let resources: RuntimeResourceListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/runtime-resources",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(resources.resources.iter().any(|resource| {
+        resource.resource_kind == RuntimeResourceKind::Pod
+            && resource.cluster.as_deref() == Some("k3s-dev")
+            && resource.status == RuntimeResourceStatus::Ready
+    }));
+    assert!(resources.resources.iter().any(|resource| {
+        resource.resource_kind == RuntimeResourceKind::Pod
+            && resource.cluster.as_deref() == Some("k3s-edge")
+            && resource.status == RuntimeResourceStatus::Ready
+    }));
 }
 
 async fn assert_retryable_failure_requeues_command(

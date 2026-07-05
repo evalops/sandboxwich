@@ -336,6 +336,8 @@ pub struct RuntimeResource {
     pub source_snapshot_id: Option<SnapshotId>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub observed_at: Option<DateTime<Utc>>,
+    pub last_reconciled_at: Option<DateTime<Utc>>,
     pub ready_at: Option<DateTime<Utc>>,
     pub deleted_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
@@ -376,6 +378,25 @@ pub struct SandboxListResponse {
 pub struct RuntimeResourceListResponse {
     pub ok: bool,
     pub resources: Vec<RuntimeResource>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReconcileRuntimeResourcesRequest {
+    pub provider: String,
+    pub namespace: String,
+    pub cluster: Option<String>,
+    #[serde(default)]
+    pub resources: Vec<ProviderRuntimeResource>,
+    #[serde(default)]
+    pub mark_missing_deleted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReconcileRuntimeResourcesResponse {
+    pub ok: bool,
+    pub observed_at: DateTime<Utc>,
+    pub upserted: Vec<RuntimeResource>,
+    pub deleted: Vec<RuntimeResource>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
