@@ -354,30 +354,36 @@ impl DbEnumColumn {
 
 async fn ensure_postgres_constraints(db: &Database) -> anyhow::Result<()> {
     for &column in db_enum_columns() {
-        let statement = postgres_enum_constraint_statement(column);
-        sqlx::query(&statement).execute(&db.pool).await?;
+        for statement in postgres_enum_constraint_statements(column) {
+            sqlx::query(&statement).execute(&db.pool).await?;
+        }
     }
 
-    let cluster_statement = r#"
-        alter table runtime_resources drop constraint if exists runtime_resources_cluster_not_empty_check;
-        alter table runtime_resources add constraint runtime_resources_cluster_not_empty_check
-            check (cluster is null or cluster <> '');
-    "#;
-    sqlx::query(cluster_statement).execute(&db.pool).await?;
+    for statement in [
+        "alter table runtime_resources drop constraint if exists runtime_resources_cluster_not_empty_check",
+        "alter table runtime_resources add constraint runtime_resources_cluster_not_empty_check check (cluster is null or cluster <> '')",
+    ] {
+        sqlx::query(statement).execute(&db.pool).await?;
+    }
 
     Ok(())
 }
 
-fn postgres_enum_constraint_statement(column: DbEnumColumn) -> String {
-    format!(
-        "alter table {table} drop constraint if exists {constraint_name};
-         alter table {table} add constraint {constraint_name}
-             check ({column_name} in ({values}));",
-        table = column.table,
-        constraint_name = column.constraint_name,
-        column_name = column.column,
-        values = sql_literal_list(column.values)
-    )
+fn postgres_enum_constraint_statements(column: DbEnumColumn) -> [String; 2] {
+    [
+        format!(
+            "alter table {table} drop constraint if exists {constraint_name}",
+            table = column.table,
+            constraint_name = column.constraint_name
+        ),
+        format!(
+            "alter table {table} add constraint {constraint_name} check ({column_name} in ({values}))",
+            table = column.table,
+            constraint_name = column.constraint_name,
+            column_name = column.column,
+            values = sql_literal_list(column.values)
+        ),
+    ]
 }
 
 async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
@@ -525,7 +531,7 @@ mod tests {
             "invalid widget's state",
         );
 
-        let postgres = postgres_enum_constraint_statement(column);
+        let postgres = postgres_enum_constraint_statements(column).join("\n");
         assert!(postgres.contains("'ready', 'it''''s-weird'"));
 
         let sqlite = sqlite_enum_trigger_statements(column).join("\n");
