@@ -763,11 +763,16 @@ pub struct Worker {
     pub status: WorkerStatus,
     pub provider: String,
     pub capabilities: Vec<WorkerCapability>,
+    #[serde(default = "default_max_concurrent_jobs")]
     pub max_concurrent_jobs: u32,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
     pub registered_at: DateTime<Utc>,
     pub last_heartbeat_at: Option<DateTime<Utc>>,
+}
+
+fn default_max_concurrent_jobs() -> u32 {
+    1
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1140,9 +1145,14 @@ pub struct HealthComponent {
 pub struct HealthResponse {
     pub ok: bool,
     pub service: String,
+    #[serde(default = "default_checked_at")]
     pub checked_at: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database: Option<HealthComponent>,
+}
+
+fn default_checked_at() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(0, 0).expect("unix epoch is valid")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

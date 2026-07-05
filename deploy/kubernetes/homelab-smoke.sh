@@ -55,7 +55,8 @@ curl -fsS "${API_URL}/readyz"
 printf '\n'
 
 log "Metrics sample:"
-curl_api "${API_URL}/metrics" | sed -n '1,24p'
+metrics_output="$(curl_api "${API_URL}/metrics")"
+printf '%s\n' "${metrics_output}" | sed -n '1,24p'
 
 log "Tenant-scoped sandbox list:"
 curl_api "${API_URL}/sandboxes"
