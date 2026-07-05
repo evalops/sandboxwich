@@ -10,14 +10,15 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use sandboxwich_core::{
-    ClaimLeaseRequest, ClaimLeaseResponse, CommandId, CommandListResponse, CommandRequest,
-    CommandResponse, CommandRun, CommandStatus, CompleteLeaseRequest, CreateDesktopSessionRequest,
-    CreateJobRequest, CreateSandboxRequest, CreateSnapshotRequest, DesktopAccess,
-    DesktopAccessMode, DesktopAccessRequest, DesktopAccessResponse, DesktopSession,
-    DesktopSessionId, DesktopSessionListResponse, DesktopSessionResponse, DesktopSessionStatus,
-    ErrorEnvelope, EventId, EventListResponse, FailLeaseRequest, GuestHealth, GuestHealthResponse,
-    GuestStatus, HealthResponse, Job, JobId, JobKind, JobLease, JobListResponse, JobResponse,
-    JobStatus, LeaseId, LeaseResponse, LeaseStatus, PromptQueuedResponse, PromptRequest,
+    ArchivedSandboxCleanupSkip, ClaimLeaseRequest, ClaimLeaseResponse, CleanupRun, CleanupRunId,
+    CleanupRunStatus, CommandId, CommandListResponse, CommandRequest, CommandResponse, CommandRun,
+    CommandStatus, CompleteLeaseRequest, CreateDesktopSessionRequest, CreateJobRequest,
+    CreateSandboxRequest, CreateSnapshotRequest, DesktopAccess, DesktopAccessMode,
+    DesktopAccessRequest, DesktopAccessResponse, DesktopSession, DesktopSessionId,
+    DesktopSessionListResponse, DesktopSessionResponse, DesktopSessionStatus, ErrorEnvelope,
+    EventId, EventListResponse, FailLeaseRequest, GuestHealth, GuestHealthResponse, GuestStatus,
+    HealthResponse, Job, JobId, JobKind, JobLease, JobListResponse, JobResponse, JobStatus,
+    LeaseId, LeaseResponse, LeaseStatus, PromptQueuedResponse, PromptRequest,
     ProviderRuntimeResource, ReconcileRuntimeResourcesRequest, ReconcileRuntimeResourcesResponse,
     RegisterWorkerRequest, RenewLeaseRequest, RequestSshKeyRequest, RuntimeResource,
     RuntimeResourceId, RuntimeResourceKind, RuntimeResourceListResponse, RuntimeResourcePurpose,
@@ -929,12 +930,15 @@ async fn get_snapshot(
 async fn cleanup_snapshots(
     State(state): State<AppState>,
 ) -> Result<Json<SnapshotCleanupResponse>, ApiError> {
-    let expired = expire_due_snapshots(&state.db).await?;
-    let archived_sandboxes_deleted = cleanup_archived_sandboxes(&state.db).await?;
+    let cleanup = run_cleanup_controller(&state.db).await?;
     Ok(Json(SnapshotCleanupResponse {
         ok: true,
-        expired,
-        archived_sandboxes_deleted,
+        cleanup_run: cleanup.cleanup_run,
+        expired: cleanup.expired,
+        archived_sandboxes_deleted: cleanup.archived_sandboxes_deleted,
+        archived_sandboxes: cleanup.archived_sandboxes,
+        archived_sandboxes_skipped: cleanup.archived_sandboxes_skipped,
+        runtime_resources_deleted: cleanup.runtime_resources_deleted,
     }))
 }
 
@@ -2331,6 +2335,71 @@ async fn mark_runtime_resource_deleted_on_connection(
     fetch_runtime_resource_on_connection(db, connection, resource_id).await
 }
 
+async fn mark_runtime_resource_deleted(
+    db: &Database,
+    resource_id: RuntimeResourceId,
+    deleted_at: DateTime<Utc>,
+    error: &str,
+) -> Result<RuntimeResource, ApiError> {
+    let sql = format!(
+        "update runtime_resources
+         set status = {}, updated_at = {}, last_reconciled_at = {}, deleted_at = {}, error = {}
+         where id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4),
+        db.placeholder(5),
+        db.placeholder(6)
+    );
+    let result = sqlx::query(&sql)
+        .bind(runtime_resource_status_to_str(
+            &RuntimeResourceStatus::Deleted,
+        ))
+        .bind(deleted_at.to_rfc3339())
+        .bind(deleted_at.to_rfc3339())
+        .bind(deleted_at.to_rfc3339())
+        .bind(error)
+        .bind(resource_id.to_string())
+        .execute(&db.pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("runtime resource not found"));
+    }
+
+    fetch_runtime_resource(db, resource_id).await
+}
+
+async fn mark_runtime_resources_deleted_for_sandbox(
+    db: &Database,
+    sandbox_id: SandboxId,
+    deleted_at: DateTime<Utc>,
+    error: &str,
+) -> Result<Vec<RuntimeResource>, ApiError> {
+    let sql = format!(
+        "select id, sandbox_id, snapshot_id, provider, resource_kind, purpose, resource_name,
+                namespace, status, cluster, storage_class, snapshot_class, storage_size,
+                runtime_image, service_port, target_port, source_snapshot_id, created_at,
+                updated_at, observed_at, last_reconciled_at, ready_at, deleted_at, error
+         from runtime_resources
+         where sandbox_id = {} and status != 'deleted'
+         order by updated_at asc, id asc",
+        db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .fetch_all(&db.pool)
+        .await?;
+
+    let mut deleted = Vec::new();
+    for row in rows {
+        let resource = row_to_runtime_resource(row)?;
+        deleted.push(mark_runtime_resource_deleted(db, resource.id, deleted_at, error).await?);
+    }
+
+    Ok(deleted)
+}
+
 fn deleted_at_for_runtime_resource(
     status: &RuntimeResourceStatus,
     now: DateTime<Utc>,
@@ -2340,6 +2409,28 @@ fn deleted_at_for_runtime_resource(
     } else {
         None
     }
+}
+
+async fn fetch_runtime_resource(
+    db: &Database,
+    resource_id: RuntimeResourceId,
+) -> Result<RuntimeResource, ApiError> {
+    let sql = format!(
+        "select id, sandbox_id, snapshot_id, provider, resource_kind, purpose, resource_name,
+                namespace, status, cluster, storage_class, snapshot_class, storage_size,
+                runtime_image, service_port, target_port, source_snapshot_id, created_at,
+                updated_at, observed_at, last_reconciled_at, ready_at, deleted_at, error
+         from runtime_resources
+         where id = {}",
+        db.placeholder(1)
+    );
+    let row = sqlx::query(&sql)
+        .bind(resource_id.to_string())
+        .fetch_optional(&db.pool)
+        .await?
+        .ok_or_else(|| ApiError::not_found("runtime resource not found"))?;
+
+    row_to_runtime_resource(row)
 }
 
 async fn fetch_command(db: &Database, command_id: CommandId) -> Result<CommandRun, ApiError> {
@@ -2579,6 +2670,66 @@ async fn insert_snapshot(db: &Database, snapshot: &Snapshot) -> Result<(), ApiEr
     Ok(())
 }
 
+async fn insert_cleanup_run(db: &Database, cleanup_run: &CleanupRun) -> Result<(), ApiError> {
+    let sql = format!(
+        "insert into cleanup_runs
+         (id, status, started_at, finished_at, expired_snapshots, archived_sandboxes_deleted,
+          archived_sandboxes_skipped, runtime_resources_deleted, error)
+         values ({})",
+        db.placeholders(9)
+    );
+    sqlx::query(&sql)
+        .bind(cleanup_run.id.to_string())
+        .bind(cleanup_run_status_to_str(&cleanup_run.status))
+        .bind(cleanup_run.started_at.to_rfc3339())
+        .bind(cleanup_run.finished_at.map(|time| time.to_rfc3339()))
+        .bind(count_to_i64(cleanup_run.expired_snapshots)?)
+        .bind(count_to_i64(cleanup_run.archived_sandboxes_deleted)?)
+        .bind(count_to_i64(cleanup_run.archived_sandboxes_skipped)?)
+        .bind(count_to_i64(cleanup_run.runtime_resources_deleted)?)
+        .bind(&cleanup_run.error)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+async fn update_cleanup_run(db: &Database, cleanup_run: &CleanupRun) -> Result<(), ApiError> {
+    let sql = format!(
+        "update cleanup_runs
+         set status = {}, finished_at = {}, expired_snapshots = {},
+             archived_sandboxes_deleted = {}, archived_sandboxes_skipped = {},
+             runtime_resources_deleted = {}, error = {}
+         where id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4),
+        db.placeholder(5),
+        db.placeholder(6),
+        db.placeholder(7),
+        db.placeholder(8)
+    );
+    let result = sqlx::query(&sql)
+        .bind(cleanup_run_status_to_str(&cleanup_run.status))
+        .bind(cleanup_run.finished_at.map(|time| time.to_rfc3339()))
+        .bind(count_to_i64(cleanup_run.expired_snapshots)?)
+        .bind(count_to_i64(cleanup_run.archived_sandboxes_deleted)?)
+        .bind(count_to_i64(cleanup_run.archived_sandboxes_skipped)?)
+        .bind(count_to_i64(cleanup_run.runtime_resources_deleted)?)
+        .bind(&cleanup_run.error)
+        .bind(cleanup_run.id.to_string())
+        .execute(&db.pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("cleanup run not found"));
+    }
+    Ok(())
+}
+
+fn count_to_i64(count: u64) -> Result<i64, ApiError> {
+    i64::try_from(count).map_err(|_| ApiError::internal("cleanup count is too large"))
+}
+
 async fn fetch_snapshot(db: &Database, snapshot_id: SnapshotId) -> Result<Snapshot, ApiError> {
     let sql = format!(
         "select id, sandbox_id, status, label, inventory, provider_metadata, created_at, ready_at, expires_at, error
@@ -2634,6 +2785,84 @@ async fn list_snapshots_for_sandbox(
     rows.into_iter().map(row_to_snapshot).collect()
 }
 
+struct CleanupControllerReport {
+    cleanup_run: CleanupRun,
+    expired: Vec<Snapshot>,
+    archived_sandboxes_deleted: u64,
+    archived_sandboxes: Vec<Sandbox>,
+    archived_sandboxes_skipped: Vec<ArchivedSandboxCleanupSkip>,
+    runtime_resources_deleted: Vec<RuntimeResource>,
+}
+
+struct ArchivedSandboxCleanupResult {
+    deleted: Vec<Sandbox>,
+    skipped: Vec<ArchivedSandboxCleanupSkip>,
+    runtime_resources_deleted: Vec<RuntimeResource>,
+}
+
+async fn run_cleanup_controller(db: &Database) -> Result<CleanupControllerReport, ApiError> {
+    let started_at = Utc::now();
+    let cleanup_run = CleanupRun {
+        id: CleanupRunId::new(),
+        status: CleanupRunStatus::Running,
+        started_at,
+        finished_at: None,
+        expired_snapshots: 0,
+        archived_sandboxes_deleted: 0,
+        archived_sandboxes_skipped: 0,
+        runtime_resources_deleted: 0,
+        error: None,
+    };
+    insert_cleanup_run(db, &cleanup_run).await?;
+
+    let started_run = cleanup_run.clone();
+    let result: Result<CleanupControllerReport, ApiError> = async {
+        let expired = expire_due_snapshots(db).await?;
+        let mut runtime_resources_deleted =
+            cleanup_runtime_resources_for_expired_snapshots(db).await?;
+        let archived = cleanup_archived_sandboxes(db).await?;
+        runtime_resources_deleted.extend(archived.runtime_resources_deleted);
+
+        let archived_sandboxes_deleted = archived.deleted.len() as u64;
+        let cleanup_run = CleanupRun {
+            status: CleanupRunStatus::Succeeded,
+            finished_at: Some(Utc::now()),
+            expired_snapshots: expired.len() as u64,
+            archived_sandboxes_deleted,
+            archived_sandboxes_skipped: archived.skipped.len() as u64,
+            runtime_resources_deleted: runtime_resources_deleted.len() as u64,
+            ..started_run.clone()
+        };
+        update_cleanup_run(db, &cleanup_run).await?;
+
+        Ok(CleanupControllerReport {
+            cleanup_run,
+            expired,
+            archived_sandboxes_deleted,
+            archived_sandboxes: archived.deleted,
+            archived_sandboxes_skipped: archived.skipped,
+            runtime_resources_deleted,
+        })
+    }
+    .await;
+
+    match result {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            let failed = CleanupRun {
+                status: CleanupRunStatus::Failed,
+                finished_at: Some(Utc::now()),
+                error: Some(format!("{error:?}")),
+                ..cleanup_run
+            };
+            if let Err(update_error) = update_cleanup_run(db, &failed).await {
+                tracing::warn!(?update_error, "failed to mark cleanup run failed");
+            }
+            Err(error)
+        }
+    }
+}
+
 async fn expire_due_snapshots(db: &Database) -> Result<Vec<Snapshot>, ApiError> {
     let now = Utc::now();
     let rows = sqlx::query(
@@ -2655,7 +2884,19 @@ async fn expire_due_snapshots(db: &Database) -> Result<Vec<Snapshot>, ApiError> 
             continue;
         }
         update_snapshot_status(db, snapshot.id, SnapshotStatus::Expired, None).await?;
-        expired.push(fetch_snapshot(db, snapshot.id).await?);
+        let expired_snapshot = fetch_snapshot(db, snapshot.id).await?;
+        insert_event(
+            db,
+            expired_snapshot.sandbox_id,
+            SandboxEventKind::LifecycleChanged,
+            json!({
+                "reason": "snapshot_expired",
+                "snapshotId": expired_snapshot.id,
+                "snapshotStatus": expired_snapshot.status
+            }),
+        )
+        .await?;
+        expired.push(expired_snapshot);
     }
 
     Ok(expired)
@@ -2687,7 +2928,46 @@ async fn update_snapshot_status(
     Ok(())
 }
 
-async fn cleanup_archived_sandboxes(db: &Database) -> Result<u64, ApiError> {
+async fn cleanup_runtime_resources_for_expired_snapshots(
+    db: &Database,
+) -> Result<Vec<RuntimeResource>, ApiError> {
+    let rows = sqlx::query(
+        "select runtime_resources.id, runtime_resources.sandbox_id, runtime_resources.snapshot_id,
+                runtime_resources.provider, runtime_resources.resource_kind, runtime_resources.purpose,
+                runtime_resources.resource_name, runtime_resources.namespace, runtime_resources.status,
+                runtime_resources.cluster, runtime_resources.storage_class, runtime_resources.snapshot_class,
+                runtime_resources.storage_size, runtime_resources.runtime_image, runtime_resources.service_port,
+                runtime_resources.target_port, runtime_resources.source_snapshot_id, runtime_resources.created_at,
+                runtime_resources.updated_at, runtime_resources.observed_at, runtime_resources.last_reconciled_at,
+                runtime_resources.ready_at, runtime_resources.deleted_at, runtime_resources.error
+         from runtime_resources
+         join snapshots on snapshots.id = runtime_resources.snapshot_id
+         where snapshots.status = 'expired' and runtime_resources.status != 'deleted'
+         order by runtime_resources.updated_at asc, runtime_resources.id asc",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+
+    let mut deleted = Vec::new();
+    for row in rows {
+        let resource = row_to_runtime_resource(row)?;
+        deleted.push(
+            mark_runtime_resource_deleted(
+                db,
+                resource.id,
+                Utc::now(),
+                "snapshot expired during cleanup",
+            )
+            .await?,
+        );
+    }
+
+    Ok(deleted)
+}
+
+async fn cleanup_archived_sandboxes(
+    db: &Database,
+) -> Result<ArchivedSandboxCleanupResult, ApiError> {
     let rows = sqlx::query(
         "select id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
@@ -2698,7 +2978,9 @@ async fn cleanup_archived_sandboxes(db: &Database) -> Result<u64, ApiError> {
     .await?;
 
     let now = Utc::now();
-    let mut deleted = 0;
+    let mut deleted = Vec::new();
+    let mut skipped = Vec::new();
+    let mut runtime_resources_deleted = Vec::new();
     for row in rows {
         let sandbox = row_to_sandbox(row)?;
         let Some(ttl_seconds) = sandbox.ttl_seconds else {
@@ -2709,8 +2991,21 @@ async fn cleanup_archived_sandboxes(db: &Database) -> Result<u64, ApiError> {
             continue;
         }
         if sandbox_snapshot_is_referenced(db, sandbox.id).await? {
+            skipped.push(ArchivedSandboxCleanupSkip {
+                sandbox,
+                reason: "sandbox has snapshots referenced by child sandboxes".to_string(),
+            });
             continue;
         }
+        runtime_resources_deleted.extend(
+            mark_runtime_resources_deleted_for_sandbox(
+                db,
+                sandbox.id,
+                now,
+                "archived sandbox deleted during cleanup",
+            )
+            .await?,
+        );
         let sql = format!(
             "delete from sandboxes where id = {} and state = 'archived'",
             db.placeholder(1)
@@ -2719,10 +3014,16 @@ async fn cleanup_archived_sandboxes(db: &Database) -> Result<u64, ApiError> {
             .bind(sandbox.id.to_string())
             .execute(&db.pool)
             .await?;
-        deleted += result.rows_affected();
+        if result.rows_affected() > 0 {
+            deleted.push(sandbox);
+        }
     }
 
-    Ok(deleted)
+    Ok(ArchivedSandboxCleanupResult {
+        deleted,
+        skipped,
+        runtime_resources_deleted,
+    })
 }
 
 async fn sandbox_snapshot_is_referenced(
@@ -4490,6 +4791,14 @@ fn runtime_resource_status_to_str(status: &RuntimeResourceStatus) -> &'static st
         RuntimeResourceStatus::Ready => "ready",
         RuntimeResourceStatus::Failed => "failed",
         RuntimeResourceStatus::Deleted => "deleted",
+    }
+}
+
+fn cleanup_run_status_to_str(status: &CleanupRunStatus) -> &'static str {
+    match status {
+        CleanupRunStatus::Running => "running",
+        CleanupRunStatus::Succeeded => "succeeded",
+        CleanupRunStatus::Failed => "failed",
     }
 }
 
