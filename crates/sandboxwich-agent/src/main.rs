@@ -224,7 +224,12 @@ async fn heartbeat_loop(
 ) -> anyhow::Result<()> {
     loop {
         tokio::time::sleep(heartbeat_interval).await;
-        post_guest_health(&client, &api, sandbox_id, GuestStatus::Ready, None).await?;
+        if let Err(error) =
+            post_guest_health(&client, &api, sandbox_id, GuestStatus::Ready, None).await
+        {
+            let warning = format!("sandboxwich-agent: heartbeat post failed: {error}\n");
+            let _ = tokio::io::stderr().write_all(warning.as_bytes()).await;
+        }
     }
 }
 
