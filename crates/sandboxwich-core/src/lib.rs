@@ -1,8 +1,44 @@
 use std::{collections::BTreeMap, fmt};
 
 use chrono::{DateTime, Utc};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, InvalidHeaderValue};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use uuid::Uuid;
+
+#[derive(Debug, Error)]
+pub enum ApiClientBuildError {
+    #[error("invalid SANDBOXWICH_API_TOKEN")]
+    InvalidApiToken(#[source] InvalidHeaderValue),
+    #[error("invalid SANDBOXWICH_TENANT")]
+    InvalidTenant(#[source] InvalidHeaderValue),
+    #[error("failed to build HTTP client")]
+    Build(#[source] reqwest::Error),
+}
+
+pub fn build_api_client(
+    api_token: Option<&str>,
+    tenant: Option<&str>,
+) -> Result<reqwest::Client, ApiClientBuildError> {
+    let mut headers = HeaderMap::new();
+    if let Some(api_token) = api_token.map(str::trim).filter(|token| !token.is_empty()) {
+        let value = format!("Bearer {api_token}");
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&value).map_err(ApiClientBuildError::InvalidApiToken)?,
+        );
+    }
+    if let Some(tenant) = tenant.map(str::trim).filter(|tenant| !tenant.is_empty()) {
+        headers.insert(
+            HeaderName::from_static("x-sandboxwich-tenant"),
+            HeaderValue::from_str(tenant).map_err(ApiClientBuildError::InvalidTenant)?,
+        );
+    }
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .map_err(ApiClientBuildError::Build)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
