@@ -16,7 +16,7 @@ use sandboxwich_core::{
     CommandOutputChunk, CommandOutputChunkId, CommandOutputChunkResponse,
     CommandOutputListResponse, CommandOutputStream, CommandRequest, CommandResponse, CommandRun,
     CommandStatus, CompleteLeaseRequest, CreateDesktopSessionRequest, CreateJobRequest,
-    CreateSandboxRequest, CreateSnapshotRequest, DesktopAccess, DesktopAccessMode,
+    CreateSandboxRequest, CreateSnapshotRequest, DbVariant, DesktopAccess, DesktopAccessMode,
     DesktopAccessRequest, DesktopAccessResponse, DesktopSession, DesktopSessionId,
     DesktopSessionListResponse, DesktopSessionResponse, DesktopSessionStatus, ErrorEnvelope,
     EventId, EventListResponse, FailLeaseRequest, GuestHealth, GuestHealthResponse, GuestStatus,
@@ -171,210 +171,248 @@ async fn ensure_database_constraints(db: &Database) -> anyhow::Result<()> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct DbEnumColumn {
+    table: &'static str,
+    column: &'static str,
+    constraint_name: &'static str,
+    values: &'static [&'static str],
+    error_message: &'static str,
+}
+
+const DB_ENUM_COLUMNS: &[DbEnumColumn] = &[
+    DbEnumColumn::new(
+        "sandboxes",
+        "state",
+        "sandboxes_state_check",
+        <SandboxState as DbVariant>::VALUES,
+        "invalid sandbox state",
+    ),
+    DbEnumColumn::new(
+        "commands",
+        "status",
+        "commands_status_check",
+        <CommandStatus as DbVariant>::VALUES,
+        "invalid command status",
+    ),
+    DbEnumColumn::new(
+        "command_output_chunks",
+        "stream",
+        "command_output_chunks_stream_check",
+        <CommandOutputStream as DbVariant>::VALUES,
+        "invalid command output stream",
+    ),
+    DbEnumColumn::new(
+        "sandbox_events",
+        "kind",
+        "sandbox_events_kind_check",
+        <SandboxEventKind as DbVariant>::VALUES,
+        "invalid event kind",
+    ),
+    DbEnumColumn::new(
+        "workers",
+        "status",
+        "workers_status_check",
+        <WorkerStatus as DbVariant>::VALUES,
+        "invalid worker status",
+    ),
+    DbEnumColumn::new(
+        "jobs",
+        "kind",
+        "jobs_kind_check",
+        <JobKind as DbVariant>::VALUES,
+        "invalid job kind",
+    ),
+    DbEnumColumn::new(
+        "jobs",
+        "status",
+        "jobs_status_check",
+        <JobStatus as DbVariant>::VALUES,
+        "invalid job status",
+    ),
+    DbEnumColumn::new(
+        "jobs",
+        "required_capability",
+        "jobs_required_capability_check",
+        <WorkerCapability as DbVariant>::VALUES,
+        "invalid job required capability",
+    ),
+    DbEnumColumn::new(
+        "job_leases",
+        "status",
+        "job_leases_status_check",
+        <LeaseStatus as DbVariant>::VALUES,
+        "invalid lease status",
+    ),
+    DbEnumColumn::new(
+        "guest_health",
+        "status",
+        "guest_health_status_check",
+        <GuestStatus as DbVariant>::VALUES,
+        "invalid guest status",
+    ),
+    DbEnumColumn::new(
+        "snapshots",
+        "status",
+        "snapshots_status_check",
+        <SnapshotStatus as DbVariant>::VALUES,
+        "invalid snapshot status",
+    ),
+    DbEnumColumn::new(
+        "desktop_sessions",
+        "status",
+        "desktop_sessions_status_check",
+        <DesktopSessionStatus as DbVariant>::VALUES,
+        "invalid desktop session status",
+    ),
+    DbEnumColumn::new(
+        "desktop_sessions",
+        "access_mode",
+        "desktop_sessions_access_mode_check",
+        <DesktopAccessMode as DbVariant>::VALUES,
+        "invalid desktop access mode",
+    ),
+    DbEnumColumn::new(
+        "ssh_keys",
+        "status",
+        "ssh_keys_status_check",
+        <SshKeyStatus as DbVariant>::VALUES,
+        "invalid ssh key status",
+    ),
+    DbEnumColumn::new(
+        "runtime_resources",
+        "resource_kind",
+        "runtime_resources_kind_check",
+        <RuntimeResourceKind as DbVariant>::VALUES,
+        "invalid runtime resource kind",
+    ),
+    DbEnumColumn::new(
+        "runtime_resources",
+        "purpose",
+        "runtime_resources_purpose_check",
+        <RuntimeResourcePurpose as DbVariant>::VALUES,
+        "invalid runtime resource purpose",
+    ),
+    DbEnumColumn::new(
+        "runtime_resources",
+        "status",
+        "runtime_resources_status_check",
+        <RuntimeResourceStatus as DbVariant>::VALUES,
+        "invalid runtime resource status",
+    ),
+    DbEnumColumn::new(
+        "runtime_resource_tombstones",
+        "resource_kind",
+        "runtime_resource_tombstones_kind_check",
+        <RuntimeResourceKind as DbVariant>::VALUES,
+        "invalid runtime resource tombstone kind",
+    ),
+    DbEnumColumn::new(
+        "runtime_resource_tombstones",
+        "purpose",
+        "runtime_resource_tombstones_purpose_check",
+        <RuntimeResourcePurpose as DbVariant>::VALUES,
+        "invalid runtime resource tombstone purpose",
+    ),
+    DbEnumColumn::new(
+        "runtime_resource_tombstones",
+        "status",
+        "runtime_resource_tombstones_status_check",
+        <RuntimeResourceStatus as DbVariant>::VALUES,
+        "invalid runtime resource tombstone status",
+    ),
+    DbEnumColumn::new(
+        "cleanup_runs",
+        "status",
+        "cleanup_runs_status_check",
+        <CleanupRunStatus as DbVariant>::VALUES,
+        "invalid cleanup run status",
+    ),
+];
+
+fn db_enum_columns() -> &'static [DbEnumColumn] {
+    DB_ENUM_COLUMNS
+}
+
+impl DbEnumColumn {
+    const fn new(
+        table: &'static str,
+        column: &'static str,
+        constraint_name: &'static str,
+        values: &'static [&'static str],
+        error_message: &'static str,
+    ) -> Self {
+        Self {
+            table,
+            column,
+            constraint_name,
+            values,
+            error_message,
+        }
+    }
+}
+
 async fn ensure_postgres_constraints(db: &Database) -> anyhow::Result<()> {
+    for &column in db_enum_columns() {
+        for statement in postgres_enum_constraint_statements(column) {
+            sqlx::query(&statement).execute(&db.pool).await?;
+        }
+    }
+
     for statement in [
+        "alter table runtime_resources drop constraint if exists runtime_resources_cluster_not_empty_check",
+        "alter table runtime_resources add constraint runtime_resources_cluster_not_empty_check check (cluster is null or cluster <> '')",
+    ] {
+        sqlx::query(statement).execute(&db.pool).await?;
+    }
+
+    Ok(())
+}
+
+fn postgres_enum_constraint_statements(column: DbEnumColumn) -> [String; 2] {
+    [
+        format!(
+            "alter table {table} drop constraint if exists {constraint_name}",
+            table = column.table,
+            constraint_name = column.constraint_name
+        ),
+        format!(
+            "alter table {table} add constraint {constraint_name} check ({column_name} in ({values}))",
+            table = column.table,
+            constraint_name = column.constraint_name,
+            column_name = column.column,
+            values = sql_literal_list(column.values)
+        ),
+    ]
+}
+
+async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
+    for &column in db_enum_columns() {
+        for statement in sqlite_enum_trigger_statements(column) {
+            sqlx::query(&statement).execute(&db.pool).await?;
+        }
+    }
+
+    for statement in [
+        "drop trigger if exists validate_runtime_resources_cluster_insert",
+        "drop trigger if exists validate_runtime_resources_cluster_update",
         r#"
-        do $$
+        create trigger validate_runtime_resources_cluster_insert
+        before insert on runtime_resources
+        for each row
+        when new.cluster = ''
         begin
-            alter table sandboxes drop constraint if exists sandboxes_state_check;
-            alter table sandboxes add constraint sandboxes_state_check
-                check (state in ('planning', 'provisioning', 'ready', 'running', 'idle', 'archiving', 'archived', 'error'));
-        end $$;
+            select raise(abort, 'invalid runtime resource cluster');
+        end;
         "#,
         r#"
-        do $$
+        create trigger validate_runtime_resources_cluster_update
+        before update of cluster on runtime_resources
+        for each row
+        when new.cluster = ''
         begin
-            if not exists (
-                select 1 from pg_constraint where conname = 'commands_status_check'
-            ) then
-                alter table commands add constraint commands_status_check
-                    check (status in ('queued', 'running', 'finished', 'failed'));
-            end if;
-        end $$;
-        "#,
-        r#"
-        do $$
-        begin
-            alter table sandbox_events drop constraint if exists sandbox_events_kind_check;
-            alter table sandbox_events add constraint sandbox_events_kind_check
-                check (kind in (
-                    'lifecycle_changed',
-                    'command_queued',
-                    'command_started',
-                    'command_output',
-                    'command_finished',
-                    'prompt_queued',
-                    'prompt_started',
-                    'prompt_finished',
-                    'desktop_requested',
-                    'desktop_ready',
-                    'desktop_failed',
-                    'desktop_closed',
-                    'desktop_expired'
-                ));
-        end $$;
-        "#,
-        r#"
-        do $$
-        begin
-            if not exists (
-                select 1 from pg_constraint where conname = 'workers_status_check'
-            ) then
-                alter table workers add constraint workers_status_check
-                    check (status in ('registered', 'online', 'draining', 'offline'));
-            end if;
-        end $$;
-        "#,
-        r#"
-        do $$
-        begin
-            if not exists (
-                select 1 from pg_constraint where conname = 'jobs_kind_check'
-            ) then
-                alter table jobs add constraint jobs_kind_check
-                    check (kind in (
-                        'provision_sandbox',
-                        'stop_sandbox',
-                        'resume_sandbox',
-                        'run_command',
-                        'run_prompt',
-                        'create_snapshot',
-                        'fork_sandbox'
-                    ));
-            end if;
-        end $$;
-        "#,
-        r#"
-        do $$
-        begin
-            if not exists (
-                select 1 from pg_constraint where conname = 'jobs_status_check'
-            ) then
-                alter table jobs add constraint jobs_status_check
-                    check (status in ('queued', 'leased', 'succeeded', 'failed', 'dead'));
-            end if;
-        end $$;
-        "#,
-        r#"
-        do $$
-        begin
-            if not exists (
-                select 1 from pg_constraint where conname = 'job_leases_status_check'
-            ) then
-                alter table job_leases add constraint job_leases_status_check
-                    check (status in ('active', 'completed', 'failed', 'expired'));
-            end if;
-        end $$;
-        "#,
-        r#"
-        do $$
-        begin
-            if not exists (
-                select 1 from pg_constraint where conname = 'guest_health_status_check'
-            ) then
-                alter table guest_health add constraint guest_health_status_check
-                    check (status in ('pending', 'ready', 'unreachable', 'unhealthy', 'terminated'));
-            end if;
-        end $$;
-        "#,
-        r#"
-        do $$
-        begin
-            if not exists (
-                select 1 from pg_constraint where conname = 'snapshots_status_check'
-            ) then
-                alter table snapshots add constraint snapshots_status_check
-                    check (status in ('pending', 'ready', 'failed', 'expired'));
-            end if;
-        end $$;
-        "#,
-        r#"
-        do $$
-        begin
-            if not exists (
-                select 1 from pg_constraint where conname = 'desktop_sessions_status_check'
-            ) then
-                alter table desktop_sessions add constraint desktop_sessions_status_check
-                    check (status in ('pending', 'ready', 'failed', 'closed', 'expired'));
-            end if;
-        end $$;
-        "#,
-        r#"
-        do $$
-        begin
-            if not exists (
-                select 1 from pg_constraint where conname = 'desktop_sessions_access_mode_check'
-            ) then
-                alter table desktop_sessions add constraint desktop_sessions_access_mode_check
-                    check (access_mode in ('browser', 'vnc', 'rdp'));
-            end if;
-        end $$;
-        "#,
-        r#"
-        do $$
-        begin
-            if not exists (
-                select 1 from pg_constraint where conname = 'ssh_keys_status_check'
-            ) then
-                alter table ssh_keys add constraint ssh_keys_status_check
-                    check (status in ('requested', 'applied', 'failed', 'revoked'));
-            end if;
-        end $$;
-        "#,
-        r#"
-        do $$
-        begin
-            if not exists (
-                select 1 from pg_constraint where conname = 'runtime_resources_kind_check'
-            ) then
-                alter table runtime_resources add constraint runtime_resources_kind_check
-                    check (resource_kind in ('pod', 'persistent_volume_claim', 'service', 'volume_snapshot'));
-            end if;
-        end $$;
-        "#,
-        r#"
-        do $$
-        begin
-            if not exists (
-                select 1 from pg_constraint where conname = 'runtime_resources_purpose_check'
-            ) then
-                alter table runtime_resources add constraint runtime_resources_purpose_check
-                    check (purpose in ('runtime', 'workspace', 'ssh', 'desktop', 'snapshot'));
-            end if;
-        end $$;
-        "#,
-        r#"
-        do $$
-        begin
-            if not exists (
-                select 1 from pg_constraint where conname = 'runtime_resources_status_check'
-            ) then
-                alter table runtime_resources add constraint runtime_resources_status_check
-                    check (status in ('planned', 'applied', 'ready', 'failed', 'deleted'));
-            end if;
-        end $$;
-        "#,
-        r#"
-        do $$
-        begin
-            if not exists (
-                select 1 from pg_constraint where conname = 'runtime_resources_cluster_not_empty_check'
-            ) then
-                alter table runtime_resources add constraint runtime_resources_cluster_not_empty_check
-                    check (cluster is null or cluster <> '');
-            end if;
-        end $$;
-        "#,
-        r#"
-        do $$
-        begin
-            if not exists (
-                select 1 from pg_constraint where conname = 'cleanup_runs_status_check'
-            ) then
-                alter table cleanup_runs add constraint cleanup_runs_status_check
-                    check (status in ('running', 'succeeded', 'failed'));
-            end if;
-        end $$;
+            select raise(abort, 'invalid runtime resource cluster');
+        end;
         "#,
     ] {
         sqlx::query(statement).execute(&db.pool).await?;
@@ -383,359 +421,123 @@ async fn ensure_postgres_constraints(db: &Database) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
-    for statement in [
-        r#"
-        drop trigger if exists validate_sandboxes_state_insert;
-        "#,
-        r#"
-        drop trigger if exists validate_sandboxes_state_update;
-        "#,
-        r#"
-        drop trigger if exists validate_sandbox_events_kind_insert;
-        "#,
-        r#"
-        drop trigger if exists validate_sandbox_events_kind_update;
-        "#,
-        r#"
-        create trigger if not exists validate_sandboxes_state_insert
-        before insert on sandboxes
-        for each row
-        when new.state not in ('planning', 'provisioning', 'ready', 'running', 'idle', 'archiving', 'archived', 'error')
-        begin
-            select raise(abort, 'invalid sandbox state');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_sandboxes_state_update
-        before update of state on sandboxes
-        for each row
-        when new.state not in ('planning', 'provisioning', 'ready', 'running', 'idle', 'archiving', 'archived', 'error')
-        begin
-            select raise(abort, 'invalid sandbox state');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_commands_status_insert
-        before insert on commands
-        for each row
-        when new.status not in ('queued', 'running', 'finished', 'failed')
-        begin
-            select raise(abort, 'invalid command status');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_commands_status_update
-        before update of status on commands
-        for each row
-        when new.status not in ('queued', 'running', 'finished', 'failed')
-        begin
-            select raise(abort, 'invalid command status');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_sandbox_events_kind_insert
-        before insert on sandbox_events
-        for each row
-        when new.kind not in (
-            'lifecycle_changed',
-            'command_queued',
-            'command_started',
-            'command_output',
-            'command_finished',
-            'prompt_queued',
-            'prompt_started',
-            'prompt_finished',
-            'desktop_requested',
-            'desktop_ready',
-            'desktop_failed',
-            'desktop_closed',
-            'desktop_expired'
-        )
-        begin
-            select raise(abort, 'invalid event kind');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_sandbox_events_kind_update
-        before update of kind on sandbox_events
-        for each row
-        when new.kind not in (
-            'lifecycle_changed',
-            'command_queued',
-            'command_started',
-            'command_output',
-            'command_finished',
-            'prompt_queued',
-            'prompt_started',
-            'prompt_finished',
-            'desktop_requested',
-            'desktop_ready',
-            'desktop_failed',
-            'desktop_closed',
-            'desktop_expired'
-        )
-        begin
-            select raise(abort, 'invalid event kind');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_workers_status_insert
-        before insert on workers
-        for each row
-        when new.status not in ('registered', 'online', 'draining', 'offline')
-        begin
-            select raise(abort, 'invalid worker status');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_workers_status_update
-        before update of status on workers
-        for each row
-        when new.status not in ('registered', 'online', 'draining', 'offline')
-        begin
-            select raise(abort, 'invalid worker status');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_jobs_kind_insert
-        before insert on jobs
-        for each row
-        when new.kind not in ('provision_sandbox', 'stop_sandbox', 'resume_sandbox', 'run_command', 'run_prompt', 'create_snapshot', 'fork_sandbox')
-        begin
-            select raise(abort, 'invalid job kind');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_jobs_kind_update
-        before update of kind on jobs
-        for each row
-        when new.kind not in ('provision_sandbox', 'stop_sandbox', 'resume_sandbox', 'run_command', 'run_prompt', 'create_snapshot', 'fork_sandbox')
-        begin
-            select raise(abort, 'invalid job kind');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_jobs_status_insert
-        before insert on jobs
-        for each row
-        when new.status not in ('queued', 'leased', 'succeeded', 'failed', 'dead')
-        begin
-            select raise(abort, 'invalid job status');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_jobs_status_update
-        before update of status on jobs
-        for each row
-        when new.status not in ('queued', 'leased', 'succeeded', 'failed', 'dead')
-        begin
-            select raise(abort, 'invalid job status');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_job_leases_status_insert
-        before insert on job_leases
-        for each row
-        when new.status not in ('active', 'completed', 'failed', 'expired')
-        begin
-            select raise(abort, 'invalid lease status');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_job_leases_status_update
-        before update of status on job_leases
-        for each row
-        when new.status not in ('active', 'completed', 'failed', 'expired')
-        begin
-            select raise(abort, 'invalid lease status');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_guest_health_status_insert
-        before insert on guest_health
-        for each row
-        when new.status not in ('pending', 'ready', 'unreachable', 'unhealthy', 'terminated')
-        begin
-            select raise(abort, 'invalid guest status');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_guest_health_status_update
-        before update of status on guest_health
-        for each row
-        when new.status not in ('pending', 'ready', 'unreachable', 'unhealthy', 'terminated')
-        begin
-            select raise(abort, 'invalid guest status');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_snapshots_status_insert
-        before insert on snapshots
-        for each row
-        when new.status not in ('pending', 'ready', 'failed', 'expired')
-        begin
-            select raise(abort, 'invalid snapshot status');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_snapshots_status_update
-        before update of status on snapshots
-        for each row
-        when new.status not in ('pending', 'ready', 'failed', 'expired')
-        begin
-            select raise(abort, 'invalid snapshot status');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_desktop_sessions_status_insert
-        before insert on desktop_sessions
-        for each row
-        when new.status not in ('pending', 'ready', 'failed', 'closed', 'expired')
-        begin
-            select raise(abort, 'invalid desktop session status');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_desktop_sessions_status_update
-        before update of status on desktop_sessions
-        for each row
-        when new.status not in ('pending', 'ready', 'failed', 'closed', 'expired')
-        begin
-            select raise(abort, 'invalid desktop session status');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_desktop_sessions_access_mode_insert
-        before insert on desktop_sessions
-        for each row
-        when new.access_mode not in ('browser', 'vnc', 'rdp')
-        begin
-            select raise(abort, 'invalid desktop access mode');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_desktop_sessions_access_mode_update
-        before update of access_mode on desktop_sessions
-        for each row
-        when new.access_mode not in ('browser', 'vnc', 'rdp')
-        begin
-            select raise(abort, 'invalid desktop access mode');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_ssh_keys_status_insert
-        before insert on ssh_keys
-        for each row
-        when new.status not in ('requested', 'applied', 'failed', 'revoked')
-        begin
-            select raise(abort, 'invalid ssh key status');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_ssh_keys_status_update
-        before update of status on ssh_keys
-        for each row
-        when new.status not in ('requested', 'applied', 'failed', 'revoked')
-        begin
-            select raise(abort, 'invalid ssh key status');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_runtime_resources_kind_insert
-        before insert on runtime_resources
-        for each row
-        when new.resource_kind not in ('pod', 'persistent_volume_claim', 'service', 'volume_snapshot')
-        begin
-            select raise(abort, 'invalid runtime resource kind');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_runtime_resources_kind_update
-        before update of resource_kind on runtime_resources
-        for each row
-        when new.resource_kind not in ('pod', 'persistent_volume_claim', 'service', 'volume_snapshot')
-        begin
-            select raise(abort, 'invalid runtime resource kind');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_runtime_resources_purpose_insert
-        before insert on runtime_resources
-        for each row
-        when new.purpose not in ('runtime', 'workspace', 'ssh', 'desktop', 'snapshot')
-        begin
-            select raise(abort, 'invalid runtime resource purpose');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_runtime_resources_purpose_update
-        before update of purpose on runtime_resources
-        for each row
-        when new.purpose not in ('runtime', 'workspace', 'ssh', 'desktop', 'snapshot')
-        begin
-            select raise(abort, 'invalid runtime resource purpose');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_runtime_resources_status_insert
-        before insert on runtime_resources
-        for each row
-        when new.status not in ('planned', 'applied', 'ready', 'failed', 'deleted')
-        begin
-            select raise(abort, 'invalid runtime resource status');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_runtime_resources_status_update
-        before update of status on runtime_resources
-        for each row
-        when new.status not in ('planned', 'applied', 'ready', 'failed', 'deleted')
-        begin
-            select raise(abort, 'invalid runtime resource status');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_runtime_resources_cluster_insert
-        before insert on runtime_resources
-        for each row
-        when new.cluster = ''
-        begin
-            select raise(abort, 'invalid runtime resource cluster');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_runtime_resources_cluster_update
-        before update of cluster on runtime_resources
-        for each row
-        when new.cluster = ''
-        begin
-            select raise(abort, 'invalid runtime resource cluster');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_cleanup_runs_status_insert
-        before insert on cleanup_runs
-        for each row
-        when new.status not in ('running', 'succeeded', 'failed')
-        begin
-            select raise(abort, 'invalid cleanup run status');
-        end;
-        "#,
-        r#"
-        create trigger if not exists validate_cleanup_runs_status_update
-        before update of status on cleanup_runs
-        for each row
-        when new.status not in ('running', 'succeeded', 'failed')
-        begin
-            select raise(abort, 'invalid cleanup run status');
-        end;
-        "#,
-    ] {
-        sqlx::query(statement).execute(&db.pool).await?;
+fn sqlite_enum_trigger_statements(column: DbEnumColumn) -> Vec<String> {
+    let insert_trigger = format!("validate_{}_{}_insert", column.table, column.column);
+    let update_trigger = format!("validate_{}_{}_update", column.table, column.column);
+    let values = sql_literal_list(column.values);
+    let error = sql_literal(column.error_message);
+    vec![
+        format!("drop trigger if exists {insert_trigger}"),
+        format!("drop trigger if exists {update_trigger}"),
+        format!(
+            "create trigger {insert_trigger}
+             before insert on {table}
+             for each row
+             when new.{column_name} not in ({values})
+             begin
+                 select raise(abort, {error});
+             end;",
+            table = column.table,
+            column_name = column.column
+        ),
+        format!(
+            "create trigger {update_trigger}
+             before update of {column_name} on {table}
+             for each row
+             when new.{column_name} not in ({values})
+             begin
+                 select raise(abort, {error});
+             end;",
+            table = column.table,
+            column_name = column.column
+        ),
+    ]
+}
+
+fn sql_literal_list(values: &[&str]) -> String {
+    values
+        .iter()
+        .map(|value| sql_literal(value))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn db_enum_registry_covers_persisted_variant_columns() {
+        let mut seen = BTreeSet::new();
+        for column in db_enum_columns() {
+            assert!(
+                seen.insert((column.table, column.column)),
+                "duplicate db enum registry entry for {}.{}",
+                column.table,
+                column.column
+            );
+            assert!(
+                !column.values.is_empty(),
+                "empty db enum values for {}.{}",
+                column.table,
+                column.column
+            );
+        }
+
+        for expected in [
+            ("sandboxes", "state"),
+            ("commands", "status"),
+            ("command_output_chunks", "stream"),
+            ("sandbox_events", "kind"),
+            ("workers", "status"),
+            ("jobs", "kind"),
+            ("jobs", "status"),
+            ("jobs", "required_capability"),
+            ("job_leases", "status"),
+            ("guest_health", "status"),
+            ("snapshots", "status"),
+            ("desktop_sessions", "status"),
+            ("desktop_sessions", "access_mode"),
+            ("ssh_keys", "status"),
+            ("runtime_resources", "resource_kind"),
+            ("runtime_resources", "purpose"),
+            ("runtime_resources", "status"),
+            ("runtime_resource_tombstones", "resource_kind"),
+            ("runtime_resource_tombstones", "purpose"),
+            ("runtime_resource_tombstones", "status"),
+            ("cleanup_runs", "status"),
+        ] {
+            assert!(
+                seen.contains(&expected),
+                "missing db enum registry entry for {}.{}",
+                expected.0,
+                expected.1
+            );
+        }
     }
 
-    Ok(())
+    #[test]
+    fn generated_sql_quotes_enum_values_and_errors() {
+        let column = DbEnumColumn::new(
+            "widgets",
+            "state",
+            "widgets_state_check",
+            &["ready", "it''s-weird"],
+            "invalid widget's state",
+        );
+
+        let postgres = postgres_enum_constraint_statements(column).join("\n");
+        assert!(postgres.contains("'ready', 'it''''s-weird'"));
+
+        let sqlite = sqlite_enum_trigger_statements(column).join("\n");
+        assert!(sqlite.contains("'ready', 'it''''s-weird'"));
+        assert!(sqlite.contains("'invalid widget''s state'"));
+    }
 }
 
 fn app(state: AppState) -> Router {
@@ -3452,10 +3254,7 @@ async fn append_command_output_to_command_on_connection(
     stream: &CommandOutputStream,
     chunk: &str,
 ) -> Result<(), ApiError> {
-    let column = match stream {
-        CommandOutputStream::Stdout => "stdout",
-        CommandOutputStream::Stderr => "stderr",
-    };
+    let column = stream.as_db_str();
     let sql = format!(
         "update commands
          set {column} = {column} || {}
@@ -5257,10 +5056,7 @@ async fn command_output_for_stream_on_connection(
     command_id: CommandId,
     stream: &CommandOutputStream,
 ) -> Result<String, ApiError> {
-    let column = match stream {
-        CommandOutputStream::Stdout => "stdout",
-        CommandOutputStream::Stderr => "stderr",
-    };
+    let column = stream.as_db_str();
     let sql = format!(
         "select {column} as output
          from commands
@@ -5281,10 +5077,7 @@ async fn replace_command_output_stream_on_connection(
     command_id: CommandId,
     stream: &CommandOutputStream,
 ) -> Result<(), ApiError> {
-    let column = match stream {
-        CommandOutputStream::Stdout => "stdout",
-        CommandOutputStream::Stderr => "stderr",
-    };
+    let column = stream.as_db_str();
     let delete_sql = format!(
         "delete from command_output_chunks
          where command_id = {} and stream = {}",
@@ -6411,398 +6204,147 @@ fn parse_timestamp(value: &str) -> Result<DateTime<Utc>, ApiError> {
 }
 
 fn state_to_str(state: &SandboxState) -> &'static str {
-    match state {
-        SandboxState::Planning => "planning",
-        SandboxState::Provisioning => "provisioning",
-        SandboxState::Ready => "ready",
-        SandboxState::Running => "running",
-        SandboxState::Idle => "idle",
-        SandboxState::Archiving => "archiving",
-        SandboxState::Archived => "archived",
-        SandboxState::Error => "error",
-    }
+    state.as_db_str()
 }
 
 fn parse_state(value: &str) -> Result<SandboxState, ApiError> {
-    match value {
-        "planning" => Ok(SandboxState::Planning),
-        "provisioning" => Ok(SandboxState::Provisioning),
-        "ready" => Ok(SandboxState::Ready),
-        "running" => Ok(SandboxState::Running),
-        "idle" => Ok(SandboxState::Idle),
-        "archiving" => Ok(SandboxState::Archiving),
-        "archived" => Ok(SandboxState::Archived),
-        "error" => Ok(SandboxState::Error),
-        _ => Err(ApiError::internal(
-            "database contains invalid sandbox state",
-        )),
-    }
+    parse_db_variant(value, "database contains invalid sandbox state")
 }
 
 fn snapshot_status_to_str(status: &SnapshotStatus) -> &'static str {
-    match status {
-        SnapshotStatus::Pending => "pending",
-        SnapshotStatus::Ready => "ready",
-        SnapshotStatus::Failed => "failed",
-        SnapshotStatus::Expired => "expired",
-    }
+    status.as_db_str()
 }
 
 fn desktop_session_status_to_str(status: &DesktopSessionStatus) -> &'static str {
-    match status {
-        DesktopSessionStatus::Pending => "pending",
-        DesktopSessionStatus::Ready => "ready",
-        DesktopSessionStatus::Failed => "failed",
-        DesktopSessionStatus::Closed => "closed",
-        DesktopSessionStatus::Expired => "expired",
-    }
+    status.as_db_str()
 }
 
 fn desktop_access_mode_to_str(access_mode: &DesktopAccessMode) -> &'static str {
-    match access_mode {
-        DesktopAccessMode::Browser => "browser",
-        DesktopAccessMode::Vnc => "vnc",
-        DesktopAccessMode::Rdp => "rdp",
-    }
+    access_mode.as_db_str()
 }
 
 fn runtime_resource_kind_to_str(kind: &RuntimeResourceKind) -> &'static str {
-    match kind {
-        RuntimeResourceKind::Pod => "pod",
-        RuntimeResourceKind::PersistentVolumeClaim => "persistent_volume_claim",
-        RuntimeResourceKind::Service => "service",
-        RuntimeResourceKind::VolumeSnapshot => "volume_snapshot",
-    }
+    kind.as_db_str()
 }
 
 fn runtime_resource_purpose_to_str(purpose: &RuntimeResourcePurpose) -> &'static str {
-    match purpose {
-        RuntimeResourcePurpose::Runtime => "runtime",
-        RuntimeResourcePurpose::Workspace => "workspace",
-        RuntimeResourcePurpose::Ssh => "ssh",
-        RuntimeResourcePurpose::Desktop => "desktop",
-        RuntimeResourcePurpose::Snapshot => "snapshot",
-    }
+    purpose.as_db_str()
 }
 
 fn runtime_resource_status_to_str(status: &RuntimeResourceStatus) -> &'static str {
-    match status {
-        RuntimeResourceStatus::Planned => "planned",
-        RuntimeResourceStatus::Applied => "applied",
-        RuntimeResourceStatus::Ready => "ready",
-        RuntimeResourceStatus::Failed => "failed",
-        RuntimeResourceStatus::Deleted => "deleted",
-    }
+    status.as_db_str()
 }
 
 fn cleanup_run_status_to_str(status: &CleanupRunStatus) -> &'static str {
-    match status {
-        CleanupRunStatus::Running => "running",
-        CleanupRunStatus::Succeeded => "succeeded",
-        CleanupRunStatus::Failed => "failed",
-    }
+    status.as_db_str()
 }
 
 fn command_status_to_str(status: &CommandStatus) -> &'static str {
-    match status {
-        CommandStatus::Queued => "queued",
-        CommandStatus::Running => "running",
-        CommandStatus::Finished => "finished",
-        CommandStatus::Failed => "failed",
-    }
+    status.as_db_str()
 }
 
 fn command_output_stream_to_str(stream: &CommandOutputStream) -> &'static str {
-    match stream {
-        CommandOutputStream::Stdout => "stdout",
-        CommandOutputStream::Stderr => "stderr",
-    }
+    stream.as_db_str()
 }
 
 fn worker_status_to_str(status: &WorkerStatus) -> &'static str {
-    match status {
-        WorkerStatus::Registered => "registered",
-        WorkerStatus::Online => "online",
-        WorkerStatus::Draining => "draining",
-        WorkerStatus::Offline => "offline",
-    }
+    status.as_db_str()
 }
 
 fn worker_capability_to_str(capability: &WorkerCapability) -> &'static str {
-    match capability {
-        WorkerCapability::ProvisionSandbox => "provision_sandbox",
-        WorkerCapability::RunCommand => "run_command",
-        WorkerCapability::AgentPrompt => "agent_prompt",
-        WorkerCapability::Snapshot => "snapshot",
-        WorkerCapability::DesktopStream => "desktop_stream",
-        WorkerCapability::K8sPod => "k8s_pod",
-    }
+    capability.as_db_str()
 }
 
 fn job_kind_to_str(kind: &JobKind) -> &'static str {
-    match kind {
-        JobKind::ProvisionSandbox => "provision_sandbox",
-        JobKind::StopSandbox => "stop_sandbox",
-        JobKind::ResumeSandbox => "resume_sandbox",
-        JobKind::RunCommand => "run_command",
-        JobKind::RunPrompt => "run_prompt",
-        JobKind::CreateSnapshot => "create_snapshot",
-        JobKind::ForkSandbox => "fork_sandbox",
-    }
+    kind.as_db_str()
 }
 
 fn job_status_to_str(status: &JobStatus) -> &'static str {
-    match status {
-        JobStatus::Queued => "queued",
-        JobStatus::Leased => "leased",
-        JobStatus::Succeeded => "succeeded",
-        JobStatus::Failed => "failed",
-        JobStatus::Dead => "dead",
-    }
+    status.as_db_str()
 }
 
 fn lease_status_to_str(status: &LeaseStatus) -> &'static str {
-    match status {
-        LeaseStatus::Active => "active",
-        LeaseStatus::Completed => "completed",
-        LeaseStatus::Failed => "failed",
-        LeaseStatus::Expired => "expired",
-    }
+    status.as_db_str()
 }
 
 fn guest_status_to_str(status: &GuestStatus) -> &'static str {
-    match status {
-        GuestStatus::Pending => "pending",
-        GuestStatus::Ready => "ready",
-        GuestStatus::Unreachable => "unreachable",
-        GuestStatus::Unhealthy => "unhealthy",
-        GuestStatus::Terminated => "terminated",
-    }
+    status.as_db_str()
 }
 
 fn ssh_key_status_to_str(status: &SshKeyStatus) -> &'static str {
-    match status {
-        SshKeyStatus::Requested => "requested",
-        SshKeyStatus::Applied => "applied",
-        SshKeyStatus::Failed => "failed",
-        SshKeyStatus::Revoked => "revoked",
-    }
-}
-
-fn parse_command_status(value: &str) -> Result<CommandStatus, ApiError> {
-    match value {
-        "queued" => Ok(CommandStatus::Queued),
-        "running" => Ok(CommandStatus::Running),
-        "finished" => Ok(CommandStatus::Finished),
-        "failed" => Ok(CommandStatus::Failed),
-        _ => Err(ApiError::internal(
-            "database contains invalid command status",
-        )),
-    }
-}
-
-fn parse_command_output_stream(value: &str) -> Result<CommandOutputStream, ApiError> {
-    match value {
-        "stdout" => Ok(CommandOutputStream::Stdout),
-        "stderr" => Ok(CommandOutputStream::Stderr),
-        _ => Err(ApiError::internal(
-            "database contains invalid command output stream",
-        )),
-    }
-}
-
-fn parse_snapshot_status(value: &str) -> Result<SnapshotStatus, ApiError> {
-    match value {
-        "pending" => Ok(SnapshotStatus::Pending),
-        "ready" => Ok(SnapshotStatus::Ready),
-        "failed" => Ok(SnapshotStatus::Failed),
-        "expired" => Ok(SnapshotStatus::Expired),
-        _ => Err(ApiError::internal(
-            "database contains invalid snapshot status",
-        )),
-    }
-}
-
-fn parse_desktop_session_status(value: &str) -> Result<DesktopSessionStatus, ApiError> {
-    match value {
-        "pending" => Ok(DesktopSessionStatus::Pending),
-        "ready" => Ok(DesktopSessionStatus::Ready),
-        "failed" => Ok(DesktopSessionStatus::Failed),
-        "closed" => Ok(DesktopSessionStatus::Closed),
-        "expired" => Ok(DesktopSessionStatus::Expired),
-        _ => Err(ApiError::internal(
-            "database contains invalid desktop session status",
-        )),
-    }
-}
-
-fn parse_desktop_access_mode(value: &str) -> Result<DesktopAccessMode, ApiError> {
-    match value {
-        "browser" => Ok(DesktopAccessMode::Browser),
-        "vnc" => Ok(DesktopAccessMode::Vnc),
-        "rdp" => Ok(DesktopAccessMode::Rdp),
-        _ => Err(ApiError::internal(
-            "database contains invalid desktop access mode",
-        )),
-    }
-}
-
-fn parse_runtime_resource_kind(value: &str) -> Result<RuntimeResourceKind, ApiError> {
-    match value {
-        "pod" => Ok(RuntimeResourceKind::Pod),
-        "persistent_volume_claim" => Ok(RuntimeResourceKind::PersistentVolumeClaim),
-        "service" => Ok(RuntimeResourceKind::Service),
-        "volume_snapshot" => Ok(RuntimeResourceKind::VolumeSnapshot),
-        _ => Err(ApiError::internal(
-            "database contains invalid runtime resource kind",
-        )),
-    }
-}
-
-fn parse_runtime_resource_purpose(value: &str) -> Result<RuntimeResourcePurpose, ApiError> {
-    match value {
-        "runtime" => Ok(RuntimeResourcePurpose::Runtime),
-        "workspace" => Ok(RuntimeResourcePurpose::Workspace),
-        "ssh" => Ok(RuntimeResourcePurpose::Ssh),
-        "desktop" => Ok(RuntimeResourcePurpose::Desktop),
-        "snapshot" => Ok(RuntimeResourcePurpose::Snapshot),
-        _ => Err(ApiError::internal(
-            "database contains invalid runtime resource purpose",
-        )),
-    }
-}
-
-fn parse_runtime_resource_status(value: &str) -> Result<RuntimeResourceStatus, ApiError> {
-    match value {
-        "planned" => Ok(RuntimeResourceStatus::Planned),
-        "applied" => Ok(RuntimeResourceStatus::Applied),
-        "ready" => Ok(RuntimeResourceStatus::Ready),
-        "failed" => Ok(RuntimeResourceStatus::Failed),
-        "deleted" => Ok(RuntimeResourceStatus::Deleted),
-        _ => Err(ApiError::internal(
-            "database contains invalid runtime resource status",
-        )),
-    }
-}
-
-fn parse_worker_capability(value: &str) -> Result<WorkerCapability, ApiError> {
-    match value {
-        "provision_sandbox" => Ok(WorkerCapability::ProvisionSandbox),
-        "run_command" => Ok(WorkerCapability::RunCommand),
-        "agent_prompt" => Ok(WorkerCapability::AgentPrompt),
-        "snapshot" => Ok(WorkerCapability::Snapshot),
-        "desktop_stream" => Ok(WorkerCapability::DesktopStream),
-        "k8s_pod" => Ok(WorkerCapability::K8sPod),
-        _ => Err(ApiError::internal(
-            "database contains invalid worker capability",
-        )),
-    }
-}
-
-fn parse_job_kind(value: &str) -> Result<JobKind, ApiError> {
-    match value {
-        "provision_sandbox" => Ok(JobKind::ProvisionSandbox),
-        "stop_sandbox" => Ok(JobKind::StopSandbox),
-        "resume_sandbox" => Ok(JobKind::ResumeSandbox),
-        "run_command" => Ok(JobKind::RunCommand),
-        "run_prompt" => Ok(JobKind::RunPrompt),
-        "create_snapshot" => Ok(JobKind::CreateSnapshot),
-        "fork_sandbox" => Ok(JobKind::ForkSandbox),
-        _ => Err(ApiError::internal("database contains invalid job kind")),
-    }
-}
-
-fn parse_job_status(value: &str) -> Result<JobStatus, ApiError> {
-    match value {
-        "queued" => Ok(JobStatus::Queued),
-        "leased" => Ok(JobStatus::Leased),
-        "succeeded" => Ok(JobStatus::Succeeded),
-        "failed" => Ok(JobStatus::Failed),
-        "dead" => Ok(JobStatus::Dead),
-        _ => Err(ApiError::internal("database contains invalid job status")),
-    }
-}
-
-fn parse_lease_status(value: &str) -> Result<LeaseStatus, ApiError> {
-    match value {
-        "active" => Ok(LeaseStatus::Active),
-        "completed" => Ok(LeaseStatus::Completed),
-        "failed" => Ok(LeaseStatus::Failed),
-        "expired" => Ok(LeaseStatus::Expired),
-        _ => Err(ApiError::internal("database contains invalid lease status")),
-    }
-}
-
-fn parse_guest_status(value: &str) -> Result<GuestStatus, ApiError> {
-    match value {
-        "pending" => Ok(GuestStatus::Pending),
-        "ready" => Ok(GuestStatus::Ready),
-        "unreachable" => Ok(GuestStatus::Unreachable),
-        "unhealthy" => Ok(GuestStatus::Unhealthy),
-        "terminated" => Ok(GuestStatus::Terminated),
-        _ => Err(ApiError::internal("database contains invalid guest status")),
-    }
-}
-
-fn parse_ssh_key_status(value: &str) -> Result<SshKeyStatus, ApiError> {
-    match value {
-        "requested" => Ok(SshKeyStatus::Requested),
-        "applied" => Ok(SshKeyStatus::Applied),
-        "failed" => Ok(SshKeyStatus::Failed),
-        "revoked" => Ok(SshKeyStatus::Revoked),
-        _ => Err(ApiError::internal(
-            "database contains invalid ssh key status",
-        )),
-    }
-}
-
-fn parse_worker_status(value: &str) -> Result<WorkerStatus, ApiError> {
-    match value {
-        "registered" => Ok(WorkerStatus::Registered),
-        "online" => Ok(WorkerStatus::Online),
-        "draining" => Ok(WorkerStatus::Draining),
-        "offline" => Ok(WorkerStatus::Offline),
-        _ => Err(ApiError::internal(
-            "database contains invalid worker status",
-        )),
-    }
+    status.as_db_str()
 }
 
 fn event_kind_to_str(kind: &SandboxEventKind) -> &'static str {
-    match kind {
-        SandboxEventKind::LifecycleChanged => "lifecycle_changed",
-        SandboxEventKind::CommandQueued => "command_queued",
-        SandboxEventKind::CommandStarted => "command_started",
-        SandboxEventKind::CommandOutput => "command_output",
-        SandboxEventKind::CommandFinished => "command_finished",
-        SandboxEventKind::PromptQueued => "prompt_queued",
-        SandboxEventKind::PromptStarted => "prompt_started",
-        SandboxEventKind::PromptFinished => "prompt_finished",
-        SandboxEventKind::DesktopRequested => "desktop_requested",
-        SandboxEventKind::DesktopReady => "desktop_ready",
-        SandboxEventKind::DesktopFailed => "desktop_failed",
-        SandboxEventKind::DesktopClosed => "desktop_closed",
-        SandboxEventKind::DesktopExpired => "desktop_expired",
-    }
+    kind.as_db_str()
+}
+
+fn parse_db_variant<T: DbVariant>(value: &str, message: &'static str) -> Result<T, ApiError> {
+    T::parse_db_str(value).map_err(|_| ApiError::internal(message))
+}
+
+fn parse_command_status(value: &str) -> Result<CommandStatus, ApiError> {
+    parse_db_variant(value, "database contains invalid command status")
+}
+
+fn parse_command_output_stream(value: &str) -> Result<CommandOutputStream, ApiError> {
+    parse_db_variant(value, "database contains invalid command output stream")
+}
+
+fn parse_snapshot_status(value: &str) -> Result<SnapshotStatus, ApiError> {
+    parse_db_variant(value, "database contains invalid snapshot status")
+}
+
+fn parse_desktop_session_status(value: &str) -> Result<DesktopSessionStatus, ApiError> {
+    parse_db_variant(value, "database contains invalid desktop session status")
+}
+
+fn parse_desktop_access_mode(value: &str) -> Result<DesktopAccessMode, ApiError> {
+    parse_db_variant(value, "database contains invalid desktop access mode")
+}
+
+fn parse_runtime_resource_kind(value: &str) -> Result<RuntimeResourceKind, ApiError> {
+    parse_db_variant(value, "database contains invalid runtime resource kind")
+}
+
+fn parse_runtime_resource_purpose(value: &str) -> Result<RuntimeResourcePurpose, ApiError> {
+    parse_db_variant(value, "database contains invalid runtime resource purpose")
+}
+
+fn parse_runtime_resource_status(value: &str) -> Result<RuntimeResourceStatus, ApiError> {
+    parse_db_variant(value, "database contains invalid runtime resource status")
+}
+
+fn parse_worker_capability(value: &str) -> Result<WorkerCapability, ApiError> {
+    parse_db_variant(value, "database contains invalid worker capability")
+}
+
+fn parse_job_kind(value: &str) -> Result<JobKind, ApiError> {
+    parse_db_variant(value, "database contains invalid job kind")
+}
+
+fn parse_job_status(value: &str) -> Result<JobStatus, ApiError> {
+    parse_db_variant(value, "database contains invalid job status")
+}
+
+fn parse_lease_status(value: &str) -> Result<LeaseStatus, ApiError> {
+    parse_db_variant(value, "database contains invalid lease status")
+}
+
+fn parse_guest_status(value: &str) -> Result<GuestStatus, ApiError> {
+    parse_db_variant(value, "database contains invalid guest status")
+}
+
+fn parse_ssh_key_status(value: &str) -> Result<SshKeyStatus, ApiError> {
+    parse_db_variant(value, "database contains invalid ssh key status")
+}
+
+fn parse_worker_status(value: &str) -> Result<WorkerStatus, ApiError> {
+    parse_db_variant(value, "database contains invalid worker status")
 }
 
 fn parse_event_kind(value: &str) -> Result<SandboxEventKind, ApiError> {
-    match value {
-        "lifecycle_changed" => Ok(SandboxEventKind::LifecycleChanged),
-        "command_queued" => Ok(SandboxEventKind::CommandQueued),
-        "command_started" => Ok(SandboxEventKind::CommandStarted),
-        "command_output" => Ok(SandboxEventKind::CommandOutput),
-        "command_finished" => Ok(SandboxEventKind::CommandFinished),
-        "prompt_queued" => Ok(SandboxEventKind::PromptQueued),
-        "prompt_started" => Ok(SandboxEventKind::PromptStarted),
-        "prompt_finished" => Ok(SandboxEventKind::PromptFinished),
-        "desktop_requested" => Ok(SandboxEventKind::DesktopRequested),
-        "desktop_ready" => Ok(SandboxEventKind::DesktopReady),
-        "desktop_failed" => Ok(SandboxEventKind::DesktopFailed),
-        "desktop_closed" => Ok(SandboxEventKind::DesktopClosed),
-        "desktop_expired" => Ok(SandboxEventKind::DesktopExpired),
-        _ => Err(ApiError::internal("database contains invalid event kind")),
-    }
+    parse_db_variant(value, "database contains invalid event kind")
 }
 
 #[derive(Debug)]
