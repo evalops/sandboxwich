@@ -155,6 +155,7 @@ async fn run_contract(server: TestServer) {
             .any(|seen| seen.id == worker.worker.id)
     );
     assert_provision_job_persists_runtime_resources(&client, &server, &created, &worker).await;
+    assert_failed_completion_rolls_back_lease_state(&client, &server, &created, &worker).await;
 
     let listed: SandboxListResponse = client
         .get(format!("{}/sandboxes", server.base_url))
@@ -612,6 +613,89 @@ async fn assert_provision_job_persists_runtime_resources(
             && resource.purpose == RuntimeResourcePurpose::Ssh
             && resource.service_port == Some(22)
     }));
+}
+
+async fn assert_failed_completion_rolls_back_lease_state(
+    client: &reqwest::Client,
+    server: &TestServer,
+    sandbox: &SandboxResponse,
+    worker: &WorkerResponse,
+) {
+    let queued: JobResponse = client
+        .post(format!("{}/jobs", server.base_url))
+        .json(&CreateJobRequest {
+            kind: JobKind::ProvisionSandbox,
+            payload: serde_json::json!({
+                "sandboxId": sandbox.sandbox.id
+            }),
+            required_capability: WorkerCapability::ProvisionSandbox,
+            priority: Some(9),
+            max_attempts: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let claimed: ClaimLeaseResponse = client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claimed
+        .lease
+        .expect("expected worker to claim rollback probe job");
+    assert_eq!(lease.job.id, queued.job.id);
+
+    let mut resources = provision_resources(sandbox.sandbox.id);
+    resources[0].provider = String::new();
+    let rejected = client
+        .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::ProvisionSandbox {
+                handle: ProviderSandboxHandle {
+                    provider: "kubernetes".to_string(),
+                    sandbox_id: sandbox.sandbox.id,
+                    resources,
+                    metadata: serde_json::json!({}),
+                },
+            }),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+    let failed: LeaseResponse = client
+        .post(format!("{}/leases/{}/fail", server.base_url, lease.id))
+        .json(&FailLeaseRequest {
+            error: "rollback probe".to_string(),
+            retry: false,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(failed.lease.job.status, JobStatus::Failed);
 }
 
 async fn assert_retryable_failure_requeues_command(
