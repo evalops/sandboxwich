@@ -6,8 +6,9 @@ use std::{
 
 use reqwest::StatusCode;
 use sandboxwich_core::{
-    AgentCommandResult, CapacityResponse, ClaimLeaseRequest, ClaimLeaseResponse, CleanupRunStatus,
-    CommandListResponse, CommandRequest, CommandResponse, CommandStatus, CompleteLeaseRequest,
+    AgentCommandResult, AppendCommandOutputRequest, CapacityResponse, ClaimLeaseRequest,
+    ClaimLeaseResponse, CleanupRunStatus, CommandListResponse, CommandOutputListResponse,
+    CommandOutputStream, CommandRequest, CommandResponse, CommandStatus, CompleteLeaseRequest,
     CreateDesktopSessionRequest, CreateJobRequest, CreateSandboxRequest, CreateSnapshotRequest,
     DesktopAccessMode, DesktopAccessRequest, DesktopAccessResponse, DesktopSessionListResponse,
     DesktopSessionResponse, DesktopSessionStatus, EventListResponse, FailLeaseRequest,
@@ -249,6 +250,53 @@ async fn run_contract(server: TestServer) {
         .await
         .unwrap();
     assert_eq!(running_command.command.status, CommandStatus::Running);
+
+    let first_chunk: sandboxwich_core::CommandOutputChunkResponse = client
+        .post(format!("{}/leases/{}/output", server.base_url, lease.id))
+        .json(&AppendCommandOutputRequest {
+            stream: CommandOutputStream::Stdout,
+            chunk: "hel".to_string(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first_chunk.chunk.sequence, 1);
+    let second_chunk: sandboxwich_core::CommandOutputChunkResponse = client
+        .post(format!("{}/leases/{}/output", server.base_url, lease.id))
+        .json(&AppendCommandOutputRequest {
+            stream: CommandOutputStream::Stdout,
+            chunk: "lo\n".to_string(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(second_chunk.chunk.sequence, 2);
+    let output_chunks: CommandOutputListResponse = client
+        .get(format!(
+            "{}/commands/{}/output",
+            server.base_url, command.command.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(output_chunks.chunks.len(), 2);
+    assert_eq!(output_chunks.chunks[0].chunk, "hel");
+    assert_eq!(output_chunks.chunks[1].chunk, "lo\n");
 
     let second_command: CommandResponse = client
         .post(format!(

@@ -10,15 +10,17 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use sandboxwich_core::{
-    ArchivedSandboxCleanupSkip, CapacityResponse, ClaimLeaseRequest, ClaimLeaseResponse,
-    CleanupRun, CleanupRunId, CleanupRunStatus, CommandId, CommandListResponse, CommandRequest,
-    CommandResponse, CommandRun, CommandStatus, CompleteLeaseRequest, CreateDesktopSessionRequest,
-    CreateJobRequest, CreateSandboxRequest, CreateSnapshotRequest, DesktopAccess,
-    DesktopAccessMode, DesktopAccessRequest, DesktopAccessResponse, DesktopSession,
-    DesktopSessionId, DesktopSessionListResponse, DesktopSessionResponse, DesktopSessionStatus,
-    ErrorEnvelope, EventId, EventListResponse, FailLeaseRequest, GuestHealth, GuestHealthResponse,
-    GuestStatus, HealthResponse, Job, JobId, JobKind, JobLease, JobListResponse, JobResponse,
-    JobStatus, LeaseId, LeaseResponse, LeaseStatus, PromptQueuedResponse, PromptRequest,
+    AppendCommandOutputRequest, ArchivedSandboxCleanupSkip, CapacityResponse, ClaimLeaseRequest,
+    ClaimLeaseResponse, CleanupRun, CleanupRunId, CleanupRunStatus, CommandId, CommandListResponse,
+    CommandOutputChunk, CommandOutputChunkId, CommandOutputChunkResponse,
+    CommandOutputListResponse, CommandOutputStream, CommandRequest, CommandResponse, CommandRun,
+    CommandStatus, CompleteLeaseRequest, CreateDesktopSessionRequest, CreateJobRequest,
+    CreateSandboxRequest, CreateSnapshotRequest, DesktopAccess, DesktopAccessMode,
+    DesktopAccessRequest, DesktopAccessResponse, DesktopSession, DesktopSessionId,
+    DesktopSessionListResponse, DesktopSessionResponse, DesktopSessionStatus, ErrorEnvelope,
+    EventId, EventListResponse, FailLeaseRequest, GuestHealth, GuestHealthResponse, GuestStatus,
+    HealthResponse, Job, JobId, JobKind, JobLease, JobListResponse, JobResponse, JobStatus,
+    LeaseId, LeaseResponse, LeaseStatus, PromptQueuedResponse, PromptRequest,
     ProviderRuntimeResource, ReconcileRuntimeResourcesRequest, ReconcileRuntimeResourcesResponse,
     RegisterWorkerRequest, RenewLeaseRequest, RequestSshKeyRequest, RuntimeResource,
     RuntimeResourceId, RuntimeResourceKind, RuntimeResourceListResponse, RuntimeResourcePurpose,
@@ -658,6 +660,7 @@ fn app(state: AppState) -> Router {
         .route("/snapshots/cleanup", post(cleanup_snapshots))
         .route("/snapshots/{snapshot_id}", get(get_snapshot))
         .route("/commands/{command_id}", get(get_command))
+        .route("/commands/{command_id}/output", get(list_command_output))
         .route("/workers", get(list_workers))
         .route("/capacity", get(get_capacity))
         .route("/workers/register", post(register_worker))
@@ -669,6 +672,7 @@ fn app(state: AppState) -> Router {
         .route("/jobs", get(list_jobs).post(create_job))
         .route("/workers/{worker_id}/leases/claim", post(claim_lease))
         .route("/leases/{lease_id}/renew", post(renew_lease))
+        .route("/leases/{lease_id}/output", post(append_lease_output))
         .route("/leases/{lease_id}/complete", post(complete_lease))
         .route("/leases/{lease_id}/fail", post(fail_lease))
         .route(
@@ -1144,6 +1148,16 @@ async fn get_command(
 ) -> Result<Json<CommandResponse>, ApiError> {
     let command = fetch_command(&state.db, CommandId(command_id)).await?;
     Ok(Json(CommandResponse { ok: true, command }))
+}
+
+async fn list_command_output(
+    State(state): State<AppState>,
+    Path(command_id): Path<Uuid>,
+) -> Result<Json<CommandOutputListResponse>, ApiError> {
+    let command_id = CommandId(command_id);
+    fetch_command(&state.db, command_id).await?;
+    let chunks = list_command_output_chunks(&state.db, command_id).await?;
+    Ok(Json(CommandOutputListResponse { ok: true, chunks }))
 }
 
 async fn queue_prompt(
@@ -1665,6 +1679,38 @@ async fn renew_lease(
 
     let lease = fetch_lease(&state.db, lease_id).await?;
     Ok(Json(LeaseResponse { ok: true, lease }))
+}
+
+async fn append_lease_output(
+    State(state): State<AppState>,
+    Path(lease_id): Path<Uuid>,
+    Json(request): Json<AppendCommandOutputRequest>,
+) -> Result<Json<CommandOutputChunkResponse>, ApiError> {
+    if request.chunk.is_empty() {
+        return Err(ApiError::bad_request(
+            "command output chunk cannot be empty",
+        ));
+    }
+    let lease = fetch_lease(&state.db, LeaseId(lease_id)).await?;
+    if lease.status != LeaseStatus::Active {
+        return Err(ApiError::bad_request("lease is not active"));
+    }
+    if lease.job.kind != JobKind::RunCommand {
+        return Err(ApiError::bad_request(
+            "lease does not belong to a run command job",
+        ));
+    }
+    let command_id = command_id_from_job(&lease.job)?;
+    let sandbox_id = sandbox_id_from_job(&lease.job)?;
+    let chunk = append_command_output_chunk(
+        &state.db,
+        command_id,
+        sandbox_id,
+        request.stream,
+        request.chunk,
+    )
+    .await?;
+    Ok(Json(CommandOutputChunkResponse { ok: true, chunk }))
 }
 
 async fn complete_lease(
@@ -2528,6 +2574,186 @@ async fn fetch_command(db: &Database, command_id: CommandId) -> Result<CommandRu
         .ok_or_else(|| ApiError::not_found("command not found"))?;
 
     row_to_command(row)
+}
+
+async fn list_command_output_chunks(
+    db: &Database,
+    command_id: CommandId,
+) -> Result<Vec<CommandOutputChunk>, ApiError> {
+    let sql = format!(
+        "select id, command_id, stream, sequence, chunk, created_at
+         from command_output_chunks
+         where command_id = {}
+         order by sequence asc, created_at asc, id asc",
+        db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(command_id.to_string())
+        .fetch_all(&db.pool)
+        .await?;
+    rows.into_iter().map(row_to_command_output_chunk).collect()
+}
+
+async fn append_command_output_chunk(
+    db: &Database,
+    command_id: CommandId,
+    sandbox_id: SandboxId,
+    stream: CommandOutputStream,
+    chunk: String,
+) -> Result<CommandOutputChunk, ApiError> {
+    let mut tx = db.pool.begin().await?;
+    let appended = append_command_output_chunk_on_connection(
+        db, &mut *tx, command_id, sandbox_id, stream, chunk,
+    )
+    .await;
+    match appended {
+        Ok(chunk) => {
+            tx.commit().await?;
+            Ok(chunk)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = tx.rollback().await {
+                tracing::warn!(%rollback_error, "failed to roll back command output append");
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn append_command_output_chunk_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    command_id: CommandId,
+    sandbox_id: SandboxId,
+    stream: CommandOutputStream,
+    chunk: String,
+) -> Result<CommandOutputChunk, ApiError> {
+    let sequence =
+        next_command_output_sequence_on_connection(db, connection, command_id, &stream).await?;
+    let now = Utc::now();
+    let output_chunk = CommandOutputChunk {
+        id: CommandOutputChunkId::new(),
+        command_id,
+        stream,
+        sequence,
+        chunk,
+        created_at: now,
+    };
+    let sql = format!(
+        "insert into command_output_chunks (id, command_id, stream, sequence, chunk, created_at)
+         values ({})",
+        db.placeholders(6)
+    );
+    sqlx::query(&sql)
+        .bind(output_chunk.id.to_string())
+        .bind(output_chunk.command_id.to_string())
+        .bind(command_output_stream_to_str(&output_chunk.stream))
+        .bind(count_to_i64(output_chunk.sequence)?)
+        .bind(&output_chunk.chunk)
+        .bind(output_chunk.created_at.to_rfc3339())
+        .execute(&mut *connection)
+        .await?;
+
+    append_command_output_to_command_on_connection(
+        db,
+        connection,
+        command_id,
+        &output_chunk.stream,
+        &output_chunk.chunk,
+    )
+    .await?;
+    insert_event_on_connection(
+        db,
+        connection,
+        sandbox_id,
+        SandboxEventKind::CommandOutput,
+        json!({
+            "commandId": command_id,
+            "stream": output_chunk.stream,
+            "sequence": output_chunk.sequence,
+            "chunk": output_chunk.chunk
+        }),
+    )
+    .await?;
+
+    Ok(output_chunk)
+}
+
+async fn next_command_output_sequence_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    command_id: CommandId,
+    stream: &CommandOutputStream,
+) -> Result<u64, ApiError> {
+    let sql = format!(
+        "select coalesce(max(sequence), 0) as max_sequence
+         from command_output_chunks
+         where command_id = {} and stream = {}",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    let row = sqlx::query(&sql)
+        .bind(command_id.to_string())
+        .bind(command_output_stream_to_str(stream))
+        .fetch_one(&mut *connection)
+        .await?;
+    let max_sequence: i64 = row.try_get("max_sequence")?;
+    let next = max_sequence
+        .checked_add(1)
+        .ok_or_else(|| ApiError::internal("command output sequence overflow"))?;
+    u64::try_from(next)
+        .map_err(|_| ApiError::internal("database contains invalid command output sequence"))
+}
+
+async fn append_command_output_to_command_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    command_id: CommandId,
+    stream: &CommandOutputStream,
+    chunk: &str,
+) -> Result<(), ApiError> {
+    let column = match stream {
+        CommandOutputStream::Stdout => "stdout",
+        CommandOutputStream::Stderr => "stderr",
+    };
+    let sql = format!(
+        "update commands
+         set {column} = {column} || {}
+         where id = {}",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    let result = sqlx::query(&sql)
+        .bind(chunk)
+        .bind(command_id.to_string())
+        .execute(&mut *connection)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("command not found"));
+    }
+    Ok(())
+}
+
+async fn command_has_output_chunks_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    command_id: CommandId,
+    stream: &CommandOutputStream,
+) -> Result<bool, ApiError> {
+    let sql = format!(
+        "select id
+         from command_output_chunks
+         where command_id = {} and stream = {}
+         limit 1",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    let row = sqlx::query(&sql)
+        .bind(command_id.to_string())
+        .bind(command_output_stream_to_str(stream))
+        .fetch_optional(&mut *connection)
+        .await?;
+    Ok(row.is_some())
 }
 
 async fn fetch_worker(db: &Database, worker_id: WorkerId) -> Result<Worker, ApiError> {
@@ -3951,36 +4177,55 @@ async fn update_command_from_lease_result(
     Ok(())
 }
 
-async fn update_command_from_lease_result_on_connection(
+async fn finish_command_from_lease_result_on_connection(
     db: &Database,
     connection: &mut AnyConnection,
     command_id: CommandId,
     status: CommandStatus,
-    stdout: &str,
-    stderr: &str,
     exit_code: Option<i32>,
 ) -> Result<(), ApiError> {
     let now = Utc::now();
     let sql = format!(
         "update commands
-         set status = {}, stdout = {}, stderr = {}, exit_code = {}, finished_at = {}
+         set status = {}, exit_code = {}, finished_at = {}
          where id = {}",
         db.placeholder(1),
         db.placeholder(2),
         db.placeholder(3),
-        db.placeholder(4),
-        db.placeholder(5),
-        db.placeholder(6)
+        db.placeholder(4)
     );
     sqlx::query(&sql)
         .bind(command_status_to_str(&status))
-        .bind(stdout)
-        .bind(stderr)
         .bind(exit_code)
         .bind(now.to_rfc3339())
         .bind(command_id.to_string())
         .execute(&mut *connection)
         .await?;
+    Ok(())
+}
+
+async fn append_completion_output_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    command_id: CommandId,
+    sandbox_id: SandboxId,
+    stream: CommandOutputStream,
+    chunk: &str,
+) -> Result<(), ApiError> {
+    if chunk.is_empty()
+        || command_has_output_chunks_on_connection(db, connection, command_id, &stream).await?
+    {
+        return Ok(());
+    }
+    append_command_output_chunk_on_connection(
+        db,
+        connection,
+        command_id,
+        sandbox_id,
+        stream,
+        chunk.to_string(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -3997,44 +4242,32 @@ async fn apply_completed_job_on_connection(
             let stdout = result.stdout.as_str();
             let stderr = result.stderr.as_str();
             let exit_code = result.exit_code.or(Some(0));
-            update_command_from_lease_result_on_connection(
+            append_completion_output_on_connection(
+                db,
+                connection,
+                command_id,
+                sandbox_id,
+                CommandOutputStream::Stdout,
+                stdout,
+            )
+            .await?;
+            append_completion_output_on_connection(
+                db,
+                connection,
+                command_id,
+                sandbox_id,
+                CommandOutputStream::Stderr,
+                stderr,
+            )
+            .await?;
+            finish_command_from_lease_result_on_connection(
                 db,
                 connection,
                 command_id,
                 CommandStatus::Finished,
-                stdout,
-                stderr,
                 exit_code,
             )
             .await?;
-            if !stdout.is_empty() {
-                insert_event_on_connection(
-                    db,
-                    connection,
-                    sandbox_id,
-                    SandboxEventKind::CommandOutput,
-                    json!({
-                        "commandId": command_id,
-                        "stream": "stdout",
-                        "chunk": stdout
-                    }),
-                )
-                .await?;
-            }
-            if !stderr.is_empty() {
-                insert_event_on_connection(
-                    db,
-                    connection,
-                    sandbox_id,
-                    SandboxEventKind::CommandOutput,
-                    json!({
-                        "commandId": command_id,
-                        "stream": "stderr",
-                        "chunk": stderr
-                    }),
-                )
-                .await?;
-            }
             insert_event_on_connection(
                 db,
                 connection,
@@ -4917,6 +5150,24 @@ fn row_to_job(row: AnyRow) -> Result<Job, ApiError> {
     })
 }
 
+fn row_to_command_output_chunk(row: AnyRow) -> Result<CommandOutputChunk, ApiError> {
+    let id: String = row.try_get("id")?;
+    let command_id: String = row.try_get("command_id")?;
+    let stream: String = row.try_get("stream")?;
+    let sequence: i64 = row.try_get("sequence")?;
+    let created_at: String = row.try_get("created_at")?;
+
+    Ok(CommandOutputChunk {
+        id: CommandOutputChunkId(parse_uuid(&id)?),
+        command_id: CommandId(parse_uuid(&command_id)?),
+        stream: parse_command_output_stream(&stream)?,
+        sequence: u64::try_from(sequence)
+            .map_err(|_| ApiError::internal("database contains invalid output sequence"))?,
+        chunk: row.try_get("chunk")?,
+        created_at: parse_timestamp(&created_at)?,
+    })
+}
+
 fn row_to_lease_without_job(row: AnyRow) -> Result<JobLease, ApiError> {
     let id: String = row.try_get("id")?;
     let job_id: String = row.try_get("job_id")?;
@@ -5067,6 +5318,13 @@ fn command_status_to_str(status: &CommandStatus) -> &'static str {
     }
 }
 
+fn command_output_stream_to_str(stream: &CommandOutputStream) -> &'static str {
+    match stream {
+        CommandOutputStream::Stdout => "stdout",
+        CommandOutputStream::Stderr => "stderr",
+    }
+}
+
 fn worker_status_to_str(status: &WorkerStatus) -> &'static str {
     match status {
         WorkerStatus::Registered => "registered",
@@ -5145,6 +5403,16 @@ fn parse_command_status(value: &str) -> Result<CommandStatus, ApiError> {
         "failed" => Ok(CommandStatus::Failed),
         _ => Err(ApiError::internal(
             "database contains invalid command status",
+        )),
+    }
+}
+
+fn parse_command_output_stream(value: &str) -> Result<CommandOutputStream, ApiError> {
+    match value {
+        "stdout" => Ok(CommandOutputStream::Stdout),
+        "stderr" => Ok(CommandOutputStream::Stderr),
+        _ => Err(ApiError::internal(
+            "database contains invalid command output stream",
         )),
     }
 }
