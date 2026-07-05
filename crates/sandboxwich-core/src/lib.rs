@@ -1131,9 +1131,18 @@ pub struct SshKeyListResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HealthComponent {
+    pub ok: bool,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub ok: bool,
     pub service: String,
+    pub checked_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database: Option<HealthComponent>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

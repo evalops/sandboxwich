@@ -147,18 +147,37 @@ By default the smoke command deletes the resources it created with `kubectl dele
 
 Clusters without a CSI `VolumeSnapshotClass` should use the long-running apply-mode worker for pod/exec smoke and skip the standalone full apply smoke, or pass a real snapshot class. The command execution path does not require snapshots.
 
+## Health, Metrics, And Smoke
+
+The API exposes:
+
+- `/healthz` for lightweight liveness.
+- `/readyz` for database-backed readiness.
+- `/metrics` for Prometheus text metrics. If `SANDBOXWICH_API_TOKEN` is configured, scrape clients must send the bearer token.
+
+Run the read-only homelab smoke through a port-forward after GitOps applies the manifests:
+
+```sh
+SANDBOXWICH_API_TOKEN="$(kubectl -n sandboxwich get secret sandboxwich-secrets -o jsonpath='{.data.api-token}' | base64 -d)" \
+SANDBOXWICH_TENANT=default \
+deploy/kubernetes/homelab-smoke.sh
+```
+
+The smoke checks API and worker rollouts, `/readyz`, `/metrics`, and a tenant-scoped sandbox list. It does not apply manifests or mutate sandbox resources.
+
 ## Apply The API Manifests
 
-The starter manifests in `deploy/kubernetes/` expect a Secret named `sandboxwich-secrets` with `database-url`.
+The starter manifests in `deploy/kubernetes/` expect a Secret named `sandboxwich-secrets` with `database-url`. Add `api-token` through your existing secret-management path when the API should require bearer auth.
 
 ```sh
 kubectl create namespace sandboxwich
 kubectl -n sandboxwich create secret generic sandboxwich-secrets \
-  --from-literal=database-url='postgres://user:password@postgres.example:5432/sandboxwich'
+  --from-literal=database-url='postgres://user:password@postgres.example:5432/sandboxwich' \
+  --from-literal=api-token='replace-through-secret-management'
 kubectl apply -f deploy/kubernetes/
 ```
 
-Do not commit the real database URL. Use your existing secret-management path for shared clusters.
+Do not commit the real database URL or API token. Use your existing secret-management path for shared clusters.
 
 ## Next Kubernetes Work
 

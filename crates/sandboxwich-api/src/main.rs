@@ -20,8 +20,8 @@ use sandboxwich_core::{
     DesktopAccessRequest, DesktopAccessResponse, DesktopSession, DesktopSessionId,
     DesktopSessionListResponse, DesktopSessionResponse, DesktopSessionStatus, ErrorEnvelope,
     EventId, EventListResponse, FailLeaseRequest, GuestHealth, GuestHealthResponse, GuestStatus,
-    HealthResponse, Job, JobId, JobKind, JobLease, JobListResponse, JobResponse, JobStatus,
-    LeaseId, LeaseResponse, LeaseStatus, PromptQueuedResponse, PromptRequest,
+    HealthComponent, HealthResponse, Job, JobId, JobKind, JobLease, JobListResponse, JobResponse,
+    JobStatus, LeaseId, LeaseResponse, LeaseStatus, PromptQueuedResponse, PromptRequest,
     ProviderRuntimeResource, ReconcileRuntimeResourcesRequest, ReconcileRuntimeResourcesResponse,
     RegisterWorkerRequest, RenewLeaseRequest, RequestSshKeyRequest, RuntimeResource,
     RuntimeResourceId, RuntimeResourceKind, RuntimeResourceListResponse, RuntimeResourcePurpose,
@@ -640,6 +640,8 @@ async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
 fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
         .route("/sandboxes", get(list_sandboxes).post(create_sandbox))
         .route("/sandboxes/{sandbox_id}", get(get_sandbox))
         .route(
@@ -719,13 +721,16 @@ async fn auth_and_tenant(
     mut request: Request,
     next: Next,
 ) -> Response {
+    let path = request.uri().path();
     if let Some(expected_token) = &state.auth_token {
-        let authorized = request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .is_some_and(|token| token == expected_token);
+        let is_probe = matches!(path, "/healthz" | "/readyz");
+        let authorized = is_probe
+            || request
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .is_some_and(|token| token == expected_token);
         if !authorized {
             return ApiError::unauthorized("valid bearer token is required").into_response();
         }
@@ -754,7 +759,184 @@ async fn healthz() -> Json<HealthResponse> {
     Json(HealthResponse {
         ok: true,
         service: "sandboxwich-api".to_string(),
+        checked_at: Utc::now(),
+        database: None,
     })
+}
+
+async fn readyz(State(state): State<AppState>) -> Response {
+    match check_database_health(&state.db).await {
+        Ok(database) => (
+            StatusCode::OK,
+            Json(HealthResponse {
+                ok: true,
+                service: "sandboxwich-api".to_string(),
+                checked_at: Utc::now(),
+                database: Some(database),
+            }),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::warn!(?error, "readiness check failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(HealthResponse {
+                    ok: false,
+                    service: "sandboxwich-api".to_string(),
+                    checked_at: Utc::now(),
+                    database: Some(HealthComponent {
+                        ok: false,
+                        message: Some("database unavailable".to_string()),
+                    }),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let body = collect_prometheus_metrics(&state.db).await?;
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response())
+}
+
+async fn check_database_health(db: &Database) -> Result<HealthComponent, ApiError> {
+    sqlx::query("select 1").execute(&db.pool).await?;
+    Ok(HealthComponent {
+        ok: true,
+        message: None,
+    })
+}
+
+async fn collect_prometheus_metrics(db: &Database) -> Result<String, ApiError> {
+    let mut body = String::new();
+    append_count_family(
+        &mut body,
+        "sandboxwich_sandboxes_total",
+        "Sandboxes by lifecycle state.",
+        "state",
+        count_by(db, "sandboxes", "state").await?,
+    );
+    append_count_family(
+        &mut body,
+        "sandboxwich_workers_total",
+        "Workers by registration status.",
+        "status",
+        count_by(db, "workers", "status").await?,
+    );
+    append_count_family(
+        &mut body,
+        "sandboxwich_jobs_total",
+        "Jobs by scheduler status.",
+        "status",
+        count_by(db, "jobs", "status").await?,
+    );
+    append_count_family(
+        &mut body,
+        "sandboxwich_runtime_resources_total",
+        "Runtime resources by provider status.",
+        "status",
+        count_by(db, "runtime_resources", "status").await?,
+    );
+    append_gauge(
+        &mut body,
+        "sandboxwich_job_leases_active",
+        "Active job leases.",
+        scalar_i64(
+            db,
+            "select count(*) as value from job_leases where status = 'active'",
+        )
+        .await?,
+    );
+    append_gauge(
+        &mut body,
+        "sandboxwich_worker_capacity_slots",
+        "Total configured worker concurrency slots.",
+        scalar_i64(
+            db,
+            "select coalesce(sum(max_concurrent_jobs), 0) as value from workers",
+        )
+        .await?,
+    );
+    Ok(body)
+}
+
+async fn count_by(
+    db: &Database,
+    table: &'static str,
+    column: &'static str,
+) -> Result<Vec<(String, i64)>, ApiError> {
+    let sql = format!(
+        "select {column} as label, count(*) as value
+         from {table}
+         group by {column}
+         order by {column} asc"
+    );
+    let rows = sqlx::query(&sql).fetch_all(&db.pool).await?;
+    rows.into_iter()
+        .map(|row| Ok((row.try_get("label")?, row.try_get("value")?)))
+        .collect()
+}
+
+async fn scalar_i64(db: &Database, sql: &'static str) -> Result<i64, ApiError> {
+    let row = sqlx::query(sql).fetch_one(&db.pool).await?;
+    Ok(row.try_get("value")?)
+}
+
+fn append_count_family(
+    body: &mut String,
+    name: &'static str,
+    help: &'static str,
+    label_name: &'static str,
+    values: Vec<(String, i64)>,
+) {
+    body.push_str("# HELP ");
+    body.push_str(name);
+    body.push(' ');
+    body.push_str(help);
+    body.push('\n');
+    body.push_str("# TYPE ");
+    body.push_str(name);
+    body.push_str(" gauge\n");
+    for (label, value) in values {
+        body.push_str(name);
+        body.push('{');
+        body.push_str(label_name);
+        body.push_str("=\"");
+        body.push_str(&escape_prometheus_label(&label));
+        body.push_str("\"} ");
+        body.push_str(&value.to_string());
+        body.push('\n');
+    }
+}
+
+fn append_gauge(body: &mut String, name: &'static str, help: &'static str, value: i64) {
+    body.push_str("# HELP ");
+    body.push_str(name);
+    body.push(' ');
+    body.push_str(help);
+    body.push('\n');
+    body.push_str("# TYPE ");
+    body.push_str(name);
+    body.push_str(" gauge\n");
+    body.push_str(name);
+    body.push(' ');
+    body.push_str(&value.to_string());
+    body.push('\n');
+}
+
+fn escape_prometheus_label(value: &str) -> String {
+    value
+        .replace('\\', r"\\")
+        .replace('\n', r"\n")
+        .replace('"', r#"\""#)
 }
 
 fn ensure_tenant(resource_tenant_id: &str, ctx: &TenantContext) -> Result<(), ApiError> {

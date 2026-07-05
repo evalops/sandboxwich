@@ -80,6 +80,25 @@ async fn api_token_is_required_when_configured() {
         .unwrap();
     assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
 
+    let ready_without_token: HealthResponse = client
+        .get(format!("{}/readyz", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(ready_without_token.ok);
+
+    let metrics_without_token = client
+        .get(format!("{}/metrics", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(metrics_without_token.status(), StatusCode::UNAUTHORIZED);
+
     let authorized: SandboxListResponse = client
         .get(format!("{}/sandboxes", server.base_url))
         .bearer_auth("test-token")
@@ -108,6 +127,20 @@ async fn run_contract(server: TestServer) {
         .await
         .unwrap();
     assert!(health.ok);
+    assert!(health.database.is_none());
+
+    let readiness: HealthResponse = client
+        .get(format!("{}/readyz", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(readiness.ok);
+    assert!(readiness.database.unwrap().ok);
 
     let created: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
@@ -132,6 +165,7 @@ async fn run_contract(server: TestServer) {
     .await;
     assert_eq!(created.sandbox.tenant_id, "default");
     assert_tenant_boundaries_are_enforced(&client, &server, &created).await;
+    assert_metrics_are_exposed(&client, &server).await;
     assert_guest_health_and_ssh_key_lifecycle(&client, &server, &created).await;
 
     let worker: WorkerResponse = client
@@ -651,6 +685,22 @@ async fn assert_tenant_boundaries_are_enforced(
             .iter()
             .all(|sandbox| sandbox.id != default_sandbox.sandbox.id)
     );
+}
+
+async fn assert_metrics_are_exposed(client: &reqwest::Client, server: &TestServer) {
+    let metrics = client
+        .get(format!("{}/metrics", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics.contains("# TYPE sandboxwich_sandboxes_total gauge"));
+    assert!(metrics.contains("sandboxwich_sandboxes_total{state=\"ready\"}"));
+    assert!(metrics.contains("sandboxwich_worker_capacity_slots"));
 }
 
 async fn assert_guest_health_and_ssh_key_lifecycle(

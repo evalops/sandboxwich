@@ -67,6 +67,14 @@ spec:
           env:
             - name: SANDBOXWICH_API
               value: http://sandboxwich-api:3217
+            - name: SANDBOXWICH_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sandboxwich-secrets
+                  key: api-token
+                  optional: true
+            - name: SANDBOXWICH_TENANT
+              value: default
             - name: POD_NAME
               valueFrom:
                 fieldRef:
