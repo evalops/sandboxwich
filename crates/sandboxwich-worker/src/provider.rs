@@ -30,6 +30,7 @@ pub trait SandboxProvider {
     fn exec_handoff(
         &self,
         sandbox_id: SandboxId,
+        spec: &SandboxProvisionSpec,
         request: AgentCommandRequest,
     ) -> anyhow::Result<AgentCommandResult>;
     fn create_snapshot(
@@ -198,6 +199,21 @@ impl KubernetesDryRunProvider {
             "backend": self.isolation_backend,
             "runtimeClassName": self.runtime_class_name
         })
+    }
+
+    fn validate_network_policy_egress(network_egress: &NetworkEgress) -> anyhow::Result<()> {
+        if let NetworkEgress::Allowlist { rules } = network_egress {
+            if let Some(rule) = rules
+                .iter()
+                .find(|rule| rule.kind == NetworkAllowRuleKind::Host)
+            {
+                bail!(
+                    "standard Kubernetes NetworkPolicy cannot enforce host allow rule {}; use cidr allow rules or a provider with FQDN egress support",
+                    rule.value
+                );
+            }
+        }
+        Ok(())
     }
 
     fn effective_workspace_storage(&self, memory_limit: &MemoryLimit) -> String {
@@ -372,26 +388,6 @@ impl KubernetesDryRunProvider {
         sandbox_id: SandboxId,
         network_egress: &NetworkEgress,
     ) -> serde_json::Value {
-        let mut metadata =
-            self.object_metadata(format!("sandboxwich-egress-{sandbox_id}"), Some(sandbox_id));
-        if let Some(object) = metadata.as_object_mut() {
-            let host_rules = network_egress
-                .rules()
-                .iter()
-                .filter(|rule| rule.kind == NetworkAllowRuleKind::Host)
-                .map(|rule| rule.value.as_str())
-                .collect::<Vec<_>>()
-                .join(",");
-            if !host_rules.is_empty() {
-                object.insert(
-                    "annotations".to_string(),
-                    json!({
-                        "sandboxwich.dev/egress-hosts": host_rules
-                    }),
-                );
-            }
-        }
-
         let egress = match network_egress {
             NetworkEgress::DenyAll => Vec::new(),
             NetworkEgress::AllowAll => vec![json!({})],
@@ -413,7 +409,7 @@ impl KubernetesDryRunProvider {
         json!({
             "apiVersion": "networking.k8s.io/v1",
             "kind": "NetworkPolicy",
-            "metadata": metadata,
+            "metadata": self.object_metadata(format!("sandboxwich-egress-{sandbox_id}"), Some(sandbox_id)),
             "spec": {
                 "podSelector": {
                     "matchLabels": {
@@ -801,6 +797,7 @@ impl KubernetesApplyProvider {
             .dry_run
             .exec_handoff(
                 sandbox_id,
+                &spec,
                 AgentCommandRequest {
                     argv: vec!["echo".to_string(), "sandboxwich".to_string()],
                     cwd: None,
@@ -1150,6 +1147,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
         sandbox_id: SandboxId,
         spec: &SandboxProvisionSpec,
     ) -> anyhow::Result<ProviderSandboxHandle> {
+        Self::validate_network_policy_egress(&spec.network_egress)?;
         Ok(ProviderSandboxHandle {
             provider: "kubernetes".to_string(),
             sandbox_id,
@@ -1161,6 +1159,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
     fn exec_handoff(
         &self,
         sandbox_id: SandboxId,
+        spec: &SandboxProvisionSpec,
         request: AgentCommandRequest,
     ) -> anyhow::Result<AgentCommandResult> {
         let started_at = Utc::now();
@@ -1172,6 +1171,8 @@ impl SandboxProvider for KubernetesDryRunProvider {
                 "mode": "dry_run",
                 "operation": "exec",
                 "sandboxId": sandbox_id,
+                "memoryLimit": spec.memory_limit,
+                "networkEgress": spec.network_egress,
                 "argv": request.argv,
                 "cwd": request.cwd,
                 "envKeys": request.env.keys().collect::<Vec<_>>()
@@ -1221,6 +1222,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
         snapshot_id: SnapshotId,
         spec: &SandboxProvisionSpec,
     ) -> anyhow::Result<ProviderForkHandle> {
+        Self::validate_network_policy_egress(&spec.network_egress)?;
         Ok(ProviderForkHandle {
             provider: "kubernetes".to_string(),
             parent_sandbox_id,
@@ -1301,6 +1303,7 @@ impl SandboxProvider for KubernetesApplyProvider {
         sandbox_id: SandboxId,
         spec: &SandboxProvisionSpec,
     ) -> anyhow::Result<ProviderSandboxHandle> {
+        KubernetesDryRunProvider::validate_network_policy_egress(&spec.network_egress)?;
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
         let manifests = self.provision_manifests(sandbox_id, spec);
         let apply = run_kubectl_documents(
@@ -1344,9 +1347,10 @@ impl SandboxProvider for KubernetesApplyProvider {
     fn exec_handoff(
         &self,
         sandbox_id: SandboxId,
+        spec: &SandboxProvisionSpec,
         request: AgentCommandRequest,
     ) -> anyhow::Result<AgentCommandResult> {
-        self.provision(sandbox_id, &SandboxProvisionSpec::default())?;
+        self.provision(sandbox_id, spec)?;
         let started_at = Utc::now();
         let output = run_kubectl_command(
             &self.kubectl,
@@ -1406,6 +1410,7 @@ impl SandboxProvider for KubernetesApplyProvider {
         snapshot_id: SnapshotId,
         spec: &SandboxProvisionSpec,
     ) -> anyhow::Result<ProviderForkHandle> {
+        KubernetesDryRunProvider::validate_network_policy_egress(&spec.network_egress)?;
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
         let manifests = vec![
             self.dry_run
@@ -1539,6 +1544,7 @@ mod tests {
         let exec = provider
             .exec_handoff(
                 sandbox_id,
+                &spec,
                 AgentCommandRequest {
                     argv: vec!["echo".to_string(), "hello".to_string()],
                     cwd: None,
@@ -1671,6 +1677,26 @@ mod tests {
                 .capabilities
                 .contains(&WorkerCapability::GvisorSandbox)
         );
+    }
+
+    #[test]
+    fn kubernetes_dry_run_rejects_host_allow_rules_for_standard_network_policy() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        let spec = SandboxProvisionSpec {
+            memory_limit: MemoryLimit::OneG,
+            network_egress: NetworkEgress::Allowlist {
+                rules: vec![sandboxwich_core::NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Host,
+                    value: "api.example.com".to_string(),
+                }],
+            },
+        };
+
+        let error = provider
+            .provision(SandboxId::new(), &spec)
+            .expect_err("host allow rules should not silently render deny-all");
+        assert!(error.to_string().contains("cannot enforce host allow rule"));
     }
 
     #[test]

@@ -342,6 +342,14 @@ async fn run_contract(server: TestServer) {
         .unwrap();
     let queued_job = job_for_command(&jobs.jobs, &command.command.id.to_string());
     assert_eq!(queued_job.status, JobStatus::Queued);
+    assert_eq!(
+        queued_job.payload["provisionSpec"]["memory_limit"],
+        serde_json::json!("1g")
+    );
+    assert_eq!(
+        queued_job.payload["provisionSpec"]["network_egress"]["mode"],
+        serde_json::json!("deny_all")
+    );
 
     let claimed: ClaimLeaseResponse = client
         .post(format!(
@@ -1007,6 +1015,74 @@ async fn assert_guest_health_and_ssh_key_lifecycle(
         .await
         .unwrap();
     assert_eq!(ready_health.guest_health.status, GuestStatus::Ready);
+
+    let unhealthy_health: GuestHealthResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/guest-health",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&UpdateGuestHealthRequest {
+            status: GuestStatus::Unhealthy,
+            agent_version: Some("sandboxwich-agent/test".to_string()),
+            checks: Some(serde_json::json!({
+                "exec": {"status": "failed"}
+            })),
+            message: Some("exec stream failed".to_string()),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(unhealthy_health.guest_health.status, GuestStatus::Unhealthy);
+
+    let health_events: EventListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/events",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(health_events.events.iter().any(|event| {
+        event.kind == SandboxEventKind::DesktopExpired
+            && event.data["reason"] == serde_json::json!("guest_unhealthy")
+    }));
+
+    let _: GuestHealthResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/guest-health",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&UpdateGuestHealthRequest {
+            status: GuestStatus::Ready,
+            agent_version: Some("sandboxwich-agent/test".to_string()),
+            checks: Some(serde_json::json!({
+                "exec": {"status": "ok"},
+                "ssh": {
+                    "host": "127.0.0.1",
+                    "port": 2222,
+                    "username": "ubuntu"
+                }
+            })),
+            message: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
 
     let requested_key: SshKeyResponse = client
         .post(format!(

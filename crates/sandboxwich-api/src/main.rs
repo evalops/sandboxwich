@@ -1904,6 +1904,10 @@ async fn queue_command(
                 "argv": command.argv,
                 "cwd": command.cwd,
                 "env": env,
+                "provisionSpec": SandboxProvisionSpec {
+                    memory_limit: sandbox.memory_limit.clone(),
+                    network_egress: sandbox.network_egress.clone(),
+                }
             }),
             required_capability: WorkerCapability::RunCommand,
             priority: 0,
@@ -2290,7 +2294,7 @@ async fn enrich_job_payload_with_provision_spec(
     job: &mut Job,
 ) -> Result<(), ApiError> {
     match job.kind {
-        JobKind::ProvisionSandbox => {
+        JobKind::ProvisionSandbox | JobKind::RunCommand => {
             let sandbox = fetch_sandbox(db, sandbox_id_from_job(job)?).await?;
             add_provision_spec_to_payload(job, &sandbox)?;
         }
@@ -2298,8 +2302,7 @@ async fn enrich_job_payload_with_provision_spec(
             let child = fetch_sandbox(db, child_sandbox_id_from_job(job)?).await?;
             add_provision_spec_to_payload(job, &child)?;
         }
-        JobKind::RunCommand
-        | JobKind::RunPrompt
+        JobKind::RunPrompt
         | JobKind::CreateSnapshot
         | JobKind::StopSandbox
         | JobKind::ResumeSandbox => {}
@@ -2427,11 +2430,39 @@ async fn update_guest_health(
         message: request.message,
     };
     upsert_guest_health(&state.db, &guest_health).await?;
+    maybe_insert_guest_failure_event(&state.db, &guest_health).await?;
 
     Ok(Json(GuestHealthResponse {
         ok: true,
         guest_health,
     }))
+}
+
+async fn maybe_insert_guest_failure_event(
+    db: &Database,
+    guest_health: &GuestHealth,
+) -> Result<(), ApiError> {
+    let reason = match &guest_health.status {
+        GuestStatus::Unhealthy => "guest_unhealthy",
+        GuestStatus::Unreachable => "guest_unreachable",
+        GuestStatus::Pending | GuestStatus::Ready | GuestStatus::Terminated => return Ok(()),
+    };
+
+    insert_event(
+        db,
+        guest_health.sandbox_id,
+        SandboxEventKind::DesktopExpired,
+        json!({
+            "reason": reason,
+            "guestStatus": &guest_health.status,
+            "agentVersion": &guest_health.agent_version,
+            "checks": &guest_health.checks,
+            "message": &guest_health.message,
+            "lastProbeAt": &guest_health.last_probe_at
+        }),
+    )
+    .await?;
+    Ok(())
 }
 
 async fn request_ssh_key(

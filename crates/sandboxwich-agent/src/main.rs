@@ -153,45 +153,79 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
     let client = build_api_client(args.api_token.as_deref(), args.tenant.as_deref())?;
     let sandbox_id = SandboxId(args.sandbox_id);
     let mut iterations = 0_u64;
+    let heartbeat_interval = Duration::from_millis(args.heartbeat_interval_ms.max(1));
+    post_guest_health(&client, &api, sandbox_id, GuestStatus::Ready, None).await?;
+    let heartbeat_task = tokio::spawn(heartbeat_loop(
+        client.clone(),
+        api.clone(),
+        sandbox_id,
+        heartbeat_interval,
+    ));
 
-    loop {
-        if args
-            .max_iterations
-            .is_some_and(|max_iterations| iterations >= max_iterations)
-        {
-            break;
-        }
-        iterations += 1;
-        post_guest_health(&client, &api, sandbox_id, GuestStatus::Ready, None).await?;
-
-        if let Some(worker_id) = args.worker_id {
-            if let Some(lease) = claim_lease(&client, &api, worker_id, args.lease_seconds)
-                .await?
-                .lease
+    let daemon_result = async {
+        loop {
+            if heartbeat_task.is_finished() {
+                bail!("heartbeat loop stopped");
+            }
+            if args
+                .max_iterations
+                .is_some_and(|max_iterations| iterations >= max_iterations)
             {
-                if let Err(error) = handle_lease(&client, &api, lease).await {
-                    post_guest_health(
-                        &client,
-                        &api,
-                        sandbox_id,
-                        GuestStatus::Unhealthy,
-                        Some(error.to_string()),
-                    )
-                    .await?;
+                break;
+            }
+            iterations += 1;
+
+            if let Some(worker_id) = args.worker_id {
+                if let Some(lease) = claim_lease(&client, &api, worker_id, args.lease_seconds)
+                    .await?
+                    .lease
+                {
+                    if let Err(error) = handle_lease(&client, &api, lease).await {
+                        post_guest_health(
+                            &client,
+                            &api,
+                            sandbox_id,
+                            GuestStatus::Unhealthy,
+                            Some(error.to_string()),
+                        )
+                        .await?;
+                    }
                 }
             }
+
+            if args
+                .max_iterations
+                .is_some_and(|max_iterations| iterations >= max_iterations)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(args.idle_sleep_ms)).await;
         }
 
-        if args
-            .max_iterations
-            .is_some_and(|max_iterations| iterations >= max_iterations)
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(args.idle_sleep_ms)).await;
+        Ok(())
+    }
+    .await;
+
+    if heartbeat_task.is_finished() {
+        heartbeat_task.await.context("heartbeat task failed")??;
+    } else {
+        heartbeat_task.abort();
+        let _ = heartbeat_task.await;
     }
 
-    Ok(())
+    daemon_result
+}
+
+async fn heartbeat_loop(
+    client: reqwest::Client,
+    api: String,
+    sandbox_id: SandboxId,
+    heartbeat_interval: Duration,
+) -> anyhow::Result<()> {
+    loop {
+        tokio::time::sleep(heartbeat_interval).await;
+        post_guest_health(&client, &api, sandbox_id, GuestStatus::Ready, None).await?;
+    }
 }
 
 async fn exec(args: ExecArgs) -> anyhow::Result<()> {
@@ -409,14 +443,19 @@ where
             CommandOutputStream::Stderr => tokio::io::stderr().write_all(chunk).await?,
         }
         if let (Some(client), Some(api), Some(lease_id)) = (&client, &api, lease_id) {
-            append_output_chunk(
+            if let Err(error) = append_output_chunk(
                 client,
                 api,
                 lease_id,
                 stream.clone(),
                 String::from_utf8_lossy(chunk).into_owned(),
             )
-            .await?;
+            .await
+            {
+                let warning =
+                    format!("sandboxwich-agent: failed to stream output chunk: {error}\n");
+                let _ = tokio::io::stderr().write_all(warning.as_bytes()).await;
+            }
         }
     }
     Ok(captured)

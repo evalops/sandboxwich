@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, fmt};
 
+use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Utc};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, InvalidHeaderValue};
 use serde::{Deserialize, Serialize};
@@ -1305,6 +1306,7 @@ pub struct AgentHealthResponse {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentFileWriteRequest {
     pub path: String,
+    #[serde(with = "serde_base64_bytes")]
     pub content: Vec<u8>,
 }
 
@@ -1316,7 +1318,29 @@ pub struct AgentFileReadRequest {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentFileReadResponse {
     pub path: String,
+    #[serde(with = "serde_base64_bytes")]
     pub content: Vec<u8>,
+}
+
+mod serde_base64_bytes {
+    use super::*;
+
+    pub fn serialize<S>(content: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&general_purpose::STANDARD.encode(content))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 db_variant_enum! {
@@ -1537,6 +1561,21 @@ mod tests {
         assert_db_variant_contract::<ProviderHealthStatus>();
         assert_db_variant_contract::<GuestStatus>();
         assert_db_variant_contract::<SshKeyStatus>();
+    }
+
+    #[test]
+    fn agent_file_payloads_serialize_content_as_base64() {
+        let payload = AgentFileReadResponse {
+            path: "/workspace/out.bin".to_string(),
+            content: b"hello\0world".to_vec(),
+        };
+
+        let json = serde_json::to_value(&payload).expect("file payload should serialize");
+        assert_eq!(json["content"], "aGVsbG8Ad29ybGQ=");
+
+        let decoded: AgentFileReadResponse =
+            serde_json::from_value(json).expect("file payload should deserialize");
+        assert_eq!(decoded, payload);
     }
 }
 

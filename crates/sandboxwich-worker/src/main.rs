@@ -295,11 +295,12 @@ impl SandboxProvider for RuntimeProvider {
     fn exec_handoff(
         &self,
         sandbox_id: sandboxwich_core::SandboxId,
+        spec: &SandboxProvisionSpec,
         request: AgentCommandRequest,
     ) -> anyhow::Result<sandboxwich_core::AgentCommandResult> {
         match self {
-            Self::DryRun(provider) => provider.exec_handoff(sandbox_id, request),
-            Self::Apply(provider) => provider.exec_handoff(sandbox_id, request),
+            Self::DryRun(provider) => provider.exec_handoff(sandbox_id, spec, request),
+            Self::Apply(provider) => provider.exec_handoff(sandbox_id, spec, request),
         }
     }
 
@@ -379,6 +380,7 @@ async fn main() -> anyhow::Result<()> {
             let spec = SandboxProvisionSpec::default();
             let exec = provider.exec_handoff(
                 sandbox_id,
+                &spec,
                 AgentCommandRequest {
                     argv: vec!["echo".to_string(), "sandboxwich".to_string()],
                     cwd: None,
@@ -765,8 +767,12 @@ fn execute_job(
         }
         JobKind::RunCommand => {
             let sandbox_id = sandbox_id_from_payload(&job.payload)?;
-            let result =
-                provider.exec_handoff(sandbox_id, agent_request_from_payload(&job.payload)?)?;
+            let spec = provision_spec_from_payload(&job.payload)?;
+            let result = provider.exec_handoff(
+                sandbox_id,
+                &spec,
+                agent_request_from_payload(&job.payload)?,
+            )?;
             if result.exit_code.unwrap_or(1) == 0 {
                 Ok(WorkerJobOutcome::Complete(WorkerJobResult::RunCommand {
                     result,
@@ -1052,11 +1058,16 @@ mod tests {
     #[test]
     fn dispatches_command_job_to_provider_exec_handoff() {
         let sandbox_id = SandboxId::new();
+        let spec = SandboxProvisionSpec {
+            memory_limit: sandboxwich_core::MemoryLimit::FourG,
+            network_egress: Default::default(),
+        };
         let outcome = execute_job(
             &job(
                 JobKind::RunCommand,
                 json!({
                     "sandboxId": sandbox_id,
+                    "provisionSpec": spec,
                     "argv": ["echo", "hello"],
                     "env": {}
                 }),
@@ -1071,6 +1082,7 @@ mod tests {
 
         assert_eq!(result.exit_code, Some(0));
         assert!(result.stdout.contains("\"operation\":\"exec\""));
+        assert!(result.stdout.contains("\"memoryLimit\":\"4g\""));
     }
 
     #[test]
