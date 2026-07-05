@@ -1267,6 +1267,11 @@ fn validate_network_egress(network_egress: &NetworkEgress) -> Result<(), ApiErro
                         "cidr network allow rule must use CIDR notation",
                     ));
                 }
+                if rule.kind == NetworkAllowRuleKind::Host {
+                    return Err(ApiError::bad_request(
+                        "host network allow rules require a provider with FQDN egress support; use cidr rules for Kubernetes NetworkPolicy",
+                    ));
+                }
             }
             Ok(())
         }

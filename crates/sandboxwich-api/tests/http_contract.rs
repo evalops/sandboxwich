@@ -836,6 +836,25 @@ async fn assert_resource_tiers_and_file_contracts(
         }
     );
 
+    let host_allowlist = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("host-egress-contract".to_string()),
+            template: None,
+            memory_limit: Some(MemoryLimit::OneG),
+            network_egress: Some(NetworkEgress::Allowlist {
+                rules: vec![NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Host,
+                    value: "api.example.com".to_string(),
+                }],
+            }),
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(host_allowlist.status(), StatusCode::BAD_REQUEST);
+
     let fetched: SandboxResponse = client
         .get(format!(
             "{}/sandboxes/{}",
