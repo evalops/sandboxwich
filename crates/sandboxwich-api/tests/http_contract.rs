@@ -132,6 +132,38 @@ async fn api_token_is_required_when_configured() {
     assert_eq!(spoofed_tenant.sandbox.tenant_id, "default");
 }
 
+#[tokio::test]
+async fn migrate_command_prepares_database_for_no_auto_migrate_server() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("sandboxwich-migrate-test.db")
+            .display()
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_sandboxwich-api"))
+        .arg("migrate")
+        .env("SANDBOXWICH_DATABASE_URL", &database_url)
+        .status()
+        .unwrap();
+    assert!(status.success(), "migrate command failed: {status}");
+
+    let server = TestServer::start_with_auto_migrate(database_url, Some(data_dir), false).await;
+    let readiness: HealthResponse = reqwest::Client::new()
+        .get(format!("{}/readyz", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(readiness.ok);
+}
+
 async fn run_contract(server: TestServer) {
     let client = reqwest::Client::new();
 
@@ -2515,10 +2547,27 @@ impl TestServer {
         Self::start_with_auth(database_url, data_dir, None).await
     }
 
+    async fn start_with_auto_migrate(
+        database_url: String,
+        data_dir: Option<TempDir>,
+        auto_migrate: bool,
+    ) -> Self {
+        Self::start_with_auth_and_auto_migrate(database_url, data_dir, None, auto_migrate).await
+    }
+
     async fn start_with_auth(
         database_url: String,
         data_dir: Option<TempDir>,
         auth_token: Option<&str>,
+    ) -> Self {
+        Self::start_with_auth_and_auto_migrate(database_url, data_dir, auth_token, true).await
+    }
+
+    async fn start_with_auth_and_auto_migrate(
+        database_url: String,
+        data_dir: Option<TempDir>,
+        auth_token: Option<&str>,
+        auto_migrate: bool,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let bind = listener.local_addr().unwrap();
@@ -2530,6 +2579,9 @@ impl TestServer {
             .env("SANDBOXWICH_BIND", bind.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if !auto_migrate {
+            command.env("SANDBOXWICH_AUTO_MIGRATE", "false");
+        }
         if let Some(auth_token) = auth_token {
             command.env("SANDBOXWICH_API_TOKEN", auth_token);
         }

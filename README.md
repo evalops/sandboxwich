@@ -20,6 +20,16 @@ Run the API:
 cargo run -p sandboxwich-api
 ```
 
+Prepare or repair the database schema without starting the server:
+
+```sh
+cargo run -p sandboxwich-api -- migrate
+```
+
+Shared deployments can run `migrate` as a one-shot job and start API pods with
+`SANDBOXWICH_AUTO_MIGRATE=false`; startup then only verifies that migrations and
+typed database constraints are current.
+
 In another shell:
 
 ```sh
@@ -41,6 +51,7 @@ cargo run -p sandboxwich-cli -- workers
 By default the CLI talks to `http://127.0.0.1:3217`. Override it with `SANDBOXWICH_API`.
 
 By default the API writes to `sqlite://sandboxwich.db`. Override it with `SANDBOXWICH_DATABASE_URL`, for example `postgres://sandboxwich:secret@localhost:5432/sandboxwich`.
+Tune the API pool with `SANDBOXWICH_DATABASE_MAX_CONNECTIONS`.
 
 The API exposes `/healthz`, `/readyz`, and `/metrics`. Set `SANDBOXWICH_API_TOKEN` to require bearer auth on API and metrics requests; `/healthz` and `/readyz` remain probe-friendly for Kubernetes.
 
@@ -61,3 +72,20 @@ See [ROADMAP.md](ROADMAP.md) for the current milestones.
 For k3s and Kubernetes deployment notes, see [docs/kubernetes.md](docs/kubernetes.md).
 
 For API compatibility notes, see [CHANGELOG.md](CHANGELOG.md).
+
+## Benchmarks
+
+Run the local benchmark harness after building the API:
+
+```sh
+cargo build -p sandboxwich-api -p sandboxwich-bench
+cargo run -p sandboxwich-bench -- all \
+  --api-bin target/debug/sandboxwich-api \
+  --runs 5 \
+  --requests 300 \
+  --seed-sandboxes 250
+```
+
+The harness runs a warm-start benchmark, seeds realistic sandboxes, commands,
+events, workers, jobs, and runtime resources, then measures common HTTP paths.
+CI uploads the same style of report as `sandboxwich-benchmark-report`.

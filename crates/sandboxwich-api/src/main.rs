@@ -78,19 +78,81 @@ enum SqlDialect {
     Sqlite,
 }
 
+enum ApiCommand {
+    Serve,
+    Migrate,
+    CheckSchema,
+}
+
+struct ApiConfig {
+    command: ApiCommand,
+    database_url: String,
+    bind: SocketAddr,
+    database_max_connections: u32,
+    auto_migrate: bool,
+    shared_token: Option<String>,
+    tenant_tokens: Vec<TenantToken>,
+    default_tenant_id: String,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
+    let config = load_api_config()?;
+    let db = connect_database(&config.database_url, config.database_max_connections).await?;
+
+    match config.command {
+        ApiCommand::Migrate => {
+            migrate_database(&db).await?;
+            tracing::info!(database_url = %config.database_url, "database migrations complete");
+            return Ok(());
+        }
+        ApiCommand::CheckSchema => {
+            verify_database_schema(&db).await?;
+            tracing::info!(database_url = %config.database_url, "database schema ready");
+            return Ok(());
+        }
+        ApiCommand::Serve => {
+            if config.auto_migrate {
+                migrate_database(&db).await?;
+            } else {
+                verify_database_schema(&db).await?;
+            }
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind(config.bind).await?;
+    tracing::info!(addr = %config.bind, database_url = %config.database_url, "sandboxwich-api listening");
+    axum::serve(
+        listener,
+        app(AppState {
+            db,
+            auth: AuthConfig {
+                shared_token: config.shared_token,
+                tenant_tokens: config.tenant_tokens,
+            },
+            default_tenant_id: config.default_tenant_id,
+        }),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
+    Ok(())
+}
+
+fn load_api_config() -> anyhow::Result<ApiConfig> {
+    let command = parse_api_command(std::env::args().skip(1))?;
     let bind = std::env::var("SANDBOXWICH_BIND").unwrap_or_else(|_| "127.0.0.1:3217".to_string());
-    let addr: SocketAddr = bind
+    let bind: SocketAddr = bind
         .parse()
         .with_context(|| format!("invalid SANDBOXWICH_BIND value: {bind}"))?;
 
     let database_url = std::env::var("SANDBOXWICH_DATABASE_URL")
         .unwrap_or_else(|_| "sqlite://sandboxwich.db".to_string());
+    let database_max_connections = parse_env_u32("SANDBOXWICH_DATABASE_MAX_CONNECTIONS", 5)?.max(1);
+    let auto_migrate = parse_env_bool("SANDBOXWICH_AUTO_MIGRATE", true)?;
     let shared_token = std::env::var("SANDBOXWICH_API_TOKEN")
         .ok()
         .map(|token| token.trim().to_string())
@@ -101,29 +163,95 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .filter(|tenant| !tenant.trim().is_empty())
         .unwrap_or_else(|| "default".to_string());
-    let db = connect_database(&database_url).await?;
+
+    Ok(ApiConfig {
+        command,
+        database_url,
+        bind,
+        database_max_connections,
+        auto_migrate,
+        shared_token,
+        tenant_tokens,
+        default_tenant_id,
+    })
+}
+
+fn parse_api_command(args: impl IntoIterator<Item = String>) -> anyhow::Result<ApiCommand> {
+    let mut args = args.into_iter();
+    let command = match args.next().as_deref() {
+        None | Some("serve") => ApiCommand::Serve,
+        Some("migrate") => ApiCommand::Migrate,
+        Some("check-schema") => ApiCommand::CheckSchema,
+        Some("--help") | Some("-h") => {
+            println!("usage: sandboxwich-api [serve|migrate|check-schema]");
+            std::process::exit(0);
+        }
+        Some(command) => anyhow::bail!(
+            "unknown sandboxwich-api command {command:?}; expected serve, migrate, or check-schema"
+        ),
+    };
+    if let Some(extra) = args.next() {
+        anyhow::bail!("unexpected extra sandboxwich-api argument {extra:?}");
+    }
+    Ok(command)
+}
+
+fn parse_env_u32(name: &'static str, default: u32) -> anyhow::Result<u32> {
+    let Some(value) = std::env::var(name).ok() else {
+        return Ok(default);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(default);
+    }
+    value
+        .parse()
+        .with_context(|| format!("invalid {name} value: {value}"))
+}
+
+fn parse_env_bool(name: &'static str, default: bool) -> anyhow::Result<bool> {
+    let Some(value) = std::env::var(name).ok() else {
+        return Ok(default);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(default),
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        value => anyhow::bail!("invalid {name} value: {value}"),
+    }
+}
+
+async fn migrate_database(db: &Database) -> anyhow::Result<()> {
     sqlx::migrate!("./migrations").run(&db.pool).await?;
     ensure_database_constraints(&db).await?;
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, %database_url, "sandboxwich-api listening");
-    axum::serve(
-        listener,
-        app(AppState {
-            db,
-            auth: AuthConfig {
-                shared_token,
-                tenant_tokens,
-            },
-            default_tenant_id,
-        }),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
     Ok(())
 }
 
-async fn connect_database(database_url: &str) -> anyhow::Result<Database> {
+async fn verify_database_schema(db: &Database) -> anyhow::Result<()> {
+    let migration = sqlx::query(
+        "select version from _sqlx_migrations where success = true order by version desc limit 1",
+    )
+    .fetch_optional(&db.pool)
+    .await
+    .context("database migrations have not been applied; run `sandboxwich-api migrate`")?;
+    if migration.is_none() {
+        anyhow::bail!("database migrations have not been applied; run `sandboxwich-api migrate`");
+    }
+    let Some(value) = fetch_schema_metadata(db, DB_ENUM_SCHEMA_METADATA_KEY).await? else {
+        anyhow::bail!(
+            "database enum constraints have not been reconciled; run `sandboxwich-api migrate`"
+        );
+    };
+    let expected = db_enum_schema_fingerprint();
+    if value != expected {
+        anyhow::bail!(
+            "database enum constraints are out of date; expected fingerprint {expected}, found {value}; run `sandboxwich-api migrate`"
+        );
+    }
+    Ok(())
+}
+
+async fn connect_database(database_url: &str, max_connections: u32) -> anyhow::Result<Database> {
     sqlx::any::install_default_drivers();
     let dialect = SqlDialect::from_url(database_url)?;
     if matches!(dialect, SqlDialect::Sqlite)
@@ -133,7 +261,7 @@ async fn connect_database(database_url: &str) -> anyhow::Result<Database> {
     }
 
     let pool = AnyPoolOptions::new()
-        .max_connections(5)
+        .max_connections(max_connections)
         .connect(database_url)
         .await?;
     Ok(Database { pool, dialect })
@@ -165,10 +293,95 @@ fn parse_tenant_tokens(value: Option<&str>) -> anyhow::Result<Vec<TenantToken>> 
 }
 
 async fn ensure_database_constraints(db: &Database) -> anyhow::Result<()> {
-    match db.dialect {
-        SqlDialect::Postgres => ensure_postgres_constraints(db).await,
-        SqlDialect::Sqlite => ensure_sqlite_constraints(db).await,
+    let fingerprint = db_enum_schema_fingerprint();
+    if fetch_schema_metadata(db, DB_ENUM_SCHEMA_METADATA_KEY)
+        .await?
+        .as_deref()
+        == Some(fingerprint.as_str())
+    {
+        return Ok(());
     }
+
+    match db.dialect {
+        SqlDialect::Postgres => ensure_postgres_constraints(db).await?,
+        SqlDialect::Sqlite => ensure_sqlite_constraints(db).await?,
+    };
+    write_schema_metadata(db, DB_ENUM_SCHEMA_METADATA_KEY, &fingerprint).await?;
+    Ok(())
+}
+
+const DB_ENUM_SCHEMA_METADATA_KEY: &str = "db_enum_constraints_fingerprint";
+const DB_ENUM_SCHEMA_FINGERPRINT_VERSION: &str = "db-enum-v1";
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x00000100000001b3;
+
+fn db_enum_schema_fingerprint() -> String {
+    let mut hash = FNV_OFFSET_BASIS;
+    feed_hash(&mut hash, DB_ENUM_SCHEMA_FINGERPRINT_VERSION);
+    for column in db_enum_columns() {
+        feed_hash(&mut hash, column.table);
+        feed_hash(&mut hash, column.column);
+        feed_hash(&mut hash, column.constraint_name);
+        feed_hash(&mut hash, column.error_message);
+        for value in column.values {
+            feed_hash(&mut hash, value);
+        }
+    }
+    feed_hash(&mut hash, "runtime_resources.cluster:not_empty");
+    format!("{DB_ENUM_SCHEMA_FINGERPRINT_VERSION}:{hash:016x}")
+}
+
+fn feed_hash(hash: &mut u64, value: &str) {
+    for byte in value.as_bytes() {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    *hash ^= 0xff;
+    *hash = hash.wrapping_mul(FNV_PRIME);
+}
+
+async fn fetch_schema_metadata(db: &Database, key: &str) -> anyhow::Result<Option<String>> {
+    let sql = format!(
+        "select value from schema_metadata where key = {}",
+        db.placeholder(1)
+    );
+    let row = sqlx::query(&sql).bind(key).fetch_optional(&db.pool).await?;
+    row.map(|row| row.try_get("value"))
+        .transpose()
+        .map_err(Into::into)
+}
+
+async fn write_schema_metadata(db: &Database, key: &str, value: &str) -> anyhow::Result<()> {
+    let now = Utc::now().to_rfc3339();
+    let sql = match db.dialect {
+        SqlDialect::Postgres => format!(
+            "insert into schema_metadata (key, value, updated_at)
+             values ({}, {}, {})
+             on conflict (key) do update set
+                 value = excluded.value,
+                 updated_at = excluded.updated_at",
+            db.placeholder(1),
+            db.placeholder(2),
+            db.placeholder(3)
+        ),
+        SqlDialect::Sqlite => format!(
+            "insert into schema_metadata (key, value, updated_at)
+             values ({}, {}, {})
+             on conflict (key) do update set
+                 value = excluded.value,
+                 updated_at = excluded.updated_at",
+            db.placeholder(1),
+            db.placeholder(2),
+            db.placeholder(3)
+        ),
+    };
+    sqlx::query(&sql)
+        .bind(key)
+        .bind(value)
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -537,6 +750,35 @@ mod tests {
         let sqlite = sqlite_enum_trigger_statements(column).join("\n");
         assert!(sqlite.contains("'ready', 'it''''s-weird'"));
         assert!(sqlite.contains("'invalid widget''s state'"));
+    }
+
+    #[test]
+    fn api_command_parser_accepts_operational_modes() {
+        assert!(matches!(
+            parse_api_command(Vec::<String>::new()).unwrap(),
+            ApiCommand::Serve
+        ));
+        assert!(matches!(
+            parse_api_command(["serve".to_string()]).unwrap(),
+            ApiCommand::Serve
+        ));
+        assert!(matches!(
+            parse_api_command(["migrate".to_string()]).unwrap(),
+            ApiCommand::Migrate
+        ));
+        assert!(matches!(
+            parse_api_command(["check-schema".to_string()]).unwrap(),
+            ApiCommand::CheckSchema
+        ));
+        assert!(parse_api_command(["migrate".to_string(), "extra".to_string()]).is_err());
+        assert!(parse_api_command(["wat".to_string()]).is_err());
+    }
+
+    #[test]
+    fn db_enum_fingerprint_is_versioned_and_stable_for_current_registry() {
+        let fingerprint = db_enum_schema_fingerprint();
+        assert!(fingerprint.starts_with("db-enum-v1:"));
+        assert_eq!(fingerprint, db_enum_schema_fingerprint());
     }
 }
 

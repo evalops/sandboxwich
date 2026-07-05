@@ -2,6 +2,7 @@
 members = [
     "crates/sandboxwich-agent",
     "crates/sandboxwich-api",
+    "crates/sandboxwich-bench",
     "crates/sandboxwich-cli",
     "crates/sandboxwich-core",
     "crates/sandboxwich-worker",
