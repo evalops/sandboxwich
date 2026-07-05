@@ -45,13 +45,25 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct AppState {
     db: Database,
-    auth_token: Option<String>,
+    auth: AuthConfig,
     default_tenant_id: String,
 }
 
 #[derive(Clone, Debug)]
 struct TenantContext {
     tenant_id: String,
+}
+
+#[derive(Clone)]
+struct AuthConfig {
+    shared_token: Option<String>,
+    tenant_tokens: Vec<TenantToken>,
+}
+
+#[derive(Clone)]
+struct TenantToken {
+    tenant_id: String,
+    token: String,
 }
 
 #[derive(Clone)]
@@ -79,9 +91,12 @@ async fn main() -> anyhow::Result<()> {
 
     let database_url = std::env::var("SANDBOXWICH_DATABASE_URL")
         .unwrap_or_else(|_| "sqlite://sandboxwich.db".to_string());
-    let auth_token = std::env::var("SANDBOXWICH_API_TOKEN")
+    let shared_token = std::env::var("SANDBOXWICH_API_TOKEN")
         .ok()
-        .filter(|token| !token.trim().is_empty());
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty());
+    let tenant_tokens =
+        parse_tenant_tokens(std::env::var("SANDBOXWICH_TENANT_TOKENS").ok().as_deref())?;
     let default_tenant_id = std::env::var("SANDBOXWICH_DEFAULT_TENANT")
         .ok()
         .filter(|tenant| !tenant.trim().is_empty())
@@ -96,7 +111,10 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app(AppState {
             db,
-            auth_token,
+            auth: AuthConfig {
+                shared_token,
+                tenant_tokens,
+            },
             default_tenant_id,
         }),
     )
@@ -119,6 +137,31 @@ async fn connect_database(database_url: &str) -> anyhow::Result<Database> {
         .connect(database_url)
         .await?;
     Ok(Database { pool, dialect })
+}
+
+fn parse_tenant_tokens(value: Option<&str>) -> anyhow::Result<Vec<TenantToken>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let (tenant_id, token) = entry
+                .split_once('=')
+                .with_context(|| format!("invalid SANDBOXWICH_TENANT_TOKENS entry: {entry}"))?;
+            let tenant_id = tenant_id.trim();
+            let token = token.trim();
+            if tenant_id.is_empty() || token.is_empty() {
+                anyhow::bail!("invalid SANDBOXWICH_TENANT_TOKENS entry: {entry}");
+            }
+            Ok(TenantToken {
+                tenant_id: tenant_id.to_string(),
+                token: token.to_string(),
+            })
+        })
+        .collect()
 }
 
 async fn ensure_database_constraints(db: &Database) -> anyhow::Result<()> {
@@ -308,6 +351,28 @@ async fn ensure_postgres_constraints(db: &Database) -> anyhow::Result<()> {
             ) then
                 alter table runtime_resources add constraint runtime_resources_status_check
                     check (status in ('planned', 'applied', 'ready', 'failed', 'deleted'));
+            end if;
+        end $$;
+        "#,
+        r#"
+        do $$
+        begin
+            if not exists (
+                select 1 from pg_constraint where conname = 'runtime_resources_cluster_not_empty_check'
+            ) then
+                alter table runtime_resources add constraint runtime_resources_cluster_not_empty_check
+                    check (cluster is null or cluster <> '');
+            end if;
+        end $$;
+        "#,
+        r#"
+        do $$
+        begin
+            if not exists (
+                select 1 from pg_constraint where conname = 'cleanup_runs_status_check'
+            ) then
+                alter table cleanup_runs add constraint cleanup_runs_status_check
+                    check (status in ('running', 'succeeded', 'failed'));
             end if;
         end $$;
         "#,
@@ -630,6 +695,42 @@ async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
             select raise(abort, 'invalid runtime resource status');
         end;
         "#,
+        r#"
+        create trigger if not exists validate_runtime_resources_cluster_insert
+        before insert on runtime_resources
+        for each row
+        when new.cluster = ''
+        begin
+            select raise(abort, 'invalid runtime resource cluster');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_runtime_resources_cluster_update
+        before update of cluster on runtime_resources
+        for each row
+        when new.cluster = ''
+        begin
+            select raise(abort, 'invalid runtime resource cluster');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_cleanup_runs_status_insert
+        before insert on cleanup_runs
+        for each row
+        when new.status not in ('running', 'succeeded', 'failed')
+        begin
+            select raise(abort, 'invalid cleanup run status');
+        end;
+        "#,
+        r#"
+        create trigger if not exists validate_cleanup_runs_status_update
+        before update of status on cleanup_runs
+        for each row
+        when new.status not in ('running', 'succeeded', 'failed')
+        begin
+            select raise(abort, 'invalid cleanup run status');
+        end;
+        "#,
     ] {
         sqlx::query(statement).execute(&db.pool).await?;
     }
@@ -716,37 +817,68 @@ fn app(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(state, auth_and_tenant))
 }
 
+const PROBE_PATHS: &[&str] = &["/healthz", "/readyz"];
+
 async fn auth_and_tenant(
     State(state): State<AppState>,
     mut request: Request,
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    if let Some(expected_token) = &state.auth_token {
-        let is_probe = matches!(path, "/healthz" | "/readyz");
-        let authorized = is_probe
-            || request
-                .headers()
-                .get(header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.strip_prefix("Bearer "))
-                .is_some_and(|token| token == expected_token);
+    let tenant_id = if PROBE_PATHS.contains(&path) {
+        state.default_tenant_id.clone()
+    } else if !state.auth.tenant_tokens.is_empty() {
+        let Some(token) = bearer_token(&request) else {
+            return ApiError::unauthorized("valid bearer token is required").into_response();
+        };
+        let Some(tenant) = state
+            .auth
+            .tenant_tokens
+            .iter()
+            .find(|candidate| constant_time_eq(token.as_bytes(), candidate.token.as_bytes()))
+        else {
+            return ApiError::unauthorized("valid tenant bearer token is required").into_response();
+        };
+        tenant.tenant_id.clone()
+    } else if let Some(expected_token) = &state.auth.shared_token {
+        let authorized = bearer_token(&request)
+            .is_some_and(|token| constant_time_eq(token.as_bytes(), expected_token.as_bytes()));
         if !authorized {
             return ApiError::unauthorized("valid bearer token is required").into_response();
         }
-    }
-
-    let tenant_id = request
-        .headers()
-        .get("x-sandboxwich-tenant")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|tenant| !tenant.is_empty())
-        .unwrap_or(&state.default_tenant_id)
-        .to_string();
+        state.default_tenant_id.clone()
+    } else {
+        request
+            .headers()
+            .get("x-sandboxwich-tenant")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|tenant| !tenant.is_empty())
+            .unwrap_or(&state.default_tenant_id)
+            .to_string()
+    };
     request.extensions_mut().insert(TenantContext { tenant_id });
 
     next.run(request).await
+}
+
+fn bearer_token(request: &Request) -> Option<&str> {
+    request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        diff |= usize::from(left_byte ^ right_byte);
+    }
+    diff == 0
 }
 
 async fn shutdown_signal() {
@@ -776,22 +908,19 @@ async fn readyz(State(state): State<AppState>) -> Response {
             }),
         )
             .into_response(),
-        Err(error) => {
-            tracing::warn!(?error, "readiness check failed");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(HealthResponse {
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HealthResponse {
+                ok: false,
+                service: "sandboxwich-api".to_string(),
+                checked_at: Utc::now(),
+                database: Some(HealthComponent {
                     ok: false,
-                    service: "sandboxwich-api".to_string(),
-                    checked_at: Utc::now(),
-                    database: Some(HealthComponent {
-                        ok: false,
-                        message: Some("database unavailable".to_string()),
-                    }),
+                    message: Some("database unavailable".to_string()),
                 }),
-            )
-                .into_response()
-        }
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -819,28 +948,28 @@ async fn collect_prometheus_metrics(db: &Database) -> Result<String, ApiError> {
     let mut body = String::new();
     append_count_family(
         &mut body,
-        "sandboxwich_sandboxes_total",
+        "sandboxwich_sandbox_count",
         "Sandboxes by lifecycle state.",
         "state",
         count_by(db, "sandboxes", "state").await?,
     );
     append_count_family(
         &mut body,
-        "sandboxwich_workers_total",
+        "sandboxwich_worker_count",
         "Workers by registration status.",
         "status",
         count_by(db, "workers", "status").await?,
     );
     append_count_family(
         &mut body,
-        "sandboxwich_jobs_total",
+        "sandboxwich_job_count",
         "Jobs by scheduler status.",
         "status",
         count_by(db, "jobs", "status").await?,
     );
     append_count_family(
         &mut body,
-        "sandboxwich_runtime_resources_total",
+        "sandboxwich_runtime_resource_count",
         "Runtime resources by provider status.",
         "status",
         count_by(db, "runtime_resources", "status").await?,
@@ -1115,7 +1244,7 @@ async fn fork_sandbox(
         }),
         created_at: now,
         ready_at: None,
-        expires_at: expires_at_from_ttl(now, request.ttl_seconds)?,
+        expires_at: None,
         error: None,
     };
     insert_snapshot(&state.db, &snapshot).await?;
@@ -1677,8 +1806,14 @@ async fn reconcile_runtime_resources(
 
     let observed_at = Utc::now();
     let mut tx = state.db.pool.begin().await?;
-    let reconciled =
-        reconcile_runtime_resources_on_connection(&state.db, &mut *tx, &request, observed_at).await;
+    let reconciled = reconcile_runtime_resources_on_connection(
+        &state.db,
+        &mut *tx,
+        &request,
+        &ctx.tenant_id,
+        observed_at,
+    )
+    .await;
 
     match reconciled {
         Ok((upserted, deleted)) => {
@@ -1731,6 +1866,7 @@ async fn get_capacity(
     let workers = list_worker_capacities(&state.db, &ctx.tenant_id).await?;
     let total_max_concurrent_jobs = workers
         .iter()
+        .filter(|worker| worker.status == WorkerStatus::Online)
         .map(|worker| worker.max_concurrent_jobs)
         .sum();
     let total_active_leases = workers.iter().map(|worker| worker.active_leases).sum();
@@ -1753,7 +1889,7 @@ async fn create_job(
     let now = Utc::now();
     let job = Job {
         id: JobId::new(),
-        tenant_id: ctx.tenant_id,
+        tenant_id: ctx.tenant_id.clone(),
         kind: request.kind,
         status: JobStatus::Queued,
         payload: request.payload,
@@ -1766,8 +1902,45 @@ async fn create_job(
         updated_at: now,
         last_error: None,
     };
+    validate_job_payload_tenant(&state.db, &job, &ctx).await?;
     insert_job(&state.db, &job).await?;
     Ok(Json(JobResponse { ok: true, job }))
+}
+
+async fn validate_job_payload_tenant(
+    db: &Database,
+    job: &Job,
+    ctx: &TenantContext,
+) -> Result<(), ApiError> {
+    match job.kind {
+        JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {
+            ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
+        }
+        JobKind::RunCommand => {
+            ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
+            let command = fetch_command(db, command_id_from_job(job)?).await?;
+            ensure_sandbox_tenant(db, command.sandbox_id, ctx).await?;
+        }
+        JobKind::RunPrompt => {
+            ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
+        }
+        JobKind::CreateSnapshot => {
+            let snapshot = fetch_snapshot(db, snapshot_id_from_job(job)?).await?;
+            let sandbox = ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
+            if snapshot.sandbox_id != sandbox.id {
+                return Err(ApiError::bad_request(
+                    "snapshot must belong to the referenced sandbox",
+                ));
+            }
+        }
+        JobKind::ForkSandbox => {
+            ensure_sandbox_tenant(db, parent_sandbox_id_from_job(job)?, ctx).await?;
+            ensure_sandbox_tenant(db, child_sandbox_id_from_job(job)?, ctx).await?;
+            let snapshot = fetch_snapshot(db, snapshot_id_from_job(job)?).await?;
+            ensure_sandbox_tenant(db, snapshot.sandbox_id, ctx).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn list_jobs(
@@ -1960,13 +2133,6 @@ async fn claim_lease(
 ) -> Result<Json<ClaimLeaseResponse>, ApiError> {
     expire_due_leases(&state.db).await?;
     let worker = ensure_worker_tenant(&state.db, WorkerId(worker_id), &ctx).await?;
-    if !worker_has_capacity(&state.db, &worker).await? {
-        return Ok(Json(ClaimLeaseResponse {
-            ok: true,
-            lease: None,
-        }));
-    }
-
     let sql = format!(
         "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
@@ -1986,9 +2152,7 @@ async fn claim_lease(
         if !worker.capabilities.contains(&job.required_capability) {
             continue;
         }
-        if let Some(lease) =
-            try_claim_job(&state.db, worker.id, &job, request.lease_seconds).await?
-        {
+        if let Some(lease) = try_claim_job(&state.db, &worker, &job, request.lease_seconds).await? {
             return Ok(Json(ClaimLeaseResponse {
                 ok: true,
                 lease: Some(lease),
@@ -2134,45 +2298,69 @@ async fn fail_lease(
         return Err(ApiError::bad_request("error is required"));
     }
     let lease_id = LeaseId(lease_id);
-    let lease = ensure_lease_tenant(&state.db, lease_id, &ctx).await?;
-    if lease.status != LeaseStatus::Active {
-        return Err(ApiError::bad_request("lease is not active"));
-    }
-
-    let now = Utc::now();
-    update_lease_status(
-        &state.db,
-        lease_id,
-        LeaseStatus::Failed,
-        Some(now),
-        Some(&request.error),
-    )
-    .await?;
-    let retry = request.retry && lease.job.attempts < lease.job.max_attempts;
-    if retry {
-        update_job_status(
-            &state.db,
-            lease.job_id,
-            JobStatus::Queued,
-            Some(&request.error),
-            now,
-        )
-        .await?;
-        apply_retryable_job(&state.db, &lease.job, &request.error).await?;
-    } else {
-        update_job_status(
-            &state.db,
-            lease.job_id,
-            JobStatus::Failed,
-            Some(&request.error),
-            now,
-        )
-        .await?;
-        apply_failed_job(&state.db, &lease.job, &request.error).await?;
-    }
-
-    let lease = fetch_lease(&state.db, lease_id).await?;
+    ensure_lease_tenant(&state.db, lease_id, &ctx).await?;
+    let lease =
+        fail_lease_in_transaction(&state.db, lease_id, request.retry, &request.error).await?;
     Ok(Json(LeaseResponse { ok: true, lease }))
+}
+
+async fn fail_lease_in_transaction(
+    db: &Database,
+    lease_id: LeaseId,
+    retry_requested: bool,
+    error: &str,
+) -> Result<JobLease, ApiError> {
+    let mut tx = db.pool.begin().await?;
+
+    let failed = async {
+        let lease = fetch_lease_on_connection(db, &mut *tx, lease_id).await?;
+        if lease.status != LeaseStatus::Active {
+            return Err(ApiError::bad_request("lease is not active"));
+        }
+
+        let now = Utc::now();
+        fail_active_lease_on_connection(db, &mut *tx, lease_id, now, error).await?;
+        let retry = retry_requested && lease.job.attempts < lease.job.max_attempts;
+        if retry {
+            update_job_status_on_connection(
+                db,
+                &mut *tx,
+                lease.job_id,
+                JobStatus::Queued,
+                Some(error),
+                now,
+            )
+            .await?;
+            apply_retryable_job_on_connection(db, &mut *tx, &lease.job, error).await?;
+        } else {
+            update_job_status_on_connection(
+                db,
+                &mut *tx,
+                lease.job_id,
+                JobStatus::Failed,
+                Some(error),
+                now,
+            )
+            .await?;
+            apply_failed_job_on_connection(db, &mut *tx, &lease.job, error).await?;
+        }
+
+        fetch_lease_on_connection(db, &mut *tx, lease_id).await
+    }
+    .await;
+
+    match failed {
+        Ok(lease) => {
+            tx.commit().await?;
+            Ok(lease)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = tx.rollback().await {
+                tracing::warn!(%rollback_error, "failed to roll back lease failure");
+            }
+            Err(error)
+        }
+    }
 }
 
 async fn transition_sandbox(
@@ -2286,6 +2474,39 @@ async fn fetch_sandbox(db: &Database, sandbox_id: SandboxId) -> Result<Sandbox, 
     row_to_sandbox(row)
 }
 
+async fn fetch_sandbox_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    sandbox_id: SandboxId,
+) -> Result<Sandbox, ApiError> {
+    let sql = format!(
+        "select id, tenant_id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id
+         from sandboxes
+         where id = {}",
+        db.placeholder(1)
+    );
+    let row = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| ApiError::not_found("sandbox not found"))?;
+
+    row_to_sandbox(row)
+}
+
+async fn ensure_sandbox_tenant_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    sandbox_id: SandboxId,
+    tenant_id: &str,
+) -> Result<Sandbox, ApiError> {
+    let sandbox = fetch_sandbox_on_connection(db, connection, sandbox_id).await?;
+    if sandbox.tenant_id != tenant_id {
+        return Err(ApiError::not_found("resource not found"));
+    }
+    Ok(sandbox)
+}
+
 async fn list_runtime_resources_for_sandbox(
     db: &Database,
     sandbox_id: SandboxId,
@@ -2321,6 +2542,7 @@ async fn upsert_provider_runtime_resources_on_connection(
             resource,
             Some(observed_at),
             None,
+            None,
         )
         .await?;
     }
@@ -2332,18 +2554,29 @@ async fn reconcile_runtime_resources_on_connection(
     db: &Database,
     connection: &mut AnyConnection,
     request: &ReconcileRuntimeResourcesRequest,
+    tenant_id: &str,
     observed_at: DateTime<Utc>,
 ) -> Result<(Vec<RuntimeResource>, Vec<RuntimeResource>), ApiError> {
     let mut upserted = Vec::new();
     let mut observed = Vec::new();
 
     for resource in &request.resources {
+        ensure_sandbox_tenant_on_connection(db, connection, resource.sandbox_id, tenant_id).await?;
+        if let Some(snapshot_id) = resource.snapshot_id {
+            let snapshot = fetch_snapshot_on_connection(db, connection, snapshot_id).await?;
+            if snapshot.sandbox_id != resource.sandbox_id {
+                return Err(ApiError::bad_request(
+                    "runtime resource snapshot must belong to the resource sandbox",
+                ));
+            }
+        }
         let resource = upsert_provider_runtime_resource_on_connection(
             db,
             connection,
             resource,
             Some(observed_at),
             Some(observed_at),
+            Some(tenant_id),
         )
         .await?;
         observed.push(ObservedRuntimeResourceIdentity {
@@ -2358,6 +2591,7 @@ async fn reconcile_runtime_resources_on_connection(
             db,
             connection,
             request,
+            tenant_id,
             &observed,
             observed_at,
         )
@@ -2537,6 +2771,7 @@ async fn upsert_provider_runtime_resource_on_connection(
     resource: &ProviderRuntimeResource,
     observed_at: Option<DateTime<Utc>>,
     last_reconciled_at: Option<DateTime<Utc>>,
+    tenant_id: Option<&str>,
 ) -> Result<RuntimeResource, ApiError> {
     validate_provider_runtime_resource(resource)?;
     let existing_id = fetch_runtime_resource_id_on_connection(
@@ -2550,6 +2785,12 @@ async fn upsert_provider_runtime_resource_on_connection(
     )
     .await?;
     if let Some(resource_id) = existing_id {
+        if let Some(tenant_id) = tenant_id {
+            let existing =
+                fetch_runtime_resource_on_connection(db, connection, resource_id).await?;
+            ensure_sandbox_tenant_on_connection(db, connection, existing.sandbox_id, tenant_id)
+                .await?;
+        }
         update_runtime_resource_from_provider_on_connection(
             db,
             connection,
@@ -2644,7 +2885,7 @@ async fn update_runtime_resource_from_provider_on_connection(
              resource_name = {}, namespace = {}, status = {}, cluster = {}, storage_class = {},
              snapshot_class = {}, storage_size = {}, runtime_image = {}, service_port = {},
              target_port = {}, source_snapshot_id = {}, updated_at = {}, ready_at = {},
-             deleted_at = {}, error = {}, observed_at = {}, last_reconciled_at = {}
+             deleted_at = {}, error = {}, observed_at = {}, last_reconciled_at = coalesce({}, last_reconciled_at)
          where id = {}",
         db.placeholder(1),
         db.placeholder(2),
@@ -2714,37 +2955,54 @@ async fn mark_missing_runtime_resources_deleted_on_connection(
     db: &Database,
     connection: &mut AnyConnection,
     request: &ReconcileRuntimeResourcesRequest,
+    tenant_id: &str,
     observed: &[ObservedRuntimeResourceIdentity],
     reconciled_at: DateTime<Utc>,
 ) -> Result<Vec<RuntimeResource>, ApiError> {
     let (sql, cluster_bind) = if request.cluster.is_some() {
         (
             format!(
-                "select id, sandbox_id, snapshot_id, provider, resource_kind, purpose, resource_name,
-                        namespace, status, cluster, storage_class, snapshot_class, storage_size,
-                        runtime_image, service_port, target_port, source_snapshot_id, created_at,
-                        updated_at, observed_at, last_reconciled_at, ready_at, deleted_at, error
+                "select runtime_resources.id, runtime_resources.sandbox_id, runtime_resources.snapshot_id,
+                        runtime_resources.provider, runtime_resources.resource_kind, runtime_resources.purpose,
+                        runtime_resources.resource_name, runtime_resources.namespace, runtime_resources.status,
+                        runtime_resources.cluster, runtime_resources.storage_class, runtime_resources.snapshot_class,
+                        runtime_resources.storage_size, runtime_resources.runtime_image, runtime_resources.service_port,
+                        runtime_resources.target_port, runtime_resources.source_snapshot_id, runtime_resources.created_at,
+                        runtime_resources.updated_at, runtime_resources.observed_at, runtime_resources.last_reconciled_at,
+                        runtime_resources.ready_at, runtime_resources.deleted_at, runtime_resources.error
                  from runtime_resources
-                 where provider = {} and namespace = {} and cluster = {} and status != 'deleted'
-                 order by resource_kind asc, resource_name asc, id asc",
+                 join sandboxes on sandboxes.id = runtime_resources.sandbox_id
+                 where runtime_resources.provider = {} and runtime_resources.namespace = {}
+                   and runtime_resources.cluster = {} and sandboxes.tenant_id = {}
+                   and runtime_resources.status != 'deleted'
+                 order by runtime_resources.resource_kind asc, runtime_resources.resource_name asc, runtime_resources.id asc",
                 db.placeholder(1),
                 db.placeholder(2),
-                db.placeholder(3)
+                db.placeholder(3),
+                db.placeholder(4)
             ),
             true,
         )
     } else {
         (
             format!(
-                "select id, sandbox_id, snapshot_id, provider, resource_kind, purpose, resource_name,
-                        namespace, status, cluster, storage_class, snapshot_class, storage_size,
-                        runtime_image, service_port, target_port, source_snapshot_id, created_at,
-                        updated_at, observed_at, last_reconciled_at, ready_at, deleted_at, error
+                "select runtime_resources.id, runtime_resources.sandbox_id, runtime_resources.snapshot_id,
+                        runtime_resources.provider, runtime_resources.resource_kind, runtime_resources.purpose,
+                        runtime_resources.resource_name, runtime_resources.namespace, runtime_resources.status,
+                        runtime_resources.cluster, runtime_resources.storage_class, runtime_resources.snapshot_class,
+                        runtime_resources.storage_size, runtime_resources.runtime_image, runtime_resources.service_port,
+                        runtime_resources.target_port, runtime_resources.source_snapshot_id, runtime_resources.created_at,
+                        runtime_resources.updated_at, runtime_resources.observed_at, runtime_resources.last_reconciled_at,
+                        runtime_resources.ready_at, runtime_resources.deleted_at, runtime_resources.error
                  from runtime_resources
-                 where provider = {} and namespace = {} and cluster is null and status != 'deleted'
-                 order by resource_kind asc, resource_name asc, id asc",
+                 join sandboxes on sandboxes.id = runtime_resources.sandbox_id
+                 where runtime_resources.provider = {} and runtime_resources.namespace = {}
+                   and runtime_resources.cluster is null and sandboxes.tenant_id = {}
+                   and runtime_resources.status != 'deleted'
+                 order by runtime_resources.resource_kind asc, runtime_resources.resource_name asc, runtime_resources.id asc",
                 db.placeholder(1),
-                db.placeholder(2)
+                db.placeholder(2),
+                db.placeholder(3)
             ),
             false,
         )
@@ -2755,6 +3013,7 @@ async fn mark_missing_runtime_resources_deleted_on_connection(
     if cluster_bind {
         query = query.bind(&request.cluster);
     }
+    query = query.bind(tenant_id);
     let candidates = query.fetch_all(&mut *connection).await?;
 
     let mut deleted = Vec::new();
@@ -2882,6 +3141,66 @@ async fn mark_runtime_resources_deleted_for_sandbox(
     Ok(deleted)
 }
 
+async fn insert_runtime_resource_tombstone(
+    db: &Database,
+    resource: &RuntimeResource,
+    tombstoned_at: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "insert into runtime_resource_tombstones
+         (id, sandbox_id, snapshot_id, provider, resource_kind, purpose, resource_name, namespace,
+          status, cluster, storage_class, snapshot_class, storage_size, runtime_image, service_port,
+          target_port, source_snapshot_id, created_at, updated_at, observed_at, last_reconciled_at,
+          ready_at, deleted_at, error, tombstoned_at)
+         values ({})
+         on conflict (id) do update set
+             status = excluded.status,
+             updated_at = excluded.updated_at,
+             last_reconciled_at = excluded.last_reconciled_at,
+             deleted_at = excluded.deleted_at,
+             error = excluded.error,
+             tombstoned_at = excluded.tombstoned_at",
+        db.placeholders(25)
+    );
+    sqlx::query(&sql)
+        .bind(resource.id.to_string())
+        .bind(resource.sandbox_id.to_string())
+        .bind(
+            resource
+                .snapshot_id
+                .map(|snapshot_id| snapshot_id.to_string()),
+        )
+        .bind(&resource.provider)
+        .bind(runtime_resource_kind_to_str(&resource.resource_kind))
+        .bind(runtime_resource_purpose_to_str(&resource.purpose))
+        .bind(&resource.resource_name)
+        .bind(&resource.namespace)
+        .bind(runtime_resource_status_to_str(&resource.status))
+        .bind(&resource.cluster)
+        .bind(&resource.storage_class)
+        .bind(&resource.snapshot_class)
+        .bind(&resource.storage_size)
+        .bind(&resource.runtime_image)
+        .bind(resource.service_port.map(i64::from))
+        .bind(&resource.target_port)
+        .bind(
+            resource
+                .source_snapshot_id
+                .map(|snapshot_id| snapshot_id.to_string()),
+        )
+        .bind(resource.created_at.to_rfc3339())
+        .bind(resource.updated_at.to_rfc3339())
+        .bind(resource.observed_at.map(|time| time.to_rfc3339()))
+        .bind(resource.last_reconciled_at.map(|time| time.to_rfc3339()))
+        .bind(resource.ready_at.map(|time| time.to_rfc3339()))
+        .bind(resource.deleted_at.map(|time| time.to_rfc3339()))
+        .bind(&resource.error)
+        .bind(tombstoned_at.to_rfc3339())
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
 fn deleted_at_for_runtime_resource(
     status: &RuntimeResourceStatus,
     now: DateTime<Utc>,
@@ -2939,7 +3258,7 @@ async fn list_command_output_chunks(
         "select id, command_id, stream, sequence, chunk, created_at
          from command_output_chunks
          where command_id = {}
-         order by sequence asc, created_at asc, id asc",
+         order by created_at asc, id asc",
         db.placeholder(1)
     );
     let rows = sqlx::query(&sql)
@@ -3089,26 +3408,41 @@ async fn append_command_output_to_command_on_connection(
     Ok(())
 }
 
-async fn command_has_output_chunks_on_connection(
+async fn reset_command_for_retry_on_connection(
     db: &Database,
     connection: &mut AnyConnection,
     command_id: CommandId,
-    stream: &CommandOutputStream,
-) -> Result<bool, ApiError> {
-    let sql = format!(
-        "select id
-         from command_output_chunks
-         where command_id = {} and stream = {}
-         limit 1",
-        db.placeholder(1),
-        db.placeholder(2)
+) -> Result<(), ApiError> {
+    let delete_sql = format!(
+        "delete from command_output_chunks
+         where command_id = {}",
+        db.placeholder(1)
     );
-    let row = sqlx::query(&sql)
+    sqlx::query(&delete_sql)
         .bind(command_id.to_string())
-        .bind(command_output_stream_to_str(stream))
-        .fetch_optional(&mut *connection)
+        .execute(&mut *connection)
         .await?;
-    Ok(row.is_some())
+
+    let update_sql = format!(
+        "update commands
+         set status = {}, stdout = '', stderr = '', exit_code = {}, finished_at = {}
+         where id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4)
+    );
+    let result = sqlx::query(&update_sql)
+        .bind(command_status_to_str(&CommandStatus::Queued))
+        .bind(Option::<i32>::None)
+        .bind(Option::<String>::None)
+        .bind(command_id.to_string())
+        .execute(&mut *connection)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("command not found"));
+    }
+    Ok(())
 }
 
 async fn fetch_worker(db: &Database, worker_id: WorkerId) -> Result<Worker, ApiError> {
@@ -3127,8 +3461,9 @@ async fn fetch_worker(db: &Database, worker_id: WorkerId) -> Result<Worker, ApiE
     row_to_worker(row)
 }
 
-async fn active_lease_count_for_worker(
+async fn active_lease_count_for_worker_on_connection(
     db: &Database,
+    connection: &mut AnyConnection,
     worker_id: WorkerId,
 ) -> Result<u32, ApiError> {
     let sql = format!(
@@ -3139,16 +3474,11 @@ async fn active_lease_count_for_worker(
     );
     let row = sqlx::query(&sql)
         .bind(worker_id.to_string())
-        .fetch_one(&db.pool)
+        .fetch_one(&mut *connection)
         .await?;
     let active_leases: i64 = row.try_get("active_leases")?;
     u32::try_from(active_leases)
         .map_err(|_| ApiError::internal("database contains invalid active lease count"))
-}
-
-async fn worker_has_capacity(db: &Database, worker: &Worker) -> Result<bool, ApiError> {
-    let active_leases = active_lease_count_for_worker(db, worker.id).await?;
-    Ok(active_leases < worker.max_concurrent_jobs)
 }
 
 async fn list_worker_capacities(
@@ -3156,10 +3486,17 @@ async fn list_worker_capacities(
     tenant_id: &str,
 ) -> Result<Vec<WorkerCapacity>, ApiError> {
     let sql = format!(
-        "select id, tenant_id, name, status, provider, capabilities, max_concurrent_jobs, labels, registered_at, last_heartbeat_at
+        "select workers.id, workers.tenant_id, workers.name, workers.status, workers.provider,
+                workers.capabilities, workers.max_concurrent_jobs, workers.labels,
+                workers.registered_at, workers.last_heartbeat_at,
+                coalesce(count(job_leases.id), 0) as active_leases
          from workers
-         where tenant_id = {}
-         order by registered_at asc, id asc",
+         left join job_leases on job_leases.worker_id = workers.id and job_leases.status = 'active'
+         where workers.tenant_id = {}
+         group by workers.id, workers.tenant_id, workers.name, workers.status, workers.provider,
+                  workers.capabilities, workers.max_concurrent_jobs, workers.labels,
+                  workers.registered_at, workers.last_heartbeat_at
+         order by workers.registered_at asc, workers.id asc",
         db.placeholder(1)
     );
     let rows = sqlx::query(&sql)
@@ -3169,8 +3506,13 @@ async fn list_worker_capacities(
 
     let mut capacities = Vec::new();
     for row in rows {
+        let active_leases = count_to_u32(row.try_get("active_leases")?)?;
         let worker = row_to_worker(row)?;
-        let active_leases = active_lease_count_for_worker(db, worker.id).await?;
+        let available_slots = if worker.status == WorkerStatus::Online {
+            worker.max_concurrent_jobs.saturating_sub(active_leases)
+        } else {
+            0
+        };
         capacities.push(WorkerCapacity {
             worker_id: worker.id,
             worker_name: worker.name,
@@ -3178,7 +3520,7 @@ async fn list_worker_capacities(
             status: worker.status,
             max_concurrent_jobs: worker.max_concurrent_jobs,
             active_leases,
-            available_slots: worker.max_concurrent_jobs.saturating_sub(active_leases),
+            available_slots,
         });
     }
 
@@ -3451,6 +3793,10 @@ fn count_to_i64(count: u64) -> Result<i64, ApiError> {
     i64::try_from(count).map_err(|_| ApiError::internal("cleanup count is too large"))
 }
 
+fn count_to_u32(count: i64) -> Result<u32, ApiError> {
+    u32::try_from(count).map_err(|_| ApiError::internal("database count is out of range"))
+}
+
 async fn fetch_snapshot(db: &Database, snapshot_id: SnapshotId) -> Result<Snapshot, ApiError> {
     let sql = format!(
         "select id, sandbox_id, status, label, inventory, provider_metadata, created_at, ready_at, expires_at, error
@@ -3536,51 +3882,113 @@ async fn run_cleanup_controller(db: &Database) -> Result<CleanupControllerReport
     };
     insert_cleanup_run(db, &cleanup_run).await?;
 
-    let started_run = cleanup_run.clone();
-    let result: Result<CleanupControllerReport, ApiError> = async {
-        let expired = expire_due_snapshots(db).await?;
-        let mut runtime_resources_deleted =
-            cleanup_runtime_resources_for_expired_snapshots(db).await?;
-        let archived = cleanup_archived_sandboxes(db).await?;
-        runtime_resources_deleted.extend(archived.runtime_resources_deleted);
+    let mut expired_count = 0;
+    let mut archived_deleted_count = 0;
+    let mut archived_skipped_count = 0;
+    let mut runtime_deleted_count = 0;
 
-        let archived_sandboxes_deleted = archived.deleted.len() as u64;
-        let cleanup_run = CleanupRun {
-            status: CleanupRunStatus::Succeeded,
-            finished_at: Some(Utc::now()),
-            expired_snapshots: expired.len() as u64,
-            archived_sandboxes_deleted,
-            archived_sandboxes_skipped: archived.skipped.len() as u64,
-            runtime_resources_deleted: runtime_resources_deleted.len() as u64,
-            ..started_run.clone()
-        };
-        update_cleanup_run(db, &cleanup_run).await?;
-
-        Ok(CleanupControllerReport {
-            cleanup_run,
-            expired,
-            archived_sandboxes_deleted,
-            archived_sandboxes: archived.deleted,
-            archived_sandboxes_skipped: archived.skipped,
-            runtime_resources_deleted,
-        })
-    }
-    .await;
-
-    match result {
-        Ok(report) => Ok(report),
-        Err(error) => {
-            let failed = CleanupRun {
-                status: CleanupRunStatus::Failed,
-                finished_at: Some(Utc::now()),
-                error: Some(format!("{error:?}")),
-                ..cleanup_run
-            };
-            if let Err(update_error) = update_cleanup_run(db, &failed).await {
-                tracing::warn!(?update_error, "failed to mark cleanup run failed");
-            }
-            Err(error)
+    let expired = match expire_due_snapshots(db).await {
+        Ok(expired) => {
+            expired_count = expired.len() as u64;
+            expired
         }
+        Err(error) => {
+            mark_cleanup_run_failed(
+                db,
+                &cleanup_run,
+                expired_count,
+                archived_deleted_count,
+                archived_skipped_count,
+                runtime_deleted_count,
+                &error,
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    let mut runtime_resources_deleted =
+        match cleanup_runtime_resources_for_expired_snapshots(db).await {
+            Ok(deleted) => {
+                runtime_deleted_count = deleted.len() as u64;
+                deleted
+            }
+            Err(error) => {
+                mark_cleanup_run_failed(
+                    db,
+                    &cleanup_run,
+                    expired_count,
+                    archived_deleted_count,
+                    archived_skipped_count,
+                    runtime_deleted_count,
+                    &error,
+                )
+                .await;
+                return Err(error);
+            }
+        };
+    let archived = match cleanup_archived_sandboxes(db).await {
+        Ok(archived) => archived,
+        Err(error) => {
+            mark_cleanup_run_failed(
+                db,
+                &cleanup_run,
+                expired_count,
+                archived_deleted_count,
+                archived_skipped_count,
+                runtime_deleted_count,
+                &error,
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    runtime_resources_deleted.extend(archived.runtime_resources_deleted);
+    archived_deleted_count = archived.deleted.len() as u64;
+    archived_skipped_count = archived.skipped.len() as u64;
+    runtime_deleted_count = runtime_resources_deleted.len() as u64;
+
+    let cleanup_run = CleanupRun {
+        status: CleanupRunStatus::Succeeded,
+        finished_at: Some(Utc::now()),
+        expired_snapshots: expired_count,
+        archived_sandboxes_deleted: archived_deleted_count,
+        archived_sandboxes_skipped: archived_skipped_count,
+        runtime_resources_deleted: runtime_deleted_count,
+        ..cleanup_run
+    };
+    update_cleanup_run(db, &cleanup_run).await?;
+
+    Ok(CleanupControllerReport {
+        cleanup_run,
+        expired,
+        archived_sandboxes_deleted: archived_deleted_count,
+        archived_sandboxes: archived.deleted,
+        archived_sandboxes_skipped: archived.skipped,
+        runtime_resources_deleted,
+    })
+}
+
+async fn mark_cleanup_run_failed(
+    db: &Database,
+    cleanup_run: &CleanupRun,
+    expired_snapshots: u64,
+    archived_sandboxes_deleted: u64,
+    archived_sandboxes_skipped: u64,
+    runtime_resources_deleted: u64,
+    error: &ApiError,
+) {
+    let failed = CleanupRun {
+        status: CleanupRunStatus::Failed,
+        finished_at: Some(Utc::now()),
+        expired_snapshots,
+        archived_sandboxes_deleted,
+        archived_sandboxes_skipped,
+        runtime_resources_deleted,
+        error: Some(format!("{error:?}")),
+        ..cleanup_run.clone()
+    };
+    if let Err(update_error) = update_cleanup_run(db, &failed).await {
+        tracing::warn!(?update_error, "failed to mark cleanup run failed");
     }
 }
 
@@ -3604,28 +4012,62 @@ async fn expire_due_snapshots(db: &Database) -> Result<Vec<Snapshot>, ApiError> 
         if expires_at > now {
             continue;
         }
-        update_snapshot_status(db, snapshot.id, SnapshotStatus::Expired, None).await?;
-        dead_queued_snapshot_jobs(db, snapshot.id, "snapshot expired").await?;
-        let expired_snapshot = fetch_snapshot(db, snapshot.id).await?;
-        insert_event(
-            db,
-            expired_snapshot.sandbox_id,
-            SandboxEventKind::LifecycleChanged,
-            json!({
-                "reason": "snapshot_expired",
-                "snapshotId": expired_snapshot.id,
-                "snapshotStatus": expired_snapshot.status
-            }),
-        )
-        .await?;
-        expired.push(expired_snapshot);
+        let mut tx = db.pool.begin().await?;
+        let expired_snapshot = async {
+            update_snapshot_status_on_connection(
+                db,
+                &mut *tx,
+                snapshot.id,
+                SnapshotStatus::Expired,
+                None,
+            )
+            .await?;
+            dead_queued_snapshot_jobs_on_connection(db, &mut *tx, snapshot.id, "snapshot expired")
+                .await?;
+            fail_sandboxes_waiting_on_snapshot_on_connection(
+                db,
+                &mut *tx,
+                snapshot.id,
+                "snapshot_expired",
+                "snapshot expired",
+            )
+            .await?;
+            let expired_snapshot = fetch_snapshot_on_connection(db, &mut *tx, snapshot.id).await?;
+            insert_event_on_connection(
+                db,
+                &mut *tx,
+                expired_snapshot.sandbox_id,
+                SandboxEventKind::LifecycleChanged,
+                json!({
+                    "reason": "snapshot_expired",
+                    "snapshotId": expired_snapshot.id,
+                    "snapshotStatus": expired_snapshot.status
+                }),
+            )
+            .await?;
+            Ok(expired_snapshot)
+        }
+        .await;
+        match expired_snapshot {
+            Ok(expired_snapshot) => {
+                tx.commit().await?;
+                expired.push(expired_snapshot);
+            }
+            Err(error) => {
+                if let Err(rollback_error) = tx.rollback().await {
+                    tracing::warn!(%rollback_error, "failed to roll back snapshot expiration");
+                }
+                return Err(error);
+            }
+        }
     }
 
     Ok(expired)
 }
 
-async fn update_snapshot_status(
+async fn update_snapshot_status_on_connection(
     db: &Database,
+    connection: &mut AnyConnection,
     snapshot_id: SnapshotId,
     status: SnapshotStatus,
     error: Option<&str>,
@@ -3642,7 +4084,7 @@ async fn update_snapshot_status(
         .bind(snapshot_status_to_str(&status))
         .bind(error)
         .bind(snapshot_id.to_string())
-        .execute(&db.pool)
+        .execute(&mut *connection)
         .await?;
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found("snapshot not found"));
@@ -3650,27 +4092,35 @@ async fn update_snapshot_status(
     Ok(())
 }
 
-async fn dead_queued_snapshot_jobs(
+async fn dead_queued_snapshot_jobs_on_connection(
     db: &Database,
+    connection: &mut AnyConnection,
     snapshot_id: SnapshotId,
     error: &str,
 ) -> Result<(), ApiError> {
-    let rows = sqlx::query(
-        "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
-                scheduled_at, created_at, updated_at, last_error
+    let sql = format!(
+        "select id
          from jobs
-         where kind = 'create_snapshot' and status = 'queued'
-         order by scheduled_at asc, created_at asc, id asc",
-    )
-    .fetch_all(&db.pool)
-    .await?;
+         where kind = 'create_snapshot' and status = 'queued' and snapshot_id = {}",
+        db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(snapshot_id.to_string())
+        .fetch_all(&mut *connection)
+        .await?;
 
     let now = Utc::now();
     for row in rows {
-        let job = row_to_job(row)?;
-        if snapshot_id_from_job(&job)? == snapshot_id {
-            update_job_status(db, job.id, JobStatus::Dead, Some(error), now).await?;
-        }
+        let job_id: String = row.try_get("id")?;
+        update_job_status_on_connection(
+            db,
+            connection,
+            JobId(parse_uuid(&job_id)?),
+            JobStatus::Dead,
+            Some(error),
+            now,
+        )
+        .await?;
     }
 
     Ok(())
@@ -3745,15 +4195,17 @@ async fn cleanup_archived_sandboxes(
             });
             continue;
         }
-        runtime_resources_deleted.extend(
-            mark_runtime_resources_deleted_for_sandbox(
-                db,
-                sandbox.id,
-                now,
-                "archived sandbox deleted during cleanup",
-            )
-            .await?,
-        );
+        let deleted_resources = mark_runtime_resources_deleted_for_sandbox(
+            db,
+            sandbox.id,
+            now,
+            "archived sandbox deleted during cleanup",
+        )
+        .await?;
+        for resource in &deleted_resources {
+            insert_runtime_resource_tombstone(db, resource, now).await?;
+        }
+        runtime_resources_deleted.extend(deleted_resources);
         let sql = format!(
             "delete from sandboxes where id = {} and state = 'archived'",
             db.placeholder(1)
@@ -4162,12 +4614,14 @@ async fn insert_command(db: &Database, command: &CommandRun) -> Result<(), ApiEr
 }
 
 async fn insert_job(db: &Database, job: &Job) -> Result<(), ApiError> {
+    let references = job_references(job)?;
     let sql = format!(
         "insert into jobs
          (id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
-          scheduled_at, created_at, updated_at, last_error)
+          scheduled_at, created_at, updated_at, last_error, sandbox_id, command_id, snapshot_id,
+          parent_sandbox_id, child_sandbox_id, prompt_event_id)
          values ({})",
-        db.placeholders(13)
+        db.placeholders(19)
     );
     sqlx::query(&sql)
         .bind(job.id.to_string())
@@ -4183,6 +4637,12 @@ async fn insert_job(db: &Database, job: &Job) -> Result<(), ApiError> {
         .bind(job.created_at.to_rfc3339())
         .bind(job.updated_at.to_rfc3339())
         .bind(&job.last_error)
+        .bind(references.sandbox_id.map(|id| id.to_string()))
+        .bind(references.command_id.map(|id| id.to_string()))
+        .bind(references.snapshot_id.map(|id| id.to_string()))
+        .bind(references.parent_sandbox_id.map(|id| id.to_string()))
+        .bind(references.child_sandbox_id.map(|id| id.to_string()))
+        .bind(references.prompt_event_id.map(|id| id.to_string()))
         .execute(&db.pool)
         .await?;
     Ok(())
@@ -4193,12 +4653,14 @@ async fn insert_job_on_connection(
     connection: &mut AnyConnection,
     job: &Job,
 ) -> Result<(), ApiError> {
+    let references = job_references(job)?;
     let sql = format!(
         "insert into jobs
          (id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
-          scheduled_at, created_at, updated_at, last_error)
+          scheduled_at, created_at, updated_at, last_error, sandbox_id, command_id, snapshot_id,
+          parent_sandbox_id, child_sandbox_id, prompt_event_id)
          values ({})",
-        db.placeholders(13)
+        db.placeholders(19)
     );
     sqlx::query(&sql)
         .bind(job.id.to_string())
@@ -4214,59 +4676,153 @@ async fn insert_job_on_connection(
         .bind(job.created_at.to_rfc3339())
         .bind(job.updated_at.to_rfc3339())
         .bind(&job.last_error)
+        .bind(references.sandbox_id.map(|id| id.to_string()))
+        .bind(references.command_id.map(|id| id.to_string()))
+        .bind(references.snapshot_id.map(|id| id.to_string()))
+        .bind(references.parent_sandbox_id.map(|id| id.to_string()))
+        .bind(references.child_sandbox_id.map(|id| id.to_string()))
+        .bind(references.prompt_event_id.map(|id| id.to_string()))
         .execute(&mut *connection)
         .await?;
     Ok(())
 }
 
+#[derive(Default)]
+struct JobReferences {
+    sandbox_id: Option<SandboxId>,
+    command_id: Option<CommandId>,
+    snapshot_id: Option<SnapshotId>,
+    parent_sandbox_id: Option<SandboxId>,
+    child_sandbox_id: Option<SandboxId>,
+    prompt_event_id: Option<EventId>,
+}
+
+fn job_references(job: &Job) -> Result<JobReferences, ApiError> {
+    let mut references = JobReferences::default();
+    match job.kind {
+        JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {
+            references.sandbox_id = Some(sandbox_id_from_job(job)?);
+        }
+        JobKind::RunCommand => {
+            references.sandbox_id = Some(sandbox_id_from_job(job)?);
+            references.command_id = Some(command_id_from_job(job)?);
+        }
+        JobKind::RunPrompt => {
+            references.sandbox_id = Some(sandbox_id_from_job(job)?);
+            references.prompt_event_id = Some(prompt_event_id_from_job(job)?);
+        }
+        JobKind::CreateSnapshot => {
+            references.sandbox_id = Some(sandbox_id_from_job(job)?);
+            references.snapshot_id = Some(snapshot_id_from_job(job)?);
+        }
+        JobKind::ForkSandbox => {
+            references.parent_sandbox_id = Some(parent_sandbox_id_from_job(job)?);
+            references.child_sandbox_id = Some(child_sandbox_id_from_job(job)?);
+            references.snapshot_id = Some(snapshot_id_from_job(job)?);
+        }
+    }
+    Ok(references)
+}
+
 async fn try_claim_job(
     db: &Database,
-    worker_id: WorkerId,
+    worker: &Worker,
     job: &Job,
     lease_seconds: Option<u64>,
 ) -> Result<Option<JobLease>, ApiError> {
-    let now = Utc::now();
-    let attempt = job.attempts + 1;
-    let expires_at = now + chrono::Duration::seconds(lease_seconds.unwrap_or(60) as i64);
-    let sql = format!(
-        "update jobs
-         set status = {}, attempts = {}, updated_at = {}
-         where id = {} and status = 'queued'",
-        db.placeholder(1),
-        db.placeholder(2),
-        db.placeholder(3),
-        db.placeholder(4)
-    );
-    let result = sqlx::query(&sql)
-        .bind(job_status_to_str(&JobStatus::Leased))
-        .bind(attempt)
-        .bind(now.to_rfc3339())
-        .bind(job.id.to_string())
-        .execute(&db.pool)
-        .await?;
-    if result.rows_affected() == 0 {
-        return Ok(None);
-    }
+    let mut tx = db.pool.begin().await?;
+    let claimed = async {
+        lock_worker_for_claim_on_connection(db, &mut *tx, worker.id).await?;
+        let active_leases =
+            active_lease_count_for_worker_on_connection(db, &mut *tx, worker.id).await?;
+        if active_leases >= worker.max_concurrent_jobs {
+            return Ok(None);
+        }
 
-    let lease = JobLease {
-        id: LeaseId::new(),
-        job_id: job.id,
-        worker_id,
-        status: LeaseStatus::Active,
-        attempt,
-        leased_at: now,
-        expires_at,
-        completed_at: None,
-        error: None,
-        job: fetch_job(db, job.id).await?,
+        let now = Utc::now();
+        let attempt = job.attempts + 1;
+        let expires_at = now + chrono::Duration::seconds(lease_seconds.unwrap_or(60) as i64);
+        let sql = format!(
+            "update jobs
+             set status = {}, attempts = {}, updated_at = {}
+             where id = {} and status = 'queued'",
+            db.placeholder(1),
+            db.placeholder(2),
+            db.placeholder(3),
+            db.placeholder(4)
+        );
+        let result = sqlx::query(&sql)
+            .bind(job_status_to_str(&JobStatus::Leased))
+            .bind(attempt)
+            .bind(now.to_rfc3339())
+            .bind(job.id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        let lease = JobLease {
+            id: LeaseId::new(),
+            job_id: job.id,
+            worker_id: worker.id,
+            status: LeaseStatus::Active,
+            attempt,
+            leased_at: now,
+            expires_at,
+            completed_at: None,
+            error: None,
+            job: fetch_job_on_connection(db, &mut *tx, job.id).await?,
+        };
+        insert_lease_on_connection(db, &mut *tx, &lease).await?;
+        apply_claimed_job_on_connection(db, &mut *tx, &lease.job).await?;
+        let lease = fetch_lease_on_connection(db, &mut *tx, lease.id).await?;
+        Ok(Some(lease))
     };
-    insert_lease(db, &lease).await?;
-    let lease = fetch_lease(db, lease.id).await?;
-    apply_claimed_job(db, &lease.job).await?;
-    Ok(Some(lease))
+    match claimed.await {
+        Ok(Some(lease)) => {
+            tx.commit().await?;
+            Ok(Some(lease))
+        }
+        Ok(None) => {
+            tx.rollback().await?;
+            Ok(None)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = tx.rollback().await {
+                tracing::warn!(%rollback_error, "failed to roll back lease claim");
+            }
+            Err(error)
+        }
+    }
 }
 
-async fn insert_lease(db: &Database, lease: &JobLease) -> Result<(), ApiError> {
+async fn lock_worker_for_claim_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    worker_id: WorkerId,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "update workers
+         set last_heartbeat_at = last_heartbeat_at
+         where id = {}",
+        db.placeholder(1)
+    );
+    let result = sqlx::query(&sql)
+        .bind(worker_id.to_string())
+        .execute(&mut *connection)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("worker not found"));
+    }
+    Ok(())
+}
+
+async fn insert_lease_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    lease: &JobLease,
+) -> Result<(), ApiError> {
     let sql = format!(
         "insert into job_leases
          (id, job_id, worker_id, status, attempt, leased_at, expires_at, completed_at, error)
@@ -4283,7 +4839,7 @@ async fn insert_lease(db: &Database, lease: &JobLease) -> Result<(), ApiError> {
         .bind(lease.expires_at.to_rfc3339())
         .bind(lease.completed_at.map(|time| time.to_rfc3339()))
         .bind(&lease.error)
-        .execute(&db.pool)
+        .execute(&mut *connection)
         .await?;
     Ok(())
 }
@@ -4457,6 +5013,35 @@ async fn complete_active_lease_on_connection(
     Ok(())
 }
 
+async fn fail_active_lease_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    lease_id: LeaseId,
+    completed_at: DateTime<Utc>,
+    error: &str,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "update job_leases
+         set status = {}, completed_at = {}, error = {}
+         where id = {} and status = 'active'",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4)
+    );
+    let result = sqlx::query(&sql)
+        .bind(lease_status_to_str(&LeaseStatus::Failed))
+        .bind(completed_at.to_rfc3339())
+        .bind(error)
+        .bind(lease_id.to_string())
+        .execute(&mut *connection)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::bad_request("lease is not active"));
+    }
+    Ok(())
+}
+
 async fn update_job_status(
     db: &Database,
     job_id: JobId,
@@ -4510,38 +5095,6 @@ async fn update_job_status_on_connection(
     Ok(())
 }
 
-async fn update_command_from_lease_result(
-    db: &Database,
-    command_id: CommandId,
-    status: CommandStatus,
-    stdout: &str,
-    stderr: &str,
-    exit_code: Option<i32>,
-) -> Result<(), ApiError> {
-    let now = Utc::now();
-    let sql = format!(
-        "update commands
-         set status = {}, stdout = {}, stderr = {}, exit_code = {}, finished_at = {}
-         where id = {}",
-        db.placeholder(1),
-        db.placeholder(2),
-        db.placeholder(3),
-        db.placeholder(4),
-        db.placeholder(5),
-        db.placeholder(6)
-    );
-    sqlx::query(&sql)
-        .bind(command_status_to_str(&status))
-        .bind(stdout)
-        .bind(stderr)
-        .bind(exit_code)
-        .bind(now.to_rfc3339())
-        .bind(command_id.to_string())
-        .execute(&db.pool)
-        .await?;
-    Ok(())
-}
-
 async fn finish_command_from_lease_result_on_connection(
     db: &Database,
     connection: &mut AnyConnection,
@@ -4577,11 +5130,30 @@ async fn append_completion_output_on_connection(
     stream: CommandOutputStream,
     chunk: &str,
 ) -> Result<(), ApiError> {
-    if chunk.is_empty()
-        || command_has_output_chunks_on_connection(db, connection, command_id, &stream).await?
-    {
+    if chunk.is_empty() {
         return Ok(());
     }
+    let current =
+        command_output_for_stream_on_connection(db, connection, command_id, &stream).await?;
+    if current == chunk {
+        return Ok(());
+    }
+    if let Some(suffix) = chunk.strip_prefix(&current) {
+        if suffix.is_empty() {
+            return Ok(());
+        }
+        append_command_output_chunk_on_connection(
+            db,
+            connection,
+            command_id,
+            sandbox_id,
+            stream,
+            suffix.to_string(),
+        )
+        .await?;
+        return Ok(());
+    }
+    replace_command_output_stream_on_connection(db, connection, command_id, &stream).await?;
     append_command_output_chunk_on_connection(
         db,
         connection,
@@ -4591,6 +5163,68 @@ async fn append_completion_output_on_connection(
         chunk.to_string(),
     )
     .await?;
+    Ok(())
+}
+
+async fn command_output_for_stream_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    command_id: CommandId,
+    stream: &CommandOutputStream,
+) -> Result<String, ApiError> {
+    let column = match stream {
+        CommandOutputStream::Stdout => "stdout",
+        CommandOutputStream::Stderr => "stderr",
+    };
+    let sql = format!(
+        "select {column} as output
+         from commands
+         where id = {}",
+        db.placeholder(1)
+    );
+    let row = sqlx::query(&sql)
+        .bind(command_id.to_string())
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| ApiError::not_found("command not found"))?;
+    Ok(row.try_get("output")?)
+}
+
+async fn replace_command_output_stream_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    command_id: CommandId,
+    stream: &CommandOutputStream,
+) -> Result<(), ApiError> {
+    let column = match stream {
+        CommandOutputStream::Stdout => "stdout",
+        CommandOutputStream::Stderr => "stderr",
+    };
+    let delete_sql = format!(
+        "delete from command_output_chunks
+         where command_id = {} and stream = {}",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    sqlx::query(&delete_sql)
+        .bind(command_id.to_string())
+        .bind(command_output_stream_to_str(stream))
+        .execute(&mut *connection)
+        .await?;
+
+    let update_sql = format!(
+        "update commands
+         set {column} = ''
+         where id = {}",
+        db.placeholder(1)
+    );
+    let result = sqlx::query(&update_sql)
+        .bind(command_id.to_string())
+        .execute(&mut *connection)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("command not found"));
+    }
     Ok(())
 }
 
@@ -4751,7 +5385,11 @@ async fn apply_completed_job_on_connection(
     Ok(())
 }
 
-async fn apply_claimed_job(db: &Database, job: &Job) -> Result<(), ApiError> {
+async fn apply_claimed_job_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    job: &Job,
+) -> Result<(), ApiError> {
     match job.kind {
         JobKind::RunCommand => {
             let command_id = command_id_from_job(job)?;
@@ -4766,10 +5404,11 @@ async fn apply_claimed_job(db: &Database, job: &Job) -> Result<(), ApiError> {
             sqlx::query(&sql)
                 .bind(command_status_to_str(&CommandStatus::Running))
                 .bind(command_id.to_string())
-                .execute(&db.pool)
+                .execute(&mut *connection)
                 .await?;
-            insert_event(
+            insert_event_on_connection(
                 db,
+                connection,
                 sandbox_id,
                 SandboxEventKind::CommandStarted,
                 json!({
@@ -4779,8 +5418,9 @@ async fn apply_claimed_job(db: &Database, job: &Job) -> Result<(), ApiError> {
             .await?;
         }
         JobKind::CreateSnapshot => {
-            update_snapshot_status(
+            update_snapshot_status_on_connection(
                 db,
+                connection,
                 snapshot_id_from_job(job)?,
                 SnapshotStatus::Pending,
                 None,
@@ -4790,8 +5430,9 @@ async fn apply_claimed_job(db: &Database, job: &Job) -> Result<(), ApiError> {
         JobKind::RunPrompt => {
             let sandbox_id = sandbox_id_from_job(job)?;
             let prompt_event_id = prompt_event_id_from_job(job)?;
-            insert_event(
+            insert_event_on_connection(
                 db,
+                connection,
                 sandbox_id,
                 SandboxEventKind::PromptStarted,
                 json!({
@@ -4804,8 +5445,9 @@ async fn apply_claimed_job(db: &Database, job: &Job) -> Result<(), ApiError> {
             let child_id = child_sandbox_id_from_job(job)?;
             let snapshot_id = snapshot_id_from_job(job)?;
             let next_state = SandboxState::Provisioning;
-            set_sandbox_state(
+            set_sandbox_state_on_connection(
                 db,
+                connection,
                 child_id,
                 next_state.clone(),
                 json!({
@@ -4822,26 +5464,53 @@ async fn apply_claimed_job(db: &Database, job: &Job) -> Result<(), ApiError> {
 }
 
 async fn apply_retryable_job(db: &Database, job: &Job, error: &str) -> Result<(), ApiError> {
+    let mut tx = db.pool.begin().await?;
+    let applied = apply_retryable_job_on_connection(db, &mut *tx, job, error).await;
+    match applied {
+        Ok(()) => {
+            tx.commit().await?;
+            Ok(())
+        }
+        Err(error) => {
+            if let Err(rollback_error) = tx.rollback().await {
+                tracing::warn!(%rollback_error, "failed to roll back retryable job side effects");
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn apply_failed_job(db: &Database, job: &Job, error: &str) -> Result<(), ApiError> {
+    let mut tx = db.pool.begin().await?;
+    let applied = apply_failed_job_on_connection(db, &mut *tx, job, error).await;
+    match applied {
+        Ok(()) => {
+            tx.commit().await?;
+            Ok(())
+        }
+        Err(error) => {
+            if let Err(rollback_error) = tx.rollback().await {
+                tracing::warn!(%rollback_error, "failed to roll back failed job side effects");
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn apply_retryable_job_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    job: &Job,
+    error: &str,
+) -> Result<(), ApiError> {
     match job.kind {
         JobKind::RunCommand => {
             let command_id = command_id_from_job(job)?;
             let sandbox_id = sandbox_id_from_job(job)?;
-            let sql = format!(
-                "update commands
-                 set status = {}, stderr = {}
-                 where id = {}",
-                db.placeholder(1),
-                db.placeholder(2),
-                db.placeholder(3)
-            );
-            sqlx::query(&sql)
-                .bind(command_status_to_str(&CommandStatus::Queued))
-                .bind(error)
-                .bind(command_id.to_string())
-                .execute(&db.pool)
-                .await?;
-            insert_event(
+            reset_command_for_retry_on_connection(db, connection, command_id).await?;
+            insert_event_on_connection(
                 db,
+                connection,
                 sandbox_id,
                 SandboxEventKind::CommandQueued,
                 json!({
@@ -4853,8 +5522,9 @@ async fn apply_retryable_job(db: &Database, job: &Job, error: &str) -> Result<()
             .await?;
         }
         JobKind::CreateSnapshot => {
-            update_snapshot_status(
+            update_snapshot_status_on_connection(
                 db,
+                connection,
                 snapshot_id_from_job(job)?,
                 SnapshotStatus::Pending,
                 Some(error),
@@ -4864,8 +5534,9 @@ async fn apply_retryable_job(db: &Database, job: &Job, error: &str) -> Result<()
         JobKind::RunPrompt => {
             let sandbox_id = sandbox_id_from_job(job)?;
             let prompt_event_id = prompt_event_id_from_job(job)?;
-            insert_event(
+            insert_event_on_connection(
                 db,
+                connection,
                 sandbox_id,
                 SandboxEventKind::PromptQueued,
                 json!({
@@ -4880,8 +5551,9 @@ async fn apply_retryable_job(db: &Database, job: &Job, error: &str) -> Result<()
             let child_id = child_sandbox_id_from_job(job)?;
             let snapshot_id = snapshot_id_from_job(job)?;
             let next_state = SandboxState::Planning;
-            set_sandbox_state(
+            set_sandbox_state_on_connection(
                 db,
+                connection,
                 child_id,
                 next_state.clone(),
                 json!({
@@ -4898,22 +5570,36 @@ async fn apply_retryable_job(db: &Database, job: &Job, error: &str) -> Result<()
     Ok(())
 }
 
-async fn apply_failed_job(db: &Database, job: &Job, error: &str) -> Result<(), ApiError> {
+async fn apply_failed_job_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    job: &Job,
+    error: &str,
+) -> Result<(), ApiError> {
     match job.kind {
         JobKind::RunCommand => {
             let command_id = command_id_from_job(job)?;
             let sandbox_id = sandbox_id_from_job(job)?;
-            update_command_from_lease_result(
+            append_command_output_chunk_on_connection(
                 db,
+                connection,
+                command_id,
+                sandbox_id,
+                CommandOutputStream::Stderr,
+                error.to_string(),
+            )
+            .await?;
+            finish_command_from_lease_result_on_connection(
+                db,
+                connection,
                 command_id,
                 CommandStatus::Failed,
-                "",
-                error,
                 None,
             )
             .await?;
-            insert_event(
+            insert_event_on_connection(
                 db,
+                connection,
                 sandbox_id,
                 SandboxEventKind::CommandFinished,
                 json!({
@@ -4925,19 +5611,30 @@ async fn apply_failed_job(db: &Database, job: &Job, error: &str) -> Result<(), A
             .await?;
         }
         JobKind::CreateSnapshot => {
-            update_snapshot_status(
+            let snapshot_id = snapshot_id_from_job(job)?;
+            update_snapshot_status_on_connection(
                 db,
-                snapshot_id_from_job(job)?,
+                connection,
+                snapshot_id,
                 SnapshotStatus::Failed,
                 Some(error),
+            )
+            .await?;
+            fail_sandboxes_waiting_on_snapshot_on_connection(
+                db,
+                connection,
+                snapshot_id,
+                "snapshot_failed",
+                error,
             )
             .await?;
         }
         JobKind::RunPrompt => {
             let sandbox_id = sandbox_id_from_job(job)?;
             let prompt_event_id = prompt_event_id_from_job(job)?;
-            insert_event(
+            insert_event_on_connection(
                 db,
+                connection,
                 sandbox_id,
                 SandboxEventKind::PromptFinished,
                 json!({
@@ -4951,8 +5648,9 @@ async fn apply_failed_job(db: &Database, job: &Job, error: &str) -> Result<(), A
             let child_id = child_sandbox_id_from_job(job)?;
             let snapshot_id = snapshot_id_from_job(job)?;
             let next_state = SandboxState::Error;
-            set_sandbox_state(
+            set_sandbox_state_on_connection(
                 db,
+                connection,
                 child_id,
                 next_state.clone(),
                 json!({
@@ -5072,6 +5770,46 @@ async fn queue_forks_waiting_on_snapshot_on_connection(
                 "reason": "fork_snapshot_ready",
                 "parentSandboxId": parent_sandbox_id,
                 "parentSnapshotId": snapshot_id
+            }),
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn fail_sandboxes_waiting_on_snapshot_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    snapshot_id: SnapshotId,
+    reason: &'static str,
+    error: &str,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "select id, tenant_id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id
+         from sandboxes
+         where parent_snapshot_id = {} and state = 'planning'
+         order by created_at asc, id asc",
+        db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(snapshot_id.to_string())
+        .fetch_all(&mut *connection)
+        .await?;
+
+    for row in rows {
+        let child = row_to_sandbox(row)?;
+        let next_state = SandboxState::Error;
+        set_sandbox_state_on_connection(
+            db,
+            connection,
+            child.id,
+            next_state.clone(),
+            json!({
+                "state": next_state,
+                "reason": reason,
+                "parentSnapshotId": snapshot_id,
+                "error": error
             }),
         )
         .await?;

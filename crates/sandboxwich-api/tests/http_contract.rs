@@ -111,6 +111,25 @@ async fn api_token_is_required_when_configured() {
         .await
         .unwrap();
     assert!(authorized.ok);
+
+    let spoofed_tenant: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .bearer_auth("test-token")
+        .header("x-sandboxwich-tenant", "tenant-b")
+        .json(&CreateSandboxRequest {
+            name: Some("spoof-attempt".to_string()),
+            template: None,
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(spoofed_tenant.sandbox.tenant_id, "default");
 }
 
 async fn run_contract(server: TestServer) {
@@ -490,6 +509,22 @@ async fn run_contract(server: TestServer) {
         .unwrap();
     assert_eq!(finished_command.command.status, CommandStatus::Finished);
     assert_eq!(finished_command.command.stdout, "hello\n");
+    let output_after_completion: CommandOutputListResponse = client
+        .get(format!(
+            "{}/commands/{}/output",
+            server.base_url, command.command.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(output_after_completion.chunks.len(), 2);
+    assert_eq!(output_after_completion.chunks[0].chunk, "hel");
+    assert_eq!(output_after_completion.chunks[1].chunk, "lo\n");
 
     let commands: CommandListResponse = client
         .get(format!(
@@ -662,6 +697,23 @@ async fn assert_tenant_boundaries_are_enforced(
         .unwrap();
     assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
 
+    let cross_tenant_job = client
+        .post(format!("{}/jobs", server.base_url))
+        .header("x-sandboxwich-tenant", "tenant-b")
+        .json(&CreateJobRequest {
+            kind: JobKind::ProvisionSandbox,
+            payload: serde_json::json!({
+                "sandboxId": default_sandbox.sandbox.id
+            }),
+            required_capability: WorkerCapability::ProvisionSandbox,
+            priority: None,
+            max_attempts: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_tenant_job.status(), StatusCode::NOT_FOUND);
+
     let tenant_list: SandboxListResponse = client
         .get(format!("{}/sandboxes", server.base_url))
         .header("x-sandboxwich-tenant", "tenant-b")
@@ -698,8 +750,8 @@ async fn assert_metrics_are_exposed(client: &reqwest::Client, server: &TestServe
         .text()
         .await
         .unwrap();
-    assert!(metrics.contains("# TYPE sandboxwich_sandboxes_total gauge"));
-    assert!(metrics.contains("sandboxwich_sandboxes_total{state=\"ready\"}"));
+    assert!(metrics.contains("# TYPE sandboxwich_sandbox_count gauge"));
+    assert!(metrics.contains("sandboxwich_sandbox_count{state=\"ready\"}"));
     assert!(metrics.contains("sandboxwich_worker_capacity_slots"));
 }
 
@@ -1184,6 +1236,17 @@ async fn assert_retryable_failure_requeues_command(
         .await
         .unwrap();
     let lease = claimed.lease.expect("expected retry test lease");
+    client
+        .post(format!("{}/leases/{}/output", server.base_url, lease.id))
+        .json(&AppendCommandOutputRequest {
+            stream: CommandOutputStream::Stdout,
+            chunk: "partial".to_string(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
     let failed: LeaseResponse = client
         .post(format!("{}/leases/{}/fail", server.base_url, lease.id))
         .json(&FailLeaseRequest {
@@ -1214,6 +1277,21 @@ async fn assert_retryable_failure_requeues_command(
         .await
         .unwrap();
     assert_eq!(fetched.command.status, CommandStatus::Queued);
+    assert_eq!(fetched.command.stdout, "");
+    let chunks_after_retry: CommandOutputListResponse = client
+        .get(format!(
+            "{}/commands/{}/output",
+            server.base_url, command.command.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(chunks_after_retry.chunks.is_empty());
 
     let claimed_again: ClaimLeaseResponse = client
         .post(format!(
@@ -2150,6 +2228,93 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
             && resource.purpose == RuntimeResourcePurpose::Workspace
             && resource.source_snapshot_id == Some(fork_snapshot_id)
     }));
+
+    let failed_fork: SandboxResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/fork",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&CreateSandboxRequest {
+            name: Some("failed-child".to_string()),
+            template: None,
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(failed_fork.sandbox.state, SandboxState::Planning);
+    let failed_snapshot_id = failed_fork
+        .sandbox
+        .parent_snapshot_id
+        .expect("failed fork should point at a source snapshot");
+    let jobs: JobListResponse = client
+        .get(format!("{}/jobs", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let failed_snapshot_job = job_for_snapshot(&jobs.jobs, &failed_snapshot_id.to_string());
+    let claimed_failed_snapshot: ClaimLeaseResponse = client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, snapshot_worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let failed_snapshot_lease = claimed_failed_snapshot
+        .lease
+        .expect("expected snapshot worker to claim failing fork snapshot job");
+    assert_eq!(failed_snapshot_lease.job.id, failed_snapshot_job.id);
+    let failed: LeaseResponse = client
+        .post(format!(
+            "{}/leases/{}/fail",
+            server.base_url, failed_snapshot_lease.id
+        ))
+        .json(&FailLeaseRequest {
+            error: "source snapshot failed".to_string(),
+            retry: false,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(failed.lease.job.status, JobStatus::Failed);
+    let failed_child: SandboxResponse = client
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, failed_fork.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(failed_child.sandbox.state, SandboxState::Error);
 }
 
 fn job_for_command(jobs: &[Job], command_id: &str) -> Job {
