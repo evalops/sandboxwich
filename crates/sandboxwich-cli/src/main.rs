@@ -1,6 +1,5 @@
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use sandboxwich_core::{
     CapacityResponse, CommandListResponse, CommandRequest, CommandResponse,
     CreateDesktopSessionRequest, CreateSandboxRequest, CreateSnapshotRequest, DesktopAccessMode,
@@ -10,7 +9,7 @@ use sandboxwich_core::{
     RuntimeResourceListResponse, SandboxListResponse, SandboxResponse, SnapshotCleanupResponse,
     SnapshotListResponse, SnapshotResponse, SshAccessRequest, SshAccessResponse,
     SshKeyListResponse, SshKeyResponse, SshKeyStatus, UpdateDesktopSessionRequest,
-    UpdateGuestHealthRequest, UpdateSshKeyStatusRequest, WorkerListResponse,
+    UpdateGuestHealthRequest, UpdateSshKeyStatusRequest, WorkerListResponse, build_api_client,
 };
 use uuid::Uuid;
 
@@ -255,7 +254,7 @@ enum DesktopSessionStatusArg {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let client = build_client(cli.api_token.as_deref(), cli.tenant.as_deref())?;
+    let client = build_api_client(cli.api_token.as_deref(), cli.tenant.as_deref())?;
     let api = cli.api.trim_end_matches('/');
 
     match cli.command {
@@ -533,27 +532,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-fn build_client(api_token: Option<&str>, tenant: Option<&str>) -> anyhow::Result<reqwest::Client> {
-    let mut headers = HeaderMap::new();
-    if let Some(api_token) = api_token.map(str::trim).filter(|token| !token.is_empty()) {
-        let value = format!("Bearer {api_token}");
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&value).context("invalid SANDBOXWICH_API_TOKEN")?,
-        );
-    }
-    if let Some(tenant) = tenant.map(str::trim).filter(|tenant| !tenant.is_empty()) {
-        headers.insert(
-            HeaderName::from_static("x-sandboxwich-tenant"),
-            HeaderValue::from_str(tenant).context("invalid SANDBOXWICH_TENANT")?,
-        );
-    }
-    reqwest::Client::builder()
-        .default_headers(headers)
-        .build()
-        .context("failed to build HTTP client")
 }
 
 impl From<GuestStatusArg> for GuestStatus {

@@ -1748,6 +1748,7 @@ name = "sandboxwich-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",

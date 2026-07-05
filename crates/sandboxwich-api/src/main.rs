@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{collections::BTreeMap, net::SocketAddr};
 
 use anyhow::Context;
 use axum::{
@@ -945,78 +945,110 @@ async fn check_database_health(db: &Database) -> Result<HealthComponent, ApiErro
 }
 
 async fn collect_prometheus_metrics(db: &Database) -> Result<String, ApiError> {
+    let metrics = fetch_prometheus_metrics(db).await?;
     let mut body = String::new();
     append_count_family(
         &mut body,
         "sandboxwich_sandbox_count",
         "Sandboxes by lifecycle state.",
         "state",
-        count_by(db, "sandboxes", "state").await?,
+        metrics.counts("sandbox"),
     );
     append_count_family(
         &mut body,
         "sandboxwich_worker_count",
         "Workers by registration status.",
         "status",
-        count_by(db, "workers", "status").await?,
+        metrics.counts("worker"),
     );
     append_count_family(
         &mut body,
         "sandboxwich_job_count",
         "Jobs by scheduler status.",
         "status",
-        count_by(db, "jobs", "status").await?,
+        metrics.counts("job"),
     );
     append_count_family(
         &mut body,
         "sandboxwich_runtime_resource_count",
         "Runtime resources by provider status.",
         "status",
-        count_by(db, "runtime_resources", "status").await?,
+        metrics.counts("runtime_resource"),
     );
     append_gauge(
         &mut body,
         "sandboxwich_job_leases_active",
         "Active job leases.",
-        scalar_i64(
-            db,
-            "select count(*) as value from job_leases where status = 'active'",
-        )
-        .await?,
+        metrics.scalar("job_leases_active"),
     );
     append_gauge(
         &mut body,
         "sandboxwich_worker_capacity_slots",
-        "Total configured worker concurrency slots.",
-        scalar_i64(
-            db,
-            "select coalesce(sum(max_concurrent_jobs), 0) as value from workers",
-        )
-        .await?,
+        "Total configured online worker concurrency slots.",
+        metrics.scalar("worker_capacity_slots"),
     );
     Ok(body)
 }
 
-async fn count_by(
-    db: &Database,
-    table: &'static str,
-    column: &'static str,
-) -> Result<Vec<(String, i64)>, ApiError> {
-    let sql = format!(
-        "select {column} as label, count(*) as value
-         from {table}
-         group by {column}
-         order by {column} asc"
-    );
-    let rows = sqlx::query(&sql).fetch_all(&db.pool).await?;
-    rows.into_iter()
-        .map(|row| Ok((row.try_get("label")?, row.try_get("value")?)))
-        .collect()
+struct PrometheusMetrics {
+    values: BTreeMap<String, Vec<(String, i64)>>,
 }
 
-async fn scalar_i64(db: &Database, sql: &'static str) -> Result<i64, ApiError> {
-    let row = sqlx::query(sql).fetch_one(&db.pool).await?;
-    Ok(row.try_get("value")?)
+impl PrometheusMetrics {
+    fn counts(&self, family: &'static str) -> Vec<(String, i64)> {
+        self.values.get(family).cloned().unwrap_or_default()
+    }
+
+    fn scalar(&self, family: &'static str) -> i64 {
+        self.values
+            .get(family)
+            .and_then(|values| values.first())
+            .map(|(_, value)| *value)
+            .unwrap_or_default()
+    }
+}
+
+async fn fetch_prometheus_metrics(db: &Database) -> Result<PrometheusMetrics, ApiError> {
+    let rows = sqlx::query(
+        "select 'sandbox' as family, state as label, count(*) as value
+         from sandboxes
+         group by state
+         union all
+         select 'worker' as family, status as label, count(*) as value
+         from workers
+         group by status
+         union all
+         select 'job' as family, status as label, count(*) as value
+         from jobs
+         group by status
+         union all
+         select 'runtime_resource' as family, status as label, count(*) as value
+         from runtime_resources
+         group by status
+         union all
+         select 'job_leases_active' as family, '' as label, count(*) as value
+         from job_leases
+         where status = 'active'
+         union all
+         select 'worker_capacity_slots' as family, '' as label, coalesce(sum(max_concurrent_jobs), 0) as value
+         from workers
+         where status = 'online'
+         order by family asc, label asc",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+
+    let mut values = BTreeMap::new();
+    for row in rows {
+        let family: String = row.try_get("family")?;
+        let label: String = row.try_get("label")?;
+        let value: i64 = row.try_get("value")?;
+        values
+            .entry(family)
+            .or_insert_with(Vec::new)
+            .push((label, value));
+    }
+    Ok(PrometheusMetrics { values })
 }
 
 fn append_count_family(
@@ -2959,72 +2991,73 @@ async fn mark_missing_runtime_resources_deleted_on_connection(
     observed: &[ObservedRuntimeResourceIdentity],
     reconciled_at: DateTime<Utc>,
 ) -> Result<Vec<RuntimeResource>, ApiError> {
-    let (sql, cluster_bind) = if request.cluster.is_some() {
-        (
-            format!(
-                "select runtime_resources.id, runtime_resources.sandbox_id, runtime_resources.snapshot_id,
-                        runtime_resources.provider, runtime_resources.resource_kind, runtime_resources.purpose,
-                        runtime_resources.resource_name, runtime_resources.namespace, runtime_resources.status,
-                        runtime_resources.cluster, runtime_resources.storage_class, runtime_resources.snapshot_class,
-                        runtime_resources.storage_size, runtime_resources.runtime_image, runtime_resources.service_port,
-                        runtime_resources.target_port, runtime_resources.source_snapshot_id, runtime_resources.created_at,
-                        runtime_resources.updated_at, runtime_resources.observed_at, runtime_resources.last_reconciled_at,
-                        runtime_resources.ready_at, runtime_resources.deleted_at, runtime_resources.error
-                 from runtime_resources
-                 join sandboxes on sandboxes.id = runtime_resources.sandbox_id
-                 where runtime_resources.provider = {} and runtime_resources.namespace = {}
-                   and runtime_resources.cluster = {} and sandboxes.tenant_id = {}
-                   and runtime_resources.status != 'deleted'
-                 order by runtime_resources.resource_kind asc, runtime_resources.resource_name asc, runtime_resources.id asc",
-                db.placeholder(1),
-                db.placeholder(2),
-                db.placeholder(3),
-                db.placeholder(4)
-            ),
-            true,
-        )
+    let mut placeholder_index = 1;
+    let provider_placeholder = db.placeholder(placeholder_index);
+    placeholder_index += 1;
+    let namespace_placeholder = db.placeholder(placeholder_index);
+    placeholder_index += 1;
+    let cluster_filter = if request.cluster.is_some() {
+        let cluster_placeholder = db.placeholder(placeholder_index);
+        placeholder_index += 1;
+        format!("runtime_resources.cluster = {cluster_placeholder}")
     } else {
-        (
-            format!(
-                "select runtime_resources.id, runtime_resources.sandbox_id, runtime_resources.snapshot_id,
-                        runtime_resources.provider, runtime_resources.resource_kind, runtime_resources.purpose,
-                        runtime_resources.resource_name, runtime_resources.namespace, runtime_resources.status,
-                        runtime_resources.cluster, runtime_resources.storage_class, runtime_resources.snapshot_class,
-                        runtime_resources.storage_size, runtime_resources.runtime_image, runtime_resources.service_port,
-                        runtime_resources.target_port, runtime_resources.source_snapshot_id, runtime_resources.created_at,
-                        runtime_resources.updated_at, runtime_resources.observed_at, runtime_resources.last_reconciled_at,
-                        runtime_resources.ready_at, runtime_resources.deleted_at, runtime_resources.error
-                 from runtime_resources
-                 join sandboxes on sandboxes.id = runtime_resources.sandbox_id
-                 where runtime_resources.provider = {} and runtime_resources.namespace = {}
-                   and runtime_resources.cluster is null and sandboxes.tenant_id = {}
-                   and runtime_resources.status != 'deleted'
-                 order by runtime_resources.resource_kind asc, runtime_resources.resource_name asc, runtime_resources.id asc",
-                db.placeholder(1),
-                db.placeholder(2),
-                db.placeholder(3)
-            ),
-            false,
-        )
+        "runtime_resources.cluster is null".to_string()
     };
+    let tenant_placeholder = db.placeholder(placeholder_index);
+    placeholder_index += 1;
+
+    let mut observed_filters = Vec::new();
+    for _ in observed {
+        let kind_placeholder = db.placeholder(placeholder_index);
+        placeholder_index += 1;
+        let name_placeholder = db.placeholder(placeholder_index);
+        placeholder_index += 1;
+        observed_filters.push(format!(
+            "(runtime_resources.resource_kind = {kind_placeholder} and runtime_resources.resource_name = {name_placeholder})"
+        ));
+    }
+    let missing_filter = if observed_filters.is_empty() {
+        String::new()
+    } else {
+        format!(" and not ({})", observed_filters.join(" or "))
+    };
+
+    let sql = format!(
+        "select runtime_resources.id, runtime_resources.sandbox_id, runtime_resources.snapshot_id,
+                runtime_resources.provider, runtime_resources.resource_kind, runtime_resources.purpose,
+                runtime_resources.resource_name, runtime_resources.namespace, runtime_resources.status,
+                runtime_resources.cluster, runtime_resources.storage_class, runtime_resources.snapshot_class,
+                runtime_resources.storage_size, runtime_resources.runtime_image, runtime_resources.service_port,
+                runtime_resources.target_port, runtime_resources.source_snapshot_id, runtime_resources.created_at,
+                runtime_resources.updated_at, runtime_resources.observed_at, runtime_resources.last_reconciled_at,
+                runtime_resources.ready_at, runtime_resources.deleted_at, runtime_resources.error
+         from runtime_resources
+         join sandboxes on sandboxes.id = runtime_resources.sandbox_id
+         where runtime_resources.provider = {provider_placeholder}
+           and runtime_resources.namespace = {namespace_placeholder}
+           and {cluster_filter}
+           and sandboxes.tenant_id = {tenant_placeholder}
+           and runtime_resources.status != 'deleted'
+           {missing_filter}
+         order by runtime_resources.resource_kind asc, runtime_resources.resource_name asc, runtime_resources.id asc"
+    );
     let mut query = sqlx::query(&sql)
         .bind(&request.provider)
         .bind(&request.namespace);
-    if cluster_bind {
+    if request.cluster.is_some() {
         query = query.bind(&request.cluster);
     }
     query = query.bind(tenant_id);
+    for identity in observed {
+        query = query
+            .bind(runtime_resource_kind_to_str(&identity.resource_kind))
+            .bind(&identity.resource_name);
+    }
     let candidates = query.fetch_all(&mut *connection).await?;
 
     let mut deleted = Vec::new();
     for row in candidates {
         let resource = row_to_runtime_resource(row)?;
-        if observed.iter().any(|identity| {
-            identity.resource_kind == resource.resource_kind
-                && identity.resource_name == resource.resource_name
-        }) {
-            continue;
-        }
         deleted.push(
             mark_runtime_resource_deleted_on_connection(
                 db,
@@ -3111,8 +3144,9 @@ async fn mark_runtime_resource_deleted(
     fetch_runtime_resource(db, resource_id).await
 }
 
-async fn mark_runtime_resources_deleted_for_sandbox(
+async fn mark_runtime_resources_deleted_for_sandbox_on_connection(
     db: &Database,
+    connection: &mut AnyConnection,
     sandbox_id: SandboxId,
     deleted_at: DateTime<Utc>,
     error: &str,
@@ -3129,20 +3163,30 @@ async fn mark_runtime_resources_deleted_for_sandbox(
     );
     let rows = sqlx::query(&sql)
         .bind(sandbox_id.to_string())
-        .fetch_all(&db.pool)
+        .fetch_all(&mut *connection)
         .await?;
 
     let mut deleted = Vec::new();
     for row in rows {
         let resource = row_to_runtime_resource(row)?;
-        deleted.push(mark_runtime_resource_deleted(db, resource.id, deleted_at, error).await?);
+        deleted.push(
+            mark_runtime_resource_deleted_on_connection(
+                db,
+                connection,
+                resource.id,
+                deleted_at,
+                error,
+            )
+            .await?,
+        );
     }
 
     Ok(deleted)
 }
 
-async fn insert_runtime_resource_tombstone(
+async fn insert_runtime_resource_tombstone_on_connection(
     db: &Database,
+    connection: &mut AnyConnection,
     resource: &RuntimeResource,
     tombstoned_at: DateTime<Utc>,
 ) -> Result<(), ApiError> {
@@ -3196,7 +3240,7 @@ async fn insert_runtime_resource_tombstone(
         .bind(resource.deleted_at.map(|time| time.to_rfc3339()))
         .bind(&resource.error)
         .bind(tombstoned_at.to_rfc3339())
-        .execute(&db.pool)
+        .execute(&mut *connection)
         .await?;
     Ok(())
 }
@@ -3302,6 +3346,7 @@ async fn append_command_output_chunk_on_connection(
     stream: CommandOutputStream,
     chunk: String,
 ) -> Result<CommandOutputChunk, ApiError> {
+    lock_command_output_for_append_on_connection(db, connection, command_id).await?;
     let sequence =
         next_command_output_sequence_on_connection(db, connection, command_id, &stream).await?;
     let now = Utc::now();
@@ -3351,6 +3396,27 @@ async fn append_command_output_chunk_on_connection(
     .await?;
 
     Ok(output_chunk)
+}
+
+async fn lock_command_output_for_append_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    command_id: CommandId,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "update commands
+         set id = id
+         where id = {}",
+        db.placeholder(1)
+    );
+    let result = sqlx::query(&sql)
+        .bind(command_id.to_string())
+        .execute(&mut *connection)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("command not found"));
+    }
+    Ok(())
 }
 
 async fn next_command_output_sequence_on_connection(
@@ -4195,27 +4261,46 @@ async fn cleanup_archived_sandboxes(
             });
             continue;
         }
-        let deleted_resources = mark_runtime_resources_deleted_for_sandbox(
-            db,
-            sandbox.id,
-            now,
-            "archived sandbox deleted during cleanup",
-        )
-        .await?;
-        for resource in &deleted_resources {
-            insert_runtime_resource_tombstone(db, resource, now).await?;
-        }
-        runtime_resources_deleted.extend(deleted_resources);
-        let sql = format!(
-            "delete from sandboxes where id = {} and state = 'archived'",
-            db.placeholder(1)
-        );
-        let result = sqlx::query(&sql)
-            .bind(sandbox.id.to_string())
-            .execute(&db.pool)
+        let mut tx = db.pool.begin().await?;
+        let cleaned = async {
+            let deleted_resources = mark_runtime_resources_deleted_for_sandbox_on_connection(
+                db,
+                &mut *tx,
+                sandbox.id,
+                now,
+                "archived sandbox deleted during cleanup",
+            )
             .await?;
-        if result.rows_affected() > 0 {
-            deleted.push(sandbox);
+            for resource in &deleted_resources {
+                insert_runtime_resource_tombstone_on_connection(db, &mut *tx, resource, now)
+                    .await?;
+            }
+            let sql = format!(
+                "delete from sandboxes where id = {} and state = 'archived'",
+                db.placeholder(1)
+            );
+            let result = sqlx::query(&sql)
+                .bind(sandbox.id.to_string())
+                .execute(&mut *tx)
+                .await?;
+            Ok((result.rows_affected() > 0, deleted_resources))
+        }
+        .await;
+        match cleaned {
+            Ok((true, deleted_resources)) => {
+                tx.commit().await?;
+                runtime_resources_deleted.extend(deleted_resources);
+                deleted.push(sandbox);
+            }
+            Ok((false, _)) => {
+                tx.rollback().await?;
+            }
+            Err(error) => {
+                if let Err(rollback_error) = tx.rollback().await {
+                    tracing::warn!(%rollback_error, "failed to roll back archived sandbox cleanup");
+                }
+                return Err(error);
+            }
         }
     }
 

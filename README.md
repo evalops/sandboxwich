@@ -59,3 +59,5 @@ Worker completions use typed result variants. Provider-created pods, PVCs, Servi
 See [ROADMAP.md](ROADMAP.md) for the current milestones.
 
 For k3s and Kubernetes deployment notes, see [docs/kubernetes.md](docs/kubernetes.md).
+
+For API compatibility notes, see [CHANGELOG.md](CHANGELOG.md).
