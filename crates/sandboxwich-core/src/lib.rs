@@ -160,6 +160,28 @@ impl fmt::Display for CommandOutputChunkId {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
+pub struct FileId(pub Uuid);
+
+impl FileId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for FileId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for FileId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct EventId(pub Uuid);
 
 impl EventId {
@@ -402,6 +424,7 @@ pub enum RuntimeResourceKind {
     PersistentVolumeClaim => "persistent_volume_claim",
     Service => "service",
     VolumeSnapshot => "volume_snapshot",
+    NetworkPolicy => "network_policy",
 }
 }
 
@@ -412,6 +435,7 @@ pub enum RuntimeResourcePurpose {
     Ssh => "ssh",
     Desktop => "desktop",
     Snapshot => "snapshot",
+    Network => "network",
 }
 }
 
@@ -422,6 +446,7 @@ pub enum RuntimeResourceStatus {
     Ready => "ready",
     Failed => "failed",
     Deleted => "deleted",
+    Destroyed => "destroyed",
 }
 }
 
@@ -431,6 +456,170 @@ pub enum CleanupRunStatus {
     Succeeded => "succeeded",
     Failed => "failed",
 }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MemoryLimit {
+    OneG,
+    FourG,
+    SixteenG,
+    SixtyFourG,
+}
+
+impl Default for MemoryLimit {
+    fn default() -> Self {
+        Self::OneG
+    }
+}
+
+impl MemoryLimit {
+    pub fn cpu_limit(&self) -> &'static str {
+        match self {
+            Self::OneG => "500m",
+            Self::FourG => "1",
+            Self::SixteenG => "4",
+            Self::SixtyFourG => "16",
+        }
+    }
+
+    pub fn memory_quantity(&self) -> &'static str {
+        match self {
+            Self::OneG => "1Gi",
+            Self::FourG => "4Gi",
+            Self::SixteenG => "16Gi",
+            Self::SixtyFourG => "64Gi",
+        }
+    }
+
+    pub fn disk_limit(&self) -> &'static str {
+        match self {
+            Self::OneG => "2Gi",
+            Self::FourG => "8Gi",
+            Self::SixteenG => "32Gi",
+            Self::SixtyFourG => "128Gi",
+        }
+    }
+}
+
+impl DbVariant for MemoryLimit {
+    const VALUES: &'static [&'static str] = &["1g", "4g", "16g", "64g"];
+
+    fn as_db_str(&self) -> &'static str {
+        match self {
+            Self::OneG => "1g",
+            Self::FourG => "4g",
+            Self::SixteenG => "16g",
+            Self::SixtyFourG => "64g",
+        }
+    }
+
+    fn parse_db_str(value: &str) -> Result<Self, DbVariantError> {
+        match value {
+            "1g" => Ok(Self::OneG),
+            "4g" => Ok(Self::FourG),
+            "16g" => Ok(Self::SixteenG),
+            "64g" => Ok(Self::SixtyFourG),
+            _ => Err(DbVariantError {
+                enum_name: "MemoryLimit",
+                value: value.to_string(),
+                expected: Self::VALUES,
+            }),
+        }
+    }
+}
+
+impl fmt::Display for MemoryLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_db_str())
+    }
+}
+
+impl Serialize for MemoryLimit {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_db_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for MemoryLimit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse_db_str(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+db_variant_enum! {
+pub enum NetworkEgressMode {
+    DenyAll => "deny_all",
+    Allowlist => "allowlist",
+    AllowAll => "allow_all",
+}
+}
+
+db_variant_enum! {
+pub enum NetworkAllowRuleKind {
+    Cidr => "cidr",
+    Host => "host",
+}
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NetworkAllowRule {
+    pub kind: NetworkAllowRuleKind,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum NetworkEgress {
+    DenyAll,
+    Allowlist { rules: Vec<NetworkAllowRule> },
+    AllowAll,
+}
+
+impl Default for NetworkEgress {
+    fn default() -> Self {
+        Self::DenyAll
+    }
+}
+
+impl NetworkEgress {
+    pub fn mode(&self) -> NetworkEgressMode {
+        match self {
+            Self::DenyAll => NetworkEgressMode::DenyAll,
+            Self::Allowlist { .. } => NetworkEgressMode::Allowlist,
+            Self::AllowAll => NetworkEgressMode::AllowAll,
+        }
+    }
+
+    pub fn rules(&self) -> &[NetworkAllowRule] {
+        match self {
+            Self::Allowlist { rules } => rules,
+            Self::DenyAll | Self::AllowAll => &[],
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SandboxProvisionSpec {
+    #[serde(default)]
+    pub memory_limit: MemoryLimit,
+    #[serde(default)]
+    pub network_egress: NetworkEgress,
+}
+
+impl Default for SandboxProvisionSpec {
+    fn default() -> Self {
+        Self {
+            memory_limit: MemoryLimit::default(),
+            network_egress: NetworkEgress::default(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -490,6 +679,9 @@ pub struct Sandbox {
     pub name: String,
     pub state: SandboxState,
     pub template: String,
+    pub memory_limit: MemoryLimit,
+    #[serde(default)]
+    pub network_egress: NetworkEgress,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub ttl_seconds: Option<u64>,
@@ -500,6 +692,8 @@ pub struct Sandbox {
 pub struct CreateSandboxRequest {
     pub name: Option<String>,
     pub template: Option<String>,
+    pub memory_limit: Option<MemoryLimit>,
+    pub network_egress: Option<NetworkEgress>,
     pub ttl_seconds: Option<u64>,
 }
 
@@ -519,6 +713,45 @@ pub struct SandboxListResponse {
 pub struct RuntimeResourceListResponse {
     pub ok: bool,
     pub resources: Vec<RuntimeResource>,
+}
+
+pub const MAX_SANDBOX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UploadFileRequest {
+    pub path: String,
+    pub mime_type: Option<String>,
+    pub content: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SandboxFile {
+    pub id: FileId,
+    pub sandbox_id: SandboxId,
+    pub path: String,
+    pub size_bytes: u64,
+    pub mime_type: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ListFilesResponse {
+    pub ok: bool,
+    pub files: Vec<SandboxFile>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileResponse {
+    pub ok: bool,
+    pub file: SandboxFile,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DownloadFileResponse {
+    pub ok: bool,
+    pub file: SandboxFile,
+    pub content: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -755,6 +988,8 @@ pub struct CommandOutputChunk {
     pub stream: CommandOutputStream,
     pub sequence: u64,
     pub chunk: String,
+    #[serde(default)]
+    pub annotations: Vec<CommandOutputAnnotation>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -762,6 +997,8 @@ pub struct CommandOutputChunk {
 pub struct AppendCommandOutputRequest {
     pub stream: CommandOutputStream,
     pub chunk: String,
+    #[serde(default)]
+    pub annotations: Vec<CommandOutputAnnotation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -774,6 +1011,17 @@ pub struct CommandOutputChunkResponse {
 pub struct CommandOutputListResponse {
     pub ok: bool,
     pub chunks: Vec<CommandOutputChunk>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CommandOutputAnnotation {
+    ContainerFileCitation {
+        file_id: FileId,
+        path: String,
+        start_index: Option<u64>,
+        end_index: Option<u64>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -805,6 +1053,7 @@ pub enum SandboxEventKind {
     DesktopFailed => "desktop_failed",
     DesktopClosed => "desktop_closed",
     DesktopExpired => "desktop_expired",
+    FileUploaded => "file_uploaded",
 }
 }
 
@@ -840,6 +1089,7 @@ pub enum WorkerCapability {
     Snapshot => "snapshot",
     DesktopStream => "desktop_stream",
     K8sPod => "k8s_pod",
+    GvisorSandbox => "gvisor_sandbox",
 }
 }
 
@@ -1052,6 +1302,23 @@ pub struct AgentHealthResponse {
     pub ready: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentFileWriteRequest {
+    pub path: String,
+    pub content: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentFileReadRequest {
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentFileReadResponse {
+    pub path: String,
+    pub content: Vec<u8>,
+}
+
 db_variant_enum! {
 pub enum ProviderHealthStatus {
     Healthy => "healthy",
@@ -1256,6 +1523,9 @@ mod tests {
         assert_db_variant_contract::<RuntimeResourcePurpose>();
         assert_db_variant_contract::<RuntimeResourceStatus>();
         assert_db_variant_contract::<CleanupRunStatus>();
+        assert_db_variant_contract::<MemoryLimit>();
+        assert_db_variant_contract::<NetworkEgressMode>();
+        assert_db_variant_contract::<NetworkAllowRuleKind>();
         assert_db_variant_contract::<CommandStatus>();
         assert_db_variant_contract::<CommandOutputStream>();
         assert_db_variant_contract::<SandboxEventKind>();

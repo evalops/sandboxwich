@@ -1,3 +1,4 @@
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -17,10 +18,18 @@ metadata:
     app.kubernetes.io/part-of: sandboxwich
 rules:
   - apiGroups: [""]
-    resources: ["pods", "pods/log", "pods/exec", "services", "persistentvolumeclaims"]
+    resources:
+      - pods
+      - pods/log
+      - pods/exec
+      - services
+      - persistentvolumeclaims
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources: ["volumesnapshots"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -93,6 +102,8 @@ spec:
               value: 2Gi
             - name: SANDBOXWICH_SSH_AUTHORIZED_KEYS_SECRET
               value: ""
+            - name: SANDBOXWICH_RUNTIME_CLASS_NAME
+              value: ""
             - name: SANDBOXWICH_K8S_ENABLE_MUTATION
               value: "1"
           args:
@@ -118,6 +129,8 @@ spec:
             - $(SANDBOXWICH_WORKSPACE_STORAGE)
             - --ssh-authorized-keys-secret
             - $(SANDBOXWICH_SSH_AUTHORIZED_KEYS_SECRET)
+            - --runtime-class-name
+            - $(SANDBOXWICH_RUNTIME_CLASS_NAME)
             - --label
             - cluster=$(SANDBOXWICH_CLUSTER)
             - --label

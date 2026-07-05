@@ -8,8 +8,8 @@ use provider::{KubernetesApplyProvider, KubernetesDryRunProvider, SandboxProvide
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse,
     CompleteLeaseRequest, FailLeaseRequest, JobKind, LeaseResponse, RegisterWorkerRequest,
-    RenewLeaseRequest, WorkerCapability, WorkerHeartbeatRequest, WorkerJobResult, WorkerResponse,
-    build_api_client,
+    RenewLeaseRequest, SandboxProvisionSpec, WorkerCapability, WorkerHeartbeatRequest,
+    WorkerJobResult, WorkerResponse, build_api_client,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -203,6 +203,9 @@ struct ProviderArgs {
 
     #[arg(long)]
     ssh_authorized_keys_secret: Option<String>,
+
+    #[arg(long, env = "SANDBOXWICH_RUNTIME_CLASS_NAME")]
+    runtime_class_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -249,6 +252,7 @@ enum CapabilityArg {
     Snapshot,
     DesktopStream,
     K8sPod,
+    GvisorSandbox,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -280,10 +284,11 @@ impl SandboxProvider for RuntimeProvider {
     fn provision(
         &self,
         sandbox_id: sandboxwich_core::SandboxId,
+        spec: &SandboxProvisionSpec,
     ) -> anyhow::Result<sandboxwich_core::ProviderSandboxHandle> {
         match self {
-            Self::DryRun(provider) => provider.provision(sandbox_id),
-            Self::Apply(provider) => provider.provision(sandbox_id),
+            Self::DryRun(provider) => provider.provision(sandbox_id, spec),
+            Self::Apply(provider) => provider.provision(sandbox_id, spec),
         }
     }
 
@@ -314,13 +319,14 @@ impl SandboxProvider for RuntimeProvider {
         parent_sandbox_id: sandboxwich_core::SandboxId,
         child_sandbox_id: sandboxwich_core::SandboxId,
         snapshot_id: sandboxwich_core::SnapshotId,
+        spec: &SandboxProvisionSpec,
     ) -> anyhow::Result<sandboxwich_core::ProviderForkHandle> {
         match self {
             Self::DryRun(provider) => {
-                provider.fork(parent_sandbox_id, child_sandbox_id, snapshot_id)
+                provider.fork(parent_sandbox_id, child_sandbox_id, snapshot_id, spec)
             }
             Self::Apply(provider) => {
-                provider.fork(parent_sandbox_id, child_sandbox_id, snapshot_id)
+                provider.fork(parent_sandbox_id, child_sandbox_id, snapshot_id, spec)
             }
         }
     }
@@ -345,7 +351,8 @@ async fn main() -> anyhow::Result<()> {
                         "agent_prompt",
                         "snapshot",
                         "desktop_stream",
-                        "k8s_pod"
+                        "k8s_pod",
+                        "gvisor_sandbox"
                     ]
                 }))?
             );
@@ -369,6 +376,7 @@ async fn main() -> anyhow::Result<()> {
             let sandbox_id = sandboxwich_core::SandboxId::new();
             let child_sandbox_id = sandboxwich_core::SandboxId::new();
             let snapshot_id = sandboxwich_core::SnapshotId::new();
+            let spec = SandboxProvisionSpec::default();
             let exec = provider.exec_handoff(
                 sandbox_id,
                 AgentCommandRequest {
@@ -377,9 +385,9 @@ async fn main() -> anyhow::Result<()> {
                     env: BTreeMap::new(),
                 },
             )?;
-            let provision = provider.provision(sandbox_id)?;
+            let provision = provider.provision(sandbox_id, &spec)?;
             let snapshot = provider.create_snapshot(sandbox_id, snapshot_id)?;
-            let fork = provider.fork(sandbox_id, child_sandbox_id, snapshot_id)?;
+            let fork = provider.fork(sandbox_id, child_sandbox_id, snapshot_id, &spec)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -556,6 +564,7 @@ fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
     .with_runtime_image(non_empty(args.runtime_image))
     .with_workspace_storage(non_empty(args.workspace_storage))
     .with_ssh_authorized_keys_secret(non_empty(args.ssh_authorized_keys_secret))
+    .with_runtime_class_name(non_empty(args.runtime_class_name))
 }
 
 fn apply_provider_from_args(args: ProviderApplyArgs) -> KubernetesApplyProvider {
@@ -748,7 +757,8 @@ fn execute_job(
     match job.kind {
         JobKind::ProvisionSandbox => {
             let sandbox_id = sandbox_id_from_payload(&job.payload)?;
-            let handle = provider.provision(sandbox_id)?;
+            let spec = provision_spec_from_payload(&job.payload)?;
+            let handle = provider.provision(sandbox_id, &spec)?;
             Ok(WorkerJobOutcome::Complete(
                 WorkerJobResult::ProvisionSandbox { handle },
             ))
@@ -783,7 +793,8 @@ fn execute_job(
             let parent_sandbox_id = parent_sandbox_id_from_payload(&job.payload)?;
             let child_sandbox_id = child_sandbox_id_from_payload(&job.payload)?;
             let snapshot_id = snapshot_id_from_payload(&job.payload)?;
-            let handle = provider.fork(parent_sandbox_id, child_sandbox_id, snapshot_id)?;
+            let spec = provision_spec_from_payload(&job.payload)?;
+            let handle = provider.fork(parent_sandbox_id, child_sandbox_id, snapshot_id, &spec)?;
             Ok(WorkerJobOutcome::Complete(WorkerJobResult::ForkSandbox {
                 handle,
             }))
@@ -847,6 +858,18 @@ fn prompt_output_from_payload(payload: &serde_json::Value) -> anyhow::Result<Str
         "dry-run prompt accepted: {}",
         instructions.lines().next().unwrap_or_default()
     ))
+}
+
+fn provision_spec_from_payload(
+    payload: &serde_json::Value,
+) -> anyhow::Result<SandboxProvisionSpec> {
+    payload
+        .get("provisionSpec")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .context("job payload provisionSpec is invalid")
+        .map(|spec| spec.unwrap_or_default())
 }
 
 fn sandbox_id_from_payload(
@@ -952,6 +975,7 @@ fn to_capability(value: CapabilityArg) -> WorkerCapability {
         CapabilityArg::Snapshot => WorkerCapability::Snapshot,
         CapabilityArg::DesktopStream => WorkerCapability::DesktopStream,
         CapabilityArg::K8sPod => WorkerCapability::K8sPod,
+        CapabilityArg::GvisorSandbox => WorkerCapability::GvisorSandbox,
     }
 }
 

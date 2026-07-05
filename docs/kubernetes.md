@@ -8,8 +8,8 @@
 - Run `sandboxwich-api migrate` as a Job before or during rollouts.
 - Store state in Postgres through `SANDBOXWICH_DATABASE_URL`.
 - Expose the API with a ClusterIP Service.
-- Register workers with typed provider labels such as `provider=kubernetes` and capabilities such as `k8s_pod` and `run_command`.
-- Persist provider-created Pods, PVCs, Services, and VolumeSnapshots in the `runtime_resources` table for controller cleanup and capacity accounting.
+- Register workers with typed provider labels such as `provider=kubernetes` and capabilities such as `k8s_pod`, `run_command`, and, when configured, `gvisor_sandbox`.
+- Persist provider-created Pods, PVCs, Services, NetworkPolicies, and VolumeSnapshots in the `runtime_resources` table for controller cleanup and capacity accounting.
 
 The worker binary can register and heartbeat today:
 
@@ -58,11 +58,14 @@ SANDBOXWICH_K8S_ENABLE_MUTATION=1 sandboxwich-worker --api http://sandboxwich-ap
   --cluster k3s-dev \
   --namespace sandboxwich \
   --storage-class local-path \
+  --runtime-class-name gvisor \
   --workspace-storage 2Gi \
   --label cluster=k3s-dev
 ```
 
-Apply mode uses the pod ServiceAccount and `kubectl` to create the sandbox PVC, Pod, and Services in the worker namespace, waits for the sandbox Pod to become Ready, records the runtime resources through the API, and executes command jobs with `kubectl exec` against the sandbox container. The double opt-in (`--confirm-apply` plus `SANDBOXWICH_K8S_ENABLE_MUTATION=1`) is intentional so a worker cannot mutate Kubernetes resources by accident.
+Apply mode uses the pod ServiceAccount and `kubectl` to create the sandbox PVC, Pod, NetworkPolicy, and Services in the worker namespace, waits for the sandbox Pod to become Ready, records the runtime resources through the API, and executes command jobs with `kubectl exec` against the sandbox container. The double opt-in (`--confirm-apply` plus `SANDBOXWICH_K8S_ENABLE_MUTATION=1`) is intentional so a worker cannot mutate Kubernetes resources by accident.
+
+Sandbox creation carries a typed provision spec: memory tier (`1g`, `4g`, `16g`, `64g`) and network egress (`deny_all`, `allow_all`, or `allowlist`). The Kubernetes provider maps tiers to CPU/memory requests and PVC size, renders deny-by-default egress with explicit CIDR allow rules, sets `runAsNonRoot`, drops all container capabilities, and uses `RuntimeDefault` seccomp. `--runtime-class-name gvisor` or `--runtime-class-name kata` enables a RuntimeClass-backed isolation backend when the cluster supports it.
 
 Inspect the persisted runtime view with:
 
@@ -72,7 +75,7 @@ sandboxwich-cli --api http://sandboxwich-api:3217 resources <sandbox-id>
 
 ## Provider Adapter Dry Run
 
-The first provider adapter is a Kubernetes-shaped dry run. It reports the same typed capabilities and provider metadata that a k3s worker will use, but it does not call the Kubernetes API or mutate Pods, PVCs, VolumeSnapshots, Services, or Secrets.
+The first provider adapter is a Kubernetes-shaped dry run. It reports the same typed capabilities and provider metadata that a k3s worker will use, but it does not call the Kubernetes API or mutate Pods, PVCs, NetworkPolicies, VolumeSnapshots, Services, or Secrets.
 
 ```sh
 sandboxwich-worker provider-capabilities \
@@ -90,18 +93,19 @@ sandboxwich-worker provider-smoke \
   --ssh-authorized-keys-secret sandboxwich-authorized-keys
 ```
 
-Use the dry-run output to validate control-plane wiring before granting a worker ServiceAccount any Kubernetes permissions. The smoke output includes Pod, PVC, Service, and VolumeSnapshot-shaped manifests as diagnostics, while lease completion sends typed runtime-resource records to the API.
+Use the dry-run output to validate control-plane wiring before granting a worker ServiceAccount any Kubernetes permissions. The smoke output includes Pod, PVC, NetworkPolicy, Service, and VolumeSnapshot-shaped manifests as diagnostics, while lease completion sends typed runtime-resource records to the API.
 
 ## Guest Runtime Image
 
 The starter guest runtime lives in `deploy/runtime/ubuntu-dev/`. It is an Ubuntu image contract for sandbox Pods:
 
-- SSH daemon on port `22`.
+- SSH daemon on port `2222`.
 - noVNC desktop bridge on port `6080`.
 - Persistent workspace mounted at `/workspace`.
 - Optional authorized keys file mounted from a caller-owned Secret.
 - Development tooling installed from package repositories, including Git, Rust, Node/npm, GitHub CLI, Docker CLI/daemon packages, Python, tmux, and shell utilities.
-- Docker daemon startup is opt-in with `SANDBOXWICH_DOCKERD=1` because most clusters require explicit runtime policy for that.
+- The image runs as the unprivileged `sandbox` user by default.
+- Docker daemon startup is opt-in with `SANDBOXWICH_DOCKERD=1`, and is ignored in non-root pods because most clusters require explicit runtime policy for that.
 
 Build it locally or in your own registry pipeline:
 
@@ -144,7 +148,7 @@ SANDBOXWICH_K8S_ENABLE_MUTATION=1 sandboxwich-worker provider-apply-smoke \
   --confirm-apply
 ```
 
-By default the smoke command deletes the resources it created with `kubectl delete --ignore-not-found -f -`. Use `--keep-resources` only when debugging a disposable namespace. Do not run the apply smoke against production-like namespaces. Grant the worker only namespace-scoped permissions for Pods, PVCs, Services, and VolumeSnapshots. `deploy/kubernetes/worker.yaml` includes a ServiceAccount, Role, RoleBinding, and worker Deployment example. Secret creation should stay in your existing secret-management path.
+By default the smoke command deletes the resources it created with `kubectl delete --ignore-not-found -f -`. Use `--keep-resources` only when debugging a disposable namespace. Do not run the apply smoke against production-like namespaces. Grant the worker only namespace-scoped permissions for Pods, PVCs, Services, NetworkPolicies, and VolumeSnapshots. `deploy/kubernetes/worker.yaml` includes a ServiceAccount, Role, RoleBinding, and worker Deployment example. Secret creation should stay in your existing secret-management path.
 
 Clusters without a CSI `VolumeSnapshotClass` should use the long-running apply-mode worker for pod/exec smoke and skip the standalone full apply smoke, or pass a real snapshot class. The command execution path does not require snapshots.
 
@@ -233,4 +237,4 @@ project has dedicated, quiet benchmark runners.
 ## Next Kubernetes Work
 
 - Add Helm or Kustomize overlays for k3s, staging, and production.
-- Add NetworkPolicy examples for Kubernetes API egress and sandbox egress control.
+- Add cluster-specific RuntimeClass examples for gVisor, runsc, and Kata.

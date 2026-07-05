@@ -30,6 +30,8 @@ Goal: replace dry-run command responses with real command lifecycle events from 
 - Stream command output into control-plane events.
 - Add SSH key injection lifecycle.
 - Add failure semantics for unhealthy or unreachable guests.
+- Ship daemon-mode guest agent execution with streaming stdout/stderr chunks.
+- Add guest file upload, download, list, and file-citation annotations.
 
 ## Milestone 4: Snapshot And Fork
 
@@ -55,6 +57,8 @@ Goal: make providers pluggable and testable before wiring real infrastructure.
 
 - Define provider adapter traits and capability reports.
 - Implement the first VM or microVM adapter.
+- Add RuntimeClass-backed isolation for gVisor/Kata-capable Kubernetes clusters.
+- Add resource tiers and network egress policy to provisioning specs.
 - Add provider health and capability reporting.
 - Add an end-to-end provision, exec, snapshot, and fork smoke test.
 
