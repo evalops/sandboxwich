@@ -13,9 +13,9 @@ use sandboxwich_core::{
     DesktopSessionResponse, DesktopSessionStatus, EventListResponse, FailLeaseRequest,
     GuestHealthResponse, GuestStatus, HealthResponse, Job, JobKind, JobListResponse, JobResponse,
     JobStatus, LeaseResponse, PromptQueuedResponse, PromptRequest, ProviderForkHandle,
-    ProviderRuntimeResource, ProviderSandboxHandle, ReconcileRuntimeResourcesRequest,
-    ReconcileRuntimeResourcesResponse, RegisterWorkerRequest, RequestSshKeyRequest,
-    RuntimeResourceKind, RuntimeResourceListResponse, RuntimeResourcePurpose,
+    ProviderRuntimeResource, ProviderSandboxHandle, ProviderSnapshotHandle,
+    ReconcileRuntimeResourcesRequest, ReconcileRuntimeResourcesResponse, RegisterWorkerRequest,
+    RequestSshKeyRequest, RuntimeResourceKind, RuntimeResourceListResponse, RuntimeResourcePurpose,
     RuntimeResourceStatus, SandboxEventKind, SandboxListResponse, SandboxResponse, SandboxState,
     SnapshotCleanupResponse, SnapshotId, SnapshotListResponse, SnapshotResponse, SnapshotStatus,
     SshAccessRequest, SshAccessResponse, SshKeyListResponse, SshKeyResponse, SshKeyStatus,
@@ -1467,6 +1467,24 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
     sandbox: &SandboxResponse,
     worker: &WorkerResponse,
 ) {
+    let snapshot_worker: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "k3s-snapshot-worker".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![WorkerCapability::Snapshot],
+            max_concurrent_jobs: Some(1),
+            labels: [("cluster".to_string(), "k3s-dev".to_string())].into(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
     let snapshot: SnapshotResponse = client
         .post(format!(
             "{}/sandboxes/{}/snapshots",
@@ -1486,8 +1504,65 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .json()
         .await
         .unwrap();
-    assert_eq!(snapshot.snapshot.status, SnapshotStatus::Ready);
+    assert_eq!(snapshot.snapshot.status, SnapshotStatus::Pending);
     assert_eq!(snapshot.snapshot.sandbox_id, sandbox.sandbox.id);
+
+    let snapshot_claimed: ClaimLeaseResponse = client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, snapshot_worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let snapshot_lease = snapshot_claimed
+        .lease
+        .expect("expected snapshot worker to claim manual snapshot job");
+    assert_eq!(snapshot_lease.job.kind, JobKind::CreateSnapshot);
+    let snapshot_id = snapshot.snapshot.id.to_string();
+    assert_eq!(
+        snapshot_lease
+            .job
+            .payload
+            .get("snapshotId")
+            .and_then(|value| value.as_str()),
+        Some(snapshot_id.as_str())
+    );
+    let completed_snapshot: LeaseResponse = client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, snapshot_lease.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::CreateSnapshot {
+                handle: ProviderSnapshotHandle {
+                    provider: "kubernetes".to_string(),
+                    snapshot_id: snapshot.snapshot.id,
+                    resources: snapshot_resources(sandbox.sandbox.id, snapshot.snapshot.id),
+                    metadata: serde_json::json!({
+                        "cluster": "k3s-dev",
+                        "namespace": "sandboxwich-contract"
+                    }),
+                },
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(completed_snapshot.lease.job.status, JobStatus::Succeeded);
 
     let fetched_snapshot: SnapshotResponse = client
         .get(format!(
@@ -1503,6 +1578,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .await
         .unwrap();
     assert_eq!(fetched_snapshot.snapshot.id, snapshot.snapshot.id);
+    assert_eq!(fetched_snapshot.snapshot.status, SnapshotStatus::Ready);
 
     let snapshots: SnapshotListResponse = client
         .get(format!(
@@ -1622,24 +1698,6 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .unwrap();
     assert_eq!(missing_archived.status(), StatusCode::NOT_FOUND);
 
-    let snapshot_worker: WorkerResponse = client
-        .post(format!("{}/workers/register", server.base_url))
-        .json(&RegisterWorkerRequest {
-            name: "k3s-snapshot-worker".to_string(),
-            provider: "kubernetes".to_string(),
-            capabilities: vec![WorkerCapability::Snapshot],
-            max_concurrent_jobs: Some(1),
-            labels: [("cluster".to_string(), "k3s-dev".to_string())].into(),
-        })
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-
     let forked: SandboxResponse = client
         .post(format!(
             "{}/sandboxes/{}/fork",
@@ -1663,6 +1721,92 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .sandbox
         .parent_snapshot_id
         .expect("fork should point at a real snapshot");
+
+    let parent_snapshots: SnapshotListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/snapshots",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        parent_snapshots
+            .snapshots
+            .iter()
+            .any(|seen| { seen.id == fork_snapshot_id && seen.status == SnapshotStatus::Pending })
+    );
+
+    let jobs: JobListResponse = client
+        .get(format!("{}/jobs", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let fork_snapshot_job = job_for_snapshot(&jobs.jobs, &fork_snapshot_id.to_string());
+    assert_eq!(fork_snapshot_job.kind, JobKind::CreateSnapshot);
+    assert_eq!(fork_snapshot_job.status, JobStatus::Queued);
+
+    let claimed_snapshot: ClaimLeaseResponse = client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, snapshot_worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let snapshot_lease = claimed_snapshot
+        .lease
+        .expect("expected snapshot worker to claim fork snapshot job");
+    assert_eq!(snapshot_lease.job.id, fork_snapshot_job.id);
+
+    let completed_fork_snapshot: LeaseResponse = client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, snapshot_lease.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::CreateSnapshot {
+                handle: ProviderSnapshotHandle {
+                    provider: "kubernetes".to_string(),
+                    snapshot_id: fork_snapshot_id,
+                    resources: snapshot_resources(sandbox.sandbox.id, fork_snapshot_id),
+                    metadata: serde_json::json!({
+                        "cluster": "k3s-dev",
+                        "namespace": "sandboxwich-contract"
+                    }),
+                },
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        completed_fork_snapshot.lease.job.status,
+        JobStatus::Succeeded
+    );
 
     let parent_snapshots: SnapshotListResponse = client
         .get(format!(
@@ -1819,6 +1963,19 @@ fn job_for_child_sandbox(jobs: &[Job], child_sandbox_id: &str) -> Job {
         .expect("expected fork job")
 }
 
+fn job_for_snapshot(jobs: &[Job], snapshot_id: &str) -> Job {
+    jobs.iter()
+        .find(|job| {
+            job.payload
+                .get("snapshotId")
+                .and_then(|value| value.as_str())
+                == Some(snapshot_id)
+                && job.kind == JobKind::CreateSnapshot
+        })
+        .cloned()
+        .expect("expected snapshot job")
+}
+
 fn job_for_prompt(jobs: &[Job], prompt_event_id: &str) -> Job {
     jobs.iter()
         .find(|job| {
@@ -1910,6 +2067,19 @@ fn fork_resources(
             resource
         })
         .collect()
+}
+
+fn snapshot_resources(
+    sandbox_id: sandboxwich_core::SandboxId,
+    snapshot_id: SnapshotId,
+) -> Vec<ProviderRuntimeResource> {
+    vec![provider_resource(
+        sandbox_id,
+        Some(snapshot_id),
+        RuntimeResourceKind::VolumeSnapshot,
+        RuntimeResourcePurpose::Snapshot,
+        format!("sandboxwich-snapshot-{snapshot_id}"),
+    )]
 }
 
 fn provider_resource(
