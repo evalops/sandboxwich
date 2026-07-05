@@ -50,6 +50,28 @@ impl fmt::Display for CommandId {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
+pub struct CommandOutputChunkId(pub Uuid);
+
+impl CommandOutputChunkId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for CommandOutputChunkId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for CommandOutputChunkId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct EventId(pub Uuid);
 
 impl EventId {
@@ -605,6 +627,13 @@ pub enum CommandStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandOutputStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CommandRun {
     pub id: CommandId,
     pub sandbox_id: SandboxId,
@@ -628,6 +657,34 @@ pub struct CommandResponse {
 pub struct CommandListResponse {
     pub ok: bool,
     pub commands: Vec<CommandRun>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CommandOutputChunk {
+    pub id: CommandOutputChunkId,
+    pub command_id: CommandId,
+    pub stream: CommandOutputStream,
+    pub sequence: u64,
+    pub chunk: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AppendCommandOutputRequest {
+    pub stream: CommandOutputStream,
+    pub chunk: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CommandOutputChunkResponse {
+    pub ok: bool,
+    pub chunk: CommandOutputChunk,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CommandOutputListResponse {
+    pub ok: bool,
+    pub chunks: Vec<CommandOutputChunk>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
