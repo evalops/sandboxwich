@@ -18,3 +18,5 @@
   response structs.
 - Kubernetes provider manifests now include NetworkPolicies, resource requests/limits,
   pod/container security contexts, and optional RuntimeClass isolation.
+- Runtime resource cleanup distinguishes `deleted` resources reconciled as missing
+  from `destroyed` resources explicitly torn down during archived-sandbox cleanup.

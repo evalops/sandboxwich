@@ -59,7 +59,7 @@ The API exposes `/healthz`, `/readyz`, and `/metrics`. Set `SANDBOXWICH_API_TOKE
 
 Sandbox create accepts typed memory tiers (`1g`, `4g`, `16g`, `64g`) and typed network egress policy. File upload/list/download state is persisted in SQL and command output chunks can carry typed file-citation annotations.
 
-Worker completions use typed result variants. Provider-created Pods, PVCs, Services, NetworkPolicies, and VolumeSnapshots are persisted as `runtime_resources` rows with constrained kind, purpose, and status columns; provider metadata is diagnostic compatibility data, not the durable source of runtime state. Kubernetes providers render deny-by-default egress, pod/container security contexts, resource requests/limits, and optional RuntimeClass isolation such as gVisor or Kata.
+Worker completions use typed result variants. Provider-created Pods, PVCs, Services, NetworkPolicies, and VolumeSnapshots are persisted as `runtime_resources` rows with constrained kind, purpose, and status columns; provider metadata is diagnostic compatibility data, not the durable source of runtime state. Runtime resources marked `deleted` were reconciled as missing or removed outside the cleanup path; resources marked `destroyed` were explicitly torn down by archived-sandbox cleanup. Kubernetes providers render deny-by-default egress, pod/container security contexts, resource requests/limits, and optional RuntimeClass isolation such as gVisor or Kata.
 
 ## Design principles
 
