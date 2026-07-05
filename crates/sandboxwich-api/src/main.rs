@@ -18,15 +18,16 @@ use sandboxwich_core::{
     ErrorEnvelope, EventId, EventListResponse, FailLeaseRequest, GuestHealth, GuestHealthResponse,
     GuestStatus, HealthResponse, Job, JobId, JobKind, JobLease, JobListResponse, JobResponse,
     JobStatus, LeaseId, LeaseResponse, LeaseStatus, PromptQueuedResponse, PromptRequest,
-    ProviderRuntimeResource, RegisterWorkerRequest, RenewLeaseRequest, RequestSshKeyRequest,
-    RuntimeResource, RuntimeResourceId, RuntimeResourceKind, RuntimeResourceListResponse,
-    RuntimeResourcePurpose, RuntimeResourceStatus, Sandbox, SandboxEvent, SandboxEventKind,
-    SandboxId, SandboxListResponse, SandboxResponse, SandboxState, Snapshot,
-    SnapshotCleanupResponse, SnapshotId, SnapshotListResponse, SnapshotResponse, SnapshotStatus,
-    SshAccess, SshAccessRequest, SshAccessResponse, SshKey, SshKeyId, SshKeyListResponse,
-    SshKeyResponse, SshKeyStatus, UpdateDesktopSessionRequest, UpdateGuestHealthRequest,
-    UpdateSshKeyStatusRequest, Worker, WorkerCapability, WorkerHeartbeatRequest, WorkerId,
-    WorkerJobResult, WorkerListResponse, WorkerResponse, WorkerStatus,
+    ProviderRuntimeResource, ReconcileRuntimeResourcesRequest, ReconcileRuntimeResourcesResponse,
+    RegisterWorkerRequest, RenewLeaseRequest, RequestSshKeyRequest, RuntimeResource,
+    RuntimeResourceId, RuntimeResourceKind, RuntimeResourceListResponse, RuntimeResourcePurpose,
+    RuntimeResourceStatus, Sandbox, SandboxEvent, SandboxEventKind, SandboxId, SandboxListResponse,
+    SandboxResponse, SandboxState, Snapshot, SnapshotCleanupResponse, SnapshotId,
+    SnapshotListResponse, SnapshotResponse, SnapshotStatus, SshAccess, SshAccessRequest,
+    SshAccessResponse, SshKey, SshKeyId, SshKeyListResponse, SshKeyResponse, SshKeyStatus,
+    UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest, Worker,
+    WorkerCapability, WorkerHeartbeatRequest, WorkerId, WorkerJobResult, WorkerListResponse,
+    WorkerResponse, WorkerStatus,
 };
 use serde_json::json;
 use sqlx::{
@@ -659,6 +660,10 @@ fn app(state: AppState) -> Router {
         .route("/workers", get(list_workers))
         .route("/workers/register", post(register_worker))
         .route("/workers/{worker_id}/heartbeat", post(heartbeat_worker))
+        .route(
+            "/workers/{worker_id}/runtime-resources/reconcile",
+            post(reconcile_runtime_resources),
+        )
         .route("/jobs", get(list_jobs).post(create_job))
         .route("/workers/{worker_id}/leases/claim", post(claim_lease))
         .route("/leases/{lease_id}/renew", post(renew_lease))
@@ -1264,6 +1269,43 @@ async fn heartbeat_worker(
     Ok(Json(WorkerResponse { ok: true, worker }))
 }
 
+async fn reconcile_runtime_resources(
+    State(state): State<AppState>,
+    Path(worker_id): Path<Uuid>,
+    Json(request): Json<ReconcileRuntimeResourcesRequest>,
+) -> Result<Json<ReconcileRuntimeResourcesResponse>, ApiError> {
+    let worker = fetch_worker(&state.db, WorkerId(worker_id)).await?;
+    if worker.provider != request.provider {
+        return Err(ApiError::bad_request(
+            "runtime resource provider must match worker provider",
+        ));
+    }
+    validate_reconcile_runtime_resources_request(&request)?;
+
+    let observed_at = Utc::now();
+    let mut tx = state.db.pool.begin().await?;
+    let reconciled =
+        reconcile_runtime_resources_on_connection(&state.db, &mut *tx, &request, observed_at).await;
+
+    match reconciled {
+        Ok((upserted, deleted)) => {
+            tx.commit().await?;
+            Ok(Json(ReconcileRuntimeResourcesResponse {
+                ok: true,
+                observed_at,
+                upserted,
+                deleted,
+            }))
+        }
+        Err(error) => {
+            if let Err(rollback_error) = tx.rollback().await {
+                tracing::warn!(%rollback_error, "failed to roll back runtime resource reconcile");
+            }
+            Err(error)
+        }
+    }
+}
+
 async fn list_workers(State(state): State<AppState>) -> Result<Json<WorkerListResponse>, ApiError> {
     let rows = sqlx::query(
         "select id, name, status, provider, capabilities, labels, registered_at, last_heartbeat_at
@@ -1766,7 +1808,7 @@ async fn list_runtime_resources_for_sandbox(
         "select id, sandbox_id, snapshot_id, provider, resource_kind, purpose, resource_name,
                 namespace, status, cluster, storage_class, snapshot_class, storage_size,
                 runtime_image, service_port, target_port, source_snapshot_id, created_at,
-                updated_at, ready_at, deleted_at, error
+                updated_at, observed_at, last_reconciled_at, ready_at, deleted_at, error
          from runtime_resources
          where sandbox_id = {}
          order by provider asc, namespace asc, resource_kind asc, purpose asc, resource_name asc",
@@ -1785,27 +1827,107 @@ async fn upsert_provider_runtime_resources_on_connection(
     connection: &mut AnyConnection,
     resources: &[ProviderRuntimeResource],
 ) -> Result<(), ApiError> {
+    let observed_at = Utc::now();
     for resource in resources {
-        validate_provider_runtime_resource(resource)?;
-        let existing_id = fetch_runtime_resource_id_on_connection(
+        upsert_provider_runtime_resource_on_connection(
             db,
             connection,
-            &resource.provider,
-            &resource.resource_kind,
-            &resource.namespace,
-            &resource.resource_name,
+            resource,
+            Some(observed_at),
+            None,
         )
         .await?;
-        if let Some(resource_id) = existing_id {
-            update_runtime_resource_from_provider_on_connection(
-                db,
-                connection,
-                resource_id,
-                resource,
-            )
-            .await?;
-        } else {
-            insert_runtime_resource_from_provider_on_connection(db, connection, resource).await?;
+    }
+
+    Ok(())
+}
+
+async fn reconcile_runtime_resources_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    request: &ReconcileRuntimeResourcesRequest,
+    observed_at: DateTime<Utc>,
+) -> Result<(Vec<RuntimeResource>, Vec<RuntimeResource>), ApiError> {
+    let mut upserted = Vec::new();
+    let mut observed = Vec::new();
+
+    for resource in &request.resources {
+        let resource = upsert_provider_runtime_resource_on_connection(
+            db,
+            connection,
+            resource,
+            Some(observed_at),
+            Some(observed_at),
+        )
+        .await?;
+        observed.push(ObservedRuntimeResourceIdentity {
+            resource_kind: resource.resource_kind.clone(),
+            resource_name: resource.resource_name.clone(),
+        });
+        upserted.push(resource);
+    }
+
+    let deleted = if request.mark_missing_deleted {
+        mark_missing_runtime_resources_deleted_on_connection(
+            db,
+            connection,
+            request,
+            &observed,
+            observed_at,
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
+
+    Ok((upserted, deleted))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ObservedRuntimeResourceIdentity {
+    resource_kind: RuntimeResourceKind,
+    resource_name: String,
+}
+
+fn validate_reconcile_runtime_resources_request(
+    request: &ReconcileRuntimeResourcesRequest,
+) -> Result<(), ApiError> {
+    if request.provider.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "runtime resource provider is required",
+        ));
+    }
+    if request.namespace.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "runtime resource namespace is required",
+        ));
+    }
+    if request
+        .cluster
+        .as_ref()
+        .is_some_and(|cluster| cluster.trim().is_empty())
+    {
+        return Err(ApiError::bad_request(
+            "runtime resource cluster cannot be empty",
+        ));
+    }
+
+    for resource in &request.resources {
+        validate_provider_runtime_resource(resource)?;
+        if resource.provider != request.provider {
+            return Err(ApiError::bad_request(
+                "observed runtime resource provider must match reconcile provider",
+            ));
+        }
+        if resource.namespace != request.namespace {
+            return Err(ApiError::bad_request(
+                "observed runtime resource namespace must match reconcile namespace",
+            ));
+        }
+        if resource.cluster != request.cluster {
+            return Err(ApiError::bad_request(
+                "observed runtime resource cluster must match reconcile cluster",
+            ));
         }
     }
 
@@ -1821,6 +1943,15 @@ fn validate_provider_runtime_resource(resource: &ProviderRuntimeResource) -> Res
     if resource.namespace.trim().is_empty() {
         return Err(ApiError::bad_request(
             "runtime resource namespace is required",
+        ));
+    }
+    if resource
+        .cluster
+        .as_ref()
+        .is_some_and(|cluster| cluster.trim().is_empty())
+    {
+        return Err(ApiError::bad_request(
+            "runtime resource cluster cannot be empty",
         ));
     }
     if resource.resource_name.trim().is_empty() {
@@ -1840,21 +1971,47 @@ async fn fetch_runtime_resource_id_on_connection(
     provider: &str,
     resource_kind: &RuntimeResourceKind,
     namespace: &str,
+    cluster: &Option<String>,
     resource_name: &str,
 ) -> Result<Option<RuntimeResourceId>, ApiError> {
-    let sql = format!(
-        "select id
-         from runtime_resources
-         where provider = {} and resource_kind = {} and namespace = {} and resource_name = {}",
-        db.placeholder(1),
-        db.placeholder(2),
-        db.placeholder(3),
-        db.placeholder(4)
-    );
-    let row = sqlx::query(&sql)
+    let (sql, bind_cluster) = if cluster.is_some() {
+        (
+            format!(
+                "select id
+                 from runtime_resources
+                 where provider = {} and resource_kind = {} and namespace = {} and cluster = {}
+                   and resource_name = {}",
+                db.placeholder(1),
+                db.placeholder(2),
+                db.placeholder(3),
+                db.placeholder(4),
+                db.placeholder(5)
+            ),
+            true,
+        )
+    } else {
+        (
+            format!(
+                "select id
+                 from runtime_resources
+                 where provider = {} and resource_kind = {} and namespace = {} and cluster is null
+                   and resource_name = {}",
+                db.placeholder(1),
+                db.placeholder(2),
+                db.placeholder(3),
+                db.placeholder(4)
+            ),
+            false,
+        )
+    };
+    let mut query = sqlx::query(&sql)
         .bind(provider)
         .bind(runtime_resource_kind_to_str(resource_kind))
-        .bind(namespace)
+        .bind(namespace);
+    if bind_cluster {
+        query = query.bind(cluster);
+    }
+    let row = query
         .bind(resource_name)
         .fetch_optional(&mut *connection)
         .await?;
@@ -1865,23 +2022,90 @@ async fn fetch_runtime_resource_id_on_connection(
     .transpose()
 }
 
+async fn fetch_runtime_resource_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    resource_id: RuntimeResourceId,
+) -> Result<RuntimeResource, ApiError> {
+    let sql = format!(
+        "select id, sandbox_id, snapshot_id, provider, resource_kind, purpose, resource_name,
+                namespace, status, cluster, storage_class, snapshot_class, storage_size,
+                runtime_image, service_port, target_port, source_snapshot_id, created_at,
+                updated_at, observed_at, last_reconciled_at, ready_at, deleted_at, error
+         from runtime_resources
+         where id = {}",
+        db.placeholder(1)
+    );
+    let row = sqlx::query(&sql)
+        .bind(resource_id.to_string())
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| ApiError::not_found("runtime resource not found"))?;
+
+    row_to_runtime_resource(row)
+}
+
+async fn upsert_provider_runtime_resource_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    resource: &ProviderRuntimeResource,
+    observed_at: Option<DateTime<Utc>>,
+    last_reconciled_at: Option<DateTime<Utc>>,
+) -> Result<RuntimeResource, ApiError> {
+    validate_provider_runtime_resource(resource)?;
+    let existing_id = fetch_runtime_resource_id_on_connection(
+        db,
+        connection,
+        &resource.provider,
+        &resource.resource_kind,
+        &resource.namespace,
+        &resource.cluster,
+        &resource.resource_name,
+    )
+    .await?;
+    if let Some(resource_id) = existing_id {
+        update_runtime_resource_from_provider_on_connection(
+            db,
+            connection,
+            resource_id,
+            resource,
+            observed_at,
+            last_reconciled_at,
+        )
+        .await
+    } else {
+        insert_runtime_resource_from_provider_on_connection(
+            db,
+            connection,
+            resource,
+            observed_at,
+            last_reconciled_at,
+        )
+        .await
+    }
+}
+
 async fn insert_runtime_resource_from_provider_on_connection(
     db: &Database,
     connection: &mut AnyConnection,
     resource: &ProviderRuntimeResource,
-) -> Result<(), ApiError> {
+    observed_at: Option<DateTime<Utc>>,
+    last_reconciled_at: Option<DateTime<Utc>>,
+) -> Result<RuntimeResource, ApiError> {
     let now = Utc::now();
+    let resource_id = RuntimeResourceId::new();
     let deleted_at = deleted_at_for_runtime_resource(&resource.status, now);
     let sql = format!(
         "insert into runtime_resources
          (id, sandbox_id, snapshot_id, provider, resource_kind, purpose, resource_name, namespace,
           status, cluster, storage_class, snapshot_class, storage_size, runtime_image, service_port,
-          target_port, source_snapshot_id, created_at, updated_at, ready_at, deleted_at, error)
+          target_port, source_snapshot_id, created_at, updated_at, observed_at, last_reconciled_at,
+          ready_at, deleted_at, error)
          values ({})",
-        db.placeholders(22)
+        db.placeholders(24)
     );
     sqlx::query(&sql)
-        .bind(RuntimeResourceId::new().to_string())
+        .bind(resource_id.to_string())
         .bind(resource.sandbox_id.to_string())
         .bind(
             resource
@@ -1908,12 +2132,14 @@ async fn insert_runtime_resource_from_provider_on_connection(
         )
         .bind(now.to_rfc3339())
         .bind(now.to_rfc3339())
+        .bind(observed_at.map(|time| time.to_rfc3339()))
+        .bind(last_reconciled_at.map(|time| time.to_rfc3339()))
         .bind(resource.ready_at.map(|time| time.to_rfc3339()))
         .bind(deleted_at.map(|time| time.to_rfc3339()))
         .bind(&resource.error)
         .execute(&mut *connection)
         .await?;
-    Ok(())
+    fetch_runtime_resource_on_connection(db, connection, resource_id).await
 }
 
 async fn update_runtime_resource_from_provider_on_connection(
@@ -1921,7 +2147,9 @@ async fn update_runtime_resource_from_provider_on_connection(
     connection: &mut AnyConnection,
     resource_id: RuntimeResourceId,
     resource: &ProviderRuntimeResource,
-) -> Result<(), ApiError> {
+    observed_at: Option<DateTime<Utc>>,
+    last_reconciled_at: Option<DateTime<Utc>>,
+) -> Result<RuntimeResource, ApiError> {
     let now = Utc::now();
     let deleted_at = deleted_at_for_runtime_resource(&resource.status, now);
     let sql = format!(
@@ -1930,7 +2158,7 @@ async fn update_runtime_resource_from_provider_on_connection(
              resource_name = {}, namespace = {}, status = {}, cluster = {}, storage_class = {},
              snapshot_class = {}, storage_size = {}, runtime_image = {}, service_port = {},
              target_port = {}, source_snapshot_id = {}, updated_at = {}, ready_at = {},
-             deleted_at = {}, error = {}
+             deleted_at = {}, error = {}, observed_at = {}, last_reconciled_at = {}
          where id = {}",
         db.placeholder(1),
         db.placeholder(2),
@@ -1952,7 +2180,9 @@ async fn update_runtime_resource_from_provider_on_connection(
         db.placeholder(18),
         db.placeholder(19),
         db.placeholder(20),
-        db.placeholder(21)
+        db.placeholder(21),
+        db.placeholder(22),
+        db.placeholder(23)
     );
     let result = sqlx::query(&sql)
         .bind(resource.sandbox_id.to_string())
@@ -1983,13 +2213,122 @@ async fn update_runtime_resource_from_provider_on_connection(
         .bind(resource.ready_at.map(|time| time.to_rfc3339()))
         .bind(deleted_at.map(|time| time.to_rfc3339()))
         .bind(&resource.error)
+        .bind(observed_at.map(|time| time.to_rfc3339()))
+        .bind(last_reconciled_at.map(|time| time.to_rfc3339()))
         .bind(resource_id.to_string())
         .execute(&mut *connection)
         .await?;
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found("runtime resource not found"));
     }
-    Ok(())
+    fetch_runtime_resource_on_connection(db, connection, resource_id).await
+}
+
+async fn mark_missing_runtime_resources_deleted_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    request: &ReconcileRuntimeResourcesRequest,
+    observed: &[ObservedRuntimeResourceIdentity],
+    reconciled_at: DateTime<Utc>,
+) -> Result<Vec<RuntimeResource>, ApiError> {
+    let (sql, cluster_bind) = if request.cluster.is_some() {
+        (
+            format!(
+                "select id, sandbox_id, snapshot_id, provider, resource_kind, purpose, resource_name,
+                        namespace, status, cluster, storage_class, snapshot_class, storage_size,
+                        runtime_image, service_port, target_port, source_snapshot_id, created_at,
+                        updated_at, observed_at, last_reconciled_at, ready_at, deleted_at, error
+                 from runtime_resources
+                 where provider = {} and namespace = {} and cluster = {} and status != 'deleted'
+                 order by resource_kind asc, resource_name asc, id asc",
+                db.placeholder(1),
+                db.placeholder(2),
+                db.placeholder(3)
+            ),
+            true,
+        )
+    } else {
+        (
+            format!(
+                "select id, sandbox_id, snapshot_id, provider, resource_kind, purpose, resource_name,
+                        namespace, status, cluster, storage_class, snapshot_class, storage_size,
+                        runtime_image, service_port, target_port, source_snapshot_id, created_at,
+                        updated_at, observed_at, last_reconciled_at, ready_at, deleted_at, error
+                 from runtime_resources
+                 where provider = {} and namespace = {} and cluster is null and status != 'deleted'
+                 order by resource_kind asc, resource_name asc, id asc",
+                db.placeholder(1),
+                db.placeholder(2)
+            ),
+            false,
+        )
+    };
+    let mut query = sqlx::query(&sql)
+        .bind(&request.provider)
+        .bind(&request.namespace);
+    if cluster_bind {
+        query = query.bind(&request.cluster);
+    }
+    let candidates = query.fetch_all(&mut *connection).await?;
+
+    let mut deleted = Vec::new();
+    for row in candidates {
+        let resource = row_to_runtime_resource(row)?;
+        if observed.iter().any(|identity| {
+            identity.resource_kind == resource.resource_kind
+                && identity.resource_name == resource.resource_name
+        }) {
+            continue;
+        }
+        deleted.push(
+            mark_runtime_resource_deleted_on_connection(
+                db,
+                connection,
+                resource.id,
+                reconciled_at,
+                "missing from runtime resource reconcile observation",
+            )
+            .await?,
+        );
+    }
+
+    Ok(deleted)
+}
+
+async fn mark_runtime_resource_deleted_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    resource_id: RuntimeResourceId,
+    deleted_at: DateTime<Utc>,
+    error: &str,
+) -> Result<RuntimeResource, ApiError> {
+    let sql = format!(
+        "update runtime_resources
+         set status = {}, updated_at = {}, last_reconciled_at = {}, deleted_at = {}, error = {}
+         where id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4),
+        db.placeholder(5),
+        db.placeholder(6)
+    );
+    let result = sqlx::query(&sql)
+        .bind(runtime_resource_status_to_str(
+            &RuntimeResourceStatus::Deleted,
+        ))
+        .bind(deleted_at.to_rfc3339())
+        .bind(deleted_at.to_rfc3339())
+        .bind(deleted_at.to_rfc3339())
+        .bind(error)
+        .bind(resource_id.to_string())
+        .execute(&mut *connection)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("runtime resource not found"));
+    }
+
+    fetch_runtime_resource_on_connection(db, connection, resource_id).await
 }
 
 fn deleted_at_for_runtime_resource(
@@ -3807,6 +4146,8 @@ fn row_to_runtime_resource(row: AnyRow) -> Result<RuntimeResource, ApiError> {
     let source_snapshot_id: Option<String> = row.try_get("source_snapshot_id")?;
     let created_at: String = row.try_get("created_at")?;
     let updated_at: String = row.try_get("updated_at")?;
+    let observed_at: Option<String> = row.try_get("observed_at")?;
+    let last_reconciled_at: Option<String> = row.try_get("last_reconciled_at")?;
     let ready_at: Option<String> = row.try_get("ready_at")?;
     let deleted_at: Option<String> = row.try_get("deleted_at")?;
 
@@ -3837,6 +4178,10 @@ fn row_to_runtime_resource(row: AnyRow) -> Result<RuntimeResource, ApiError> {
             .transpose()?,
         created_at: parse_timestamp(&created_at)?,
         updated_at: parse_timestamp(&updated_at)?,
+        observed_at: observed_at.map(|time| parse_timestamp(&time)).transpose()?,
+        last_reconciled_at: last_reconciled_at
+            .map(|time| parse_timestamp(&time))
+            .transpose()?,
         ready_at: ready_at.map(|time| parse_timestamp(&time)).transpose()?,
         deleted_at: deleted_at.map(|time| parse_timestamp(&time)).transpose()?,
         error: row.try_get("error")?,
