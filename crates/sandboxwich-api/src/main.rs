@@ -810,7 +810,7 @@ async fn fork_sandbox(
     let snapshot = Snapshot {
         id: SnapshotId::new(),
         sandbox_id: parent.id,
-        status: SnapshotStatus::Ready,
+        status: SnapshotStatus::Pending,
         label: format!("fork-source-{}", now.timestamp_millis()),
         inventory: json!({
             "sourceSandboxId": parent.id,
@@ -820,7 +820,7 @@ async fn fork_sandbox(
             "source": "fork_request"
         }),
         created_at: now,
-        ready_at: Some(now),
+        ready_at: None,
         expires_at: expires_at_from_ttl(now, request.ttl_seconds)?,
         error: None,
     };
@@ -856,11 +856,10 @@ async fn fork_sandbox(
         &state.db,
         &Job {
             id: JobId::new(),
-            kind: JobKind::ForkSandbox,
+            kind: JobKind::CreateSnapshot,
             status: JobStatus::Queued,
             payload: json!({
-                "parentSandboxId": parent.id,
-                "childSandboxId": child.id,
+                "sandboxId": parent.id,
                 "snapshotId": snapshot.id
             }),
             required_capability: WorkerCapability::Snapshot,
@@ -888,7 +887,8 @@ async fn create_snapshot(
 ) -> Result<Json<SnapshotResponse>, ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
     fetch_sandbox(&state.db, sandbox_id).await?;
-    let snapshot = ready_snapshot_from_request(sandbox_id, request)?;
+    let snapshot = pending_snapshot_from_request(sandbox_id, request)?;
+    let scheduled_at = snapshot.created_at;
     insert_snapshot(&state.db, &snapshot).await?;
     insert_event(
         &state.db,
@@ -899,6 +899,27 @@ async fn create_snapshot(
             "snapshotId": snapshot.id,
             "snapshotStatus": snapshot.status
         }),
+    )
+    .await?;
+    insert_job(
+        &state.db,
+        &Job {
+            id: JobId::new(),
+            kind: JobKind::CreateSnapshot,
+            status: JobStatus::Queued,
+            payload: json!({
+                "sandboxId": sandbox_id,
+                "snapshotId": snapshot.id
+            }),
+            required_capability: WorkerCapability::Snapshot,
+            priority: 0,
+            attempts: 0,
+            max_attempts: 3,
+            scheduled_at,
+            created_at: scheduled_at,
+            updated_at: scheduled_at,
+            last_error: None,
+        },
     )
     .await?;
 
@@ -2609,7 +2630,7 @@ async fn fetch_ssh_key(db: &Database, ssh_key_id: SshKeyId) -> Result<SshKey, Ap
     row_to_ssh_key(row)
 }
 
-fn ready_snapshot_from_request(
+fn pending_snapshot_from_request(
     sandbox_id: SandboxId,
     request: CreateSnapshotRequest,
 ) -> Result<Snapshot, ApiError> {
@@ -2625,12 +2646,12 @@ fn ready_snapshot_from_request(
     Ok(Snapshot {
         id: SnapshotId::new(),
         sandbox_id,
-        status: SnapshotStatus::Ready,
+        status: SnapshotStatus::Pending,
         label,
         inventory: request.inventory.unwrap_or_else(|| json!({})),
         provider_metadata: request.provider_metadata.unwrap_or_else(|| json!({})),
         created_at: now,
-        ready_at: Some(now),
+        ready_at: None,
         expires_at: expires_at_from_ttl(now, request.ttl_seconds)?,
         error: None,
     })
@@ -2995,6 +3016,7 @@ async fn expire_due_snapshots(db: &Database) -> Result<Vec<Snapshot>, ApiError> 
             continue;
         }
         update_snapshot_status(db, snapshot.id, SnapshotStatus::Expired, None).await?;
+        dead_queued_snapshot_jobs(db, snapshot.id, "snapshot expired").await?;
         let expired_snapshot = fetch_snapshot(db, snapshot.id).await?;
         insert_event(
             db,
@@ -3036,6 +3058,32 @@ async fn update_snapshot_status(
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found("snapshot not found"));
     }
+    Ok(())
+}
+
+async fn dead_queued_snapshot_jobs(
+    db: &Database,
+    snapshot_id: SnapshotId,
+    error: &str,
+) -> Result<(), ApiError> {
+    let rows = sqlx::query(
+        "select id, kind, status, payload, required_capability, priority, attempts, max_attempts,
+                scheduled_at, created_at, updated_at, last_error
+         from jobs
+         where kind = 'create_snapshot' and status = 'queued'
+         order by scheduled_at asc, created_at asc, id asc",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+
+    let now = Utc::now();
+    for row in rows {
+        let job = row_to_job(row)?;
+        if snapshot_id_from_job(&job)? == snapshot_id {
+            update_job_status(db, job.id, JobStatus::Dead, Some(error), now).await?;
+        }
+    }
+
     Ok(())
 }
 
@@ -3546,6 +3594,36 @@ async fn insert_job(db: &Database, job: &Job) -> Result<(), ApiError> {
         .bind(job.updated_at.to_rfc3339())
         .bind(&job.last_error)
         .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+async fn insert_job_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    job: &Job,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "insert into jobs
+         (id, kind, status, payload, required_capability, priority, attempts, max_attempts,
+          scheduled_at, created_at, updated_at, last_error)
+         values ({})",
+        db.placeholders(12)
+    );
+    sqlx::query(&sql)
+        .bind(job.id.to_string())
+        .bind(job_kind_to_str(&job.kind))
+        .bind(job_status_to_str(&job.status))
+        .bind(serde_json::to_string(&job.payload)?)
+        .bind(worker_capability_to_str(&job.required_capability))
+        .bind(job.priority)
+        .bind(job.attempts)
+        .bind(job.max_attempts)
+        .bind(job.scheduled_at.to_rfc3339())
+        .bind(job.created_at.to_rfc3339())
+        .bind(job.updated_at.to_rfc3339())
+        .bind(&job.last_error)
+        .execute(&mut *connection)
         .await?;
     Ok(())
 }
@@ -4337,6 +4415,69 @@ async fn mark_snapshot_ready_from_provider_handle_on_connection(
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found("snapshot not found"));
     }
+    queue_forks_waiting_on_snapshot_on_connection(db, connection, snapshot_id, sandbox_id).await?;
+    Ok(())
+}
+
+async fn queue_forks_waiting_on_snapshot_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    snapshot_id: SnapshotId,
+    parent_sandbox_id: SandboxId,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "select id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id
+         from sandboxes
+         where parent_snapshot_id = {} and state = 'planning'
+         order by created_at asc, id asc",
+        db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(snapshot_id.to_string())
+        .fetch_all(&mut *connection)
+        .await?;
+
+    for row in rows {
+        let child = row_to_sandbox(row)?;
+        let now = Utc::now();
+        insert_job_on_connection(
+            db,
+            connection,
+            &Job {
+                id: JobId::new(),
+                kind: JobKind::ForkSandbox,
+                status: JobStatus::Queued,
+                payload: json!({
+                    "parentSandboxId": parent_sandbox_id,
+                    "childSandboxId": child.id,
+                    "snapshotId": snapshot_id
+                }),
+                required_capability: WorkerCapability::Snapshot,
+                priority: 0,
+                attempts: 0,
+                max_attempts: 3,
+                scheduled_at: now,
+                created_at: now,
+                updated_at: now,
+                last_error: None,
+            },
+        )
+        .await?;
+        insert_event_on_connection(
+            db,
+            connection,
+            child.id,
+            SandboxEventKind::LifecycleChanged,
+            json!({
+                "state": child.state,
+                "reason": "fork_snapshot_ready",
+                "parentSandboxId": parent_sandbox_id,
+                "parentSnapshotId": snapshot_id
+            }),
+        )
+        .await?;
+    }
+
     Ok(())
 }
 
