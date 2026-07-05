@@ -81,21 +81,39 @@ spec:
               value: local-path
             - name: SANDBOXWICH_SNAPSHOT_CLASS
               value: ""
+            - name: SANDBOXWICH_WORKSPACE_STORAGE
+              value: 2Gi
             - name: SANDBOXWICH_SSH_AUTHORIZED_KEYS_SECRET
               value: ""
-          command: ["/bin/sh", "-lc"]
+            - name: SANDBOXWICH_K8S_ENABLE_MUTATION
+              value: "1"
           args:
-            - >
-              sandboxwich-worker run
-              --name "$POD_NAME"
-              --provider kubernetes
-              --cluster "$SANDBOXWICH_CLUSTER"
-              --namespace "$SANDBOXWICH_NAMESPACE"
-              --storage-class "$SANDBOXWICH_STORAGE_CLASS"
-              --snapshot-class "$SANDBOXWICH_SNAPSHOT_CLASS"
-              --ssh-authorized-keys-secret "$SANDBOXWICH_SSH_AUTHORIZED_KEYS_SECRET"
-              --label cluster="$SANDBOXWICH_CLUSTER"
-              --label pod="$POD_NAME"
+            - run
+            - --name
+            - $(POD_NAME)
+            - --provider
+            - kubernetes
+            - --provider-mode
+            - apply
+            - --confirm-apply
+            - --kubectl-context
+            - in-cluster
+            - --cluster
+            - $(SANDBOXWICH_CLUSTER)
+            - --namespace
+            - $(SANDBOXWICH_NAMESPACE)
+            - --storage-class
+            - $(SANDBOXWICH_STORAGE_CLASS)
+            - --snapshot-class
+            - $(SANDBOXWICH_SNAPSHOT_CLASS)
+            - --workspace-storage
+            - $(SANDBOXWICH_WORKSPACE_STORAGE)
+            - --ssh-authorized-keys-secret
+            - $(SANDBOXWICH_SSH_AUTHORIZED_KEYS_SECRET)
+            - --label
+            - cluster=$(SANDBOXWICH_CLUSTER)
+            - --label
+            - pod=$(POD_NAME)
           resources:
             requests:
               cpu: 100m

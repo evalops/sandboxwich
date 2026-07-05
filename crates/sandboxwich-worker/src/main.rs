@@ -82,7 +82,7 @@ struct RunArgs {
     max_iterations: Option<u64>,
 
     #[command(flatten)]
-    provider: ProviderArgs,
+    provider: RuntimeProviderArgs,
 }
 
 #[derive(Debug, Args)]
@@ -109,7 +109,7 @@ struct WorkOnceArgs {
     lease_seconds: Option<u64>,
 
     #[command(flatten)]
-    provider: ProviderArgs,
+    provider: RuntimeProviderArgs,
 }
 
 #[derive(Debug, Args)]
@@ -129,7 +129,7 @@ struct WorkLoopArgs {
     label: Vec<(String, String)>,
 
     #[command(flatten)]
-    provider: ProviderArgs,
+    provider: RuntimeProviderArgs,
 }
 
 #[derive(Debug, Args)]
@@ -165,7 +165,7 @@ struct FailArgs {
     retry: bool,
 }
 
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 struct ProviderArgs {
     #[arg(long, default_value = "k3s-dev")]
     cluster: String,
@@ -182,8 +182,29 @@ struct ProviderArgs {
     #[arg(long, env = "SANDBOXWICH_RUNTIME_IMAGE")]
     runtime_image: Option<String>,
 
+    #[arg(long, env = "SANDBOXWICH_WORKSPACE_STORAGE")]
+    workspace_storage: Option<String>,
+
     #[arg(long)]
     ssh_authorized_keys_secret: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct RuntimeProviderArgs {
+    #[command(flatten)]
+    provider: ProviderArgs,
+
+    #[arg(long, value_enum, default_value_t = ProviderModeArg::DryRun)]
+    provider_mode: ProviderModeArg,
+
+    #[arg(long, default_value = "kubectl")]
+    kubectl: String,
+
+    #[arg(long)]
+    kubectl_context: Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    confirm_apply: bool,
 }
 
 #[derive(Debug, Args)]
@@ -193,6 +214,9 @@ struct ProviderApplyArgs {
 
     #[arg(long, default_value = "kubectl")]
     kubectl: String,
+
+    #[arg(long)]
+    kubectl_context: Option<String>,
 
     #[arg(long, default_value_t = false)]
     confirm_apply: bool,
@@ -209,6 +233,81 @@ enum CapabilityArg {
     Snapshot,
     DesktopStream,
     K8sPod,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ProviderModeArg {
+    DryRun,
+    Apply,
+}
+
+enum RuntimeProvider {
+    DryRun(KubernetesDryRunProvider),
+    Apply(KubernetesApplyProvider),
+}
+
+impl SandboxProvider for RuntimeProvider {
+    fn capability_report(&self) -> sandboxwich_core::ProviderCapabilityReport {
+        match self {
+            Self::DryRun(provider) => provider.capability_report(),
+            Self::Apply(provider) => provider.capability_report(),
+        }
+    }
+
+    fn health_report(&self) -> sandboxwich_core::ProviderHealthReport {
+        match self {
+            Self::DryRun(provider) => provider.health_report(),
+            Self::Apply(provider) => provider.health_report(),
+        }
+    }
+
+    fn provision(
+        &self,
+        sandbox_id: sandboxwich_core::SandboxId,
+    ) -> anyhow::Result<sandboxwich_core::ProviderSandboxHandle> {
+        match self {
+            Self::DryRun(provider) => provider.provision(sandbox_id),
+            Self::Apply(provider) => provider.provision(sandbox_id),
+        }
+    }
+
+    fn exec_handoff(
+        &self,
+        sandbox_id: sandboxwich_core::SandboxId,
+        request: AgentCommandRequest,
+    ) -> anyhow::Result<sandboxwich_core::AgentCommandResult> {
+        match self {
+            Self::DryRun(provider) => provider.exec_handoff(sandbox_id, request),
+            Self::Apply(provider) => provider.exec_handoff(sandbox_id, request),
+        }
+    }
+
+    fn create_snapshot(
+        &self,
+        sandbox_id: sandboxwich_core::SandboxId,
+        snapshot_id: sandboxwich_core::SnapshotId,
+    ) -> anyhow::Result<sandboxwich_core::ProviderSnapshotHandle> {
+        match self {
+            Self::DryRun(provider) => provider.create_snapshot(sandbox_id, snapshot_id),
+            Self::Apply(provider) => provider.create_snapshot(sandbox_id, snapshot_id),
+        }
+    }
+
+    fn fork(
+        &self,
+        parent_sandbox_id: sandboxwich_core::SandboxId,
+        child_sandbox_id: sandboxwich_core::SandboxId,
+        snapshot_id: sandboxwich_core::SnapshotId,
+    ) -> anyhow::Result<sandboxwich_core::ProviderForkHandle> {
+        match self {
+            Self::DryRun(provider) => {
+                provider.fork(parent_sandbox_id, child_sandbox_id, snapshot_id)
+            }
+            Self::Apply(provider) => {
+                provider.fork(parent_sandbox_id, child_sandbox_id, snapshot_id)
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -261,17 +360,20 @@ async fn main() -> anyhow::Result<()> {
                     cwd: None,
                     env: BTreeMap::new(),
                 },
-            );
+            )?;
+            let provision = provider.provision(sandbox_id)?;
+            let snapshot = provider.create_snapshot(sandbox_id, snapshot_id)?;
+            let fork = provider.fork(sandbox_id, child_sandbox_id, snapshot_id)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "ok": true,
                     "provider": provider.capability_report(),
                     "health": provider.health_report(),
-                    "provision": provider.provision(sandbox_id),
+                    "provision": provision,
                     "exec": exec,
-                    "snapshot": provider.create_snapshot(sandbox_id, snapshot_id),
-                    "fork": provider.fork(sandbox_id, child_sandbox_id, snapshot_id)
+                    "snapshot": snapshot,
+                    "fork": fork
                 }))?
             );
         }
@@ -395,7 +497,7 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
         Command::WorkOnce(args) => {
-            let provider = provider_from_args(args.provider);
+            let provider = runtime_provider_from_args(args.provider);
             let response = claim(
                 &client,
                 &api,
@@ -428,11 +530,32 @@ fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
         non_empty(args.snapshot_class),
     )
     .with_runtime_image(non_empty(args.runtime_image))
+    .with_workspace_storage(non_empty(args.workspace_storage))
     .with_ssh_authorized_keys_secret(non_empty(args.ssh_authorized_keys_secret))
 }
 
 fn apply_provider_from_args(args: ProviderApplyArgs) -> KubernetesApplyProvider {
     KubernetesApplyProvider::new(provider_from_args(args.provider), args.kubectl)
+        .with_kubectl_context(args.kubectl_context)
+        .with_mutation_gate(
+            args.confirm_apply,
+            KubernetesApplyProvider::mutation_enabled_from_env(),
+        )
+}
+
+fn runtime_provider_from_args(args: RuntimeProviderArgs) -> RuntimeProvider {
+    let provider = provider_from_args(args.provider);
+    match args.provider_mode {
+        ProviderModeArg::DryRun => RuntimeProvider::DryRun(provider),
+        ProviderModeArg::Apply => RuntimeProvider::Apply(
+            KubernetesApplyProvider::new(provider, args.kubectl)
+                .with_kubectl_context(args.kubectl_context)
+                .with_mutation_gate(
+                    args.confirm_apply,
+                    KubernetesApplyProvider::mutation_enabled_from_env(),
+                ),
+        ),
+    }
 }
 
 async fn claim(
@@ -486,7 +609,7 @@ async fn heartbeat_worker(
 }
 
 async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> anyhow::Result<()> {
-    let provider = provider_from_args(args.provider);
+    let provider = runtime_provider_from_args(args.provider);
     let labels: BTreeMap<_, _> = args.label.into_iter().collect();
     let mut iterations = 0_u64;
 
@@ -596,7 +719,7 @@ fn execute_job(
     match job.kind {
         JobKind::ProvisionSandbox => {
             let sandbox_id = sandbox_id_from_payload(&job.payload)?;
-            let handle = provider.provision(sandbox_id);
+            let handle = provider.provision(sandbox_id)?;
             Ok(WorkerJobOutcome::Complete(json!({
                 "provider": handle.provider,
                 "sandboxId": handle.sandbox_id,
@@ -606,7 +729,7 @@ fn execute_job(
         JobKind::RunCommand => {
             let sandbox_id = sandbox_id_from_payload(&job.payload)?;
             let result =
-                provider.exec_handoff(sandbox_id, agent_request_from_payload(&job.payload)?);
+                provider.exec_handoff(sandbox_id, agent_request_from_payload(&job.payload)?)?;
             if result.exit_code.unwrap_or(1) == 0 {
                 Ok(WorkerJobOutcome::Complete(serde_json::to_value(&result)?))
             } else {
@@ -622,7 +745,7 @@ fn execute_job(
         JobKind::CreateSnapshot => {
             let sandbox_id = sandbox_id_from_payload(&job.payload)?;
             let snapshot_id = snapshot_id_from_payload(&job.payload)?;
-            let handle = provider.create_snapshot(sandbox_id, snapshot_id);
+            let handle = provider.create_snapshot(sandbox_id, snapshot_id)?;
             Ok(WorkerJobOutcome::Complete(json!({
                 "inventory": {
                     "sandboxId": sandbox_id,
@@ -636,7 +759,7 @@ fn execute_job(
             let parent_sandbox_id = parent_sandbox_id_from_payload(&job.payload)?;
             let child_sandbox_id = child_sandbox_id_from_payload(&job.payload)?;
             let snapshot_id = snapshot_id_from_payload(&job.payload)?;
-            let handle = provider.fork(parent_sandbox_id, child_sandbox_id, snapshot_id);
+            let handle = provider.fork(parent_sandbox_id, child_sandbox_id, snapshot_id)?;
             Ok(WorkerJobOutcome::Complete(json!({
                 "provider": handle.provider,
                 "parentSandboxId": handle.parent_sandbox_id,

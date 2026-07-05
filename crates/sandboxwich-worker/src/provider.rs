@@ -20,23 +20,23 @@ pub const DEFAULT_SANDBOX_GUEST_IMAGE: &str = "ghcr.io/evalops/sandboxwich-ubunt
 pub trait SandboxProvider {
     fn capability_report(&self) -> ProviderCapabilityReport;
     fn health_report(&self) -> ProviderHealthReport;
-    fn provision(&self, sandbox_id: SandboxId) -> ProviderSandboxHandle;
+    fn provision(&self, sandbox_id: SandboxId) -> anyhow::Result<ProviderSandboxHandle>;
     fn exec_handoff(
         &self,
         sandbox_id: SandboxId,
         request: AgentCommandRequest,
-    ) -> AgentCommandResult;
+    ) -> anyhow::Result<AgentCommandResult>;
     fn create_snapshot(
         &self,
         sandbox_id: SandboxId,
         snapshot_id: SnapshotId,
-    ) -> ProviderSnapshotHandle;
+    ) -> anyhow::Result<ProviderSnapshotHandle>;
     fn fork(
         &self,
         parent_sandbox_id: SandboxId,
         child_sandbox_id: SandboxId,
         snapshot_id: SnapshotId,
-    ) -> ProviderForkHandle;
+    ) -> anyhow::Result<ProviderForkHandle>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -46,6 +46,7 @@ pub struct KubernetesDryRunProvider {
     storage_class: Option<String>,
     snapshot_class: Option<String>,
     runtime_image: String,
+    workspace_storage: String,
     ssh_authorized_keys_secret: Option<String>,
 }
 
@@ -62,6 +63,7 @@ impl KubernetesDryRunProvider {
             storage_class,
             snapshot_class,
             runtime_image: DEFAULT_SANDBOX_GUEST_IMAGE.to_string(),
+            workspace_storage: "2Gi".to_string(),
             ssh_authorized_keys_secret: None,
         }
     }
@@ -69,6 +71,13 @@ impl KubernetesDryRunProvider {
     pub fn with_runtime_image(mut self, image: Option<String>) -> Self {
         if let Some(image) = image {
             self.runtime_image = image;
+        }
+        self
+    }
+
+    pub fn with_workspace_storage(mut self, storage: Option<String>) -> Self {
+        if let Some(storage) = storage {
+            self.workspace_storage = storage;
         }
         self
     }
@@ -91,6 +100,10 @@ impl KubernetesDryRunProvider {
             labels.insert("snapshot_class".to_string(), snapshot_class.clone());
         }
         labels.insert("runtime_image".to_string(), self.runtime_image.clone());
+        labels.insert(
+            "workspace_storage".to_string(),
+            self.workspace_storage.clone(),
+        );
         if let Some(secret) = &self.ssh_authorized_keys_secret {
             labels.insert("ssh_authorized_keys_secret".to_string(), secret.clone());
         }
@@ -108,10 +121,11 @@ impl KubernetesDryRunProvider {
             "podName": format!("sandboxwich-{}", sandbox_id),
             "storageClass": self.storage_class,
             "snapshotClass": self.snapshot_class,
+            "workspaceStorage": self.workspace_storage,
             "runtime": self.runtime_metadata(),
             "manifests": {
                 "pod": self.pod_manifest(sandbox_id),
-                "pvc": self.pvc_manifest(format!("sandboxwich-pvc-{sandbox_id}")),
+                "pvc": self.pvc_manifest(format!("sandboxwich-pvc-{sandbox_id}"), Some(sandbox_id)),
                 "sshService": self.ssh_service_manifest(sandbox_id),
                 "desktopService": self.desktop_service_manifest(sandbox_id)
             }
@@ -208,14 +222,14 @@ impl KubernetesDryRunProvider {
         })
     }
 
-    fn pvc_manifest(&self, name: String) -> serde_json::Value {
+    fn pvc_manifest(&self, name: String, sandbox_id: Option<SandboxId>) -> serde_json::Value {
         let mut spec = Map::from_iter([
             ("accessModes".to_string(), json!(["ReadWriteOnce"])),
             (
                 "resources".to_string(),
                 json!({
                     "requests": {
-                        "storage": "40Gi"
+                        "storage": self.workspace_storage
                     }
                 }),
             ),
@@ -227,7 +241,7 @@ impl KubernetesDryRunProvider {
         json!({
             "apiVersion": "v1",
             "kind": "PersistentVolumeClaim",
-            "metadata": self.object_metadata(name, None),
+            "metadata": self.object_metadata(name, sandbox_id),
             "spec": spec
         })
     }
@@ -262,7 +276,7 @@ impl KubernetesDryRunProvider {
                 "resources".to_string(),
                 json!({
                     "requests": {
-                        "storage": "40Gi"
+                        "storage": self.workspace_storage
                     }
                 }),
             ),
@@ -363,14 +377,39 @@ pub struct KubernetesApplyOutcome {
 pub struct KubernetesApplyProvider {
     dry_run: KubernetesDryRunProvider,
     kubectl: String,
+    kubectl_context: Option<String>,
+    confirm_apply: bool,
+    mutation_enabled: bool,
 }
 
 impl KubernetesApplyProvider {
     pub fn new(dry_run: KubernetesDryRunProvider, kubectl: impl Into<String>) -> Self {
+        let kubectl_context = Some(dry_run.cluster.clone());
         Self {
             dry_run,
             kubectl: kubectl.into(),
+            kubectl_context,
+            confirm_apply: false,
+            mutation_enabled: false,
         }
+    }
+
+    pub fn with_kubectl_context(mut self, context: Option<String>) -> Self {
+        self.kubectl_context = context.and_then(|context| {
+            let context = context.trim();
+            if context.is_empty() || context == "in-cluster" {
+                None
+            } else {
+                Some(context.to_string())
+            }
+        });
+        self
+    }
+
+    pub fn with_mutation_gate(mut self, confirm_apply: bool, mutation_enabled: bool) -> Self {
+        self.confirm_apply = confirm_apply;
+        self.mutation_enabled = mutation_enabled;
+        self
     }
 
     pub fn smoke_plan(
@@ -381,7 +420,7 @@ impl KubernetesApplyProvider {
     ) -> KubernetesApplyPlan {
         let provision_pvc = self
             .dry_run
-            .pvc_manifest(format!("sandboxwich-pvc-{sandbox_id}"));
+            .pvc_manifest(format!("sandboxwich-pvc-{sandbox_id}"), Some(sandbox_id));
         let provision_pod = self.dry_run.pod_manifest(sandbox_id);
         let provision_ssh_service = self.dry_run.ssh_service_manifest(sandbox_id);
         let provision_service = self.dry_run.desktop_service_manifest(sandbox_id);
@@ -394,14 +433,17 @@ impl KubernetesApplyProvider {
         let fork_pod = self.dry_run.pod_manifest(child_sandbox_id);
         let fork_ssh_service = self.dry_run.ssh_service_manifest(child_sandbox_id);
         let fork_service = self.dry_run.desktop_service_manifest(child_sandbox_id);
-        let exec_handoff = self.dry_run.exec_handoff(
-            sandbox_id,
-            AgentCommandRequest {
-                argv: vec!["echo".to_string(), "sandboxwich".to_string()],
-                cwd: None,
-                env: BTreeMap::new(),
-            },
-        );
+        let exec_handoff = self
+            .dry_run
+            .exec_handoff(
+                sandbox_id,
+                AgentCommandRequest {
+                    argv: vec!["echo".to_string(), "sandboxwich".to_string()],
+                    cwd: None,
+                    env: BTreeMap::new(),
+                },
+            )
+            .expect("dry-run exec handoff should not fail");
         let apply_manifests = vec![
             provision_pvc.clone(),
             provision_pod.clone(),
@@ -521,33 +563,92 @@ impl KubernetesApplyProvider {
     }
 
     fn kubectl_args(&self, verb: &str) -> Vec<String> {
-        vec![
-            "--context".to_string(),
-            self.dry_run.cluster.clone(),
-            "-n".to_string(),
-            self.dry_run.namespace.clone(),
-            verb.to_string(),
-            "-f".to_string(),
-            "-".to_string(),
-        ]
+        let mut args = self.kubectl_base_args();
+        args.extend([verb.to_string(), "-f".to_string(), "-".to_string()]);
+        args
     }
 
     fn kubectl_delete_args(&self) -> Vec<String> {
-        vec![
-            "--context".to_string(),
-            self.dry_run.cluster.clone(),
-            "-n".to_string(),
-            self.dry_run.namespace.clone(),
+        let mut args = self.kubectl_base_args();
+        args.extend([
             "delete".to_string(),
             "--ignore-not-found=true".to_string(),
             "-f".to_string(),
             "-".to_string(),
+        ]);
+        args
+    }
+
+    fn kubectl_base_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if let Some(context) = &self.kubectl_context {
+            args.extend(["--context".to_string(), context.clone()]);
+        }
+        args.extend(["-n".to_string(), self.dry_run.namespace.clone()]);
+        args
+    }
+
+    fn pod_name(&self, sandbox_id: SandboxId) -> String {
+        format!("sandboxwich-{sandbox_id}")
+    }
+
+    fn provision_manifests(&self, sandbox_id: SandboxId) -> Vec<Value> {
+        vec![
+            self.dry_run
+                .pvc_manifest(format!("sandboxwich-pvc-{sandbox_id}"), Some(sandbox_id)),
+            self.dry_run.pod_manifest(sandbox_id),
+            self.dry_run.ssh_service_manifest(sandbox_id),
+            self.dry_run.desktop_service_manifest(sandbox_id),
         ]
+    }
+
+    fn wait_for_pod_ready(&self, sandbox_id: SandboxId) -> anyhow::Result<KubectlOutput> {
+        let mut args = self.kubectl_base_args();
+        args.extend([
+            "wait".to_string(),
+            "--for=condition=Ready".to_string(),
+            format!("pod/{}", self.pod_name(sandbox_id)),
+            "--timeout=120s".to_string(),
+        ]);
+        run_kubectl_command(&self.kubectl, &args, "wait for sandbox pod readiness")
+    }
+
+    fn exec_args(&self, sandbox_id: SandboxId, request: &AgentCommandRequest) -> Vec<String> {
+        let mut args = self.kubectl_base_args();
+        args.extend([
+            "exec".to_string(),
+            self.pod_name(sandbox_id),
+            "--".to_string(),
+        ]);
+
+        if request.cwd.is_some() || !request.env.is_empty() {
+            if !request.env.is_empty() {
+                args.push("env".to_string());
+                for (key, value) in &request.env {
+                    args.push(format!("{key}={value}"));
+                }
+            }
+            if let Some(cwd) = &request.cwd {
+                args.extend([
+                    "sh".to_string(),
+                    "-lc".to_string(),
+                    "cd \"$1\" && shift && exec \"$@\"".to_string(),
+                    "sandboxwich-cwd".to_string(),
+                    cwd.clone(),
+                ]);
+                args.extend(request.argv.clone());
+                return args;
+            }
+        }
+
+        args.extend(request.argv.clone());
+        args
     }
 }
 
 struct KubectlOutput {
     success: bool,
+    code: Option<i32>,
     status: String,
     stdout: String,
     stderr: String,
@@ -581,6 +682,28 @@ fn run_kubectl_documents(
 
     Ok(KubectlOutput {
         success: output.status.success(),
+        code: output.status.code(),
+        status: output.status.to_string(),
+        stdout,
+        stderr,
+    })
+}
+
+fn run_kubectl_command(
+    kubectl: &str,
+    args: &[String],
+    context: &'static str,
+) -> anyhow::Result<KubectlOutput> {
+    let output = Command::new(kubectl)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run kubectl for {context}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    Ok(KubectlOutput {
+        success: output.status.success(),
+        code: output.status.code(),
         status: output.status.to_string(),
         stdout,
         stderr,
@@ -630,22 +753,22 @@ impl SandboxProvider for KubernetesDryRunProvider {
         }
     }
 
-    fn provision(&self, sandbox_id: SandboxId) -> ProviderSandboxHandle {
-        ProviderSandboxHandle {
+    fn provision(&self, sandbox_id: SandboxId) -> anyhow::Result<ProviderSandboxHandle> {
+        Ok(ProviderSandboxHandle {
             provider: "kubernetes".to_string(),
             sandbox_id,
             metadata: self.metadata(sandbox_id, "provision"),
-        }
+        })
     }
 
     fn exec_handoff(
         &self,
         sandbox_id: SandboxId,
         request: AgentCommandRequest,
-    ) -> AgentCommandResult {
+    ) -> anyhow::Result<AgentCommandResult> {
         let started_at = Utc::now();
         let finished_at = Utc::now();
-        AgentCommandResult {
+        Ok(AgentCommandResult {
             exit_code: Some(0),
             stdout: serde_json::to_string(&json!({
                 "provider": "kubernetes",
@@ -660,15 +783,15 @@ impl SandboxProvider for KubernetesDryRunProvider {
             stderr: String::new(),
             started_at,
             finished_at,
-        }
+        })
     }
 
     fn create_snapshot(
         &self,
         sandbox_id: SandboxId,
         snapshot_id: SnapshotId,
-    ) -> ProviderSnapshotHandle {
-        ProviderSnapshotHandle {
+    ) -> anyhow::Result<ProviderSnapshotHandle> {
+        Ok(ProviderSnapshotHandle {
             provider: "kubernetes".to_string(),
             snapshot_id,
             metadata: json!({
@@ -686,7 +809,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
                     "volumeSnapshot": self.volume_snapshot_manifest(sandbox_id, snapshot_id)
                 }
             }),
-        }
+        })
     }
 
     fn fork(
@@ -694,8 +817,8 @@ impl SandboxProvider for KubernetesDryRunProvider {
         parent_sandbox_id: SandboxId,
         child_sandbox_id: SandboxId,
         snapshot_id: SnapshotId,
-    ) -> ProviderForkHandle {
-        ProviderForkHandle {
+    ) -> anyhow::Result<ProviderForkHandle> {
+        Ok(ProviderForkHandle {
             provider: "kubernetes".to_string(),
             parent_sandbox_id,
             child_sandbox_id,
@@ -720,7 +843,181 @@ impl SandboxProvider for KubernetesDryRunProvider {
                     "desktopService": self.desktop_service_manifest(child_sandbox_id)
                 }
             }),
+        })
+    }
+}
+
+impl SandboxProvider for KubernetesApplyProvider {
+    fn capability_report(&self) -> ProviderCapabilityReport {
+        let mut report = self.dry_run.capability_report();
+        report
+            .labels
+            .insert("provider_mode".to_string(), "apply".to_string());
+        report.labels.insert(
+            "kubectl_context".to_string(),
+            self.kubectl_context
+                .clone()
+                .unwrap_or_else(|| "in-cluster".to_string()),
+        );
+        report
+    }
+
+    fn health_report(&self) -> ProviderHealthReport {
+        let mut labels = self.capability_report().labels;
+        labels.insert(
+            "mutation_enabled".to_string(),
+            self.mutation_enabled.to_string(),
+        );
+        ProviderHealthReport {
+            provider: "kubernetes".to_string(),
+            status: if self.confirm_apply && self.mutation_enabled {
+                ProviderHealthStatus::Healthy
+            } else {
+                ProviderHealthStatus::Degraded
+            },
+            checked_at: Utc::now(),
+            labels,
+            message: Some(format!(
+                "apply provider ready; mutations require --confirm-apply and {KUBERNETES_MUTATION_ENV}=1"
+            )),
         }
+    }
+
+    fn provision(&self, sandbox_id: SandboxId) -> anyhow::Result<ProviderSandboxHandle> {
+        Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
+        let manifests = self.provision_manifests(sandbox_id);
+        let apply = run_kubectl_documents(
+            &self.kubectl,
+            &self.kubectl_args("apply"),
+            &manifests,
+            "apply sandbox manifests",
+        )?;
+        if !apply.success {
+            bail!(
+                "kubectl apply sandbox manifests failed with {}: {}",
+                apply.status,
+                apply.stderr
+            );
+        }
+        let wait = self.wait_for_pod_ready(sandbox_id)?;
+        if !wait.success {
+            bail!(
+                "sandbox pod did not become ready with {}: {}",
+                wait.status,
+                wait.stderr
+            );
+        }
+
+        let mut handle = self.dry_run.provision(sandbox_id)?;
+        if let Some(metadata) = handle.metadata.as_object_mut() {
+            metadata.insert("mode".to_string(), json!("apply"));
+            metadata.insert("applyStatus".to_string(), json!(apply.status));
+            metadata.insert("applyStdout".to_string(), json!(apply.stdout));
+            metadata.insert("waitStatus".to_string(), json!(wait.status));
+            metadata.insert("waitStdout".to_string(), json!(wait.stdout));
+        }
+        Ok(handle)
+    }
+
+    fn exec_handoff(
+        &self,
+        sandbox_id: SandboxId,
+        request: AgentCommandRequest,
+    ) -> anyhow::Result<AgentCommandResult> {
+        self.provision(sandbox_id)?;
+        let started_at = Utc::now();
+        let output = run_kubectl_command(
+            &self.kubectl,
+            &self.exec_args(sandbox_id, &request),
+            "execute sandbox command",
+        )?;
+        let finished_at = Utc::now();
+        Ok(AgentCommandResult {
+            exit_code: output.code.or(Some(if output.success { 0 } else { 1 })),
+            stdout: output.stdout,
+            stderr: output.stderr,
+            started_at,
+            finished_at,
+        })
+    }
+
+    fn create_snapshot(
+        &self,
+        sandbox_id: SandboxId,
+        snapshot_id: SnapshotId,
+    ) -> anyhow::Result<ProviderSnapshotHandle> {
+        Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
+        let snapshot = self
+            .dry_run
+            .volume_snapshot_manifest(sandbox_id, snapshot_id);
+        let apply = run_kubectl_documents(
+            &self.kubectl,
+            &self.kubectl_args("apply"),
+            std::slice::from_ref(&snapshot),
+            "apply snapshot manifest",
+        )?;
+        if !apply.success {
+            bail!(
+                "kubectl apply snapshot manifest failed with {}: {}",
+                apply.status,
+                apply.stderr
+            );
+        }
+        let mut handle = self.dry_run.create_snapshot(sandbox_id, snapshot_id)?;
+        if let Some(metadata) = handle.metadata.as_object_mut() {
+            metadata.insert("mode".to_string(), json!("apply"));
+            metadata.insert("applyStatus".to_string(), json!(apply.status));
+            metadata.insert("applyStdout".to_string(), json!(apply.stdout));
+        }
+        Ok(handle)
+    }
+
+    fn fork(
+        &self,
+        parent_sandbox_id: SandboxId,
+        child_sandbox_id: SandboxId,
+        snapshot_id: SnapshotId,
+    ) -> anyhow::Result<ProviderForkHandle> {
+        Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
+        let manifests = vec![
+            self.dry_run
+                .fork_pvc_manifest(child_sandbox_id, snapshot_id),
+            self.dry_run.pod_manifest(child_sandbox_id),
+            self.dry_run.ssh_service_manifest(child_sandbox_id),
+            self.dry_run.desktop_service_manifest(child_sandbox_id),
+        ];
+        let apply = run_kubectl_documents(
+            &self.kubectl,
+            &self.kubectl_args("apply"),
+            &manifests,
+            "apply fork manifests",
+        )?;
+        if !apply.success {
+            bail!(
+                "kubectl apply fork manifests failed with {}: {}",
+                apply.status,
+                apply.stderr
+            );
+        }
+        let wait = self.wait_for_pod_ready(child_sandbox_id)?;
+        if !wait.success {
+            bail!(
+                "forked sandbox pod did not become ready with {}: {}",
+                wait.status,
+                wait.stderr
+            );
+        }
+        let mut handle = self
+            .dry_run
+            .fork(parent_sandbox_id, child_sandbox_id, snapshot_id)?;
+        if let Some(metadata) = handle.metadata.as_object_mut() {
+            metadata.insert("mode".to_string(), json!("apply"));
+            metadata.insert("applyStatus".to_string(), json!(apply.status));
+            metadata.insert("applyStdout".to_string(), json!(apply.stdout));
+            metadata.insert("waitStatus".to_string(), json!(wait.status));
+            metadata.insert("waitStdout".to_string(), json!(wait.stdout));
+        }
+        Ok(handle)
     }
 }
 
@@ -772,7 +1069,9 @@ mod tests {
         let child_sandbox_id = SandboxId::new();
         let snapshot_id = SnapshotId::new();
 
-        let provisioned = provider.provision(sandbox_id);
+        let provisioned = provider
+            .provision(sandbox_id)
+            .expect("dry-run provision should succeed");
         assert_eq!(provisioned.metadata["mode"], "dry_run");
         assert_eq!(provisioned.metadata["operation"], "provision");
         assert_eq!(
@@ -793,25 +1092,31 @@ mod tests {
             "Service"
         );
 
-        let exec = provider.exec_handoff(
-            sandbox_id,
-            AgentCommandRequest {
-                argv: vec!["echo".to_string(), "hello".to_string()],
-                cwd: None,
-                env: BTreeMap::new(),
-            },
-        );
+        let exec = provider
+            .exec_handoff(
+                sandbox_id,
+                AgentCommandRequest {
+                    argv: vec!["echo".to_string(), "hello".to_string()],
+                    cwd: None,
+                    env: BTreeMap::new(),
+                },
+            )
+            .expect("dry-run exec should succeed");
         assert_eq!(exec.exit_code, Some(0));
         assert!(exec.stdout.contains("\"operation\":\"exec\""));
 
-        let snapshot = provider.create_snapshot(sandbox_id, snapshot_id);
+        let snapshot = provider
+            .create_snapshot(sandbox_id, snapshot_id)
+            .expect("dry-run snapshot should succeed");
         assert_eq!(snapshot.metadata["operation"], "snapshot");
         assert_eq!(
             snapshot.metadata["manifests"]["volumeSnapshot"]["kind"],
             "VolumeSnapshot"
         );
 
-        let fork = provider.fork(sandbox_id, child_sandbox_id, snapshot_id);
+        let fork = provider
+            .fork(sandbox_id, child_sandbox_id, snapshot_id)
+            .expect("dry-run fork should succeed");
         assert_eq!(fork.metadata["operation"], "fork");
         assert_eq!(fork.provider, "kubernetes");
         assert_eq!(
@@ -838,7 +1143,9 @@ mod tests {
             Some(runtime_image.as_str())
         );
 
-        let provisioned = provider.provision(SandboxId::new());
+        let provisioned = provider
+            .provision(SandboxId::new())
+            .expect("dry-run provision should succeed");
         assert_eq!(
             provisioned.metadata["runtime"]["image"],
             runtime_image.as_str()
@@ -850,11 +1157,37 @@ mod tests {
     }
 
     #[test]
+    fn kubernetes_dry_run_uses_configured_workspace_storage() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_workspace_storage(Some("2Gi".to_string()));
+
+        let capabilities = provider.capability_report();
+        assert_eq!(
+            capabilities
+                .labels
+                .get("workspace_storage")
+                .map(String::as_str),
+            Some("2Gi")
+        );
+
+        let provisioned = provider
+            .provision(SandboxId::new())
+            .expect("dry-run provision should succeed");
+        assert_eq!(
+            provisioned.metadata["manifests"]["pvc"]["spec"]["resources"]["requests"]["storage"],
+            "2Gi"
+        );
+    }
+
+    #[test]
     fn kubernetes_pod_mounts_authorized_keys_secret_by_reference() {
         let provider =
             KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
                 .with_ssh_authorized_keys_secret(Some("sandboxwich-authorized-keys".to_string()));
-        let provisioned = provider.provision(SandboxId::new());
+        let provisioned = provider
+            .provision(SandboxId::new())
+            .expect("dry-run provision should succeed");
         let pod = &provisioned.metadata["manifests"]["pod"];
 
         assert_eq!(
@@ -944,6 +1277,39 @@ mod tests {
                 .apply_manifests
                 .iter()
                 .any(|manifest| manifest["kind"] == "Secret")
+        );
+    }
+
+    #[test]
+    fn kubernetes_apply_provider_can_use_in_cluster_service_account() {
+        let provider = KubernetesDryRunProvider::with_snapshot_class(
+            "k3s-ci",
+            "sandboxwich-ci",
+            Some("local-path".to_string()),
+            None,
+        );
+        let apply = KubernetesApplyProvider::new(provider, "kubectl")
+            .with_kubectl_context(Some("in-cluster".to_string()))
+            .with_mutation_gate(true, true);
+        let plan = apply.smoke_plan(SandboxId::new(), SandboxId::new(), SnapshotId::new());
+
+        assert!(!plan.apply_args.iter().any(|arg| arg == "--context"));
+        assert_eq!(&plan.apply_args[..2], ["-n", "sandboxwich-ci"]);
+
+        let sandbox_id = SandboxId::new();
+        let request = AgentCommandRequest {
+            argv: vec!["printf".to_string(), "ok".to_string()],
+            cwd: None,
+            env: BTreeMap::new(),
+        };
+        let exec_args = apply.exec_args(sandbox_id, &request);
+
+        assert!(!exec_args.iter().any(|arg| arg == "--context"));
+        assert_eq!(&exec_args[..2], ["-n", "sandboxwich-ci"]);
+        assert!(exec_args.contains(&format!("sandboxwich-{sandbox_id}")));
+        assert_eq!(
+            &exec_args[exec_args.len() - 2..],
+            ["printf".to_string(), "ok".to_string()]
         );
     }
 
