@@ -10,15 +10,15 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use sandboxwich_core::{
-    ArchivedSandboxCleanupSkip, ClaimLeaseRequest, ClaimLeaseResponse, CleanupRun, CleanupRunId,
-    CleanupRunStatus, CommandId, CommandListResponse, CommandRequest, CommandResponse, CommandRun,
-    CommandStatus, CompleteLeaseRequest, CreateDesktopSessionRequest, CreateJobRequest,
-    CreateSandboxRequest, CreateSnapshotRequest, DesktopAccess, DesktopAccessMode,
-    DesktopAccessRequest, DesktopAccessResponse, DesktopSession, DesktopSessionId,
-    DesktopSessionListResponse, DesktopSessionResponse, DesktopSessionStatus, ErrorEnvelope,
-    EventId, EventListResponse, FailLeaseRequest, GuestHealth, GuestHealthResponse, GuestStatus,
-    HealthResponse, Job, JobId, JobKind, JobLease, JobListResponse, JobResponse, JobStatus,
-    LeaseId, LeaseResponse, LeaseStatus, PromptQueuedResponse, PromptRequest,
+    ArchivedSandboxCleanupSkip, CapacityResponse, ClaimLeaseRequest, ClaimLeaseResponse,
+    CleanupRun, CleanupRunId, CleanupRunStatus, CommandId, CommandListResponse, CommandRequest,
+    CommandResponse, CommandRun, CommandStatus, CompleteLeaseRequest, CreateDesktopSessionRequest,
+    CreateJobRequest, CreateSandboxRequest, CreateSnapshotRequest, DesktopAccess,
+    DesktopAccessMode, DesktopAccessRequest, DesktopAccessResponse, DesktopSession,
+    DesktopSessionId, DesktopSessionListResponse, DesktopSessionResponse, DesktopSessionStatus,
+    ErrorEnvelope, EventId, EventListResponse, FailLeaseRequest, GuestHealth, GuestHealthResponse,
+    GuestStatus, HealthResponse, Job, JobId, JobKind, JobLease, JobListResponse, JobResponse,
+    JobStatus, LeaseId, LeaseResponse, LeaseStatus, PromptQueuedResponse, PromptRequest,
     ProviderRuntimeResource, ReconcileRuntimeResourcesRequest, ReconcileRuntimeResourcesResponse,
     RegisterWorkerRequest, RenewLeaseRequest, RequestSshKeyRequest, RuntimeResource,
     RuntimeResourceId, RuntimeResourceKind, RuntimeResourceListResponse, RuntimeResourcePurpose,
@@ -27,8 +27,8 @@ use sandboxwich_core::{
     SnapshotListResponse, SnapshotResponse, SnapshotStatus, SshAccess, SshAccessRequest,
     SshAccessResponse, SshKey, SshKeyId, SshKeyListResponse, SshKeyResponse, SshKeyStatus,
     UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest, Worker,
-    WorkerCapability, WorkerHeartbeatRequest, WorkerId, WorkerJobResult, WorkerListResponse,
-    WorkerResponse, WorkerStatus,
+    WorkerCapability, WorkerCapacity, WorkerHeartbeatRequest, WorkerId, WorkerJobResult,
+    WorkerListResponse, WorkerResponse, WorkerStatus,
 };
 use serde_json::json;
 use sqlx::{
@@ -659,6 +659,7 @@ fn app(state: AppState) -> Router {
         .route("/snapshots/{snapshot_id}", get(get_snapshot))
         .route("/commands/{command_id}", get(get_command))
         .route("/workers", get(list_workers))
+        .route("/capacity", get(get_capacity))
         .route("/workers/register", post(register_worker))
         .route("/workers/{worker_id}/heartbeat", post(heartbeat_worker))
         .route(
@@ -1205,6 +1206,15 @@ async fn list_events(
     Ok(Json(EventListResponse { ok: true, events }))
 }
 
+fn validate_max_concurrent_jobs(max_concurrent_jobs: u32) -> Result<u32, ApiError> {
+    if max_concurrent_jobs == 0 {
+        return Err(ApiError::bad_request(
+            "max_concurrent_jobs must be greater than 0",
+        ));
+    }
+    Ok(max_concurrent_jobs)
+}
+
 async fn register_worker(
     State(state): State<AppState>,
     Json(request): Json<RegisterWorkerRequest>,
@@ -1220,6 +1230,8 @@ async fn register_worker(
             "worker must report at least one capability",
         ));
     }
+    let max_concurrent_jobs =
+        validate_max_concurrent_jobs(request.max_concurrent_jobs.unwrap_or(1))?;
 
     let now = Utc::now();
     let worker = Worker {
@@ -1228,6 +1240,7 @@ async fn register_worker(
         status: WorkerStatus::Registered,
         provider: request.provider,
         capabilities: request.capabilities,
+        max_concurrent_jobs,
         labels: request.labels,
         registered_at: now,
         last_heartbeat_at: None,
@@ -1246,22 +1259,44 @@ async fn heartbeat_worker(
     fetch_worker(&state.db, worker_id).await?;
     let now = Utc::now();
     let labels = serde_json::to_string(&request.labels)?;
-    let sql = format!(
-        "update workers
-         set status = {}, last_heartbeat_at = {}, labels = {}
-         where id = {}",
-        state.db.placeholder(1),
-        state.db.placeholder(2),
-        state.db.placeholder(3),
-        state.db.placeholder(4)
-    );
-    let result = sqlx::query(&sql)
-        .bind(worker_status_to_str(&WorkerStatus::Online))
-        .bind(now.to_rfc3339())
-        .bind(labels.clone())
-        .bind(worker_id.to_string())
-        .execute(&state.db.pool)
-        .await?;
+    let result = if let Some(max_concurrent_jobs) = request.max_concurrent_jobs {
+        let max_concurrent_jobs = validate_max_concurrent_jobs(max_concurrent_jobs)?;
+        let sql = format!(
+            "update workers
+             set status = {}, last_heartbeat_at = {}, labels = {}, max_concurrent_jobs = {}
+             where id = {}",
+            state.db.placeholder(1),
+            state.db.placeholder(2),
+            state.db.placeholder(3),
+            state.db.placeholder(4),
+            state.db.placeholder(5)
+        );
+        sqlx::query(&sql)
+            .bind(worker_status_to_str(&WorkerStatus::Online))
+            .bind(now.to_rfc3339())
+            .bind(labels.clone())
+            .bind(i64::from(max_concurrent_jobs))
+            .bind(worker_id.to_string())
+            .execute(&state.db.pool)
+            .await?
+    } else {
+        let sql = format!(
+            "update workers
+             set status = {}, last_heartbeat_at = {}, labels = {}
+             where id = {}",
+            state.db.placeholder(1),
+            state.db.placeholder(2),
+            state.db.placeholder(3),
+            state.db.placeholder(4)
+        );
+        sqlx::query(&sql)
+            .bind(worker_status_to_str(&WorkerStatus::Online))
+            .bind(now.to_rfc3339())
+            .bind(labels.clone())
+            .bind(worker_id.to_string())
+            .execute(&state.db.pool)
+            .await?
+    };
 
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found("worker not found"));
@@ -1312,7 +1347,7 @@ async fn reconcile_runtime_resources(
 
 async fn list_workers(State(state): State<AppState>) -> Result<Json<WorkerListResponse>, ApiError> {
     let rows = sqlx::query(
-        "select id, name, status, provider, capabilities, labels, registered_at, last_heartbeat_at
+        "select id, name, status, provider, capabilities, max_concurrent_jobs, labels, registered_at, last_heartbeat_at
          from workers
          order by registered_at asc, id asc",
     )
@@ -1325,6 +1360,25 @@ async fn list_workers(State(state): State<AppState>) -> Result<Json<WorkerListRe
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Json(WorkerListResponse { ok: true, workers }))
+}
+
+async fn get_capacity(State(state): State<AppState>) -> Result<Json<CapacityResponse>, ApiError> {
+    expire_due_leases(&state.db).await?;
+    let workers = list_worker_capacities(&state.db).await?;
+    let total_max_concurrent_jobs = workers
+        .iter()
+        .map(|worker| worker.max_concurrent_jobs)
+        .sum();
+    let total_active_leases = workers.iter().map(|worker| worker.active_leases).sum();
+    let total_available_slots = workers.iter().map(|worker| worker.available_slots).sum();
+
+    Ok(Json(CapacityResponse {
+        ok: true,
+        workers,
+        total_max_concurrent_jobs,
+        total_active_leases,
+        total_available_slots,
+    }))
 }
 
 async fn create_job(
@@ -1523,8 +1577,14 @@ async fn claim_lease(
     Path(worker_id): Path<Uuid>,
     Json(request): Json<ClaimLeaseRequest>,
 ) -> Result<Json<ClaimLeaseResponse>, ApiError> {
-    let worker = fetch_worker(&state.db, WorkerId(worker_id)).await?;
     expire_due_leases(&state.db).await?;
+    let worker = fetch_worker(&state.db, WorkerId(worker_id)).await?;
+    if !worker_has_capacity(&state.db, &worker).await? {
+        return Ok(Json(ClaimLeaseResponse {
+            ok: true,
+            lease: None,
+        }));
+    }
 
     let rows = sqlx::query(
         "select id, kind, status, payload, required_capability, priority, attempts, max_attempts,
@@ -2451,7 +2511,7 @@ async fn fetch_command(db: &Database, command_id: CommandId) -> Result<CommandRu
 
 async fn fetch_worker(db: &Database, worker_id: WorkerId) -> Result<Worker, ApiError> {
     let sql = format!(
-        "select id, name, status, provider, capabilities, labels, registered_at, last_heartbeat_at
+        "select id, name, status, provider, capabilities, max_concurrent_jobs, labels, registered_at, last_heartbeat_at
          from workers
          where id = {}",
         db.placeholder(1)
@@ -2463,6 +2523,57 @@ async fn fetch_worker(db: &Database, worker_id: WorkerId) -> Result<Worker, ApiE
         .ok_or_else(|| ApiError::not_found("worker not found"))?;
 
     row_to_worker(row)
+}
+
+async fn active_lease_count_for_worker(
+    db: &Database,
+    worker_id: WorkerId,
+) -> Result<u32, ApiError> {
+    let sql = format!(
+        "select count(*) as active_leases
+         from job_leases
+         where worker_id = {} and status = 'active'",
+        db.placeholder(1)
+    );
+    let row = sqlx::query(&sql)
+        .bind(worker_id.to_string())
+        .fetch_one(&db.pool)
+        .await?;
+    let active_leases: i64 = row.try_get("active_leases")?;
+    u32::try_from(active_leases)
+        .map_err(|_| ApiError::internal("database contains invalid active lease count"))
+}
+
+async fn worker_has_capacity(db: &Database, worker: &Worker) -> Result<bool, ApiError> {
+    let active_leases = active_lease_count_for_worker(db, worker.id).await?;
+    Ok(active_leases < worker.max_concurrent_jobs)
+}
+
+async fn list_worker_capacities(db: &Database) -> Result<Vec<WorkerCapacity>, ApiError> {
+    let rows = sqlx::query(
+        "select id, name, status, provider, capabilities, max_concurrent_jobs, labels, registered_at, last_heartbeat_at
+         from workers
+         order by registered_at asc, id asc",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+
+    let mut capacities = Vec::new();
+    for row in rows {
+        let worker = row_to_worker(row)?;
+        let active_leases = active_lease_count_for_worker(db, worker.id).await?;
+        capacities.push(WorkerCapacity {
+            worker_id: worker.id,
+            worker_name: worker.name,
+            provider: worker.provider,
+            status: worker.status,
+            max_concurrent_jobs: worker.max_concurrent_jobs,
+            active_leases,
+            available_slots: worker.max_concurrent_jobs.saturating_sub(active_leases),
+        });
+    }
+
+    Ok(capacities)
 }
 
 async fn fetch_guest_health(
@@ -4375,9 +4486,9 @@ impl Database {
 async fn insert_worker(db: &Database, worker: &Worker) -> Result<(), ApiError> {
     let sql = format!(
         "insert into workers
-         (id, name, status, provider, capabilities, labels, registered_at, last_heartbeat_at)
+         (id, name, status, provider, capabilities, max_concurrent_jobs, labels, registered_at, last_heartbeat_at)
          values ({})",
-        db.placeholders(8)
+        db.placeholders(9)
     );
     sqlx::query(&sql)
         .bind(worker.id.to_string())
@@ -4385,6 +4496,7 @@ async fn insert_worker(db: &Database, worker: &Worker) -> Result<(), ApiError> {
         .bind(worker_status_to_str(&worker.status))
         .bind(&worker.provider)
         .bind(serde_json::to_string(&worker.capabilities)?)
+        .bind(i64::from(worker.max_concurrent_jobs))
         .bind(serde_json::to_string(&worker.labels)?)
         .bind(worker.registered_at.to_rfc3339())
         .bind(worker.last_heartbeat_at.map(|time| time.to_rfc3339()))
@@ -4542,6 +4654,7 @@ fn row_to_worker(row: AnyRow) -> Result<Worker, ApiError> {
     let id: String = row.try_get("id")?;
     let status: String = row.try_get("status")?;
     let capabilities: String = row.try_get("capabilities")?;
+    let max_concurrent_jobs: i64 = row.try_get("max_concurrent_jobs")?;
     let labels: String = row.try_get("labels")?;
     let registered_at: String = row.try_get("registered_at")?;
     let last_heartbeat_at: Option<String> = row.try_get("last_heartbeat_at")?;
@@ -4552,6 +4665,8 @@ fn row_to_worker(row: AnyRow) -> Result<Worker, ApiError> {
         status: parse_worker_status(&status)?,
         provider: row.try_get("provider")?,
         capabilities: serde_json::from_str::<Vec<WorkerCapability>>(&capabilities)?,
+        max_concurrent_jobs: u32::try_from(max_concurrent_jobs)
+            .map_err(|_| ApiError::internal("database contains invalid worker capacity"))?,
         labels: serde_json::from_str(&labels)?,
         registered_at: parse_timestamp(&registered_at)?,
         last_heartbeat_at: last_heartbeat_at

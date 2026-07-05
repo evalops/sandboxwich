@@ -56,6 +56,9 @@ struct RegisterArgs {
 
     #[arg(long = "label", value_parser = parse_label)]
     label: Vec<(String, String)>,
+
+    #[arg(long)]
+    max_concurrent_jobs: Option<u32>,
 }
 
 #[derive(Debug, Args)]
@@ -71,6 +74,9 @@ struct RunArgs {
 
     #[arg(long = "label", value_parser = parse_label)]
     label: Vec<(String, String)>,
+
+    #[arg(long)]
+    max_concurrent_jobs: Option<u32>,
 
     #[arg(long)]
     lease_seconds: Option<u64>,
@@ -91,6 +97,9 @@ struct HeartbeatArgs {
 
     #[arg(long = "label", value_parser = parse_label)]
     label: Vec<(String, String)>,
+
+    #[arg(long)]
+    max_concurrent_jobs: Option<u32>,
 }
 
 #[derive(Debug, Args)]
@@ -411,6 +420,7 @@ async fn main() -> anyhow::Result<()> {
                 args.provider,
                 capabilities_from_args(args.capability),
                 args.label.into_iter().collect(),
+                args.max_concurrent_jobs,
             )
             .await?;
             println!("{}", serde_json::to_string_pretty(&response)?);
@@ -419,6 +429,7 @@ async fn main() -> anyhow::Result<()> {
             let response = client
                 .post(format!("{api}/workers/{}/heartbeat", args.worker_id))
                 .json(&WorkerHeartbeatRequest {
+                    max_concurrent_jobs: args.max_concurrent_jobs,
                     labels: args.label.into_iter().collect(),
                 })
                 .send()
@@ -478,6 +489,7 @@ async fn main() -> anyhow::Result<()> {
                 args.worker_provider,
                 capabilities_from_args(args.capability),
                 labels.clone(),
+                args.max_concurrent_jobs,
             )
             .await?;
             println!(
@@ -585,6 +597,7 @@ async fn register_worker(
     provider: String,
     capabilities: Vec<WorkerCapability>,
     labels: BTreeMap<String, String>,
+    max_concurrent_jobs: Option<u32>,
 ) -> anyhow::Result<WorkerResponse> {
     let response = client
         .post(format!("{api}/workers/register"))
@@ -592,6 +605,7 @@ async fn register_worker(
             name,
             provider,
             capabilities,
+            max_concurrent_jobs,
             labels,
         })
         .send()
@@ -607,7 +621,10 @@ async fn heartbeat_worker(
 ) -> anyhow::Result<WorkerResponse> {
     let response = client
         .post(format!("{api}/workers/{worker_id}/heartbeat"))
-        .json(&WorkerHeartbeatRequest { labels })
+        .json(&WorkerHeartbeatRequest {
+            max_concurrent_jobs: None,
+            labels,
+        })
         .send()
         .await?;
     decode_json::<WorkerResponse>(response).await

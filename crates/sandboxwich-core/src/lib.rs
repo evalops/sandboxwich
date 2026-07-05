@@ -704,6 +704,7 @@ pub struct Worker {
     pub status: WorkerStatus,
     pub provider: String,
     pub capabilities: Vec<WorkerCapability>,
+    pub max_concurrent_jobs: u32,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
     pub registered_at: DateTime<Utc>,
@@ -715,12 +716,14 @@ pub struct RegisterWorkerRequest {
     pub name: String,
     pub provider: String,
     pub capabilities: Vec<WorkerCapability>,
+    pub max_concurrent_jobs: Option<u32>,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorkerHeartbeatRequest {
+    pub max_concurrent_jobs: Option<u32>,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
 }
@@ -735,6 +738,26 @@ pub struct WorkerResponse {
 pub struct WorkerListResponse {
     pub ok: bool,
     pub workers: Vec<Worker>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkerCapacity {
+    pub worker_id: WorkerId,
+    pub worker_name: String,
+    pub provider: String,
+    pub status: WorkerStatus,
+    pub max_concurrent_jobs: u32,
+    pub active_leases: u32,
+    pub available_slots: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CapacityResponse {
+    pub ok: bool,
+    pub workers: Vec<WorkerCapacity>,
+    pub total_max_concurrent_jobs: u32,
+    pub total_active_leases: u32,
+    pub total_available_slots: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

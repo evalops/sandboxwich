@@ -6,7 +6,7 @@ use std::{
 
 use reqwest::StatusCode;
 use sandboxwich_core::{
-    AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse, CleanupRunStatus,
+    AgentCommandResult, CapacityResponse, ClaimLeaseRequest, ClaimLeaseResponse, CleanupRunStatus,
     CommandListResponse, CommandRequest, CommandResponse, CommandStatus, CompleteLeaseRequest,
     CreateDesktopSessionRequest, CreateJobRequest, CreateSandboxRequest, CreateSnapshotRequest,
     DesktopAccessMode, DesktopAccessRequest, DesktopAccessResponse, DesktopSessionListResponse,
@@ -109,6 +109,7 @@ async fn run_contract(server: TestServer) {
                 WorkerCapability::ProvisionSandbox,
                 WorkerCapability::RunCommand,
             ],
+            max_concurrent_jobs: Some(1),
             labels: [("cluster".to_string(), "k3s-dev".to_string())].into(),
         })
         .send()
@@ -127,6 +128,7 @@ async fn run_contract(server: TestServer) {
             server.base_url, worker.worker.id
         ))
         .json(&WorkerHeartbeatRequest {
+            max_concurrent_jobs: None,
             labels: [("node".to_string(), "k3s-node-1".to_string())].into(),
         })
         .send()
@@ -248,6 +250,63 @@ async fn run_contract(server: TestServer) {
         .unwrap();
     assert_eq!(running_command.command.status, CommandStatus::Running);
 
+    let second_command: CommandResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/commands",
+            server.base_url, created.sandbox.id
+        ))
+        .json(&CommandRequest {
+            argv: vec!["echo".to_string(), "second".to_string()],
+            cwd: None,
+            env: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(second_command.command.status, CommandStatus::Queued);
+
+    let saturated_capacity: CapacityResponse = client
+        .get(format!("{}/capacity", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let saturated_worker = saturated_capacity
+        .workers
+        .iter()
+        .find(|capacity| capacity.worker_id == worker.worker.id)
+        .expect("worker should have capacity row");
+    assert_eq!(saturated_worker.max_concurrent_jobs, 1);
+    assert_eq!(saturated_worker.active_leases, 1);
+    assert_eq!(saturated_worker.available_slots, 0);
+
+    let saturated_claim: ClaimLeaseResponse = client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(saturated_claim.lease.is_none());
+
     let completed: LeaseResponse = client
         .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
         .json(&CompleteLeaseRequest {
@@ -262,6 +321,43 @@ async fn run_contract(server: TestServer) {
         .await
         .unwrap();
     assert_eq!(completed.lease.job.status, JobStatus::Succeeded);
+
+    let second_claimed: ClaimLeaseResponse = client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let second_lease = second_claimed
+        .lease
+        .expect("worker should claim queued command after capacity frees");
+    let second_completed: LeaseResponse = client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, second_lease.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(command_result("second\n", "", 0)),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(second_completed.lease.job.status, JobStatus::Succeeded);
 
     let finished_command: CommandResponse = client
         .get(format!(
@@ -292,8 +388,18 @@ async fn run_contract(server: TestServer) {
         .json()
         .await
         .unwrap();
-    assert_eq!(commands.commands.len(), 1);
-    assert_eq!(commands.commands[0].id, command.command.id);
+    assert!(
+        commands
+            .commands
+            .iter()
+            .any(|seen| seen.id == command.command.id)
+    );
+    assert!(
+        commands
+            .commands
+            .iter()
+            .any(|seen| seen.id == second_command.command.id)
+    );
 
     let fetched_command: CommandResponse = client
         .get(format!(
@@ -1016,6 +1122,7 @@ async fn assert_prompt_job_lifecycle(
             name: "prompt-worker".to_string(),
             provider: "kubernetes".to_string(),
             capabilities: vec![WorkerCapability::AgentPrompt],
+            max_concurrent_jobs: Some(1),
             labels: [("cluster".to_string(), "k3s-dev".to_string())].into(),
         })
         .send()
@@ -1521,6 +1628,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
             name: "k3s-snapshot-worker".to_string(),
             provider: "kubernetes".to_string(),
             capabilities: vec![WorkerCapability::Snapshot],
+            max_concurrent_jobs: Some(1),
             labels: [("cluster".to_string(), "k3s-dev".to_string())].into(),
         })
         .send()
