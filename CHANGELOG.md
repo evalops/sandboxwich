@@ -20,3 +20,7 @@
   pod/container security contexts, and optional RuntimeClass isolation.
 - Runtime resource cleanup distinguishes `deleted` resources reconciled as missing
   from `destroyed` resources explicitly torn down during archived-sandbox cleanup.
+- The guest agent preserves split multi-byte UTF-8 characters in streamed command
+  output chunks and exits its heartbeat task after 12 consecutive failed heartbeat
+  posts by default. Operators can tune that circuit breaker with
+  `SANDBOXWICH_HEARTBEAT_FAILURE_THRESHOLD`.

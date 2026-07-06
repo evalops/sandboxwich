@@ -15,6 +15,8 @@ use tokio::{
 };
 use uuid::Uuid;
 
+const DEFAULT_HEARTBEAT_FAILURE_THRESHOLD: u32 = 12;
+
 #[derive(Debug, Parser)]
 #[command(name = "sandboxwich-agent")]
 #[command(about = "Guest-side agent for command and file operations")]
@@ -69,6 +71,13 @@ struct DaemonArgs {
 
     #[arg(long, default_value_t = 5000)]
     heartbeat_interval_ms: u64,
+
+    #[arg(
+        long,
+        env = "SANDBOXWICH_HEARTBEAT_FAILURE_THRESHOLD",
+        default_value_t = DEFAULT_HEARTBEAT_FAILURE_THRESHOLD
+    )]
+    heartbeat_failure_threshold: u32,
 
     #[arg(long, default_value_t = 1000)]
     idle_sleep_ms: u64,
@@ -160,6 +169,7 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
         api.clone(),
         sandbox_id,
         heartbeat_interval,
+        args.heartbeat_failure_threshold.max(1),
     ));
 
     let daemon_result = async {
@@ -221,15 +231,59 @@ async fn heartbeat_loop(
     api: String,
     sandbox_id: SandboxId,
     heartbeat_interval: Duration,
+    heartbeat_failure_threshold: u32,
 ) -> anyhow::Result<()> {
+    let mut failure_budget = HeartbeatFailureBudget::new(heartbeat_failure_threshold);
     loop {
         tokio::time::sleep(heartbeat_interval).await;
-        if let Err(error) =
-            post_guest_health(&client, &api, sandbox_id, GuestStatus::Ready, None).await
-        {
-            let warning = format!("sandboxwich-agent: heartbeat post failed: {error}\n");
-            let _ = tokio::io::stderr().write_all(warning.as_bytes()).await;
+        match post_guest_health(&client, &api, sandbox_id, GuestStatus::Ready, None).await {
+            Ok(()) => failure_budget.record_success(),
+            Err(error) => {
+                let warning = format!(
+                    "sandboxwich-agent: heartbeat post failed ({}/{}): {error}\n",
+                    failure_budget.consecutive_failures() + 1,
+                    failure_budget.max_consecutive_failures(),
+                );
+                let _ = tokio::io::stderr().write_all(warning.as_bytes()).await;
+                if failure_budget.record_failure() {
+                    bail!(
+                        "heartbeat failed {} consecutive times: {error}",
+                        failure_budget.max_consecutive_failures()
+                    );
+                }
+            }
         }
+    }
+}
+
+struct HeartbeatFailureBudget {
+    max_consecutive_failures: u32,
+    consecutive_failures: u32,
+}
+
+impl HeartbeatFailureBudget {
+    fn new(max_consecutive_failures: u32) -> Self {
+        Self {
+            max_consecutive_failures: max_consecutive_failures.max(1),
+            consecutive_failures: 0,
+        }
+    }
+
+    fn max_consecutive_failures(&self) -> u32 {
+        self.max_consecutive_failures
+    }
+
+    fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+
+    fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+    }
+
+    fn record_failure(&mut self) -> bool {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.consecutive_failures >= self.max_consecutive_failures
     }
 }
 
@@ -648,5 +702,36 @@ mod tests {
         assert_eq!(decoder.push(&[0xF0, 0x9F]), "");
         assert_eq!(decoder.push(&[0x8D, 0x95]), "🍕");
         assert_eq!(decoder.finish(), "");
+    }
+
+    #[test]
+    fn heartbeat_failure_budget_trips_after_threshold() {
+        let mut budget = HeartbeatFailureBudget::new(3);
+
+        assert!(!budget.record_failure());
+        assert_eq!(budget.consecutive_failures(), 1);
+        assert!(!budget.record_failure());
+        assert_eq!(budget.consecutive_failures(), 2);
+        assert!(budget.record_failure());
+        assert_eq!(budget.consecutive_failures(), 3);
+    }
+
+    #[test]
+    fn heartbeat_failure_budget_resets_after_success() {
+        let mut budget = HeartbeatFailureBudget::new(2);
+
+        assert!(!budget.record_failure());
+        budget.record_success();
+        assert_eq!(budget.consecutive_failures(), 0);
+        assert!(!budget.record_failure());
+        assert!(budget.record_failure());
+    }
+
+    #[test]
+    fn heartbeat_failure_budget_requires_at_least_one_failure() {
+        let mut budget = HeartbeatFailureBudget::new(0);
+
+        assert_eq!(budget.max_consecutive_failures(), 1);
+        assert!(budget.record_failure());
     }
 }
