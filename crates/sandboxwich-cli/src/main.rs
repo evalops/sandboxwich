@@ -4,12 +4,13 @@ use sandboxwich_core::{
     CapacityResponse, CommandListResponse, CommandRequest, CommandResponse,
     CreateDesktopSessionRequest, CreateSandboxRequest, CreateSnapshotRequest, DesktopAccessMode,
     DesktopAccessRequest, DesktopAccessResponse, DesktopSessionListResponse,
-    DesktopSessionResponse, DesktopSessionStatus, EventListResponse, GuestHealthResponse,
-    GuestStatus, JobListResponse, PromptQueuedResponse, PromptRequest, RequestSshKeyRequest,
-    RuntimeResourceListResponse, SandboxListResponse, SandboxResponse, SnapshotCleanupResponse,
-    SnapshotListResponse, SnapshotResponse, SshAccessRequest, SshAccessResponse,
-    SshKeyListResponse, SshKeyResponse, SshKeyStatus, UpdateDesktopSessionRequest,
-    UpdateGuestHealthRequest, UpdateSshKeyStatusRequest, WorkerListResponse, build_api_client,
+    DesktopSessionResponse, DesktopSessionStatus, EventListResponse, FileResponse,
+    GuestHealthResponse, GuestStatus, JobListResponse, ListFilesResponse, MemoryLimit,
+    PromptQueuedResponse, PromptRequest, RequestSshKeyRequest, RuntimeResourceListResponse,
+    SandboxListResponse, SandboxResponse, SnapshotCleanupResponse, SnapshotListResponse,
+    SnapshotResponse, SshAccessRequest, SshAccessResponse, SshKeyListResponse, SshKeyResponse,
+    SshKeyStatus, UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest,
+    WorkerListResponse, build_api_client,
 };
 use uuid::Uuid;
 
@@ -50,6 +51,7 @@ enum Command {
     DesktopAccess(DesktopAccessArgs),
     Ssh(SshAccessArgs),
     Scp(SshAccessArgs),
+    Cp(CpArgs),
     Prompt(PromptArgs),
     Exec(ExecArgs),
     Commands { sandbox_id: Uuid },
@@ -72,6 +74,9 @@ struct NewArgs {
 
     #[arg(long)]
     template: Option<String>,
+
+    #[arg(long, value_enum)]
+    memory_limit: Option<MemoryLimitArg>,
 
     #[arg(long)]
     ttl_seconds: Option<u64>,
@@ -156,6 +161,19 @@ struct SshAccessArgs {
 
     #[arg(long)]
     ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+struct CpArgs {
+    sandbox_id: Uuid,
+    source: String,
+    destination: String,
+
+    #[arg(long, default_value_t = false)]
+    download: bool,
+
+    #[arg(long)]
+    mime_type: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -251,6 +269,18 @@ enum DesktopSessionStatusArg {
     Expired,
 }
 
+#[derive(Clone, Debug, ValueEnum)]
+enum MemoryLimitArg {
+    #[value(name = "1g")]
+    OneG,
+    #[value(name = "4g")]
+    FourG,
+    #[value(name = "16g")]
+    SixteenG,
+    #[value(name = "64g")]
+    SixtyFourG,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -264,6 +294,8 @@ async fn main() -> anyhow::Result<()> {
                 .json(&CreateSandboxRequest {
                     name: args.name,
                     template: args.template,
+                    memory_limit: args.memory_limit.map(Into::into),
+                    network_egress: None,
                     ttl_seconds: args.ttl_seconds,
                 })
                 .send()
@@ -308,6 +340,8 @@ async fn main() -> anyhow::Result<()> {
                 .json(&CreateSandboxRequest {
                     name: args.name,
                     template: None,
+                    memory_limit: None,
+                    network_egress: None,
                     ttl_seconds: args.ttl_seconds,
                 })
                 .send()
@@ -421,6 +455,13 @@ async fn main() -> anyhow::Result<()> {
                 .send()
                 .await?;
             print_json::<SshAccessResponse>(response).await?;
+        }
+        Command::Cp(args) => {
+            if args.download {
+                download_file(&client, api, args).await?;
+            } else {
+                upload_file(&client, api, args).await?;
+            }
         }
         Command::Prompt(args) => {
             let response = client
@@ -579,9 +620,90 @@ impl From<DesktopSessionStatusArg> for DesktopSessionStatus {
     }
 }
 
+impl From<MemoryLimitArg> for MemoryLimit {
+    fn from(value: MemoryLimitArg) -> Self {
+        match value {
+            MemoryLimitArg::OneG => Self::OneG,
+            MemoryLimitArg::FourG => Self::FourG,
+            MemoryLimitArg::SixteenG => Self::SixteenG,
+            MemoryLimitArg::SixtyFourG => Self::SixtyFourG,
+        }
+    }
+}
+
+async fn upload_file(client: &reqwest::Client, api: &str, args: CpArgs) -> anyhow::Result<()> {
+    let content = tokio::fs::read(&args.source)
+        .await
+        .with_context(|| format!("failed to read local file {}", args.source))?;
+    let file_name = std::path::Path::new(&args.source)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("upload")
+        .to_string();
+    let mut part = reqwest::multipart::Part::bytes(content).file_name(file_name);
+    if let Some(mime_type) = &args.mime_type {
+        part = part
+            .mime_str(mime_type)
+            .with_context(|| format!("invalid MIME type {mime_type:?}"))?;
+    }
+    let form = reqwest::multipart::Form::new()
+        .text("path", args.destination)
+        .part("file", part);
+    let response = client
+        .post(format!("{api}/sandboxes/{}/files", args.sandbox_id))
+        .multipart(form)
+        .send()
+        .await?;
+    print_json::<FileResponse>(response).await
+}
+
+async fn download_file(client: &reqwest::Client, api: &str, args: CpArgs) -> anyhow::Result<()> {
+    let listed = client
+        .get(format!("{api}/sandboxes/{}/files", args.sandbox_id))
+        .send()
+        .await?;
+    let files = decode_json::<ListFilesResponse>(listed).await?;
+    let file = files
+        .files
+        .into_iter()
+        .find(|file| file.path == args.source)
+        .ok_or_else(|| anyhow::anyhow!("remote file {:?} was not found", args.source))?;
+    let response = client
+        .get(format!(
+            "{api}/sandboxes/{}/files/{}",
+            args.sandbox_id, file.id
+        ))
+        .send()
+        .await?;
+    let status = response.status();
+    let content = response
+        .bytes()
+        .await
+        .context("failed to read downloaded file")?;
+    if !status.is_success() {
+        bail!(
+            "download failed with {status}: {}",
+            String::from_utf8_lossy(&content)
+        );
+    }
+    tokio::fs::write(&args.destination, &content)
+        .await
+        .with_context(|| format!("failed to write local file {}", args.destination))?;
+    Ok(())
+}
+
 async fn print_json<T>(response: reqwest::Response) -> anyhow::Result<()>
 where
     T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    let value = decode_json::<T>(response).await?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+async fn decode_json<T>(response: reqwest::Response) -> anyhow::Result<T>
+where
+    T: serde::de::DeserializeOwned,
 {
     let status = response.status();
     let body = response
@@ -592,7 +714,5 @@ where
         bail!("request failed with {status}: {body}");
     }
 
-    let value: T = serde_json::from_str(&body).context("failed to decode response body")?;
-    println!("{}", serde_json::to_string_pretty(&value)?);
-    Ok(())
+    serde_json::from_str(&body).context("failed to decode response body")
 }

@@ -7,10 +7,10 @@ The name is dumb on purpose. The contracts should not be.
 ## What exists now
 
 - `sandboxwich-api`: HTTP control plane backed by SQLite for local dev or Postgres for shared deployments.
-- `sandboxwich-cli`: CLI for creating, listing, stopping, resuming, forking, running commands, reading events, and inspecting runtime resources.
+- `sandboxwich-cli`: CLI for creating, listing, stopping, resuming, forking, copying files, running commands, reading events, and inspecting runtime resources.
 - `sandboxwich-core`: shared typed request/response/event contracts.
 - `sandboxwich-worker`: host-side worker registration and heartbeat CLI.
-- `sandboxwich-agent`: guest-side agent placeholder.
+- `sandboxwich-agent`: guest-side daemon/CLI for guest health, streaming exec, and file read/write operations.
 
 ## Quick start
 
@@ -33,8 +33,10 @@ typed database constraints are current.
 In another shell:
 
 ```sh
-cargo run -p sandboxwich-cli -- new --name demo
+cargo run -p sandboxwich-cli -- new --name demo --memory-limit 4g
 cargo run -p sandboxwich-cli -- list
+cargo run -p sandboxwich-cli -- cp <sandbox-id> ./local.txt /workspace/local.txt
+cargo run -p sandboxwich-cli -- cp <sandbox-id> /workspace/local.txt ./downloaded.txt --download
 cargo run -p sandboxwich-cli -- exec <sandbox-id> -- echo hello
 cargo run -p sandboxwich-cli -- ssh <sandbox-id>
 cargo run -p sandboxwich-cli -- prompt <sandbox-id> "inspect the repo"
@@ -55,7 +57,9 @@ Tune the API pool with `SANDBOXWICH_DATABASE_MAX_CONNECTIONS`.
 
 The API exposes `/healthz`, `/readyz`, and `/metrics`. Set `SANDBOXWICH_API_TOKEN` to require bearer auth on API and metrics requests; `/healthz` and `/readyz` remain probe-friendly for Kubernetes.
 
-Worker completions use typed result variants. Provider-created pods, PVCs, Services, and VolumeSnapshots are persisted as `runtime_resources` rows with constrained kind, purpose, and status columns; provider metadata is diagnostic compatibility data, not the durable source of runtime state.
+Sandbox create accepts typed memory tiers (`1g`, `4g`, `16g`, `64g`) and typed network egress policy. File upload/list/download state is persisted in SQL and command output chunks can carry typed file-citation annotations.
+
+Worker completions use typed result variants. Provider-created Pods, PVCs, Services, NetworkPolicies, and VolumeSnapshots are persisted as `runtime_resources` rows with constrained kind, purpose, and status columns; provider metadata is diagnostic compatibility data, not the durable source of runtime state. Runtime resources marked `deleted` were reconciled as missing or removed outside the cleanup path; resources marked `destroyed` were explicitly torn down by archived-sandbox cleanup. Kubernetes providers render deny-by-default egress, pod/container security contexts, resource requests/limits, and optional RuntimeClass isolation such as gVisor or Kata.
 
 ## Design principles
 

@@ -3,35 +3,39 @@ use std::{collections::BTreeMap, net::SocketAddr};
 use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::{Extension, Path, Request, State},
+    body::Bytes,
+    extract::{DefaultBodyLimit, Extension, Multipart, Path, Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Utc};
 use sandboxwich_core::{
     AppendCommandOutputRequest, ArchivedSandboxCleanupSkip, CapacityResponse, ClaimLeaseRequest,
     ClaimLeaseResponse, CleanupRun, CleanupRunId, CleanupRunStatus, CommandId, CommandListResponse,
-    CommandOutputChunk, CommandOutputChunkId, CommandOutputChunkResponse,
+    CommandOutputAnnotation, CommandOutputChunk, CommandOutputChunkId, CommandOutputChunkResponse,
     CommandOutputListResponse, CommandOutputStream, CommandRequest, CommandResponse, CommandRun,
     CommandStatus, CompleteLeaseRequest, CreateDesktopSessionRequest, CreateJobRequest,
     CreateSandboxRequest, CreateSnapshotRequest, DbVariant, DesktopAccess, DesktopAccessMode,
     DesktopAccessRequest, DesktopAccessResponse, DesktopSession, DesktopSessionId,
     DesktopSessionListResponse, DesktopSessionResponse, DesktopSessionStatus, ErrorEnvelope,
-    EventId, EventListResponse, FailLeaseRequest, GuestHealth, GuestHealthResponse, GuestStatus,
-    HealthComponent, HealthResponse, Job, JobId, JobKind, JobLease, JobListResponse, JobResponse,
-    JobStatus, LeaseId, LeaseResponse, LeaseStatus, PromptQueuedResponse, PromptRequest,
-    ProviderRuntimeResource, ReconcileRuntimeResourcesRequest, ReconcileRuntimeResourcesResponse,
-    RegisterWorkerRequest, RenewLeaseRequest, RequestSshKeyRequest, RuntimeResource,
-    RuntimeResourceId, RuntimeResourceKind, RuntimeResourceListResponse, RuntimeResourcePurpose,
-    RuntimeResourceStatus, Sandbox, SandboxEvent, SandboxEventKind, SandboxId, SandboxListResponse,
-    SandboxResponse, SandboxState, Snapshot, SnapshotCleanupResponse, SnapshotId,
-    SnapshotListResponse, SnapshotResponse, SnapshotStatus, SshAccess, SshAccessRequest,
-    SshAccessResponse, SshKey, SshKeyId, SshKeyListResponse, SshKeyResponse, SshKeyStatus,
-    UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest, Worker,
-    WorkerCapability, WorkerCapacity, WorkerHeartbeatRequest, WorkerId, WorkerJobResult,
-    WorkerListResponse, WorkerResponse, WorkerStatus,
+    EventId, EventListResponse, FailLeaseRequest, FileId, FileResponse, GuestHealth,
+    GuestHealthResponse, GuestStatus, HealthComponent, HealthResponse, Job, JobId, JobKind,
+    JobLease, JobListResponse, JobResponse, JobStatus, LeaseId, LeaseResponse, LeaseStatus,
+    ListFilesResponse, MAX_SANDBOX_FILE_BYTES, MemoryLimit, NetworkAllowRule, NetworkAllowRuleKind,
+    NetworkEgress, NetworkEgressMode, PromptQueuedResponse, PromptRequest, ProviderRuntimeResource,
+    ReconcileRuntimeResourcesRequest, ReconcileRuntimeResourcesResponse, RegisterWorkerRequest,
+    RenewLeaseRequest, RequestSshKeyRequest, RuntimeResource, RuntimeResourceId,
+    RuntimeResourceKind, RuntimeResourceListResponse, RuntimeResourcePurpose,
+    RuntimeResourceStatus, Sandbox, SandboxEvent, SandboxEventKind, SandboxFile, SandboxId,
+    SandboxListResponse, SandboxProvisionSpec, SandboxResponse, SandboxState, Snapshot,
+    SnapshotCleanupResponse, SnapshotId, SnapshotListResponse, SnapshotResponse, SnapshotStatus,
+    SshAccess, SshAccessRequest, SshAccessResponse, SshKey, SshKeyId, SshKeyListResponse,
+    SshKeyResponse, SshKeyStatus, UpdateDesktopSessionRequest, UpdateGuestHealthRequest,
+    UpdateSshKeyStatusRequest, Worker, WorkerCapability, WorkerCapacity, WorkerHeartbeatRequest,
+    WorkerId, WorkerJobResult, WorkerListResponse, WorkerResponse, WorkerStatus,
 };
 use serde_json::json;
 use sqlx::{
@@ -402,6 +406,27 @@ const DB_ENUM_COLUMNS: &[DbEnumColumn] = &[
         "invalid sandbox state",
     ),
     DbEnumColumn::new(
+        "sandboxes",
+        "memory_limit",
+        "sandboxes_memory_limit_check",
+        <MemoryLimit as DbVariant>::VALUES,
+        "invalid sandbox memory limit",
+    ),
+    DbEnumColumn::new(
+        "sandboxes",
+        "network_egress_mode",
+        "sandboxes_network_egress_mode_check",
+        <NetworkEgressMode as DbVariant>::VALUES,
+        "invalid sandbox network egress mode",
+    ),
+    DbEnumColumn::new(
+        "sandbox_network_egress_rules",
+        "kind",
+        "sandbox_network_egress_rules_kind_check",
+        <NetworkAllowRuleKind as DbVariant>::VALUES,
+        "invalid network allow rule kind",
+    ),
+    DbEnumColumn::new(
         "commands",
         "status",
         "commands_status_check",
@@ -704,6 +729,9 @@ mod tests {
 
         for expected in [
             ("sandboxes", "state"),
+            ("sandboxes", "memory_limit"),
+            ("sandboxes", "network_egress_mode"),
+            ("sandbox_network_egress_rules", "kind"),
             ("commands", "status"),
             ("command_output_chunks", "stream"),
             ("sandbox_events", "kind"),
@@ -790,6 +818,14 @@ fn app(state: AppState) -> Router {
         .route("/sandboxes", get(list_sandboxes).post(create_sandbox))
         .route("/sandboxes/{sandbox_id}", get(get_sandbox))
         .route(
+            "/sandboxes/{sandbox_id}/files",
+            get(list_files).post(upload_file),
+        )
+        .route(
+            "/sandboxes/{sandbox_id}/files/{file_id}",
+            get(download_file),
+        )
+        .route(
             "/sandboxes/{sandbox_id}/runtime-resources",
             get(list_runtime_resources),
         )
@@ -857,6 +893,10 @@ fn app(state: AppState) -> Router {
             post(create_ssh_access),
         )
         .route("/ssh-keys/{ssh_key_id}/status", post(update_ssh_key_status))
+        .layer(DefaultBodyLimit::max(
+            usize::try_from(MAX_SANDBOX_FILE_BYTES + 1024 * 1024)
+                .expect("file upload limit should fit usize"),
+        ))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, auth_and_tenant))
 }
@@ -1185,18 +1225,161 @@ async fn ensure_lease_tenant(
     Ok(lease)
 }
 
+fn provision_spec_from_request(
+    request: &CreateSandboxRequest,
+    parent: Option<&Sandbox>,
+) -> Result<SandboxProvisionSpec, ApiError> {
+    let memory_limit = request
+        .memory_limit
+        .clone()
+        .or_else(|| parent.map(|sandbox| sandbox.memory_limit.clone()))
+        .unwrap_or_default();
+    let network_egress = request
+        .network_egress
+        .clone()
+        .or_else(|| parent.map(|sandbox| sandbox.network_egress.clone()))
+        .unwrap_or_default();
+    validate_network_egress(&network_egress)?;
+    Ok(SandboxProvisionSpec {
+        memory_limit,
+        network_egress,
+    })
+}
+
+fn validate_network_egress(network_egress: &NetworkEgress) -> Result<(), ApiError> {
+    match network_egress {
+        NetworkEgress::DenyAll | NetworkEgress::AllowAll => Ok(()),
+        NetworkEgress::Allowlist { rules } => {
+            for rule in rules {
+                let value = rule.value.trim();
+                if value.is_empty() {
+                    return Err(ApiError::bad_request(
+                        "network allow rule value cannot be empty",
+                    ));
+                }
+                if value.len() > 253 {
+                    return Err(ApiError::bad_request(
+                        "network allow rule value is too long",
+                    ));
+                }
+                if rule.kind == NetworkAllowRuleKind::Cidr && !looks_like_cidr(value) {
+                    return Err(ApiError::bad_request(
+                        "cidr network allow rule must use CIDR notation",
+                    ));
+                }
+                if rule.kind == NetworkAllowRuleKind::Host {
+                    return Err(ApiError::bad_request(
+                        "host network allow rules require a provider with FQDN egress support; use cidr rules for Kubernetes NetworkPolicy",
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn looks_like_cidr(value: &str) -> bool {
+    let Some((address, prefix)) = value.split_once('/') else {
+        return false;
+    };
+    !address.trim().is_empty()
+        && prefix
+            .parse::<u8>()
+            .is_ok_and(|prefix| matches!(prefix, 0..=128))
+}
+
+const ALLOWED_FILE_MIME_TYPES: &[&str] = &[
+    "application/json",
+    "application/octet-stream",
+    "application/pdf",
+    "image/jpeg",
+    "image/png",
+    "text/csv",
+    "text/markdown",
+    "text/plain",
+    "text/x-python",
+    "text/x-rust",
+    "text/x-shellscript",
+];
+
+fn normalize_file_path(path: Option<String>) -> Result<String, ApiError> {
+    let path = path
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| ApiError::bad_request("file path is required"))?;
+    if path.contains('\0') {
+        return Err(ApiError::bad_request("file path cannot contain NUL"));
+    }
+    if path.len() > 1024 {
+        return Err(ApiError::bad_request("file path is too long"));
+    }
+    Ok(path)
+}
+
+fn normalize_mime_type(mime_type: Option<String>) -> Result<Option<String>, ApiError> {
+    let Some(mime_type) = mime_type else {
+        return Ok(Some("application/octet-stream".to_string()));
+    };
+    let mime_type = mime_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if mime_type.is_empty() {
+        return Ok(Some("application/octet-stream".to_string()));
+    }
+    if mime_type.len() > 128 {
+        return Err(ApiError::bad_request("mime_type is too long"));
+    }
+    Ok(Some(mime_type))
+}
+
+fn validate_file_mime_type(mime_type: Option<&str>) -> Result<(), ApiError> {
+    let Some(mime_type) = mime_type else {
+        return Ok(());
+    };
+    if ALLOWED_FILE_MIME_TYPES.contains(&mime_type) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(format!(
+            "unsupported mime_type {mime_type:?}"
+        )))
+    }
+}
+
+fn validate_file_size(size_bytes: u64) -> Result<(), ApiError> {
+    if size_bytes > MAX_SANDBOX_FILE_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "file exceeds maximum size of {MAX_SANDBOX_FILE_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn download_name(path: &str) -> String {
+    path.rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("sandbox-file")
+        .replace(['"', '\\'], "_")
+}
+
 async fn create_sandbox(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
     Json(request): Json<CreateSandboxRequest>,
 ) -> Result<Json<SandboxResponse>, ApiError> {
     let now = Utc::now();
+    let provision_spec = provision_spec_from_request(&request, None)?;
     let sandbox = Sandbox {
         id: SandboxId::new(),
         tenant_id: ctx.tenant_id.clone(),
         name: request.name.unwrap_or_else(|| "fresh-sandwich".to_string()),
         state: SandboxState::Ready,
         template: request.template.unwrap_or_else(|| "ubuntu-dev".to_string()),
+        memory_limit: provision_spec.memory_limit,
+        network_egress: provision_spec.network_egress,
         created_at: now,
         updated_at: now,
         ttl_seconds: request.ttl_seconds.or(Some(3600)),
@@ -1210,7 +1393,9 @@ async fn create_sandbox(
         SandboxEventKind::LifecycleChanged,
         json!({
             "state": sandbox.state,
-            "reason": "created"
+            "reason": "created",
+            "memoryLimit": sandbox.memory_limit,
+            "networkEgress": sandbox.network_egress
         }),
     )
     .await?;
@@ -1223,7 +1408,8 @@ async fn list_sandboxes(
     Extension(ctx): Extension<TenantContext>,
 ) -> Result<Json<SandboxListResponse>, ApiError> {
     let sql = format!(
-        "select id, tenant_id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id
+        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode,
+                created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where tenant_id = {}
          order by created_at asc",
@@ -1234,10 +1420,11 @@ async fn list_sandboxes(
         .fetch_all(&state.db.pool)
         .await?;
 
-    let sandboxes = rows
+    let mut sandboxes = rows
         .into_iter()
         .map(row_to_sandbox)
         .collect::<Result<Vec<_>, _>>()?;
+    hydrate_sandboxes_network_egress(&state.db, &mut sandboxes).await?;
 
     Ok(Json(SandboxListResponse {
         ok: true,
@@ -1252,6 +1439,116 @@ async fn get_sandbox(
 ) -> Result<Json<SandboxResponse>, ApiError> {
     let sandbox = ensure_sandbox_tenant(&state.db, SandboxId(sandbox_id), &ctx).await?;
     Ok(Json(SandboxResponse { ok: true, sandbox }))
+}
+
+async fn upload_file(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path(sandbox_id): Path<Uuid>,
+    mut multipart: Multipart,
+) -> Result<Json<FileResponse>, ApiError> {
+    let sandbox_id = SandboxId(sandbox_id);
+    ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
+
+    let mut path = None;
+    let mut mime_type = None;
+    let mut content = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request(format!("invalid multipart upload: {error}")))?
+    {
+        let name = field.name().unwrap_or_default().to_string();
+        match name.as_str() {
+            "path" => {
+                path = Some(field.text().await.map_err(|error| {
+                    ApiError::bad_request(format!("invalid multipart path field: {error}"))
+                })?);
+            }
+            "mime_type" => {
+                mime_type = Some(field.text().await.map_err(|error| {
+                    ApiError::bad_request(format!("invalid multipart mime_type field: {error}"))
+                })?);
+            }
+            "file" | "content" => {
+                if mime_type.is_none() {
+                    mime_type = field.content_type().map(ToOwned::to_owned);
+                }
+                if path.is_none() {
+                    path = field.file_name().map(ToOwned::to_owned);
+                }
+                content = Some(field.bytes().await.map_err(|error| {
+                    ApiError::bad_request(format!("invalid multipart file field: {error}"))
+                })?);
+            }
+            _ => {
+                let _ = field.bytes().await;
+            }
+        }
+    }
+
+    let path = normalize_file_path(path)?;
+    let content = content.ok_or_else(|| ApiError::bad_request("file part is required"))?;
+    validate_file_size(content.len() as u64)?;
+    let mime_type = normalize_mime_type(mime_type)?;
+    validate_file_mime_type(mime_type.as_deref())?;
+    let file =
+        upsert_sandbox_file(&state.db, sandbox_id, &path, mime_type.as_deref(), &content).await?;
+    insert_event(
+        &state.db,
+        sandbox_id,
+        SandboxEventKind::FileUploaded,
+        json!({
+            "fileId": file.id,
+            "path": file.path,
+            "sizeBytes": file.size_bytes,
+            "mimeType": file.mime_type
+        }),
+    )
+    .await?;
+
+    Ok(Json(FileResponse { ok: true, file }))
+}
+
+async fn list_files(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path(sandbox_id): Path<Uuid>,
+) -> Result<Json<ListFilesResponse>, ApiError> {
+    let sandbox_id = SandboxId(sandbox_id);
+    ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
+    let files = list_sandbox_files(&state.db, sandbox_id).await?;
+    Ok(Json(ListFilesResponse { ok: true, files }))
+}
+
+async fn download_file(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path((sandbox_id, file_id)): Path<(Uuid, Uuid)>,
+) -> Result<Response, ApiError> {
+    let sandbox_id = SandboxId(sandbox_id);
+    ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
+    let stored = fetch_sandbox_file(&state.db, sandbox_id, FileId(file_id)).await?;
+    let content_type = stored
+        .file
+        .mime_type
+        .as_deref()
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type),
+            (
+                header::CONTENT_DISPOSITION,
+                format!(
+                    "attachment; filename=\"{}\"",
+                    download_name(&stored.file.path)
+                ),
+            ),
+        ],
+        Bytes::from(stored.content),
+    )
+        .into_response())
 }
 
 async fn list_runtime_resources(
@@ -1305,6 +1602,7 @@ async fn fork_sandbox(
     Json(request): Json<CreateSandboxRequest>,
 ) -> Result<Json<SandboxResponse>, ApiError> {
     let parent = ensure_sandbox_tenant(&state.db, SandboxId(sandbox_id), &ctx).await?;
+    let provision_spec = provision_spec_from_request(&request, Some(&parent))?;
     let now = Utc::now();
     let snapshot = Snapshot {
         id: SnapshotId::new(),
@@ -1332,7 +1630,9 @@ async fn fork_sandbox(
             .name
             .unwrap_or_else(|| format!("{}-fork", parent.name)),
         state: SandboxState::Planning,
-        template: request.template.unwrap_or(parent.template),
+        template: request.template.unwrap_or_else(|| parent.template.clone()),
+        memory_limit: provision_spec.memory_limit,
+        network_egress: provision_spec.network_egress,
         created_at: now,
         updated_at: now,
         ttl_seconds: request.ttl_seconds.or(parent.ttl_seconds),
@@ -1348,7 +1648,9 @@ async fn fork_sandbox(
             "state": child.state,
             "reason": "fork_planned",
             "parentSandboxId": parent.id,
-            "parentSnapshotId": snapshot.id
+            "parentSnapshotId": snapshot.id,
+            "memoryLimit": child.memory_limit,
+            "networkEgress": child.network_egress
         }),
     )
     .await?;
@@ -1361,7 +1663,11 @@ async fn fork_sandbox(
             status: JobStatus::Queued,
             payload: json!({
                 "sandboxId": parent.id,
-                "snapshotId": snapshot.id
+                "snapshotId": snapshot.id,
+                "provisionSpec": SandboxProvisionSpec {
+                    memory_limit: parent.memory_limit.clone(),
+                    network_egress: parent.network_egress.clone(),
+                }
             }),
             required_capability: WorkerCapability::Snapshot,
             priority: 0,
@@ -1603,6 +1909,10 @@ async fn queue_command(
                 "argv": command.argv,
                 "cwd": command.cwd,
                 "env": env,
+                "provisionSpec": SandboxProvisionSpec {
+                    memory_limit: sandbox.memory_limit.clone(),
+                    network_egress: sandbox.network_egress.clone(),
+                }
             }),
             required_capability: WorkerCapability::RunCommand,
             priority: 0,
@@ -1963,7 +2273,7 @@ async fn create_job(
     Json(request): Json<CreateJobRequest>,
 ) -> Result<Json<JobResponse>, ApiError> {
     let now = Utc::now();
-    let job = Job {
+    let mut job = Job {
         id: JobId::new(),
         tenant_id: ctx.tenant_id.clone(),
         kind: request.kind,
@@ -1979,8 +2289,47 @@ async fn create_job(
         last_error: None,
     };
     validate_job_payload_tenant(&state.db, &job, &ctx).await?;
+    enrich_job_payload_with_provision_spec(&state.db, &mut job).await?;
     insert_job(&state.db, &job).await?;
     Ok(Json(JobResponse { ok: true, job }))
+}
+
+async fn enrich_job_payload_with_provision_spec(
+    db: &Database,
+    job: &mut Job,
+) -> Result<(), ApiError> {
+    match job.kind {
+        JobKind::ProvisionSandbox | JobKind::RunCommand => {
+            let sandbox = fetch_sandbox(db, sandbox_id_from_job(job)?).await?;
+            add_provision_spec_to_payload(job, &sandbox)?;
+        }
+        JobKind::ForkSandbox => {
+            let child = fetch_sandbox(db, child_sandbox_id_from_job(job)?).await?;
+            add_provision_spec_to_payload(job, &child)?;
+        }
+        JobKind::RunPrompt
+        | JobKind::CreateSnapshot
+        | JobKind::StopSandbox
+        | JobKind::ResumeSandbox => {}
+    }
+    Ok(())
+}
+
+fn add_provision_spec_to_payload(job: &mut Job, sandbox: &Sandbox) -> Result<(), ApiError> {
+    if job.payload.get("provisionSpec").is_some() {
+        return Ok(());
+    }
+    let Some(payload) = job.payload.as_object_mut() else {
+        return Err(ApiError::bad_request("job payload must be an object"));
+    };
+    payload.insert(
+        "provisionSpec".to_string(),
+        serde_json::to_value(SandboxProvisionSpec {
+            memory_limit: sandbox.memory_limit.clone(),
+            network_egress: sandbox.network_egress.clone(),
+        })?,
+    );
+    Ok(())
 }
 
 async fn validate_job_payload_tenant(
@@ -2086,11 +2435,39 @@ async fn update_guest_health(
         message: request.message,
     };
     upsert_guest_health(&state.db, &guest_health).await?;
+    maybe_insert_guest_failure_event(&state.db, &guest_health).await?;
 
     Ok(Json(GuestHealthResponse {
         ok: true,
         guest_health,
     }))
+}
+
+async fn maybe_insert_guest_failure_event(
+    db: &Database,
+    guest_health: &GuestHealth,
+) -> Result<(), ApiError> {
+    let reason = match &guest_health.status {
+        GuestStatus::Unhealthy => "guest_unhealthy",
+        GuestStatus::Unreachable => "guest_unreachable",
+        GuestStatus::Pending | GuestStatus::Ready | GuestStatus::Terminated => return Ok(()),
+    };
+
+    insert_event(
+        db,
+        guest_health.sandbox_id,
+        SandboxEventKind::DesktopExpired,
+        json!({
+            "reason": reason,
+            "guestStatus": &guest_health.status,
+            "agentVersion": &guest_health.agent_version,
+            "checks": &guest_health.checks,
+            "message": &guest_health.message,
+            "lastProbeAt": &guest_health.last_probe_at
+        }),
+    )
+    .await?;
+    Ok(())
 }
 
 async fn request_ssh_key(
@@ -2300,6 +2677,7 @@ async fn append_lease_output(
         sandbox_id,
         request.stream,
         request.chunk,
+        request.annotations,
     )
     .await?;
     Ok(Json(CommandOutputChunkResponse { ok: true, chunk }))
@@ -2536,7 +2914,8 @@ async fn set_sandbox_state_on_connection(
 
 async fn fetch_sandbox(db: &Database, sandbox_id: SandboxId) -> Result<Sandbox, ApiError> {
     let sql = format!(
-        "select id, tenant_id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id
+        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode,
+                created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where id = {}",
         db.placeholder(1)
@@ -2547,7 +2926,9 @@ async fn fetch_sandbox(db: &Database, sandbox_id: SandboxId) -> Result<Sandbox, 
         .await?
         .ok_or_else(|| ApiError::not_found("sandbox not found"))?;
 
-    row_to_sandbox(row)
+    let mut sandbox = row_to_sandbox(row)?;
+    hydrate_sandbox_network_egress(db, &mut sandbox).await?;
+    Ok(sandbox)
 }
 
 async fn fetch_sandbox_on_connection(
@@ -2556,7 +2937,8 @@ async fn fetch_sandbox_on_connection(
     sandbox_id: SandboxId,
 ) -> Result<Sandbox, ApiError> {
     let sql = format!(
-        "select id, tenant_id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id
+        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode,
+                created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where id = {}",
         db.placeholder(1)
@@ -2567,7 +2949,9 @@ async fn fetch_sandbox_on_connection(
         .await?
         .ok_or_else(|| ApiError::not_found("sandbox not found"))?;
 
-    row_to_sandbox(row)
+    let mut sandbox = row_to_sandbox(row)?;
+    hydrate_sandbox_network_egress_on_connection(db, connection, &mut sandbox).await?;
+    Ok(sandbox)
 }
 
 async fn ensure_sandbox_tenant_on_connection(
@@ -3081,7 +3465,7 @@ async fn mark_missing_runtime_resources_deleted_on_connection(
            and runtime_resources.namespace = {namespace_placeholder}
            and {cluster_filter}
            and sandboxes.tenant_id = {tenant_placeholder}
-           and runtime_resources.status != 'deleted'
+           and runtime_resources.status not in ('deleted', 'destroyed')
            {missing_filter}
          order by runtime_resources.resource_kind asc, runtime_resources.resource_name asc, runtime_resources.id asc"
     );
@@ -3108,6 +3492,7 @@ async fn mark_missing_runtime_resources_deleted_on_connection(
                 connection,
                 resource.id,
                 reconciled_at,
+                RuntimeResourceStatus::Deleted,
                 "missing from runtime resource reconcile observation",
             )
             .await?,
@@ -3122,6 +3507,7 @@ async fn mark_runtime_resource_deleted_on_connection(
     connection: &mut AnyConnection,
     resource_id: RuntimeResourceId,
     deleted_at: DateTime<Utc>,
+    status: RuntimeResourceStatus,
     error: &str,
 ) -> Result<RuntimeResource, ApiError> {
     let sql = format!(
@@ -3136,9 +3522,7 @@ async fn mark_runtime_resource_deleted_on_connection(
         db.placeholder(6)
     );
     let result = sqlx::query(&sql)
-        .bind(runtime_resource_status_to_str(
-            &RuntimeResourceStatus::Deleted,
-        ))
+        .bind(runtime_resource_status_to_str(&status))
         .bind(deleted_at.to_rfc3339())
         .bind(deleted_at.to_rfc3339())
         .bind(deleted_at.to_rfc3339())
@@ -3201,7 +3585,7 @@ async fn mark_runtime_resources_deleted_for_sandbox_on_connection(
                 runtime_image, service_port, target_port, source_snapshot_id, created_at,
                 updated_at, observed_at, last_reconciled_at, ready_at, deleted_at, error
          from runtime_resources
-         where sandbox_id = {} and status != 'deleted'
+         where sandbox_id = {} and status not in ('deleted', 'destroyed')
          order by updated_at asc, id asc",
         db.placeholder(1)
     );
@@ -3219,6 +3603,7 @@ async fn mark_runtime_resources_deleted_for_sandbox_on_connection(
                 connection,
                 resource.id,
                 deleted_at,
+                RuntimeResourceStatus::Destroyed,
                 error,
             )
             .await?,
@@ -3293,7 +3678,10 @@ fn deleted_at_for_runtime_resource(
     status: &RuntimeResourceStatus,
     now: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
-    if *status == RuntimeResourceStatus::Deleted {
+    if matches!(
+        status,
+        RuntimeResourceStatus::Deleted | RuntimeResourceStatus::Destroyed
+    ) {
         Some(now)
     } else {
         None
@@ -3322,6 +3710,171 @@ async fn fetch_runtime_resource(
     row_to_runtime_resource(row)
 }
 
+struct StoredSandboxFile {
+    file: SandboxFile,
+    content: Vec<u8>,
+}
+
+async fn upsert_sandbox_file(
+    db: &Database,
+    sandbox_id: SandboxId,
+    path: &str,
+    mime_type: Option<&str>,
+    content: &[u8],
+) -> Result<SandboxFile, ApiError> {
+    let mut tx = db.pool.begin().await?;
+    let upserted = async {
+        let now = Utc::now();
+        let existing_id = fetch_sandbox_file_id_by_path_on_connection(
+            db,
+            &mut *tx,
+            sandbox_id,
+            path,
+        )
+        .await?;
+        let file_id = existing_id.unwrap_or_else(FileId::new);
+        let content_base64 = general_purpose::STANDARD.encode(content);
+        let size_bytes = i64::try_from(content.len())
+            .map_err(|_| ApiError::bad_request("file is too large"))?;
+        if existing_id.is_some() {
+            let sql = format!(
+                "update sandbox_files
+                 set size_bytes = {}, mime_type = {}, content_base64 = {}, updated_at = {}
+                 where id = {}",
+                db.placeholder(1),
+                db.placeholder(2),
+                db.placeholder(3),
+                db.placeholder(4),
+                db.placeholder(5)
+            );
+            sqlx::query(&sql)
+                .bind(size_bytes)
+                .bind(mime_type)
+                .bind(content_base64)
+                .bind(now.to_rfc3339())
+                .bind(file_id.to_string())
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            let sql = format!(
+                "insert into sandbox_files
+                 (id, sandbox_id, path, size_bytes, mime_type, content_base64, created_at, updated_at)
+                 values ({})",
+                db.placeholders(8)
+            );
+            sqlx::query(&sql)
+                .bind(file_id.to_string())
+                .bind(sandbox_id.to_string())
+                .bind(path)
+                .bind(size_bytes)
+                .bind(mime_type)
+                .bind(content_base64)
+                .bind(now.to_rfc3339())
+                .bind(now.to_rfc3339())
+                .execute(&mut *tx)
+                .await?;
+        }
+        fetch_sandbox_file_metadata_on_connection(db, &mut *tx, sandbox_id, file_id).await
+    }
+    .await;
+    match upserted {
+        Ok(file) => {
+            tx.commit().await?;
+            Ok(file)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = tx.rollback().await {
+                tracing::warn!(%rollback_error, "failed to roll back sandbox file upsert");
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn fetch_sandbox_file_id_by_path_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    sandbox_id: SandboxId,
+    path: &str,
+) -> Result<Option<FileId>, ApiError> {
+    let sql = format!(
+        "select id from sandbox_files where sandbox_id = {} and path = {}",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    let row = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .bind(path)
+        .fetch_optional(&mut *connection)
+        .await?;
+    row.map(|row| {
+        let id: String = row.try_get("id")?;
+        Ok(FileId(parse_uuid(&id)?))
+    })
+    .transpose()
+}
+
+async fn list_sandbox_files(
+    db: &Database,
+    sandbox_id: SandboxId,
+) -> Result<Vec<SandboxFile>, ApiError> {
+    let sql = format!(
+        "select id, sandbox_id, path, size_bytes, mime_type, created_at, updated_at
+         from sandbox_files
+         where sandbox_id = {}
+         order by path asc, id asc",
+        db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .fetch_all(&db.pool)
+        .await?;
+    rows.into_iter().map(row_to_sandbox_file).collect()
+}
+
+async fn fetch_sandbox_file(
+    db: &Database,
+    sandbox_id: SandboxId,
+    file_id: FileId,
+) -> Result<StoredSandboxFile, ApiError> {
+    let sql = format!(
+        "select id, sandbox_id, path, size_bytes, mime_type, content_base64, created_at, updated_at
+         from sandbox_files
+         where sandbox_id = {} and id = {}",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    let row = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .bind(file_id.to_string())
+        .fetch_optional(&db.pool)
+        .await?
+        .ok_or_else(|| ApiError::not_found("file not found"))?;
+    row_to_stored_sandbox_file(row)
+}
+
+async fn fetch_sandbox_file_metadata_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    sandbox_id: SandboxId,
+    file_id: FileId,
+) -> Result<SandboxFile, ApiError> {
+    let sql = format!(
+        "select id, sandbox_id, path, size_bytes, mime_type, created_at, updated_at
+         from sandbox_files
+         where sandbox_id = {} and id = {}",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    let row = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .bind(file_id.to_string())
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| ApiError::not_found("file not found"))?;
+    row_to_sandbox_file(row)
+}
+
 async fn fetch_command(db: &Database, command_id: CommandId) -> Result<CommandRun, ApiError> {
     let sql = format!(
         "select id, sandbox_id, status, argv, cwd, exit_code, stdout, stderr, created_at, finished_at
@@ -3343,7 +3896,7 @@ async fn list_command_output_chunks(
     command_id: CommandId,
 ) -> Result<Vec<CommandOutputChunk>, ApiError> {
     let sql = format!(
-        "select id, command_id, stream, sequence, chunk, created_at
+        "select id, command_id, stream, sequence, chunk, annotations, created_at
          from command_output_chunks
          where command_id = {}
          order by created_at asc, id asc",
@@ -3362,10 +3915,17 @@ async fn append_command_output_chunk(
     sandbox_id: SandboxId,
     stream: CommandOutputStream,
     chunk: String,
+    annotations: Vec<CommandOutputAnnotation>,
 ) -> Result<CommandOutputChunk, ApiError> {
     let mut tx = db.pool.begin().await?;
     let appended = append_command_output_chunk_on_connection(
-        db, &mut *tx, command_id, sandbox_id, stream, chunk,
+        db,
+        &mut *tx,
+        command_id,
+        sandbox_id,
+        stream,
+        chunk,
+        annotations,
     )
     .await;
     match appended {
@@ -3389,6 +3949,7 @@ async fn append_command_output_chunk_on_connection(
     sandbox_id: SandboxId,
     stream: CommandOutputStream,
     chunk: String,
+    annotations: Vec<CommandOutputAnnotation>,
 ) -> Result<CommandOutputChunk, ApiError> {
     lock_command_output_for_append_on_connection(db, connection, command_id).await?;
     let sequence =
@@ -3400,12 +3961,13 @@ async fn append_command_output_chunk_on_connection(
         stream,
         sequence,
         chunk,
+        annotations,
         created_at: now,
     };
     let sql = format!(
-        "insert into command_output_chunks (id, command_id, stream, sequence, chunk, created_at)
+        "insert into command_output_chunks (id, command_id, stream, sequence, chunk, annotations, created_at)
          values ({})",
-        db.placeholders(6)
+        db.placeholders(7)
     );
     sqlx::query(&sql)
         .bind(output_chunk.id.to_string())
@@ -3413,6 +3975,7 @@ async fn append_command_output_chunk_on_connection(
         .bind(command_output_stream_to_str(&output_chunk.stream))
         .bind(count_to_i64(output_chunk.sequence)?)
         .bind(&output_chunk.chunk)
+        .bind(serde_json::to_string(&output_chunk.annotations)?)
         .bind(output_chunk.created_at.to_rfc3339())
         .execute(&mut *connection)
         .await?;
@@ -3792,11 +4355,44 @@ fn expires_at_from_ttl(
 }
 
 async fn insert_sandbox(db: &Database, sandbox: &Sandbox) -> Result<(), ApiError> {
+    validate_network_egress(&sandbox.network_egress)?;
+    let mut tx = db.pool.begin().await?;
+    let inserted = async {
+        insert_sandbox_on_connection(db, &mut *tx, sandbox).await?;
+        replace_sandbox_network_rules_on_connection(
+            db,
+            &mut *tx,
+            sandbox.id,
+            sandbox.network_egress.rules(),
+        )
+        .await
+    }
+    .await;
+    match inserted {
+        Ok(()) => {
+            tx.commit().await?;
+            Ok(())
+        }
+        Err(error) => {
+            if let Err(rollback_error) = tx.rollback().await {
+                tracing::warn!(%rollback_error, "failed to roll back sandbox insert");
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn insert_sandbox_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    sandbox: &Sandbox,
+) -> Result<(), ApiError> {
     let sql = format!(
         "insert into sandboxes
-         (id, tenant_id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id)
+         (id, tenant_id, name, state, template, memory_limit, network_egress_mode,
+          created_at, updated_at, ttl_seconds, parent_snapshot_id)
          values ({})",
-        db.placeholders(9)
+        db.placeholders(11)
     );
     sqlx::query(&sql)
         .bind(sandbox.id.to_string())
@@ -3804,6 +4400,8 @@ async fn insert_sandbox(db: &Database, sandbox: &Sandbox) -> Result<(), ApiError
         .bind(&sandbox.name)
         .bind(state_to_str(&sandbox.state))
         .bind(&sandbox.template)
+        .bind(memory_limit_to_str(&sandbox.memory_limit))
+        .bind(network_egress_mode_to_str(&sandbox.network_egress.mode()))
         .bind(sandbox.created_at.to_rfc3339())
         .bind(sandbox.updated_at.to_rfc3339())
         .bind(sandbox.ttl_seconds.map(|ttl| ttl as i64))
@@ -3812,8 +4410,42 @@ async fn insert_sandbox(db: &Database, sandbox: &Sandbox) -> Result<(), ApiError
                 .parent_snapshot_id
                 .map(|snapshot| snapshot.0.to_string()),
         )
-        .execute(&db.pool)
+        .execute(&mut *connection)
         .await?;
+    Ok(())
+}
+
+async fn replace_sandbox_network_rules_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    sandbox_id: SandboxId,
+    rules: &[NetworkAllowRule],
+) -> Result<(), ApiError> {
+    let delete_sql = format!(
+        "delete from sandbox_network_egress_rules where sandbox_id = {}",
+        db.placeholder(1)
+    );
+    sqlx::query(&delete_sql)
+        .bind(sandbox_id.to_string())
+        .execute(&mut *connection)
+        .await?;
+
+    for rule in rules {
+        let sql = format!(
+            "insert into sandbox_network_egress_rules (id, sandbox_id, kind, value, created_at)
+             values ({})",
+            db.placeholders(5)
+        );
+        sqlx::query(&sql)
+            .bind(EventId::new().to_string())
+            .bind(sandbox_id.to_string())
+            .bind(network_allow_rule_kind_to_str(&rule.kind))
+            .bind(&rule.value)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut *connection)
+            .await?;
+    }
+
     Ok(())
 }
 
@@ -4247,7 +4879,7 @@ async fn cleanup_runtime_resources_for_expired_snapshots(
                 runtime_resources.ready_at, runtime_resources.deleted_at, runtime_resources.error
          from runtime_resources
          join snapshots on snapshots.id = runtime_resources.snapshot_id
-         where snapshots.status = 'expired' and runtime_resources.status != 'deleted'
+         where snapshots.status = 'expired' and runtime_resources.status not in ('deleted', 'destroyed')
          order by runtime_resources.updated_at asc, runtime_resources.id asc",
     )
     .fetch_all(&db.pool)
@@ -4274,7 +4906,8 @@ async fn cleanup_archived_sandboxes(
     db: &Database,
 ) -> Result<ArchivedSandboxCleanupResult, ApiError> {
     let rows = sqlx::query(
-        "select id, tenant_id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id
+        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode,
+                created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where state = 'archived' and ttl_seconds is not null
          order by updated_at asc, id asc",
@@ -4287,7 +4920,8 @@ async fn cleanup_archived_sandboxes(
     let mut skipped = Vec::new();
     let mut runtime_resources_deleted = Vec::new();
     for row in rows {
-        let sandbox = row_to_sandbox(row)?;
+        let mut sandbox = row_to_sandbox(row)?;
+        hydrate_sandbox_network_egress(db, &mut sandbox).await?;
         let Some(ttl_seconds) = sandbox.ttl_seconds else {
             continue;
         };
@@ -5275,6 +5909,7 @@ async fn append_completion_output_on_connection(
             sandbox_id,
             stream,
             suffix.to_string(),
+            Vec::new(),
         )
         .await?;
         return Ok(());
@@ -5287,6 +5922,7 @@ async fn append_completion_output_on_connection(
         sandbox_id,
         stream,
         chunk.to_string(),
+        Vec::new(),
     )
     .await?;
     Ok(())
@@ -5707,6 +6343,7 @@ async fn apply_failed_job_on_connection(
                 sandbox_id,
                 CommandOutputStream::Stderr,
                 error.to_string(),
+                Vec::new(),
             )
             .await?;
             finish_command_from_lease_result_on_connection(
@@ -5842,7 +6479,8 @@ async fn queue_forks_waiting_on_snapshot_on_connection(
     parent_sandbox_id: SandboxId,
 ) -> Result<(), ApiError> {
     let sql = format!(
-        "select id, tenant_id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id
+        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode,
+                created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where parent_snapshot_id = {} and state = 'planning'
          order by created_at asc, id asc",
@@ -5854,7 +6492,8 @@ async fn queue_forks_waiting_on_snapshot_on_connection(
         .await?;
 
     for row in rows {
-        let child = row_to_sandbox(row)?;
+        let mut child = row_to_sandbox(row)?;
+        hydrate_sandbox_network_egress_on_connection(db, connection, &mut child).await?;
         let now = Utc::now();
         insert_job_on_connection(
             db,
@@ -5867,7 +6506,11 @@ async fn queue_forks_waiting_on_snapshot_on_connection(
                 payload: json!({
                     "parentSandboxId": parent_sandbox_id,
                     "childSandboxId": child.id,
-                    "snapshotId": snapshot_id
+                    "snapshotId": snapshot_id,
+                    "provisionSpec": SandboxProvisionSpec {
+                        memory_limit: child.memory_limit.clone(),
+                        network_egress: child.network_egress.clone(),
+                    }
                 }),
                 required_capability: WorkerCapability::Snapshot,
                 priority: 0,
@@ -5906,7 +6549,8 @@ async fn fail_sandboxes_waiting_on_snapshot_on_connection(
     error: &str,
 ) -> Result<(), ApiError> {
     let sql = format!(
-        "select id, tenant_id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id
+        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode,
+                created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where parent_snapshot_id = {} and state = 'planning'
          order by created_at asc, id asc",
@@ -5918,7 +6562,8 @@ async fn fail_sandboxes_waiting_on_snapshot_on_connection(
         .await?;
 
     for row in rows {
-        let child = row_to_sandbox(row)?;
+        let mut child = row_to_sandbox(row)?;
+        hydrate_sandbox_network_egress_on_connection(db, connection, &mut child).await?;
         let next_state = SandboxState::Error;
         set_sandbox_state_on_connection(
             db,
@@ -6128,10 +6773,17 @@ async fn insert_worker_heartbeat(
 fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
     let id: String = row.try_get("id")?;
     let state: String = row.try_get("state")?;
+    let memory_limit: String = row.try_get("memory_limit")?;
+    let network_egress_mode: String = row.try_get("network_egress_mode")?;
     let created_at: String = row.try_get("created_at")?;
     let updated_at: String = row.try_get("updated_at")?;
     let ttl_seconds: Option<i64> = row.try_get("ttl_seconds")?;
     let parent_snapshot_id: Option<String> = row.try_get("parent_snapshot_id")?;
+    let network_egress = match parse_network_egress_mode(&network_egress_mode)? {
+        NetworkEgressMode::DenyAll => NetworkEgress::DenyAll,
+        NetworkEgressMode::Allowlist => NetworkEgress::Allowlist { rules: Vec::new() },
+        NetworkEgressMode::AllowAll => NetworkEgress::AllowAll,
+    };
 
     Ok(Sandbox {
         id: SandboxId(parse_uuid(&id)?),
@@ -6139,12 +6791,123 @@ fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
         name: row.try_get("name")?,
         state: parse_state(&state)?,
         template: row.try_get("template")?,
+        memory_limit: parse_memory_limit(&memory_limit)?,
+        network_egress,
         created_at: parse_timestamp(&created_at)?,
         updated_at: parse_timestamp(&updated_at)?,
         ttl_seconds: ttl_seconds.map(|ttl| ttl as u64),
         parent_snapshot_id: parent_snapshot_id
             .map(|snapshot| parse_uuid(&snapshot).map(SnapshotId))
             .transpose()?,
+    })
+}
+
+async fn hydrate_sandboxes_network_egress(
+    db: &Database,
+    sandboxes: &mut [Sandbox],
+) -> Result<(), ApiError> {
+    for sandbox in sandboxes {
+        hydrate_sandbox_network_egress(db, sandbox).await?;
+    }
+    Ok(())
+}
+
+async fn hydrate_sandbox_network_egress(
+    db: &Database,
+    sandbox: &mut Sandbox,
+) -> Result<(), ApiError> {
+    if !matches!(sandbox.network_egress, NetworkEgress::Allowlist { .. }) {
+        return Ok(());
+    }
+    let rules = list_network_allow_rules(db, sandbox.id).await?;
+    sandbox.network_egress = NetworkEgress::Allowlist { rules };
+    Ok(())
+}
+
+async fn hydrate_sandbox_network_egress_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    sandbox: &mut Sandbox,
+) -> Result<(), ApiError> {
+    if !matches!(sandbox.network_egress, NetworkEgress::Allowlist { .. }) {
+        return Ok(());
+    }
+    let rules = list_network_allow_rules_on_connection(db, connection, sandbox.id).await?;
+    sandbox.network_egress = NetworkEgress::Allowlist { rules };
+    Ok(())
+}
+
+async fn list_network_allow_rules(
+    db: &Database,
+    sandbox_id: SandboxId,
+) -> Result<Vec<NetworkAllowRule>, ApiError> {
+    let sql = format!(
+        "select kind, value
+         from sandbox_network_egress_rules
+         where sandbox_id = {}
+         order by kind asc, value asc",
+        db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .fetch_all(&db.pool)
+        .await?;
+    rows.into_iter().map(row_to_network_allow_rule).collect()
+}
+
+async fn list_network_allow_rules_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    sandbox_id: SandboxId,
+) -> Result<Vec<NetworkAllowRule>, ApiError> {
+    let sql = format!(
+        "select kind, value
+         from sandbox_network_egress_rules
+         where sandbox_id = {}
+         order by kind asc, value asc",
+        db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .fetch_all(&mut *connection)
+        .await?;
+    rows.into_iter().map(row_to_network_allow_rule).collect()
+}
+
+fn row_to_network_allow_rule(row: AnyRow) -> Result<NetworkAllowRule, ApiError> {
+    let kind: String = row.try_get("kind")?;
+    Ok(NetworkAllowRule {
+        kind: parse_network_allow_rule_kind(&kind)?,
+        value: row.try_get("value")?,
+    })
+}
+
+fn row_to_sandbox_file(row: AnyRow) -> Result<SandboxFile, ApiError> {
+    let id: String = row.try_get("id")?;
+    let sandbox_id: String = row.try_get("sandbox_id")?;
+    let size_bytes: i64 = row.try_get("size_bytes")?;
+    let created_at: String = row.try_get("created_at")?;
+    let updated_at: String = row.try_get("updated_at")?;
+    Ok(SandboxFile {
+        id: FileId(parse_uuid(&id)?),
+        sandbox_id: SandboxId(parse_uuid(&sandbox_id)?),
+        path: row.try_get("path")?,
+        size_bytes: u64::try_from(size_bytes)
+            .map_err(|_| ApiError::internal("database contains invalid file size"))?,
+        mime_type: row.try_get("mime_type")?,
+        created_at: parse_timestamp(&created_at)?,
+        updated_at: parse_timestamp(&updated_at)?,
+    })
+}
+
+fn row_to_stored_sandbox_file(row: AnyRow) -> Result<StoredSandboxFile, ApiError> {
+    let content_base64: String = row.try_get("content_base64")?;
+    let content = general_purpose::STANDARD
+        .decode(content_base64)
+        .map_err(|_| ApiError::internal("database contains invalid file content"))?;
+    Ok(StoredSandboxFile {
+        file: row_to_sandbox_file(row)?,
+        content,
     })
 }
 
@@ -6383,6 +7146,7 @@ fn row_to_command_output_chunk(row: AnyRow) -> Result<CommandOutputChunk, ApiErr
     let command_id: String = row.try_get("command_id")?;
     let stream: String = row.try_get("stream")?;
     let sequence: i64 = row.try_get("sequence")?;
+    let annotations: String = row.try_get("annotations")?;
     let created_at: String = row.try_get("created_at")?;
 
     Ok(CommandOutputChunk {
@@ -6392,6 +7156,8 @@ fn row_to_command_output_chunk(row: AnyRow) -> Result<CommandOutputChunk, ApiErr
         sequence: u64::try_from(sequence)
             .map_err(|_| ApiError::internal("database contains invalid output sequence"))?,
         chunk: row.try_get("chunk")?,
+        annotations: serde_json::from_str(&annotations)
+            .map_err(|_| ApiError::internal("database contains invalid output annotations"))?,
         created_at: parse_timestamp(&created_at)?,
     })
 }
@@ -6451,6 +7217,33 @@ fn state_to_str(state: &SandboxState) -> &'static str {
 
 fn parse_state(value: &str) -> Result<SandboxState, ApiError> {
     parse_db_variant(value, "database contains invalid sandbox state")
+}
+
+fn memory_limit_to_str(memory_limit: &MemoryLimit) -> &'static str {
+    memory_limit.as_db_str()
+}
+
+fn parse_memory_limit(value: &str) -> Result<MemoryLimit, ApiError> {
+    parse_db_variant(value, "database contains invalid sandbox memory limit")
+}
+
+fn network_egress_mode_to_str(mode: &NetworkEgressMode) -> &'static str {
+    mode.as_db_str()
+}
+
+fn parse_network_egress_mode(value: &str) -> Result<NetworkEgressMode, ApiError> {
+    parse_db_variant(
+        value,
+        "database contains invalid sandbox network egress mode",
+    )
+}
+
+fn network_allow_rule_kind_to_str(kind: &NetworkAllowRuleKind) -> &'static str {
+    kind.as_db_str()
+}
+
+fn parse_network_allow_rule_kind(value: &str) -> Result<NetworkAllowRuleKind, ApiError> {
+    parse_db_variant(value, "database contains invalid network allow rule kind")
 }
 
 fn snapshot_status_to_str(status: &SnapshotStatus) -> &'static str {

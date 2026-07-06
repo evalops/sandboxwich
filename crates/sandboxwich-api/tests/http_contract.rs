@@ -7,14 +7,15 @@ use std::{
 use reqwest::StatusCode;
 use sandboxwich_core::{
     AgentCommandResult, AppendCommandOutputRequest, CapacityResponse, ClaimLeaseRequest,
-    ClaimLeaseResponse, CleanupRunStatus, CommandListResponse, CommandOutputListResponse,
-    CommandOutputStream, CommandRequest, CommandResponse, CommandStatus, CompleteLeaseRequest,
-    CreateDesktopSessionRequest, CreateJobRequest, CreateSandboxRequest, CreateSnapshotRequest,
-    DesktopAccessMode, DesktopAccessRequest, DesktopAccessResponse, DesktopSessionListResponse,
-    DesktopSessionResponse, DesktopSessionStatus, EventListResponse, FailLeaseRequest,
-    GuestHealthResponse, GuestStatus, HealthResponse, Job, JobKind, JobListResponse, JobResponse,
-    JobStatus, LeaseResponse, PromptQueuedResponse, PromptRequest, ProviderForkHandle,
-    ProviderRuntimeResource, ProviderSandboxHandle, ProviderSnapshotHandle,
+    ClaimLeaseResponse, CleanupRunStatus, CommandListResponse, CommandOutputAnnotation,
+    CommandOutputListResponse, CommandOutputStream, CommandRequest, CommandResponse, CommandStatus,
+    CompleteLeaseRequest, CreateDesktopSessionRequest, CreateJobRequest, CreateSandboxRequest,
+    CreateSnapshotRequest, DesktopAccessMode, DesktopAccessRequest, DesktopAccessResponse,
+    DesktopSessionListResponse, DesktopSessionResponse, DesktopSessionStatus, EventListResponse,
+    FailLeaseRequest, FileResponse, GuestHealthResponse, GuestStatus, HealthResponse, Job, JobKind,
+    JobListResponse, JobResponse, JobStatus, LeaseResponse, ListFilesResponse, MemoryLimit,
+    NetworkAllowRule, NetworkAllowRuleKind, NetworkEgress, PromptQueuedResponse, PromptRequest,
+    ProviderForkHandle, ProviderRuntimeResource, ProviderSandboxHandle, ProviderSnapshotHandle,
     ReconcileRuntimeResourcesRequest, ReconcileRuntimeResourcesResponse, RegisterWorkerRequest,
     RequestSshKeyRequest, RuntimeResourceKind, RuntimeResourceListResponse, RuntimeResourcePurpose,
     RuntimeResourceStatus, SandboxEventKind, SandboxListResponse, SandboxResponse, SandboxState,
@@ -119,6 +120,8 @@ async fn api_token_is_required_when_configured() {
         .json(&CreateSandboxRequest {
             name: Some("spoof-attempt".to_string()),
             template: None,
+            memory_limit: None,
+            network_egress: None,
             ttl_seconds: Some(120),
         })
         .send()
@@ -198,6 +201,8 @@ async fn run_contract(server: TestServer) {
         .json(&CreateSandboxRequest {
             name: Some("contract-test".to_string()),
             template: None,
+            memory_limit: None,
+            network_egress: None,
             ttl_seconds: Some(120),
         })
         .send()
@@ -209,6 +214,8 @@ async fn run_contract(server: TestServer) {
         .await
         .unwrap();
     assert_eq!(created.sandbox.name, "contract-test");
+    assert_eq!(created.sandbox.memory_limit, MemoryLimit::OneG);
+    assert_eq!(created.sandbox.network_egress, NetworkEgress::DenyAll);
     assert_database_rejects_invalid_typed_values(
         &server.database_url,
         &created.sandbox.id.to_string(),
@@ -216,6 +223,7 @@ async fn run_contract(server: TestServer) {
     .await;
     assert_eq!(created.sandbox.tenant_id, "default");
     assert_tenant_boundaries_are_enforced(&client, &server, &created).await;
+    let uploaded_file = assert_resource_tiers_and_file_contracts(&client, &server, &created).await;
     assert_metrics_are_exposed(&client, &server).await;
     assert_guest_health_and_ssh_key_lifecycle(&client, &server, &created).await;
 
@@ -334,6 +342,14 @@ async fn run_contract(server: TestServer) {
         .unwrap();
     let queued_job = job_for_command(&jobs.jobs, &command.command.id.to_string());
     assert_eq!(queued_job.status, JobStatus::Queued);
+    assert_eq!(
+        queued_job.payload["provisionSpec"]["memory_limit"],
+        serde_json::json!("1g")
+    );
+    assert_eq!(
+        queued_job.payload["provisionSpec"]["network_egress"]["mode"],
+        serde_json::json!("deny_all")
+    );
 
     let claimed: ClaimLeaseResponse = client
         .post(format!(
@@ -375,6 +391,12 @@ async fn run_contract(server: TestServer) {
         .json(&AppendCommandOutputRequest {
             stream: CommandOutputStream::Stdout,
             chunk: "hel".to_string(),
+            annotations: vec![CommandOutputAnnotation::ContainerFileCitation {
+                file_id: uploaded_file.file.id,
+                path: uploaded_file.file.path.clone(),
+                start_index: Some(0),
+                end_index: Some(3),
+            }],
         })
         .send()
         .await
@@ -385,11 +407,13 @@ async fn run_contract(server: TestServer) {
         .await
         .unwrap();
     assert_eq!(first_chunk.chunk.sequence, 1);
+    assert_eq!(first_chunk.chunk.annotations.len(), 1);
     let second_chunk: sandboxwich_core::CommandOutputChunkResponse = client
         .post(format!("{}/leases/{}/output", server.base_url, lease.id))
         .json(&AppendCommandOutputRequest {
             stream: CommandOutputStream::Stdout,
             chunk: "lo\n".to_string(),
+            annotations: Vec::new(),
         })
         .send()
         .await
@@ -415,6 +439,7 @@ async fn run_contract(server: TestServer) {
         .unwrap();
     assert_eq!(output_chunks.chunks.len(), 2);
     assert_eq!(output_chunks.chunks[0].chunk, "hel");
+    assert_eq!(output_chunks.chunks[0].annotations.len(), 1);
     assert_eq!(output_chunks.chunks[1].chunk, "lo\n");
 
     let second_command: CommandResponse = client
@@ -684,6 +709,8 @@ async fn assert_tenant_boundaries_are_enforced(
         .json(&CreateSandboxRequest {
             name: Some("tenant-b-sandbox".to_string()),
             template: None,
+            memory_limit: None,
+            network_egress: None,
             ttl_seconds: Some(120),
         })
         .send()
@@ -771,6 +798,179 @@ async fn assert_tenant_boundaries_are_enforced(
     );
 }
 
+async fn assert_resource_tiers_and_file_contracts(
+    client: &reqwest::Client,
+    server: &TestServer,
+    default_sandbox: &SandboxResponse,
+) -> FileResponse {
+    let sized: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("sized-contract".to_string()),
+            template: None,
+            memory_limit: Some(MemoryLimit::FourG),
+            network_egress: Some(NetworkEgress::Allowlist {
+                rules: vec![NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Cidr,
+                    value: "10.0.0.0/8".to_string(),
+                }],
+            }),
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sized.sandbox.memory_limit, MemoryLimit::FourG);
+    assert_eq!(
+        sized.sandbox.network_egress,
+        NetworkEgress::Allowlist {
+            rules: vec![NetworkAllowRule {
+                kind: NetworkAllowRuleKind::Cidr,
+                value: "10.0.0.0/8".to_string(),
+            }]
+        }
+    );
+
+    let host_allowlist = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("host-egress-contract".to_string()),
+            template: None,
+            memory_limit: Some(MemoryLimit::OneG),
+            network_egress: Some(NetworkEgress::Allowlist {
+                rules: vec![NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Host,
+                    value: "api.example.com".to_string(),
+                }],
+            }),
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(host_allowlist.status(), StatusCode::BAD_REQUEST);
+
+    let fetched: SandboxResponse = client
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, sized.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(fetched.sandbox.memory_limit, MemoryLimit::FourG);
+    assert_eq!(fetched.sandbox.network_egress, sized.sandbox.network_egress);
+
+    let invalid_tier = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .header("content-type", "application/json")
+        .body(r#"{"memory_limit":"2g"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert!(invalid_tier.status().is_client_error());
+
+    let form = reqwest::multipart::Form::new()
+        .text("path", "/workspace/hello.txt")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes("hello file\n".as_bytes().to_vec())
+                .file_name("hello.txt")
+                .mime_str("text/plain")
+                .unwrap(),
+        );
+    let uploaded: FileResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/files",
+            server.base_url, default_sandbox.sandbox.id
+        ))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(uploaded.file.path, "/workspace/hello.txt");
+    assert_eq!(uploaded.file.mime_type.as_deref(), Some("text/plain"));
+    assert_eq!(uploaded.file.size_bytes, "hello file\n".len() as u64);
+
+    let listed: ListFilesResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/files",
+            server.base_url, default_sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(listed.files.iter().any(|file| file.id == uploaded.file.id));
+
+    let downloaded = client
+        .get(format!(
+            "{}/sandboxes/{}/files/{}",
+            server.base_url, default_sandbox.sandbox.id, uploaded.file.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(&downloaded[..], b"hello file\n");
+
+    let bad_mime_form = reqwest::multipart::Form::new()
+        .text("path", "/workspace/nope.exe")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(vec![0, 1, 2])
+                .file_name("nope.exe")
+                .mime_str("application/x-msdownload")
+                .unwrap(),
+        );
+    let bad_mime = client
+        .post(format!(
+            "{}/sandboxes/{}/files",
+            server.base_url, default_sandbox.sandbox.id
+        ))
+        .multipart(bad_mime_form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_mime.status(), StatusCode::BAD_REQUEST);
+
+    let hidden = client
+        .get(format!(
+            "{}/sandboxes/{}/files",
+            server.base_url, default_sandbox.sandbox.id
+        ))
+        .header("x-sandboxwich-tenant", "tenant-b")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+
+    uploaded
+}
+
 async fn assert_metrics_are_exposed(client: &reqwest::Client, server: &TestServer) {
     let metrics = client
         .get(format!("{}/metrics", server.base_url))
@@ -834,6 +1034,74 @@ async fn assert_guest_health_and_ssh_key_lifecycle(
         .await
         .unwrap();
     assert_eq!(ready_health.guest_health.status, GuestStatus::Ready);
+
+    let unhealthy_health: GuestHealthResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/guest-health",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&UpdateGuestHealthRequest {
+            status: GuestStatus::Unhealthy,
+            agent_version: Some("sandboxwich-agent/test".to_string()),
+            checks: Some(serde_json::json!({
+                "exec": {"status": "failed"}
+            })),
+            message: Some("exec stream failed".to_string()),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(unhealthy_health.guest_health.status, GuestStatus::Unhealthy);
+
+    let health_events: EventListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/events",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(health_events.events.iter().any(|event| {
+        event.kind == SandboxEventKind::DesktopExpired
+            && event.data["reason"] == serde_json::json!("guest_unhealthy")
+    }));
+
+    let _: GuestHealthResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/guest-health",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&UpdateGuestHealthRequest {
+            status: GuestStatus::Ready,
+            agent_version: Some("sandboxwich-agent/test".to_string()),
+            checks: Some(serde_json::json!({
+                "exec": {"status": "ok"},
+                "ssh": {
+                    "host": "127.0.0.1",
+                    "port": 2222,
+                    "username": "ubuntu"
+                }
+            })),
+            message: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
 
     let requested_key: SshKeyResponse = client
         .post(format!(
@@ -1139,7 +1407,7 @@ async fn assert_runtime_resource_reconcile_marks_missing_resources_deleted(
         .unwrap();
 
     assert!(reconciled.ok);
-    assert_eq!(reconciled.upserted.len(), 3);
+    assert_eq!(reconciled.upserted.len(), 4);
     assert!(reconciled.upserted.iter().all(|resource| {
         resource.observed_at.is_some() && resource.last_reconciled_at.is_some()
     }));
@@ -1193,7 +1461,7 @@ async fn assert_runtime_resource_reconcile_marks_missing_resources_deleted(
         .json()
         .await
         .unwrap();
-    assert_eq!(edge_reconciled.upserted.len(), 4);
+    assert_eq!(edge_reconciled.upserted.len(), 5);
     assert!(
         edge_reconciled
             .upserted
@@ -1273,6 +1541,7 @@ async fn assert_retryable_failure_requeues_command(
         .json(&AppendCommandOutputRequest {
             stream: CommandOutputStream::Stdout,
             chunk: "partial".to_string(),
+            annotations: Vec::new(),
         })
         .send()
         .await
@@ -1967,6 +2236,8 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .json(&CreateSandboxRequest {
             name: Some("cleanup-me".to_string()),
             template: None,
+            memory_limit: None,
+            network_egress: None,
             ttl_seconds: Some(0),
         })
         .send()
@@ -2008,7 +2279,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
     );
     assert!(cleanup.runtime_resources_deleted.iter().any(|resource| {
         resource.sandbox_id == archived.sandbox.id
-            && resource.status == RuntimeResourceStatus::Deleted
+            && resource.status == RuntimeResourceStatus::Destroyed
     }));
     assert!(cleanup.cleanup_run.runtime_resources_deleted >= 1);
     let missing_archived = client
@@ -2029,6 +2300,8 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .json(&CreateSandboxRequest {
             name: Some("contract-child".to_string()),
             template: None,
+            memory_limit: None,
+            network_egress: None,
             ttl_seconds: Some(120),
         })
         .send()
@@ -2269,6 +2542,8 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .json(&CreateSandboxRequest {
             name: Some("failed-child".to_string()),
             template: None,
+            memory_limit: None,
+            network_egress: None,
             ttl_seconds: Some(120),
         })
         .send()
@@ -2461,6 +2736,13 @@ fn provision_resources(sandbox_id: sandboxwich_core::SandboxId) -> Vec<ProviderR
             RuntimeResourcePurpose::Desktop,
             format!("sandboxwich-desktop-{sandbox_id}"),
         ),
+        provider_resource(
+            sandbox_id,
+            None,
+            RuntimeResourceKind::NetworkPolicy,
+            RuntimeResourcePurpose::Network,
+            format!("sandboxwich-egress-{sandbox_id}"),
+        ),
     ]
 }
 
@@ -2536,6 +2818,7 @@ fn provider_resource(
             resource.service_port = Some(6080);
             resource.target_port = Some("desktop".to_string());
         }
+        RuntimeResourcePurpose::Network => {}
         RuntimeResourcePurpose::Snapshot => {}
     }
 
@@ -2652,6 +2935,8 @@ async fn assert_database_rejects_invalid_typed_values(database_url: &str, sandbo
         .bind("invalid")
         .bind("not_real")
         .bind("ubuntu-dev")
+        .bind("1g")
+        .bind("deny_all")
         .bind(now)
         .bind(now)
         .bind(120_i64)
@@ -2661,6 +2946,55 @@ async fn assert_database_rejects_invalid_typed_values(database_url: &str, sandbo
     assert!(
         sandbox_result.is_err(),
         "invalid sandbox state was accepted"
+    );
+
+    let invalid_memory_result = sqlx::query(&insert_sandbox_sql(database_url))
+        .bind(Uuid::now_v7().to_string())
+        .bind("invalid-memory")
+        .bind("ready")
+        .bind("ubuntu-dev")
+        .bind("2g")
+        .bind("deny_all")
+        .bind(now)
+        .bind(now)
+        .bind(120_i64)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await;
+    assert!(
+        invalid_memory_result.is_err(),
+        "invalid sandbox memory limit was accepted"
+    );
+
+    let invalid_network_result = sqlx::query(&insert_sandbox_sql(database_url))
+        .bind(Uuid::now_v7().to_string())
+        .bind("invalid-network")
+        .bind("ready")
+        .bind("ubuntu-dev")
+        .bind("1g")
+        .bind("sometimes")
+        .bind(now)
+        .bind(now)
+        .bind(120_i64)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await;
+    assert!(
+        invalid_network_result.is_err(),
+        "invalid sandbox network egress mode was accepted"
+    );
+
+    let invalid_network_rule_result = sqlx::query(&insert_network_allow_rule_sql(database_url))
+        .bind(Uuid::now_v7().to_string())
+        .bind(sandbox_id)
+        .bind("not_real")
+        .bind("10.0.0.0/8")
+        .bind(now)
+        .execute(&pool)
+        .await;
+    assert!(
+        invalid_network_rule_result.is_err(),
+        "invalid network allow rule kind was accepted"
     );
 
     let command_result = sqlx::query(&insert_command_sql(database_url))
@@ -2702,6 +3036,7 @@ async fn assert_database_rejects_invalid_typed_values(database_url: &str, sandbo
         .bind("not_real")
         .bind(0_i64)
         .bind("nope")
+        .bind("[]")
         .bind(now)
         .execute(&pool)
         .await;
@@ -3086,9 +3421,18 @@ async fn assert_database_rejects_invalid_typed_values(database_url: &str, sandbo
 fn insert_sandbox_sql(database_url: &str) -> String {
     format!(
         "insert into sandboxes
-         (id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id)
+         (id, name, state, template, memory_limit, network_egress_mode,
+          created_at, updated_at, ttl_seconds, parent_snapshot_id)
          values ({})",
-        placeholders(database_url, 8)
+        placeholders(database_url, 10)
+    )
+}
+
+fn insert_network_allow_rule_sql(database_url: &str) -> String {
+    format!(
+        "insert into sandbox_network_egress_rules (id, sandbox_id, kind, value, created_at)
+         values ({})",
+        placeholders(database_url, 5)
     )
 }
 
@@ -3104,9 +3448,9 @@ fn insert_command_sql(database_url: &str) -> String {
 fn insert_command_output_chunk_sql(database_url: &str) -> String {
     format!(
         "insert into command_output_chunks
-         (id, command_id, stream, sequence, chunk, created_at)
+         (id, command_id, stream, sequence, chunk, annotations, created_at)
          values ({})",
-        placeholders(database_url, 6)
+        placeholders(database_url, 7)
     )
 }
 
