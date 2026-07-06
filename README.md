@@ -96,7 +96,9 @@ The harness runs a warm-start benchmark, seeds realistic sandboxes, commands,
 events, workers, jobs, and runtime resources, then measures common HTTP paths.
 It also measures sandbox TTFT as create sandbox request start to the first
 persisted command-output chunk through a live API and live dry-run Kubernetes
-worker. CI uploads the same style of report as `sandboxwich-benchmark-report`.
+worker. The TTFT phase uses a fresh temporary SQLite database so seeded jobs do
+not pollute worker-claim timing. CI uploads the same style of report as
+`sandboxwich-benchmark-report`.
 
 Run just the sandbox TTFT path with:
 

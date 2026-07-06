@@ -875,6 +875,7 @@ fn app(state: AppState) -> Router {
             post(reconcile_runtime_resources),
         )
         .route("/jobs", get(list_jobs).post(create_job))
+        .route("/jobs/{job_id}", get(get_job))
         .route("/workers/{worker_id}/leases/claim", post(claim_lease))
         .route("/leases/{lease_id}/renew", post(renew_lease))
         .route("/leases/{lease_id}/output", post(append_lease_output))
@@ -2291,6 +2292,17 @@ async fn create_job(
     validate_job_payload_tenant(&state.db, &job, &ctx).await?;
     enrich_job_payload_with_provision_spec(&state.db, &mut job).await?;
     insert_job(&state.db, &job).await?;
+    Ok(Json(JobResponse { ok: true, job }))
+}
+
+async fn get_job(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path(job_id): Path<Uuid>,
+) -> Result<Json<JobResponse>, ApiError> {
+    expire_due_leases(&state.db).await?;
+    let job = fetch_job(&state.db, JobId(job_id)).await?;
+    ensure_job_tenant(&job, &ctx)?;
     Ok(Json(JobResponse { ok: true, job }))
 }
 

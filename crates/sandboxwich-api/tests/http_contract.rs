@@ -136,6 +136,76 @@ async fn api_token_is_required_when_configured() {
 }
 
 #[tokio::test]
+async fn job_can_be_fetched_by_id_with_tenant_isolation() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("sandboxwich-job-test.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = reqwest::Client::new();
+
+    let sandbox: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("job-fetch".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let job: JobResponse = client
+        .post(format!("{}/jobs", server.base_url))
+        .json(&CreateJobRequest {
+            kind: JobKind::ProvisionSandbox,
+            payload: serde_json::json!({
+                "sandboxId": sandbox.sandbox.id
+            }),
+            required_capability: WorkerCapability::ProvisionSandbox,
+            priority: None,
+            max_attempts: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let fetched: JobResponse = client
+        .get(format!("{}/jobs/{}", server.base_url, job.job.id))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(fetched.job.id, job.job.id);
+    assert_eq!(fetched.job.status, JobStatus::Queued);
+
+    let hidden = client
+        .get(format!("{}/jobs/{}", server.base_url, job.job.id))
+        .header("x-sandboxwich-tenant", "tenant-b")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn migrate_command_prepares_database_for_no_auto_migrate_server() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!(

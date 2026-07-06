@@ -1,4 +1,5 @@
 use std::{
+    fs::{self, File},
     net::{SocketAddr, TcpListener},
     path::PathBuf,
     process::{Child, Command, Stdio},
@@ -14,7 +15,7 @@ use chrono::Utc;
 use reqwest::StatusCode;
 use sandboxwich_core::{
     CapacityResponse, CommandOutputListResponse, CommandRequest, CommandResponse, CommandStatus,
-    CreateJobRequest, CreateSandboxRequest, JobId, JobKind, JobListResponse, JobStatus, SandboxId,
+    CreateJobRequest, CreateSandboxRequest, JobId, JobKind, JobResponse, JobStatus, SandboxId,
     SandboxResponse, WorkerCapability,
 };
 use serde::de::DeserializeOwned;
@@ -343,7 +344,7 @@ async fn run_all(mut options: AllOptions) -> anyhow::Result<()> {
     })
     .await?;
     server.stop();
-    let _ = std::fs::remove_file(db_path);
+    let _ = fs::remove_file(db_path);
 
     let sandbox_ttft = if options.ttft_runs == 0 {
         None
@@ -402,6 +403,7 @@ fn run_api_command(api_bin: &PathBuf, command: &str, database_url: &str) -> anyh
 struct ApiProcess {
     child: Child,
     base_url: String,
+    stderr_path: PathBuf,
 }
 
 impl ApiProcess {
@@ -411,6 +413,9 @@ impl ApiProcess {
         auto_migrate: bool,
     ) -> anyhow::Result<Self> {
         let addr = free_addr()?;
+        let stderr_path = process_log_path("api");
+        let stderr = File::create(&stderr_path)
+            .with_context(|| format!("failed to create {}", stderr_path.display()))?;
         let mut child = Command::new(api_bin)
             .env("SANDBOXWICH_DATABASE_URL", database_url)
             .env("SANDBOXWICH_BIND", addr.to_string())
@@ -419,18 +424,28 @@ impl ApiProcess {
                 if auto_migrate { "true" } else { "false" },
             )
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr))
             .spawn()
             .with_context(|| format!("failed to start {}", api_bin.display()))?;
 
         let base_url = format!("http://{addr}");
-        wait_for_health(&base_url, &mut child).await?;
-        Ok(Self { child, base_url })
+        if let Err(error) = wait_for_health(&base_url, &mut child, &stderr_path).await {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&stderr_path);
+            return Err(error);
+        }
+        Ok(Self {
+            child,
+            base_url,
+            stderr_path,
+        })
     }
 
     fn stop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = fs::remove_file(&self.stderr_path);
     }
 }
 
@@ -442,10 +457,14 @@ impl Drop for ApiProcess {
 
 struct WorkerProcess {
     child: Child,
+    stderr_path: PathBuf,
 }
 
 impl WorkerProcess {
     async fn start(worker_bin: &PathBuf, api_url: &str) -> anyhow::Result<Self> {
+        let stderr_path = process_log_path("worker");
+        let stderr = File::create(&stderr_path)
+            .with_context(|| format!("failed to create {}", stderr_path.display()))?;
         let child = Command::new(worker_bin)
             .arg("--api")
             .arg(api_url)
@@ -463,15 +482,18 @@ impl WorkerProcess {
             .arg("--max-concurrent-jobs")
             .arg("1")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr))
             .spawn()
             .with_context(|| format!("failed to start {}", worker_bin.display()))?;
-        Ok(Self { child })
+        Ok(Self { child, stderr_path })
     }
 
     fn ensure_running(&mut self) -> anyhow::Result<()> {
         if let Some(status) = self.child.try_wait()? {
-            bail!("worker exited before benchmark completed: {status}");
+            bail!(
+                "worker exited before benchmark completed: {status}\nstderr:\n{}",
+                process_stderr(&self.stderr_path)
+            );
         }
         Ok(())
     }
@@ -479,6 +501,7 @@ impl WorkerProcess {
     fn stop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = fs::remove_file(&self.stderr_path);
     }
 }
 
@@ -488,7 +511,32 @@ impl Drop for WorkerProcess {
     }
 }
 
-async fn wait_for_health(base_url: &str, child: &mut Child) -> anyhow::Result<()> {
+fn process_log_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "sandboxwich-bench-{name}-{}.stderr.log",
+        Uuid::now_v7()
+    ))
+}
+
+fn process_stderr(path: &PathBuf) -> String {
+    let stderr = fs::read_to_string(path).unwrap_or_else(|error| {
+        format!(
+            "failed to read process stderr at {}: {error}",
+            path.display()
+        )
+    });
+    if stderr.trim().is_empty() {
+        "(empty)".to_string()
+    } else {
+        stderr
+    }
+}
+
+async fn wait_for_health(
+    base_url: &str,
+    child: &mut Child,
+    stderr_path: &PathBuf,
+) -> anyhow::Result<()> {
     let client = reqwest::Client::new();
     for _ in 0..700 {
         if client
@@ -500,11 +548,17 @@ async fn wait_for_health(base_url: &str, child: &mut Child) -> anyhow::Result<()
             return Ok(());
         }
         if let Some(status) = child.try_wait()? {
-            bail!("api exited before becoming healthy: {status}");
+            bail!(
+                "api exited before becoming healthy: {status}\nstderr:\n{}",
+                process_stderr(stderr_path)
+            );
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    bail!("api did not become healthy");
+    bail!(
+        "api did not become healthy\nstderr:\n{}",
+        process_stderr(stderr_path)
+    );
 }
 
 fn free_addr() -> anyhow::Result<SocketAddr> {
@@ -599,7 +653,7 @@ async fn benchmark_sandbox_ttft(options: &SandboxTtftOptions) -> anyhow::Result<
 
     worker.stop();
     server.stop();
-    let _ = std::fs::remove_file(db_path);
+    let _ = fs::remove_file(db_path);
 
     Ok(SandboxTtftReport { samples })
 }
@@ -748,20 +802,16 @@ async fn wait_for_job_status(
             bail!("job {job_id} did not reach {expected:?} within {timeout:?}");
         }
 
-        let jobs = get_json::<JobListResponse>(
+        let response = get_json::<JobResponse>(
             client,
-            &format!("{}/jobs", base_url.trim_end_matches('/')),
+            &format!("{}/jobs/{job_id}", base_url.trim_end_matches('/')),
         )
         .await?;
-        let job = jobs
-            .jobs
-            .into_iter()
-            .find(|job| job.id == job_id)
-            .with_context(|| format!("job {job_id} disappeared from list"))?;
+        let job = response.job;
         if job.status == expected {
             return Ok(());
         }
-        if matches!(&job.status, JobStatus::Failed | JobStatus::Dead) && job.status != expected {
+        if matches!(&job.status, JobStatus::Failed | JobStatus::Dead) {
             bail!(
                 "job {job_id} reached terminal status {:?}: {}",
                 job.status,
@@ -908,7 +958,8 @@ impl SandboxTtftReport {
         format!(
             "## {name}\n\n\
              Measurement: create sandbox request start -> first command output chunk observed. \
-             Worker mode: Kubernetes dry-run; no cluster mutation.\n\n\
+             Worker mode: Kubernetes dry-run; no cluster mutation. \
+             Database: fresh temporary SQLite database.\n\n\
              | phase | samples | mean | p50 | p95 | p99 | min | max |\n\
              |---|---:|---:|---:|---:|---:|---:|---:|\n\
              {total_row}\
