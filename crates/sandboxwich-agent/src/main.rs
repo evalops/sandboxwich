@@ -435,6 +435,7 @@ where
     R: AsyncRead + Unpin,
 {
     let mut captured = Vec::new();
+    let mut stream_decoder = Utf8StreamDecoder::default();
     let mut buffer = [0_u8; 8192];
     loop {
         let count = reader.read(&mut buffer).await?;
@@ -448,14 +449,9 @@ where
             CommandOutputStream::Stderr => tokio::io::stderr().write_all(chunk).await?,
         }
         if let (Some(client), Some(api), Some(lease_id)) = (&client, &api, lease_id) {
-            if let Err(error) = append_output_chunk(
-                client,
-                api,
-                lease_id,
-                stream.clone(),
-                String::from_utf8_lossy(chunk).into_owned(),
-            )
-            .await
+            let decoded_chunk = stream_decoder.push(chunk);
+            if let Err(error) =
+                append_output_chunk(client, api, lease_id, stream.clone(), decoded_chunk).await
             {
                 let warning =
                     format!("sandboxwich-agent: failed to stream output chunk: {error}\n");
@@ -463,7 +459,67 @@ where
             }
         }
     }
+    if let (Some(client), Some(api), Some(lease_id)) = (&client, &api, lease_id) {
+        if let Err(error) =
+            append_output_chunk(client, api, lease_id, stream, stream_decoder.finish()).await
+        {
+            let warning = format!("sandboxwich-agent: failed to flush output chunk: {error}\n");
+            let _ = tokio::io::stderr().write_all(warning.as_bytes()).await;
+        }
+    }
     Ok(captured)
+}
+
+#[derive(Default)]
+struct Utf8StreamDecoder {
+    pending: Vec<u8>,
+}
+
+impl Utf8StreamDecoder {
+    fn push(&mut self, chunk: &[u8]) -> String {
+        self.pending.extend_from_slice(chunk);
+        let mut output = String::new();
+
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(text) => {
+                    output.push_str(text);
+                    self.pending.clear();
+                    break;
+                }
+                Err(error) => {
+                    let valid_up_to = error.valid_up_to();
+                    if valid_up_to > 0 {
+                        let text = std::str::from_utf8(&self.pending[..valid_up_to])
+                            .expect("valid_up_to prefix must be valid UTF-8");
+                        output.push_str(text);
+                    }
+
+                    if let Some(error_len) = error.error_len() {
+                        output.push_str(
+                            &String::from_utf8_lossy(
+                                &self.pending[valid_up_to..valid_up_to + error_len],
+                            )
+                            .into_owned(),
+                        );
+                        self.pending.drain(..valid_up_to + error_len);
+                        continue;
+                    }
+
+                    self.pending = self.pending[valid_up_to..].to_vec();
+                    break;
+                }
+            }
+        }
+
+        output
+    }
+
+    fn finish(&mut self) -> String {
+        let output = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        output
+    }
 }
 
 async fn append_output_chunk(
@@ -559,4 +615,38 @@ fn parse_env(value: &str) -> Result<(String, String), String> {
         return Err("env var key cannot be empty".to_string());
     }
     Ok((key.to_string(), value.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utf8_stream_decoder_preserves_split_multibyte_characters() {
+        let mut decoder = Utf8StreamDecoder::default();
+
+        assert_eq!(decoder.push("snow: ".as_bytes()), "snow: ");
+        assert_eq!(decoder.push(&[0xE2, 0x98]), "");
+        assert_eq!(decoder.push(&[0x83, b'\n']), "☃\n");
+        assert_eq!(decoder.finish(), "");
+    }
+
+    #[test]
+    fn utf8_stream_decoder_flushes_incomplete_suffix_lossily() {
+        let mut decoder = Utf8StreamDecoder::default();
+
+        assert_eq!(decoder.push(b"prefix "), "prefix ");
+        assert_eq!(decoder.push(&[0xF0, 0x9F]), "");
+        assert_eq!(decoder.finish(), "\u{FFFD}");
+    }
+
+    #[test]
+    fn utf8_stream_decoder_recovers_after_invalid_bytes() {
+        let mut decoder = Utf8StreamDecoder::default();
+
+        assert_eq!(decoder.push(&[b'a', 0xFF, b'b']), "a\u{FFFD}b");
+        assert_eq!(decoder.push(&[0xF0, 0x9F]), "");
+        assert_eq!(decoder.push(&[0x8D, 0x95]), "🍕");
+        assert_eq!(decoder.finish(), "");
+    }
 }
