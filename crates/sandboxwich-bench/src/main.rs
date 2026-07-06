@@ -349,6 +349,7 @@ async fn run_all(mut options: AllOptions) -> anyhow::Result<()> {
     let sandbox_ttft = if options.ttft_runs == 0 {
         None
     } else {
+        // TTFT uses a fresh DB so seeded benchmark data cannot affect worker claim timing.
         Some(
             benchmark_sandbox_ttft(&SandboxTtftOptions {
                 api_bin: options.api_bin.clone(),
