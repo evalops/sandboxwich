@@ -1581,7 +1581,7 @@ async fn assert_retryable_failure_requeues_command(
     sandbox: &SandboxResponse,
     worker: &WorkerResponse,
 ) {
-    let command: CommandResponse = client
+    let command: QueueCommandResponse = client
         .post(format!(
             "{}/sandboxes/{}/commands",
             server.base_url, sandbox.sandbox.id
@@ -1599,6 +1599,8 @@ async fn assert_retryable_failure_requeues_command(
         .json()
         .await
         .unwrap();
+    assert_eq!(command.queued_job.sandbox_id, sandbox.sandbox.id);
+    assert_eq!(command.queued_job.command_id, command.command.id);
 
     let claimed: ClaimLeaseResponse = client
         .post(format!(
@@ -1617,6 +1619,7 @@ async fn assert_retryable_failure_requeues_command(
         .await
         .unwrap();
     let lease = claimed.lease.expect("expected retry test lease");
+    assert_eq!(lease.job.id, command.queued_job.id);
     client
         .post(format!("{}/leases/{}/output", server.base_url, lease.id))
         .json(&AppendCommandOutputRequest {
@@ -1718,7 +1721,7 @@ async fn assert_expired_lease_requeues_command(
     sandbox: &SandboxResponse,
     worker: &WorkerResponse,
 ) {
-    let command: CommandResponse = client
+    let command: QueueCommandResponse = client
         .post(format!(
             "{}/sandboxes/{}/commands",
             server.base_url, sandbox.sandbox.id
@@ -1736,6 +1739,8 @@ async fn assert_expired_lease_requeues_command(
         .json()
         .await
         .unwrap();
+    assert_eq!(command.queued_job.sandbox_id, sandbox.sandbox.id);
+    assert_eq!(command.queued_job.command_id, command.command.id);
 
     let claimed: ClaimLeaseResponse = client
         .post(format!(
@@ -1753,7 +1758,8 @@ async fn assert_expired_lease_requeues_command(
         .json()
         .await
         .unwrap();
-    assert!(claimed.lease.is_some());
+    let lease = claimed.lease.expect("expected expiring lease");
+    assert_eq!(lease.job.id, command.queued_job.id);
 
     let jobs: JobListResponse = client
         .get(format!("{}/jobs", server.base_url))
