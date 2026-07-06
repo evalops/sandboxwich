@@ -26,16 +26,17 @@ use sandboxwich_core::{
     JobLease, JobListResponse, JobResponse, JobStatus, LeaseId, LeaseResponse, LeaseStatus,
     ListFilesResponse, MAX_SANDBOX_FILE_BYTES, MemoryLimit, NetworkAllowRule, NetworkAllowRuleKind,
     NetworkEgress, NetworkEgressMode, PromptQueuedResponse, PromptRequest, ProviderRuntimeResource,
-    ReconcileRuntimeResourcesRequest, ReconcileRuntimeResourcesResponse, RegisterWorkerRequest,
-    RenewLeaseRequest, RequestSshKeyRequest, RuntimeResource, RuntimeResourceId,
-    RuntimeResourceKind, RuntimeResourceListResponse, RuntimeResourcePurpose,
-    RuntimeResourceStatus, Sandbox, SandboxEvent, SandboxEventKind, SandboxFile, SandboxId,
-    SandboxListResponse, SandboxProvisionSpec, SandboxResponse, SandboxState, Snapshot,
-    SnapshotCleanupResponse, SnapshotId, SnapshotListResponse, SnapshotResponse, SnapshotStatus,
-    SshAccess, SshAccessRequest, SshAccessResponse, SshKey, SshKeyId, SshKeyListResponse,
-    SshKeyResponse, SshKeyStatus, UpdateDesktopSessionRequest, UpdateGuestHealthRequest,
-    UpdateSshKeyStatusRequest, Worker, WorkerCapability, WorkerCapacity, WorkerHeartbeatRequest,
-    WorkerId, WorkerJobResult, WorkerListResponse, WorkerResponse, WorkerStatus,
+    QueueCommandResponse, QueuedCommandJob, ReconcileRuntimeResourcesRequest,
+    ReconcileRuntimeResourcesResponse, RegisterWorkerRequest, RenewLeaseRequest,
+    RequestSshKeyRequest, RuntimeResource, RuntimeResourceId, RuntimeResourceKind,
+    RuntimeResourceListResponse, RuntimeResourcePurpose, RuntimeResourceStatus, Sandbox,
+    SandboxEvent, SandboxEventKind, SandboxFile, SandboxId, SandboxListResponse,
+    SandboxProvisionSpec, SandboxResponse, SandboxState, Snapshot, SnapshotCleanupResponse,
+    SnapshotId, SnapshotListResponse, SnapshotResponse, SnapshotStatus, SshAccess,
+    SshAccessRequest, SshAccessResponse, SshKey, SshKeyId, SshKeyListResponse, SshKeyResponse,
+    SshKeyStatus, UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest,
+    Worker, WorkerCapability, WorkerCapacity, WorkerHeartbeatRequest, WorkerId, WorkerJobResult,
+    WorkerListResponse, WorkerResponse, WorkerStatus,
 };
 use serde_json::json;
 use sqlx::{
@@ -1873,7 +1874,7 @@ async fn queue_command(
     Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
     Json(request): Json<CommandRequest>,
-) -> Result<Json<CommandResponse>, ApiError> {
+) -> Result<Json<QueueCommandResponse>, ApiError> {
     if request.argv.is_empty() {
         return Err(ApiError::bad_request("argv must contain at least one item"));
     }
@@ -1934,10 +1935,18 @@ async fn queue_command(
         }),
     )
     .await?;
-    Ok(Json(CommandResponse {
+    let command_id = command.id;
+    Ok(Json(QueueCommandResponse {
         ok: true,
         command,
-        job: Some(job),
+        queued_job: QueuedCommandJob {
+            id: job.id,
+            sandbox_id,
+            command_id,
+            kind: JobKind::RunCommand,
+            status: JobStatus::Queued,
+            required_capability: WorkerCapability::RunCommand,
+        },
     }))
 }
 
@@ -1975,11 +1984,7 @@ async fn get_command(
 ) -> Result<Json<CommandResponse>, ApiError> {
     let command = fetch_command(&state.db, CommandId(command_id)).await?;
     ensure_sandbox_tenant(&state.db, command.sandbox_id, &ctx).await?;
-    Ok(Json(CommandResponse {
-        ok: true,
-        command,
-        job: None,
-    }))
+    Ok(Json(CommandResponse { ok: true, command }))
 }
 
 async fn list_command_output(

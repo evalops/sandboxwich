@@ -16,13 +16,14 @@ use sandboxwich_core::{
     JobListResponse, JobResponse, JobStatus, LeaseResponse, ListFilesResponse, MemoryLimit,
     NetworkAllowRule, NetworkAllowRuleKind, NetworkEgress, PromptQueuedResponse, PromptRequest,
     ProviderForkHandle, ProviderRuntimeResource, ProviderSandboxHandle, ProviderSnapshotHandle,
-    ReconcileRuntimeResourcesRequest, ReconcileRuntimeResourcesResponse, RegisterWorkerRequest,
-    RequestSshKeyRequest, RuntimeResourceKind, RuntimeResourceListResponse, RuntimeResourcePurpose,
-    RuntimeResourceStatus, SandboxEventKind, SandboxListResponse, SandboxResponse, SandboxState,
-    SnapshotCleanupResponse, SnapshotId, SnapshotListResponse, SnapshotResponse, SnapshotStatus,
-    SshAccessRequest, SshAccessResponse, SshKeyListResponse, SshKeyResponse, SshKeyStatus,
-    UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest,
-    WorkerCapability, WorkerHeartbeatRequest, WorkerJobResult, WorkerListResponse, WorkerResponse,
+    QueueCommandResponse, ReconcileRuntimeResourcesRequest, ReconcileRuntimeResourcesResponse,
+    RegisterWorkerRequest, RequestSshKeyRequest, RuntimeResourceKind, RuntimeResourceListResponse,
+    RuntimeResourcePurpose, RuntimeResourceStatus, SandboxEventKind, SandboxListResponse,
+    SandboxResponse, SandboxState, SnapshotCleanupResponse, SnapshotId, SnapshotListResponse,
+    SnapshotResponse, SnapshotStatus, SshAccessRequest, SshAccessResponse, SshKeyListResponse,
+    SshKeyResponse, SshKeyStatus, UpdateDesktopSessionRequest, UpdateGuestHealthRequest,
+    UpdateSshKeyStatusRequest, WorkerCapability, WorkerHeartbeatRequest, WorkerJobResult,
+    WorkerListResponse, WorkerResponse,
 };
 use sqlx::any::AnyPoolOptions;
 use tempfile::TempDir;
@@ -379,7 +380,7 @@ async fn run_contract(server: TestServer) {
             .any(|sandbox| sandbox.id == created.sandbox.id)
     );
 
-    let command: CommandResponse = client
+    let command: QueueCommandResponse = client
         .post(format!(
             "{}/sandboxes/{}/commands",
             server.base_url, created.sandbox.id
@@ -399,10 +400,9 @@ async fn run_contract(server: TestServer) {
         .unwrap();
     assert_eq!(command.command.argv, ["echo", "hello"]);
     assert_eq!(command.command.status, CommandStatus::Queued);
-    let command_job = command
-        .job
-        .as_ref()
-        .expect("queue command response should include RunCommand job");
+    let command_job = &command.queued_job;
+    assert_eq!(command_job.sandbox_id, created.sandbox.id);
+    assert_eq!(command_job.command_id, command.command.id);
     assert_eq!(command_job.kind, JobKind::RunCommand);
     assert_eq!(command_job.status, JobStatus::Queued);
     assert_eq!(
@@ -1782,7 +1782,6 @@ async fn assert_expired_lease_requeues_command(
         .await
         .unwrap();
     assert_eq!(fetched.command.status, CommandStatus::Queued);
-    assert!(fetched.job.is_none());
 }
 
 async fn assert_prompt_job_lifecycle(

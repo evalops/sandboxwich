@@ -15,10 +15,10 @@ use chrono::Utc;
 use reqwest::StatusCode;
 use sandboxwich_core::{
     CapacityResponse, CommandId, CommandOutputListResponse, CommandRequest, CommandResponse,
-    CommandStatus, CreateJobRequest, CreateSandboxRequest, Job, JobId, JobKind, JobResponse,
-    JobStatus, SandboxId, SandboxResponse, WorkerCapability,
+    CommandStatus, CreateJobRequest, CreateSandboxRequest, JobId, JobKind, JobResponse, JobStatus,
+    QueueCommandResponse, QueuedCommandJob, SandboxId, SandboxResponse, WorkerCapability,
 };
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
 use sqlx::{AnyPool, any::AnyPoolOptions};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -201,13 +201,17 @@ impl Args {
             }),
             Some("--help") | Some("-h") => {
                 println!(
-                    "usage: sandboxwich-bench [all|startup|http|sandbox-ttft|seed]\n\
-                     examples:\n\
-                       sandboxwich-bench all --api-bin target/debug/sandboxwich-api --worker-bin target/debug/sandboxwich-worker\n\
-                     sandboxwich-bench startup --database-url sqlite:///tmp/bench.db\n\
-                     sandboxwich-bench http --api-url http://127.0.0.1:3217 --path /readyz\n\
-                       sandboxwich-bench sandbox-ttft --api-bin target/debug/sandboxwich-api --worker-bin target/debug/sandboxwich-worker\n\
-                     sandboxwich-bench seed --database-url sqlite:///tmp/bench.db"
+                    "{}",
+                    [
+                        "usage: sandboxwich-bench [all|startup|http|sandbox-ttft|seed]",
+                        "examples:",
+                        "  sandboxwich-bench all --api-bin target/debug/sandboxwich-api --worker-bin target/debug/sandboxwich-worker",
+                        "  sandboxwich-bench startup --database-url sqlite:///tmp/bench.db",
+                        "  sandboxwich-bench http --api-url http://127.0.0.1:3217 --path /readyz",
+                        "  sandboxwich-bench sandbox-ttft --api-bin target/debug/sandboxwich-api --worker-bin target/debug/sandboxwich-worker",
+                        "  sandboxwich-bench seed --database-url sqlite:///tmp/bench.db",
+                    ]
+                    .join("\n")
                 );
                 std::process::exit(0);
             }
@@ -706,7 +710,7 @@ async fn run_sandbox_ttft_once(
     let provision_ready = started.elapsed();
 
     let started = Instant::now();
-    let command: CommandResponse = post_json(
+    let command: QueueCommandResponse = post_json(
         client
             .post(format!(
                 "{}/sandboxes/{sandbox_id}/commands",
@@ -719,13 +723,7 @@ async fn run_sandbox_ttft_once(
             }),
     )
     .await?;
-    let command_job = command.job.as_ref().with_context(|| {
-        format!(
-            "command {} response did not include its RunCommand job",
-            command.command.id
-        )
-    })?;
-    ensure_run_command_job_contract(command_job, sandbox_id, command.command.id)?;
+    ensure_run_command_job_contract(&command.queued_job, sandbox_id, command.command.id)?;
     let queue_command = started.elapsed();
 
     let started = Instant::now();
@@ -769,15 +767,8 @@ async fn create_provision_job(
     .await
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RunCommandJobPayload {
-    sandbox_id: SandboxId,
-    command_id: CommandId,
-}
-
 fn ensure_run_command_job_contract(
-    job: &Job,
+    job: &QueuedCommandJob,
     sandbox_id: SandboxId,
     command_id: CommandId,
 ) -> anyhow::Result<()> {
@@ -802,26 +793,18 @@ fn ensure_run_command_job_contract(
             job.status
         );
     }
-
-    let payload: RunCommandJobPayload =
-        serde_json::from_value(job.payload.clone()).with_context(|| {
-            format!(
-                "run command job {} payload does not match command IDs",
-                job.id
-            )
-        })?;
-    if payload.sandbox_id != sandbox_id {
+    if job.sandbox_id != sandbox_id {
         bail!(
             "run command job {} points at sandbox {}, expected {sandbox_id}",
             job.id,
-            payload.sandbox_id
+            job.sandbox_id
         );
     }
-    if payload.command_id != command_id {
+    if job.command_id != command_id {
         bail!(
             "run command job {} points at command {}, expected {command_id}",
             job.id,
-            payload.command_id
+            job.command_id
         );
     }
 
@@ -1405,33 +1388,19 @@ mod tests {
     fn run_command_job_contract_is_validated_from_queue_response() {
         let sandbox_id = SandboxId::new();
         let command_id = CommandId::new();
-        let now = Utc::now();
-        let mut job = Job {
+        let mut job = QueuedCommandJob {
             id: JobId::new(),
-            tenant_id: "default".to_string(),
+            sandbox_id,
+            command_id,
             kind: JobKind::RunCommand,
             status: JobStatus::Queued,
-            payload: serde_json::json!({
-                "sandboxId": sandbox_id,
-                "commandId": command_id
-            }),
             required_capability: WorkerCapability::RunCommand,
-            priority: 0,
-            attempts: 0,
-            max_attempts: 3,
-            scheduled_at: now,
-            created_at: now,
-            updated_at: now,
-            last_error: None,
         };
 
         ensure_run_command_job_contract(&job, sandbox_id, command_id)
             .expect("matching job contract should pass");
 
-        job.payload = serde_json::json!({
-            "sandboxId": sandbox_id,
-            "commandId": CommandId::new()
-        });
+        job.command_id = CommandId::new();
         assert!(ensure_run_command_job_contract(&job, sandbox_id, command_id).is_err());
     }
 

@@ -974,8 +974,23 @@ pub struct CommandRun {
 pub struct CommandResponse {
     pub ok: bool,
     pub command: CommandRun,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub job: Option<Job>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueuedCommandJob {
+    pub id: JobId,
+    pub sandbox_id: SandboxId,
+    pub command_id: CommandId,
+    pub kind: JobKind,
+    pub status: JobStatus,
+    pub required_capability: WorkerCapability,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueueCommandResponse {
+    pub ok: bool,
+    pub command: CommandRun,
+    pub queued_job: QueuedCommandJob,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
