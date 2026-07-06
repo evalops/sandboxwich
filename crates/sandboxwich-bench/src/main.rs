@@ -14,11 +14,11 @@ use anyhow::{Context, bail};
 use chrono::Utc;
 use reqwest::StatusCode;
 use sandboxwich_core::{
-    CapacityResponse, CommandOutputListResponse, CommandRequest, CommandResponse, CommandStatus,
-    CreateJobRequest, CreateSandboxRequest, JobId, JobKind, JobResponse, JobStatus, SandboxId,
-    SandboxResponse, WorkerCapability,
+    CapacityResponse, CommandId, CommandOutputListResponse, CommandRequest, CommandResponse,
+    CommandStatus, CreateJobRequest, CreateSandboxRequest, Job, JobId, JobKind, JobResponse,
+    JobStatus, SandboxId, SandboxResponse, WorkerCapability,
 };
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, de::DeserializeOwned};
 use sqlx::{AnyPool, any::AnyPoolOptions};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -499,6 +499,10 @@ impl WorkerProcess {
         Ok(())
     }
 
+    fn stderr(&self) -> String {
+        process_stderr(&self.stderr_path)
+    }
+
     fn stop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -715,6 +719,13 @@ async fn run_sandbox_ttft_once(
             }),
     )
     .await?;
+    let command_job = command.job.as_ref().with_context(|| {
+        format!(
+            "command {} response did not include its RunCommand job",
+            command.command.id
+        )
+    })?;
+    ensure_run_command_job_contract(command_job, sandbox_id, command.command.id)?;
     let queue_command = started.elapsed();
 
     let started = Instant::now();
@@ -758,6 +769,65 @@ async fn create_provision_job(
     .await
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunCommandJobPayload {
+    sandbox_id: SandboxId,
+    command_id: CommandId,
+}
+
+fn ensure_run_command_job_contract(
+    job: &Job,
+    sandbox_id: SandboxId,
+    command_id: CommandId,
+) -> anyhow::Result<()> {
+    if job.kind != JobKind::RunCommand {
+        bail!(
+            "command {command_id} queued {:?} job {}, expected RunCommand",
+            job.kind,
+            job.id
+        );
+    }
+    if job.required_capability != WorkerCapability::RunCommand {
+        bail!(
+            "command {command_id} queued job {} with {:?} capability, expected RunCommand",
+            job.id,
+            job.required_capability
+        );
+    }
+    if job.status != JobStatus::Queued {
+        bail!(
+            "command {command_id} queued job {} with {:?} status, expected Queued",
+            job.id,
+            job.status
+        );
+    }
+
+    let payload: RunCommandJobPayload =
+        serde_json::from_value(job.payload.clone()).with_context(|| {
+            format!(
+                "run command job {} payload does not match command IDs",
+                job.id
+            )
+        })?;
+    if payload.sandbox_id != sandbox_id {
+        bail!(
+            "run command job {} points at sandbox {}, expected {sandbox_id}",
+            job.id,
+            payload.sandbox_id
+        );
+    }
+    if payload.command_id != command_id {
+        bail!(
+            "run command job {} points at command {}, expected {command_id}",
+            job.id,
+            payload.command_id
+        );
+    }
+
+    Ok(())
+}
+
 async fn wait_for_worker_capacity(
     client: &reqwest::Client,
     base_url: &str,
@@ -766,10 +836,15 @@ async fn wait_for_worker_capacity(
     poll_interval: Duration,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
+    let mut last_capacity_error = None;
     loop {
         worker.ensure_running()?;
         if started.elapsed() > timeout {
-            bail!("worker did not report available capacity within {timeout:?}");
+            bail!(
+                "worker did not report available capacity within {timeout:?}\nlast capacity error: {}\nstderr:\n{}",
+                last_capacity_error.unwrap_or_else(|| "none".to_string()),
+                worker.stderr()
+            );
         }
 
         let capacity = get_json::<CapacityResponse>(
@@ -777,9 +852,14 @@ async fn wait_for_worker_capacity(
             &format!("{}/capacity", base_url.trim_end_matches('/')),
         )
         .await;
-        if let Ok(capacity) = capacity {
-            if capacity.total_available_slots > 0 {
-                return Ok(());
+        match capacity {
+            Ok(capacity) => {
+                if capacity.total_available_slots > 0 {
+                    return Ok(());
+                }
+            }
+            Err(error) => {
+                last_capacity_error = Some(error.to_string());
             }
         }
 
@@ -1319,6 +1399,40 @@ mod tests {
         assert_eq!(options.runs, 3);
         assert_eq!(options.poll_interval, Duration::from_millis(7));
         assert_eq!(options.timeout, Duration::from_millis(1234));
+    }
+
+    #[test]
+    fn run_command_job_contract_is_validated_from_queue_response() {
+        let sandbox_id = SandboxId::new();
+        let command_id = CommandId::new();
+        let now = Utc::now();
+        let mut job = Job {
+            id: JobId::new(),
+            tenant_id: "default".to_string(),
+            kind: JobKind::RunCommand,
+            status: JobStatus::Queued,
+            payload: serde_json::json!({
+                "sandboxId": sandbox_id,
+                "commandId": command_id
+            }),
+            required_capability: WorkerCapability::RunCommand,
+            priority: 0,
+            attempts: 0,
+            max_attempts: 3,
+            scheduled_at: now,
+            created_at: now,
+            updated_at: now,
+            last_error: None,
+        };
+
+        ensure_run_command_job_contract(&job, sandbox_id, command_id)
+            .expect("matching job contract should pass");
+
+        job.payload = serde_json::json!({
+            "sandboxId": sandbox_id,
+            "commandId": CommandId::new()
+        });
+        assert!(ensure_run_command_job_contract(&job, sandbox_id, command_id).is_err());
     }
 
     #[test]

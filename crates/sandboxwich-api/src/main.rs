@@ -1896,36 +1896,34 @@ async fn queue_command(
         finished_at: None,
     };
 
+    let job = Job {
+        id: JobId::new(),
+        tenant_id: sandbox.tenant_id,
+        kind: JobKind::RunCommand,
+        status: JobStatus::Queued,
+        payload: json!({
+            "sandboxId": sandbox_id,
+            "commandId": command.id,
+            "argv": command.argv,
+            "cwd": command.cwd,
+            "env": env,
+            "provisionSpec": SandboxProvisionSpec {
+                memory_limit: sandbox.memory_limit.clone(),
+                network_egress: sandbox.network_egress.clone(),
+            }
+        }),
+        required_capability: WorkerCapability::RunCommand,
+        priority: 0,
+        attempts: 0,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+    };
+
     insert_command(&state.db, &command).await?;
-    insert_job(
-        &state.db,
-        &Job {
-            id: JobId::new(),
-            tenant_id: sandbox.tenant_id,
-            kind: JobKind::RunCommand,
-            status: JobStatus::Queued,
-            payload: json!({
-                "sandboxId": sandbox_id,
-                "commandId": command.id,
-                "argv": command.argv,
-                "cwd": command.cwd,
-                "env": env,
-                "provisionSpec": SandboxProvisionSpec {
-                    memory_limit: sandbox.memory_limit.clone(),
-                    network_egress: sandbox.network_egress.clone(),
-                }
-            }),
-            required_capability: WorkerCapability::RunCommand,
-            priority: 0,
-            attempts: 0,
-            max_attempts: 3,
-            scheduled_at: now,
-            created_at: now,
-            updated_at: now,
-            last_error: None,
-        },
-    )
-    .await?;
+    insert_job(&state.db, &job).await?;
     insert_event(
         &state.db,
         sandbox_id,
@@ -1936,7 +1934,11 @@ async fn queue_command(
         }),
     )
     .await?;
-    Ok(Json(CommandResponse { ok: true, command }))
+    Ok(Json(CommandResponse {
+        ok: true,
+        command,
+        job: Some(job),
+    }))
 }
 
 async fn list_commands(
@@ -1973,7 +1975,11 @@ async fn get_command(
 ) -> Result<Json<CommandResponse>, ApiError> {
     let command = fetch_command(&state.db, CommandId(command_id)).await?;
     ensure_sandbox_tenant(&state.db, command.sandbox_id, &ctx).await?;
-    Ok(Json(CommandResponse { ok: true, command }))
+    Ok(Json(CommandResponse {
+        ok: true,
+        command,
+        job: None,
+    }))
 }
 
 async fn list_command_output(
@@ -2300,7 +2306,6 @@ async fn get_job(
     Extension(ctx): Extension<TenantContext>,
     Path(job_id): Path<Uuid>,
 ) -> Result<Json<JobResponse>, ApiError> {
-    expire_due_leases(&state.db).await?;
     let job = fetch_job(&state.db, JobId(job_id)).await?;
     ensure_job_tenant(&job, &ctx)?;
     Ok(Json(JobResponse { ok: true, job }))

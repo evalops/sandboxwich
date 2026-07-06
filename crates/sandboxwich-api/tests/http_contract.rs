@@ -7,7 +7,7 @@ use std::{
 use reqwest::StatusCode;
 use sandboxwich_core::{
     AgentCommandResult, AppendCommandOutputRequest, CapacityResponse, ClaimLeaseRequest,
-    ClaimLeaseResponse, CleanupRunStatus, CommandListResponse, CommandOutputAnnotation,
+    ClaimLeaseResponse, CleanupRunStatus, CommandId, CommandListResponse, CommandOutputAnnotation,
     CommandOutputListResponse, CommandOutputStream, CommandRequest, CommandResponse, CommandStatus,
     CompleteLeaseRequest, CreateDesktopSessionRequest, CreateJobRequest, CreateSandboxRequest,
     CreateSnapshotRequest, DesktopAccessMode, DesktopAccessRequest, DesktopAccessResponse,
@@ -399,6 +399,16 @@ async fn run_contract(server: TestServer) {
         .unwrap();
     assert_eq!(command.command.argv, ["echo", "hello"]);
     assert_eq!(command.command.status, CommandStatus::Queued);
+    let command_job = command
+        .job
+        .as_ref()
+        .expect("queue command response should include RunCommand job");
+    assert_eq!(command_job.kind, JobKind::RunCommand);
+    assert_eq!(command_job.status, JobStatus::Queued);
+    assert_eq!(
+        command_job.required_capability,
+        WorkerCapability::RunCommand
+    );
 
     let jobs: JobListResponse = client
         .get(format!("{}/jobs", server.base_url))
@@ -410,7 +420,8 @@ async fn run_contract(server: TestServer) {
         .json()
         .await
         .unwrap();
-    let queued_job = job_for_command(&jobs.jobs, &command.command.id.to_string());
+    let queued_job = job_for_command(&jobs.jobs, command.command.id);
+    assert_eq!(queued_job.id, command_job.id);
     assert_eq!(queued_job.status, JobStatus::Queued);
     assert_eq!(
         queued_job.payload["provisionSpec"]["memory_limit"],
@@ -1754,7 +1765,7 @@ async fn assert_expired_lease_requeues_command(
         .json()
         .await
         .unwrap();
-    let expired_job = job_for_command(&jobs.jobs, &command.command.id.to_string());
+    let expired_job = job_for_command(&jobs.jobs, command.command.id);
     assert_eq!(expired_job.status, JobStatus::Queued);
 
     let fetched: CommandResponse = client
@@ -1771,6 +1782,7 @@ async fn assert_expired_lease_requeues_command(
         .await
         .unwrap();
     assert_eq!(fetched.command.status, CommandStatus::Queued);
+    assert!(fetched.job.is_none());
 }
 
 async fn assert_prompt_job_lifecycle(
@@ -2694,13 +2706,16 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
     assert_eq!(failed_child.sandbox.state, SandboxState::Error);
 }
 
-fn job_for_command(jobs: &[Job], command_id: &str) -> Job {
+fn job_for_command(jobs: &[Job], command_id: CommandId) -> Job {
     jobs.iter()
         .find(|job| {
-            job.payload
-                .get("commandId")
-                .and_then(|value| value.as_str())
-                == Some(command_id)
+            job.kind == JobKind::RunCommand
+                && job
+                    .payload
+                    .get("commandId")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<CommandId>(value).ok())
+                    == Some(command_id)
         })
         .cloned()
         .expect("expected command job")

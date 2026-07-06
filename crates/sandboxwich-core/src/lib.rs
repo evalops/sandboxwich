@@ -974,6 +974,8 @@ pub struct CommandRun {
 pub struct CommandResponse {
     pub ok: bool,
     pub command: CommandRun,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<Job>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

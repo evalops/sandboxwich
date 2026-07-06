@@ -28,3 +28,5 @@
   dry-run Kubernetes worker, split into create, provision, command queue, and
   first-output phases.
 - Jobs can now be fetched directly with `GET /jobs/{job_id}`.
+- Command queue responses now include the created `RunCommand` job so clients can
+  verify worker handoff without inferring it from later output.
