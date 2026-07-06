@@ -26,16 +26,17 @@ use sandboxwich_core::{
     JobLease, JobListResponse, JobResponse, JobStatus, LeaseId, LeaseResponse, LeaseStatus,
     ListFilesResponse, MAX_SANDBOX_FILE_BYTES, MemoryLimit, NetworkAllowRule, NetworkAllowRuleKind,
     NetworkEgress, NetworkEgressMode, PromptQueuedResponse, PromptRequest, ProviderRuntimeResource,
-    ReconcileRuntimeResourcesRequest, ReconcileRuntimeResourcesResponse, RegisterWorkerRequest,
-    RenewLeaseRequest, RequestSshKeyRequest, RuntimeResource, RuntimeResourceId,
-    RuntimeResourceKind, RuntimeResourceListResponse, RuntimeResourcePurpose,
-    RuntimeResourceStatus, Sandbox, SandboxEvent, SandboxEventKind, SandboxFile, SandboxId,
-    SandboxListResponse, SandboxProvisionSpec, SandboxResponse, SandboxState, Snapshot,
-    SnapshotCleanupResponse, SnapshotId, SnapshotListResponse, SnapshotResponse, SnapshotStatus,
-    SshAccess, SshAccessRequest, SshAccessResponse, SshKey, SshKeyId, SshKeyListResponse,
-    SshKeyResponse, SshKeyStatus, UpdateDesktopSessionRequest, UpdateGuestHealthRequest,
-    UpdateSshKeyStatusRequest, Worker, WorkerCapability, WorkerCapacity, WorkerHeartbeatRequest,
-    WorkerId, WorkerJobResult, WorkerListResponse, WorkerResponse, WorkerStatus,
+    QueueCommandResponse, QueuedCommandJob, ReconcileRuntimeResourcesRequest,
+    ReconcileRuntimeResourcesResponse, RegisterWorkerRequest, RenewLeaseRequest,
+    RequestSshKeyRequest, RuntimeResource, RuntimeResourceId, RuntimeResourceKind,
+    RuntimeResourceListResponse, RuntimeResourcePurpose, RuntimeResourceStatus, Sandbox,
+    SandboxEvent, SandboxEventKind, SandboxFile, SandboxId, SandboxListResponse,
+    SandboxProvisionSpec, SandboxResponse, SandboxState, Snapshot, SnapshotCleanupResponse,
+    SnapshotId, SnapshotListResponse, SnapshotResponse, SnapshotStatus, SshAccess,
+    SshAccessRequest, SshAccessResponse, SshKey, SshKeyId, SshKeyListResponse, SshKeyResponse,
+    SshKeyStatus, UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest,
+    Worker, WorkerCapability, WorkerCapacity, WorkerHeartbeatRequest, WorkerId, WorkerJobResult,
+    WorkerListResponse, WorkerResponse, WorkerStatus,
 };
 use serde_json::json;
 use sqlx::{
@@ -875,6 +876,7 @@ fn app(state: AppState) -> Router {
             post(reconcile_runtime_resources),
         )
         .route("/jobs", get(list_jobs).post(create_job))
+        .route("/jobs/{job_id}", get(get_job))
         .route("/workers/{worker_id}/leases/claim", post(claim_lease))
         .route("/leases/{lease_id}/renew", post(renew_lease))
         .route("/leases/{lease_id}/output", post(append_lease_output))
@@ -1872,7 +1874,7 @@ async fn queue_command(
     Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
     Json(request): Json<CommandRequest>,
-) -> Result<Json<CommandResponse>, ApiError> {
+) -> Result<Json<QueueCommandResponse>, ApiError> {
     if request.argv.is_empty() {
         return Err(ApiError::bad_request("argv must contain at least one item"));
     }
@@ -1895,36 +1897,34 @@ async fn queue_command(
         finished_at: None,
     };
 
+    let job = Job {
+        id: JobId::new(),
+        tenant_id: sandbox.tenant_id,
+        kind: JobKind::RunCommand,
+        status: JobStatus::Queued,
+        payload: json!({
+            "sandboxId": sandbox_id,
+            "commandId": command.id,
+            "argv": command.argv,
+            "cwd": command.cwd,
+            "env": env,
+            "provisionSpec": SandboxProvisionSpec {
+                memory_limit: sandbox.memory_limit.clone(),
+                network_egress: sandbox.network_egress.clone(),
+            }
+        }),
+        required_capability: WorkerCapability::RunCommand,
+        priority: 0,
+        attempts: 0,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+    };
+
     insert_command(&state.db, &command).await?;
-    insert_job(
-        &state.db,
-        &Job {
-            id: JobId::new(),
-            tenant_id: sandbox.tenant_id,
-            kind: JobKind::RunCommand,
-            status: JobStatus::Queued,
-            payload: json!({
-                "sandboxId": sandbox_id,
-                "commandId": command.id,
-                "argv": command.argv,
-                "cwd": command.cwd,
-                "env": env,
-                "provisionSpec": SandboxProvisionSpec {
-                    memory_limit: sandbox.memory_limit.clone(),
-                    network_egress: sandbox.network_egress.clone(),
-                }
-            }),
-            required_capability: WorkerCapability::RunCommand,
-            priority: 0,
-            attempts: 0,
-            max_attempts: 3,
-            scheduled_at: now,
-            created_at: now,
-            updated_at: now,
-            last_error: None,
-        },
-    )
-    .await?;
+    insert_job(&state.db, &job).await?;
     insert_event(
         &state.db,
         sandbox_id,
@@ -1935,7 +1935,19 @@ async fn queue_command(
         }),
     )
     .await?;
-    Ok(Json(CommandResponse { ok: true, command }))
+    let command_id = command.id;
+    Ok(Json(QueueCommandResponse {
+        ok: true,
+        command,
+        queued_job: QueuedCommandJob {
+            id: job.id,
+            sandbox_id,
+            command_id,
+            kind: JobKind::RunCommand,
+            status: JobStatus::Queued,
+            required_capability: WorkerCapability::RunCommand,
+        },
+    }))
 }
 
 async fn list_commands(
@@ -2291,6 +2303,16 @@ async fn create_job(
     validate_job_payload_tenant(&state.db, &job, &ctx).await?;
     enrich_job_payload_with_provision_spec(&state.db, &mut job).await?;
     insert_job(&state.db, &job).await?;
+    Ok(Json(JobResponse { ok: true, job }))
+}
+
+async fn get_job(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path(job_id): Path<Uuid>,
+) -> Result<Json<JobResponse>, ApiError> {
+    let job = fetch_job(&state.db, JobId(job_id)).await?;
+    ensure_job_tenant(&job, &ctx)?;
     Ok(Json(JobResponse { ok: true, job }))
 }
 

@@ -32,12 +32,18 @@ jobs:
         env:
           SANDBOXWICH_TEST_POSTGRES_URL: >-
             postgres://postgres:postgres@localhost:5432/sandboxwich
-      - run: cargo build -p sandboxwich-api -p sandboxwich-bench
+      - run: |
+          cargo build \
+            -p sandboxwich-api \
+            -p sandboxwich-worker \
+            -p sandboxwich-bench
       - name: Generate benchmark report
         run: |
           cargo run -p sandboxwich-bench -- all \
             --api-bin target/debug/sandboxwich-api \
+            --worker-bin target/debug/sandboxwich-worker \
             --runs 5 \
+            --ttft-runs 10 \
             --requests 300 \
             --concurrency 25 \
             --seed-sandboxes 250 \

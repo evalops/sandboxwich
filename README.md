@@ -79,17 +79,33 @@ For API compatibility notes, see [CHANGELOG.md](CHANGELOG.md).
 
 ## Benchmarks
 
-Run the local benchmark harness after building the API:
+Run the local benchmark harness after building the API, worker, and bench binaries:
 
 ```sh
-cargo build -p sandboxwich-api -p sandboxwich-bench
+cargo build -p sandboxwich-api -p sandboxwich-worker -p sandboxwich-bench
 cargo run -p sandboxwich-bench -- all \
   --api-bin target/debug/sandboxwich-api \
+  --worker-bin target/debug/sandboxwich-worker \
   --runs 5 \
+  --ttft-runs 10 \
   --requests 300 \
   --seed-sandboxes 250
 ```
 
 The harness runs a warm-start benchmark, seeds realistic sandboxes, commands,
 events, workers, jobs, and runtime resources, then measures common HTTP paths.
-CI uploads the same style of report as `sandboxwich-benchmark-report`.
+It also measures sandbox TTFT as create sandbox request start to the first
+persisted command-output chunk through a live API and live dry-run Kubernetes
+worker. The TTFT phase uses a fresh temporary SQLite database so seeded jobs do
+not pollute worker-claim timing. CI uploads the same style of report as
+`sandboxwich-benchmark-report`.
+
+Run just the sandbox TTFT path with:
+
+```sh
+cargo build -p sandboxwich-api -p sandboxwich-worker -p sandboxwich-bench
+cargo run -p sandboxwich-bench -- sandbox-ttft \
+  --api-bin target/debug/sandboxwich-api \
+  --worker-bin target/debug/sandboxwich-worker \
+  --runs 20
+```

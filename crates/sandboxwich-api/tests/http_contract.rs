@@ -7,7 +7,7 @@ use std::{
 use reqwest::StatusCode;
 use sandboxwich_core::{
     AgentCommandResult, AppendCommandOutputRequest, CapacityResponse, ClaimLeaseRequest,
-    ClaimLeaseResponse, CleanupRunStatus, CommandListResponse, CommandOutputAnnotation,
+    ClaimLeaseResponse, CleanupRunStatus, CommandId, CommandListResponse, CommandOutputAnnotation,
     CommandOutputListResponse, CommandOutputStream, CommandRequest, CommandResponse, CommandStatus,
     CompleteLeaseRequest, CreateDesktopSessionRequest, CreateJobRequest, CreateSandboxRequest,
     CreateSnapshotRequest, DesktopAccessMode, DesktopAccessRequest, DesktopAccessResponse,
@@ -16,13 +16,14 @@ use sandboxwich_core::{
     JobListResponse, JobResponse, JobStatus, LeaseResponse, ListFilesResponse, MemoryLimit,
     NetworkAllowRule, NetworkAllowRuleKind, NetworkEgress, PromptQueuedResponse, PromptRequest,
     ProviderForkHandle, ProviderRuntimeResource, ProviderSandboxHandle, ProviderSnapshotHandle,
-    ReconcileRuntimeResourcesRequest, ReconcileRuntimeResourcesResponse, RegisterWorkerRequest,
-    RequestSshKeyRequest, RuntimeResourceKind, RuntimeResourceListResponse, RuntimeResourcePurpose,
-    RuntimeResourceStatus, SandboxEventKind, SandboxListResponse, SandboxResponse, SandboxState,
-    SnapshotCleanupResponse, SnapshotId, SnapshotListResponse, SnapshotResponse, SnapshotStatus,
-    SshAccessRequest, SshAccessResponse, SshKeyListResponse, SshKeyResponse, SshKeyStatus,
-    UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest,
-    WorkerCapability, WorkerHeartbeatRequest, WorkerJobResult, WorkerListResponse, WorkerResponse,
+    QueueCommandResponse, ReconcileRuntimeResourcesRequest, ReconcileRuntimeResourcesResponse,
+    RegisterWorkerRequest, RequestSshKeyRequest, RuntimeResourceKind, RuntimeResourceListResponse,
+    RuntimeResourcePurpose, RuntimeResourceStatus, SandboxEventKind, SandboxListResponse,
+    SandboxResponse, SandboxState, SnapshotCleanupResponse, SnapshotId, SnapshotListResponse,
+    SnapshotResponse, SnapshotStatus, SshAccessRequest, SshAccessResponse, SshKeyListResponse,
+    SshKeyResponse, SshKeyStatus, UpdateDesktopSessionRequest, UpdateGuestHealthRequest,
+    UpdateSshKeyStatusRequest, WorkerCapability, WorkerHeartbeatRequest, WorkerJobResult,
+    WorkerListResponse, WorkerResponse,
 };
 use sqlx::any::AnyPoolOptions;
 use tempfile::TempDir;
@@ -133,6 +134,76 @@ async fn api_token_is_required_when_configured() {
         .await
         .unwrap();
     assert_eq!(spoofed_tenant.sandbox.tenant_id, "default");
+}
+
+#[tokio::test]
+async fn job_can_be_fetched_by_id_with_tenant_isolation() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("sandboxwich-job-test.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = reqwest::Client::new();
+
+    let sandbox: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("job-fetch".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let job: JobResponse = client
+        .post(format!("{}/jobs", server.base_url))
+        .json(&CreateJobRequest {
+            kind: JobKind::ProvisionSandbox,
+            payload: serde_json::json!({
+                "sandboxId": sandbox.sandbox.id
+            }),
+            required_capability: WorkerCapability::ProvisionSandbox,
+            priority: None,
+            max_attempts: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let fetched: JobResponse = client
+        .get(format!("{}/jobs/{}", server.base_url, job.job.id))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(fetched.job.id, job.job.id);
+    assert_eq!(fetched.job.status, JobStatus::Queued);
+
+    let hidden = client
+        .get(format!("{}/jobs/{}", server.base_url, job.job.id))
+        .header("x-sandboxwich-tenant", "tenant-b")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -309,7 +380,7 @@ async fn run_contract(server: TestServer) {
             .any(|sandbox| sandbox.id == created.sandbox.id)
     );
 
-    let command: CommandResponse = client
+    let command: QueueCommandResponse = client
         .post(format!(
             "{}/sandboxes/{}/commands",
             server.base_url, created.sandbox.id
@@ -329,6 +400,15 @@ async fn run_contract(server: TestServer) {
         .unwrap();
     assert_eq!(command.command.argv, ["echo", "hello"]);
     assert_eq!(command.command.status, CommandStatus::Queued);
+    let command_job = &command.queued_job;
+    assert_eq!(command_job.sandbox_id, created.sandbox.id);
+    assert_eq!(command_job.command_id, command.command.id);
+    assert_eq!(command_job.kind, JobKind::RunCommand);
+    assert_eq!(command_job.status, JobStatus::Queued);
+    assert_eq!(
+        command_job.required_capability,
+        WorkerCapability::RunCommand
+    );
 
     let jobs: JobListResponse = client
         .get(format!("{}/jobs", server.base_url))
@@ -340,7 +420,8 @@ async fn run_contract(server: TestServer) {
         .json()
         .await
         .unwrap();
-    let queued_job = job_for_command(&jobs.jobs, &command.command.id.to_string());
+    let queued_job = job_for_command(&jobs.jobs, command.command.id);
+    assert_eq!(queued_job.id, command_job.id);
     assert_eq!(queued_job.status, JobStatus::Queued);
     assert_eq!(
         queued_job.payload["provisionSpec"]["memory_limit"],
@@ -1500,7 +1581,7 @@ async fn assert_retryable_failure_requeues_command(
     sandbox: &SandboxResponse,
     worker: &WorkerResponse,
 ) {
-    let command: CommandResponse = client
+    let command: QueueCommandResponse = client
         .post(format!(
             "{}/sandboxes/{}/commands",
             server.base_url, sandbox.sandbox.id
@@ -1518,6 +1599,8 @@ async fn assert_retryable_failure_requeues_command(
         .json()
         .await
         .unwrap();
+    assert_eq!(command.queued_job.sandbox_id, sandbox.sandbox.id);
+    assert_eq!(command.queued_job.command_id, command.command.id);
 
     let claimed: ClaimLeaseResponse = client
         .post(format!(
@@ -1536,6 +1619,7 @@ async fn assert_retryable_failure_requeues_command(
         .await
         .unwrap();
     let lease = claimed.lease.expect("expected retry test lease");
+    assert_eq!(lease.job.id, command.queued_job.id);
     client
         .post(format!("{}/leases/{}/output", server.base_url, lease.id))
         .json(&AppendCommandOutputRequest {
@@ -1637,7 +1721,7 @@ async fn assert_expired_lease_requeues_command(
     sandbox: &SandboxResponse,
     worker: &WorkerResponse,
 ) {
-    let command: CommandResponse = client
+    let command: QueueCommandResponse = client
         .post(format!(
             "{}/sandboxes/{}/commands",
             server.base_url, sandbox.sandbox.id
@@ -1655,6 +1739,8 @@ async fn assert_expired_lease_requeues_command(
         .json()
         .await
         .unwrap();
+    assert_eq!(command.queued_job.sandbox_id, sandbox.sandbox.id);
+    assert_eq!(command.queued_job.command_id, command.command.id);
 
     let claimed: ClaimLeaseResponse = client
         .post(format!(
@@ -1672,7 +1758,8 @@ async fn assert_expired_lease_requeues_command(
         .json()
         .await
         .unwrap();
-    assert!(claimed.lease.is_some());
+    let lease = claimed.lease.expect("expected expiring lease");
+    assert_eq!(lease.job.id, command.queued_job.id);
 
     let jobs: JobListResponse = client
         .get(format!("{}/jobs", server.base_url))
@@ -1684,7 +1771,7 @@ async fn assert_expired_lease_requeues_command(
         .json()
         .await
         .unwrap();
-    let expired_job = job_for_command(&jobs.jobs, &command.command.id.to_string());
+    let expired_job = job_for_command(&jobs.jobs, command.command.id);
     assert_eq!(expired_job.status, JobStatus::Queued);
 
     let fetched: CommandResponse = client
@@ -2624,13 +2711,16 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
     assert_eq!(failed_child.sandbox.state, SandboxState::Error);
 }
 
-fn job_for_command(jobs: &[Job], command_id: &str) -> Job {
+fn job_for_command(jobs: &[Job], command_id: CommandId) -> Job {
     jobs.iter()
         .find(|job| {
-            job.payload
-                .get("commandId")
-                .and_then(|value| value.as_str())
-                == Some(command_id)
+            job.kind == JobKind::RunCommand
+                && job
+                    .payload
+                    .get("commandId")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<CommandId>(value).ok())
+                    == Some(command_id)
         })
         .cloned()
         .expect("expected command job")
