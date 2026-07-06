@@ -12,6 +12,12 @@ use std::{
 use anyhow::{Context, bail};
 use chrono::Utc;
 use reqwest::StatusCode;
+use sandboxwich_core::{
+    CapacityResponse, CommandOutputListResponse, CommandRequest, CommandResponse, CommandStatus,
+    CreateJobRequest, CreateSandboxRequest, JobId, JobKind, JobListResponse, JobStatus, SandboxId,
+    SandboxResponse, WorkerCapability,
+};
+use serde::de::DeserializeOwned;
 use sqlx::{AnyPool, any::AnyPoolOptions};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -34,6 +40,11 @@ async fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
+        BenchCommand::SandboxTtft(options) => {
+            let report = benchmark_sandbox_ttft(&options).await?;
+            println!("{}", report.markdown("Sandbox TTFT (dry-run k8s worker)"));
+            Ok(())
+        }
         BenchCommand::Seed(options) => seed_database(&options).await,
     }
 }
@@ -46,13 +57,16 @@ enum BenchCommand {
     All(AllOptions),
     Startup(StartupOptions),
     Http(HttpOptions),
+    SandboxTtft(SandboxTtftOptions),
     Seed(SeedOptions),
 }
 
 #[derive(Clone)]
 struct AllOptions {
     api_bin: PathBuf,
+    worker_bin: PathBuf,
     runs: usize,
+    ttft_runs: usize,
     requests: usize,
     concurrency: usize,
     seed: SeedOptions,
@@ -86,6 +100,15 @@ struct SeedOptions {
     jobs: usize,
 }
 
+#[derive(Clone)]
+struct SandboxTtftOptions {
+    api_bin: PathBuf,
+    worker_bin: PathBuf,
+    runs: usize,
+    poll_interval: Duration,
+    timeout: Duration,
+}
+
 #[derive(Clone, Copy)]
 enum HttpMethod {
     Get,
@@ -109,7 +132,11 @@ impl Args {
                 api_bin: parser
                     .path_opt("--api-bin")?
                     .unwrap_or_else(default_api_binary),
+                worker_bin: parser
+                    .path_opt("--worker-bin")?
+                    .unwrap_or_else(default_worker_binary),
                 runs: parser.usize_opt("--runs", 5)?,
+                ttft_runs: parser.usize_opt("--ttft-runs", 10)?,
                 requests: parser.usize_opt("--requests", 500)?,
                 concurrency: parser.usize_opt("--concurrency", 25)?,
                 seed: SeedOptions {
@@ -148,6 +175,19 @@ impl Args {
                 requests: parser.usize_opt("--requests", 1000)?,
                 concurrency: parser.usize_opt("--concurrency", 25)?,
             }),
+            Some("sandbox-ttft") => BenchCommand::SandboxTtft(SandboxTtftOptions {
+                api_bin: parser
+                    .path_opt("--api-bin")?
+                    .unwrap_or_else(default_api_binary),
+                worker_bin: parser
+                    .path_opt("--worker-bin")?
+                    .unwrap_or_else(default_worker_binary),
+                runs: parser.usize_opt("--runs", 10)?,
+                poll_interval: Duration::from_millis(
+                    parser.usize_opt("--poll-interval-ms", 5)? as u64
+                ),
+                timeout: Duration::from_millis(parser.usize_opt("--timeout-ms", 10_000)? as u64),
+            }),
             Some("seed") => BenchCommand::Seed(SeedOptions {
                 database_url: parser.required("--database-url")?,
                 sandboxes: parser.usize_opt("--sandboxes", 1000)?,
@@ -160,12 +200,13 @@ impl Args {
             }),
             Some("--help") | Some("-h") => {
                 println!(
-                    "usage: sandboxwich-bench [all|startup|http|seed]\n\
+                    "usage: sandboxwich-bench [all|startup|http|sandbox-ttft|seed]\n\
                      examples:\n\
-                       sandboxwich-bench all --api-bin target/debug/sandboxwich-api\n\
-                       sandboxwich-bench startup --database-url sqlite:///tmp/bench.db\n\
-                       sandboxwich-bench http --api-url http://127.0.0.1:3217 --path /readyz\n\
-                       sandboxwich-bench seed --database-url sqlite:///tmp/bench.db"
+                       sandboxwich-bench all --api-bin target/debug/sandboxwich-api --worker-bin target/debug/sandboxwich-worker\n\
+                     sandboxwich-bench startup --database-url sqlite:///tmp/bench.db\n\
+                     sandboxwich-bench http --api-url http://127.0.0.1:3217 --path /readyz\n\
+                       sandboxwich-bench sandbox-ttft --api-bin target/debug/sandboxwich-api --worker-bin target/debug/sandboxwich-worker\n\
+                     sandboxwich-bench seed --database-url sqlite:///tmp/bench.db"
                 );
                 std::process::exit(0);
             }
@@ -248,6 +289,10 @@ fn default_api_binary() -> PathBuf {
     PathBuf::from("target/debug/sandboxwich-api")
 }
 
+fn default_worker_binary() -> PathBuf {
+    PathBuf::from("target/debug/sandboxwich-worker")
+}
+
 async fn run_all(mut options: AllOptions) -> anyhow::Result<()> {
     let bench_id = Uuid::now_v7().to_string();
     let db_path = std::env::temp_dir().join(format!("sandboxwich-bench-{bench_id}.db"));
@@ -300,6 +345,21 @@ async fn run_all(mut options: AllOptions) -> anyhow::Result<()> {
     server.stop();
     let _ = std::fs::remove_file(db_path);
 
+    let sandbox_ttft = if options.ttft_runs == 0 {
+        None
+    } else {
+        Some(
+            benchmark_sandbox_ttft(&SandboxTtftOptions {
+                api_bin: options.api_bin.clone(),
+                worker_bin: options.worker_bin.clone(),
+                runs: options.ttft_runs,
+                poll_interval: Duration::from_millis(5),
+                timeout: Duration::from_secs(10),
+            })
+            .await?,
+        )
+    };
+
     println!("# Sandboxwich Benchmark Report");
     println!();
     println!("- profile: debug");
@@ -319,6 +379,9 @@ async fn run_all(mut options: AllOptions) -> anyhow::Result<()> {
     println!("{}", readyz.markdown("GET /readyz"));
     println!("{}", sandboxes.markdown("GET /sandboxes"));
     println!("{}", creates.markdown("POST /sandboxes"));
+    if let Some(report) = sandbox_ttft {
+        println!("{}", report.markdown("Sandbox TTFT (dry-run k8s worker)"));
+    }
     Ok(())
 }
 
@@ -372,6 +435,54 @@ impl ApiProcess {
 }
 
 impl Drop for ApiProcess {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+struct WorkerProcess {
+    child: Child,
+}
+
+impl WorkerProcess {
+    async fn start(worker_bin: &PathBuf, api_url: &str) -> anyhow::Result<Self> {
+        let child = Command::new(worker_bin)
+            .arg("--api")
+            .arg(api_url)
+            .arg("run")
+            .arg("--name")
+            .arg(format!("bench-ttft-{}", Uuid::now_v7()))
+            .arg("--provider")
+            .arg("kubernetes")
+            .arg("--cluster")
+            .arg("k3s-bench")
+            .arg("--namespace")
+            .arg("sandboxwich-bench")
+            .arg("--idle-sleep-ms")
+            .arg("5")
+            .arg("--max-concurrent-jobs")
+            .arg("1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("failed to start {}", worker_bin.display()))?;
+        Ok(Self { child })
+    }
+
+    fn ensure_running(&mut self) -> anyhow::Result<()> {
+        if let Some(status) = self.child.try_wait()? {
+            bail!("worker exited before benchmark completed: {status}");
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for WorkerProcess {
     fn drop(&mut self) {
         self.stop();
     }
@@ -461,6 +572,292 @@ async fn benchmark_http(options: &HttpOptions) -> anyhow::Result<BenchSummary> {
     Ok(summary)
 }
 
+async fn benchmark_sandbox_ttft(options: &SandboxTtftOptions) -> anyhow::Result<SandboxTtftReport> {
+    let bench_id = Uuid::now_v7().to_string();
+    let db_path = std::env::temp_dir().join(format!("sandboxwich-ttft-{bench_id}.db"));
+    let database_url = format!("sqlite://{}", db_path.display());
+    run_api_command(&options.api_bin, "migrate", &database_url)?;
+
+    let mut server = ApiProcess::start(&options.api_bin, &database_url, false).await?;
+    let mut worker = WorkerProcess::start(&options.worker_bin, &server.base_url).await?;
+    let client = reqwest::Client::new();
+    wait_for_worker_capacity(
+        &client,
+        &server.base_url,
+        &mut worker,
+        options.timeout,
+        options.poll_interval,
+    )
+    .await?;
+
+    let mut samples = Vec::with_capacity(options.runs);
+    for index in 0..options.runs {
+        samples.push(
+            run_sandbox_ttft_once(&client, &server.base_url, &mut worker, options, index).await?,
+        );
+    }
+
+    worker.stop();
+    server.stop();
+    let _ = std::fs::remove_file(db_path);
+
+    Ok(SandboxTtftReport { samples })
+}
+
+async fn run_sandbox_ttft_once(
+    client: &reqwest::Client,
+    base_url: &str,
+    worker: &mut WorkerProcess,
+    options: &SandboxTtftOptions,
+    index: usize,
+) -> anyhow::Result<SandboxTtftSample> {
+    let total_started = Instant::now();
+
+    let started = Instant::now();
+    let sandbox: SandboxResponse = post_json(
+        client
+            .post(format!("{}/sandboxes", base_url.trim_end_matches('/')))
+            .json(&CreateSandboxRequest {
+                name: Some(format!("ttft-bench-{index}")),
+                template: Some("ubuntu-dev".to_string()),
+                memory_limit: None,
+                network_egress: None,
+                ttl_seconds: Some(120),
+            }),
+    )
+    .await?;
+    let create_sandbox = started.elapsed();
+    let sandbox_id = sandbox.sandbox.id;
+
+    let started = Instant::now();
+    let provision_job = create_provision_job(client, base_url, sandbox_id).await?;
+    let queue_provision = started.elapsed();
+
+    let started = Instant::now();
+    wait_for_job_status(
+        client,
+        base_url,
+        worker,
+        provision_job.job.id,
+        JobStatus::Succeeded,
+        options.timeout,
+        options.poll_interval,
+    )
+    .await?;
+    let provision_ready = started.elapsed();
+
+    let started = Instant::now();
+    let command: CommandResponse = post_json(
+        client
+            .post(format!(
+                "{}/sandboxes/{sandbox_id}/commands",
+                base_url.trim_end_matches('/')
+            ))
+            .json(&CommandRequest {
+                argv: vec!["printf".to_string(), "sandboxwich-ttft\n".to_string()],
+                cwd: None,
+                env: Default::default(),
+            }),
+    )
+    .await?;
+    let queue_command = started.elapsed();
+
+    let started = Instant::now();
+    wait_for_first_output_chunk(
+        client,
+        base_url,
+        worker,
+        command.command.id,
+        options.timeout,
+        options.poll_interval,
+    )
+    .await?;
+    let first_output = started.elapsed();
+
+    Ok(SandboxTtftSample {
+        create_sandbox,
+        queue_provision,
+        provision_ready,
+        queue_command,
+        first_output,
+        total: total_started.elapsed(),
+    })
+}
+
+async fn create_provision_job(
+    client: &reqwest::Client,
+    base_url: &str,
+    sandbox_id: SandboxId,
+) -> anyhow::Result<sandboxwich_core::JobResponse> {
+    post_json(
+        client
+            .post(format!("{}/jobs", base_url.trim_end_matches('/')))
+            .json(&CreateJobRequest {
+                kind: JobKind::ProvisionSandbox,
+                payload: serde_json::json!({ "sandboxId": sandbox_id }),
+                required_capability: WorkerCapability::ProvisionSandbox,
+                priority: Some(100),
+                max_attempts: Some(1),
+            }),
+    )
+    .await
+}
+
+async fn wait_for_worker_capacity(
+    client: &reqwest::Client,
+    base_url: &str,
+    worker: &mut WorkerProcess,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> anyhow::Result<()> {
+    let started = Instant::now();
+    loop {
+        worker.ensure_running()?;
+        if started.elapsed() > timeout {
+            bail!("worker did not report available capacity within {timeout:?}");
+        }
+
+        let capacity = get_json::<CapacityResponse>(
+            client,
+            &format!("{}/capacity", base_url.trim_end_matches('/')),
+        )
+        .await;
+        if let Ok(capacity) = capacity {
+            if capacity.total_available_slots > 0 {
+                return Ok(());
+            }
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+async fn wait_for_job_status(
+    client: &reqwest::Client,
+    base_url: &str,
+    worker: &mut WorkerProcess,
+    job_id: JobId,
+    expected: JobStatus,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> anyhow::Result<()> {
+    let started = Instant::now();
+    loop {
+        worker.ensure_running()?;
+        if started.elapsed() > timeout {
+            bail!("job {job_id} did not reach {expected:?} within {timeout:?}");
+        }
+
+        let jobs = get_json::<JobListResponse>(
+            client,
+            &format!("{}/jobs", base_url.trim_end_matches('/')),
+        )
+        .await?;
+        let job = jobs
+            .jobs
+            .into_iter()
+            .find(|job| job.id == job_id)
+            .with_context(|| format!("job {job_id} disappeared from list"))?;
+        if job.status == expected {
+            return Ok(());
+        }
+        if matches!(&job.status, JobStatus::Failed | JobStatus::Dead) && job.status != expected {
+            bail!(
+                "job {job_id} reached terminal status {:?}: {}",
+                job.status,
+                job.last_error
+                    .unwrap_or_else(|| "no error recorded".to_string())
+            );
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+async fn wait_for_first_output_chunk(
+    client: &reqwest::Client,
+    base_url: &str,
+    worker: &mut WorkerProcess,
+    command_id: sandboxwich_core::CommandId,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> anyhow::Result<()> {
+    let started = Instant::now();
+    loop {
+        worker.ensure_running()?;
+        if started.elapsed() > timeout {
+            bail!("command {command_id} did not produce output within {timeout:?}");
+        }
+
+        let output = get_json::<CommandOutputListResponse>(
+            client,
+            &format!(
+                "{}/commands/{command_id}/output",
+                base_url.trim_end_matches('/')
+            ),
+        )
+        .await?;
+        if !output.chunks.is_empty() {
+            return Ok(());
+        }
+
+        let command = get_json::<CommandResponse>(
+            client,
+            &format!("{}/commands/{command_id}", base_url.trim_end_matches('/')),
+        )
+        .await?;
+        match command.command.status {
+            CommandStatus::Failed => bail!("command {command_id} failed before producing output"),
+            CommandStatus::Finished => {
+                let output = get_json::<CommandOutputListResponse>(
+                    client,
+                    &format!(
+                        "{}/commands/{command_id}/output",
+                        base_url.trim_end_matches('/')
+                    ),
+                )
+                .await?;
+                if !output.chunks.is_empty() {
+                    return Ok(());
+                }
+                bail!("command {command_id} finished without output");
+            }
+            CommandStatus::Queued | CommandStatus::Running => {}
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+async fn get_json<T>(client: &reqwest::Client, url: &str) -> anyhow::Result<T>
+where
+    T: DeserializeOwned,
+{
+    decode_json(client.get(url).send().await?).await
+}
+
+async fn post_json<T>(request: reqwest::RequestBuilder) -> anyhow::Result<T>
+where
+    T: DeserializeOwned,
+{
+    decode_json(request.send().await?).await
+}
+
+async fn decode_json<T>(response: reqwest::Response) -> anyhow::Result<T>
+where
+    T: DeserializeOwned,
+{
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("failed to read response body")?;
+    if !status.is_success() {
+        bail!("request failed with {status}: {body}");
+    }
+    serde_json::from_str(&body).context("failed to decode response body")
+}
+
 async fn send_request(
     client: &reqwest::Client,
     method: HttpMethod,
@@ -484,6 +881,67 @@ async fn send_request(
     response
         .map(|response| response.status())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+struct SandboxTtftSample {
+    create_sandbox: Duration,
+    queue_provision: Duration,
+    provision_ready: Duration,
+    queue_command: Duration,
+    first_output: Duration,
+    total: Duration,
+}
+
+struct SandboxTtftReport {
+    samples: Vec<SandboxTtftSample>,
+}
+
+impl SandboxTtftReport {
+    fn markdown(&self, name: &str) -> String {
+        let total = self.summary(|sample| sample.total);
+        let create_sandbox = self.summary(|sample| sample.create_sandbox);
+        let queue_provision = self.summary(|sample| sample.queue_provision);
+        let provision_ready = self.summary(|sample| sample.provision_ready);
+        let queue_command = self.summary(|sample| sample.queue_command);
+        let first_output = self.summary(|sample| sample.first_output);
+
+        format!(
+            "## {name}\n\n\
+             Measurement: create sandbox request start -> first command output chunk observed. \
+             Worker mode: Kubernetes dry-run; no cluster mutation.\n\n\
+             | phase | samples | mean | p50 | p95 | p99 | min | max |\n\
+             |---|---:|---:|---:|---:|---:|---:|---:|\n\
+             {total_row}\
+             {create_row}\
+             {queue_provision_row}\
+             {provision_ready_row}\
+             {queue_command_row}\
+             {first_output_row}",
+            total_row = phase_row("total TTFT", &total),
+            create_row = phase_row("create sandbox request", &create_sandbox),
+            queue_provision_row = phase_row("queue provision job", &queue_provision),
+            provision_ready_row = phase_row("provision job queued -> succeeded", &provision_ready),
+            queue_command_row = phase_row("queue command request", &queue_command),
+            first_output_row = phase_row("command queued -> first output", &first_output),
+        )
+    }
+
+    fn summary(&self, phase: impl Fn(&SandboxTtftSample) -> Duration) -> BenchSummary {
+        BenchSummary::from_durations(self.samples.iter().map(phase).collect(), 0)
+    }
+}
+
+fn phase_row(name: &str, summary: &BenchSummary) -> String {
+    format!(
+        "| {name} | {count} | {mean} | {p50} | {p95} | {p99} | {min} | {max} |\n",
+        count = summary.count,
+        mean = format_duration(summary.mean),
+        p50 = format_duration(summary.p50),
+        p95 = format_duration(summary.p95),
+        p99 = format_duration(summary.p99),
+        min = format_duration(summary.min),
+        max = format_duration(summary.max),
+    )
 }
 
 struct BenchSummary {
@@ -778,4 +1236,67 @@ fn placeholders(database_url: &str, count: usize) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_ttft_command_parses_worker_options() {
+        let args = Args::parse(vec![
+            "sandbox-ttft".to_string(),
+            "--api-bin".to_string(),
+            "target/test-api".to_string(),
+            "--worker-bin".to_string(),
+            "target/test-worker".to_string(),
+            "--runs".to_string(),
+            "3".to_string(),
+            "--poll-interval-ms".to_string(),
+            "7".to_string(),
+            "--timeout-ms".to_string(),
+            "1234".to_string(),
+        ])
+        .expect("sandbox-ttft args should parse");
+
+        let BenchCommand::SandboxTtft(options) = args.command else {
+            panic!("expected sandbox-ttft command");
+        };
+        assert_eq!(options.api_bin, PathBuf::from("target/test-api"));
+        assert_eq!(options.worker_bin, PathBuf::from("target/test-worker"));
+        assert_eq!(options.runs, 3);
+        assert_eq!(options.poll_interval, Duration::from_millis(7));
+        assert_eq!(options.timeout, Duration::from_millis(1234));
+    }
+
+    #[test]
+    fn sandbox_ttft_report_renders_phase_table() {
+        let report = SandboxTtftReport {
+            samples: vec![
+                SandboxTtftSample {
+                    create_sandbox: Duration::from_millis(1),
+                    queue_provision: Duration::from_millis(2),
+                    provision_ready: Duration::from_millis(3),
+                    queue_command: Duration::from_millis(4),
+                    first_output: Duration::from_millis(5),
+                    total: Duration::from_millis(15),
+                },
+                SandboxTtftSample {
+                    create_sandbox: Duration::from_millis(2),
+                    queue_provision: Duration::from_millis(3),
+                    provision_ready: Duration::from_millis(4),
+                    queue_command: Duration::from_millis(5),
+                    first_output: Duration::from_millis(6),
+                    total: Duration::from_millis(20),
+                },
+            ],
+        };
+
+        let markdown = report.markdown("Sandbox TTFT");
+        assert!(markdown.contains("create sandbox request start"));
+        assert!(markdown.contains("| total TTFT | 2 |"));
+        assert!(markdown.contains("| provision job queued -> succeeded | 2 |"));
+        assert!(markdown.contains("| command queued -> first output | 2 |"));
+        assert!(markdown.contains("20.00ms"));
+    }
 }

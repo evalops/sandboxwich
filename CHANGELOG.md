@@ -24,3 +24,6 @@
   output chunks and exits its heartbeat task after 12 consecutive failed heartbeat
   posts by default. Operators can tune that circuit breaker with
   `SANDBOXWICH_HEARTBEAT_FAILURE_THRESHOLD`.
+- Benchmark reports now include sandbox TTFT measured through a live API and
+  dry-run Kubernetes worker, split into create, provision, command queue, and
+  first-output phases.

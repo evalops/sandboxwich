@@ -1770,6 +1770,8 @@ dependencies = [
  "anyhow",
  "chrono",
  "reqwest",
+ "sandboxwich-core",
+ "serde",
  "serde_json",
  "sqlx",
  "tokio",
