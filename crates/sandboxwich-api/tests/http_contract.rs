@@ -29,10 +29,30 @@ use sqlx::any::AnyPoolOptions;
 use tempfile::TempDir;
 use uuid::Uuid;
 
+/// Default-tenant bearer token used by `TestServer::start*` helpers when no
+/// explicit auth token is requested. The server is always started with real
+/// authentication configured (SANDBOXWICH_TENANT_TOKENS covering this tenant
+/// and `TEST_TENANT_B_TOKEN`) so that tests exercise the fail-closed auth
+/// path rather than the removed "trust the client header" fallback.
+const TEST_DEFAULT_TENANT_TOKEN: &str = "sandboxwich-test-default-tenant-token";
+/// Bearer token for a second tenant ("tenant-b"), used to prove tenant
+/// isolation via real credentials instead of a spoofable header.
+const TEST_TENANT_B_TOKEN: &str = "sandboxwich-test-tenant-b-token";
+/// Dedicated operator credential for `/snapshots/cleanup`, distinct from any
+/// tenant token.
+const TEST_OPERATOR_TOKEN: &str = "sandboxwich-test-operator-token";
+/// Must match `OPERATOR_TOKEN_HEADER` in `sandboxwich-api::main`.
+const OPERATOR_TOKEN_HEADER: &str = "x-sandboxwich-operator-token";
+
 struct TestServer {
     base_url: String,
     database_url: String,
     child: Child,
+    /// Bearer token that authenticates as the default tenant, if any auth is
+    /// configured at all. `None` only for servers started with
+    /// `start_with_no_auth_configured`, which deliberately leave both
+    /// SANDBOXWICH_API_TOKEN and SANDBOXWICH_TENANT_TOKENS unset.
+    auth_token: Option<String>,
     _data_dir: Option<TempDir>,
 }
 
@@ -144,7 +164,7 @@ async fn job_can_be_fetched_by_id_with_tenant_isolation() {
         data_dir.path().join("sandboxwich-job-test.db").display()
     );
     let server = TestServer::start(database_url, Some(data_dir)).await;
-    let client = reqwest::Client::new();
+    let client = server.client();
 
     let sandbox: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
@@ -197,13 +217,173 @@ async fn job_can_be_fetched_by_id_with_tenant_isolation() {
     assert_eq!(fetched.job.id, job.job.id);
     assert_eq!(fetched.job.status, JobStatus::Queued);
 
-    let hidden = client
+    // Tenant identity now comes only from which bearer token authenticated
+    // the request, never from a client-supplied header: authenticate as
+    // "tenant-b" with its own token rather than spoofing a header.
+    let hidden = reqwest::Client::new()
         .get(format!("{}/jobs/{}", server.base_url, job.job.id))
-        .header("x-sandboxwich-tenant", "tenant-b")
+        .bearer_auth(TEST_TENANT_B_TOKEN)
         .send()
         .await
         .unwrap();
     assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+}
+
+/// Regression test for issue #63: with neither `SANDBOXWICH_API_TOKEN` nor
+/// `SANDBOXWICH_TENANT_TOKENS` configured, the server must fail closed and
+/// refuse every non-probe request, rather than trusting a client-supplied
+/// `x-sandboxwich-tenant` header to select tenant identity.
+#[tokio::test]
+async fn unauthenticated_deployment_rejects_tenant_header_spoofing() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("sandboxwich-no-auth-test.db")
+            .display()
+    );
+    let server = TestServer::start_with_no_auth_configured(database_url, Some(data_dir)).await;
+    let client = reqwest::Client::new();
+
+    // Probe paths remain open even with no auth configured, so kubernetes
+    // liveness/readiness checks keep working.
+    let health = client
+        .get(format!("{}/healthz", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+    let ready = client
+        .get(format!("{}/readyz", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), StatusCode::OK);
+
+    // A plain, credential-free request must be rejected.
+    let plain = client
+        .get(format!("{}/sandboxes", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        plain.status() == StatusCode::UNAUTHORIZED
+            || plain.status() == StatusCode::INTERNAL_SERVER_ERROR,
+        "expected an auth failure, got {}",
+        plain.status()
+    );
+
+    // The previous vulnerability: an attacker supplies a bogus
+    // `x-sandboxwich-tenant` header and no credential at all, expecting the
+    // server to trust it and select that tenant. It must instead be
+    // rejected exactly like the plain request above, never selecting a
+    // tenant or creating data.
+    let spoofed = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .header("x-sandboxwich-tenant", "someone-elses-tenant")
+        .json(&CreateSandboxRequest {
+            name: Some("should-never-be-created".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        spoofed.status() == StatusCode::UNAUTHORIZED
+            || spoofed.status() == StatusCode::INTERNAL_SERVER_ERROR,
+        "expected the tenant-header request to be rejected, got {}",
+        spoofed.status()
+    );
+
+    // Confirm no sandbox was created as a side effect of the rejected
+    // request: with no auth configured at all, /sandboxes is also
+    // unreachable, so we just assert it is consistently rejected rather
+    // than sometimes trusting the header and sometimes not.
+    let listed = client
+        .get(format!("{}/sandboxes", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        listed.status() == StatusCode::UNAUTHORIZED
+            || listed.status() == StatusCode::INTERNAL_SERVER_ERROR
+    );
+}
+
+/// Regression test for issue #65: `/snapshots/cleanup` acts across every
+/// tenant's data, so it must never be reachable with an ordinary tenant
+/// credential alone -- it requires a dedicated `SANDBOXWICH_OPERATOR_TOKEN`
+/// credential, distinct from any tenant token.
+#[tokio::test]
+async fn cleanup_is_not_usable_cross_tenant() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("sandboxwich-cleanup-auth-test.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+
+    // A valid credential for the default tenant is not sufficient on its
+    // own: no operator token was presented.
+    let default_tenant_attempt = server
+        .client()
+        .post(format!("{}/snapshots/cleanup", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        default_tenant_attempt.status(),
+        StatusCode::UNAUTHORIZED,
+        "a tenant credential alone must not be able to run cross-tenant cleanup"
+    );
+
+    // A valid credential for a *different* tenant is equally insufficient --
+    // this is the direct cross-tenant scenario from issue #65: tenant-b must
+    // never be able to trigger cleanup that deletes tenant-default's data.
+    let cross_tenant_attempt = reqwest::Client::new()
+        .post(format!("{}/snapshots/cleanup", server.base_url))
+        .bearer_auth(TEST_TENANT_B_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        cross_tenant_attempt.status(),
+        StatusCode::UNAUTHORIZED,
+        "tenant-b's credential must not be able to run cleanup affecting other tenants"
+    );
+
+    // The dedicated operator credential, alongside normal tenant auth, is
+    // required and sufficient.
+    let operator_attempt: SnapshotCleanupResponse = server
+        .client()
+        .post(format!("{}/snapshots/cleanup", server.base_url))
+        .header(OPERATOR_TOKEN_HEADER, TEST_OPERATOR_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(operator_attempt.ok);
+
+    // A wrong operator token is rejected just like a missing one.
+    let wrong_operator_token = server
+        .client()
+        .post(format!("{}/snapshots/cleanup", server.base_url))
+        .header(OPERATOR_TOKEN_HEADER, "not-the-operator-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_operator_token.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -238,8 +418,211 @@ async fn migrate_command_prepares_database_for_no_auto_migrate_server() {
     assert!(readiness.ok);
 }
 
+#[tokio::test]
+async fn small_body_route_rejects_oversized_json_but_upload_route_accepts_large_file() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("sandboxwich-body-limit-test.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+
+    let created: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("body-limit-test".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // The global default body limit (1 MiB) applies to ordinary JSON routes: a body padded well
+    // past that with an otherwise-valid JSON payload must be rejected before it is ever buffered
+    // or parsed. Without `Expect: 100-continue`, the server can reject and close the connection
+    // while the client is still writing the oversized body, which surfaces to the client as a
+    // connection error rather than a clean response; either outcome proves the body was rejected.
+    let oversized_name = "x".repeat(2 * 1024 * 1024);
+    let oversized_body = format!(r#"{{"name":"{oversized_name}"}}"#);
+    match client
+        .post(format!("{}/sandboxes", server.base_url))
+        .header("content-type", "application/json")
+        .body(oversized_body)
+        .send()
+        .await
+    {
+        Ok(response) => {
+            assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        Err(error) => {
+            assert!(
+                error.is_request() || error.is_body() || error.is_connect(),
+                "unexpected error sending oversized body: {error}"
+            );
+        }
+    }
+
+    // The file upload route opts into a much larger, explicit limit and must still accept a
+    // payload far above the small default (well below the new MAX_SANDBOX_FILE_BYTES cap).
+    // Use a fresh client: rejecting the oversized body above closes the connection mid-write,
+    // which can poison a pooled connection and surface here as a spurious send error.
+    let upload_client = server.client();
+    let large_content = vec![b'a'; 8 * 1024 * 1024];
+    let form = reqwest::multipart::Form::new()
+        .text("path", "/workspace/large.bin")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(large_content.clone())
+                .file_name("large.bin")
+                .mime_str("application/octet-stream")
+                .unwrap(),
+        );
+    let uploaded: FileResponse = upload_client
+        .post(format!(
+            "{}/sandboxes/{}/files",
+            server.base_url, created.sandbox.id
+        ))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(uploaded.file.size_bytes, large_content.len() as u64);
+}
+
+#[tokio::test]
+async fn list_commands_respect_limit_and_paginate_with_cursor() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("sandboxwich-pagination-test.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+
+    let created: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("pagination-test".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sandbox_id = created.sandbox.id;
+
+    const TOTAL_COMMANDS: usize = 5;
+    let mut created_ids = Vec::with_capacity(TOTAL_COMMANDS);
+    for index in 0..TOTAL_COMMANDS {
+        let command: QueueCommandResponse = client
+            .post(format!(
+                "{}/sandboxes/{}/commands",
+                server.base_url, sandbox_id
+            ))
+            .json(&CommandRequest {
+                argv: vec!["echo".to_string(), index.to_string()],
+                cwd: None,
+                env: Default::default(),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        created_ids.push(command.command.id);
+    }
+
+    // limit=0 is rejected rather than silently treated as "no limit".
+    let zero_limit = client
+        .get(format!(
+            "{}/sandboxes/{}/commands?limit=0",
+            server.base_url, sandbox_id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(zero_limit.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Passing both before and after is rejected as ambiguous.
+    let both_cursors = client
+        .get(format!(
+            "{}/sandboxes/{}/commands?before=a&after=b",
+            server.base_url, sandbox_id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(both_cursors.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Page through the full set two at a time and confirm we see every command exactly once, in
+    // creation order, with the cursor chain terminating cleanly on the last page.
+    let mut collected = Vec::with_capacity(TOTAL_COMMANDS);
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut url = format!(
+            "{}/sandboxes/{}/commands?limit=2",
+            server.base_url, sandbox_id
+        );
+        if let Some(after) = &cursor {
+            url.push_str(&format!("&after={after}"));
+        }
+        let page: CommandListResponse = client
+            .get(url)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(page.commands.len() <= 2);
+        collected.extend(page.commands.iter().map(|command| command.id));
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+        assert!(
+            collected.len() < TOTAL_COMMANDS * 2,
+            "pagination did not terminate"
+        );
+    }
+
+    assert_eq!(collected, created_ids);
+}
+
 async fn run_contract(server: TestServer) {
-    let client = reqwest::Client::new();
+    let client = server.client();
 
     let health: HealthResponse = client
         .get(format!("{}/healthz", server.base_url))
@@ -784,9 +1167,14 @@ async fn assert_tenant_boundaries_are_enforced(
     server: &TestServer,
     default_sandbox: &SandboxResponse,
 ) {
-    let tenant_sandbox: SandboxResponse = client
+    // Authenticate as "tenant-b" using its own bearer token: tenant identity
+    // is derived solely from which credential matched, never from a
+    // client-supplied header, so a plain `.header(...)` no longer switches
+    // tenant context.
+    let tenant_b_client = reqwest::Client::new();
+    let tenant_sandbox: SandboxResponse = tenant_b_client
         .post(format!("{}/sandboxes", server.base_url))
-        .header("x-sandboxwich-tenant", "tenant-b")
+        .bearer_auth(TEST_TENANT_B_TOKEN)
         .json(&CreateSandboxRequest {
             name: Some("tenant-b-sandbox".to_string()),
             template: None,
@@ -837,9 +1225,9 @@ async fn assert_tenant_boundaries_are_enforced(
         .unwrap();
     assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
 
-    let cross_tenant_job = client
+    let cross_tenant_job = tenant_b_client
         .post(format!("{}/jobs", server.base_url))
-        .header("x-sandboxwich-tenant", "tenant-b")
+        .bearer_auth(TEST_TENANT_B_TOKEN)
         .json(&CreateJobRequest {
             kind: JobKind::ProvisionSandbox,
             payload: serde_json::json!({
@@ -854,9 +1242,9 @@ async fn assert_tenant_boundaries_are_enforced(
         .unwrap();
     assert_eq!(cross_tenant_job.status(), StatusCode::NOT_FOUND);
 
-    let tenant_list: SandboxListResponse = client
+    let tenant_list: SandboxListResponse = tenant_b_client
         .get(format!("{}/sandboxes", server.base_url))
-        .header("x-sandboxwich-tenant", "tenant-b")
+        .bearer_auth(TEST_TENANT_B_TOKEN)
         .send()
         .await
         .unwrap()
@@ -1038,12 +1426,12 @@ async fn assert_resource_tiers_and_file_contracts(
         .unwrap();
     assert_eq!(bad_mime.status(), StatusCode::BAD_REQUEST);
 
-    let hidden = client
+    let hidden = reqwest::Client::new()
         .get(format!(
             "{}/sandboxes/{}/files",
             server.base_url, default_sandbox.sandbox.id
         ))
-        .header("x-sandboxwich-tenant", "tenant-b")
+        .bearer_auth(TEST_TENANT_B_TOKEN)
         .send()
         .await
         .unwrap();
@@ -1761,33 +2149,63 @@ async fn assert_expired_lease_requeues_command(
     let lease = claimed.lease.expect("expected expiring lease");
     assert_eq!(lease.job.id, command.queued_job.id);
 
-    let jobs: JobListResponse = client
-        .get(format!("{}/jobs", server.base_url))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let expired_job = job_for_command(&jobs.jobs, command.command.id);
+    // Lease expiry now runs on a background sweep interval (see
+    // SANDBOXWICH_SWEEP_INTERVAL_MS in TestServer) instead of inline on this GET,
+    // so poll for the requeue instead of asserting it happened synchronously.
+    let expired_job = poll_until(|| async {
+        let jobs: JobListResponse = client
+            .get(format!("{}/jobs", server.base_url))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let job = job_for_command(&jobs.jobs, command.command.id);
+        (job.status == JobStatus::Queued).then_some(job)
+    })
+    .await
+    .expect("expired lease should requeue the job via the background sweep");
     assert_eq!(expired_job.status, JobStatus::Queued);
 
-    let fetched: CommandResponse = client
-        .get(format!(
-            "{}/commands/{}",
-            server.base_url, command.command.id
-        ))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let fetched = poll_until(|| async {
+        let response: CommandResponse = client
+            .get(format!(
+                "{}/commands/{}",
+                server.base_url, command.command.id
+            ))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        (response.command.status == CommandStatus::Queued).then_some(response)
+    })
+    .await
+    .expect("expired lease should reset the command to queued via the background sweep");
     assert_eq!(fetched.command.status, CommandStatus::Queued);
+}
+
+/// Polls `check` until it returns `Some`, or panics after a bounded wait. Used
+/// for assertions on state produced by the background expiry sweeper, which is
+/// no longer synchronous with any single request.
+async fn poll_until<F, Fut, T>(mut check: F) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    for _ in 0..100 {
+        if let Some(value) = check().await {
+            return Some(value);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    None
 }
 
 async fn assert_prompt_job_lifecycle(
@@ -2122,22 +2540,36 @@ async fn assert_desktop_session_lifecycle(
         .json()
         .await
         .unwrap();
-    let discovered: DesktopSessionListResponse = client
-        .get(format!(
-            "{}/sandboxes/{}/desktop-sessions",
-            server.base_url, sandbox.sandbox.id
-        ))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(discovered.desktop_sessions.iter().any(|seen| {
-        seen.id == expiring.desktop_session.id && seen.status == DesktopSessionStatus::Expired
-    }));
+    // Desktop session expiry now runs on the background sweep interval instead
+    // of inline on this GET, so poll for it instead of asserting synchronously.
+    let expired_seen = poll_until(|| async {
+        let discovered: DesktopSessionListResponse = client
+            .get(format!(
+                "{}/sandboxes/{}/desktop-sessions",
+                server.base_url, sandbox.sandbox.id
+            ))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        discovered
+            .desktop_sessions
+            .iter()
+            .any(|seen| {
+                seen.id == expiring.desktop_session.id
+                    && seen.status == DesktopSessionStatus::Expired
+            })
+            .then_some(())
+    })
+    .await;
+    assert!(
+        expired_seen.is_some(),
+        "expired desktop session should be reported via the background sweep"
+    );
 }
 
 async fn assert_snapshot_fork_and_cleanup_lifecycle(
@@ -2300,6 +2732,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .unwrap();
     let cleanup: SnapshotCleanupResponse = client
         .post(format!("{}/snapshots/cleanup", server.base_url))
+        .header(OPERATOR_TOKEN_HEADER, TEST_OPERATOR_TOKEN)
         .send()
         .await
         .unwrap()
@@ -2348,6 +2781,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .unwrap();
     let cleanup: SnapshotCleanupResponse = client
         .post(format!("{}/snapshots/cleanup", server.base_url))
+        .header(OPERATOR_TOKEN_HEADER, TEST_OPERATOR_TOKEN)
         .send()
         .await
         .unwrap()
@@ -2916,6 +3350,10 @@ fn provider_resource(
 }
 
 impl TestServer {
+    /// Starts a server with real multi-tenant auth configured (the default
+    /// tenant plus "tenant-b"), so every existing behavioral test continues
+    /// to exercise an authenticated deployment rather than the removed
+    /// header-trust fallback.
     async fn start(database_url: String, data_dir: Option<TempDir>) -> Self {
         Self::start_with_auth(database_url, data_dir, None).await
     }
@@ -2928,6 +3366,10 @@ impl TestServer {
         Self::start_with_auth_and_auto_migrate(database_url, data_dir, None, auto_migrate).await
     }
 
+    /// `auth_token: Some(token)` configures `SANDBOXWICH_API_TOKEN` (shared,
+    /// single-tenant) mode with that exact token. `auth_token: None`
+    /// configures `SANDBOXWICH_TENANT_TOKENS` (multi-tenant) mode with
+    /// `TEST_DEFAULT_TENANT_TOKEN` and `TEST_TENANT_B_TOKEN`.
     async fn start_with_auth(
         database_url: String,
         data_dir: Option<TempDir>,
@@ -2942,6 +3384,50 @@ impl TestServer {
         auth_token: Option<&str>,
         auto_migrate: bool,
     ) -> Self {
+        let default_tenant_token = auth_token
+            .map(str::to_string)
+            .unwrap_or_else(|| TEST_DEFAULT_TENANT_TOKEN.to_string());
+        let resolved_auth_token = default_tenant_token.clone();
+        Self::spawn(database_url, data_dir, auto_migrate, move |command| {
+            if let Some(auth_token) = auth_token {
+                command.env("SANDBOXWICH_API_TOKEN", auth_token);
+            } else {
+                command.env(
+                    "SANDBOXWICH_TENANT_TOKENS",
+                    format!("default={default_tenant_token},tenant-b={TEST_TENANT_B_TOKEN}"),
+                );
+            }
+            command.env("SANDBOXWICH_OPERATOR_TOKEN", TEST_OPERATOR_TOKEN);
+        })
+        .await
+        .with_auth_token(Some(resolved_auth_token))
+    }
+
+    /// Starts a server with neither `SANDBOXWICH_API_TOKEN` nor
+    /// `SANDBOXWICH_TENANT_TOKENS` set, to prove the fail-closed behavior
+    /// from issue #63: with no auth configured, the server must refuse every
+    /// non-probe request rather than trusting a client-supplied
+    /// `x-sandboxwich-tenant` header.
+    async fn start_with_no_auth_configured(
+        database_url: String,
+        data_dir: Option<TempDir>,
+    ) -> Self {
+        Self::spawn(database_url, data_dir, true, |_command| {})
+            .await
+            .with_auth_token(None)
+    }
+
+    fn with_auth_token(mut self, auth_token: Option<String>) -> Self {
+        self.auth_token = auth_token;
+        self
+    }
+
+    async fn spawn(
+        database_url: String,
+        data_dir: Option<TempDir>,
+        auto_migrate: bool,
+        configure: impl FnOnce(&mut Command),
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let bind = listener.local_addr().unwrap();
         drop(listener);
@@ -2950,32 +3436,39 @@ impl TestServer {
         command
             .env("SANDBOXWICH_DATABASE_URL", &database_url)
             .env("SANDBOXWICH_BIND", bind.to_string())
+            // Expiry sweeps (leases, snapshots, desktop sessions) now run on a
+            // background interval instead of inline on every read request; run
+            // it fast in tests so assertions that expect prompt expiry don't
+            // need long sleeps.
+            .env("SANDBOXWICH_SWEEP_INTERVAL_MS", "25")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         if !auto_migrate {
             command.env("SANDBOXWICH_AUTO_MIGRATE", "false");
         }
-        if let Some(auth_token) = auth_token {
-            command.env("SANDBOXWICH_API_TOKEN", auth_token);
-        }
+        configure(&mut command);
         let mut child = command.spawn().unwrap();
 
         let base_url = format!("http://{bind}");
-        let client = reqwest::Client::new();
+        // /healthz is a probe path exempt from auth in every mode, so no
+        // credential is needed here regardless of how the server was
+        // configured above.
+        let health_client = reqwest::Client::new();
         for _ in 0..100 {
-            let mut health_request = client.get(format!("{base_url}/healthz"));
-            if let Some(auth_token) = auth_token {
-                health_request = health_request.bearer_auth(auth_token);
-            }
-            if let Ok(response) = health_request.send().await
-                && response.status().is_success()
+            if let Ok(response) = health_client
+                .get(format!("{base_url}/healthz"))
+                .send()
+                .await
             {
-                return Self {
-                    base_url,
-                    database_url,
-                    child,
-                    _data_dir: data_dir,
-                };
+                if response.status().is_success() {
+                    return Self {
+                        base_url,
+                        database_url,
+                        child,
+                        auth_token: None,
+                        _data_dir: data_dir,
+                    };
+                }
             }
             if let Some(status) = child.try_wait().unwrap() {
                 panic!("server exited before becoming healthy: {status}");
@@ -2986,6 +3479,27 @@ impl TestServer {
         let _ = child.kill();
         let _ = child.wait();
         panic!("server did not become healthy");
+    }
+
+    /// A client that authenticates as the default tenant when the server has
+    /// auth configured (i.e. wasn't started via
+    /// `start_with_no_auth_configured`), and an unauthenticated client
+    /// otherwise.
+    fn client(&self) -> reqwest::Client {
+        match &self.auth_token {
+            Some(token) => {
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(
+                    reqwest::header::AUTHORIZATION,
+                    format!("Bearer {token}").parse().unwrap(),
+                );
+                reqwest::Client::builder()
+                    .default_headers(headers)
+                    .build()
+                    .unwrap()
+            }
+            None => reqwest::Client::new(),
+        }
     }
 }
 
@@ -3649,10 +4163,6 @@ fn insert_runtime_resource_tombstone_sql(database_url: &str) -> String {
     )
 }
 
-// Test-only helper mirroring a wide insert statement; bundling the
-// columns into a params struct is a larger test-harness refactor left
-// for a follow-up rather than done as part of this CI/lint cleanup.
-#[allow(clippy::too_many_arguments)]
 async fn insert_runtime_resource_tombstone(
     pool: &sqlx::AnyPool,
     database_url: &str,

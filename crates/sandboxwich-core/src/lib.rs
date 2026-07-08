@@ -691,6 +691,9 @@ pub struct SandboxResponse {
 pub struct SandboxListResponse {
     pub ok: bool,
     pub sandboxes: Vec<Sandbox>,
+    /// Opaque keyset cursor for the next page, present only when more results exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -699,7 +702,14 @@ pub struct RuntimeResourceListResponse {
     pub resources: Vec<RuntimeResource>,
 }
 
-pub const MAX_SANDBOX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+/// Maximum size of a file that can be uploaded into a sandbox and stored (base64-encoded) in the
+/// primary database. Kept well below the historical 512 MiB cap: base64 inflates storage by ~33%,
+/// every stored byte lives in the primary DB (not object storage), and the whole file is buffered
+/// in process memory both on upload and on download. 64 MiB covers the overwhelming majority of
+/// legitimate config/source/small-artifact uploads while bounding per-request memory and DB bloat.
+/// Workloads that need larger blobs should use snapshots or an external object store (tracked as
+/// follow-up work, not implemented in this change).
+pub const MAX_SANDBOX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UploadFileRequest {
@@ -802,6 +812,8 @@ pub struct SnapshotResponse {
 pub struct SnapshotListResponse {
     pub ok: bool,
     pub snapshots: Vec<Snapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -980,6 +992,8 @@ pub struct QueueCommandResponse {
 pub struct CommandListResponse {
     pub ok: bool,
     pub commands: Vec<CommandRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1012,6 +1026,8 @@ pub struct CommandOutputChunkResponse {
 pub struct CommandOutputListResponse {
     pub ok: bool,
     pub chunks: Vec<CommandOutputChunk>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1071,6 +1087,8 @@ pub struct SandboxEvent {
 pub struct EventListResponse {
     pub ok: bool,
     pub events: Vec<SandboxEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 db_variant_enum! {
@@ -1265,6 +1283,8 @@ pub struct JobResponse {
 pub struct JobListResponse {
     pub ok: bool,
     pub jobs: Vec<Job>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

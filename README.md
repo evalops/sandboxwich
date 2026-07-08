@@ -55,7 +55,16 @@ By default the CLI talks to `http://127.0.0.1:3217`. Override it with `SANDBOXWI
 By default the API writes to `sqlite://sandboxwich.db`. Override it with `SANDBOXWICH_DATABASE_URL`, for example `postgres://sandboxwich:secret@localhost:5432/sandboxwich`.
 Tune the API pool with `SANDBOXWICH_DATABASE_MAX_CONNECTIONS`.
 
-The API exposes `/healthz`, `/readyz`, and `/metrics`. Set `SANDBOXWICH_API_TOKEN` to require bearer auth on API and metrics requests; `/healthz` and `/readyz` remain probe-friendly for Kubernetes.
+The API exposes `/healthz`, `/readyz`, and `/metrics`. `/healthz` and `/readyz` remain probe-friendly for Kubernetes; every other route requires authentication.
+
+Configure exactly one of:
+
+- `SANDBOXWICH_API_TOKEN` — a single shared bearer token. **This is single-tenant only**: every request that presents the token is treated as `SANDBOXWICH_DEFAULT_TENANT` (`default` unless overridden), regardless of any `x-sandboxwich-tenant` header a client sends. Do not run more than one tenant's data through a shared-token deployment.
+- `SANDBOXWICH_TENANT_TOKENS` — a comma-separated `tenant_id=token` list (e.g. `acme=abc123,globex=def456`) for real multi-tenant isolation. Tenant identity is derived from which bearer token matched, never from a client-supplied header.
+
+If neither is set, the API fails closed: it refuses every non-probe request with an error rather than trusting a client-supplied `x-sandboxwich-tenant` header. There is no way to run sandboxwich-api unauthenticated.
+
+`POST /snapshots/cleanup` performs cross-tenant maintenance (expiring snapshots and deleting archived sandboxes for every tenant) and is gated by a separate `SANDBOXWICH_OPERATOR_TOKEN` credential, checked via the `x-sandboxwich-operator-token` header. This token is intentionally distinct from tenant/shared tokens: a valid tenant credential is never sufficient to run cleanup, and cleanup is disabled (rejected) until an operator token is configured.
 
 Sandbox create accepts typed memory tiers (`1g`, `4g`, `16g`, `64g`) and typed network egress policy. File upload/list/download state is persisted in SQL and command output chunks can carry typed file-citation annotations.
 
