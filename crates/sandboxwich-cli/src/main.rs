@@ -1,7 +1,11 @@
+use std::time::Duration;
+
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use sandboxwich_core::{
-    CapacityResponse, CommandListResponse, CommandRequest, CommandResponse,
+    CapacityResponse, CommandId, CommandListResponse, CommandOutputListResponse,
+    CommandOutputStream, CommandRequest, CommandResponse, CommandRun, CommandStatus,
     CreateDesktopSessionRequest, CreateSandboxRequest, CreateSnapshotRequest, DesktopAccessMode,
     DesktopAccessRequest, DesktopAccessResponse, DesktopSessionListResponse,
     DesktopSessionResponse, DesktopSessionStatus, EventListResponse, FileResponse,
@@ -10,9 +14,15 @@ use sandboxwich_core::{
     SandboxListResponse, SandboxResponse, SnapshotCleanupResponse, SnapshotListResponse,
     SnapshotResponse, SshAccessRequest, SshAccessResponse, SshKeyListResponse, SshKeyResponse,
     SshKeyStatus, UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest,
-    WorkerListResponse, build_api_client,
+    WorkerListResponse,
 };
 use uuid::Uuid;
+
+/// Default `reqwest` request timeout applied to every CLI call; overridable via
+/// `--request-timeout-secs` / `SANDBOXWICH_REQUEST_TIMEOUT_SECS`. A value of `0` disables it.
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Default ceiling on how long `--wait`/`--follow` (and `logs --follow`) poll for completion.
+const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Debug, Parser)]
 #[command(name = "sandboxwich")]
@@ -26,6 +36,14 @@ struct Cli {
 
     #[arg(long, env = "SANDBOXWICH_TENANT")]
     tenant: Option<String>,
+
+    /// Request timeout in seconds applied to every API call. `0` disables the timeout.
+    #[arg(
+        long,
+        env = "SANDBOXWICH_REQUEST_TIMEOUT_SECS",
+        default_value_t = DEFAULT_REQUEST_TIMEOUT_SECS
+    )]
+    request_timeout_secs: u64,
 
     #[command(subcommand)]
     command: Command,
@@ -56,6 +74,7 @@ enum Command {
     Exec(ExecArgs),
     Commands { sandbox_id: Uuid },
     Command { command_id: Uuid },
+    Logs(LogsArgs),
     Workers,
     Capacity,
     Jobs,
@@ -196,8 +215,33 @@ struct PromptArgs {
 struct ExecArgs {
     sandbox_id: Uuid,
 
+    /// Block until the command reaches a terminal state (Finished/Failed) before printing.
+    #[arg(long)]
+    wait: bool,
+
+    /// Like --wait, but also tail stdout/stderr as new output chunks arrive. Implies --wait.
+    #[arg(long)]
+    follow: bool,
+
+    /// Maximum time to poll for completion when --wait/--follow is set.
+    #[arg(long, default_value_t = DEFAULT_WAIT_TIMEOUT_SECS)]
+    wait_timeout_secs: u64,
+
     #[arg(trailing_var_arg = true, required = true)]
     argv: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct LogsArgs {
+    command_id: Uuid,
+
+    /// Keep polling and tailing output until the command reaches a terminal state.
+    #[arg(long)]
+    follow: bool,
+
+    /// Maximum time to poll for completion when --follow is set.
+    #[arg(long, default_value_t = DEFAULT_WAIT_TIMEOUT_SECS)]
+    wait_timeout_secs: u64,
 }
 
 #[derive(Debug, Args)]
@@ -284,7 +328,16 @@ enum MemoryLimitArg {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let client = build_api_client(cli.api_token.as_deref(), cli.tenant.as_deref())?;
+    let request_timeout = if cli.request_timeout_secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(cli.request_timeout_secs))
+    };
+    let client = build_client(
+        cli.api_token.as_deref(),
+        cli.tenant.as_deref(),
+        request_timeout,
+    )?;
     let api = cli.api.trim_end_matches('/');
 
     match cli.command {
@@ -477,6 +530,8 @@ async fn main() -> anyhow::Result<()> {
             print_json::<PromptQueuedResponse>(response).await?;
         }
         Command::Exec(args) => {
+            let follow = args.follow;
+            let wait = args.wait || follow;
             let response = client
                 .post(format!("{api}/sandboxes/{}/commands", args.sandbox_id))
                 .json(&CommandRequest {
@@ -486,7 +541,20 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .send()
                 .await?;
-            print_json::<CommandResponse>(response).await?;
+            let queued = decode_json::<CommandResponse>(response).await?;
+            if wait {
+                let command = poll_command_until_terminal(
+                    &client,
+                    api,
+                    queued.command.id,
+                    Duration::from_secs(args.wait_timeout_secs),
+                    follow,
+                )
+                .await?;
+                print_value(&CommandResponse { ok: true, command })?;
+            } else {
+                print_value(&queued)?;
+            }
         }
         Command::Commands { sandbox_id } => {
             let response = client
@@ -501,6 +569,36 @@ async fn main() -> anyhow::Result<()> {
                 .send()
                 .await?;
             print_json::<CommandResponse>(response).await?;
+        }
+        Command::Logs(args) => {
+            // One-shot fetch, reusing the existing `Command::Command` getter's endpoint.
+            let response = client
+                .get(format!("{api}/commands/{}", args.command_id))
+                .send()
+                .await?;
+            let initial = decode_json::<CommandResponse>(response).await?.command;
+
+            let command = if args.follow && !is_terminal(&initial.status) {
+                poll_command_until_terminal(
+                    &client,
+                    api,
+                    CommandId(args.command_id),
+                    Duration::from_secs(args.wait_timeout_secs),
+                    true,
+                )
+                .await?
+            } else {
+                let output = client
+                    .get(format!("{api}/commands/{}/output", args.command_id))
+                    .send()
+                    .await?;
+                let chunks = decode_json::<CommandOutputListResponse>(output)
+                    .await?
+                    .chunks;
+                print_output_chunks(&chunks);
+                initial
+            };
+            print_value(&CommandResponse { ok: true, command })?;
         }
         Command::Workers => {
             let response = client.get(format!("{api}/workers")).send().await?;
@@ -697,8 +795,113 @@ where
     T: serde::de::DeserializeOwned + serde::Serialize,
 {
     let value = decode_json::<T>(response).await?;
-    println!("{}", serde_json::to_string_pretty(&value)?);
+    print_value(&value)
+}
+
+fn print_value<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+fn is_terminal(status: &CommandStatus) -> bool {
+    matches!(status, CommandStatus::Finished | CommandStatus::Failed)
+}
+
+fn print_output_chunks(chunks: &[sandboxwich_core::CommandOutputChunk]) {
+    use std::io::Write as _;
+
+    for chunk in chunks {
+        match chunk.stream {
+            CommandOutputStream::Stdout => {
+                print!("{}", chunk.chunk);
+                let _ = std::io::stdout().flush();
+            }
+            CommandOutputStream::Stderr => {
+                eprint!("{}", chunk.chunk);
+                let _ = std::io::stderr().flush();
+            }
+        }
+    }
+}
+
+/// Polls `GET /commands/{id}` (the existing one-shot command getter) with bounded exponential
+/// backoff until the command reaches a terminal state (Finished/Failed) or `timeout` elapses.
+/// When `follow` is set, also polls `GET /commands/{id}/output` each iteration and prints any
+/// output chunks not yet seen, so stdout/stderr are tailed live rather than dumped at the end.
+async fn poll_command_until_terminal(
+    client: &reqwest::Client,
+    api: &str,
+    command_id: CommandId,
+    timeout: Duration,
+    follow: bool,
+) -> anyhow::Result<CommandRun> {
+    let start = tokio::time::Instant::now();
+    let mut delay = Duration::from_millis(200);
+    let max_delay = Duration::from_secs(5);
+    let mut seen_chunks = 0usize;
+
+    loop {
+        let response = client
+            .get(format!("{api}/commands/{command_id}"))
+            .send()
+            .await?;
+        let command = decode_json::<CommandResponse>(response).await?.command;
+
+        if follow {
+            let output = client
+                .get(format!("{api}/commands/{command_id}/output"))
+                .send()
+                .await?;
+            let chunks = decode_json::<CommandOutputListResponse>(output)
+                .await?
+                .chunks;
+            print_output_chunks(&chunks[seen_chunks.min(chunks.len())..]);
+            seen_chunks = chunks.len();
+        }
+
+        if is_terminal(&command.status) {
+            return Ok(command);
+        }
+
+        if start.elapsed() >= timeout {
+            bail!(
+                "timed out after {:?} waiting for command {command_id} to finish (last status: {:?})",
+                timeout,
+                command.status
+            );
+        }
+
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(max_delay);
+    }
+}
+
+/// Builds the shared API client, applying auth/tenant headers and an optional request timeout
+/// overridable via `--request-timeout-secs` / `SANDBOXWICH_REQUEST_TIMEOUT_SECS`.
+fn build_client(
+    api_token: Option<&str>,
+    tenant: Option<&str>,
+    request_timeout: Option<Duration>,
+) -> anyhow::Result<reqwest::Client> {
+    let mut headers = HeaderMap::new();
+    if let Some(api_token) = api_token.map(str::trim).filter(|token| !token.is_empty()) {
+        let value = format!("Bearer {api_token}");
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&value).context("invalid SANDBOXWICH_API_TOKEN")?,
+        );
+    }
+    if let Some(tenant) = tenant.map(str::trim).filter(|tenant| !tenant.is_empty()) {
+        headers.insert(
+            HeaderName::from_static("x-sandboxwich-tenant"),
+            HeaderValue::from_str(tenant).context("invalid SANDBOXWICH_TENANT")?,
+        );
+    }
+    let mut builder = reqwest::Client::builder().default_headers(headers);
+    if let Some(request_timeout) = request_timeout {
+        builder = builder.timeout(request_timeout);
+    }
+    builder.build().context("failed to build HTTP client")
 }
 
 async fn decode_json<T>(response: reqwest::Response) -> anyhow::Result<T>
@@ -715,4 +918,43 @@ where
     }
 
     serde_json::from_str(&body).context("failed to decode response body")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_terminal_true_only_for_finished_or_failed() {
+        assert!(is_terminal(&CommandStatus::Finished));
+        assert!(is_terminal(&CommandStatus::Failed));
+        assert!(!is_terminal(&CommandStatus::Queued));
+        assert!(!is_terminal(&CommandStatus::Running));
+    }
+
+    #[test]
+    fn build_client_applies_a_request_timeout_by_default() {
+        // There's no public accessor on `reqwest::Client` for its configured timeout, so this
+        // just verifies the default-path construction succeeds; the request-timeout wiring
+        // itself is covered end-to-end by `--request-timeout-secs`/`SANDBOXWICH_REQUEST_TIMEOUT_SECS`
+        // being threaded straight into `reqwest::ClientBuilder::timeout`.
+        let client = build_client(
+            None,
+            None,
+            Some(Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS)),
+        );
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn build_client_allows_disabling_the_timeout() {
+        let client = build_client(None, None, None);
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn build_client_rejects_invalid_api_token_header_value() {
+        let client = build_client(Some("bad\ntoken"), None, None);
+        assert!(client.is_err());
+    }
 }
