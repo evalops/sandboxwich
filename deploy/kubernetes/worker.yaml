@@ -97,7 +97,11 @@ spec:
       containers:
         - name: worker
           image: ghcr.io/evalops/sandboxwich-worker:latest
-          imagePullPolicy: IfNotPresent
+          # TODO(follow-up): pin to the sha-<12> tag containers.yml already
+          # publishes instead of floating :latest, so deploys correlate to a
+          # commit. Always at least forces a pull instead of trusting a
+          # node's cached (possibly stale) :latest image.
+          imagePullPolicy: Always
           env:
             - name: SANDBOXWICH_API
               value: http://sandboxwich-api:3217

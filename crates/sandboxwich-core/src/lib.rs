@@ -459,18 +459,13 @@ pub enum CleanupRunStatus {
 }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub enum MemoryLimit {
+    #[default]
     OneG,
     FourG,
     SixteenG,
     SixtyFourG,
-}
-
-impl Default for MemoryLimit {
-    fn default() -> Self {
-        Self::OneG
-    }
 }
 
 impl MemoryLimit {
@@ -575,18 +570,15 @@ pub struct NetworkAllowRule {
     pub value: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum NetworkEgress {
+    #[default]
     DenyAll,
-    Allowlist { rules: Vec<NetworkAllowRule> },
+    Allowlist {
+        rules: Vec<NetworkAllowRule>,
+    },
     AllowAll,
-}
-
-impl Default for NetworkEgress {
-    fn default() -> Self {
-        Self::DenyAll
-    }
 }
 
 impl NetworkEgress {
@@ -606,21 +598,12 @@ impl NetworkEgress {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub struct SandboxProvisionSpec {
     #[serde(default)]
     pub memory_limit: MemoryLimit,
     #[serde(default)]
     pub network_egress: NetworkEgress,
-}
-
-impl Default for SandboxProvisionSpec {
-    fn default() -> Self {
-        Self {
-            memory_limit: MemoryLimit::default(),
-            network_egress: NetworkEgress::default(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

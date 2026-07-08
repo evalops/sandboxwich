@@ -356,16 +356,15 @@ impl KubernetesDryRunProvider {
     }
 
     fn validate_network_policy_egress(network_egress: &NetworkEgress) -> anyhow::Result<()> {
-        if let NetworkEgress::Allowlist { rules } = network_egress {
-            if let Some(rule) = rules
+        if let NetworkEgress::Allowlist { rules } = network_egress
+            && let Some(rule) = rules
                 .iter()
                 .find(|rule| rule.kind == NetworkAllowRuleKind::Host)
-            {
-                bail!(
-                    "standard Kubernetes NetworkPolicy cannot enforce host allow rule {}; use cidr allow rules or a provider with FQDN egress support",
-                    rule.value
-                );
-            }
+        {
+            bail!(
+                "standard Kubernetes NetworkPolicy cannot enforce host allow rule {}; use cidr allow rules or a provider with FQDN egress support",
+                rule.value
+            );
         }
         Ok(())
     }
