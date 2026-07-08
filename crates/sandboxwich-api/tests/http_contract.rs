@@ -243,7 +243,10 @@ async fn small_body_route_rejects_oversized_json_but_upload_route_accepts_large_
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!(
         "sqlite://{}",
-        data_dir.path().join("sandboxwich-body-limit-test.db").display()
+        data_dir
+            .path()
+            .join("sandboxwich-body-limit-test.db")
+            .display()
     );
     let server = TestServer::start(database_url, Some(data_dir)).await;
     let client = reqwest::Client::new();
@@ -325,7 +328,10 @@ async fn list_commands_respect_limit_and_paginate_with_cursor() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!(
         "sqlite://{}",
-        data_dir.path().join("sandboxwich-pagination-test.db").display()
+        data_dir
+            .path()
+            .join("sandboxwich-pagination-test.db")
+            .display()
     );
     let server = TestServer::start(database_url, Some(data_dir)).await;
     let client = reqwest::Client::new();

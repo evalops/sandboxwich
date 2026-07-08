@@ -1446,10 +1446,8 @@ struct PageCursor {
 
 impl PageCursor {
     fn encode(&self) -> String {
-        general_purpose::URL_SAFE_NO_PAD.encode(format!(
-            "{}{PAGE_CURSOR_SEP}{}",
-            self.created_at, self.id
-        ))
+        general_purpose::URL_SAFE_NO_PAD
+            .encode(format!("{}{PAGE_CURSOR_SEP}{}", self.created_at, self.id))
     }
 
     fn decode(raw: &str) -> Result<Self, ApiError> {
@@ -1478,7 +1476,9 @@ fn resolve_page_limit(limit: Option<u32>) -> Result<u32, ApiError> {
     }
 }
 
-fn resolve_page_cursor(params: &PageParams) -> Result<Option<(PageDirection, PageCursor)>, ApiError> {
+fn resolve_page_cursor(
+    params: &PageParams,
+) -> Result<Option<(PageDirection, PageCursor)>, ApiError> {
     match (&params.before, &params.after) {
         (Some(_), Some(_)) => Err(ApiError::bad_request(
             "only one of before or after may be set",
