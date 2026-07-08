@@ -54,10 +54,12 @@ RUN groupadd --gid "${SANDBOX_GID}" "${SANDBOX_USER}" \
         --uid "${SANDBOX_UID}" \
         --gid "${SANDBOX_GID}" \
         "${SANDBOX_USER}" \
-    && printf '%s ALL=(ALL) NOPASSWD:ALL\n' "${SANDBOX_USER}" > /etc/sudoers.d/sandboxwich \
-    && chmod 0440 /etc/sudoers.d/sandboxwich \
     && mkdir -p /run/sshd /run/sandboxwich/ssh /workspace \
     && chown -R "${SANDBOX_USER}:${SANDBOX_USER}" /run/sandboxwich /workspace "/home/${SANDBOX_USER}"
+# NOTE (GH-75): intentionally no passwordless (or any) sudoers grant for
+# ${SANDBOX_USER}. The previous `ALL=(ALL) NOPASSWD:ALL` entry meant any
+# code execution as this user was one `sudo` away from root, defeating
+# runAsNonRoot/capability-drop/seccomp at the pod securityContext layer.
 
 COPY sandboxwich-entrypoint.sh /usr/local/bin/sandboxwich-entrypoint
 RUN chmod 0755 /usr/local/bin/sandboxwich-entrypoint

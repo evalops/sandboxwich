@@ -19,6 +19,26 @@ use serde_json::{Map, Value, json};
 pub const KUBERNETES_MUTATION_ENV: &str = "SANDBOXWICH_K8S_ENABLE_MUTATION";
 pub const DEFAULT_SANDBOX_GUEST_IMAGE: &str = "ghcr.io/evalops/sandboxwich-ubuntu-dev:latest";
 
+/// Default dedicated namespace sandbox workloads are provisioned into, kept
+/// separate from the control-plane namespace (see GH-76). Not read directly
+/// by this crate (the sandbox namespace stays opt-in via
+/// `--sandbox-namespace`/`SANDBOXWICH_SANDBOX_NAMESPACE` to avoid changing
+/// behavior for existing single-namespace deployments); this constant
+/// documents the value the checked-in worker Deployment manifest sets
+/// explicitly.
+#[allow(dead_code)]
+pub const DEFAULT_SANDBOX_NAMESPACE: &str = "sandboxwich-sandboxes";
+/// Default namespace running the cluster DNS service.
+pub const DEFAULT_DNS_NAMESPACE: &str = "kube-system";
+/// Egress CIDRs excluded by default from `0.0.0.0/0` allow rules: link-local
+/// (which covers cloud metadata endpoints) plus the k3s default cluster and
+/// service CIDRs. Override with real values for non-k3s clusters (GH-66).
+pub const DEFAULT_EGRESS_EXCLUDED_CIDRS: &[&str] =
+    &["169.254.0.0/16", "10.42.0.0/16", "10.43.0.0/16"];
+/// Default label used to identify control-plane pods allowed to reach a
+/// sandbox's ssh/desktop/vnc ports (GH-67).
+pub const DEFAULT_INGRESS_SELECTOR_KEY: &str = "app.kubernetes.io/part-of";
+pub const DEFAULT_INGRESS_SELECTOR_VALUE: &str = "sandboxwich";
 /// Kubernetes resource kinds (as a `kubectl get/delete` type list) that carry the
 /// `sandboxwich.dev/sandbox-id` label and must be torn down when a sandbox is stopped.
 pub const SANDBOX_TEARDOWN_RESOURCE_KINDS: &str = "pod,persistentvolumeclaim,service,networkpolicy";
@@ -66,6 +86,32 @@ pub struct KubernetesDryRunProvider {
     ssh_authorized_keys_secret: Option<String>,
     runtime_class_name: Option<String>,
     isolation_backend: String,
+    /// Dedicated namespace sandbox pods/services/PVCs/NetworkPolicies are
+    /// rendered into. Falls back to `namespace` (the control-plane
+    /// namespace) when unset, preserving pre-existing single-namespace
+    /// deployments. See GH-76 for the namespace-separation rationale; full
+    /// wiring (namespace manifest, cross-namespace secret sync, etc.) is
+    /// tracked separately, this only controls where the provider renders
+    /// sandbox resources.
+    sandbox_namespace: Option<String>,
+    /// Namespace running cluster DNS, used to scope the always-on DNS
+    /// egress rule (GH-66).
+    dns_namespace: String,
+    /// CIDRs carved out (via NetworkPolicy `except`) of any `0.0.0.0/0`
+    /// egress rule so sandboxes can never reach the control plane /
+    /// metadata endpoints even in `AllowAll` or an allowlist that includes
+    /// `0.0.0.0/0` (GH-66).
+    egress_excluded_cidrs: Vec<String>,
+    /// Namespace containing pods allowed to reach a sandbox's ssh/desktop
+    /// ports via the rendered ingress NetworkPolicy. Falls back to
+    /// `namespace` (the control-plane namespace) when unset (GH-67).
+    ingress_namespace: Option<String>,
+    /// Pod selector labels identifying which pods in `ingress_namespace`
+    /// may reach a sandbox's ssh/desktop ports (GH-67).
+    ingress_pod_selector: BTreeMap<String, String>,
+    /// Optional Secret name providing `SANDBOXWICH_VNC_PASSWORD` to the
+    /// sandbox container, mirroring `ssh_authorized_keys_secret` (GH-67).
+    vnc_password_secret: Option<String>,
 }
 
 impl KubernetesDryRunProvider {
@@ -86,6 +132,18 @@ impl KubernetesDryRunProvider {
             ssh_authorized_keys_secret: None,
             runtime_class_name: None,
             isolation_backend: "kubernetes".to_string(),
+            sandbox_namespace: None,
+            dns_namespace: DEFAULT_DNS_NAMESPACE.to_string(),
+            egress_excluded_cidrs: DEFAULT_EGRESS_EXCLUDED_CIDRS
+                .iter()
+                .map(|cidr| cidr.to_string())
+                .collect(),
+            ingress_namespace: None,
+            ingress_pod_selector: BTreeMap::from([(
+                DEFAULT_INGRESS_SELECTOR_KEY.to_string(),
+                DEFAULT_INGRESS_SELECTOR_VALUE.to_string(),
+            )]),
+            vnc_password_secret: None,
         }
     }
 
@@ -124,10 +182,94 @@ impl KubernetesDryRunProvider {
         self
     }
 
+    pub fn with_sandbox_namespace(mut self, sandbox_namespace: Option<String>) -> Self {
+        self.sandbox_namespace = sandbox_namespace.and_then(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        });
+        self
+    }
+
+    pub fn with_dns_namespace(mut self, dns_namespace: Option<String>) -> Self {
+        if let Some(dns_namespace) = dns_namespace {
+            let dns_namespace = dns_namespace.trim();
+            if !dns_namespace.is_empty() {
+                self.dns_namespace = dns_namespace.to_string();
+            }
+        }
+        self
+    }
+
+    pub fn with_egress_excluded_cidrs(mut self, cidrs: Vec<String>) -> Self {
+        let cidrs: Vec<String> = cidrs
+            .into_iter()
+            .map(|cidr| cidr.trim().to_string())
+            .filter(|cidr| !cidr.is_empty())
+            .collect();
+        if !cidrs.is_empty() {
+            self.egress_excluded_cidrs = cidrs;
+        }
+        self
+    }
+
+    pub fn with_ingress_namespace(mut self, ingress_namespace: Option<String>) -> Self {
+        self.ingress_namespace = ingress_namespace.and_then(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        });
+        self
+    }
+
+    pub fn with_ingress_pod_selector(mut self, selector: Vec<(String, String)>) -> Self {
+        if !selector.is_empty() {
+            self.ingress_pod_selector = selector.into_iter().collect();
+        }
+        self
+    }
+
+    pub fn with_vnc_password_secret(mut self, secret: Option<String>) -> Self {
+        self.vnc_password_secret = secret.and_then(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        });
+        self
+    }
+
+    fn effective_sandbox_namespace(&self) -> &str {
+        self.sandbox_namespace
+            .as_deref()
+            .unwrap_or(self.namespace.as_str())
+    }
+
+    fn effective_ingress_namespace(&self) -> &str {
+        self.ingress_namespace
+            .as_deref()
+            .unwrap_or(self.namespace.as_str())
+    }
+
     fn labels(&self) -> BTreeMap<String, String> {
         let mut labels = BTreeMap::from([
             ("cluster".to_string(), self.cluster.clone()),
-            ("namespace".to_string(), self.namespace.clone()),
+            (
+                "namespace".to_string(),
+                self.effective_sandbox_namespace().to_string(),
+            ),
+            (
+                "control_plane_namespace".to_string(),
+                self.namespace.clone(),
+            ),
             ("provider_mode".to_string(), "dry_run".to_string()),
         ]);
         if let Some(storage_class) = &self.storage_class {
@@ -166,7 +308,8 @@ impl KubernetesDryRunProvider {
             "mode": "dry_run",
             "operation": operation,
             "cluster": self.cluster,
-            "namespace": self.namespace,
+            "namespace": self.effective_sandbox_namespace(),
+            "controlPlaneNamespace": self.namespace,
             "sandboxId": sandbox_id,
             "podName": format!("sandboxwich-{}", sandbox_id),
             "storageClass": self.storage_class,
@@ -251,9 +394,23 @@ impl KubernetesDryRunProvider {
         }
         json!({
             "name": name,
-            "namespace": self.namespace,
+            "namespace": self.effective_sandbox_namespace(),
             "labels": labels
         })
+    }
+
+    /// Ephemeral (root filesystem) storage limit for the sandbox container.
+    /// This is separate from the PVC-backed `/workspace` mount and bounds
+    /// how much a sandbox can write to `/tmp`, `/home`, and other
+    /// node-local paths, preventing a single sandbox from filling node
+    /// disk (GH-75).
+    fn ephemeral_storage_limit(memory_limit: &MemoryLimit) -> &'static str {
+        match memory_limit {
+            MemoryLimit::OneG => "1Gi",
+            MemoryLimit::FourG => "2Gi",
+            MemoryLimit::SixteenG => "4Gi",
+            MemoryLimit::SixtyFourG => "8Gi",
+        }
     }
 
     fn pod_manifest(
@@ -304,7 +461,21 @@ impl KubernetesDryRunProvider {
             }));
         }
 
+        if let Some(secret_name) = &self.vnc_password_secret {
+            env.push(json!({
+                "name": "SANDBOXWICH_VNC_PASSWORD",
+                "valueFrom": {
+                    "secretKeyRef": {
+                        "name": secret_name,
+                        "key": "vnc-password"
+                    }
+                }
+            }));
+        }
+
+        let ephemeral_storage = Self::ephemeral_storage_limit(&spec.memory_limit);
         let mut pod_spec = Map::from_iter([
+            ("automountServiceAccountToken".to_string(), json!(false)),
             (
                 "securityContext".to_string(),
                 json!({
@@ -330,11 +501,13 @@ impl KubernetesDryRunProvider {
                     "resources": {
                         "requests": {
                             "cpu": spec.memory_limit.cpu_limit(),
-                            "memory": spec.memory_limit.memory_quantity()
+                            "memory": spec.memory_limit.memory_quantity(),
+                            "ephemeral-storage": ephemeral_storage
                         },
                         "limits": {
                             "cpu": spec.memory_limit.cpu_limit(),
-                            "memory": spec.memory_limit.memory_quantity()
+                            "memory": spec.memory_limit.memory_quantity(),
+                            "ephemeral-storage": ephemeral_storage
                         }
                     },
                     "securityContext": {
@@ -394,6 +567,72 @@ impl KubernetesDryRunProvider {
         })
     }
 
+    /// Builds an `ipBlock` for `cidr`. When `cidr` is the wide-open
+    /// `0.0.0.0/0` (used by `AllowAll` and by allowlists that intentionally
+    /// include it), the configured `egress_excluded_cidrs` are carved out
+    /// via `except` so sandboxes can never reach the control plane / cloud
+    /// metadata endpoint regardless of egress mode (GH-66). `except` must
+    /// be a subset of `cidr`, which only holds generically for `0.0.0.0/0`,
+    /// so narrower allowlist CIDRs are left as-is.
+    fn ip_block(&self, cidr: &str) -> serde_json::Value {
+        if cidr == "0.0.0.0/0" && !self.egress_excluded_cidrs.is_empty() {
+            json!({
+                "cidr": cidr,
+                "except": self.egress_excluded_cidrs
+            })
+        } else {
+            json!({ "cidr": cidr })
+        }
+    }
+
+    /// Egress rule always appended so sandboxes can resolve DNS even under
+    /// a restrictive allowlist (GH-66). Scoped to the cluster DNS
+    /// namespace/pods rather than left open.
+    fn dns_egress_rule(&self) -> serde_json::Value {
+        json!({
+            "to": [{
+                "namespaceSelector": {
+                    "matchLabels": {
+                        "kubernetes.io/metadata.name": self.dns_namespace
+                    }
+                },
+                "podSelector": {
+                    "matchLabels": {
+                        "k8s-app": "kube-dns"
+                    }
+                }
+            }],
+            "ports": [
+                {"protocol": "UDP", "port": 53},
+                {"protocol": "TCP", "port": 53}
+            ]
+        })
+    }
+
+    /// Ingress rule restricting the sandbox's ssh/desktop/vnc ports to
+    /// control-plane pods only, closing the unauthenticated cross-tenant
+    /// path where any pod on the cluster network (including other
+    /// tenants' sandboxes) could otherwise reach them directly (GH-67).
+    fn ingress_rule(&self) -> serde_json::Value {
+        json!({
+            "from": [{
+                "namespaceSelector": {
+                    "matchLabels": {
+                        "kubernetes.io/metadata.name": self.effective_ingress_namespace()
+                    }
+                },
+                "podSelector": {
+                    "matchLabels": self.ingress_pod_selector
+                }
+            }],
+            "ports": [
+                {"protocol": "TCP", "port": 2222},
+                {"protocol": "TCP", "port": 6080},
+                {"protocol": "TCP", "port": 5900}
+            ]
+        })
+    }
+
     fn network_policy_manifest(
         &self,
         sandbox_id: SandboxId,
@@ -402,20 +641,23 @@ impl KubernetesDryRunProvider {
         Self::validate_network_policy_egress(network_egress)?;
         let egress = match network_egress {
             NetworkEgress::DenyAll => Vec::new(),
-            NetworkEgress::AllowAll => vec![json!({})],
-            NetworkEgress::Allowlist { rules } => rules
-                .iter()
-                .filter(|rule| rule.kind == NetworkAllowRuleKind::Cidr)
-                .map(|rule| {
-                    json!({
-                        "to": [{
-                            "ipBlock": {
-                                "cidr": rule.value
-                            }
-                        }]
+            NetworkEgress::AllowAll => vec![
+                json!({ "to": [{ "ipBlock": self.ip_block("0.0.0.0/0") }] }),
+                self.dns_egress_rule(),
+            ],
+            NetworkEgress::Allowlist { rules } => {
+                let mut egress: Vec<serde_json::Value> = rules
+                    .iter()
+                    .filter(|rule| rule.kind == NetworkAllowRuleKind::Cidr)
+                    .map(|rule| {
+                        json!({
+                            "to": [{ "ipBlock": self.ip_block(&rule.value) }]
+                        })
                     })
-                })
-                .collect(),
+                    .collect();
+                egress.push(self.dns_egress_rule());
+                egress
+            }
         };
 
         Ok(json!({
@@ -428,7 +670,8 @@ impl KubernetesDryRunProvider {
                         "sandboxwich.dev/sandbox-id": sandbox_id
                     }
                 },
-                "policyTypes": ["Egress"],
+                "policyTypes": ["Ingress", "Egress"],
+                "ingress": [self.ingress_rule()],
                 "egress": egress
             }
         }))
@@ -691,7 +934,7 @@ impl KubernetesDryRunProvider {
             resource_kind,
             purpose,
             resource_name,
-            namespace: self.namespace.clone(),
+            namespace: self.effective_sandbox_namespace().to_string(),
             status,
             cluster: Some(self.cluster.clone()),
             storage_class: None,
@@ -851,7 +1094,7 @@ impl KubernetesApplyProvider {
             mode: "apply".to_string(),
             operation: "smoke".to_string(),
             cluster: self.dry_run.cluster.clone(),
-            namespace: self.dry_run.namespace.clone(),
+            namespace: self.dry_run.effective_sandbox_namespace().to_string(),
             kubectl: self.kubectl.clone(),
             exec_handoff,
             apply_args: self.kubectl_args("apply"),
@@ -963,7 +1206,10 @@ impl KubernetesApplyProvider {
         if let Some(context) = &self.kubectl_context {
             args.extend(["--context".to_string(), context.clone()]);
         }
-        args.extend(["-n".to_string(), self.dry_run.namespace.clone()]);
+        args.extend([
+            "-n".to_string(),
+            self.dry_run.effective_sandbox_namespace().to_string(),
+        ]);
         args
     }
 
@@ -1255,7 +1501,8 @@ impl SandboxProvider for KubernetesDryRunProvider {
                 "mode": "dry_run",
                 "operation": "snapshot",
                 "cluster": self.cluster,
-                "namespace": self.namespace,
+                "namespace": self.effective_sandbox_namespace(),
+                "controlPlaneNamespace": self.namespace,
                 "sandboxId": sandbox_id,
                 "snapshotId": snapshot_id,
                 "volumeSnapshotName": format!("sandboxwich-snapshot-{}", snapshot_id),
@@ -1294,7 +1541,8 @@ impl SandboxProvider for KubernetesDryRunProvider {
                 "mode": "dry_run",
                 "operation": "fork",
                 "cluster": self.cluster,
-                "namespace": self.namespace,
+                "namespace": self.effective_sandbox_namespace(),
+                "controlPlaneNamespace": self.namespace,
                 "parentSandboxId": parent_sandbox_id,
                 "childSandboxId": child_sandbox_id,
                 "snapshotId": snapshot_id,
@@ -1946,6 +2194,276 @@ mod tests {
 
         KubernetesApplyProvider::validate_apply_gate(true, true)
             .expect("double opt-in should pass validation");
+    }
+
+    #[test]
+    fn allow_all_egress_carves_out_control_plane_and_dns_ranges() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        let spec = SandboxProvisionSpec {
+            memory_limit: MemoryLimit::OneG,
+            network_egress: NetworkEgress::AllowAll,
+        };
+
+        let provisioned = provider
+            .provision(SandboxId::new(), &spec)
+            .expect("dry-run provision should succeed");
+        let policy = &provisioned.metadata["manifests"]["networkPolicy"];
+
+        assert_eq!(policy["spec"]["policyTypes"], json!(["Ingress", "Egress"]));
+
+        let egress = policy["spec"]["egress"]
+            .as_array()
+            .expect("egress should be an array");
+        let open_rule = &egress[0]["to"][0]["ipBlock"];
+        assert_eq!(open_rule["cidr"], "0.0.0.0/0");
+        let except = open_rule["except"]
+            .as_array()
+            .expect("0.0.0.0/0 rule should carve out control-plane/link-local ranges");
+        let except: Vec<&str> = except.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(except.contains(&"169.254.0.0/16"));
+        assert!(except.contains(&"10.42.0.0/16"));
+        assert!(except.contains(&"10.43.0.0/16"));
+
+        let dns_rule = egress
+            .iter()
+            .find(|rule| rule["ports"][0]["port"] == 53)
+            .expect("a DNS egress rule should always be present");
+        assert_eq!(
+            dns_rule["to"][0]["podSelector"]["matchLabels"]["k8s-app"],
+            "kube-dns"
+        );
+        assert_eq!(
+            dns_rule["to"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "kube-system"
+        );
+        let ports: Vec<(String, i64)> = dns_rule["ports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                (
+                    p["protocol"].as_str().unwrap().to_string(),
+                    p["port"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        assert!(ports.contains(&("UDP".to_string(), 53)));
+        assert!(ports.contains(&("TCP".to_string(), 53)));
+    }
+
+    #[test]
+    fn allowlist_egress_always_includes_dns_rule_and_preserves_narrow_cidrs() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        let spec = SandboxProvisionSpec {
+            memory_limit: MemoryLimit::OneG,
+            network_egress: NetworkEgress::Allowlist {
+                rules: vec![sandboxwich_core::NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Cidr,
+                    value: "10.0.0.0/8".to_string(),
+                }],
+            },
+        };
+
+        let provisioned = provider
+            .provision(SandboxId::new(), &spec)
+            .expect("dry-run provision should succeed");
+        let egress = provisioned.metadata["manifests"]["networkPolicy"]["spec"]["egress"]
+            .as_array()
+            .expect("egress should be an array");
+
+        // Narrow allowlist CIDRs are left untouched (an `except` carve-out
+        // would only be valid if it were a subset of the allowed CIDR).
+        assert_eq!(egress[0]["to"][0]["ipBlock"]["cidr"], "10.0.0.0/8");
+        assert!(egress[0]["to"][0]["ipBlock"]["except"].is_null());
+
+        assert!(
+            egress.iter().any(|rule| rule["ports"][0]["port"] == 53),
+            "allowlist egress must still include a DNS rule so name resolution keeps working"
+        );
+    }
+
+    #[test]
+    fn allowlist_egress_carves_out_control_plane_ranges_when_wide_open_cidr_is_allowed() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        let spec = SandboxProvisionSpec {
+            memory_limit: MemoryLimit::OneG,
+            network_egress: NetworkEgress::Allowlist {
+                rules: vec![sandboxwich_core::NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Cidr,
+                    value: "0.0.0.0/0".to_string(),
+                }],
+            },
+        };
+
+        let provisioned = provider
+            .provision(SandboxId::new(), &spec)
+            .expect("dry-run provision should succeed");
+        let egress = provisioned.metadata["manifests"]["networkPolicy"]["spec"]["egress"]
+            .as_array()
+            .expect("egress should be an array");
+
+        assert!(
+            !egress[0]["to"][0]["ipBlock"]["except"]
+                .as_array()
+                .expect("0.0.0.0/0 allowlist entry should carve out control-plane ranges")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn deny_all_egress_still_renders_no_egress_rules() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        let spec = SandboxProvisionSpec {
+            memory_limit: MemoryLimit::OneG,
+            network_egress: NetworkEgress::DenyAll,
+        };
+
+        let provisioned = provider
+            .provision(SandboxId::new(), &spec)
+            .expect("dry-run provision should succeed");
+        assert_eq!(
+            provisioned.metadata["manifests"]["networkPolicy"]["spec"]["egress"],
+            json!([])
+        );
+    }
+
+    #[test]
+    fn network_policy_renders_ingress_rule_restricted_to_control_plane_pods() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        let provisioned = provider
+            .provision(SandboxId::new(), &SandboxProvisionSpec::default())
+            .expect("dry-run provision should succeed");
+        let policy = &provisioned.metadata["manifests"]["networkPolicy"];
+
+        assert_eq!(policy["spec"]["policyTypes"], json!(["Ingress", "Egress"]));
+        let ingress = policy["spec"]["ingress"]
+            .as_array()
+            .expect("ingress should be an array");
+        assert_eq!(ingress.len(), 1);
+        let from = &ingress[0]["from"][0];
+        assert_eq!(
+            from["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "sandboxwich-ci"
+        );
+        assert_eq!(
+            from["podSelector"]["matchLabels"]["app.kubernetes.io/part-of"],
+            "sandboxwich"
+        );
+        let ports: Vec<i64> = ingress[0]["ports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["port"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ports, vec![2222, 6080, 5900]);
+    }
+
+    #[test]
+    fn ingress_namespace_and_selector_are_configurable() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_ingress_namespace(Some("sandboxwich-ingress".to_string()))
+                .with_ingress_pod_selector(vec![(
+                    "app".to_string(),
+                    "sandboxwich-proxy".to_string(),
+                )]);
+        let provisioned = provider
+            .provision(SandboxId::new(), &SandboxProvisionSpec::default())
+            .expect("dry-run provision should succeed");
+        let from =
+            &provisioned.metadata["manifests"]["networkPolicy"]["spec"]["ingress"][0]["from"][0];
+
+        assert_eq!(
+            from["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "sandboxwich-ingress"
+        );
+        assert_eq!(
+            from["podSelector"]["matchLabels"]["app"],
+            "sandboxwich-proxy"
+        );
+    }
+
+    #[test]
+    fn pod_disables_service_account_token_automount_and_sets_ephemeral_storage_limits() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        let spec = SandboxProvisionSpec {
+            memory_limit: MemoryLimit::FourG,
+            network_egress: NetworkEgress::DenyAll,
+        };
+        let provisioned = provider
+            .provision(SandboxId::new(), &spec)
+            .expect("dry-run provision should succeed");
+        let pod = &provisioned.metadata["manifests"]["pod"];
+
+        assert_eq!(pod["spec"]["automountServiceAccountToken"], false);
+        assert_eq!(
+            pod["spec"]["containers"][0]["resources"]["requests"]["ephemeral-storage"],
+            "2Gi"
+        );
+        assert_eq!(
+            pod["spec"]["containers"][0]["resources"]["limits"]["ephemeral-storage"],
+            "2Gi"
+        );
+    }
+
+    #[test]
+    fn vnc_password_secret_is_injected_as_env_var_when_configured() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_vnc_password_secret(Some("sandboxwich-vnc-password".to_string()));
+        let provisioned = provider
+            .provision(SandboxId::new(), &SandboxProvisionSpec::default())
+            .expect("dry-run provision should succeed");
+        let env = provisioned.metadata["manifests"]["pod"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .expect("env should be an array");
+
+        assert!(env.iter().any(|entry| {
+            entry["name"] == "SANDBOXWICH_VNC_PASSWORD"
+                && entry["valueFrom"]["secretKeyRef"]["name"] == "sandboxwich-vnc-password"
+                && entry["valueFrom"]["secretKeyRef"]["key"] == "vnc-password"
+        }));
+    }
+
+    #[test]
+    fn sandbox_namespace_override_places_all_sandbox_resources_in_dedicated_namespace() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich", None, None)
+                .with_sandbox_namespace(Some("sandboxwich-sandboxes".to_string()));
+        let provisioned = provider
+            .provision(SandboxId::new(), &SandboxProvisionSpec::default())
+            .expect("dry-run provision should succeed");
+
+        assert_eq!(provisioned.metadata["namespace"], "sandboxwich-sandboxes");
+        assert_eq!(provisioned.metadata["controlPlaneNamespace"], "sandboxwich");
+        assert_eq!(
+            provisioned.metadata["manifests"]["pod"]["metadata"]["namespace"],
+            "sandboxwich-sandboxes"
+        );
+        assert_eq!(
+            provisioned.metadata["manifests"]["networkPolicy"]["metadata"]["namespace"],
+            "sandboxwich-sandboxes"
+        );
+        assert!(
+            provisioned
+                .resources
+                .iter()
+                .all(|resource| resource.namespace == "sandboxwich-sandboxes")
+        );
+
+        let apply = KubernetesApplyProvider::new(provider, "kubectl");
+        let plan = apply.smoke_plan(SandboxId::new(), SandboxId::new(), SnapshotId::new());
+        assert!(
+            plan.apply_args
+                .contains(&"sandboxwich-sandboxes".to_string())
+        );
+        assert!(!plan.apply_args.contains(&"sandboxwich".to_string()));
     }
 
     #[test]
