@@ -66,6 +66,10 @@ struct AuthConfig {
     /// Distinct from `shared_token`/`tenant_tokens`: gates operator-only routes
     /// (currently `/snapshots/cleanup`) that act across tenant boundaries.
     operator_token: Option<String>,
+    /// Explicit, off-by-default opt-out that lets the API serve with no
+    /// authentication configured, trusting the `x-sandboxwich-tenant` header.
+    /// Intended only for local development and benchmark harnesses.
+    allow_insecure_no_auth: bool,
 }
 
 #[derive(Clone)]
@@ -101,6 +105,7 @@ struct ApiConfig {
     shared_token: Option<String>,
     tenant_tokens: Vec<TenantToken>,
     operator_token: Option<String>,
+    allow_insecure_no_auth: bool,
     default_tenant_id: String,
 }
 
@@ -133,6 +138,16 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    if config.allow_insecure_no_auth
+        && config.shared_token.is_none()
+        && config.tenant_tokens.is_empty()
+    {
+        tracing::warn!(
+            "SANDBOXWICH_ALLOW_INSECURE_NO_AUTH is set: serving with no authentication and \
+             trusting the client-supplied tenant header. Do not use this in a shared deployment."
+        );
+    }
+
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     tracing::info!(addr = %config.bind, database_url = %config.database_url, "sandboxwich-api listening");
     axum::serve(
@@ -143,6 +158,7 @@ async fn main() -> anyhow::Result<()> {
                 shared_token: config.shared_token,
                 tenant_tokens: config.tenant_tokens,
                 operator_token: config.operator_token,
+                allow_insecure_no_auth: config.allow_insecure_no_auth,
             },
             default_tenant_id: config.default_tenant_id,
         }),
@@ -173,6 +189,7 @@ fn load_api_config() -> anyhow::Result<ApiConfig> {
         .ok()
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty());
+    let allow_insecure_no_auth = parse_env_bool("SANDBOXWICH_ALLOW_INSECURE_NO_AUTH", false)?;
     let default_tenant_id = std::env::var("SANDBOXWICH_DEFAULT_TENANT")
         .ok()
         .filter(|tenant| !tenant.trim().is_empty())
@@ -187,6 +204,7 @@ fn load_api_config() -> anyhow::Result<ApiConfig> {
         shared_token,
         tenant_tokens,
         operator_token,
+        allow_insecure_no_auth,
         default_tenant_id,
     })
 }
@@ -943,6 +961,19 @@ async fn auth_and_tenant(
             return ApiError::unauthorized("valid bearer token is required").into_response();
         }
         state.default_tenant_id.clone()
+    } else if state.auth.allow_insecure_no_auth {
+        // Explicit, off-by-default opt-out (SANDBOXWICH_ALLOW_INSECURE_NO_AUTH) for
+        // local development and benchmark harnesses: with no credential configured,
+        // trust the client-supplied tenant header. Never enable this in a shared
+        // deployment.
+        request
+            .headers()
+            .get("x-sandboxwich-tenant")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|tenant| !tenant.is_empty())
+            .unwrap_or(&state.default_tenant_id)
+            .to_string()
     } else {
         // Fail closed: with no SANDBOXWICH_API_TOKEN and no SANDBOXWICH_TENANT_TOKENS
         // configured, there is no credential to authenticate against, so we must
@@ -951,7 +982,8 @@ async fn auth_and_tenant(
         return ApiError::internal(
             "sandboxwich-api has no authentication configured; set SANDBOXWICH_API_TOKEN \
              (single-tenant) or SANDBOXWICH_TENANT_TOKENS (multi-tenant) to serve \
-             authenticated routes",
+             authenticated routes (or SANDBOXWICH_ALLOW_INSECURE_NO_AUTH=true for local \
+             development only)",
         )
         .into_response();
     };

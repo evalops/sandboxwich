@@ -38,6 +38,8 @@ jobs:
             -p sandboxwich-worker \
             -p sandboxwich-bench
       - name: Generate benchmark report
+        env:
+          SANDBOXWICH_ALLOW_INSECURE_NO_AUTH: "true"
         run: |
           cargo run -p sandboxwich-bench -- all \
             --api-bin target/debug/sandboxwich-api \
