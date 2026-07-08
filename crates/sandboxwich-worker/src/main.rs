@@ -1,6 +1,6 @@
 mod provider;
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -109,7 +109,7 @@ struct HeartbeatArgs {
     max_concurrent_jobs: Option<u32>,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Copy, Args)]
 struct ClaimArgs {
     worker_id: Uuid,
 
@@ -331,6 +331,13 @@ impl SandboxProvider for RuntimeProvider {
             }
         }
     }
+
+    fn stop(&self, sandbox_id: sandboxwich_core::SandboxId) -> anyhow::Result<()> {
+        match self {
+            Self::DryRun(provider) => provider.stop(sandbox_id),
+            Self::Apply(provider) => provider.stop(sandbox_id),
+        }
+    }
 }
 
 #[tokio::main]
@@ -533,7 +540,7 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
         Command::WorkOnce(args) => {
-            let provider = runtime_provider_from_args(args.provider);
+            let provider = Arc::new(runtime_provider_from_args(args.provider));
             let response = claim(
                 &client,
                 &api,
@@ -547,7 +554,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&response)?);
                 return Ok(());
             };
-            let response = handle_lease(&client, &api, lease, &provider).await?;
+            let response = handle_lease(&client, &api, lease, provider).await?;
             println!("{}", serde_json::to_string_pretty(&response)?);
         }
         Command::WorkLoop(args) => {
@@ -650,8 +657,81 @@ async fn heartbeat_worker(
     decode_json::<WorkerResponse>(response).await
 }
 
+/// Maximum number of attempts (including the first) for a single bounded retry
+/// around a control-plane API call.
+const API_RETRY_ATTEMPTS: u32 = 5;
+/// Starting delay between retries; doubles (capped at [`RETRY_MAX_DELAY`]) after
+/// each failed attempt.
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(10);
+/// Minimum lease-renewal interval, so short/dry-run leases don't hammer the API.
+const MIN_RENEW_INTERVAL: Duration = Duration::from_secs(5);
+/// Fallback lease duration used to size the renewal interval if a lease's
+/// `expires_at`/`leased_at` pair is somehow non-positive.
+const FALLBACK_LEASE_DURATION: Duration = Duration::from_secs(30);
+
+/// Runs `f` up to `attempts` times with exponential backoff between failures.
+/// Transient control-plane hiccups (a dropped connection, a 5xx, a timeout) should
+/// not be fatal to the worker process; this bounds how long we tolerate them before
+/// surfacing the error to the caller.
+async fn with_retries<T, F, Fut>(operation: &str, attempts: u32, f: F) -> anyhow::Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let mut delay = RETRY_BASE_DELAY;
+    let mut last_error = None;
+    for attempt in 1..=attempts.max(1) {
+        match f().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if attempt == attempts.max(1) {
+                    last_error = Some(error);
+                    break;
+                }
+                eprintln!(
+                    "warning: {operation} failed (attempt {attempt}/{attempts}), retrying in {delay:?}: {error:#}"
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(RETRY_MAX_DELAY);
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("{operation} failed with no error recorded")))
+}
+
+/// Heuristically classifies whether an error looks like a transient infrastructure
+/// problem (network blip, timeout, rate limit, control-plane unavailability) as
+/// opposed to a permanent/logical failure (bad manifest, immutable field conflict,
+/// malformed payload). Provider errors here are plain `anyhow` strings rather than
+/// structured types, so this inspects the rendered error chain for well-known
+/// transient markers.
+fn classify_retry(error: &anyhow::Error) -> bool {
+    const TRANSIENT_MARKERS: &[&str] = &[
+        "timeout",
+        "timed out",
+        "connection refused",
+        "connection reset",
+        "temporarily unavailable",
+        "context deadline exceeded",
+        "too many requests",
+        "service unavailable",
+        "dial tcp",
+        "unable to connect to the server",
+        "broken pipe",
+        "i/o error",
+        " 429",
+        " 503",
+    ];
+    error.chain().any(|cause| {
+        let text = cause.to_string().to_lowercase();
+        TRANSIENT_MARKERS.iter().any(|marker| text.contains(marker))
+    })
+}
+
 async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> anyhow::Result<()> {
-    let provider = runtime_provider_from_args(args.provider);
+    let provider = Arc::new(runtime_provider_from_args(args.provider));
     let labels: BTreeMap<_, _> = args.label.into_iter().collect();
     let mut iterations = 0_u64;
 
@@ -664,17 +744,37 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
             break;
         }
         iterations += 1;
-        heartbeat_worker(client, api, args.worker_id, labels.clone()).await?;
 
-        let response = claim(
-            client,
-            api,
-            ClaimArgs {
-                worker_id: args.worker_id,
-                lease_seconds: args.lease_seconds,
-            },
-        )
-        .await?;
+        if let Err(error) = with_retries("worker heartbeat", API_RETRY_ATTEMPTS, || {
+            heartbeat_worker(client, api, args.worker_id, labels.clone())
+        })
+        .await
+        {
+            eprintln!(
+                "error: heartbeat failed after {API_RETRY_ATTEMPTS} attempts, skipping this iteration: {error:#}"
+            );
+            tokio::time::sleep(Duration::from_millis(args.idle_sleep_ms)).await;
+            continue;
+        }
+
+        let claim_args = ClaimArgs {
+            worker_id: args.worker_id,
+            lease_seconds: args.lease_seconds,
+        };
+        let response = match with_retries("claim lease", API_RETRY_ATTEMPTS, || {
+            claim(client, api, claim_args)
+        })
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                eprintln!(
+                    "error: claim failed after {API_RETRY_ATTEMPTS} attempts, skipping this iteration: {error:#}"
+                );
+                tokio::time::sleep(Duration::from_millis(args.idle_sleep_ms)).await;
+                continue;
+            }
+        };
 
         let Some(lease) = response.lease else {
             println!(
@@ -695,55 +795,125 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
             continue;
         };
 
-        let response = handle_lease(client, api, lease, &provider).await?;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "iteration": iterations,
-                "lease": response.lease
-            }))?
-        );
+        match handle_lease(client, api, lease, provider.clone()).await {
+            Ok(response) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": true,
+                        "iteration": iterations,
+                        "lease": response.lease
+                    }))?
+                );
+            }
+            Err(error) => {
+                // The job's side effects (if any) already happened; the lease will
+                // simply expire and be reclaimed rather than killing the worker.
+                eprintln!("error: handling leased job failed, continuing: {error:#}");
+            }
+        }
     }
 
     Ok(())
 }
 
-async fn handle_lease(
+async fn handle_lease<P>(
     client: &reqwest::Client,
     api: &str,
     lease: sandboxwich_core::JobLease,
-    provider: &impl SandboxProvider,
-) -> anyhow::Result<LeaseResponse> {
-    match execute_job(&lease.job, provider) {
+    provider: Arc<P>,
+) -> anyhow::Result<LeaseResponse>
+where
+    P: SandboxProvider + Send + Sync + 'static,
+{
+    let lease_id = lease.id;
+
+    // Renew the lease in the background for as long as the job is running so long
+    // jobs don't have their lease expire (and get re-claimed/duplicated) mid-flight.
+    let renew_interval = (lease.expires_at - lease.leased_at)
+        .to_std()
+        .map(|duration| (duration / 2).max(MIN_RENEW_INTERVAL))
+        .unwrap_or(FALLBACK_LEASE_DURATION);
+    let renew_client = client.clone();
+    let renew_api = api.to_string();
+    let renew_task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(renew_interval).await;
+            let payload = RenewLeaseRequest {
+                lease_seconds: None,
+            };
+            let result = with_retries("lease renewal", 3, || async {
+                let response = renew_client
+                    .post(format!("{renew_api}/leases/{lease_id}/renew"))
+                    .json(&payload)
+                    .send()
+                    .await?;
+                decode_json::<LeaseResponse>(response).await
+            })
+            .await;
+            if let Err(error) = result {
+                eprintln!("warning: renewing lease {lease_id} failed after retries: {error:#}");
+            }
+        }
+    });
+
+    // Job execution shells out to `kubectl` and blocks synchronously; run it on a
+    // blocking-pool thread so it can't stall the async runtime (and the heartbeat/
+    // renewal tasks running alongside it).
+    let job = lease.job.clone();
+    let exec_provider = provider.clone();
+    let outcome = tokio::task::spawn_blocking(move || execute_job(&job, exec_provider.as_ref()))
+        .await
+        .unwrap_or_else(|join_error| {
+            Err(anyhow::anyhow!(
+                "job execution task panicked or was cancelled: {join_error}"
+            ))
+        });
+
+    renew_task.abort();
+    let _ = renew_task.await;
+
+    match outcome {
         Ok(WorkerJobOutcome::Complete(result)) => {
-            let response = client
-                .post(format!("{api}/leases/{}/complete", lease.id))
-                .json(&CompleteLeaseRequest {
-                    result: Some(result),
-                })
-                .send()
-                .await?;
-            decode_json::<LeaseResponse>(response).await
+            let payload = CompleteLeaseRequest {
+                result: Some(result),
+            };
+            with_retries("complete lease", API_RETRY_ATTEMPTS, || async {
+                let response = client
+                    .post(format!("{api}/leases/{lease_id}/complete"))
+                    .json(&payload)
+                    .send()
+                    .await?;
+                decode_json::<LeaseResponse>(response).await
+            })
+            .await
         }
         Ok(WorkerJobOutcome::Fail { error, retry }) => {
-            let response = client
-                .post(format!("{api}/leases/{}/fail", lease.id))
-                .json(&FailLeaseRequest { error, retry })
-                .send()
-                .await?;
-            decode_json::<LeaseResponse>(response).await
+            let payload = FailLeaseRequest { error, retry };
+            with_retries("fail lease", API_RETRY_ATTEMPTS, || async {
+                let response = client
+                    .post(format!("{api}/leases/{lease_id}/fail"))
+                    .json(&payload)
+                    .send()
+                    .await?;
+                decode_json::<LeaseResponse>(response).await
+            })
+            .await
         }
         Err(error) => {
-            let response = client
-                .post(format!("{api}/leases/{}/fail", lease.id))
-                .json(&FailLeaseRequest {
-                    error: error.to_string(),
-                    retry: false,
-                })
-                .send()
-                .await?;
-            decode_json::<LeaseResponse>(response).await
+            let payload = FailLeaseRequest {
+                error: error.to_string(),
+                retry: classify_retry(&error),
+            };
+            with_retries("fail lease", API_RETRY_ATTEMPTS, || async {
+                let response = client
+                    .post(format!("{api}/leases/{lease_id}/fail"))
+                    .json(&payload)
+                    .send()
+                    .await?;
+                decode_json::<LeaseResponse>(response).await
+            })
+            .await
         }
     }
 }
@@ -769,7 +939,11 @@ fn execute_job(
         }
         JobKind::RunCommand => {
             let sandbox_id = sandbox_id_from_payload(&job.payload)?;
-            let spec = provision_spec_from_payload(&job.payload)?;
+            // Unlike ProvisionSandbox/ForkSandbox, RunCommand must not silently default
+            // an absent provisionSpec: exec_handoff only (re-)provisions when the pod is
+            // missing, so a defaulted spec that drifts from what actually provisioned the
+            // pod would apply against an immutable Pod field and hard-fail every command.
+            let spec = required_provision_spec_from_payload(&job.payload)?;
             let result = provider.exec_handoff(
                 sandbox_id,
                 &spec,
@@ -809,6 +983,10 @@ fn execute_job(
         }
         JobKind::StopSandbox => {
             let sandbox_id = sandbox_id_from_payload(&job.payload)?;
+            // Actually tear down the sandbox's resources; propagate provider errors so
+            // the job is failed (and retried per its classification) instead of the
+            // control plane recording a "stopped" sandbox that keeps running.
+            provider.stop(sandbox_id)?;
             Ok(WorkerJobOutcome::Complete(WorkerJobResult::StopSandbox {
                 provider: "kubernetes".to_string(),
                 sandbox_id,
@@ -816,10 +994,19 @@ fn execute_job(
         }
         JobKind::ResumeSandbox => {
             let sandbox_id = sandbox_id_from_payload(&job.payload)?;
-            Ok(WorkerJobOutcome::Complete(WorkerJobResult::ResumeSandbox {
-                provider: "kubernetes".to_string(),
-                sandbox_id,
-            }))
+            // Decision: stopping a sandbox tears down its Pod/PVC/Services/NetworkPolicy
+            // (see StopSandbox above and provider::SandboxProvider::stop), so there is no
+            // live workload left to resume. Rather than silently reporting success on a
+            // sandbox that in fact no longer exists, fail the job explicitly and point
+            // callers at provisioning a replacement (optionally forked from a snapshot).
+            // A "true" resume (restoring a stopped-but-not-deleted sandbox) is not
+            // implemented; revisit if StopSandbox gains a suspend-in-place mode.
+            Ok(WorkerJobOutcome::Fail {
+                error: format!(
+                    "resume is not supported: stopping sandbox {sandbox_id} tears down its resources; provision a new sandbox (or fork from a snapshot) instead"
+                ),
+                retry: false,
+            })
         }
     }
 }
@@ -878,6 +1065,20 @@ fn provision_spec_from_payload(
         .transpose()
         .context("job payload provisionSpec is invalid")
         .map(|spec| spec.unwrap_or_default())
+}
+
+/// Like [`provision_spec_from_payload`], but rejects a missing `provisionSpec`
+/// instead of defaulting it. Used for RunCommand, where a defaulted spec that
+/// disagrees with whatever spec the sandbox was actually provisioned with would
+/// silently corrupt exec's "only provision if missing" fast path.
+fn required_provision_spec_from_payload(
+    payload: &serde_json::Value,
+) -> anyhow::Result<SandboxProvisionSpec> {
+    let value = payload
+        .get("provisionSpec")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("job payload is missing provisionSpec"))?;
+    serde_json::from_value(value).context("job payload provisionSpec is invalid")
 }
 
 fn sandbox_id_from_payload(
@@ -1164,6 +1365,71 @@ mod tests {
     }
 
     #[test]
+    fn run_command_without_provision_spec_is_rejected_rather_than_defaulted() {
+        let sandbox_id = SandboxId::new();
+        let error = execute_job(
+            &job(
+                JobKind::RunCommand,
+                json!({
+                    "sandboxId": sandbox_id,
+                    "argv": ["echo", "hello"],
+                    "env": {}
+                }),
+                WorkerCapability::RunCommand,
+            ),
+            &provider(),
+        )
+        .expect_err("missing provisionSpec on RunCommand should fail, not default");
+
+        assert!(error.to_string().contains("provisionSpec"));
+    }
+
+    #[test]
+    fn stop_sandbox_job_tears_down_resources_via_provider() {
+        let sandbox_id = SandboxId::new();
+        let outcome = execute_job(
+            &job(
+                JobKind::StopSandbox,
+                json!({ "sandboxId": sandbox_id }),
+                WorkerCapability::K8sPod,
+            ),
+            &provider(),
+        )
+        .expect("stop job should execute");
+        let WorkerJobResult::StopSandbox {
+            sandbox_id: stopped_id,
+            ..
+        } = completed_result(outcome)
+        else {
+            panic!("expected stop sandbox result");
+        };
+        assert_eq!(stopped_id, sandbox_id);
+    }
+
+    #[test]
+    fn resume_sandbox_job_fails_instead_of_silently_succeeding() {
+        let sandbox_id = SandboxId::new();
+        let outcome = execute_job(
+            &job(
+                JobKind::ResumeSandbox,
+                json!({ "sandboxId": sandbox_id }),
+                WorkerCapability::K8sPod,
+            ),
+            &provider(),
+        )
+        .expect("resume job should execute (and report a job failure)");
+        match outcome {
+            WorkerJobOutcome::Fail { error, retry } => {
+                assert!(!retry, "resume is a permanent decision, not worth retrying");
+                assert!(error.contains(&sandbox_id.to_string()));
+            }
+            WorkerJobOutcome::Complete(_) => {
+                panic!("resume must not silently report success")
+            }
+        }
+    }
+
+    #[test]
     fn default_registration_capabilities_cover_supported_worker_jobs() {
         let capabilities = capabilities_from_args(Vec::new(), None);
 
@@ -1190,5 +1456,69 @@ mod tests {
             non_empty(Some("local-path".to_string())),
             Some("local-path".to_string())
         );
+    }
+
+    #[test]
+    fn classify_retry_flags_transient_infrastructure_errors_as_retryable() {
+        let timeout = anyhow::anyhow!(
+            "kubectl apply sandbox manifests failed with exit status: 1: Unable to connect to the server: dial tcp 10.0.0.1:6443: i/o timeout"
+        );
+        assert!(classify_retry(&timeout));
+
+        let reset = anyhow::anyhow!("failed to run kubectl for execute sandbox command")
+            .context("read tcp 10.0.0.1:6443->10.0.0.2:51522: connection reset by peer");
+        assert!(classify_retry(&reset));
+
+        let rate_limited = anyhow::anyhow!(
+            "kubectl apply sandbox manifests failed with exit status: 1: Error from server (Too Many Requests): rate limited"
+        );
+        assert!(classify_retry(&rate_limited));
+    }
+
+    #[test]
+    fn classify_retry_treats_permanent_provider_errors_as_non_retryable() {
+        let immutable_field = anyhow::anyhow!(
+            "kubectl apply sandbox manifests failed with exit status: 1: Pod \"sandboxwich-x\" is invalid: spec.containers[0].resources: Forbidden: field is immutable"
+        );
+        assert!(!classify_retry(&immutable_field));
+
+        let malformed_payload = anyhow::anyhow!("job payload is missing sandboxId");
+        assert!(!classify_retry(&malformed_payload));
+    }
+
+    #[tokio::test]
+    async fn with_retries_recovers_after_transient_failures() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let attempts = AtomicU32::new(0);
+        let result = with_retries("test op", 3, || {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                if attempt < 3 {
+                    Err(anyhow::anyhow!("connection reset by peer"))
+                } else {
+                    Ok(attempt)
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(result.expect("should eventually succeed"), 3);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn with_retries_gives_up_after_bounded_attempts() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let attempts = AtomicU32::new(0);
+        let result: anyhow::Result<()> = with_retries("test op", 3, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async { Err(anyhow::anyhow!("still broken")) }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 }
