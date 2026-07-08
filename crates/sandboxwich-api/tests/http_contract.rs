@@ -1946,33 +1946,63 @@ async fn assert_expired_lease_requeues_command(
     let lease = claimed.lease.expect("expected expiring lease");
     assert_eq!(lease.job.id, command.queued_job.id);
 
-    let jobs: JobListResponse = client
-        .get(format!("{}/jobs", server.base_url))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let expired_job = job_for_command(&jobs.jobs, command.command.id);
+    // Lease expiry now runs on a background sweep interval (see
+    // SANDBOXWICH_SWEEP_INTERVAL_MS in TestServer) instead of inline on this GET,
+    // so poll for the requeue instead of asserting it happened synchronously.
+    let expired_job = poll_until(|| async {
+        let jobs: JobListResponse = client
+            .get(format!("{}/jobs", server.base_url))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let job = job_for_command(&jobs.jobs, command.command.id);
+        (job.status == JobStatus::Queued).then_some(job)
+    })
+    .await
+    .expect("expired lease should requeue the job via the background sweep");
     assert_eq!(expired_job.status, JobStatus::Queued);
 
-    let fetched: CommandResponse = client
-        .get(format!(
-            "{}/commands/{}",
-            server.base_url, command.command.id
-        ))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let fetched = poll_until(|| async {
+        let response: CommandResponse = client
+            .get(format!(
+                "{}/commands/{}",
+                server.base_url, command.command.id
+            ))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        (response.command.status == CommandStatus::Queued).then_some(response)
+    })
+    .await
+    .expect("expired lease should reset the command to queued via the background sweep");
     assert_eq!(fetched.command.status, CommandStatus::Queued);
+}
+
+/// Polls `check` until it returns `Some`, or panics after a bounded wait. Used
+/// for assertions on state produced by the background expiry sweeper, which is
+/// no longer synchronous with any single request.
+async fn poll_until<F, Fut, T>(mut check: F) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    for _ in 0..100 {
+        if let Some(value) = check().await {
+            return Some(value);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    None
 }
 
 async fn assert_prompt_job_lifecycle(
@@ -2307,22 +2337,36 @@ async fn assert_desktop_session_lifecycle(
         .json()
         .await
         .unwrap();
-    let discovered: DesktopSessionListResponse = client
-        .get(format!(
-            "{}/sandboxes/{}/desktop-sessions",
-            server.base_url, sandbox.sandbox.id
-        ))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(discovered.desktop_sessions.iter().any(|seen| {
-        seen.id == expiring.desktop_session.id && seen.status == DesktopSessionStatus::Expired
-    }));
+    // Desktop session expiry now runs on the background sweep interval instead
+    // of inline on this GET, so poll for it instead of asserting synchronously.
+    let expired_seen = poll_until(|| async {
+        let discovered: DesktopSessionListResponse = client
+            .get(format!(
+                "{}/sandboxes/{}/desktop-sessions",
+                server.base_url, sandbox.sandbox.id
+            ))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        discovered
+            .desktop_sessions
+            .iter()
+            .any(|seen| {
+                seen.id == expiring.desktop_session.id
+                    && seen.status == DesktopSessionStatus::Expired
+            })
+            .then_some(())
+    })
+    .await;
+    assert!(
+        expired_seen.is_some(),
+        "expired desktop session should be reported via the background sweep"
+    );
 }
 
 async fn assert_snapshot_fork_and_cleanup_lifecycle(
@@ -3189,6 +3233,11 @@ impl TestServer {
         command
             .env("SANDBOXWICH_DATABASE_URL", &database_url)
             .env("SANDBOXWICH_BIND", bind.to_string())
+            // Expiry sweeps (leases, snapshots, desktop sessions) now run on a
+            // background interval instead of inline on every read request; run
+            // it fast in tests so assertions that expect prompt expiry don't
+            // need long sleeps.
+            .env("SANDBOXWICH_SWEEP_INTERVAL_MS", "25")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         if !auto_migrate {
