@@ -1754,6 +1754,7 @@ dependencies = [
  "chrono",
  "reqwest",
  "sandboxwich-core",
+ "serde",
  "serde_json",
  "sqlx",
  "tempfile",
