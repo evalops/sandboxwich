@@ -268,7 +268,8 @@ async fn unauthenticated_deployment_rejects_tenant_header_spoofing() {
         .await
         .unwrap();
     assert!(
-        plain.status() == StatusCode::UNAUTHORIZED || plain.status() == StatusCode::INTERNAL_SERVER_ERROR,
+        plain.status() == StatusCode::UNAUTHORIZED
+            || plain.status() == StatusCode::INTERNAL_SERVER_ERROR,
         "expected an auth failure, got {}",
         plain.status()
     );
@@ -307,7 +308,10 @@ async fn unauthenticated_deployment_rejects_tenant_header_spoofing() {
         .send()
         .await
         .unwrap();
-    assert!(listed.status() == StatusCode::UNAUTHORIZED || listed.status() == StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        listed.status() == StatusCode::UNAUTHORIZED
+            || listed.status() == StatusCode::INTERNAL_SERVER_ERROR
+    );
 }
 
 /// Regression test for issue #65: `/snapshots/cleanup` acts across every
@@ -3157,7 +3161,10 @@ impl TestServer {
     /// from issue #63: with no auth configured, the server must refuse every
     /// non-probe request rather than trusting a client-supplied
     /// `x-sandboxwich-tenant` header.
-    async fn start_with_no_auth_configured(database_url: String, data_dir: Option<TempDir>) -> Self {
+    async fn start_with_no_auth_configured(
+        database_url: String,
+        data_dir: Option<TempDir>,
+    ) -> Self {
         Self::spawn(database_url, data_dir, true, |_command| {})
             .await
             .with_auth_token(None)
