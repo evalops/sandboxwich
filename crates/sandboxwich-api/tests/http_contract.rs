@@ -2967,15 +2967,15 @@ impl TestServer {
             if let Some(auth_token) = auth_token {
                 health_request = health_request.bearer_auth(auth_token);
             }
-            if let Ok(response) = health_request.send().await {
-                if response.status().is_success() {
-                    return Self {
-                        base_url,
-                        database_url,
-                        child,
-                        _data_dir: data_dir,
-                    };
-                }
+            if let Ok(response) = health_request.send().await
+                && response.status().is_success()
+            {
+                return Self {
+                    base_url,
+                    database_url,
+                    child,
+                    _data_dir: data_dir,
+                };
             }
             if let Some(status) = child.try_wait().unwrap() {
                 panic!("server exited before becoming healthy: {status}");
@@ -3649,6 +3649,10 @@ fn insert_runtime_resource_tombstone_sql(database_url: &str) -> String {
     )
 }
 
+// Test-only helper mirroring a wide insert statement; bundling the
+// columns into a params struct is a larger test-harness refactor left
+// for a follow-up rather than done as part of this CI/lint cleanup.
+#[allow(clippy::too_many_arguments)]
 async fn insert_runtime_resource_tombstone(
     pool: &sqlx::AnyPool,
     database_url: &str,

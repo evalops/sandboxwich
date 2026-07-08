@@ -15,6 +15,19 @@ license = "Apache-2.0"
 repository = "https://github.com/evalops/sandboxwich"
 rust-version = "1.95"
 
+# Verified against this tree: `cargo build/test --workspace --all-targets`
+# and `cargo clippy --workspace --all-targets -- -D warnings` are clean,
+# and no `unsafe` blocks exist anywhere, so this floor is enforceable.
+# Two pre-existing clippy findings that don't have a clean mechanical fix
+# are silenced at their call site instead of here (see the CI PR body for
+# details): `enum_variant_names` on the CLI's `Command::Command` variant
+# (renaming it would break the CLI's public subcommand name) and
+# `too_many_arguments` on a wide test-only insert helper in
+# sandboxwich-api's http_contract test.
+[workspace.lints.rust]
+warnings = "deny"
+unsafe_code = "forbid"
+
 [workspace.dependencies]
 anyhow = "1.0"
 axum = { version = "0.8", features = ["multipart"] }

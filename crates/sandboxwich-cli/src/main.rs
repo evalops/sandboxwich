@@ -31,6 +31,10 @@ struct Cli {
     command: Command,
 }
 
+// The `Command` variant intentionally matches the enum name: renaming it
+// would rename the `sandboxwich command <id>` CLI subcommand, a
+// user-facing breaking change out of scope for this cleanup.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Subcommand)]
 enum Command {
     New(NewArgs),

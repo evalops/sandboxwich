@@ -23,3 +23,6 @@ uuid.workspace = true
 reqwest.workspace = true
 sandboxwich-core.workspace = true
 tempfile = "3.27"
+
+[lints]
+workspace = true

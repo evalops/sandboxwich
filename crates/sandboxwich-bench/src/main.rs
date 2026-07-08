@@ -339,12 +339,18 @@ async fn run_all(mut options: AllOptions) -> anyhow::Result<()> {
         concurrency: options.concurrency,
     })
     .await?;
+    // POST /sandboxes creates real rows, so it's deliberately capped well
+    // below the other read-only benchmarks. Keep the actual (post-cap)
+    // numbers around so the report can state them explicitly instead of
+    // implying the configured --requests/--concurrency ran unmodified.
+    let create_requests = options.requests.min(250);
+    let create_concurrency = options.concurrency.min(20);
     let creates = benchmark_http(&HttpOptions {
         api_url: server.base_url.clone(),
         method: HttpMethod::PostSandbox,
         path: "/sandboxes".to_string(),
-        requests: options.requests.min(250),
-        concurrency: options.concurrency.min(20),
+        requests: create_requests,
+        concurrency: create_concurrency,
     })
     .await?;
     server.stop();
@@ -379,12 +385,21 @@ async fn run_all(mut options: AllOptions) -> anyhow::Result<()> {
         "- runtime resources per sandbox: {}",
         options.seed.runtime_resources_per_sandbox
     );
+    println!(
+        "- requests per HTTP benchmark: {} (concurrency {})",
+        options.requests, options.concurrency
+    );
     println!();
     println!("{}", startup.markdown("warm startup"));
     println!("{}", healthz.markdown("GET /healthz"));
     println!("{}", readyz.markdown("GET /readyz"));
     println!("{}", sandboxes.markdown("GET /sandboxes"));
-    println!("{}", creates.markdown("POST /sandboxes"));
+    println!(
+        "{}",
+        creates.markdown(&format!(
+            "POST /sandboxes (capped: {create_requests} requests, concurrency {create_concurrency})"
+        ))
+    );
     if let Some(report) = sandbox_ttft {
         println!("{}", report.markdown("Sandbox TTFT (dry-run k8s worker)"));
     }
@@ -621,11 +636,17 @@ async fn benchmark_http(options: &HttpOptions) -> anyhow::Result<BenchSummary> {
     }
     drop(tx);
 
+    // Only successful requests feed the latency sample set: a failed (or
+    // near-instant refused/timed-out) request has a duration that says
+    // nothing about service latency, and mixing it in would deflate
+    // mean/p50/p95 while the run still looks "mostly successful". Failures
+    // are tracked separately and reported via `attempted`/`failures` instead.
     let mut durations = Vec::with_capacity(options.requests);
     let mut failures = 0;
     while let Some((duration, status)) = rx.recv().await {
-        durations.push(duration);
-        if !status.is_success() {
+        if status.is_success() {
+            durations.push(duration);
+        } else {
             failures += 1;
         }
     }
@@ -1060,7 +1081,12 @@ fn phase_row(name: &str, summary: &BenchSummary) -> String {
 }
 
 struct BenchSummary {
+    /// Number of successful requests whose durations feed the latency
+    /// percentiles below. Excludes failures.
     count: usize,
+    /// Total requests attempted, successes plus failures. This is the
+    /// "requests" figure surfaced in the markdown report.
+    attempted: usize,
     failures: usize,
     elapsed: Duration,
     mean: Duration,
@@ -1072,6 +1098,10 @@ struct BenchSummary {
 }
 
 impl BenchSummary {
+    /// `durations` must contain only successful-request samples; `failures`
+    /// is the count of requests that did not succeed (their durations are
+    /// deliberately not included here so they can't pollute the latency
+    /// distribution).
     fn from_durations(mut durations: Vec<Duration>, failures: usize) -> Self {
         durations.sort_unstable();
         let elapsed: Duration = durations.iter().copied().sum();
@@ -1083,6 +1113,7 @@ impl BenchSummary {
         };
         Self {
             count,
+            attempted: count + failures,
             failures,
             elapsed,
             mean,
@@ -1103,8 +1134,8 @@ impl BenchSummary {
 
     fn markdown(&self, name: &str) -> String {
         format!(
-            "## {name}\n\n| requests | failures | rps | mean | p50 | p95 | p99 | min | max |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n| {count} | {failures} | {rps:.1} | {mean} | {p50} | {p95} | {p99} | {min} | {max} |\n",
-            count = self.count,
+            "## {name}\n\n| requests | failures | rps | mean | p50 | p95 | p99 | min | max |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n| {attempted} | {failures} | {rps:.1} | {mean} | {p50} | {p95} | {p99} | {min} | {max} |\n",
+            attempted = self.attempted,
             failures = self.failures,
             rps = self.rps(),
             mean = format_duration(self.mean),

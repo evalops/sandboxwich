@@ -185,22 +185,20 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
             }
             iterations += 1;
 
-            if let Some(worker_id) = args.worker_id {
-                if let Some(lease) = claim_lease(&client, &api, worker_id, args.lease_seconds)
+            if let Some(worker_id) = args.worker_id
+                && let Some(lease) = claim_lease(&client, &api, worker_id, args.lease_seconds)
                     .await?
                     .lease
-                {
-                    if let Err(error) = handle_lease(&client, &api, lease).await {
-                        post_guest_health(
-                            &client,
-                            &api,
-                            sandbox_id,
-                            GuestStatus::Unhealthy,
-                            Some(error.to_string()),
-                        )
-                        .await?;
-                    }
-                }
+                && let Err(error) = handle_lease(&client, &api, lease).await
+            {
+                post_guest_health(
+                    &client,
+                    &api,
+                    sandbox_id,
+                    GuestStatus::Unhealthy,
+                    Some(error.to_string()),
+                )
+                .await?;
             }
 
             if args
@@ -513,13 +511,12 @@ where
             }
         }
     }
-    if let (Some(client), Some(api), Some(lease_id)) = (&client, &api, lease_id) {
-        if let Err(error) =
+    if let (Some(client), Some(api), Some(lease_id)) = (&client, &api, lease_id)
+        && let Err(error) =
             append_output_chunk(client, api, lease_id, stream, stream_decoder.finish()).await
-        {
-            let warning = format!("sandboxwich-agent: failed to flush output chunk: {error}\n");
-            let _ = tokio::io::stderr().write_all(warning.as_bytes()).await;
-        }
+    {
+        let warning = format!("sandboxwich-agent: failed to flush output chunk: {error}\n");
+        let _ = tokio::io::stderr().write_all(warning.as_bytes()).await;
     }
     Ok(captured)
 }
@@ -550,12 +547,9 @@ impl Utf8StreamDecoder {
                     }
 
                     if let Some(error_len) = error.error_len() {
-                        output.push_str(
-                            &String::from_utf8_lossy(
-                                &self.pending[valid_up_to..valid_up_to + error_len],
-                            )
-                            .into_owned(),
-                        );
+                        output.push_str(&String::from_utf8_lossy(
+                            &self.pending[valid_up_to..valid_up_to + error_len],
+                        ));
                         self.pending.drain(..valid_up_to + error_len);
                         continue;
                     }
