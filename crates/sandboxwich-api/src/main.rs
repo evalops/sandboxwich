@@ -4,7 +4,7 @@ use anyhow::Context;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Extension, Multipart, Path, Request, State},
+    extract::{DefaultBodyLimit, Extension, Multipart, Path, Query, Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -38,6 +38,7 @@ use sandboxwich_core::{
     Worker, WorkerCapability, WorkerCapacity, WorkerHeartbeatRequest, WorkerId, WorkerJobResult,
     WorkerListResponse, WorkerResponse, WorkerStatus,
 };
+use serde::Deserialize;
 use serde_json::json;
 use sqlx::{
     AnyConnection, AnyPool, Row, Sqlite,
@@ -811,7 +812,15 @@ mod tests {
     }
 }
 
+/// Default request body limit applied to every route. Kept small (1 MiB) because most endpoints
+/// only ever accept small JSON payloads; the file upload route below opts into a much larger,
+/// explicit limit instead of every route inheriting one sized for 512 MB file bodies.
+const DEFAULT_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+
 fn app(state: AppState) -> Router {
+    let upload_body_limit = usize::try_from(MAX_SANDBOX_FILE_BYTES + 1024 * 1024)
+        .expect("file upload limit should fit usize");
+
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -820,7 +829,11 @@ fn app(state: AppState) -> Router {
         .route("/sandboxes/{sandbox_id}", get(get_sandbox))
         .route(
             "/sandboxes/{sandbox_id}/files",
-            get(list_files).post(upload_file),
+            get(list_files)
+                .post(upload_file)
+                // Only this route needs to accept large (multipart file) bodies; every other
+                // route falls back to the small DEFAULT_BODY_LIMIT_BYTES layer below.
+                .layer(DefaultBodyLimit::max(upload_body_limit)),
         )
         .route(
             "/sandboxes/{sandbox_id}/files/{file_id}",
@@ -895,10 +908,7 @@ fn app(state: AppState) -> Router {
             post(create_ssh_access),
         )
         .route("/ssh-keys/{ssh_key_id}/status", post(update_ssh_key_status))
-        .layer(DefaultBodyLimit::max(
-            usize::try_from(MAX_SANDBOX_FILE_BYTES + 1024 * 1024)
-                .expect("file upload limit should fit usize"),
-        ))
+        .layer(DefaultBodyLimit::max(DEFAULT_BODY_LIMIT_BYTES))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, auth_and_tenant))
 }
@@ -1405,32 +1415,191 @@ async fn create_sandbox(
     Ok(Json(SandboxResponse { ok: true, sandbox }))
 }
 
+// ---- List pagination helpers ----
+//
+// List endpoints share a single keyset pagination scheme: every paginated table is ordered by
+// `(created_at, id)` ascending, and callers page through it with `limit` plus an opaque `after`
+// (or `before`) cursor produced by a previous response's `next_cursor`. The cursor encodes the
+// `(created_at, id)` of a row so pagination is stable even when new rows are inserted concurrently
+// (unlike offset/page-number pagination).
+
+const DEFAULT_PAGE_LIMIT: u32 = 100;
+const MAX_PAGE_LIMIT: u32 = 200;
+const PAGE_CURSOR_SEP: char = '|';
+
+#[derive(Debug, Deserialize)]
+struct PageParams {
+    limit: Option<u32>,
+    before: Option<String>,
+    after: Option<String>,
+}
+
+enum PageDirection {
+    After,
+    Before,
+}
+
+struct PageCursor {
+    created_at: String,
+    id: String,
+}
+
+impl PageCursor {
+    fn encode(&self) -> String {
+        general_purpose::URL_SAFE_NO_PAD.encode(format!(
+            "{}{PAGE_CURSOR_SEP}{}",
+            self.created_at, self.id
+        ))
+    }
+
+    fn decode(raw: &str) -> Result<Self, ApiError> {
+        let bytes = general_purpose::URL_SAFE_NO_PAD
+            .decode(raw)
+            .map_err(|_| ApiError::bad_request("invalid pagination cursor"))?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| ApiError::bad_request("invalid pagination cursor"))?;
+        let (created_at, id) = text
+            .split_once(PAGE_CURSOR_SEP)
+            .ok_or_else(|| ApiError::bad_request("invalid pagination cursor"))?;
+        Ok(Self {
+            created_at: created_at.to_string(),
+            id: id.to_string(),
+        })
+    }
+}
+
+/// Resolve the requested page size, clamped to `MAX_PAGE_LIMIT` and defaulting to
+/// `DEFAULT_PAGE_LIMIT` so a single list request can never pull an unbounded result set.
+fn resolve_page_limit(limit: Option<u32>) -> Result<u32, ApiError> {
+    match limit {
+        None => Ok(DEFAULT_PAGE_LIMIT),
+        Some(0) => Err(ApiError::bad_request("limit must be greater than 0")),
+        Some(value) => Ok(value.min(MAX_PAGE_LIMIT)),
+    }
+}
+
+fn resolve_page_cursor(params: &PageParams) -> Result<Option<(PageDirection, PageCursor)>, ApiError> {
+    match (&params.before, &params.after) {
+        (Some(_), Some(_)) => Err(ApiError::bad_request(
+            "only one of before or after may be set",
+        )),
+        (Some(raw), None) => Ok(Some((PageDirection::Before, PageCursor::decode(raw)?))),
+        (None, Some(raw)) => Ok(Some((PageDirection::After, PageCursor::decode(raw)?))),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Run a keyset-paginated query against a table ordered by `(created_at, id)`.
+///
+/// `base_sql` must already contain a `select ... from ... where <fixed predicate>` clause using
+/// `db.placeholder(1..=fixed_binds.len())` for its own bind values (mirroring the existing
+/// non-paginated queries in this file); this helper appends the cursor predicate, `order by`, and
+/// `limit` clauses, and binds `fixed_binds` followed by the single cursor bind (if any).
+async fn fetch_keyset_page<T>(
+    db: &Database,
+    base_sql: &str,
+    fixed_binds: &[String],
+    limit: u32,
+    cursor: &Option<(PageDirection, PageCursor)>,
+    row_map: impl Fn(AnyRow) -> Result<T, ApiError>,
+) -> Result<(Vec<T>, Option<String>), ApiError> {
+    let next_placeholder = db.placeholder(fixed_binds.len() + 1);
+    let (predicate, order_dir, cursor_bind) = match cursor {
+        None => (String::new(), "asc", None),
+        Some((PageDirection::After, c)) => (
+            format!(" and (created_at || '{PAGE_CURSOR_SEP}' || id) > {next_placeholder}"),
+            "asc",
+            Some(format!("{}{PAGE_CURSOR_SEP}{}", c.created_at, c.id)),
+        ),
+        Some((PageDirection::Before, c)) => (
+            format!(" and (created_at || '{PAGE_CURSOR_SEP}' || id) < {next_placeholder}"),
+            "desc",
+            Some(format!("{}{PAGE_CURSOR_SEP}{}", c.created_at, c.id)),
+        ),
+    };
+
+    // Fetch one extra row so we can tell whether another page follows without a second query.
+    let fetch_limit = i64::from(limit) + 1;
+    let sql = format!(
+        "{base_sql}{predicate} order by created_at {order_dir}, id {order_dir} limit {fetch_limit}"
+    );
+
+    let mut query = sqlx::query(&sql);
+    for bind in fixed_binds {
+        query = query.bind(bind.clone());
+    }
+    if let Some(bind) = cursor_bind {
+        query = query.bind(bind);
+    }
+
+    let mut rows = query.fetch_all(&db.pool).await?;
+    let has_more = rows.len() > limit as usize;
+    rows.truncate(limit as usize);
+
+    let mut keyed_items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let created_at: String = row.try_get("created_at")?;
+        let id: String = row.try_get("id")?;
+        let item = row_map(row)?;
+        keyed_items.push((created_at, id, item));
+    }
+
+    if matches!(cursor, Some((PageDirection::Before, _))) {
+        keyed_items.reverse();
+    }
+
+    // For `before` pages, the boundary row supplied by the caller necessarily follows the last
+    // item we return, so a forward cursor is always safe to hand back. For the default/`after`
+    // direction, only advertise a next page when the peeked extra row confirmed one exists.
+    let is_before = matches!(cursor, Some((PageDirection::Before, _)));
+    let next_cursor = keyed_items.last().and_then(|(created_at, id, _)| {
+        if is_before || has_more {
+            Some(
+                PageCursor {
+                    created_at: created_at.clone(),
+                    id: id.clone(),
+                }
+                .encode(),
+            )
+        } else {
+            None
+        }
+    });
+
+    let items = keyed_items.into_iter().map(|(_, _, item)| item).collect();
+    Ok((items, next_cursor))
+}
+
 async fn list_sandboxes(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
+    Query(page): Query<PageParams>,
 ) -> Result<Json<SandboxListResponse>, ApiError> {
-    let sql = format!(
+    let limit = resolve_page_limit(page.limit)?;
+    let cursor = resolve_page_cursor(&page)?;
+
+    let base_sql = format!(
         "select id, tenant_id, name, state, template, memory_limit, network_egress_mode,
                 created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
-         where tenant_id = {}
-         order by created_at asc",
+         where tenant_id = {}",
         state.db.placeholder(1)
     );
-    let rows = sqlx::query(&sql)
-        .bind(&ctx.tenant_id)
-        .fetch_all(&state.db.pool)
-        .await?;
-
-    let mut sandboxes = rows
-        .into_iter()
-        .map(row_to_sandbox)
-        .collect::<Result<Vec<_>, _>>()?;
+    let (mut sandboxes, next_cursor) = fetch_keyset_page(
+        &state.db,
+        &base_sql,
+        std::slice::from_ref(&ctx.tenant_id),
+        limit,
+        &cursor,
+        row_to_sandbox,
+    )
+    .await?;
     hydrate_sandboxes_network_egress(&state.db, &mut sandboxes).await?;
 
     Ok(Json(SandboxListResponse {
         ok: true,
         sandboxes,
+        next_cursor,
     }))
 }
 
@@ -1741,14 +1910,19 @@ async fn list_snapshots(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
+    Query(page): Query<PageParams>,
 ) -> Result<Json<SnapshotListResponse>, ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
     ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
     expire_due_snapshots(&state.db).await?;
-    let snapshots = list_snapshots_for_sandbox(&state.db, sandbox_id).await?;
+    let limit = resolve_page_limit(page.limit)?;
+    let cursor = resolve_page_cursor(&page)?;
+    let (snapshots, next_cursor) =
+        list_snapshots_for_sandbox(&state.db, sandbox_id, limit, &cursor).await?;
     Ok(Json(SnapshotListResponse {
         ok: true,
         snapshots,
+        next_cursor,
     }))
 }
 
@@ -1954,27 +2128,34 @@ async fn list_commands(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
+    Query(page): Query<PageParams>,
 ) -> Result<Json<CommandListResponse>, ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
     ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
+    let limit = resolve_page_limit(page.limit)?;
+    let cursor = resolve_page_cursor(&page)?;
 
-    let sql = format!(
+    let base_sql = format!(
         "select id, sandbox_id, status, argv, cwd, exit_code, stdout, stderr, created_at, finished_at
          from commands
-         where sandbox_id = {}
-         order by created_at asc, id asc",
+         where sandbox_id = {}",
         state.db.placeholder(1)
     );
-    let rows = sqlx::query(&sql)
-        .bind(sandbox_id.to_string())
-        .fetch_all(&state.db.pool)
-        .await?;
-    let commands = rows
-        .into_iter()
-        .map(row_to_command)
-        .collect::<Result<Vec<_>, _>>()?;
+    let (commands, next_cursor) = fetch_keyset_page(
+        &state.db,
+        &base_sql,
+        &[sandbox_id.to_string()],
+        limit,
+        &cursor,
+        row_to_command,
+    )
+    .await?;
 
-    Ok(Json(CommandListResponse { ok: true, commands }))
+    Ok(Json(CommandListResponse {
+        ok: true,
+        commands,
+        next_cursor,
+    }))
 }
 
 async fn get_command(
@@ -1991,12 +2172,20 @@ async fn list_command_output(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
     Path(command_id): Path<Uuid>,
+    Query(page): Query<PageParams>,
 ) -> Result<Json<CommandOutputListResponse>, ApiError> {
     let command_id = CommandId(command_id);
     let command = fetch_command(&state.db, command_id).await?;
     ensure_sandbox_tenant(&state.db, command.sandbox_id, &ctx).await?;
-    let chunks = list_command_output_chunks(&state.db, command_id).await?;
-    Ok(Json(CommandOutputListResponse { ok: true, chunks }))
+    let limit = resolve_page_limit(page.limit)?;
+    let cursor = resolve_page_cursor(&page)?;
+    let (chunks, next_cursor) =
+        list_command_output_chunks(&state.db, command_id, limit, &cursor).await?;
+    Ok(Json(CommandOutputListResponse {
+        ok: true,
+        chunks,
+        next_cursor,
+    }))
 }
 
 async fn queue_prompt(
@@ -2059,28 +2248,34 @@ async fn list_events(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
+    Query(page): Query<PageParams>,
 ) -> Result<Json<EventListResponse>, ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
     ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
+    let limit = resolve_page_limit(page.limit)?;
+    let cursor = resolve_page_cursor(&page)?;
 
-    let sql = format!(
+    let base_sql = format!(
         "select id, sandbox_id, kind, data, created_at
          from sandbox_events
-         where sandbox_id = {}
-         order by created_at asc, id asc",
+         where sandbox_id = {}",
         state.db.placeholder(1)
     );
-    let rows = sqlx::query(&sql)
-        .bind(sandbox_id.to_string())
-        .fetch_all(&state.db.pool)
-        .await?;
+    let (events, next_cursor) = fetch_keyset_page(
+        &state.db,
+        &base_sql,
+        &[sandbox_id.to_string()],
+        limit,
+        &cursor,
+        row_to_event,
+    )
+    .await?;
 
-    let events = rows
-        .into_iter()
-        .map(row_to_event)
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(Json(EventListResponse { ok: true, events }))
+    Ok(Json(EventListResponse {
+        ok: true,
+        events,
+        next_cursor,
+    }))
 }
 
 fn validate_max_concurrent_jobs(max_concurrent_jobs: u32) -> Result<u32, ApiError> {
@@ -2393,26 +2588,33 @@ async fn validate_job_payload_tenant(
 async fn list_jobs(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
+    Query(page): Query<PageParams>,
 ) -> Result<Json<JobListResponse>, ApiError> {
     expire_due_leases(&state.db).await?;
-    let sql = format!(
+    let limit = resolve_page_limit(page.limit)?;
+    let cursor = resolve_page_cursor(&page)?;
+    let base_sql = format!(
         "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
          from jobs
-         where tenant_id = {}
-         order by created_at asc, id asc",
+         where tenant_id = {}",
         state.db.placeholder(1)
     );
-    let rows = sqlx::query(&sql)
-        .bind(&ctx.tenant_id)
-        .fetch_all(&state.db.pool)
-        .await?;
-    let jobs = rows
-        .into_iter()
-        .map(row_to_job)
-        .collect::<Result<Vec<_>, _>>()?;
+    let (jobs, next_cursor) = fetch_keyset_page(
+        &state.db,
+        &base_sql,
+        std::slice::from_ref(&ctx.tenant_id),
+        limit,
+        &cursor,
+        row_to_job,
+    )
+    .await?;
 
-    Ok(Json(JobListResponse { ok: true, jobs }))
+    Ok(Json(JobListResponse {
+        ok: true,
+        jobs,
+        next_cursor,
+    }))
 }
 
 async fn get_guest_health(
@@ -3916,19 +4118,24 @@ async fn fetch_command(db: &Database, command_id: CommandId) -> Result<CommandRu
 async fn list_command_output_chunks(
     db: &Database,
     command_id: CommandId,
-) -> Result<Vec<CommandOutputChunk>, ApiError> {
-    let sql = format!(
+    limit: u32,
+    cursor: &Option<(PageDirection, PageCursor)>,
+) -> Result<(Vec<CommandOutputChunk>, Option<String>), ApiError> {
+    let base_sql = format!(
         "select id, command_id, stream, sequence, chunk, annotations, created_at
          from command_output_chunks
-         where command_id = {}
-         order by created_at asc, id asc",
+         where command_id = {}",
         db.placeholder(1)
     );
-    let rows = sqlx::query(&sql)
-        .bind(command_id.to_string())
-        .fetch_all(&db.pool)
-        .await?;
-    rows.into_iter().map(row_to_command_output_chunk).collect()
+    fetch_keyset_page(
+        db,
+        &base_sql,
+        &[command_id.to_string()],
+        limit,
+        cursor,
+        row_to_command_output_chunk,
+    )
+    .await
 }
 
 async fn append_command_output_chunk(
@@ -4597,20 +4804,24 @@ async fn fetch_snapshot_on_connection(
 async fn list_snapshots_for_sandbox(
     db: &Database,
     sandbox_id: SandboxId,
-) -> Result<Vec<Snapshot>, ApiError> {
-    let sql = format!(
+    limit: u32,
+    cursor: &Option<(PageDirection, PageCursor)>,
+) -> Result<(Vec<Snapshot>, Option<String>), ApiError> {
+    let base_sql = format!(
         "select id, sandbox_id, status, label, inventory, provider_metadata, created_at, ready_at, expires_at, error
          from snapshots
-         where sandbox_id = {}
-         order by created_at asc, id asc",
+         where sandbox_id = {}",
         db.placeholder(1)
     );
-    let rows = sqlx::query(&sql)
-        .bind(sandbox_id.to_string())
-        .fetch_all(&db.pool)
-        .await?;
-
-    rows.into_iter().map(row_to_snapshot).collect()
+    fetch_keyset_page(
+        db,
+        &base_sql,
+        &[sandbox_id.to_string()],
+        limit,
+        cursor,
+        row_to_snapshot,
+    )
+    .await
 }
 
 struct CleanupControllerReport {
