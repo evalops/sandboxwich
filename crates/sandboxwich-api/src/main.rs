@@ -5,7 +5,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Extension, Multipart, Path, Request, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -63,6 +63,9 @@ struct TenantContext {
 struct AuthConfig {
     shared_token: Option<String>,
     tenant_tokens: Vec<TenantToken>,
+    /// Distinct from `shared_token`/`tenant_tokens`: gates operator-only routes
+    /// (currently `/snapshots/cleanup`) that act across tenant boundaries.
+    operator_token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -97,6 +100,7 @@ struct ApiConfig {
     auto_migrate: bool,
     shared_token: Option<String>,
     tenant_tokens: Vec<TenantToken>,
+    operator_token: Option<String>,
     default_tenant_id: String,
 }
 
@@ -138,6 +142,7 @@ async fn main() -> anyhow::Result<()> {
             auth: AuthConfig {
                 shared_token: config.shared_token,
                 tenant_tokens: config.tenant_tokens,
+                operator_token: config.operator_token,
             },
             default_tenant_id: config.default_tenant_id,
         }),
@@ -164,6 +169,10 @@ fn load_api_config() -> anyhow::Result<ApiConfig> {
         .filter(|token| !token.is_empty());
     let tenant_tokens =
         parse_tenant_tokens(std::env::var("SANDBOXWICH_TENANT_TOKENS").ok().as_deref())?;
+    let operator_token = std::env::var("SANDBOXWICH_OPERATOR_TOKEN")
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty());
     let default_tenant_id = std::env::var("SANDBOXWICH_DEFAULT_TENANT")
         .ok()
         .filter(|tenant| !tenant.trim().is_empty())
@@ -177,6 +186,7 @@ fn load_api_config() -> anyhow::Result<ApiConfig> {
         auto_migrate,
         shared_token,
         tenant_tokens,
+        operator_token,
         default_tenant_id,
     })
 }
@@ -934,14 +944,16 @@ async fn auth_and_tenant(
         }
         state.default_tenant_id.clone()
     } else {
-        request
-            .headers()
-            .get("x-sandboxwich-tenant")
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|tenant| !tenant.is_empty())
-            .unwrap_or(&state.default_tenant_id)
-            .to_string()
+        // Fail closed: with no SANDBOXWICH_API_TOKEN and no SANDBOXWICH_TENANT_TOKENS
+        // configured, there is no credential to authenticate against, so we must
+        // never trust a client-supplied tenant header to select tenant identity.
+        // Refuse to serve any non-probe route rather than silently running open.
+        return ApiError::internal(
+            "sandboxwich-api has no authentication configured; set SANDBOXWICH_API_TOKEN \
+             (single-tenant) or SANDBOXWICH_TENANT_TOKENS (multi-tenant) to serve \
+             authenticated routes",
+        )
+        .into_response();
     };
     request.extensions_mut().insert(TenantContext { tenant_id });
 
@@ -1763,9 +1775,37 @@ async fn get_snapshot(
     Ok(Json(SnapshotResponse { ok: true, snapshot }))
 }
 
+/// Header carrying the operator credential required by [`cleanup_snapshots`].
+/// Deliberately distinct from the `Authorization` bearer token used for
+/// tenant auth: cleanup acts across every tenant's data, so an ordinary
+/// tenant credential (whichever tenant it belongs to) must never be
+/// sufficient to run it. See issue #65.
+const OPERATOR_TOKEN_HEADER: &str = "x-sandboxwich-operator-token";
+
+fn ensure_operator_authorized(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let Some(expected_token) = &state.auth.operator_token else {
+        return Err(ApiError::internal(
+            "snapshot cleanup is disabled: set SANDBOXWICH_OPERATOR_TOKEN to a dedicated \
+             operator credential (distinct from tenant tokens) to enable /snapshots/cleanup",
+        ));
+    };
+    let authorized = headers
+        .get(OPERATOR_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected_token.as_bytes()));
+    if !authorized {
+        return Err(ApiError::unauthorized(format!(
+            "a valid {OPERATOR_TOKEN_HEADER} header is required to run snapshot cleanup"
+        )));
+    }
+    Ok(())
+}
+
 async fn cleanup_snapshots(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<SnapshotCleanupResponse>, ApiError> {
+    ensure_operator_authorized(&state, &headers)?;
     let cleanup = run_cleanup_controller(&state.db).await?;
     Ok(Json(SnapshotCleanupResponse {
         ok: true,
