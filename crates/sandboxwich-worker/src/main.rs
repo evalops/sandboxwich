@@ -206,6 +206,47 @@ struct ProviderArgs {
 
     #[arg(long, env = "SANDBOXWICH_RUNTIME_CLASS_NAME")]
     runtime_class_name: Option<String>,
+
+    /// Dedicated namespace sandbox pods/services/PVCs/NetworkPolicies are
+    /// deployed into, separate from the control-plane namespace (GH-76).
+    /// Unset falls back to the control-plane `--namespace`, preserving
+    /// pre-existing single-namespace deployments; the checked-in worker
+    /// Deployment manifest sets this explicitly to
+    /// `DEFAULT_SANDBOX_NAMESPACE`.
+    #[arg(long, env = "SANDBOXWICH_SANDBOX_NAMESPACE")]
+    sandbox_namespace: Option<String>,
+
+    /// Namespace running cluster DNS, used to scope the always-on DNS
+    /// egress rule (GH-66).
+    #[arg(long, env = "SANDBOXWICH_DNS_NAMESPACE")]
+    dns_namespace: Option<String>,
+
+    /// CIDRs excluded from any `0.0.0.0/0` egress rule via NetworkPolicy
+    /// `except`, so sandboxes can never reach the control plane or cloud
+    /// metadata endpoints even in AllowAll mode (GH-66).
+    #[arg(
+        long = "egress-excluded-cidr",
+        env = "SANDBOXWICH_EGRESS_EXCLUDED_CIDRS",
+        value_delimiter = ','
+    )]
+    egress_excluded_cidrs: Vec<String>,
+
+    /// Namespace containing pods allowed to reach a sandbox's ssh/desktop
+    /// ports via the rendered ingress NetworkPolicy (GH-67). Defaults to
+    /// the control-plane namespace.
+    #[arg(long, env = "SANDBOXWICH_INGRESS_NAMESPACE")]
+    ingress_namespace: Option<String>,
+
+    /// Pod selector label (key=value, repeatable) identifying which pods
+    /// in the ingress namespace may reach a sandbox's ssh/desktop ports
+    /// (GH-67). Defaults to app.kubernetes.io/part-of=sandboxwich.
+    #[arg(long = "ingress-selector-label", value_parser = parse_label)]
+    ingress_selector_label: Vec<(String, String)>,
+
+    /// Secret providing SANDBOXWICH_VNC_PASSWORD to the sandbox container
+    /// (GH-67).
+    #[arg(long, env = "SANDBOXWICH_VNC_PASSWORD_SECRET")]
+    vnc_password_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -576,6 +617,12 @@ fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
     .with_workspace_storage(non_empty(args.workspace_storage))
     .with_ssh_authorized_keys_secret(non_empty(args.ssh_authorized_keys_secret))
     .with_runtime_class_name(non_empty(args.runtime_class_name))
+    .with_sandbox_namespace(non_empty(args.sandbox_namespace))
+    .with_dns_namespace(non_empty(args.dns_namespace))
+    .with_egress_excluded_cidrs(args.egress_excluded_cidrs)
+    .with_ingress_namespace(non_empty(args.ingress_namespace))
+    .with_ingress_pod_selector(args.ingress_selector_label)
+    .with_vnc_password_secret(non_empty(args.vnc_password_secret))
 }
 
 fn apply_provider_from_args(args: ProviderApplyArgs) -> KubernetesApplyProvider {
