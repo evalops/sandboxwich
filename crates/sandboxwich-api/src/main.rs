@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, net::SocketAddr};
+use std::{collections::BTreeMap, net::SocketAddr, time::Duration};
 
 use anyhow::Context;
 use axum::{
@@ -42,6 +42,7 @@ use serde_json::json;
 use sqlx::{
     AnyConnection, AnyPool, Row, Sqlite,
     any::{AnyPoolOptions, AnyRow},
+    error::ErrorKind,
     migrate::MigrateDatabase,
 };
 use tracing_subscriber::EnvFilter;
@@ -98,6 +99,7 @@ struct ApiConfig {
     shared_token: Option<String>,
     tenant_tokens: Vec<TenantToken>,
     default_tenant_id: String,
+    sweep_interval_ms: u64,
 }
 
 #[tokio::main]
@@ -129,6 +131,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    spawn_expiry_sweeper(db.clone(), Duration::from_millis(config.sweep_interval_ms));
+
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     tracing::info!(addr = %config.bind, database_url = %config.database_url, "sandboxwich-api listening");
     axum::serve(
@@ -145,6 +149,32 @@ async fn main() -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await?;
     Ok(())
+}
+
+/// Runs the lease/snapshot/desktop-session expiry sweeps on a fixed interval in
+/// a single background task, instead of on every tenant-scoped read request.
+/// This keeps read handlers O(1) in tenant data instead of doing global,
+/// mutating work proportional to total table size on every GET, and it means
+/// only one caller (this task) ever performs a given sweep at a time instead of
+/// every concurrent reader racing to expire the same rows.
+fn spawn_expiry_sweeper(db: Database, interval: Duration) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // The first tick fires immediately; that's fine, it just means the
+        // first sweep runs right away instead of waiting a full interval.
+        loop {
+            ticker.tick().await;
+            if let Err(error) = expire_due_leases(&db).await {
+                tracing::warn!(?error, "lease expiry sweep failed");
+            }
+            if let Err(error) = expire_due_snapshots(&db).await {
+                tracing::warn!(?error, "snapshot expiry sweep failed");
+            }
+            if let Err(error) = expire_due_desktop_sessions(&db).await {
+                tracing::warn!(?error, "desktop session expiry sweep failed");
+            }
+        }
+    })
 }
 
 fn load_api_config() -> anyhow::Result<ApiConfig> {
@@ -168,6 +198,7 @@ fn load_api_config() -> anyhow::Result<ApiConfig> {
         .ok()
         .filter(|tenant| !tenant.trim().is_empty())
         .unwrap_or_else(|| "default".to_string());
+    let sweep_interval_ms = u64::from(parse_env_u32("SANDBOXWICH_SWEEP_INTERVAL_MS", 1000)?.max(1));
 
     Ok(ApiConfig {
         command,
@@ -178,6 +209,7 @@ fn load_api_config() -> anyhow::Result<ApiConfig> {
         shared_token,
         tenant_tokens,
         default_tenant_id,
+        sweep_interval_ms,
     })
 }
 
@@ -265,10 +297,30 @@ async fn connect_database(database_url: &str, max_connections: u32) -> anyhow::R
         Sqlite::create_database(database_url).await?;
     }
 
-    let pool = AnyPoolOptions::new()
+    let mut pool_options = AnyPoolOptions::new()
         .max_connections(max_connections)
-        .connect(database_url)
-        .await?;
+        .acquire_timeout(Duration::from_secs(10))
+        .idle_timeout(Some(Duration::from_secs(5 * 60)));
+
+    if matches!(dialect, SqlDialect::Sqlite) {
+        // SQLite allows exactly one writer at a time. The API's request handlers
+        // and expiry sweeps issue frequent short write transactions, so without a
+        // busy timeout and WAL mode, concurrent writers surface as SQLITE_BUSY
+        // errors instead of waiting briefly for the writer ahead of them.
+        pool_options = pool_options.after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("PRAGMA busy_timeout = 5000;")
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query("PRAGMA journal_mode = WAL;")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        });
+    }
+
+    let pool = pool_options.connect(database_url).await?;
     Ok(Database { pool, dialect })
 }
 
@@ -808,6 +860,200 @@ mod tests {
         let fingerprint = db_enum_schema_fingerprint();
         assert!(fingerprint.starts_with("db-enum-v1:"));
         assert_eq!(fingerprint, db_enum_schema_fingerprint());
+    }
+
+    async fn test_sqlite_db() -> Database {
+        sqlx::any::install_default_drivers();
+        // A single pooled connection: `sqlite::memory:` gives each new
+        // connection its own private, anonymous database, so more than one
+        // pooled connection would see the migrations/schema on one connection
+        // but not the others.
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        let db = Database {
+            pool,
+            dialect: SqlDialect::Sqlite,
+        };
+        sqlx::migrate!("./migrations")
+            .run(&db.pool)
+            .await
+            .expect("run migrations");
+        ensure_database_constraints(&db)
+            .await
+            .expect("reconcile enum constraints");
+        db
+    }
+
+    async fn seed_worker(db: &Database) -> WorkerId {
+        let now = Utc::now();
+        let worker = Worker {
+            id: WorkerId::new(),
+            tenant_id: "default".to_string(),
+            name: "test-worker".to_string(),
+            status: WorkerStatus::Online,
+            provider: "test".to_string(),
+            capabilities: vec![WorkerCapability::ProvisionSandbox],
+            max_concurrent_jobs: 1,
+            labels: BTreeMap::new(),
+            registered_at: now,
+            last_heartbeat_at: Some(now),
+        };
+        insert_worker(db, &worker).await.expect("insert worker");
+        worker.id
+    }
+
+    async fn seed_provision_job(db: &Database) -> Job {
+        let now = Utc::now();
+        let job = Job {
+            id: JobId::new(),
+            tenant_id: "default".to_string(),
+            kind: JobKind::ProvisionSandbox,
+            status: JobStatus::Leased,
+            payload: json!({ "sandboxId": Uuid::now_v7().to_string() }),
+            required_capability: WorkerCapability::ProvisionSandbox,
+            priority: 0,
+            attempts: 0,
+            max_attempts: 3,
+            scheduled_at: now,
+            created_at: now,
+            updated_at: now,
+            last_error: None,
+        };
+        insert_job(db, &job).await.expect("insert job");
+        job
+    }
+
+    async fn seed_expired_active_lease(
+        db: &Database,
+        lease_id: LeaseId,
+        job_id: JobId,
+        worker_id: WorkerId,
+        expires_at: DateTime<Utc>,
+    ) {
+        sqlx::query(
+            "insert into job_leases
+             (id, job_id, worker_id, status, attempt, leased_at, expires_at, completed_at, error)
+             values (?, ?, ?, 'active', 1, ?, ?, NULL, NULL)",
+        )
+        .bind(lease_id.to_string())
+        .bind(job_id.to_string())
+        .bind(worker_id.to_string())
+        .bind((expires_at - chrono::Duration::seconds(60)).to_rfc3339())
+        .bind(expires_at.to_rfc3339())
+        .execute(&db.pool)
+        .await
+        .expect("seed active lease");
+    }
+
+    #[tokio::test]
+    async fn expire_active_lease_on_connection_only_transitions_once() {
+        let db = test_sqlite_db().await;
+        let worker_id = seed_worker(&db).await;
+        let job = seed_provision_job(&db).await;
+        let lease_id = LeaseId::new();
+        let now = Utc::now();
+        seed_expired_active_lease(&db, lease_id, job.id, worker_id, now).await;
+
+        // First caller wins the guarded active->expired transition...
+        let mut tx = db.pool.begin().await.expect("begin tx");
+        let first = expire_active_lease_on_connection(&db, &mut tx, lease_id, now, "lease expired")
+            .await
+            .expect("first expiry attempt");
+        tx.commit().await.expect("commit first expiry");
+        assert!(
+            first,
+            "first caller must observe the active->expired transition"
+        );
+
+        // ...and a racing second caller (e.g. another concurrent request or an
+        // overlapping sweep) must see zero rows affected and must not re-run any
+        // requeue/fail side effects.
+        let mut tx = db.pool.begin().await.expect("begin tx");
+        let second =
+            expire_active_lease_on_connection(&db, &mut tx, lease_id, now, "lease expired")
+                .await
+                .expect("second expiry attempt");
+        tx.commit().await.expect("commit second expiry");
+        assert!(
+            !second,
+            "second caller must not double-process an already-expired lease"
+        );
+
+        let status: String = sqlx::query("select status from job_leases where id = ?")
+            .bind(lease_id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .expect("fetch lease")
+            .try_get("status")
+            .expect("read status");
+        assert_eq!(status, "expired");
+    }
+
+    #[tokio::test]
+    async fn expire_due_leases_does_not_double_process_concurrent_sweeps() {
+        let db = test_sqlite_db().await;
+        let worker_id = seed_worker(&db).await;
+        let now = Utc::now();
+        let sandbox = Sandbox {
+            id: SandboxId::new(),
+            tenant_id: "default".to_string(),
+            name: "test-sandbox".to_string(),
+            state: SandboxState::Running,
+            template: "default".to_string(),
+            memory_limit: MemoryLimit::default(),
+            network_egress: NetworkEgress::default(),
+            created_at: now,
+            updated_at: now,
+            ttl_seconds: None,
+            parent_snapshot_id: None,
+        };
+        insert_sandbox(&db, &sandbox).await.expect("insert sandbox");
+        let prompt_event_id = Uuid::now_v7();
+        let job = Job {
+            id: JobId::new(),
+            tenant_id: "default".to_string(),
+            kind: JobKind::RunPrompt,
+            status: JobStatus::Leased,
+            payload: json!({
+                "sandboxId": sandbox.id.to_string(),
+                "promptEventId": prompt_event_id.to_string(),
+            }),
+            required_capability: WorkerCapability::AgentPrompt,
+            priority: 0,
+            attempts: 0,
+            max_attempts: 3,
+            scheduled_at: now,
+            created_at: now,
+            updated_at: now,
+            last_error: None,
+        };
+        insert_job(&db, &job).await.expect("insert job");
+        seed_expired_active_lease(&db, LeaseId::new(), job.id, worker_id, now).await;
+
+        // Two overlapping sweeps racing on the same expired lease (this is what
+        // used to happen when the sweep ran unguarded on every read handler).
+        let (first, second) = tokio::join!(expire_due_leases(&db), expire_due_leases(&db));
+        first.expect("first sweep succeeds");
+        second.expect("second sweep succeeds");
+
+        let requeued = fetch_job(&db, job.id).await.expect("fetch job");
+        assert_eq!(requeued.status, JobStatus::Queued);
+
+        let event_count: i64 = sqlx::query(
+            "select count(*) as count from sandbox_events where kind = 'prompt_queued'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("count events")
+        .try_get("count")
+        .expect("read count");
+        assert_eq!(
+            event_count, 1,
+            "guarded expiry must apply requeue side effects exactly once, not once per racing sweep"
+        );
     }
 }
 
@@ -1744,7 +1990,6 @@ async fn list_snapshots(
 ) -> Result<Json<SnapshotListResponse>, ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
     ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
-    expire_due_snapshots(&state.db).await?;
     let snapshots = list_snapshots_for_sandbox(&state.db, sandbox_id).await?;
     Ok(Json(SnapshotListResponse {
         ok: true,
@@ -1757,7 +2002,6 @@ async fn get_snapshot(
     Extension(ctx): Extension<TenantContext>,
     Path(snapshot_id): Path<Uuid>,
 ) -> Result<Json<SnapshotResponse>, ApiError> {
-    expire_due_snapshots(&state.db).await?;
     let snapshot = fetch_snapshot(&state.db, SnapshotId(snapshot_id)).await?;
     ensure_sandbox_tenant(&state.db, snapshot.sandbox_id, &ctx).await?;
     Ok(Json(SnapshotResponse { ok: true, snapshot }))
@@ -1808,7 +2052,6 @@ async fn list_desktop_sessions(
 ) -> Result<Json<DesktopSessionListResponse>, ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
     ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
-    expire_due_desktop_sessions(&state.db).await?;
     let desktop_sessions = list_desktop_sessions_for_sandbox(&state.db, sandbox_id).await?;
     Ok(Json(DesktopSessionListResponse {
         ok: true,
@@ -1821,7 +2064,6 @@ async fn get_desktop_session(
     Extension(ctx): Extension<TenantContext>,
     Path(desktop_session_id): Path<Uuid>,
 ) -> Result<Json<DesktopSessionResponse>, ApiError> {
-    expire_due_desktop_sessions(&state.db).await?;
     let desktop_session =
         fetch_desktop_session(&state.db, DesktopSessionId(desktop_session_id)).await?;
     ensure_sandbox_tenant(&state.db, desktop_session.sandbox_id, &ctx).await?;
@@ -1861,7 +2103,6 @@ async fn create_desktop_access(
     Path(desktop_session_id): Path<Uuid>,
     Json(request): Json<DesktopAccessRequest>,
 ) -> Result<Json<DesktopAccessResponse>, ApiError> {
-    expire_due_desktop_sessions(&state.db).await?;
     let desktop_session =
         fetch_desktop_session(&state.db, DesktopSessionId(desktop_session_id)).await?;
     ensure_sandbox_tenant(&state.db, desktop_session.sandbox_id, &ctx).await?;
@@ -2260,7 +2501,6 @@ async fn get_capacity(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
 ) -> Result<Json<CapacityResponse>, ApiError> {
-    expire_due_leases(&state.db).await?;
     let workers = list_worker_capacities(&state.db, &ctx.tenant_id).await?;
     let total_max_concurrent_jobs = workers
         .iter()
@@ -2394,7 +2634,6 @@ async fn list_jobs(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
 ) -> Result<Json<JobListResponse>, ApiError> {
-    expire_due_leases(&state.db).await?;
     let sql = format!(
         "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
@@ -2606,7 +2845,6 @@ async fn claim_lease(
     Path(worker_id): Path<Uuid>,
     Json(request): Json<ClaimLeaseRequest>,
 ) -> Result<Json<ClaimLeaseResponse>, ApiError> {
-    expire_due_leases(&state.db).await?;
     let worker = ensure_worker_tenant(&state.db, WorkerId(worker_id), &ctx).await?;
     let sql = format!(
         "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
@@ -5642,29 +5880,100 @@ async fn expire_due_leases(db: &Database) -> Result<(), ApiError> {
         if lease.expires_at > now {
             continue;
         }
-        let job = fetch_job(db, lease.job_id).await?;
+        expire_lease_if_still_active(db, lease.id, now).await?;
+    }
+
+    Ok(())
+}
+
+/// Atomically transitions a single lease from `active` to `expired` and, only if
+/// this caller actually won that transition, applies the job re-queue/fail side
+/// effects. Concurrent callers racing on the same expired lease (e.g. multiple
+/// requests hitting `claim_lease`/`list_jobs`/`get_capacity`, or overlapping
+/// background sweeps) must not both observe the lease as active and both emit
+/// side effects.
+async fn expire_lease_if_still_active(
+    db: &Database,
+    lease_id: LeaseId,
+    now: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    let mut tx = db.pool.begin().await?;
+    let outcome = async {
+        let won_transition =
+            expire_active_lease_on_connection(db, &mut tx, lease_id, now, "lease expired").await?;
+        if !won_transition {
+            // Another caller already expired this lease and applied its side
+            // effects; nothing left to do.
+            return Ok(());
+        }
+
+        let lease = fetch_lease_on_connection(db, &mut tx, lease_id).await?;
+        let job = lease.job;
         let next_status = if job.attempts >= job.max_attempts {
             JobStatus::Dead
         } else {
             JobStatus::Queued
         };
-        update_lease_status(
+        update_job_status_on_connection(
             db,
-            lease.id,
-            LeaseStatus::Expired,
-            Some(now),
+            &mut tx,
+            job.id,
+            next_status,
             Some("lease expired"),
+            now,
         )
         .await?;
-        update_job_status(db, job.id, next_status, Some("lease expired"), now).await?;
         if job.attempts >= job.max_attempts {
-            apply_failed_job(db, &job, "lease expired").await?;
+            apply_failed_job_on_connection(db, &mut tx, &job, "lease expired").await?;
         } else {
-            apply_retryable_job(db, &job, "lease expired").await?;
+            apply_retryable_job_on_connection(db, &mut tx, &job, "lease expired").await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    match outcome {
+        Ok(()) => {
+            tx.commit().await?;
+            Ok(())
+        }
+        Err(error) => {
+            if let Err(rollback_error) = tx.rollback().await {
+                tracing::warn!(%rollback_error, "failed to roll back lease expiration");
+            }
+            Err(error)
         }
     }
+}
 
-    Ok(())
+/// Guarded, atomic `active` -> `expired` transition. Returns `true` only if this
+/// call performed the transition (`rows_affected() == 1`); returns `false` if the
+/// lease was already expired/completed/failed by another caller, in which case
+/// no further side effects should run.
+async fn expire_active_lease_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    lease_id: LeaseId,
+    completed_at: DateTime<Utc>,
+    error: &str,
+) -> Result<bool, ApiError> {
+    let sql = format!(
+        "update job_leases
+         set status = {}, completed_at = {}, error = {}
+         where id = {} and status = 'active'",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4)
+    );
+    let result = sqlx::query(&sql)
+        .bind(lease_status_to_str(&LeaseStatus::Expired))
+        .bind(completed_at.to_rfc3339())
+        .bind(error)
+        .bind(lease_id.to_string())
+        .execute(&mut *connection)
+        .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 async fn fetch_job(db: &Database, job_id: JobId) -> Result<Job, ApiError> {
@@ -5741,32 +6050,6 @@ async fn fetch_lease_on_connection(
     Ok(JobLease { job, ..lease })
 }
 
-async fn update_lease_status(
-    db: &Database,
-    lease_id: LeaseId,
-    status: LeaseStatus,
-    completed_at: Option<DateTime<Utc>>,
-    error: Option<&str>,
-) -> Result<(), ApiError> {
-    let sql = format!(
-        "update job_leases
-         set status = {}, completed_at = {}, error = {}
-         where id = {}",
-        db.placeholder(1),
-        db.placeholder(2),
-        db.placeholder(3),
-        db.placeholder(4)
-    );
-    sqlx::query(&sql)
-        .bind(lease_status_to_str(&status))
-        .bind(completed_at.map(|time| time.to_rfc3339()))
-        .bind(error)
-        .bind(lease_id.to_string())
-        .execute(&db.pool)
-        .await?;
-    Ok(())
-}
-
 async fn complete_active_lease_on_connection(
     db: &Database,
     connection: &mut AnyConnection,
@@ -5821,32 +6104,6 @@ async fn fail_active_lease_on_connection(
     if result.rows_affected() == 0 {
         return Err(ApiError::bad_request("lease is not active"));
     }
-    Ok(())
-}
-
-async fn update_job_status(
-    db: &Database,
-    job_id: JobId,
-    status: JobStatus,
-    error: Option<&str>,
-    updated_at: DateTime<Utc>,
-) -> Result<(), ApiError> {
-    let sql = format!(
-        "update jobs
-         set status = {}, last_error = {}, updated_at = {}
-         where id = {}",
-        db.placeholder(1),
-        db.placeholder(2),
-        db.placeholder(3),
-        db.placeholder(4)
-    );
-    sqlx::query(&sql)
-        .bind(job_status_to_str(&status))
-        .bind(error)
-        .bind(updated_at.to_rfc3339())
-        .bind(job_id.to_string())
-        .execute(&db.pool)
-        .await?;
     Ok(())
 }
 
@@ -6239,40 +6496,6 @@ async fn apply_claimed_job_on_connection(
         JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {}
     }
     Ok(())
-}
-
-async fn apply_retryable_job(db: &Database, job: &Job, error: &str) -> Result<(), ApiError> {
-    let mut tx = db.pool.begin().await?;
-    let applied = apply_retryable_job_on_connection(db, &mut *tx, job, error).await;
-    match applied {
-        Ok(()) => {
-            tx.commit().await?;
-            Ok(())
-        }
-        Err(error) => {
-            if let Err(rollback_error) = tx.rollback().await {
-                tracing::warn!(%rollback_error, "failed to roll back retryable job side effects");
-            }
-            Err(error)
-        }
-    }
-}
-
-async fn apply_failed_job(db: &Database, job: &Job, error: &str) -> Result<(), ApiError> {
-    let mut tx = db.pool.begin().await?;
-    let applied = apply_failed_job_on_connection(db, &mut *tx, job, error).await;
-    match applied {
-        Ok(()) => {
-            tx.commit().await?;
-            Ok(())
-        }
-        Err(error) => {
-            if let Err(rollback_error) = tx.rollback().await {
-                tracing::warn!(%rollback_error, "failed to roll back failed job side effects");
-            }
-            Err(error)
-        }
-    }
 }
 
 async fn apply_retryable_job_on_connection(
@@ -7436,6 +7659,14 @@ impl ApiError {
         }
     }
 
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "conflict",
+            message: message.into(),
+        }
+    }
+
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -7447,6 +7678,20 @@ impl ApiError {
 
 impl From<sqlx::Error> for ApiError {
     fn from(error: sqlx::Error) -> Self {
+        // Classify the errors we can distinguish so clients don't see an opaque
+        // 500 for conditions that are really "you conflicted with another writer"
+        // (409) or "your request violates a data constraint" (400). Anything we
+        // can't confidently classify still falls back to a 500, as before.
+        if let sqlx::Error::Database(ref db_error) = error {
+            if db_error.is_unique_violation() {
+                tracing::warn!(%error, "database unique constraint violation");
+                return Self::conflict("the request conflicts with an existing record");
+            }
+            if db_error.kind() == ErrorKind::CheckViolation {
+                tracing::warn!(%error, "database check constraint violation");
+                return Self::bad_request("the request violates a database constraint");
+            }
+        }
         tracing::error!(%error, "database error");
         Self::internal("database operation failed")
     }

@@ -39,6 +39,9 @@ pub const DEFAULT_EGRESS_EXCLUDED_CIDRS: &[&str] =
 /// sandbox's ssh/desktop/vnc ports (GH-67).
 pub const DEFAULT_INGRESS_SELECTOR_KEY: &str = "app.kubernetes.io/part-of";
 pub const DEFAULT_INGRESS_SELECTOR_VALUE: &str = "sandboxwich";
+/// Kubernetes resource kinds (as a `kubectl get/delete` type list) that carry the
+/// `sandboxwich.dev/sandbox-id` label and must be torn down when a sandbox is stopped.
+pub const SANDBOX_TEARDOWN_RESOURCE_KINDS: &str = "pod,persistentvolumeclaim,service,networkpolicy";
 
 pub trait SandboxProvider {
     fn capability_report(&self) -> ProviderCapabilityReport;
@@ -66,6 +69,9 @@ pub trait SandboxProvider {
         snapshot_id: SnapshotId,
         spec: &SandboxProvisionSpec,
     ) -> anyhow::Result<ProviderForkHandle>;
+    /// Tear down every resource associated with `sandbox_id`. Must be idempotent:
+    /// calling it on an already-stopped (or never-provisioned) sandbox is not an error.
+    fn stop(&self, sandbox_id: SandboxId) -> anyhow::Result<()>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1241,6 +1247,45 @@ impl KubernetesApplyProvider {
         run_kubectl_command(&self.kubectl, &args, "wait for sandbox pod readiness")
     }
 
+    /// Returns true if the sandbox's pod already exists in the cluster. Used so that
+    /// `exec_handoff` only provisions when necessary instead of re-applying the full
+    /// manifest set (and its immutable Pod fields) before every command.
+    fn pod_exists(&self, sandbox_id: SandboxId) -> anyhow::Result<bool> {
+        let mut args = self.kubectl_base_args();
+        args.extend([
+            "get".to_string(),
+            "pod".to_string(),
+            self.pod_name(sandbox_id),
+            "--ignore-not-found".to_string(),
+            "-o".to_string(),
+            "name".to_string(),
+        ]);
+        let output = run_kubectl_command(&self.kubectl, &args, "check sandbox pod existence")?;
+        if !output.success {
+            bail!(
+                "kubectl get pod failed with {}: {}",
+                output.status,
+                output.stderr
+            );
+        }
+        Ok(!output.stdout.trim().is_empty())
+    }
+
+    /// Renders the `kubectl delete` argument list that tears down every resource
+    /// labeled with this sandbox's id. Split out from `stop` so it can be exercised
+    /// in unit tests without invoking a real `kubectl` binary.
+    fn teardown_args(&self, sandbox_id: SandboxId) -> Vec<String> {
+        let mut args = self.kubectl_base_args();
+        args.extend([
+            "delete".to_string(),
+            SANDBOX_TEARDOWN_RESOURCE_KINDS.to_string(),
+            "-l".to_string(),
+            format!("sandboxwich.dev/sandbox-id={sandbox_id}"),
+            "--ignore-not-found=true".to_string(),
+        ]);
+        args
+    }
+
     fn exec_args(&self, sandbox_id: SandboxId, request: &AgentCommandRequest) -> Vec<String> {
         let mut args = self.kubectl_base_args();
         args.extend([
@@ -1518,6 +1563,12 @@ impl SandboxProvider for KubernetesDryRunProvider {
             }),
         })
     }
+
+    fn stop(&self, _sandbox_id: SandboxId) -> anyhow::Result<()> {
+        // Dry-run provider never applies anything to a cluster, so there is nothing
+        // to tear down; treat it as a successful (planned) no-op.
+        Ok(())
+    }
 }
 
 impl SandboxProvider for KubernetesApplyProvider {
@@ -1608,7 +1659,13 @@ impl SandboxProvider for KubernetesApplyProvider {
         spec: &SandboxProvisionSpec,
         request: AgentCommandRequest,
     ) -> anyhow::Result<AgentCommandResult> {
-        self.provision(sandbox_id, spec)?;
+        // Only provision when the pod is actually missing. Re-applying the full
+        // manifest set (and re-waiting up to 120s) before every command is both slow
+        // and unsafe: Pod `resources` are immutable, so an exec whose spec drifts from
+        // the original provisioning would otherwise hard-fail every subsequent command.
+        if !self.pod_exists(sandbox_id)? {
+            self.provision(sandbox_id, spec)?;
+        }
         let started_at = Utc::now();
         let output = run_kubectl_command(
             &self.kubectl,
@@ -1718,6 +1775,20 @@ impl SandboxProvider for KubernetesApplyProvider {
             metadata.insert("waitStdout".to_string(), json!(wait.stdout));
         }
         Ok(handle)
+    }
+
+    fn stop(&self, sandbox_id: SandboxId) -> anyhow::Result<()> {
+        Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
+        let args = self.teardown_args(sandbox_id);
+        let output = run_kubectl_command(&self.kubectl, &args, "delete sandbox resources")?;
+        if !output.success {
+            bail!(
+                "kubectl delete sandbox resources failed with {}: {}",
+                output.status,
+                output.stderr
+            );
+        }
+        Ok(())
     }
 }
 
@@ -2393,5 +2464,69 @@ mod tests {
                 .contains(&"sandboxwich-sandboxes".to_string())
         );
         assert!(!plan.apply_args.contains(&"sandboxwich".to_string()));
+    }
+
+    #[test]
+    fn teardown_args_delete_every_labeled_resource_kind_scoped_to_namespace() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        let apply = KubernetesApplyProvider::new(provider, "kubectl")
+            .with_kubectl_context(Some("k3s-ci".to_string()))
+            .with_mutation_gate(true, true);
+        let sandbox_id = SandboxId::new();
+
+        let args = apply.teardown_args(sandbox_id);
+
+        assert_eq!(
+            args,
+            vec![
+                "--context".to_string(),
+                "k3s-ci".to_string(),
+                "-n".to_string(),
+                "sandboxwich-ci".to_string(),
+                "delete".to_string(),
+                SANDBOX_TEARDOWN_RESOURCE_KINDS.to_string(),
+                "-l".to_string(),
+                format!("sandboxwich.dev/sandbox-id={sandbox_id}"),
+                "--ignore-not-found=true".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn teardown_args_omit_context_flag_for_in_cluster_service_account() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        let apply = KubernetesApplyProvider::new(provider, "kubectl")
+            .with_kubectl_context(Some("in-cluster".to_string()))
+            .with_mutation_gate(true, true);
+
+        let args = apply.teardown_args(SandboxId::new());
+
+        assert!(!args.iter().any(|arg| arg == "--context"));
+        assert_eq!(args[0], "-n");
+        assert!(args.contains(&SANDBOX_TEARDOWN_RESOURCE_KINDS.to_string()));
+    }
+
+    #[test]
+    fn stop_refuses_to_mutate_without_confirm_apply_gate() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        let apply = KubernetesApplyProvider::new(provider, "kubectl");
+
+        let error = apply
+            .stop(SandboxId::new())
+            .expect_err("stop without the mutation gate should fail closed");
+        assert!(error.to_string().contains("--confirm-apply"));
+    }
+
+    #[test]
+    fn dry_run_stop_is_a_successful_no_op() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+
+        provider
+            .stop(SandboxId::new())
+            .expect("dry-run stop should never fail");
     }
 }
