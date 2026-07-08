@@ -3459,16 +3459,15 @@ impl TestServer {
                 .get(format!("{base_url}/healthz"))
                 .send()
                 .await
+                && response.status().is_success()
             {
-                if response.status().is_success() {
-                    return Self {
-                        base_url,
-                        database_url,
-                        child,
-                        auth_token: None,
-                        _data_dir: data_dir,
-                    };
-                }
+                return Self {
+                    base_url,
+                    database_url,
+                    child,
+                    auth_token: None,
+                    _data_dir: data_dir,
+                };
             }
             if let Some(status) = child.try_wait().unwrap() {
                 panic!("server exited before becoming healthy: {status}");
@@ -4163,6 +4162,7 @@ fn insert_runtime_resource_tombstone_sql(database_url: &str) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn insert_runtime_resource_tombstone(
     pool: &sqlx::AnyPool,
     database_url: &str,

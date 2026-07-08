@@ -289,7 +289,7 @@ fn parse_env_bool(name: &'static str, default: bool) -> anyhow::Result<bool> {
 
 async fn migrate_database(db: &Database) -> anyhow::Result<()> {
     sqlx::migrate!("./migrations").run(&db.pool).await?;
-    ensure_database_constraints(&db).await?;
+    ensure_database_constraints(db).await?;
     Ok(())
 }
 
@@ -2714,7 +2714,7 @@ async fn reconcile_runtime_resources(
     let mut tx = state.db.pool.begin().await?;
     let reconciled = reconcile_runtime_resources_on_connection(
         &state.db,
-        &mut *tx,
+        &mut tx,
         &request,
         &ctx.tenant_id,
         observed_at,
@@ -3240,25 +3240,18 @@ async fn complete_lease_in_transaction(
     let mut tx = db.pool.begin().await?;
 
     let completed = async {
-        let lease = fetch_lease_on_connection(db, &mut *tx, lease_id).await?;
+        let lease = fetch_lease_on_connection(db, &mut tx, lease_id).await?;
         if lease.status != LeaseStatus::Active {
             return Err(ApiError::bad_request("lease is not active"));
         }
 
         let now = Utc::now();
-        complete_active_lease_on_connection(db, &mut *tx, lease_id, now).await?;
-        apply_completed_job_on_connection(db, &mut *tx, &lease.job, result).await?;
-        update_job_status_on_connection(
-            db,
-            &mut *tx,
-            lease.job_id,
-            JobStatus::Succeeded,
-            None,
-            now,
-        )
-        .await?;
+        complete_active_lease_on_connection(db, &mut tx, lease_id, now).await?;
+        apply_completed_job_on_connection(db, &mut tx, &lease.job, result).await?;
+        update_job_status_on_connection(db, &mut tx, lease.job_id, JobStatus::Succeeded, None, now)
+            .await?;
 
-        fetch_lease_on_connection(db, &mut *tx, lease_id).await
+        fetch_lease_on_connection(db, &mut tx, lease_id).await
     }
     .await;
 
@@ -3301,39 +3294,39 @@ async fn fail_lease_in_transaction(
     let mut tx = db.pool.begin().await?;
 
     let failed = async {
-        let lease = fetch_lease_on_connection(db, &mut *tx, lease_id).await?;
+        let lease = fetch_lease_on_connection(db, &mut tx, lease_id).await?;
         if lease.status != LeaseStatus::Active {
             return Err(ApiError::bad_request("lease is not active"));
         }
 
         let now = Utc::now();
-        fail_active_lease_on_connection(db, &mut *tx, lease_id, now, error).await?;
+        fail_active_lease_on_connection(db, &mut tx, lease_id, now, error).await?;
         let retry = retry_requested && lease.job.attempts < lease.job.max_attempts;
         if retry {
             update_job_status_on_connection(
                 db,
-                &mut *tx,
+                &mut tx,
                 lease.job_id,
                 JobStatus::Queued,
                 Some(error),
                 now,
             )
             .await?;
-            apply_retryable_job_on_connection(db, &mut *tx, &lease.job, error).await?;
+            apply_retryable_job_on_connection(db, &mut tx, &lease.job, error).await?;
         } else {
             update_job_status_on_connection(
                 db,
-                &mut *tx,
+                &mut tx,
                 lease.job_id,
                 JobStatus::Failed,
                 Some(error),
                 now,
             )
             .await?;
-            apply_failed_job_on_connection(db, &mut *tx, &lease.job, error).await?;
+            apply_failed_job_on_connection(db, &mut tx, &lease.job, error).await?;
         }
 
-        fetch_lease_on_connection(db, &mut *tx, lease_id).await
+        fetch_lease_on_connection(db, &mut tx, lease_id).await
     }
     .await;
 
@@ -4261,7 +4254,7 @@ async fn upsert_sandbox_file(
         let now = Utc::now();
         let existing_id = fetch_sandbox_file_id_by_path_on_connection(
             db,
-            &mut *tx,
+            &mut tx,
             sandbox_id,
             path,
         )
@@ -4308,7 +4301,7 @@ async fn upsert_sandbox_file(
                 .execute(&mut *tx)
                 .await?;
         }
-        fetch_sandbox_file_metadata_on_connection(db, &mut *tx, sandbox_id, file_id).await
+        fetch_sandbox_file_metadata_on_connection(db, &mut tx, sandbox_id, file_id).await
     }
     .await;
     match upserted {
@@ -4459,7 +4452,7 @@ async fn append_command_output_chunk(
     let mut tx = db.pool.begin().await?;
     let appended = append_command_output_chunk_on_connection(
         db,
-        &mut *tx,
+        &mut tx,
         command_id,
         sandbox_id,
         stream,
@@ -4897,10 +4890,10 @@ async fn insert_sandbox(db: &Database, sandbox: &Sandbox) -> Result<(), ApiError
     validate_network_egress(&sandbox.network_egress)?;
     let mut tx = db.pool.begin().await?;
     let inserted = async {
-        insert_sandbox_on_connection(db, &mut *tx, sandbox).await?;
+        insert_sandbox_on_connection(db, &mut tx, sandbox).await?;
         replace_sandbox_network_rules_on_connection(
             db,
-            &mut *tx,
+            &mut tx,
             sandbox.id,
             sandbox.network_egress.rules(),
         )
@@ -5298,26 +5291,26 @@ async fn expire_due_snapshots(db: &Database) -> Result<Vec<Snapshot>, ApiError> 
         let expired_snapshot = async {
             update_snapshot_status_on_connection(
                 db,
-                &mut *tx,
+                &mut tx,
                 snapshot.id,
                 SnapshotStatus::Expired,
                 None,
             )
             .await?;
-            dead_queued_snapshot_jobs_on_connection(db, &mut *tx, snapshot.id, "snapshot expired")
+            dead_queued_snapshot_jobs_on_connection(db, &mut tx, snapshot.id, "snapshot expired")
                 .await?;
             fail_sandboxes_waiting_on_snapshot_on_connection(
                 db,
-                &mut *tx,
+                &mut tx,
                 snapshot.id,
                 "snapshot_expired",
                 "snapshot expired",
             )
             .await?;
-            let expired_snapshot = fetch_snapshot_on_connection(db, &mut *tx, snapshot.id).await?;
+            let expired_snapshot = fetch_snapshot_on_connection(db, &mut tx, snapshot.id).await?;
             insert_event_on_connection(
                 db,
-                &mut *tx,
+                &mut tx,
                 expired_snapshot.sandbox_id,
                 SandboxEventKind::LifecycleChanged,
                 json!({
@@ -5483,15 +5476,14 @@ async fn cleanup_archived_sandboxes(
         let cleaned = async {
             let deleted_resources = mark_runtime_resources_deleted_for_sandbox_on_connection(
                 db,
-                &mut *tx,
+                &mut tx,
                 sandbox.id,
                 now,
                 "archived sandbox deleted during cleanup",
             )
             .await?;
             for resource in &deleted_resources {
-                insert_runtime_resource_tombstone_on_connection(db, &mut *tx, resource, now)
-                    .await?;
+                insert_runtime_resource_tombstone_on_connection(db, &mut tx, resource, now).await?;
             }
             let sql = format!(
                 "delete from sandboxes where id = {} and state = 'archived'",
@@ -6035,9 +6027,9 @@ async fn try_claim_job(
 ) -> Result<Option<JobLease>, ApiError> {
     let mut tx = db.pool.begin().await?;
     let claimed = async {
-        lock_worker_for_claim_on_connection(db, &mut *tx, worker.id).await?;
+        lock_worker_for_claim_on_connection(db, &mut tx, worker.id).await?;
         let active_leases =
-            active_lease_count_for_worker_on_connection(db, &mut *tx, worker.id).await?;
+            active_lease_count_for_worker_on_connection(db, &mut tx, worker.id).await?;
         if active_leases >= worker.max_concurrent_jobs {
             return Ok(None);
         }
@@ -6075,11 +6067,11 @@ async fn try_claim_job(
             expires_at,
             completed_at: None,
             error: None,
-            job: fetch_job_on_connection(db, &mut *tx, job.id).await?,
+            job: fetch_job_on_connection(db, &mut tx, job.id).await?,
         };
-        insert_lease_on_connection(db, &mut *tx, &lease).await?;
-        apply_claimed_job_on_connection(db, &mut *tx, &lease.job).await?;
-        let lease = fetch_lease_on_connection(db, &mut *tx, lease.id).await?;
+        insert_lease_on_connection(db, &mut tx, &lease).await?;
+        apply_claimed_job_on_connection(db, &mut tx, &lease.job).await?;
+        let lease = fetch_lease_on_connection(db, &mut tx, lease.id).await?;
         Ok(Some(lease))
     };
     match claimed.await {

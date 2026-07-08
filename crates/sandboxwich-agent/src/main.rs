@@ -272,26 +272,25 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
                     })
                     .await?;
 
-                if let Some(lease) = claim_response.lease {
-                    if let Err(error) =
+                if let Some(lease) = claim_response.lease
+                    && let Err(error) =
                         handle_lease(&client, &api, lease, args.max_captured_output_bytes).await
-                    {
-                        with_retry(
-                            &mut claim_budget,
-                            &mut claim_backoff,
-                            "post_guest_health",
-                            || {
-                                post_guest_health(
-                                    &client,
-                                    &api,
-                                    sandbox_id,
-                                    GuestStatus::Unhealthy,
-                                    Some(error.to_string()),
-                                )
-                            },
-                        )
-                        .await?;
-                    }
+                {
+                    with_retry(
+                        &mut claim_budget,
+                        &mut claim_backoff,
+                        "post_guest_health",
+                        || {
+                            post_guest_health(
+                                &client,
+                                &api,
+                                sandbox_id,
+                                GuestStatus::Unhealthy,
+                                Some(error.to_string()),
+                            )
+                        },
+                    )
+                    .await?;
                 }
             }
 
@@ -561,13 +560,13 @@ async fn write_file(args: FileWriteArgs) -> anyhow::Result<()> {
     let target = confine_to_workspace(&args.workspace_root, &args.path).await?;
 
     // Refuse to write through an existing non-regular file (directory, symlink, device, ...).
-    if let Ok(metadata) = tokio::fs::symlink_metadata(&target).await {
-        if !metadata.is_file() {
-            bail!(
-                "refusing to write to non-regular file at {}",
-                target.display()
-            );
-        }
+    if let Ok(metadata) = tokio::fs::symlink_metadata(&target).await
+        && !metadata.is_file()
+    {
+        bail!(
+            "refusing to write to non-regular file at {}",
+            target.display()
+        );
     }
 
     if let Some(parent) = target.parent() {
@@ -883,13 +882,12 @@ where
             }
         }
     }
-    if let (Some(client), Some(api), Some(lease_id)) = (&client, &api, lease_id) {
-        if let Err(error) =
+    if let (Some(client), Some(api), Some(lease_id)) = (&client, &api, lease_id)
+        && let Err(error) =
             append_output_chunk(client, api, lease_id, stream, stream_decoder.finish()).await
-        {
-            let warning = format!("sandboxwich-agent: failed to flush output chunk: {error}\n");
-            let _ = tokio::io::stderr().write_all(warning.as_bytes()).await;
-        }
+    {
+        let warning = format!("sandboxwich-agent: failed to flush output chunk: {error}\n");
+        let _ = tokio::io::stderr().write_all(warning.as_bytes()).await;
     }
     Ok(captured)
 }
@@ -920,12 +918,9 @@ impl Utf8StreamDecoder {
                     }
 
                     if let Some(error_len) = error.error_len() {
-                        output.push_str(
-                            &String::from_utf8_lossy(
-                                &self.pending[valid_up_to..valid_up_to + error_len],
-                            )
-                            .into_owned(),
-                        );
+                        output.push_str(&String::from_utf8_lossy(
+                            &self.pending[valid_up_to..valid_up_to + error_len],
+                        ));
                         self.pending.drain(..valid_up_to + error_len);
                         continue;
                     }
