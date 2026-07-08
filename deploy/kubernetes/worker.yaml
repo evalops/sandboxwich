@@ -1,4 +1,18 @@
 ---
+# GH-76: sandboxes are provisioned into a dedicated namespace, separate
+# from the control-plane namespace (sandboxwich) where the API, the
+# sandboxwich-secrets Secret (SANDBOXWICH_DATABASE_URL, api-token), and the
+# worker's own ServiceAccount live. The worker's RBAC below is scoped to
+# this namespace only and grants nothing in the control-plane namespace,
+# so a compromised worker (or an exec-path bug) cannot reach
+# sandboxwich-api pods or the database credential.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sandboxwich-sandboxes
+  labels:
+    app.kubernetes.io/part-of: sandboxwich
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -8,11 +22,14 @@ metadata:
     app.kubernetes.io/name: sandboxwich-worker
     app.kubernetes.io/part-of: sandboxwich
 ---
+# NOTE: no Role/RoleBinding is granted to sandboxwich-worker in the
+# sandboxwich (control-plane) namespace. All sandbox-manipulating
+# permissions live in the sandboxwich-sandboxes Role/RoleBinding below.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: sandboxwich-worker
-  namespace: sandboxwich
+  namespace: sandboxwich-sandboxes
   labels:
     app.kubernetes.io/name: sandboxwich-worker
     app.kubernetes.io/part-of: sandboxwich
@@ -21,10 +38,18 @@ rules:
     resources:
       - pods
       - pods/log
-      - pods/exec
       - services
       - persistentvolumeclaims
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # pods/exec is scoped to "create" only, and to this namespace, which
+  # contains nothing but sandbox pods. RBAC has no per-resource wildcard
+  # for the dynamically-generated sandbox pod names, so namespace
+  # isolation (rather than resourceNames) is what keeps this from being
+  # usable against control-plane pods (GH-76).
+  - apiGroups: [""]
+    resources:
+      - pods/exec
+    verbs: ["create"]
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources: ["volumesnapshots"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
@@ -36,7 +61,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: sandboxwich-worker
-  namespace: sandboxwich
+  namespace: sandboxwich-sandboxes
   labels:
     app.kubernetes.io/name: sandboxwich-worker
     app.kubernetes.io/part-of: sandboxwich
@@ -94,6 +119,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # GH-76: sandboxes render into a dedicated namespace, separate
+            # from SANDBOXWICH_NAMESPACE (the control-plane namespace the
+            # worker pod itself runs in). Must match the Namespace/Role/
+            # RoleBinding above.
+            - name: SANDBOXWICH_SANDBOX_NAMESPACE
+              value: sandboxwich-sandboxes
             - name: SANDBOXWICH_STORAGE_CLASS
               value: local-path
             - name: SANDBOXWICH_SNAPSHOT_CLASS
@@ -102,8 +133,22 @@ spec:
               value: 2Gi
             - name: SANDBOXWICH_SSH_AUTHORIZED_KEYS_SECRET
               value: ""
+            - name: SANDBOXWICH_VNC_PASSWORD_SECRET
+              value: ""
             - name: SANDBOXWICH_RUNTIME_CLASS_NAME
               value: ""
+            # SECURITY NOTE (GH-76): this hardcodes both halves of the
+            # mutation double opt-in (this env var and --confirm-apply
+            # below) permanently ON in the only production deployment of
+            # this manifest, which defeats their purpose as a
+            # confirmation gate -- the worker must apply manifests to do
+            # its job, so as shipped there is no environment where the
+            # gate is ever actually closed. Left enabled because flipping
+            # it off would break the only working deployment path; tracked
+            # as follow-up to move this behind an explicit per-environment
+            # promotion step (e.g. a separate overlay/values file that
+            # must be deliberately set to true) rather than a static value
+            # in the checked-in base manifest.
             - name: SANDBOXWICH_K8S_ENABLE_MUTATION
               value: "1"
           args:
@@ -121,6 +166,8 @@ spec:
             - $(SANDBOXWICH_CLUSTER)
             - --namespace
             - $(SANDBOXWICH_NAMESPACE)
+            - --sandbox-namespace
+            - $(SANDBOXWICH_SANDBOX_NAMESPACE)
             - --storage-class
             - $(SANDBOXWICH_STORAGE_CLASS)
             - --snapshot-class
@@ -129,8 +176,12 @@ spec:
             - $(SANDBOXWICH_WORKSPACE_STORAGE)
             - --ssh-authorized-keys-secret
             - $(SANDBOXWICH_SSH_AUTHORIZED_KEYS_SECRET)
+            - --vnc-password-secret
+            - $(SANDBOXWICH_VNC_PASSWORD_SECRET)
             - --runtime-class-name
             - $(SANDBOXWICH_RUNTIME_CLASS_NAME)
+            - --ingress-namespace
+            - $(SANDBOXWICH_NAMESPACE)
             - --label
             - cluster=$(SANDBOXWICH_CLUSTER)
             - --label
