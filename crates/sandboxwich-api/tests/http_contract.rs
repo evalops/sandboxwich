@@ -429,7 +429,7 @@ async fn small_body_route_rejects_oversized_json_but_upload_route_accepts_large_
             .display()
     );
     let server = TestServer::start(database_url, Some(data_dir)).await;
-    let client = reqwest::Client::new();
+    let client = server.client();
 
     let created: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
@@ -478,7 +478,7 @@ async fn small_body_route_rejects_oversized_json_but_upload_route_accepts_large_
     // payload far above the small default (well below the new MAX_SANDBOX_FILE_BYTES cap).
     // Use a fresh client: rejecting the oversized body above closes the connection mid-write,
     // which can poison a pooled connection and surface here as a spurious send error.
-    let upload_client = reqwest::Client::new();
+    let upload_client = server.client();
     let large_content = vec![b'a'; 8 * 1024 * 1024];
     let form = reqwest::multipart::Form::new()
         .text("path", "/workspace/large.bin")
@@ -517,7 +517,7 @@ async fn list_commands_respect_limit_and_paginate_with_cursor() {
             .display()
     );
     let server = TestServer::start(database_url, Some(data_dir)).await;
-    let client = reqwest::Client::new();
+    let client = server.client();
 
     let created: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
