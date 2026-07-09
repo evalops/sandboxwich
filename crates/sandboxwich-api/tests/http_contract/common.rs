@@ -201,7 +201,7 @@ pub(crate) async fn run_contract(server: TestServer) {
     // `client`.
     let worker_client = worker_client(&worker);
 
-    let heartbeat: WorkerResponse = client
+    let heartbeat: WorkerResponse = worker_client
         .post(format!(
             "{}/workers/{}/heartbeat",
             server.base_url, worker.worker.id
