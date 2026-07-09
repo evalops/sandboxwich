@@ -43,8 +43,18 @@ pub(crate) async fn register_worker(
         validate_max_concurrent_jobs(request.max_concurrent_jobs.unwrap_or(1))?;
 
     let now = Utc::now();
+    let existing = fetch_worker_by_logical_identity(
+        &state.db,
+        &ctx.tenant_id,
+        request.name.trim(),
+        request.provider.trim(),
+    )
+    .await?;
     let worker = Worker {
-        id: WorkerId::new(),
+        id: existing
+            .as_ref()
+            .map(|worker| worker.id)
+            .unwrap_or_else(WorkerId::new),
         tenant_id: ctx.tenant_id,
         name: request.name,
         status: WorkerStatus::Registered,
@@ -61,12 +71,104 @@ pub(crate) async fn register_worker(
     // response.
     let worker_token = generate_worker_token();
     let token_hash = hash_worker_token(&worker_token);
-    insert_worker(&state.db, &worker, &token_hash).await?;
+    if existing.is_some() {
+        let sql = format!(
+            "update workers set status = {}, capabilities = {}, max_concurrent_jobs = {},
+             labels = {}, registered_at = {}, last_heartbeat_at = null, token_hash = {}
+             where id = {}",
+            state.db.placeholder(1),
+            state.db.placeholder(2),
+            state.db.placeholder(3),
+            state.db.placeholder(4),
+            state.db.placeholder(5),
+            state.db.placeholder(6),
+            state.db.placeholder(7)
+        );
+        sqlx::query(&sql)
+            .bind(worker_status_to_str(&WorkerStatus::Registered))
+            .bind(serde_json::to_string(&worker.capabilities)?)
+            .bind(i64::from(worker.max_concurrent_jobs))
+            .bind(serde_json::to_string(&worker.labels)?)
+            .bind(now.to_rfc3339())
+            .bind(&token_hash)
+            .bind(worker.id.to_string())
+            .execute(&state.db.pool)
+            .await?;
+        let generation_sql = format!(
+            "update worker_sessions set generation = generation + 1, started_at = {} where worker_id = {}",
+            state.db.placeholder(1),
+            state.db.placeholder(2)
+        );
+        sqlx::query(&generation_sql)
+            .bind(now.to_rfc3339())
+            .bind(worker.id.to_string())
+            .execute(&state.db.pool)
+            .await?;
+    } else {
+        insert_worker(&state.db, &worker, &token_hash).await?;
+        let sql = format!(
+            "insert into worker_sessions (worker_id, generation, started_at) values ({})",
+            state.db.placeholders(3)
+        );
+        sqlx::query(&sql)
+            .bind(worker.id.to_string())
+            .bind(1_i64)
+            .bind(now.to_rfc3339())
+            .execute(&state.db.pool)
+            .await?;
+    }
 
     Ok(Json(WorkerResponse {
         ok: true,
         worker,
         worker_token: Some(worker_token),
+    }))
+}
+
+async fn fetch_worker_by_logical_identity(
+    db: &Database,
+    tenant_id: &str,
+    name: &str,
+    provider: &str,
+) -> Result<Option<Worker>, ApiError> {
+    let sql =
+        format!(
+        "select id, tenant_id, name, status, provider, capabilities, max_concurrent_jobs, labels,
+                registered_at, last_heartbeat_at from workers
+         where tenant_id = {} and name = {} and provider = {}",
+        db.placeholder(1), db.placeholder(2), db.placeholder(3)
+    );
+    sqlx::query(&sql)
+        .bind(tenant_id)
+        .bind(name)
+        .bind(provider)
+        .fetch_optional(&db.pool)
+        .await?
+        .map(row_to_worker)
+        .transpose()
+}
+
+pub(crate) async fn drain_worker(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path(worker_id): Path<Uuid>,
+) -> Result<Json<WorkerResponse>, ApiError> {
+    let worker_id = WorkerId(worker_id);
+    ensure_worker_tenant(&state.db, worker_id, &ctx).await?;
+    let sql = format!(
+        "update workers set status = {} where id = {}",
+        state.db.placeholder(1),
+        state.db.placeholder(2)
+    );
+    sqlx::query(&sql)
+        .bind(worker_status_to_str(&WorkerStatus::Draining))
+        .bind(worker_id.to_string())
+        .execute(&state.db.pool)
+        .await?;
+    Ok(Json(WorkerResponse {
+        ok: true,
+        worker: fetch_worker(&state.db, worker_id).await?,
+        worker_token: None,
     }))
 }
 
@@ -246,7 +348,7 @@ pub(crate) async fn maybe_insert_guest_failure_event(
     insert_event(
         db,
         guest_health.sandbox_id,
-        SandboxEventKind::DesktopExpired,
+        SandboxEventKind::GuestHealthFailed,
         json!({
             "reason": reason,
             "guestStatus": &guest_health.status,
@@ -454,6 +556,40 @@ pub(crate) async fn insert_worker_heartbeat(
         .bind(worker_id.to_string())
         .bind(labels)
         .bind(created_at.to_rfc3339())
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+/// Reconciles liveness from durable heartbeat timestamps and bounds the
+/// append-only heartbeat history. This is deliberately idempotent so every
+/// API replica may run the periodic controller safely.
+pub(crate) async fn reconcile_worker_liveness(db: &Database) -> Result<(), ApiError> {
+    let now = Utc::now();
+    let offline_before = now - chrono::Duration::seconds(90);
+    let sql = format!(
+        "update workers set status = {}
+         where status in ('online', 'draining')
+           and (last_heartbeat_at is null or last_heartbeat_at < {})",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    sqlx::query(&sql)
+        .bind(worker_status_to_str(&WorkerStatus::Offline))
+        .bind(offline_before.to_rfc3339())
+        .execute(&db.pool)
+        .await?;
+
+    let retain_after = now - chrono::Duration::days(7);
+    let delete_sql = format!(
+        "delete from worker_heartbeats where id in (
+             select id from worker_heartbeats where created_at < {}
+             order by created_at asc, id asc limit 1000
+         )",
+        db.placeholder(1)
+    );
+    sqlx::query(&delete_sql)
+        .bind(retain_after.to_rfc3339())
         .execute(&db.pool)
         .await?;
     Ok(())

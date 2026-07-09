@@ -277,6 +277,7 @@ pub(crate) async fn try_claim_job(
     worker: &Worker,
     job: &Job,
     lease_seconds: Option<u64>,
+    operation_id: Option<Uuid>,
 ) -> Result<Option<JobLease>, ApiError> {
     let mut tx = db.pool.begin().await?;
     let claimed = async {
@@ -323,6 +324,20 @@ pub(crate) async fn try_claim_job(
             job: fetch_job_on_connection(db, &mut tx, job.id).await?,
         };
         insert_lease_on_connection(db, &mut tx, &lease).await?;
+        if let Some(operation_id) = operation_id {
+            let sql = format!(
+                "insert into lease_claim_operations (worker_id, operation_id, lease_id, created_at)
+                 values ({})",
+                db.placeholders(4)
+            );
+            sqlx::query(&sql)
+                .bind(worker.id.to_string())
+                .bind(operation_id.to_string())
+                .bind(lease.id.to_string())
+                .bind(now.to_rfc3339())
+                .execute(&mut *tx)
+                .await?;
+        }
         apply_claimed_job_on_connection(db, &mut tx, &lease.job).await?;
         let lease = fetch_lease_on_connection(db, &mut tx, lease.id).await?;
         Ok(Some(lease))
