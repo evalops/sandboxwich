@@ -1241,13 +1241,7 @@ fn capabilities_from_args(
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
-    value.and_then(|value| {
-        if value.trim().is_empty() {
-            None
-        } else {
-            Some(value)
-        }
-    })
+    value.filter(|value| !value.trim().is_empty())
 }
 
 async fn print_json<T>(response: reqwest::Response) -> anyhow::Result<()>
