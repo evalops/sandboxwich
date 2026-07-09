@@ -405,6 +405,7 @@ async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
             argv: vec!["true".to_string()],
             cwd: None,
             env: Default::default(),
+            timeout_secs: None,
         })
         .send()
         .await
@@ -1275,6 +1276,7 @@ async fn list_commands_respect_limit_and_paginate_with_cursor() {
                 argv: vec!["echo".to_string(), index.to_string()],
                 cwd: None,
                 env: Default::default(),
+                timeout_secs: None,
             })
             .send()
             .await
@@ -1506,6 +1508,7 @@ async fn run_contract(server: TestServer) {
             argv: vec!["echo".to_string(), "hello".to_string()],
             cwd: None,
             env: Default::default(),
+            timeout_secs: None,
         })
         .send()
         .await
@@ -1649,6 +1652,7 @@ async fn run_contract(server: TestServer) {
             argv: vec!["echo".to_string(), "second".to_string()],
             cwd: None,
             env: Default::default(),
+            timeout_secs: None,
         })
         .send()
         .await
@@ -2740,6 +2744,7 @@ async fn assert_retryable_failure_requeues_command(
             argv: vec!["false".to_string()],
             cwd: None,
             env: Default::default(),
+            timeout_secs: None,
         })
         .send()
         .await
@@ -2881,6 +2886,7 @@ async fn assert_expired_lease_requeues_command(
             argv: vec!["sleep".to_string(), "1".to_string()],
             cwd: None,
             env: Default::default(),
+            timeout_secs: None,
         })
         .send()
         .await

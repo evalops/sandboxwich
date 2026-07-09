@@ -3,6 +3,11 @@ use std::{
     io::Write,
     process::{Command, Stdio},
     str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use anyhow::{Context, bail};
@@ -17,6 +22,7 @@ use sandboxwich_core::{
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const KUBERNETES_MUTATION_ENV: &str = "SANDBOXWICH_K8S_ENABLE_MUTATION";
 pub const DEFAULT_SANDBOX_GUEST_IMAGE: &str = "ghcr.io/evalops/sandboxwich-ubuntu-dev:latest";
@@ -26,6 +32,17 @@ pub const DEFAULT_SANDBOX_GUEST_IMAGE: &str = "ghcr.io/evalops/sandboxwich-ubunt
 /// `sandboxwich-agent`'s `DEFAULT_MAX_CAPTURED_OUTPUT_BYTES`: without a cap, a
 /// chatty or misbehaving `kubectl` command could grow these unboundedly.
 pub const DEFAULT_MAX_CAPTURED_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Default bound applied to every `kubectl` invocation made by
+/// [`KubernetesApplyProvider`] (see [`run_kubectl_command`]). Deliberately
+/// longer than `wait_for_pod_ready`'s own `--timeout=120s` flag so this is a
+/// backstop against a wedged `kubectl`/API server (a process that hangs
+/// rather than erroring out after its own internal timeout), not something
+/// that routinely races that flag. Configurable via
+/// `with_kubectl_command_timeout`/`--kubectl-command-timeout-secs`/
+/// `SANDBOXWICH_KUBECTL_COMMAND_TIMEOUT_SECS` for environments that need a
+/// longer bound (e.g. slow-running commands executed via `kubectl exec`).
+pub const DEFAULT_KUBECTL_COMMAND_TIMEOUT_SECS: u64 = 300;
 
 /// Default dedicated namespace sandbox workloads are provisioned into, kept
 /// separate from the control-plane namespace (see GH-76). Not read directly
@@ -51,6 +68,35 @@ pub const DEFAULT_INGRESS_SELECTOR_VALUE: &str = "sandboxwich";
 /// `sandboxwich.dev/sandbox-id` label and must be torn down when a sandbox is stopped.
 pub const SANDBOX_TEARDOWN_RESOURCE_KINDS: &str = "pod,persistentvolumeclaim,service,networkpolicy";
 
+/// Cheaply cloneable signal a job's background lease-renewal task (see
+/// `handle_lease` in `main.rs`) uses to tell an in-flight `exec_handoff` call
+/// that the lease is gone -- renewal failed after retries -- so the
+/// long-running `kubectl exec` behind it should stop instead of running to
+/// (possibly duplicated) completion against a lease this worker can no
+/// longer prove is still its own.
+#[derive(Clone, Debug, Default)]
+pub struct CancelSignal(Arc<AtomicBool>);
+
+impl CancelSignal {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// A signal that never fires; for callers (dry-run execution, smoke
+    /// tests) with no lease-renewal loop backing them.
+    pub fn never_cancelled() -> Self {
+        Self::new()
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 pub trait SandboxProvider {
     fn capability_report(&self) -> ProviderCapabilityReport;
     fn health_report(&self) -> ProviderHealthReport;
@@ -64,6 +110,7 @@ pub trait SandboxProvider {
         sandbox_id: SandboxId,
         spec: &SandboxProvisionSpec,
         request: AgentCommandRequest,
+        cancelled: &CancelSignal,
     ) -> anyhow::Result<AgentCommandResult>;
     fn create_snapshot(
         &self,
@@ -1086,6 +1133,7 @@ pub struct KubernetesApplyProvider {
     kubectl_context: Option<String>,
     confirm_apply: bool,
     mutation_enabled: bool,
+    kubectl_command_timeout: Duration,
     max_captured_output_bytes: u64,
 }
 
@@ -1098,6 +1146,7 @@ impl KubernetesApplyProvider {
             kubectl_context,
             confirm_apply: false,
             mutation_enabled: false,
+            kubectl_command_timeout: Duration::from_secs(DEFAULT_KUBECTL_COMMAND_TIMEOUT_SECS),
             max_captured_output_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
         }
     }
@@ -1117,6 +1166,15 @@ impl KubernetesApplyProvider {
     pub fn with_mutation_gate(mut self, confirm_apply: bool, mutation_enabled: bool) -> Self {
         self.confirm_apply = confirm_apply;
         self.mutation_enabled = mutation_enabled;
+        self
+    }
+
+    /// Overrides the bound applied to every `kubectl` invocation this provider
+    /// makes (see [`DEFAULT_KUBECTL_COMMAND_TIMEOUT_SECS`]). A hung `kubectl`
+    /// process (e.g. talking to an unreachable API server) is killed once this
+    /// elapses instead of wedging the worker's job-execution thread forever.
+    pub fn with_kubectl_command_timeout(mut self, timeout: Duration) -> Self {
+        self.kubectl_command_timeout = timeout;
         self
     }
 
@@ -1168,7 +1226,9 @@ impl KubernetesApplyProvider {
                     argv: vec!["echo".to_string(), "sandboxwich".to_string()],
                     cwd: None,
                     env: BTreeMap::new(),
+                    timeout_secs: None,
                 },
+                &CancelSignal::never_cancelled(),
             )
             .expect("dry-run exec handoff should not fail");
         let apply_manifests = vec![
@@ -1359,6 +1419,8 @@ impl KubernetesApplyProvider {
             &self.kubectl,
             &args,
             "wait for sandbox pod readiness",
+            self.kubectl_command_timeout,
+            None,
             self.max_captured_output_bytes,
         )
     }
@@ -1380,6 +1442,8 @@ impl KubernetesApplyProvider {
             &self.kubectl,
             &args,
             "check sandbox pod existence",
+            self.kubectl_command_timeout,
+            None,
             self.max_captured_output_bytes,
         )?;
         if !output.success {
@@ -1427,6 +1491,8 @@ impl KubernetesApplyProvider {
             &self.kubectl,
             &args,
             "rollback applied resources after failed provision/fork",
+            self.kubectl_command_timeout,
+            None,
             self.max_captured_output_bytes,
         ) {
             Ok(output) if output.success => {
@@ -1544,6 +1610,7 @@ const EXEC_ENV_WRAPPER_SCRIPT: &str = concat!(
     "exec \"$@\""
 );
 
+#[derive(Debug)]
 struct KubectlOutput {
     success: bool,
     code: Option<i32>,
@@ -1602,13 +1669,40 @@ fn run_kubectl_documents(
     })
 }
 
+/// How often a kubectl invocation polls a `CancelSignal` for cancellation
+/// while waiting on the child.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Runs a `kubectl` invocation with a bounded wait, killing the child and
+/// returning a "timed out" error if it hasn't exited within `timeout`.
+///
+/// Previously this used `std::process::Command::output()`, which blocks the
+/// calling thread until `kubectl` exits with no bound at all: a `kubectl`
+/// stuck talking to an unreachable/misbehaving API server (or `kubectl exec`
+/// into a wedged pod) hung the worker's job-execution thread forever. This is
+/// called from a synchronous `SandboxProvider` method that itself always runs
+/// either inside `tokio::task::spawn_blocking` (see `handle_lease`) or
+/// directly within `#[tokio::main]`'s task, so a Tokio runtime `Handle` is
+/// normally available to drive the bounded async wait below; callers with no
+/// ambient runtime at all (synchronous unit tests) get a throwaway
+/// current-thread runtime instead.
 fn run_kubectl_command(
     kubectl: &str,
     args: &[String],
     context: &'static str,
+    timeout: Duration,
+    cancelled: Option<&CancelSignal>,
     max_output_bytes: u64,
 ) -> anyhow::Result<KubectlOutput> {
-    run_kubectl_command_with_stdin(kubectl, args, None, context, max_output_bytes)
+    run_kubectl_command_with_stdin(
+        kubectl,
+        args,
+        None,
+        context,
+        timeout,
+        cancelled,
+        max_output_bytes,
+    )
 }
 
 /// Like `run_kubectl_command`, but when `stdin_payload` is `Some`, pipes it
@@ -1620,47 +1714,151 @@ fn run_kubectl_command_with_stdin(
     args: &[String],
     stdin_payload: Option<&[u8]>,
     context: &'static str,
+    timeout: Duration,
+    cancelled: Option<&CancelSignal>,
     max_output_bytes: u64,
 ) -> anyhow::Result<KubectlOutput> {
-    let Some(payload) = stdin_payload else {
-        let output = Command::new(kubectl)
-            .args(args)
-            .output()
-            .with_context(|| format!("failed to run kubectl for {context}"))?;
-        return Ok(KubectlOutput {
-            success: output.status.success(),
-            code: output.status.code(),
-            status: output.status.to_string(),
-            stdout: cap_output_bytes(&output.stdout, max_output_bytes),
-            stderr: cap_output_bytes(&output.stderr, max_output_bytes),
-        });
-    };
+    let command = run_kubectl_command_async(
+        kubectl,
+        args,
+        stdin_payload,
+        context,
+        timeout,
+        cancelled,
+        max_output_bytes,
+    );
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(command),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build a runtime to drive a kubectl invocation")?
+            .block_on(command),
+    }
+}
 
-    let mut child = Command::new(kubectl)
+async fn run_kubectl_command_async(
+    kubectl: &str,
+    args: &[String],
+    stdin_payload: Option<&[u8]>,
+    context: &'static str,
+    timeout: Duration,
+    cancelled: Option<&CancelSignal>,
+    max_output_bytes: u64,
+) -> anyhow::Result<KubectlOutput> {
+    let mut command = tokio::process::Command::new(kubectl);
+    command
         .args(args)
-        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if stdin_payload.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn kubectl for {context}"))?;
+    let stdin_pipe = match stdin_payload {
+        Some(_) => Some(child.stdin.take().context("failed to open kubectl stdin")?),
+        None => None,
+    };
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .context("failed to capture kubectl stdout")?;
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .context("failed to capture kubectl stderr")?;
 
-    let mut stdin = child.stdin.take().context("failed to open kubectl stdin")?;
-    stdin
-        .write_all(payload)
-        .context("failed to write stdin payload to kubectl")?;
-    drop(stdin);
+    // Feed stdin (dropping the pipe afterwards sends EOF) and drain
+    // stdout/stderr concurrently with waiting on the child: kubectl can
+    // write more than a single pipe buffer's worth of output, and waiting for
+    // exit before ever reading the pipes risks a classic deadlock (kubectl
+    // blocks writing to a full pipe while we block waiting for it to exit).
+    // The same reasoning applies to writing the stdin payload.
+    let drive = async {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let feed_stdin = async {
+            if let (Some(mut stdin), Some(payload)) = (stdin_pipe, stdin_payload) {
+                stdin.write_all(payload).await?;
+            }
+            Ok::<_, std::io::Error>(())
+        };
+        tokio::try_join!(
+            child.wait(),
+            feed_stdin,
+            stdout_pipe.read_to_end(&mut stdout),
+            stderr_pipe.read_to_end(&mut stderr),
+        )
+        .map(|(status, (), _, _)| (status, stdout, stderr))
+    };
 
-    let output = child
-        .wait_with_output()
-        .with_context(|| format!("failed to wait for kubectl {context}"))?;
+    // If the caller's lease renewal is lost while this kubectl invocation is
+    // in flight (e.g. a `kubectl exec` running a long command), cancelling
+    // here means the process gets killed promptly instead of running to
+    // (possibly duplicated) completion against a lease this worker can no
+    // longer prove is still its own. Callers with no lease-renewal loop
+    // behind them (e.g. `wait_for_pod_ready`, `stop`) pass `None`, which
+    // never fires.
+    let wait_for_cancellation = async {
+        match cancelled {
+            Some(cancelled) => loop {
+                if cancelled.is_cancelled() {
+                    return;
+                }
+                tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
+            },
+            None => std::future::pending().await,
+        }
+    };
 
-    Ok(KubectlOutput {
-        success: output.status.success(),
-        code: output.status.code(),
-        status: output.status.to_string(),
-        stdout: cap_output_bytes(&output.stdout, max_output_bytes),
-        stderr: cap_output_bytes(&output.stderr, max_output_bytes),
-    })
+    tokio::select! {
+        result = tokio::time::timeout(timeout, drive) => {
+            match result {
+                Ok(result) => {
+                    let (status, stdout, stderr) =
+                        result.with_context(|| format!("failed to run kubectl for {context}"))?;
+                    Ok(KubectlOutput {
+                        success: status.success(),
+                        code: status.code(),
+                        status: status.to_string(),
+                        stdout: cap_output_bytes(&stdout, max_output_bytes),
+                        stderr: cap_output_bytes(&stderr, max_output_bytes),
+                    })
+                }
+                Err(_elapsed) => {
+                    // `drive` (and the mutable borrow of `child` it held via
+                    // `child.wait()`) was dropped when the timeout fired, so
+                    // `child` is free to use again here.
+                    if let Err(kill_error) = child.start_kill() {
+                        eprintln!(
+                            "warning: failed to kill timed-out kubectl process ({context}): {kill_error}"
+                        );
+                    }
+                    // Reap the process so it doesn't linger as a zombie.
+                    let _ = child.wait().await;
+                    bail!(
+                        "kubectl {context} timed out after {timeout:?} and was killed; this is \
+                         treated as a transient infrastructure failure and retried like other \
+                         timeouts"
+                    );
+                }
+            }
+        }
+        () = wait_for_cancellation => {
+            if let Err(kill_error) = child.start_kill() {
+                eprintln!(
+                    "warning: failed to kill cancelled kubectl process ({context}): {kill_error}"
+                );
+            }
+            let _ = child.wait().await;
+            bail!(
+                "kubectl {context} was cancelled because lease renewal was lost; the job is \
+                 being abandoned so it isn't run twice"
+            );
+        }
+    }
 }
 
 fn render_manifest_documents(manifests: &[Value]) -> anyhow::Result<String> {
@@ -1740,6 +1938,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
         sandbox_id: SandboxId,
         spec: &SandboxProvisionSpec,
         request: AgentCommandRequest,
+        _cancelled: &CancelSignal,
     ) -> anyhow::Result<AgentCommandResult> {
         let started_at = Utc::now();
         let finished_at = Utc::now();
@@ -1950,6 +2149,7 @@ impl SandboxProvider for KubernetesApplyProvider {
         sandbox_id: SandboxId,
         spec: &SandboxProvisionSpec,
         request: AgentCommandRequest,
+        cancelled: &CancelSignal,
     ) -> anyhow::Result<AgentCommandResult> {
         // Only provision when the pod is actually missing. Re-applying the full
         // manifest set (and re-waiting up to 120s) before every command is both slow
@@ -1959,12 +2159,22 @@ impl SandboxProvider for KubernetesApplyProvider {
             self.provision(sandbox_id, spec)?;
         }
         let started_at = Utc::now();
+        // A per-command `timeout_secs` (see `AgentCommandRequest`) takes
+        // precedence over this provider's default bound, so a job's
+        // requested timeout is honored the same way whether it executes via
+        // `kubectl exec` here or directly in-guest via `sandboxwich-agent`.
+        let timeout = request
+            .timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(self.kubectl_command_timeout);
         let stdin_payload = Self::exec_stdin_payload(&request);
         let output = run_kubectl_command_with_stdin(
             &self.kubectl,
             &self.exec_args(sandbox_id, &request),
             stdin_payload.as_deref(),
             "execute sandbox command",
+            timeout,
+            Some(cancelled),
             self.max_captured_output_bytes,
         )?;
         let finished_at = Utc::now();
@@ -2093,6 +2303,8 @@ impl SandboxProvider for KubernetesApplyProvider {
             &self.kubectl,
             &args,
             "delete sandbox resources",
+            self.kubectl_command_timeout,
+            None,
             self.max_captured_output_bytes,
         )?;
         if !output.success {
@@ -2109,6 +2321,99 @@ impl SandboxProvider for KubernetesApplyProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn run_kubectl_command_async_succeeds_within_timeout() {
+        let output = run_kubectl_command_async(
+            "sh",
+            &["-c".to_string(), "echo hi && exit 0".to_string()],
+            None,
+            "test fast command",
+            Duration::from_secs(5),
+            None,
+            DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
+        )
+        .await
+        .expect("fast command should succeed well within the timeout");
+        assert!(output.success);
+        assert_eq!(output.stdout.trim(), "hi");
+    }
+
+    #[tokio::test]
+    async fn run_kubectl_command_async_kills_the_child_and_errors_on_timeout() {
+        // Regression test for item 3(b): before this fix, `run_kubectl_command`
+        // used `std::process::Command::output()` with no bound at all, so a
+        // wedged `kubectl` (e.g. `kubectl exec` into an unresponsive pod, or
+        // `kubectl` stuck talking to an unreachable API server) hung the
+        // worker's job-execution thread forever. A command that would run far
+        // longer than the configured timeout must be killed and reported as a
+        // distinct timeout failure well before it would naturally exit.
+        let started = std::time::Instant::now();
+        let error = run_kubectl_command_async(
+            "sh",
+            &["-c".to_string(), "sleep 30".to_string()],
+            None,
+            "test slow command",
+            Duration::from_millis(200),
+            None,
+            DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
+        )
+        .await
+        .expect_err("a command that outlives the timeout must be treated as a failure");
+        let elapsed = started.elapsed();
+
+        assert!(
+            error.to_string().contains("timed out"),
+            "error should be distinctly reported as a timeout, got: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the timed-out child should have been killed almost immediately instead of \
+             the caller waiting anywhere near its full 30s sleep; elapsed = {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_kubectl_command_async_is_cancelled_when_lease_renewal_is_lost() {
+        // Regression test for item 4(b): before this fix, `handle_lease`'s
+        // renewal task just logged and looped when renewal failed, while the
+        // job kept executing regardless -- it could be re-queued and picked
+        // up by another worker while this one was still running `kubectl
+        // exec` for it. A lost-renewal signal must cancel the in-flight
+        // kubectl invocation promptly instead of letting it run to
+        // completion.
+        let cancelled = CancelSignal::new();
+        let flip_cancelled = cancelled.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            flip_cancelled.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let error = run_kubectl_command_async(
+            "sh",
+            &["-c".to_string(), "sleep 30".to_string()],
+            None,
+            "test slow command",
+            Duration::from_secs(60), // Long enough that the timeout branch can't win the race.
+            Some(&cancelled),
+            DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
+        )
+        .await
+        .expect_err("a cancelled kubectl invocation must be treated as a failure");
+        let elapsed = started.elapsed();
+
+        assert!(
+            error.to_string().contains("cancelled"),
+            "error should be distinctly reported as a cancellation, got: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the cancelled child should have been killed almost immediately instead of \
+             the caller waiting anywhere near its full 30s sleep or 60s timeout; \
+             elapsed = {elapsed:?}"
+        );
+    }
 
     #[test]
     fn kubernetes_dry_run_reports_k8s_capabilities_and_health() {
@@ -2194,7 +2499,9 @@ mod tests {
                     argv: vec!["echo".to_string(), "hello".to_string()],
                     cwd: None,
                     env: BTreeMap::new(),
+                    timeout_secs: None,
                 },
+                &CancelSignal::never_cancelled(),
             )
             .expect("dry-run exec should succeed");
         assert_eq!(exec.exit_code, Some(0));
@@ -2484,6 +2791,7 @@ mod tests {
             argv: vec!["printf".to_string(), "ok".to_string()],
             cwd: None,
             env: BTreeMap::new(),
+            timeout_secs: None,
         };
         let exec_args = apply.exec_args(sandbox_id, &request);
 
@@ -2516,6 +2824,7 @@ mod tests {
             argv: vec!["printf".to_string(), "ok".to_string()],
             cwd: None,
             env,
+            timeout_secs: None,
         };
 
         let exec_args = apply.exec_args(sandbox_id, &request);
@@ -2565,6 +2874,7 @@ mod tests {
             argv: vec!["printf".to_string(), "ok".to_string()],
             cwd: None,
             env: BTreeMap::new(),
+            timeout_secs: None,
         };
 
         let exec_args = apply.exec_args(SandboxId::new(), &request);
@@ -2589,6 +2899,7 @@ mod tests {
             argv: vec!["pwd".to_string()],
             cwd: Some("/workspace/project".to_string()),
             env,
+            timeout_secs: None,
         };
 
         let exec_args = apply.exec_args(SandboxId::new(), &request);
@@ -2608,6 +2919,7 @@ mod tests {
             argv: vec!["true".to_string()],
             cwd: None,
             env,
+            timeout_secs: None,
         };
 
         let payload = KubernetesApplyProvider::exec_stdin_payload(&request)

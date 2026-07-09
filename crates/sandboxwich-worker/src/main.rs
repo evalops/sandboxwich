@@ -5,8 +5,8 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use provider::{
-    DEFAULT_MAX_CAPTURED_OUTPUT_BYTES, KUBERNETES_MUTATION_ENV, KubernetesApplyProvider,
-    KubernetesDryRunProvider, SandboxProvider,
+    CancelSignal, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES, KUBERNETES_MUTATION_ENV,
+    KubernetesApplyProvider, KubernetesDryRunProvider, SandboxProvider,
 };
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse,
@@ -303,6 +303,17 @@ struct RuntimeProviderArgs {
     #[arg(long, default_value_t = false)]
     confirm_apply: bool,
 
+    /// Bound applied to every `kubectl` invocation (wait/get/exec/delete); a
+    /// hung `kubectl` (e.g. talking to an unreachable API server) is killed
+    /// once this elapses instead of wedging the worker forever. A value of
+    /// `0` falls back to the default rather than disabling the bound.
+    #[arg(
+        long,
+        env = "SANDBOXWICH_KUBECTL_COMMAND_TIMEOUT_SECS",
+        default_value_t = provider::DEFAULT_KUBECTL_COMMAND_TIMEOUT_SECS
+    )]
+    kubectl_command_timeout_secs: u64,
+
     /// Cap on the stdout/stderr captured from each kubectl invocation before it's
     /// stored in job results and provider metadata. Mirrors sandboxwich-agent's
     /// equivalent flag.
@@ -330,6 +341,17 @@ struct ProviderApplyArgs {
 
     #[arg(long, default_value_t = false)]
     keep_resources: bool,
+
+    /// Bound applied to every `kubectl` invocation (wait/get/exec/delete); a
+    /// hung `kubectl` (e.g. talking to an unreachable API server) is killed
+    /// once this elapses instead of wedging the worker forever. A value of
+    /// `0` falls back to the default rather than disabling the bound.
+    #[arg(
+        long,
+        env = "SANDBOXWICH_KUBECTL_COMMAND_TIMEOUT_SECS",
+        default_value_t = provider::DEFAULT_KUBECTL_COMMAND_TIMEOUT_SECS
+    )]
+    kubectl_command_timeout_secs: u64,
 
     /// Cap on the stdout/stderr captured from each kubectl invocation before it's
     /// stored in job results and provider metadata. Mirrors sandboxwich-agent's
@@ -395,10 +417,11 @@ impl SandboxProvider for RuntimeProvider {
         sandbox_id: sandboxwich_core::SandboxId,
         spec: &SandboxProvisionSpec,
         request: AgentCommandRequest,
+        cancelled: &CancelSignal,
     ) -> anyhow::Result<sandboxwich_core::AgentCommandResult> {
         match self {
-            Self::DryRun(provider) => provider.exec_handoff(sandbox_id, spec, request),
-            Self::Apply(provider) => provider.exec_handoff(sandbox_id, spec, request),
+            Self::DryRun(provider) => provider.exec_handoff(sandbox_id, spec, request, cancelled),
+            Self::Apply(provider) => provider.exec_handoff(sandbox_id, spec, request, cancelled),
         }
     }
 
@@ -490,7 +513,9 @@ async fn main() -> anyhow::Result<()> {
                     argv: vec!["echo".to_string(), "sandboxwich".to_string()],
                     cwd: None,
                     env: BTreeMap::new(),
+                    timeout_secs: None,
                 },
+                &CancelSignal::never_cancelled(),
             )?;
             let provision = provider.provision(sandbox_id, &spec)?;
             let snapshot = provider.create_snapshot(sandbox_id, snapshot_id)?;
@@ -732,6 +757,17 @@ fn mutation_gate_force_enabled_warning(
     }
 }
 
+/// `0` is documented as "fall back to the default" rather than "disable the
+/// bound": an unbounded `kubectl` wait is exactly the hang this timeout
+/// exists to prevent, so silently accepting `0` as infinite would defeat it.
+fn kubectl_command_timeout(secs: u64) -> Duration {
+    if secs == 0 {
+        Duration::from_secs(provider::DEFAULT_KUBECTL_COMMAND_TIMEOUT_SECS)
+    } else {
+        Duration::from_secs(secs)
+    }
+}
+
 fn apply_provider_from_args(args: ProviderApplyArgs) -> KubernetesApplyProvider {
     let provider = provider_from_args(args.provider);
     let mutation_enabled = KubernetesApplyProvider::mutation_enabled_from_env();
@@ -745,6 +781,7 @@ fn apply_provider_from_args(args: ProviderApplyArgs) -> KubernetesApplyProvider 
     KubernetesApplyProvider::new(provider, args.kubectl)
         .with_kubectl_context(args.kubectl_context)
         .with_mutation_gate(args.confirm_apply, mutation_enabled)
+        .with_kubectl_command_timeout(kubectl_command_timeout(args.kubectl_command_timeout_secs))
         .with_max_captured_output_bytes(args.max_captured_output_bytes)
 }
 
@@ -765,6 +802,9 @@ fn runtime_provider_from_args(args: RuntimeProviderArgs) -> RuntimeProvider {
                 KubernetesApplyProvider::new(provider, args.kubectl)
                     .with_kubectl_context(args.kubectl_context)
                     .with_mutation_gate(args.confirm_apply, mutation_enabled)
+                    .with_kubectl_command_timeout(kubectl_command_timeout(
+                        args.kubectl_command_timeout_secs,
+                    ))
                     .with_max_captured_output_bytes(args.max_captured_output_bytes),
             )
         }
@@ -900,6 +940,16 @@ fn classify_retry(error: &anyhow::Error) -> bool {
         "i/o error",
         " 429",
         " 503",
+        // Emitted when `run_kubectl_command`'s cancellation race (see
+        // `CancelSignal`) kills a `kubectl exec` because this job's lease
+        // renewal failed. We can't always tell whether that means the lease
+        // is genuinely gone (the common case, in which the server's expiry
+        // sweep has already re-queued the job elsewhere and this retry flag
+        // is moot) or was a transient renewal blip against a still-active
+        // lease (in which case marking this non-retryable would silently
+        // drop the job) -- treat it as retryable so the latter, worse case
+        // can't happen.
+        "lease renewal was lost",
     ];
     error.chain().any(|cause| {
         let text = cause.to_string().to_lowercase();
@@ -1123,6 +1173,14 @@ where
         .unwrap_or(FALLBACK_LEASE_DURATION);
     let renew_client = client.clone();
     let renew_api = api.to_string();
+    // Job execution can't be forcibly aborted once it's running on the blocking-pool
+    // thread below (blocking tasks can't be cancelled by Tokio), so instead of just
+    // logging and looping forever when renewal is lost, flip this signal: the exec
+    // path polls it and kills its own `kubectl` invocation, so the job stops running
+    // instead of continuing (and possibly being re-queued and executed a second time
+    // elsewhere) against a lease this worker can no longer prove is still its own.
+    let cancelled = CancelSignal::new();
+    let renew_cancelled = cancelled.clone();
     let renew_task = tokio::spawn(async move {
         loop {
             tokio::time::sleep(renew_interval).await;
@@ -1139,7 +1197,13 @@ where
             })
             .await;
             if let Err(error) = result {
-                eprintln!("warning: renewing lease {lease_id} failed after retries: {error:#}");
+                eprintln!(
+                    "warning: renewing lease {lease_id} failed after retries: {error:#}; \
+                     cancelling the running job instead of letting it keep executing against \
+                     a lease we can no longer prove is still ours"
+                );
+                renew_cancelled.cancel();
+                return;
             }
         }
     });
@@ -1149,13 +1213,16 @@ where
     // renewal tasks running alongside it).
     let job = lease.job.clone();
     let exec_provider = provider.clone();
-    let outcome = tokio::task::spawn_blocking(move || execute_job(&job, exec_provider.as_ref()))
-        .await
-        .unwrap_or_else(|join_error| {
-            Err(anyhow::anyhow!(
-                "job execution task panicked or was cancelled: {join_error}"
-            ))
-        });
+    let exec_cancelled = cancelled.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        execute_job(&job, exec_provider.as_ref(), &exec_cancelled)
+    })
+    .await
+    .unwrap_or_else(|join_error| {
+        Err(anyhow::anyhow!(
+            "job execution task panicked or was cancelled: {join_error}"
+        ))
+    });
 
     renew_task.abort();
     let _ = renew_task.await;
@@ -1214,6 +1281,7 @@ enum WorkerJobOutcome {
 fn execute_job(
     job: &sandboxwich_core::Job,
     provider: &impl SandboxProvider,
+    cancelled: &CancelSignal,
 ) -> anyhow::Result<WorkerJobOutcome> {
     match job.kind {
         JobKind::ProvisionSandbox => {
@@ -1235,6 +1303,7 @@ fn execute_job(
                 sandbox_id,
                 &spec,
                 agent_request_from_payload(&job.payload)?,
+                cancelled,
             )?;
             if result.exit_code.unwrap_or(1) == 0 {
                 Ok(WorkerJobOutcome::Complete(WorkerJobResult::RunCommand {
@@ -1327,8 +1396,14 @@ fn agent_request_from_payload(payload: &serde_json::Value) -> anyhow::Result<Age
         .transpose()
         .context("job payload env is invalid")?
         .unwrap_or_else(BTreeMap::new);
+    let timeout_secs = payload.get("timeoutSecs").and_then(|value| value.as_u64());
 
-    Ok(AgentCommandRequest { argv, cwd, env })
+    Ok(AgentCommandRequest {
+        argv,
+        cwd,
+        env,
+        timeout_secs,
+    })
 }
 
 fn prompt_output_from_payload(payload: &serde_json::Value) -> anyhow::Result<String> {
@@ -1529,6 +1604,7 @@ mod tests {
                 WorkerCapability::ProvisionSandbox,
             ),
             &provider(),
+            &CancelSignal::never_cancelled(),
         )
         .expect("provision job should execute");
         let WorkerJobResult::ProvisionSandbox { handle } = completed_result(outcome) else {
@@ -1565,6 +1641,7 @@ mod tests {
                 WorkerCapability::RunCommand,
             ),
             &provider(),
+            &CancelSignal::never_cancelled(),
         )
         .expect("command job should execute");
         let WorkerJobResult::RunCommand { result } = completed_result(outcome) else {
@@ -1594,6 +1671,7 @@ mod tests {
                     WorkerCapability::Snapshot,
                 ),
                 &provider,
+                &CancelSignal::never_cancelled(),
             )
             .expect("snapshot job should execute"),
         );
@@ -1617,6 +1695,7 @@ mod tests {
                     WorkerCapability::Snapshot,
                 ),
                 &provider,
+                &CancelSignal::never_cancelled(),
             )
             .expect("fork job should execute"),
         );
@@ -1639,6 +1718,7 @@ mod tests {
                 WorkerCapability::RunCommand,
             ),
             &provider(),
+            &CancelSignal::never_cancelled(),
         )
         .expect_err("missing sandboxId should fail");
 
@@ -1659,6 +1739,7 @@ mod tests {
                 WorkerCapability::RunCommand,
             ),
             &provider(),
+            &CancelSignal::never_cancelled(),
         )
         .expect_err("missing provisionSpec on RunCommand should fail, not default");
 
@@ -1675,6 +1756,7 @@ mod tests {
                 WorkerCapability::K8sPod,
             ),
             &provider(),
+            &CancelSignal::never_cancelled(),
         )
         .expect("stop job should execute");
         let WorkerJobResult::StopSandbox {
@@ -1697,6 +1779,7 @@ mod tests {
                 WorkerCapability::K8sPod,
             ),
             &provider(),
+            &CancelSignal::never_cancelled(),
         )
         .expect("resume job should execute (and report a job failure)");
         match outcome {
@@ -1754,6 +1837,12 @@ mod tests {
             "kubectl apply sandbox manifests failed with exit status: 1: Error from server (Too Many Requests): rate limited"
         );
         assert!(classify_retry(&rate_limited));
+
+        let cancelled_by_lost_renewal = anyhow::anyhow!(
+            "kubectl execute sandbox command was cancelled because lease renewal was lost; the \
+             job is being abandoned so it isn't run twice"
+        );
+        assert!(classify_retry(&cancelled_by_lost_renewal));
     }
 
     #[test]

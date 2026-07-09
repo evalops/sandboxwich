@@ -741,6 +741,7 @@ async fn run_sandbox_ttft_once(
                 argv: vec!["printf".to_string(), "sandboxwich-ttft\n".to_string()],
                 cwd: None,
                 env: Default::default(),
+                timeout_secs: None,
             }),
     )
     .await?;

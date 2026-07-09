@@ -2,6 +2,10 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -11,8 +15,9 @@ use clap::{Args, Parser, Subcommand};
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, AgentFileReadResponse, AgentFileWriteRequest,
     AgentHealthResponse, AppendCommandOutputRequest, ClaimLeaseRequest, ClaimLeaseResponse,
-    CommandOutputStream, CompleteLeaseRequest, FailLeaseRequest, GuestStatus, JobKind, LeaseId,
-    LeaseResponse, SandboxId, UpdateGuestHealthRequest, WorkerJobResult, build_api_client,
+    CommandOutputStream, CompleteLeaseRequest, DEFAULT_COMMAND_TIMEOUT_SECS, FailLeaseRequest,
+    GuestStatus, JobKind, LeaseId, LeaseResponse, RenewLeaseRequest, SandboxId,
+    UpdateGuestHealthRequest, WorkerJobResult, build_api_client,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -34,6 +39,21 @@ const DEFAULT_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// final JSON result. Streaming chunks are forwarded to the API incrementally regardless of
 /// this cap; this only bounds the local copy used to build the final result.
 const DEFAULT_MAX_CAPTURED_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
+/// Minimum lease-renewal interval while a command executes, so short/dry-run leases
+/// don't hammer the API. Mirrors `sandboxwich-worker`'s constant of the same name.
+const MIN_RENEW_INTERVAL: Duration = Duration::from_secs(5);
+/// Fallback lease duration used to size the renewal interval if a lease's
+/// `expires_at`/`leased_at` pair is somehow non-positive.
+const FALLBACK_LEASE_DURATION: Duration = Duration::from_secs(30);
+/// Attempts (including the first) for a single lease-renewal call before giving up and
+/// cancelling the command that lease covers, so it isn't left running (and possibly
+/// re-queued and executed a second time elsewhere) against a lease we can no longer prove
+/// is still ours.
+const RENEW_ATTEMPTS: u32 = 3;
+/// Delay between renewal retries within a single renewal attempt window.
+const RENEW_RETRY_DELAY: Duration = Duration::from_millis(250);
+/// How often a command's execution polls for a lease-cancellation signal.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Parser)]
 #[command(name = "sandboxwich-agent")]
@@ -147,6 +167,11 @@ struct ExecArgs {
         default_value_t = DEFAULT_MAX_CAPTURED_OUTPUT_BYTES
     )]
     max_captured_output_bytes: u64,
+
+    /// Maximum time the command may run before it is killed and a timeout
+    /// failure is reported. Unset falls back to `DEFAULT_COMMAND_TIMEOUT_SECS`.
+    #[arg(long)]
+    timeout_secs: Option<u64>,
 
     #[arg(trailing_var_arg = true, required = true)]
     argv: Vec<String>,
@@ -525,11 +550,13 @@ async fn exec(args: ExecArgs) -> anyhow::Result<()> {
             argv: args.argv,
             cwd: args.cwd,
             env: args.env.into_iter().collect(),
+            timeout_secs: args.timeout_secs,
         },
         client.as_ref(),
         api,
         lease,
         args.max_captured_output_bytes,
+        None,
     )
     .await?;
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -707,6 +734,78 @@ async fn claim_lease(
     decode_json(response).await
 }
 
+async fn renew_lease(
+    client: &reqwest::Client,
+    api: &str,
+    lease_id: LeaseId,
+) -> Result<LeaseResponse, AgentRequestError> {
+    let response = client
+        .post(format!("{api}/leases/{lease_id}/renew"))
+        .json(&RenewLeaseRequest {
+            lease_seconds: None,
+        })
+        .send()
+        .await?;
+    decode_json(response).await
+}
+
+/// Renews `lease_id` in the background for as long as the caller's command
+/// executes, at half the lease's original TTL, so a long-running command
+/// doesn't have its lease expire (and get re-queued/claimed onto another
+/// worker, running the same job twice) mid-flight. Mirrors
+/// `sandboxwich-worker`'s `handle_lease` renewal task.
+///
+/// If renewal is lost -- `RENEW_ATTEMPTS` consecutive calls fail -- this
+/// stops renewing (retrying a lease that's plausibly already gone forever
+/// would just hammer the API) and flips `cancelled`, which `execute_streaming`
+/// polls to kill the still-running command instead of letting it keep
+/// executing against a lease we can no longer prove is still ours.
+fn spawn_lease_renewal_task(
+    client: reqwest::Client,
+    api: String,
+    lease: &sandboxwich_core::JobLease,
+    cancelled: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    let lease_id = lease.id;
+    let renew_interval = (lease.expires_at - lease.leased_at)
+        .to_std()
+        .map(|duration| (duration / 2).max(MIN_RENEW_INTERVAL))
+        .unwrap_or(FALLBACK_LEASE_DURATION);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(renew_interval).await;
+            let mut last_error = None;
+            let mut renewed = false;
+            for attempt in 1..=RENEW_ATTEMPTS {
+                match renew_lease(&client, &api, lease_id).await {
+                    Ok(_) => {
+                        renewed = true;
+                        break;
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                        if attempt < RENEW_ATTEMPTS {
+                            tokio::time::sleep(RENEW_RETRY_DELAY).await;
+                        }
+                    }
+                }
+            }
+            if !renewed {
+                let error = last_error
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "unknown error".to_string());
+                eprintln!(
+                    "warning: renewing lease {lease_id} failed after {RENEW_ATTEMPTS} attempts \
+                     ({error}); cancelling the running command instead of letting it keep \
+                     executing against a lease we can no longer prove is still ours"
+                );
+                cancelled.store(true, Ordering::SeqCst);
+                return;
+            }
+        }
+    })
+}
+
 async fn handle_lease(
     client: &reqwest::Client,
     api: &str,
@@ -726,15 +825,24 @@ async fn handle_lease(
     }
 
     let request = agent_request_from_payload(&lease.job.payload)?;
-    match execute_streaming(
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let renew_task =
+        spawn_lease_renewal_task(client.clone(), api.to_string(), &lease, cancelled.clone());
+
+    let result = execute_streaming(
         request,
         Some(client),
         Some(api),
         Some(lease.id),
         max_captured_output_bytes,
+        Some(cancelled),
     )
-    .await
-    {
+    .await;
+
+    renew_task.abort();
+    let _ = renew_task.await;
+
+    match result {
         Ok(result) if result.exit_code.unwrap_or(1) == 0 => {
             let response = client
                 .post(format!("{api}/leases/{}/complete", lease.id))
@@ -780,10 +888,12 @@ async fn execute_streaming(
     api: Option<&str>,
     lease_id: Option<LeaseId>,
     max_captured_output_bytes: u64,
+    cancelled: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<AgentCommandResult> {
     let Some((program, args)) = request.argv.split_first() else {
         bail!("argv must contain at least one item");
     };
+    let timeout = Duration::from_secs(request.timeout_secs.unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS));
 
     let started_at = Utc::now();
     let mut command = ProcessCommand::new(program);
@@ -815,7 +925,57 @@ async fn execute_streaming(
         max_captured_output_bytes,
     ));
 
-    let status = child.wait().await.context("failed to wait for command")?;
+    // Before this bound existed, a wedged command (or one that simply runs
+    // longer than the caller expects) left `child.wait()` waiting forever,
+    // wedging this worker/agent slot for good. Racing in a poll for
+    // `cancelled` alongside it means a command also gets killed promptly if
+    // `handle_lease`'s background renewal task loses the lease, instead of
+    // continuing to run to completion (and possibly being re-queued and
+    // executed a second time elsewhere) against a lease we can no longer
+    // prove is still ours.
+    let wait_for_cancellation = async {
+        match &cancelled {
+            Some(cancelled) => loop {
+                if cancelled.load(Ordering::SeqCst) {
+                    return;
+                }
+                tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
+            },
+            None => std::future::pending().await,
+        }
+    };
+
+    let status = tokio::select! {
+        result = tokio::time::timeout(timeout, child.wait()) => {
+            match result {
+                Ok(status_result) => status_result.context("failed to wait for command")?,
+                Err(_elapsed) => {
+                    // Kill (and reap, so it doesn't linger as a zombie) the timed-out
+                    // child. This closes its stdout/stderr pipes, but the streaming
+                    // tasks are aborted directly below rather than drained, since
+                    // we're reporting a distinct failure instead of a result anyway.
+                    if let Err(kill_error) = child.start_kill() {
+                        eprintln!("warning: failed to kill timed-out command: {kill_error}");
+                    }
+                    let _ = child.wait().await;
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    bail!("command timed out after {timeout:?} and was killed (argv[0] = {program:?})");
+                }
+            }
+        }
+        () = wait_for_cancellation => {
+            if let Err(kill_error) = child.start_kill() {
+                eprintln!("warning: failed to kill cancelled command: {kill_error}");
+            }
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            bail!(
+                "command was cancelled because lease renewal was lost (argv[0] = {program:?})"
+            );
+        }
+    };
     let stdout = stdout_task.await.context("stdout stream task failed")??;
     let stderr = stderr_task.await.context("stderr stream task failed")??;
     let finished_at = Utc::now();
@@ -1011,7 +1171,13 @@ fn agent_request_from_payload(payload: &serde_json::Value) -> anyhow::Result<Age
         .transpose()
         .context("job payload env is invalid")?
         .unwrap_or_else(BTreeMap::new);
-    Ok(AgentCommandRequest { argv, cwd, env })
+    let timeout_secs = payload.get("timeoutSecs").and_then(|value| value.as_u64());
+    Ok(AgentCommandRequest {
+        argv,
+        cwd,
+        env,
+        timeout_secs,
+    })
 }
 
 async fn decode_json<T>(response: reqwest::Response) -> Result<T, AgentRequestError>
@@ -1255,6 +1421,113 @@ mod tests {
             captured.len() < 200,
             "captured buffer should stay small even though only 10 bytes were sent, got {} bytes",
             captured.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_streaming_completes_normally_within_its_timeout() {
+        let request = AgentCommandRequest {
+            argv: vec!["sh".to_string(), "-c".to_string(), "echo ok".to_string()],
+            cwd: None,
+            env: BTreeMap::new(),
+            timeout_secs: Some(5),
+        };
+        let result = execute_streaming(
+            request,
+            None,
+            None,
+            None,
+            DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
+            None,
+        )
+        .await
+        .expect("fast command should complete well within its timeout");
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.stdout.trim(), "ok");
+    }
+
+    #[tokio::test]
+    async fn execute_streaming_kills_and_errors_on_timeout() {
+        // Regression test for item 3(a): before this fix, `execute_streaming`
+        // called `child.wait().await` with no bound at all, so a wedged (or
+        // simply too-slow) command hung the agent's job-execution loop
+        // forever. A command that would run far longer than its requested
+        // timeout must be killed and reported as a distinct timeout failure
+        // well before it would naturally exit.
+        let request = AgentCommandRequest {
+            argv: vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+            cwd: None,
+            env: BTreeMap::new(),
+            timeout_secs: Some(1),
+        };
+        let started = std::time::Instant::now();
+        let error = execute_streaming(
+            request,
+            None,
+            None,
+            None,
+            DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
+            None,
+        )
+        .await
+        .expect_err("a command that outlives its timeout must be treated as a failure");
+        let elapsed = started.elapsed();
+
+        assert!(
+            error.to_string().contains("timed out"),
+            "error should be distinctly reported as a timeout, got: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the timed-out child should have been killed almost immediately instead of \
+             the caller waiting anywhere near its full 30s sleep; elapsed = {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_streaming_is_cancelled_when_lease_renewal_is_lost() {
+        // Regression test for item 4(a): the agent never renewed its lease at
+        // all, so a long-running command whose lease expired kept executing
+        // to completion regardless -- the job could be re-queued and picked
+        // up by another worker while this one was still running it. Now a
+        // lost-renewal signal (as `handle_lease`'s background renewal task
+        // sets when it gives up) must cancel the command promptly instead of
+        // letting it run to completion.
+        let request = AgentCommandRequest {
+            argv: vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+            cwd: None,
+            env: BTreeMap::new(),
+            timeout_secs: Some(60), // Long enough that the timeout branch can't win the race.
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flip_cancelled = cancelled.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            flip_cancelled.store(true, Ordering::SeqCst);
+        });
+
+        let started = std::time::Instant::now();
+        let error = execute_streaming(
+            request,
+            None,
+            None,
+            None,
+            DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
+            Some(cancelled),
+        )
+        .await
+        .expect_err("a cancelled command must be treated as a failure, not left running");
+        let elapsed = started.elapsed();
+
+        assert!(
+            error.to_string().contains("cancelled"),
+            "error should be distinctly reported as a cancellation, got: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the cancelled child should have been killed almost immediately instead of \
+             the caller waiting anywhere near its full 30s sleep or 60s timeout; \
+             elapsed = {elapsed:?}"
         );
     }
 }
