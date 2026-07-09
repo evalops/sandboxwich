@@ -62,7 +62,7 @@ struct Cli {
     request_timeout_secs: u64,
 
     /// Output format for structured responses.
-    #[arg(long, short = 'o', value_enum, default_value_t = OutputFormat::Table)]
+    #[arg(long, short = 'o', value_enum, default_value_t = OutputFormat::Json)]
     output: OutputFormat,
 
     /// Suppress structured success output.
@@ -821,7 +821,7 @@ fn parse_key_value(value: &str) -> Result<(String, String), String> {
         .ok_or_else(|| "environment values must use KEY=VALUE".to_string())?;
     if key.is_empty()
         || !key.bytes().enumerate().all(|(index, byte)| {
-            byte == b'_' || byte.is_ascii_alphanumeric() && (index > 0 || !byte.is_ascii_digit())
+            byte == b'_' || (byte.is_ascii_alphanumeric() && (index > 0 || !byte.is_ascii_digit()))
         })
     {
         return Err("environment key must be a valid POSIX-style identifier".to_string());
@@ -871,6 +871,9 @@ async fn poll_sandbox_until_ready(
         match sandbox.state {
             SandboxState::Ready => return Ok(sandbox),
             SandboxState::Error => bail!("sandbox {sandbox_id} entered the error state"),
+            SandboxState::Archived => {
+                bail!("sandbox {sandbox_id} was archived before it became ready")
+            }
             _ if start.elapsed() >= timeout => {
                 bail!(
                     "timed out after {timeout:?} waiting for sandbox {sandbox_id} (last state: {:?})",
@@ -1022,16 +1025,20 @@ fn print_value<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
 fn primary_rows(value: &serde_json::Value) -> Vec<&serde_json::Value> {
     match value {
         serde_json::Value::Array(rows) => rows.iter().collect(),
-        serde_json::Value::Object(object) => object
-            .iter()
-            .find_map(|(key, value)| {
-                if key == "ok" || key == "next_cursor" {
-                    None
-                } else {
-                    value.as_array().map(|rows| rows.iter().collect())
-                }
-            })
-            .unwrap_or_else(|| vec![value]),
+        serde_json::Value::Object(object) => {
+            let arrays = object
+                .iter()
+                .filter(|(key, _)| *key != "ok" && *key != "next_cursor")
+                .filter_map(|(_, value)| value.as_array())
+                .collect::<Vec<_>>();
+            if let [rows] = arrays.as_slice() {
+                rows.iter().collect()
+            } else {
+                // A response with several arrays has no unambiguous primary row set.
+                // Keep the complete object so table and JSONL output cannot drop fields.
+                vec![value]
+            }
+        }
         _ => vec![value],
     }
 }
@@ -1318,5 +1325,16 @@ mod tests {
             "true",
         ]);
         assert!(cli.is_ok());
+    }
+
+    #[test]
+    fn row_projection_preserves_multi_array_responses() {
+        let response = serde_json::json!({
+            "ok": true,
+            "expired": [{"id": 1}],
+            "runtime_resources_deleted": [{"id": 2}],
+        });
+
+        assert_eq!(primary_rows(&response), vec![&response]);
     }
 }

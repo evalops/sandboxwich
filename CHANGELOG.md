@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- The CLI executable is now named `sandboxwich`. Structured output supports
+  `--output json|jsonl|table` while preserving JSON as the compatibility default;
+  `--quiet` suppresses successful structured output.
+- The CLI now supports `new --wait`, command working directories and environment
+  variables, plus real SSH and SCP handoff. The misleading prompt command was
+  removed because no production prompt runtime exists yet.
 - `HealthResponse` includes `checked_at` and optional `database` fields. Clients built
   against older responses can still deserialize cached or pre-upgrade payloads because
   these fields have serde defaults in `sandboxwich-core`.
