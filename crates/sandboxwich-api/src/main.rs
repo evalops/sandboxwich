@@ -1267,9 +1267,50 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
+/// Waits for whichever shutdown signal the runtime environment sends first.
+///
+/// Kubernetes sends SIGTERM (not SIGINT) to stop a pod, so graceful shutdown
+/// never fired in the shipped deployment when this only awaited `ctrl_c()`.
+/// On Unix, race SIGTERM and SIGINT (dev/local `Ctrl-C`) together; non-Unix
+/// targets fall back to `ctrl_c()` alone since `tokio::signal::unix` isn't
+/// available there.
 async fn shutdown_signal() {
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        tracing::warn!(%error, "failed to install shutdown signal handler");
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(signal) => signal,
+            Err(error) => {
+                tracing::warn!(%error, "failed to install SIGTERM handler");
+                // Fall back to ctrl_c() alone rather than returning immediately
+                // (which would make graceful shutdown a no-op).
+                if let Err(error) = tokio::signal::ctrl_c().await {
+                    tracing::warn!(%error, "failed to install shutdown signal handler");
+                }
+                return;
+            }
+        };
+
+        tokio::select! {
+            _ = sigterm.recv() => {
+                tracing::info!("received SIGTERM, starting graceful shutdown");
+            }
+            result = tokio::signal::ctrl_c() => {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "failed to install shutdown signal handler");
+                } else {
+                    tracing::info!("received SIGINT, starting graceful shutdown");
+                }
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(%error, "failed to install shutdown signal handler");
+        }
     }
 }
 
