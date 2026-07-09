@@ -142,7 +142,7 @@ Sandbox Pods, Services, PVCs, and NetworkPolicies render into a dedicated namesp
 The rendered per-sandbox NetworkPolicy also:
 
 - Always allows DNS egress to `kube-dns` (scoped with `--dns-namespace` / `SANDBOXWICH_DNS_NAMESPACE`, default `kube-system`) regardless of egress mode, so an `allowlist` policy no longer silently breaks name resolution.
-- Carves the control-plane/link-local/cluster CIDRs (`--egress-excluded-cidr` / `SANDBOXWICH_EGRESS_EXCLUDED_CIDRS`, default `169.254.0.0/16,10.42.0.0/16,10.43.0.0/16`) out of any `0.0.0.0/0` egress rule, so `AllowAll` (or an allowlist that includes `0.0.0.0/0`) can never reach the apiserver or cloud metadata endpoints.
+- Carves the control-plane/link-local/cluster CIDRs (`--egress-excluded-cidr` / `SANDBOXWICH_EGRESS_EXCLUDED_CIDRS`, default `169.254.0.0/16,10.42.0.0/16,10.43.0.0/16`, merged with any operator-supplied CIDRs unless `--egress-excluded-cidrs-replace` is set) out of *every* egress allow rule that overlaps them, not just `0.0.0.0/0` -- an allowlist entry as broad as `10.0.0.0/8` also gets the overlapping ranges carved out -- so sandboxes can never reach the apiserver or cloud metadata endpoints regardless of egress mode.
 - Adds an ingress policy restricting the sandbox's ssh/desktop/vnc ports (2222/6080/5900) to pods matching `--ingress-namespace`/`--ingress-selector-label` (default: the control-plane namespace, pods labeled `app.kubernetes.io/part-of=sandboxwich`), closing the previous cross-tenant path where any pod on the cluster network could reach another tenant's sandbox desktop directly.
 
 ## Guarded Provider Apply Smoke

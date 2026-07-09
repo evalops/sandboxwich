@@ -2,10 +2,12 @@ use std::{
     collections::BTreeMap,
     io::Write,
     process::{Command, Stdio},
+    str::FromStr,
 };
 
 use anyhow::{Context, bail};
 use chrono::Utc;
+use ipnet::IpNet;
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, MemoryLimit, NetworkAllowRuleKind, NetworkEgress,
     ProviderCapabilityReport, ProviderForkHandle, ProviderHealthReport, ProviderHealthStatus,
@@ -97,10 +99,15 @@ pub struct KubernetesDryRunProvider {
     /// Namespace running cluster DNS, used to scope the always-on DNS
     /// egress rule (GH-66).
     dns_namespace: String,
-    /// CIDRs carved out (via NetworkPolicy `except`) of any `0.0.0.0/0`
-    /// egress rule so sandboxes can never reach the control plane /
-    /// metadata endpoints even in `AllowAll` or an allowlist that includes
-    /// `0.0.0.0/0` (GH-66).
+    /// CIDRs carved out (via NetworkPolicy `except`) of every egress allow
+    /// rule that overlaps them, so sandboxes can never reach the control
+    /// plane / metadata endpoints regardless of egress mode -- not just
+    /// `AllowAll`/`0.0.0.0/0`, but any allowlist CIDR that happens to
+    /// contain one of these ranges too (GH-66). Seeded from
+    /// `DEFAULT_EGRESS_EXCLUDED_CIDRS` and merged (not replaced) with any
+    /// operator-supplied CIDRs via `with_egress_excluded_cidrs`, so the
+    /// metadata carve-out can't be silently dropped by an override; use
+    /// `with_egress_excluded_cidrs_replace` to opt out of that merge.
     egress_excluded_cidrs: Vec<String>,
     /// Namespace containing pods allowed to reach a sandbox's ssh/desktop
     /// ports via the rendered ingress NetworkPolicy. Falls back to
@@ -204,16 +211,49 @@ impl KubernetesDryRunProvider {
         self
     }
 
+    /// Merges operator-supplied CIDRs into the excluded set (deduped
+    /// against what's already there, including `DEFAULT_EGRESS_EXCLUDED_CIDRS`)
+    /// rather than replacing it, so passing a custom list can only ever
+    /// exclude *more* addresses than the default, never accidentally drop
+    /// the `169.254.0.0/16` metadata carve-out. Use
+    /// `with_egress_excluded_cidrs_replace` if you deliberately need to
+    /// replace the set outright.
     pub fn with_egress_excluded_cidrs(mut self, cidrs: Vec<String>) -> Self {
-        let cidrs: Vec<String> = cidrs
-            .into_iter()
-            .map(|cidr| cidr.trim().to_string())
-            .filter(|cidr| !cidr.is_empty())
-            .collect();
+        for cidr in Self::normalize_cidrs(cidrs) {
+            if !self.egress_excluded_cidrs.contains(&cidr) {
+                self.egress_excluded_cidrs.push(cidr);
+            }
+        }
+        self
+    }
+
+    /// Escape hatch that replaces the excluded CIDR set outright instead of
+    /// merging with `DEFAULT_EGRESS_EXCLUDED_CIDRS` (see
+    /// `with_egress_excluded_cidrs`). Only use this if you are deliberately
+    /// replacing the metadata/control-plane carve-out with an equivalent
+    /// value for your environment -- e.g. a non-k3s cluster where the
+    /// k3s-shaped defaults (`10.42.0.0/16`, `10.43.0.0/16`) are meaningless
+    /// and you're supplying the real pod/service CIDRs instead. Passing an
+    /// empty list is a no-op (kept for parity with the merge variant); to
+    /// truly disable the carve-out, pass a value that can never match
+    /// (there's no supported way to leave the metadata endpoint reachable
+    /// by omission, that would have to be an explicit, obviously-named
+    /// escape hatch of its own, which nothing currently requests).
+    pub fn with_egress_excluded_cidrs_replace(mut self, cidrs: Vec<String>) -> Self {
+        let cidrs = Self::normalize_cidrs(cidrs);
         if !cidrs.is_empty() {
             self.egress_excluded_cidrs = cidrs;
         }
         self
+    }
+
+    fn normalize_cidrs(cidrs: Vec<String>) -> Vec<String> {
+        let mut seen = std::collections::BTreeSet::new();
+        cidrs
+            .into_iter()
+            .map(|cidr| cidr.trim().to_string())
+            .filter(|cidr| !cidr.is_empty() && seen.insert(cidr.clone()))
+            .collect()
     }
 
     pub fn with_ingress_namespace(mut self, ingress_namespace: Option<String>) -> Self {
@@ -566,22 +606,56 @@ impl KubernetesDryRunProvider {
         })
     }
 
-    /// Builds an `ipBlock` for `cidr`. When `cidr` is the wide-open
-    /// `0.0.0.0/0` (used by `AllowAll` and by allowlists that intentionally
-    /// include it), the configured `egress_excluded_cidrs` are carved out
-    /// via `except` so sandboxes can never reach the control plane / cloud
-    /// metadata endpoint regardless of egress mode (GH-66). `except` must
-    /// be a subset of `cidr`, which only holds generically for `0.0.0.0/0`,
-    /// so narrower allowlist CIDRs are left as-is.
-    fn ip_block(&self, cidr: &str) -> serde_json::Value {
-        if cidr == "0.0.0.0/0" && !self.egress_excluded_cidrs.is_empty() {
-            json!({
-                "cidr": cidr,
-                "except": self.egress_excluded_cidrs
-            })
+    /// Builds an `ipBlock` for `cidr`, carving the configured
+    /// `egress_excluded_cidrs` (control-plane / cloud metadata / cluster
+    /// service ranges) out via `except` wherever they actually overlap
+    /// `cidr` -- not just for the wide-open `0.0.0.0/0` case (GH-66,
+    /// GH-<this fix>). A narrower allowlist entry like `10.0.0.0/8` fully
+    /// contains the default excluded ranges (`10.42.0.0/16`,
+    /// `10.43.0.0/16`) and, if it happened to include `169.254.0.0/16`,
+    /// would otherwise expose the cloud metadata endpoint
+    /// (`169.254.169.254`) to every sandbox -- a direct path to credential
+    /// theft. CIDR blocks are power-of-two aligned, so two CIDRs can only
+    /// ever be identical, nested (one strictly contains the other), or
+    /// disjoint; there is no partial-overlap case to handle. Returns an
+    /// error if an excluded CIDR fully contains (or equals) `cidr`, since
+    /// Kubernetes NetworkPolicy requires every `except` entry to be a
+    /// strict subset of `cidr` and there would be nothing left to allow.
+    fn ip_block(&self, cidr: &str) -> anyhow::Result<serde_json::Value> {
+        let except = self.excepted_cidrs_for(cidr)?;
+        if except.is_empty() {
+            Ok(json!({ "cidr": cidr }))
         } else {
-            json!({ "cidr": cidr })
+            Ok(json!({
+                "cidr": cidr,
+                "except": except
+            }))
         }
+    }
+
+    /// Computes which of the configured `egress_excluded_cidrs` must be
+    /// rendered as `except` entries for the allow rule `cidr`, per the
+    /// containment rules described on `ip_block`.
+    fn excepted_cidrs_for(&self, cidr: &str) -> anyhow::Result<Vec<String>> {
+        if self.egress_excluded_cidrs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let allowed =
+            IpNet::from_str(cidr).with_context(|| format!("invalid egress allow CIDR {cidr}"))?;
+        let mut except = Vec::new();
+        for excluded_str in &self.egress_excluded_cidrs {
+            let excluded = IpNet::from_str(excluded_str)
+                .with_context(|| format!("invalid egress excluded CIDR {excluded_str}"))?;
+            if excluded.contains(&allowed) {
+                bail!(
+                    "egress allow rule {cidr} is entirely covered by excluded control-plane/metadata CIDR {excluded_str}; refusing to render a NetworkPolicy that would either expose it or leave nothing allowed"
+                );
+            }
+            if allowed.contains(&excluded) {
+                except.push(excluded_str.clone());
+            }
+        }
+        Ok(except)
     }
 
     /// Egress rule always appended so sandboxes can resolve DNS even under
@@ -641,19 +715,19 @@ impl KubernetesDryRunProvider {
         let egress = match network_egress {
             NetworkEgress::DenyAll => Vec::new(),
             NetworkEgress::AllowAll => vec![
-                json!({ "to": [{ "ipBlock": self.ip_block("0.0.0.0/0") }] }),
+                json!({ "to": [{ "ipBlock": self.ip_block("0.0.0.0/0")? }] }),
                 self.dns_egress_rule(),
             ],
             NetworkEgress::Allowlist { rules } => {
                 let mut egress: Vec<serde_json::Value> = rules
                     .iter()
                     .filter(|rule| rule.kind == NetworkAllowRuleKind::Cidr)
-                    .map(|rule| {
-                        json!({
-                            "to": [{ "ipBlock": self.ip_block(&rule.value) }]
-                        })
+                    .map(|rule| -> anyhow::Result<serde_json::Value> {
+                        Ok(json!({
+                            "to": [{ "ipBlock": self.ip_block(&rule.value)? }]
+                        }))
                     })
-                    .collect();
+                    .collect::<anyhow::Result<Vec<_>>>()?;
                 egress.push(self.dns_egress_rule());
                 egress
             }
@@ -2252,7 +2326,12 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_egress_always_includes_dns_rule_and_preserves_narrow_cidrs() {
+    fn allowlist_egress_carves_out_control_plane_ranges_contained_within_allowed_cidr() {
+        // GH-<egress carve-out fix>: `10.0.0.0/8` fully contains the default
+        // k3s pod/service ranges (`10.42.0.0/16`, `10.43.0.0/16`), so an
+        // allowlist entry that broad must carve them out via `except` just
+        // like `0.0.0.0/0` does -- an allowlist CIDR is not exempt from the
+        // carve-out just because it isn't exactly `0.0.0.0/0`.
         let provider =
             KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
         let spec = SandboxProvisionSpec {
@@ -2272,15 +2351,96 @@ mod tests {
             .as_array()
             .expect("egress should be an array");
 
-        // Narrow allowlist CIDRs are left untouched (an `except` carve-out
-        // would only be valid if it were a subset of the allowed CIDR).
         assert_eq!(egress[0]["to"][0]["ipBlock"]["cidr"], "10.0.0.0/8");
-        assert!(egress[0]["to"][0]["ipBlock"]["except"].is_null());
+        let except: Vec<&str> = egress[0]["to"][0]["ipBlock"]["except"]
+            .as_array()
+            .expect("10.0.0.0/8 fully contains the k3s pod/service ranges and must carve them out")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(except.contains(&"10.42.0.0/16"));
+        assert!(except.contains(&"10.43.0.0/16"));
+        // 169.254.0.0/16 doesn't overlap 10.0.0.0/8 at all, so it must not
+        // appear as an (invalid, non-subset) except entry.
+        assert!(!except.contains(&"169.254.0.0/16"));
 
         assert!(
             egress.iter().any(|rule| rule["ports"][0]["port"] == 53),
             "allowlist egress must still include a DNS rule so name resolution keeps working"
         );
+    }
+
+    #[test]
+    fn allowlist_egress_leaves_disjoint_narrow_cidrs_untouched() {
+        // A CIDR that shares no addresses with any excluded range gets no
+        // `except` at all -- the carve-out logic must not add irrelevant
+        // exceptions.
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        let spec = SandboxProvisionSpec {
+            memory_limit: MemoryLimit::OneG,
+            network_egress: NetworkEgress::Allowlist {
+                rules: vec![sandboxwich_core::NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Cidr,
+                    value: "192.168.1.0/24".to_string(),
+                }],
+            },
+        };
+
+        let provisioned = provider
+            .provision(SandboxId::new(), &spec)
+            .expect("dry-run provision should succeed");
+        let egress = provisioned.metadata["manifests"]["networkPolicy"]["spec"]["egress"]
+            .as_array()
+            .expect("egress should be an array");
+
+        assert_eq!(egress[0]["to"][0]["ipBlock"]["cidr"], "192.168.1.0/24");
+        assert!(egress[0]["to"][0]["ipBlock"]["except"].is_null());
+    }
+
+    #[test]
+    fn allowlist_egress_rejects_cidr_fully_covered_by_an_excluded_range() {
+        // If the allowed CIDR is entirely inside (or equal to) an excluded
+        // range, there is nothing left to allow once the carve-out is
+        // applied -- k8s NetworkPolicy also requires `except` entries to be
+        // a strict subset of `cidr`, so `except == cidr` isn't just
+        // pointless, it's invalid. Reject rather than silently exposing the
+        // excluded range or producing a broken manifest.
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        let spec = SandboxProvisionSpec {
+            memory_limit: MemoryLimit::OneG,
+            network_egress: NetworkEgress::Allowlist {
+                rules: vec![sandboxwich_core::NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Cidr,
+                    value: "169.254.169.0/24".to_string(),
+                }],
+            },
+        };
+
+        let err = provider
+            .provision(SandboxId::new(), &spec)
+            .expect_err("allowlisting a range fully covered by an excluded CIDR must be rejected");
+        assert!(err.to_string().contains("169.254.0.0/16"));
+    }
+
+    #[test]
+    fn allowlist_egress_rejects_cidr_exactly_equal_to_an_excluded_range() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        let spec = SandboxProvisionSpec {
+            memory_limit: MemoryLimit::OneG,
+            network_egress: NetworkEgress::Allowlist {
+                rules: vec![sandboxwich_core::NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Cidr,
+                    value: "10.42.0.0/16".to_string(),
+                }],
+            },
+        };
+
+        provider
+            .provision(SandboxId::new(), &spec)
+            .expect_err("allowlisting a CIDR identical to an excluded range must be rejected");
     }
 
     #[test]
@@ -2310,6 +2470,120 @@ mod tests {
                 .expect("0.0.0.0/0 allowlist entry should carve out control-plane ranges")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn ipv6_allowlist_cidr_containing_an_ipv6_excluded_range_carves_it_out() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_egress_excluded_cidrs(vec!["fd00:ec2::254/128".to_string()]);
+        let spec = SandboxProvisionSpec {
+            memory_limit: MemoryLimit::OneG,
+            network_egress: NetworkEgress::Allowlist {
+                rules: vec![sandboxwich_core::NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Cidr,
+                    value: "fd00::/8".to_string(),
+                }],
+            },
+        };
+
+        let provisioned = provider
+            .provision(SandboxId::new(), &spec)
+            .expect("dry-run provision should succeed");
+        let egress = provisioned.metadata["manifests"]["networkPolicy"]["spec"]["egress"]
+            .as_array()
+            .expect("egress should be an array");
+
+        assert_eq!(egress[0]["to"][0]["ipBlock"]["cidr"], "fd00::/8");
+        let except: Vec<&str> = egress[0]["to"][0]["ipBlock"]["except"]
+            .as_array()
+            .expect("ipv6 allowlist entry should carve out the overlapping ipv6 excluded range")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(except.contains(&"fd00:ec2::254/128"));
+        // The default (ipv4) excluded CIDRs never overlap an ipv6 allow
+        // rule, so they must not show up either.
+        assert!(!except.contains(&"169.254.0.0/16"));
+    }
+
+    #[test]
+    fn ipv6_allow_rule_is_unaffected_by_default_ipv4_excluded_cidrs() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        let spec = SandboxProvisionSpec {
+            memory_limit: MemoryLimit::OneG,
+            network_egress: NetworkEgress::Allowlist {
+                rules: vec![sandboxwich_core::NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Cidr,
+                    value: "2001:db8::/32".to_string(),
+                }],
+            },
+        };
+
+        let provisioned = provider
+            .provision(SandboxId::new(), &spec)
+            .expect("dry-run provision should succeed");
+        let egress = provisioned.metadata["manifests"]["networkPolicy"]["spec"]["egress"]
+            .as_array()
+            .expect("egress should be an array");
+
+        assert_eq!(egress[0]["to"][0]["ipBlock"]["cidr"], "2001:db8::/32");
+        assert!(egress[0]["to"][0]["ipBlock"]["except"].is_null());
+    }
+
+    #[test]
+    fn operator_supplied_egress_excluded_cidrs_merge_with_defaults() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_egress_excluded_cidrs(vec!["172.16.0.0/12".to_string()]);
+        let spec = SandboxProvisionSpec {
+            memory_limit: MemoryLimit::OneG,
+            network_egress: NetworkEgress::AllowAll,
+        };
+
+        let provisioned = provider
+            .provision(SandboxId::new(), &spec)
+            .expect("dry-run provision should succeed");
+        let except: Vec<&str> = provisioned.metadata["manifests"]["networkPolicy"]["spec"]
+            ["egress"][0]["to"][0]["ipBlock"]["except"]
+            .as_array()
+            .expect("except should be an array")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+
+        // The operator-supplied CIDR is merged in...
+        assert!(except.contains(&"172.16.0.0/12"));
+        // ...alongside every default, including the metadata carve-out --
+        // an override can never silently drop it.
+        assert!(except.contains(&"169.254.0.0/16"));
+        assert!(except.contains(&"10.42.0.0/16"));
+        assert!(except.contains(&"10.43.0.0/16"));
+    }
+
+    #[test]
+    fn with_egress_excluded_cidrs_replace_drops_the_defaults() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_egress_excluded_cidrs_replace(vec!["172.16.0.0/12".to_string()]);
+        let spec = SandboxProvisionSpec {
+            memory_limit: MemoryLimit::OneG,
+            network_egress: NetworkEgress::AllowAll,
+        };
+
+        let provisioned = provider
+            .provision(SandboxId::new(), &spec)
+            .expect("dry-run provision should succeed");
+        let except: Vec<&str> = provisioned.metadata["manifests"]["networkPolicy"]["spec"]
+            ["egress"][0]["to"][0]["ipBlock"]["except"]
+            .as_array()
+            .expect("except should be an array")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+
+        assert_eq!(except, vec!["172.16.0.0/12"]);
     }
 
     #[test]
