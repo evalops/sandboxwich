@@ -497,16 +497,16 @@ impl SandboxState {
         SandboxState::Ready,
         SandboxState::Running,
         SandboxState::Idle,
-        SandboxState::Archiving,
         SandboxState::Error,
     ];
+
+    /// A provider-confirmed teardown completes an archival already in progress.
+    pub const STOP_COMPLETED_LEGAL_FROM: &'static [SandboxState] = &[SandboxState::Archiving];
 
     /// A sandbox can only be resumed from `Archived`. Resuming from any other
     /// state (in particular `Error`) would either race a job that is still
     /// writing to the sandbox, or paper over a failure that a fresh
     /// fork/create should handle instead.
-    pub const RESUME_LEGAL_FROM: &'static [SandboxState] = &[SandboxState::Archived];
-
     /// A `ForkSandbox` job being claimed by a worker moves its child sandbox
     /// out of `Planning` (queued, waiting on the parent snapshot) into
     /// `Provisioning`.
@@ -582,8 +582,8 @@ impl SandboxState {
     /// Application code must use the specific `_LEGAL_FROM` constant for the
     /// action it is performing.
     pub fn can_transition_to(&self, next: &SandboxState) -> bool {
-        (Self::STOP_LEGAL_FROM.contains(self) && *next == SandboxState::Archived)
-            || (Self::RESUME_LEGAL_FROM.contains(self) && *next == SandboxState::Ready)
+        (Self::STOP_LEGAL_FROM.contains(self) && *next == SandboxState::Archiving)
+            || (Self::STOP_COMPLETED_LEGAL_FROM.contains(self) && *next == SandboxState::Archived)
             || (Self::FORK_CLAIMED_LEGAL_FROM.contains(self) && *next == SandboxState::Provisioning)
             || (Self::FORK_COMPLETED_LEGAL_FROM.contains(self) && *next == SandboxState::Ready)
             || (Self::FORK_RETRIED_LEGAL_FROM.contains(self) && *next == SandboxState::Planning)

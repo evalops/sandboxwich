@@ -143,6 +143,15 @@ pub(crate) fn pending_snapshot_from_request(
 }
 
 pub(crate) async fn insert_snapshot(db: &Database, snapshot: &Snapshot) -> Result<(), ApiError> {
+    let mut connection = db.pool.acquire().await?;
+    insert_snapshot_on_connection(db, &mut connection, snapshot).await
+}
+
+pub(crate) async fn insert_snapshot_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    snapshot: &Snapshot,
+) -> Result<(), ApiError> {
     let sql = format!(
         "insert into snapshots
          (id, sandbox_id, status, label, inventory, provider_metadata, created_at, ready_at, expires_at, error)
@@ -160,7 +169,7 @@ pub(crate) async fn insert_snapshot(db: &Database, snapshot: &Snapshot) -> Resul
         .bind(snapshot.ready_at.map(|time| time.to_rfc3339()))
         .bind(snapshot.expires_at.map(|time| time.to_rfc3339()))
         .bind(&snapshot.error)
-        .execute(&db.pool)
+        .execute(&mut *connection)
         .await?;
     Ok(())
 }

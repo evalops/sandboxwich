@@ -32,13 +32,35 @@ pub(crate) async fn claim_lease(
         "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
          from jobs
-         where tenant_id = {} and status = 'queued'
+         where tenant_id = {} and status = 'queued' and scheduled_at <= {}
+           and required_capability in ({})
+           and (
+             kind in ('provision_sandbox', 'run_prompt')
+             or exists (
+               select 1 from sandbox_placements p
+               where p.sandbox_id = coalesce(jobs.sandbox_id, jobs.parent_sandbox_id)
+                 and (p.worker_id = {} or (p.provider = {} and (p.cluster is null or p.cluster = {})))
+             )
+           )
          order by priority desc, scheduled_at asc, created_at asc, id asc
          limit 25",
-        state.db.placeholder(1)
+        state.db.placeholder(1),
+        state.db.placeholder(2),
+        worker.capabilities.iter().enumerate().map(|(index, _)| state.db.placeholder(index + 3)).collect::<Vec<_>>().join(", "),
+        state.db.placeholder(worker.capabilities.len() + 3),
+        state.db.placeholder(worker.capabilities.len() + 4),
+        state.db.placeholder(worker.capabilities.len() + 5)
     );
-    let rows = sqlx::query(&sql)
+    let mut query = sqlx::query(&sql)
         .bind(&worker.tenant_id)
+        .bind(Utc::now().to_rfc3339());
+    for capability in &worker.capabilities {
+        query = query.bind(worker_capability_to_str(capability));
+    }
+    let rows = query
+        .bind(worker.id.to_string())
+        .bind(&worker.provider)
+        .bind(worker.labels.get("cluster").cloned().unwrap_or_default())
         .fetch_all(&state.db.pool)
         .await?;
 
@@ -804,6 +826,15 @@ pub(crate) async fn apply_completed_job_on_connection(
                     "stop completion result does not match job sandbox",
                 ));
             }
+            set_sandbox_state_on_connection(
+                db,
+                connection,
+                sandbox_id,
+                SandboxState::STOP_COMPLETED_LEGAL_FROM,
+                SandboxState::Archived,
+                json!({"state": SandboxState::Archived, "reason": "stop_completed"}),
+            )
+            .await?;
         }
         (JobKind::ResumeSandbox, WorkerJobResult::ResumeSandbox { sandbox_id, .. }) => {
             if sandbox_id != sandbox_id_from_job(job)? {

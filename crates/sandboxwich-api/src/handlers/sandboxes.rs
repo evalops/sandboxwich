@@ -95,19 +95,43 @@ pub(crate) async fn create_sandbox(
         id: SandboxId::new(),
         tenant_id: ctx.tenant_id.clone(),
         name: request.name.unwrap_or_else(|| "fresh-sandwich".to_string()),
-        state: SandboxState::Ready,
+        state: SandboxState::Planning,
         template: request.template.unwrap_or_else(|| "ubuntu-dev".to_string()),
-        memory_limit: provision_spec.memory_limit,
-        network_egress: provision_spec.network_egress,
+        memory_limit: provision_spec.memory_limit.clone(),
+        network_egress: provision_spec.network_egress.clone(),
         created_at: now,
         updated_at: now,
         ttl_seconds: request.ttl_seconds.or(Some(3600)),
         parent_snapshot_id: None,
     };
 
-    insert_sandbox(&state.db, &sandbox).await?;
-    insert_event(
+    let job = Job {
+        id: JobId::new(),
+        tenant_id: sandbox.tenant_id.clone(),
+        kind: JobKind::ProvisionSandbox,
+        status: JobStatus::Queued,
+        payload: json!({"sandboxId": sandbox.id, "provisionSpec": provision_spec}),
+        required_capability: WorkerCapability::ProvisionSandbox,
+        priority: 0,
+        attempts: 0,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+    };
+    let mut tx = state.db.pool.begin().await?;
+    insert_sandbox_on_connection(&state.db, &mut tx, &sandbox).await?;
+    replace_sandbox_network_rules_on_connection(
         &state.db,
+        &mut tx,
+        sandbox.id,
+        sandbox.network_egress.rules(),
+    )
+    .await?;
+    insert_event_on_connection(
+        &state.db,
+        &mut tx,
         sandbox.id,
         SandboxEventKind::LifecycleChanged,
         json!({
@@ -118,6 +142,8 @@ pub(crate) async fn create_sandbox(
         }),
     )
     .await?;
+    insert_job_on_connection(&state.db, &mut tx, &job).await?;
+    tx.commit().await?;
 
     Ok(Json(SandboxResponse { ok: true, sandbox }))
 }
@@ -169,15 +195,38 @@ pub(crate) async fn stop_sandbox(
     Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<SandboxResponse>, ApiError> {
-    ensure_sandbox_tenant(&state.db, SandboxId(sandbox_id), &ctx).await?;
-    transition_sandbox(
+    let sandbox_id = SandboxId(sandbox_id);
+    let sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
+    let now = Utc::now();
+    let job = Job {
+        id: JobId::new(),
+        tenant_id: sandbox.tenant_id,
+        kind: JobKind::StopSandbox,
+        status: JobStatus::Queued,
+        payload: json!({"sandboxId": sandbox_id}),
+        required_capability: WorkerCapability::ProvisionSandbox,
+        priority: 100,
+        attempts: 0,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+    };
+    let mut tx = state.db.pool.begin().await?;
+    set_sandbox_state_on_connection(
         &state.db,
-        SandboxId(sandbox_id),
+        &mut tx,
+        sandbox_id,
         SandboxState::STOP_LEGAL_FROM,
-        SandboxState::Archived,
-        "stopped",
+        SandboxState::Archiving,
+        json!({"state": SandboxState::Archiving, "reason": "stop_requested"}),
     )
-    .await
+    .await?;
+    insert_job_on_connection(&state.db, &mut tx, &job).await?;
+    tx.commit().await?;
+    let sandbox = fetch_sandbox(&state.db, sandbox_id).await?;
+    Ok(Json(SandboxResponse { ok: true, sandbox }))
 }
 
 pub(crate) async fn resume_sandbox(
@@ -186,14 +235,9 @@ pub(crate) async fn resume_sandbox(
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<SandboxResponse>, ApiError> {
     ensure_sandbox_tenant(&state.db, SandboxId(sandbox_id), &ctx).await?;
-    transition_sandbox(
-        &state.db,
-        SandboxId(sandbox_id),
-        SandboxState::RESUME_LEGAL_FROM,
-        SandboxState::Ready,
-        "resumed",
-    )
-    .await
+    Err(ApiError::unsupported(format!(
+        "resume is not supported for sandbox {sandbox_id}; create or fork a sandbox instead"
+    )))
 }
 
 pub(crate) async fn fork_sandbox(
@@ -222,8 +266,6 @@ pub(crate) async fn fork_sandbox(
         expires_at: None,
         error: None,
     };
-    insert_snapshot(&state.db, &snapshot).await?;
-
     let child = Sandbox {
         id: SandboxId::new(),
         tenant_id: parent.tenant_id.clone(),
@@ -240,9 +282,35 @@ pub(crate) async fn fork_sandbox(
         parent_snapshot_id: Some(snapshot.id),
     };
 
-    insert_sandbox(&state.db, &child).await?;
-    insert_event(
+    let job = Job {
+        id: JobId::new(),
+        tenant_id: parent.tenant_id.clone(),
+        kind: JobKind::CreateSnapshot,
+        status: JobStatus::Queued,
+        payload: json!({"sandboxId": parent.id, "snapshotId": snapshot.id,
+            "provisionSpec": SandboxProvisionSpec { memory_limit: parent.memory_limit.clone(), network_egress: parent.network_egress.clone() }}),
+        required_capability: WorkerCapability::Snapshot,
+        priority: 0,
+        attempts: 0,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+    };
+    let mut tx = state.db.pool.begin().await?;
+    insert_snapshot_on_connection(&state.db, &mut tx, &snapshot).await?;
+    insert_sandbox_on_connection(&state.db, &mut tx, &child).await?;
+    replace_sandbox_network_rules_on_connection(
         &state.db,
+        &mut tx,
+        child.id,
+        child.network_egress.rules(),
+    )
+    .await?;
+    insert_event_on_connection(
+        &state.db,
+        &mut tx,
         child.id,
         SandboxEventKind::LifecycleChanged,
         json!({
@@ -255,32 +323,8 @@ pub(crate) async fn fork_sandbox(
         }),
     )
     .await?;
-    insert_job(
-        &state.db,
-        &Job {
-            id: JobId::new(),
-            tenant_id: parent.tenant_id.clone(),
-            kind: JobKind::CreateSnapshot,
-            status: JobStatus::Queued,
-            payload: json!({
-                "sandboxId": parent.id,
-                "snapshotId": snapshot.id,
-                "provisionSpec": SandboxProvisionSpec {
-                    memory_limit: parent.memory_limit.clone(),
-                    network_egress: parent.network_egress.clone(),
-                }
-            }),
-            required_capability: WorkerCapability::Snapshot,
-            priority: 0,
-            attempts: 0,
-            max_attempts: 3,
-            scheduled_at: now,
-            created_at: now,
-            updated_at: now,
-            last_error: None,
-        },
-    )
-    .await?;
+    insert_job_on_connection(&state.db, &mut tx, &job).await?;
+    tx.commit().await?;
 
     Ok(Json(SandboxResponse {
         ok: true,
@@ -299,6 +343,7 @@ pub(crate) async fn fork_sandbox(
 /// If the sandbox is not currently in one of `allowed_from`, this returns a
 /// 409 Conflict describing the sandbox's actual state rather than silently
 /// clobbering it.
+#[cfg(test)]
 pub(crate) async fn transition_sandbox(
     db: &Database,
     sandbox_id: SandboxId,
@@ -324,6 +369,7 @@ pub(crate) async fn transition_sandbox(
     Ok(Json(SandboxResponse { ok: true, sandbox }))
 }
 
+#[cfg(test)]
 pub(crate) async fn set_sandbox_state(
     db: &Database,
     sandbox_id: SandboxId,
@@ -365,6 +411,7 @@ pub(crate) async fn set_sandbox_state(
 /// Builds the 404/409 error for a failed user-facing compare-and-swap state
 /// update: 404 if the sandbox no longer exists at all, otherwise 409 with the
 /// sandbox's actual current state so the caller understands what conflicted.
+#[cfg(test)]
 pub(crate) async fn sandbox_state_conflict(
     db: &Database,
     sandbox_id: SandboxId,
@@ -389,6 +436,7 @@ pub(crate) async fn sandbox_state_conflict(
     })
 }
 
+#[cfg(test)]
 pub(crate) async fn fetch_sandbox_state(
     db: &Database,
     sandbox_id: SandboxId,
@@ -521,6 +569,7 @@ pub(crate) async fn ensure_sandbox_tenant_on_connection(
     Ok(sandbox)
 }
 
+#[cfg(test)]
 pub(crate) async fn insert_sandbox(db: &Database, sandbox: &Sandbox) -> Result<(), ApiError> {
     validate_network_egress(&sandbox.network_egress)?;
     let mut tx = db.pool.begin().await?;
