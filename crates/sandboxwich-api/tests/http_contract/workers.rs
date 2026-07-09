@@ -48,8 +48,11 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
             .unwrap()
     }
 
+    let first_worker_a = register(&client, &server, "worker-scope-a").await;
     let worker_a = register(&client, &server, "worker-scope-a").await;
     let worker_b = register(&client, &server, "worker-scope-b").await;
+    assert_eq!(first_worker_a.worker.id, worker_a.worker.id);
+    assert_ne!(first_worker_a.worker_token, worker_a.worker_token);
     assert!(worker_a.worker_token.is_some());
     assert!(worker_b.worker_token.is_some());
     assert_ne!(worker_a.worker_token, worker_b.worker_token);
@@ -434,6 +437,21 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
         .await
         .unwrap();
     assert_eq!(health.guest_health.status, GuestStatus::Ready);
+
+    let draining: WorkerResponse = worker_a_client
+        .post(format!(
+            "{}/workers/{}/drain",
+            server.base_url, worker_a.worker.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(draining.worker.status, WorkerStatus::Draining);
 }
 
 pub(crate) async fn assert_guest_health_and_ssh_key_lifecycle(
@@ -528,7 +546,7 @@ pub(crate) async fn assert_guest_health_and_ssh_key_lifecycle(
         .await
         .unwrap();
     assert!(health_events.events.iter().any(|event| {
-        event.kind == SandboxEventKind::DesktopExpired
+        event.kind == SandboxEventKind::GuestHealthFailed
             && event.data["reason"] == serde_json::json!("guest_unhealthy")
     }));
 

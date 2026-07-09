@@ -15,6 +15,31 @@ use sqlx::AnyConnection;
 use sqlx::Row;
 use uuid::Uuid;
 
+pub(crate) const MAX_COMMAND_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_COMMAND_OUTPUT_CHUNKS: i64 = 4_096;
+pub(crate) const MAX_COMMAND_OUTPUT_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MATERIALIZED_OUTPUT_CHUNKS: i64 = 64;
+pub(crate) const MATERIALIZED_CHUNK_CHARS: usize = 64 * 1024;
+
+pub(crate) fn validate_command_output_bounds(
+    existing_chunks: i64,
+    existing_bytes: i64,
+    new_chunk_bytes: usize,
+) -> Result<(), ApiError> {
+    if new_chunk_bytes > MAX_COMMAND_OUTPUT_CHUNK_BYTES {
+        return Err(ApiError::bad_request("command output chunk exceeds 2 MiB"));
+    }
+    if existing_chunks >= MAX_COMMAND_OUTPUT_CHUNKS {
+        return Err(ApiError::bad_request("command output exceeds 4096 chunks"));
+    }
+    let new_chunk_bytes = i64::try_from(new_chunk_bytes)
+        .map_err(|_| ApiError::bad_request("command output chunk is too large"))?;
+    if existing_bytes.saturating_add(new_chunk_bytes) > MAX_COMMAND_OUTPUT_BYTES as i64 {
+        return Err(ApiError::bad_request("command output exceeds 4 MiB"));
+    }
+    Ok(())
+}
+
 /// Clamps a client-requested command execution timeout to
 /// `(0, MAX_COMMAND_TIMEOUT_SECS]`, falling back to
 /// `DEFAULT_COMMAND_TIMEOUT_SECS` when the client omits one. This is what
@@ -172,6 +197,10 @@ pub(crate) async fn list_command_output(
         list_command_output_chunks(&state.db, command_id, limit, &cursor).await?;
     Ok(Json(CommandOutputListResponse {
         ok: true,
+        complete: matches!(
+            command.status,
+            CommandStatus::Finished | CommandStatus::Failed
+        ),
         chunks,
         next_cursor,
     }))
@@ -283,7 +312,36 @@ pub(crate) async fn fetch_command(
         .await?
         .ok_or_else(|| ApiError::not_found("command not found"))?;
 
-    row_to_command(row)
+    let mut command = row_to_command(row)?;
+    // Chunks are the canonical streaming representation. Materialize the
+    // compatibility stdout/stderr fields on reads without rewriting an
+    // ever-growing aggregate for every append. This view is explicitly
+    // bounded to 64 x 64Ki-character slices; callers needing every byte use
+    // the paginated /commands/{id}/output endpoint.
+    let sql = format!(
+        "select stream, substr(chunk, 1, {MATERIALIZED_CHUNK_CHARS}) as chunk
+         from command_output_chunks where command_id = {}
+         order by stream asc, sequence asc limit {}",
+        db.placeholder(1),
+        MATERIALIZED_OUTPUT_CHUNKS,
+    );
+    let rows = sqlx::query(&sql)
+        .bind(command_id.to_string())
+        .fetch_all(&db.pool)
+        .await?;
+    if !rows.is_empty() {
+        command.stdout.clear();
+        command.stderr.clear();
+        for row in rows {
+            let stream: String = row.try_get("stream")?;
+            let chunk: String = row.try_get("chunk")?;
+            match parse_command_output_stream(&stream)? {
+                CommandOutputStream::Stdout => command.stdout.push_str(&chunk),
+                CommandOutputStream::Stderr => command.stderr.push_str(&chunk),
+            }
+        }
+    }
+    Ok(command)
 }
 
 pub(crate) async fn list_command_output_chunks(
@@ -316,8 +374,27 @@ pub(crate) async fn append_command_output_chunk(
     stream: CommandOutputStream,
     chunk: String,
     annotations: Vec<CommandOutputAnnotation>,
+    operation: Option<(LeaseId, Uuid)>,
 ) -> Result<CommandOutputChunk, ApiError> {
     let mut tx = db.pool.begin().await?;
+    if let Some((lease_id, operation_id)) = operation {
+        let sql = format!(
+            "select chunk_id from command_output_operations where lease_id = {} and operation_id = {}",
+            db.placeholder(1),
+            db.placeholder(2)
+        );
+        if let Some(row) = sqlx::query(&sql)
+            .bind(lease_id.to_string())
+            .bind(operation_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            let chunk_id: String = row.try_get("chunk_id")?;
+            let chunk = fetch_output_chunk_on_connection(db, &mut tx, &chunk_id).await?;
+            tx.commit().await?;
+            return Ok(chunk);
+        }
+    }
     let appended = append_command_output_chunk_on_connection(
         db,
         &mut tx,
@@ -330,6 +407,19 @@ pub(crate) async fn append_command_output_chunk(
     .await;
     match appended {
         Ok(chunk) => {
+            if let Some((lease_id, operation_id)) = operation {
+                let sql = format!(
+                    "insert into command_output_operations (lease_id, operation_id, chunk_id, created_at) values ({})",
+                    db.placeholders(4)
+                );
+                sqlx::query(&sql)
+                    .bind(lease_id.to_string())
+                    .bind(operation_id.to_string())
+                    .bind(chunk.id.to_string())
+                    .bind(chunk.created_at.to_rfc3339())
+                    .execute(&mut *tx)
+                    .await?;
+            }
             tx.commit().await?;
             Ok(chunk)
         }
@@ -342,6 +432,26 @@ pub(crate) async fn append_command_output_chunk(
     }
 }
 
+async fn fetch_output_chunk_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    chunk_id: &str,
+) -> Result<CommandOutputChunk, ApiError> {
+    let sql = format!(
+        "select id, command_id, stream, sequence, chunk, annotations, created_at
+         from command_output_chunks where id = {}",
+        db.placeholder(1)
+    );
+    let row = sqlx::query(&sql)
+        .bind(chunk_id)
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| {
+            ApiError::internal("output idempotency record references a missing chunk")
+        })?;
+    row_to_command_output_chunk(row)
+}
+
 pub(crate) async fn append_command_output_chunk_on_connection(
     db: &Database,
     connection: &mut AnyConnection,
@@ -352,6 +462,24 @@ pub(crate) async fn append_command_output_chunk_on_connection(
     annotations: Vec<CommandOutputAnnotation>,
 ) -> Result<CommandOutputChunk, ApiError> {
     lock_command_output_for_append_on_connection(db, connection, command_id).await?;
+    let byte_length = match db.dialect {
+        SqlDialect::Postgres => "octet_length(chunk)",
+        SqlDialect::Sqlite => "length(cast(chunk as blob))",
+    };
+    let bounds_sql = format!(
+        "select count(*) as chunk_count, coalesce(sum({byte_length}), 0) as byte_count
+         from command_output_chunks where command_id = {}",
+        db.placeholder(1)
+    );
+    let bounds = sqlx::query(&bounds_sql)
+        .bind(command_id.to_string())
+        .fetch_one(&mut *connection)
+        .await?;
+    validate_command_output_bounds(
+        bounds.try_get("chunk_count")?,
+        bounds.try_get("byte_count")?,
+        chunk.len(),
+    )?;
     let sequence =
         next_command_output_sequence_on_connection(db, connection, command_id, &stream).await?;
     let now = Utc::now();
@@ -380,14 +508,6 @@ pub(crate) async fn append_command_output_chunk_on_connection(
         .execute(&mut *connection)
         .await?;
 
-    append_command_output_to_command_on_connection(
-        db,
-        connection,
-        command_id,
-        &output_chunk.stream,
-        &output_chunk.chunk,
-    )
-    .await?;
     insert_event_on_connection(
         db,
         connection,
@@ -396,8 +516,7 @@ pub(crate) async fn append_command_output_chunk_on_connection(
         json!({
             "commandId": command_id,
             "stream": output_chunk.stream,
-            "sequence": output_chunk.sequence,
-            "chunk": output_chunk.chunk
+            "sequence": output_chunk.sequence
         }),
     )
     .await?;
@@ -450,32 +569,6 @@ pub(crate) async fn next_command_output_sequence_on_connection(
         .ok_or_else(|| ApiError::internal("command output sequence overflow"))?;
     u64::try_from(next)
         .map_err(|_| ApiError::internal("database contains invalid command output sequence"))
-}
-
-pub(crate) async fn append_command_output_to_command_on_connection(
-    db: &Database,
-    connection: &mut AnyConnection,
-    command_id: CommandId,
-    stream: &CommandOutputStream,
-    chunk: &str,
-) -> Result<(), ApiError> {
-    let column = stream.as_db_str();
-    let sql = format!(
-        "update commands
-         set {column} = {column} || {}
-         where id = {}",
-        db.placeholder(1),
-        db.placeholder(2)
-    );
-    let result = sqlx::query(&sql)
-        .bind(chunk)
-        .bind(command_id.to_string())
-        .execute(&mut *connection)
-        .await?;
-    if result.rows_affected() == 0 {
-        return Err(ApiError::not_found("command not found"));
-    }
-    Ok(())
 }
 
 pub(crate) async fn reset_command_for_retry_on_connection(

@@ -1137,6 +1137,7 @@ async fn append_output_chunk(
     }
     let response = client
         .post(format!("{api}/leases/{lease_id}/output"))
+        .header("idempotency-key", Uuid::now_v7().to_string())
         .json(&AppendCommandOutputRequest {
             stream,
             chunk,

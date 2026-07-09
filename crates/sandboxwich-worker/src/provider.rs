@@ -24,6 +24,43 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetryDisposition {
+    Retryable,
+    Permanent,
+}
+
+#[derive(Debug)]
+pub struct ProviderError {
+    disposition: RetryDisposition,
+    source: anyhow::Error,
+}
+
+impl ProviderError {
+    pub fn retryable(source: impl Into<anyhow::Error>) -> Self {
+        Self {
+            disposition: RetryDisposition::Retryable,
+            source: source.into(),
+        }
+    }
+
+    pub fn disposition(&self) -> RetryDisposition {
+        self.disposition
+    }
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for ProviderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.source()
+    }
+}
+
 pub const KUBERNETES_MUTATION_ENV: &str = "SANDBOXWICH_K8S_ENABLE_MUTATION";
 pub const DEFAULT_SANDBOX_GUEST_IMAGE: &str = "ghcr.io/evalops/sandboxwich-ubuntu-dev:latest";
 /// Default cap on the stdout/stderr captured from a single `kubectl` invocation
@@ -1759,14 +1796,15 @@ fn run_kubectl_command_with_stdin(
         cancelled,
         max_output_bytes,
     );
-    match tokio::runtime::Handle::try_current() {
+    let result = match tokio::runtime::Handle::try_current() {
         Ok(handle) => handle.block_on(command),
         Err(_) => tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .context("failed to build a runtime to drive a kubectl invocation")?
             .block_on(command),
-    }
+    };
+    result.map_err(|error| anyhow::Error::new(ProviderError::retryable(error)))
 }
 
 async fn run_kubectl_command_async(

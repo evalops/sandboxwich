@@ -353,8 +353,10 @@ pub(crate) async fn run_contract(server: TestServer) {
         .unwrap();
     assert_eq!(running_command.command.status, CommandStatus::Running);
 
+    let output_operation_id = uuid::Uuid::now_v7();
     let first_chunk: sandboxwich_core::CommandOutputChunkResponse = worker_client
         .post(format!("{}/leases/{}/output", server.base_url, lease.id))
+        .header("idempotency-key", output_operation_id.to_string())
         .json(&AppendCommandOutputRequest {
             stream: CommandOutputStream::Stdout,
             chunk: "hel".to_string(),
@@ -375,6 +377,23 @@ pub(crate) async fn run_contract(server: TestServer) {
         .unwrap();
     assert_eq!(first_chunk.chunk.sequence, 1);
     assert_eq!(first_chunk.chunk.annotations.len(), 1);
+    let replayed_chunk: sandboxwich_core::CommandOutputChunkResponse = worker_client
+        .post(format!("{}/leases/{}/output", server.base_url, lease.id))
+        .header("idempotency-key", output_operation_id.to_string())
+        .json(&AppendCommandOutputRequest {
+            stream: CommandOutputStream::Stdout,
+            chunk: "hel".to_string(),
+            annotations: Vec::new(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replayed_chunk.chunk.id, first_chunk.chunk.id);
     let second_chunk: sandboxwich_core::CommandOutputChunkResponse = worker_client
         .post(format!("{}/leases/{}/output", server.base_url, lease.id))
         .json(&AppendCommandOutputRequest {

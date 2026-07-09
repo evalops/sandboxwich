@@ -6,7 +6,8 @@ use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use provider::{
     CancelSignal, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES, KUBERNETES_MUTATION_ENV,
-    KubernetesApplyProvider, KubernetesDryRunProvider, SandboxProvider,
+    KubernetesApplyProvider, KubernetesDryRunProvider, ProviderError, RetryDisposition,
+    SandboxProvider,
 };
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse,
@@ -131,6 +132,9 @@ struct ClaimArgs {
 
     #[arg(long)]
     lease_seconds: Option<u64>,
+
+    #[arg(skip)]
+    operation_id: Option<Uuid>,
 }
 
 #[derive(Debug, Args)]
@@ -567,6 +571,9 @@ async fn main() -> anyhow::Result<()> {
                 args.provider,
                 capabilities_from_args(args.capability, None),
                 args.label.into_iter().collect(),
+                // Standalone registration may be consumed by multiple
+                // work-once/work-loop processes, so preserve the operator's
+                // declared aggregate capacity.
                 args.max_concurrent_jobs,
             )
             .await?;
@@ -685,6 +692,7 @@ async fn main() -> anyhow::Result<()> {
                 ClaimArgs {
                     worker_id: args.worker_id,
                     lease_seconds: args.lease_seconds,
+                    operation_id: Some(Uuid::now_v7()),
                 },
             )
             .await?;
@@ -821,6 +829,10 @@ async fn claim(
 ) -> anyhow::Result<ClaimLeaseResponse> {
     let response = client
         .post(format!("{api}/workers/{}/leases/claim", args.worker_id))
+        .header(
+            "idempotency-key",
+            args.operation_id.unwrap_or_else(Uuid::now_v7).to_string(),
+        )
         .json(&ClaimLeaseRequest {
             lease_seconds: args.lease_seconds,
         })
@@ -867,6 +879,15 @@ async fn heartbeat_worker(
         .send()
         .await?;
     decode_json::<WorkerResponse>(response).await
+}
+
+async fn drain_worker(client: &reqwest::Client, api: &str, worker_id: Uuid) -> anyhow::Result<()> {
+    let response = client
+        .post(format!("{api}/workers/{worker_id}/drain"))
+        .send()
+        .await?;
+    let _: WorkerResponse = decode_json(response).await?;
+    Ok(())
 }
 
 /// Maximum number of attempts (including the first) for a single bounded retry
@@ -921,43 +942,15 @@ where
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("{operation} failed with no error recorded")))
 }
 
-/// Heuristically classifies whether an error looks like a transient infrastructure
-/// problem (network blip, timeout, rate limit, control-plane unavailability) as
-/// opposed to a permanent/logical failure (bad manifest, immutable field conflict,
-/// malformed payload). Provider errors here are plain `anyhow` strings rather than
-/// structured types, so this inspects the rendered error chain for well-known
-/// transient markers.
+/// Uses the provider's typed retry contract. Untyped errors are permanent;
+/// user-visible prose never controls scheduling behavior.
 fn classify_retry(error: &anyhow::Error) -> bool {
-    const TRANSIENT_MARKERS: &[&str] = &[
-        "timeout",
-        "timed out",
-        "connection refused",
-        "connection reset",
-        "temporarily unavailable",
-        "context deadline exceeded",
-        "too many requests",
-        "service unavailable",
-        "dial tcp",
-        "unable to connect to the server",
-        "broken pipe",
-        "i/o error",
-        " 429",
-        " 503",
-        // Emitted when `run_kubectl_command`'s cancellation race (see
-        // `CancelSignal`) kills a `kubectl exec` because this job's lease
-        // renewal failed. We can't always tell whether that means the lease
-        // is genuinely gone (the common case, in which the server's expiry
-        // sweep has already re-queued the job elsewhere and this retry flag
-        // is moot) or was a transient renewal blip against a still-active
-        // lease (in which case marking this non-retryable would silently
-        // drop the job) -- treat it as retryable so the latter, worse case
-        // can't happen.
-        "lease renewal was lost",
-    ];
-    error.chain().any(|cause| {
-        let text = cause.to_string().to_lowercase();
-        TRANSIENT_MARKERS.iter().any(|marker| text.contains(marker))
-    })
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ProviderError>())
+        .map(ProviderError::disposition)
+        .unwrap_or(RetryDisposition::Permanent)
+        == RetryDisposition::Retryable
 }
 
 /// Waits for SIGTERM or SIGINT (`Ctrl-C`). On non-Unix targets, only `Ctrl-C`
@@ -1081,6 +1074,7 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
         let claim_args = ClaimArgs {
             worker_id: args.worker_id,
             lease_seconds: args.lease_seconds,
+            operation_id: Some(Uuid::now_v7()),
         };
         let response = match with_retries("claim lease", API_RETRY_ATTEMPTS, || {
             claim(client, api, claim_args)
@@ -1154,6 +1148,13 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
         }
     }
 
+    if let Err(error) = with_retries("mark worker draining", API_RETRY_ATTEMPTS, || {
+        drain_worker(client, api, args.worker_id)
+    })
+    .await
+    {
+        eprintln!("warning: failed to mark worker draining before exit: {error:#}");
+    }
     Ok(())
 }
 
@@ -1827,35 +1828,16 @@ mod tests {
 
     #[test]
     fn classify_retry_flags_transient_infrastructure_errors_as_retryable() {
-        let timeout = anyhow::anyhow!(
-            "kubectl apply sandbox manifests failed with exit status: 1: Unable to connect to the server: dial tcp 10.0.0.1:6443: i/o timeout"
-        );
+        let timeout = anyhow::Error::new(ProviderError::retryable(anyhow::anyhow!("timeout")));
         assert!(classify_retry(&timeout));
-
-        let reset = anyhow::anyhow!("failed to run kubectl for execute sandbox command")
-            .context("read tcp 10.0.0.1:6443->10.0.0.2:51522: connection reset by peer");
-        assert!(classify_retry(&reset));
-
-        let rate_limited = anyhow::anyhow!(
-            "kubectl apply sandbox manifests failed with exit status: 1: Error from server (Too Many Requests): rate limited"
-        );
-        assert!(classify_retry(&rate_limited));
-
-        let cancelled_by_lost_renewal = anyhow::anyhow!(
-            "kubectl execute sandbox command was cancelled because lease renewal was lost; the \
-             job is being abandoned so it isn't run twice"
-        );
-        assert!(classify_retry(&cancelled_by_lost_renewal));
     }
 
     #[test]
     fn classify_retry_treats_permanent_provider_errors_as_non_retryable() {
-        let immutable_field = anyhow::anyhow!(
-            "kubectl apply sandbox manifests failed with exit status: 1: Pod \"sandboxwich-x\" is invalid: spec.containers[0].resources: Forbidden: field is immutable"
-        );
+        let immutable_field = anyhow::anyhow!("immutable field");
         assert!(!classify_retry(&immutable_field));
 
-        let malformed_payload = anyhow::anyhow!("job payload is missing sandboxId");
+        let malformed_payload = anyhow::anyhow!("timeout text alone is not a retry contract");
         assert!(!classify_retry(&malformed_payload));
     }
 

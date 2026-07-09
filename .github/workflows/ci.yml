@@ -52,6 +52,25 @@ jobs:
             --concurrency 25 \
             --seed-sandboxes 250 \
             > sandboxwich-benchmark-report.md
+      - name: Enforce benchmark budgets
+        run: |
+          awk -F'|' '
+            function ms(value) { gsub(/ms| /, "", value); return value + 0 }
+            /^## / { section = substr($0, 4) }
+            /^\| [0-9]+ \|/ {
+              if ($3 + 0 != 0) { print section ": request failures=" $3; failed = 1 }
+              p95 = ms($7)
+              limit = (section == "warm startup" ? 2000 :
+                       section == "GET /sandboxes" ? 2000 :
+                       section ~ /^POST \/sandboxes/ ? 2000 : 500)
+              if (p95 > limit) { print section ": p95 " p95 "ms exceeds " limit "ms"; failed = 1 }
+            }
+            /^\| total TTFT \|/ {
+              p95 = ms($6)
+              if (p95 > 5000) { print "Sandbox TTFT: p95 " p95 "ms exceeds 5000ms"; failed = 1 }
+            }
+            END { exit failed }
+          ' sandboxwich-benchmark-report.md
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sandboxwich-benchmark-report
