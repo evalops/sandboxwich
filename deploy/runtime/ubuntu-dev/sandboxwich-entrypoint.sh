@@ -30,12 +30,15 @@ install_authorized_keys() {
 # interface only via `-listen localhost`, so port 5900 is unreachable from
 # any other pod regardless of password, and (b) still require a VNC
 # password (removing -nopw) for defense in depth. The password comes from
-# SANDBOXWICH_VNC_PASSWORD when set (wire it from a per-sandbox Secret via
-# the worker's --vnc-password-secret flag, mirroring
-# --ssh-authorized-keys-secret); otherwise a random one-time password is
-# generated per container start and written only to a 0600 file readable
-# by this user. Note the noVNC web client will now prompt for this
-# password on connect.
+# the file at SANDBOXWICH_VNC_PASSWORD_FILE when set (wire it from a
+# per-sandbox Secret mounted read-only via the worker's
+# --vnc-password-secret flag, mirroring --ssh-authorized-keys-secret and
+# SANDBOXWICH_AUTHORIZED_KEYS_FILE above -- a mounted file, not an env var,
+# since pod env vars are visible to anything that can read this pod's spec
+# via the Kubernetes API, not just this process); otherwise a random
+# one-time password is generated per container start and written only to a
+# 0600 file readable by this user. Note the noVNC web client will now
+# prompt for this password on connect.
 start_desktop() {
   if [[ "${SANDBOXWICH_DESKTOP:-1}" != "1" ]]; then
     return
@@ -46,7 +49,11 @@ start_desktop() {
   fluxbox >/tmp/sandboxwich-fluxbox.log 2>&1 &
 
   local vnc_password_file="/tmp/sandboxwich-vnc.passwd"
-  local vnc_password="${SANDBOXWICH_VNC_PASSWORD:-}"
+  local vnc_password_source_file="${SANDBOXWICH_VNC_PASSWORD_FILE:-}"
+  local vnc_password=""
+  if [[ -n "${vnc_password_source_file}" && -s "${vnc_password_source_file}" ]]; then
+    vnc_password="$(<"${vnc_password_source_file}")"
+  fi
   if [[ -z "${vnc_password}" ]]; then
     vnc_password="$(head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16)"
   fi

@@ -261,8 +261,8 @@ struct ProviderArgs {
     #[arg(long = "ingress-selector-label", value_parser = parse_label)]
     ingress_selector_label: Vec<(String, String)>,
 
-    /// Secret providing SANDBOXWICH_VNC_PASSWORD to the sandbox container
-    /// (GH-67).
+    /// Secret mounted read-only as a file (SANDBOXWICH_VNC_PASSWORD_FILE)
+    /// in the sandbox container (GH-67).
     #[arg(long, env = "SANDBOXWICH_VNC_PASSWORD_SECRET")]
     vnc_password_secret: Option<String>,
 }

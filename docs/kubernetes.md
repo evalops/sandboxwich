@@ -103,7 +103,7 @@ Use the dry-run output to validate control-plane wiring before granting a worker
 The starter guest runtime lives in `deploy/runtime/ubuntu-dev/`. It is an Ubuntu image contract for sandbox Pods:
 
 - SSH daemon on port `2222`.
-- noVNC desktop bridge on port `6080`, backed by `x11vnc` bound to `localhost:5900` only (not reachable from other pods) and requiring a password: either `SANDBOXWICH_VNC_PASSWORD` (wire it from a Secret with `--vnc-password-secret`) or a random one generated per container start. The noVNC web client prompts for this password.
+- noVNC desktop bridge on port `6080`, backed by `x11vnc` bound to `localhost:5900` only (not reachable from other pods) and requiring a password: either read from the file at `SANDBOXWICH_VNC_PASSWORD_FILE` (wire a Secret with `--vnc-password-secret`, mounted read-only rather than exposed as a plain env var) or a random one generated per container start. The noVNC web client prompts for this password.
 - Persistent workspace mounted at `/workspace`.
 - Optional authorized keys file mounted from a caller-owned Secret.
 - Development tooling installed from package repositories, including Git, Rust, Node/npm, GitHub CLI, Docker CLI/daemon packages, Python, tmux, and shell utilities.
@@ -133,7 +133,7 @@ kubectl -n sandboxwich-sandboxes create secret generic sandboxwich-vnc-password 
   --from-literal=vnc-password='replace-with-a-strong-password'
 ```
 
-Pass `--vnc-password-secret sandboxwich-vnc-password` (or set `SANDBOXWICH_VNC_PASSWORD_SECRET`) so the worker injects it as `SANDBOXWICH_VNC_PASSWORD` in the sandbox container.
+Pass `--vnc-password-secret sandboxwich-vnc-password` (or set `SANDBOXWICH_VNC_PASSWORD_SECRET`) so the worker mounts it read-only at `/run/sandboxwich/vnc/vnc-password` in the sandbox container (exposed via `SANDBOXWICH_VNC_PASSWORD_FILE`), the same way the SSH authorized-keys Secret is mounted rather than injected as a plain env var.
 
 ## Sandbox Namespace Isolation
 

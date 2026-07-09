@@ -116,8 +116,11 @@ pub struct KubernetesDryRunProvider {
     /// Pod selector labels identifying which pods in `ingress_namespace`
     /// may reach a sandbox's ssh/desktop ports (GH-67).
     ingress_pod_selector: BTreeMap<String, String>,
-    /// Optional Secret name providing `SANDBOXWICH_VNC_PASSWORD` to the
-    /// sandbox container, mirroring `ssh_authorized_keys_secret` (GH-67).
+    /// Optional Secret name mounted read-only at
+    /// `/run/sandboxwich/vnc/vnc-password` in the sandbox container (path
+    /// exposed via `SANDBOXWICH_VNC_PASSWORD_FILE`), mirroring how
+    /// `ssh_authorized_keys_secret` is mounted as a file rather than an env
+    /// var (GH-67).
     vnc_password_secret: Option<String>,
 }
 
@@ -501,14 +504,32 @@ impl KubernetesDryRunProvider {
         }
 
         if let Some(secret_name) = &self.vnc_password_secret {
-            env.push(json!({
-                "name": "SANDBOXWICH_VNC_PASSWORD",
-                "valueFrom": {
-                    "secretKeyRef": {
-                        "name": secret_name,
-                        "key": "vnc-password"
-                    }
+            // Mounted as a read-only file rather than a `secretKeyRef` env
+            // var, mirroring the SSH authorized-keys handling above:
+            // container env vars are visible to anything that can read
+            // this pod's spec/status via the Kubernetes API (e.g.
+            // `kubectl describe pod`, or any ServiceAccount with `get pods`
+            // in this namespace), not just the process itself, whereas a
+            // mounted file is only readable by whoever can exec into the
+            // container or read the volume directly.
+            volume_mounts.push(json!({
+                "name": "vnc-password",
+                "mountPath": "/run/sandboxwich/vnc",
+                "readOnly": true
+            }));
+            volumes.push(json!({
+                "name": "vnc-password",
+                "secret": {
+                    "secretName": secret_name,
+                    "items": [{
+                        "key": "vnc-password",
+                        "path": "vnc-password"
+                    }]
                 }
+            }));
+            env.push(json!({
+                "name": "SANDBOXWICH_VNC_PASSWORD_FILE",
+                "value": "/run/sandboxwich/vnc/vnc-password"
             }));
         }
 
@@ -1359,38 +1380,96 @@ impl KubernetesApplyProvider {
         args
     }
 
+    /// Renders the `kubectl exec` argument list for `request`. Env var
+    /// *values* are never placed on this argv: any process on the guest
+    /// (or on the worker host itself, via its own `ps`/argv) can read
+    /// another process's `/proc/*/cmdline`, so passing secrets as
+    /// positional `KEY=VALUE` args to `env` -- as this used to do -- leaks
+    /// them to anything with process-listing access. When `request.env`
+    /// is non-empty, this instead wires up `kubectl exec -i` plus a small
+    /// `bash -c` wrapper that reads NUL-delimited `KEY=VALUE` pairs from
+    /// stdin and `export`s them before `exec`ing the real command; the
+    /// caller must pipe `exec_stdin_payload(request)` to that invocation's
+    /// stdin. NUL is a safe delimiter because POSIX environment variable
+    /// values can never contain an embedded NUL byte, unlike newlines.
     fn exec_args(&self, sandbox_id: SandboxId, request: &AgentCommandRequest) -> Vec<String> {
         let mut args = self.kubectl_base_args();
+        let needs_env = !request.env.is_empty();
+        if needs_env {
+            args.push("-i".to_string());
+        }
         args.extend([
             "exec".to_string(),
             self.pod_name(sandbox_id),
             "--".to_string(),
         ]);
 
-        if request.cwd.is_some() || !request.env.is_empty() {
-            if !request.env.is_empty() {
-                args.push("env".to_string());
-                for (key, value) in &request.env {
-                    args.push(format!("{key}={value}"));
-                }
-            }
+        if needs_env {
+            args.extend([
+                "bash".to_string(),
+                "-c".to_string(),
+                EXEC_ENV_WRAPPER_SCRIPT.to_string(),
+                "sandboxwich-exec".to_string(),
+            ]);
             if let Some(cwd) = &request.cwd {
-                args.extend([
-                    "sh".to_string(),
-                    "-lc".to_string(),
-                    "cd \"$1\" && shift && exec \"$@\"".to_string(),
-                    "sandboxwich-cwd".to_string(),
-                    cwd.clone(),
-                ]);
-                args.extend(request.argv.clone());
-                return args;
+                args.push("1".to_string());
+                args.push(cwd.clone());
+            } else {
+                args.push("0".to_string());
             }
+            args.extend(request.argv.clone());
+            return args;
+        }
+
+        if let Some(cwd) = &request.cwd {
+            args.extend([
+                "sh".to_string(),
+                "-lc".to_string(),
+                "cd \"$1\" && shift && exec \"$@\"".to_string(),
+                "sandboxwich-cwd".to_string(),
+                cwd.clone(),
+            ]);
+            args.extend(request.argv.clone());
+            return args;
         }
 
         args.extend(request.argv.clone());
         args
     }
+
+    /// Builds the NUL-delimited `KEY=VALUE` payload that must be piped to
+    /// the stdin of the `kubectl exec` invocation built by `exec_args` when
+    /// `request.env` is non-empty. Returns `None` when there's nothing to
+    /// send, so callers know not to bother opening a piped stdin at all.
+    fn exec_stdin_payload(request: &AgentCommandRequest) -> Option<Vec<u8>> {
+        if request.env.is_empty() {
+            return None;
+        }
+        let mut payload = Vec::new();
+        for (key, value) in &request.env {
+            payload.extend_from_slice(key.as_bytes());
+            payload.push(b'=');
+            payload.extend_from_slice(value.as_bytes());
+            payload.push(0);
+        }
+        Some(payload)
+    }
 }
+
+/// Guest-side wrapper invoked via `bash -c` by `exec_args` when the request
+/// carries env vars. Argument order (after the `bash -c` command string
+/// itself, `$0` is `sandboxwich-exec`): `$1` is `"1"`/`"0"` for
+/// has-cwd, `$2` is the cwd (only present when `$1 == "1"`), and the
+/// remaining args are the real command to run. Env `KEY=VALUE` pairs are
+/// read from stdin, NUL-delimited, before anything else runs.
+const EXEC_ENV_WRAPPER_SCRIPT: &str = concat!(
+    "while IFS= read -r -d '' kv; do ",
+    "case \"$kv\" in *=*) export \"${kv%%=*}\"=\"${kv#*=}\" ;; esac; ",
+    "done; ",
+    "has_cwd=\"$1\"; shift; ",
+    "if [ \"$has_cwd\" = \"1\" ]; then cd \"$1\" || exit 1; shift; fi; ",
+    "exec \"$@\""
+);
 
 struct KubectlOutput {
     success: bool,
@@ -1440,19 +1519,57 @@ fn run_kubectl_command(
     args: &[String],
     context: &'static str,
 ) -> anyhow::Result<KubectlOutput> {
-    let output = Command::new(kubectl)
+    run_kubectl_command_with_stdin(kubectl, args, None, context)
+}
+
+/// Like `run_kubectl_command`, but when `stdin_payload` is `Some`, pipes it
+/// to the child's stdin and closes it (sending EOF) before waiting for
+/// output. Used by `exec_handoff` to hand env var values to the guest's
+/// `bash -c` wrapper over stdin instead of argv (see `exec_args`).
+fn run_kubectl_command_with_stdin(
+    kubectl: &str,
+    args: &[String],
+    stdin_payload: Option<&[u8]>,
+    context: &'static str,
+) -> anyhow::Result<KubectlOutput> {
+    let Some(payload) = stdin_payload else {
+        let output = Command::new(kubectl)
+            .args(args)
+            .output()
+            .with_context(|| format!("failed to run kubectl for {context}"))?;
+        return Ok(KubectlOutput {
+            success: output.status.success(),
+            code: output.status.code(),
+            status: output.status.to_string(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    };
+
+    let mut child = Command::new(kubectl)
         .args(args)
-        .output()
-        .with_context(|| format!("failed to run kubectl for {context}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn kubectl for {context}"))?;
+
+    let mut stdin = child.stdin.take().context("failed to open kubectl stdin")?;
+    stdin
+        .write_all(payload)
+        .context("failed to write stdin payload to kubectl")?;
+    drop(stdin);
+
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed to wait for kubectl {context}"))?;
 
     Ok(KubectlOutput {
         success: output.status.success(),
         code: output.status.code(),
         status: output.status.to_string(),
-        stdout,
-        stderr,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
 }
 
@@ -1740,9 +1857,11 @@ impl SandboxProvider for KubernetesApplyProvider {
             self.provision(sandbox_id, spec)?;
         }
         let started_at = Utc::now();
-        let output = run_kubectl_command(
+        let stdin_payload = Self::exec_stdin_payload(&request);
+        let output = run_kubectl_command_with_stdin(
             &self.kubectl,
             &self.exec_args(sandbox_id, &request),
+            stdin_payload.as_deref(),
             "execute sandbox command",
         )?;
         let finished_at = Utc::now();
@@ -2256,6 +2375,129 @@ mod tests {
     }
 
     #[test]
+    fn exec_args_never_render_env_values_on_argv() {
+        let provider = KubernetesDryRunProvider::with_snapshot_class(
+            "k3s-ci",
+            "sandboxwich-ci",
+            Some("local-path".to_string()),
+            None,
+        );
+        let apply = KubernetesApplyProvider::new(provider, "kubectl");
+        let sandbox_id = SandboxId::new();
+        let mut env = BTreeMap::new();
+        env.insert(
+            "SUPER_SECRET_TOKEN".to_string(),
+            "sk-do-not-leak-this-value".to_string(),
+        );
+        env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+        let request = AgentCommandRequest {
+            argv: vec!["printf".to_string(), "ok".to_string()],
+            cwd: None,
+            env,
+        };
+
+        let exec_args = apply.exec_args(sandbox_id, &request);
+
+        // The secret value (and even the innocuous one) must never appear
+        // anywhere on argv, whether as a whole arg or embedded in one --
+        // /proc/*/cmdline and any local `ps` visibility would otherwise
+        // leak it to every other process on the guest, plus the worker
+        // host's own process table.
+        assert!(
+            !exec_args
+                .iter()
+                .any(|arg| arg.contains("sk-do-not-leak-this-value")),
+            "secret value leaked onto kubectl exec argv: {exec_args:?}"
+        );
+        assert!(
+            !exec_args
+                .iter()
+                .any(|arg| arg.contains("SUPER_SECRET_TOKEN")),
+            "env var name leaked onto kubectl exec argv: {exec_args:?}"
+        );
+        assert!(
+            !exec_args.iter().any(|arg| arg == "env"),
+            "must not shell out to `env KEY=VALUE ...` positional args anymore"
+        );
+
+        // `-i` must be set so kubectl actually connects the payload stdin.
+        assert!(exec_args.contains(&"-i".to_string()));
+        assert!(exec_args.contains(&"bash".to_string()));
+        // The real command must still be intact at the tail of argv.
+        assert_eq!(
+            &exec_args[exec_args.len() - 2..],
+            ["printf".to_string(), "ok".to_string()]
+        );
+    }
+
+    #[test]
+    fn exec_args_without_env_do_not_request_stdin_or_a_wrapper() {
+        let provider = KubernetesDryRunProvider::with_snapshot_class(
+            "k3s-ci",
+            "sandboxwich-ci",
+            Some("local-path".to_string()),
+            None,
+        );
+        let apply = KubernetesApplyProvider::new(provider, "kubectl");
+        let request = AgentCommandRequest {
+            argv: vec!["printf".to_string(), "ok".to_string()],
+            cwd: None,
+            env: BTreeMap::new(),
+        };
+
+        let exec_args = apply.exec_args(SandboxId::new(), &request);
+
+        assert!(!exec_args.contains(&"-i".to_string()));
+        assert!(!exec_args.contains(&"bash".to_string()));
+        assert!(KubernetesApplyProvider::exec_stdin_payload(&request).is_none());
+    }
+
+    #[test]
+    fn exec_args_carry_cwd_through_the_env_wrapper_when_both_are_set() {
+        let provider = KubernetesDryRunProvider::with_snapshot_class(
+            "k3s-ci",
+            "sandboxwich-ci",
+            Some("local-path".to_string()),
+            None,
+        );
+        let apply = KubernetesApplyProvider::new(provider, "kubectl");
+        let mut env = BTreeMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        let request = AgentCommandRequest {
+            argv: vec!["pwd".to_string()],
+            cwd: Some("/workspace/project".to_string()),
+            env,
+        };
+
+        let exec_args = apply.exec_args(SandboxId::new(), &request);
+
+        assert!(exec_args.contains(&"-i".to_string()));
+        assert!(exec_args.iter().any(|arg| arg == "/workspace/project"));
+        assert_eq!(exec_args[exec_args.len() - 1], "pwd");
+        assert!(!exec_args.iter().any(|arg| arg.contains("FOO=bar")));
+    }
+
+    #[test]
+    fn exec_stdin_payload_nul_delimits_key_value_pairs() {
+        let mut env = BTreeMap::new();
+        env.insert("A".to_string(), "1".to_string());
+        env.insert("B".to_string(), "two".to_string());
+        let request = AgentCommandRequest {
+            argv: vec!["true".to_string()],
+            cwd: None,
+            env,
+        };
+
+        let payload = KubernetesApplyProvider::exec_stdin_payload(&request)
+            .expect("non-empty env should produce a stdin payload");
+        let text = String::from_utf8(payload).expect("payload should be valid utf-8");
+        let entries: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
+
+        assert!(entries.contains(&"A=1"));
+        assert!(entries.contains(&"B=two"));
+    }
+
+    #[test]
     fn kubernetes_apply_gate_requires_explicit_double_opt_in() {
         let missing_flag = KubernetesApplyProvider::validate_apply_gate(false, true)
             .expect_err("missing --confirm-apply should fail");
@@ -2686,21 +2928,50 @@ mod tests {
     }
 
     #[test]
-    fn vnc_password_secret_is_injected_as_env_var_when_configured() {
+    fn vnc_password_secret_is_mounted_as_a_read_only_file_not_an_env_var() {
+        // The VNC password must be mounted as a file (mirroring the SSH
+        // authorized-keys handling) rather than injected via
+        // `secretKeyRef`: pod env vars are visible to anything that can
+        // read this pod's spec through the Kubernetes API, not just the
+        // process itself.
         let provider =
             KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
                 .with_vnc_password_secret(Some("sandboxwich-vnc-password".to_string()));
         let provisioned = provider
             .provision(SandboxId::new(), &SandboxProvisionSpec::default())
             .expect("dry-run provision should succeed");
-        let env = provisioned.metadata["manifests"]["pod"]["spec"]["containers"][0]["env"]
+        let pod = &provisioned.metadata["manifests"]["pod"];
+        let env = pod["spec"]["containers"][0]["env"]
             .as_array()
             .expect("env should be an array");
 
+        assert!(
+            !env.iter()
+                .any(|entry| entry["name"] == "SANDBOXWICH_VNC_PASSWORD"),
+            "the raw VNC password must never be injected as a plain env var"
+        );
         assert!(env.iter().any(|entry| {
-            entry["name"] == "SANDBOXWICH_VNC_PASSWORD"
-                && entry["valueFrom"]["secretKeyRef"]["name"] == "sandboxwich-vnc-password"
-                && entry["valueFrom"]["secretKeyRef"]["key"] == "vnc-password"
+            entry["name"] == "SANDBOXWICH_VNC_PASSWORD_FILE"
+                && entry["value"] == "/run/sandboxwich/vnc/vnc-password"
+        }));
+
+        let volume_mounts = pod["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .expect("volumeMounts should be an array");
+        assert!(volume_mounts.iter().any(|mount| {
+            mount["name"] == "vnc-password"
+                && mount["mountPath"] == "/run/sandboxwich/vnc"
+                && mount["readOnly"] == true
+        }));
+
+        let volumes = pod["spec"]["volumes"]
+            .as_array()
+            .expect("volumes should be an array");
+        assert!(volumes.iter().any(|volume| {
+            volume["name"] == "vnc-password"
+                && volume["secret"]["secretName"] == "sandboxwich-vnc-password"
+                && volume["secret"]["items"][0]["key"] == "vnc-password"
+                && volume["secret"]["items"][0]["path"] == "vnc-password"
         }));
     }
 
