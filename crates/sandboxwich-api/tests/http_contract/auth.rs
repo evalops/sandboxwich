@@ -74,6 +74,119 @@ pub(crate) async fn api_token_is_required_when_configured() {
     assert_eq!(spoofed_tenant.sandbox.tenant_id, "default");
 }
 
+/// Regression for #111 and the worker/tenant confused-deputy boundary: the
+/// one-time worker credential may authenticate only worker control-plane
+/// calls. It must neither authorize tenant/operator APIs nor reappear in any
+/// subsequent HTTP response body.
+#[tokio::test]
+pub(crate) async fn worker_tokens_are_role_scoped_and_never_reserialized() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("sandboxwich-principal-test.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let tenant_client = server.client();
+
+    let registration: WorkerResponse = tenant_client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "principal-boundary-worker".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![WorkerCapability::K8sPod],
+            max_concurrent_jobs: Some(1),
+            labels: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let canary = registration.worker_token.clone().unwrap();
+    let worker_client = worker_client(&registration);
+
+    let heartbeat = worker_client
+        .post(format!(
+            "{}/workers/{}/heartbeat",
+            server.base_url, registration.worker.id
+        ))
+        .json(&WorkerHeartbeatRequest {
+            max_concurrent_jobs: None,
+            labels: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(heartbeat.status(), StatusCode::OK);
+    assert!(!heartbeat.text().await.unwrap().contains(&canary));
+
+    let tenant_on_worker_route = tenant_client
+        .post(format!(
+            "{}/workers/{}/heartbeat",
+            server.base_url, registration.worker.id
+        ))
+        .json(&WorkerHeartbeatRequest {
+            max_concurrent_jobs: None,
+            labels: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tenant_on_worker_route.status(), StatusCode::UNAUTHORIZED);
+
+    for response in [
+        worker_client
+            .get(format!("{}/sandboxes", server.base_url))
+            .send()
+            .await
+            .unwrap(),
+        worker_client
+            .post(format!("{}/sandboxes", server.base_url))
+            .json(&CreateSandboxRequest {
+                name: Some("must-not-exist".to_string()),
+                template: None,
+                memory_limit: None,
+                network_egress: None,
+                ttl_seconds: Some(120),
+            })
+            .send()
+            .await
+            .unwrap(),
+        worker_client
+            .get(format!("{}/workers", server.base_url))
+            .send()
+            .await
+            .unwrap(),
+        worker_client
+            .post(format!("{}/snapshots/cleanup", server.base_url))
+            .header(OPERATOR_TOKEN_HEADER, TEST_OPERATOR_TOKEN)
+            .send()
+            .await
+            .unwrap(),
+    ] {
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(!response.text().await.unwrap().contains(&canary));
+    }
+
+    let sandboxes: SandboxListResponse = tenant_client
+        .get(format!("{}/sandboxes", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(sandboxes.sandboxes.is_empty());
+}
+
 /// Regression test for issue #63: with neither `SANDBOXWICH_API_TOKEN` nor
 /// `SANDBOXWICH_TENANT_TOKENS` configured, the server must fail closed and
 /// refuse every non-probe request, rather than trusting a client-supplied
