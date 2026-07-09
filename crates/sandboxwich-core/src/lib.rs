@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Utc};
@@ -17,9 +17,65 @@ pub enum ApiClientBuildError {
     Build(#[source] reqwest::Error),
 }
 
+/// Default timeout for establishing the TCP/TLS connection to the control
+/// plane. Overridable with [`CONNECT_TIMEOUT_ENV_VAR`]; a value of `0`
+/// disables it.
+pub const DEFAULT_API_CLIENT_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Default end-to-end timeout for a single control-plane request. Mirrors
+/// `sandboxwich-cli`'s `--request-timeout-secs` default (30s) and shares its
+/// env var so operators only need to remember one knob. Overridable with
+/// [`REQUEST_TIMEOUT_ENV_VAR`]; a value of `0` disables it.
+pub const DEFAULT_API_CLIENT_REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// Env var overriding the default total request timeout applied by
+/// [`build_api_client`]. A value of `0` disables the timeout entirely.
+pub const REQUEST_TIMEOUT_ENV_VAR: &str = "SANDBOXWICH_REQUEST_TIMEOUT_SECS";
+
+/// Env var overriding the default connect timeout applied by
+/// [`build_api_client`]. A value of `0` disables the timeout entirely.
+pub const CONNECT_TIMEOUT_ENV_VAR: &str = "SANDBOXWICH_CONNECT_TIMEOUT_SECS";
+
+/// Builds the shared control-plane HTTP client used by every worker and
+/// agent process. Applies sensible default connect/request timeouts (see
+/// [`DEFAULT_API_CLIENT_CONNECT_TIMEOUT_SECS`] /
+/// [`DEFAULT_API_CLIENT_REQUEST_TIMEOUT_SECS`], overridable via
+/// [`CONNECT_TIMEOUT_ENV_VAR`] / [`REQUEST_TIMEOUT_ENV_VAR`]) so a
+/// partitioned network or an API that accepts a connection but never
+/// responds can't wedge the caller forever. Before these were added, every
+/// worker/agent call through this client could hang indefinitely, and
+/// `sandboxwich-agent`'s `AgentRequestError::is_recoverable` (which checks
+/// `reqwest::Error::is_timeout`) could never observe a timeout to recover
+/// from.
+///
+/// Use [`build_api_client_with_timeouts`] to set explicit timeouts instead of
+/// reading them from the environment (e.g. in tests, or for a call site that
+/// legitimately needs a longer bound).
 pub fn build_api_client(
     api_token: Option<&str>,
     tenant: Option<&str>,
+) -> Result<reqwest::Client, ApiClientBuildError> {
+    build_api_client_with_timeouts(
+        api_token,
+        tenant,
+        timeout_from_env(
+            REQUEST_TIMEOUT_ENV_VAR,
+            DEFAULT_API_CLIENT_REQUEST_TIMEOUT_SECS,
+        ),
+        timeout_from_env(
+            CONNECT_TIMEOUT_ENV_VAR,
+            DEFAULT_API_CLIENT_CONNECT_TIMEOUT_SECS,
+        ),
+    )
+}
+
+/// Like [`build_api_client`], but with explicit timeouts instead of reading
+/// them from the environment. `None` disables the corresponding timeout.
+pub fn build_api_client_with_timeouts(
+    api_token: Option<&str>,
+    tenant: Option<&str>,
+    request_timeout: Option<Duration>,
+    connect_timeout: Option<Duration>,
 ) -> Result<reqwest::Client, ApiClientBuildError> {
     let mut headers = HeaderMap::new();
     if let Some(api_token) = api_token.map(str::trim).filter(|token| !token.is_empty()) {
@@ -35,10 +91,35 @@ pub fn build_api_client(
             HeaderValue::from_str(tenant).map_err(ApiClientBuildError::InvalidTenant)?,
         );
     }
-    reqwest::Client::builder()
-        .default_headers(headers)
-        .build()
-        .map_err(ApiClientBuildError::Build)
+    let mut builder = reqwest::Client::builder().default_headers(headers);
+    if let Some(connect_timeout) = connect_timeout {
+        builder = builder.connect_timeout(connect_timeout);
+    }
+    if let Some(request_timeout) = request_timeout {
+        builder = builder.timeout(request_timeout);
+    }
+    builder.build().map_err(ApiClientBuildError::Build)
+}
+
+/// Reads a timeout override from `var`: `0` disables the timeout, a missing
+/// or unparsable value falls back to `default_secs`, anything else is used
+/// verbatim as a second count.
+fn timeout_from_env(var: &str, default_secs: u64) -> Option<Duration> {
+    parse_timeout_override(std::env::var(var).ok().as_deref(), default_secs)
+}
+
+/// Pure parsing logic behind [`timeout_from_env`], split out so it can be
+/// exercised by tests without mutating real process environment variables
+/// (which would race with other tests running in the same binary).
+fn parse_timeout_override(raw: Option<&str>, default_secs: u64) -> Option<Duration> {
+    match raw {
+        Some(value) => match value.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(Duration::from_secs(secs)),
+            Err(_) => Some(Duration::from_secs(default_secs)),
+        },
+        None => Some(Duration::from_secs(default_secs)),
+    }
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -1581,6 +1662,44 @@ mod tests {
         assert_db_variant_contract::<ProviderHealthStatus>();
         assert_db_variant_contract::<GuestStatus>();
         assert_db_variant_contract::<SshKeyStatus>();
+    }
+
+    #[test]
+    fn timeout_override_defaults_disables_and_parses() {
+        // Unset (or unparsable) env var falls back to the caller's default.
+        assert_eq!(
+            parse_timeout_override(None, 30),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_timeout_override(Some("not-a-number"), 30),
+            Some(Duration::from_secs(30))
+        );
+        // "0" is the documented opt-out for disabling the timeout entirely.
+        assert_eq!(parse_timeout_override(Some("0"), 30), None);
+        // Any other value is used verbatim.
+        assert_eq!(
+            parse_timeout_override(Some("5"), 30),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn build_api_client_with_timeouts_builds_successfully_with_and_without_timeouts() {
+        // Every worker/agent call goes through this client; regression-test
+        // that supplying explicit timeouts (the fix for the "hangs forever"
+        // bug) still produces a valid client, and that `None`/`None`
+        // (timeouts disabled) also still builds.
+        build_api_client_with_timeouts(
+            Some("token"),
+            Some("tenant"),
+            Some(Duration::from_secs(30)),
+            Some(Duration::from_secs(10)),
+        )
+        .expect("client with explicit timeouts should build");
+
+        build_api_client_with_timeouts(None, None, None, None)
+            .expect("client with timeouts disabled should still build");
     }
 
     #[test]
