@@ -4,7 +4,9 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use provider::{KubernetesApplyProvider, KubernetesDryRunProvider, SandboxProvider};
+use provider::{
+    KUBERNETES_MUTATION_ENV, KubernetesApplyProvider, KubernetesDryRunProvider, SandboxProvider,
+};
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse,
     CompleteLeaseRequest, FailLeaseRequest, JobKind, LeaseResponse, RegisterWorkerRequest,
@@ -625,27 +627,70 @@ fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
     .with_vnc_password_secret(non_empty(args.vnc_password_secret))
 }
 
+/// GH-76: `--confirm-apply` and `SANDBOXWICH_K8S_ENABLE_MUTATION=1` are a
+/// deliberate double opt-in meant to require both a per-invocation flag and
+/// an explicit environment toggle before this process will mutate cluster
+/// state. The checked-in worker Deployment (deploy/kubernetes/worker.yaml)
+/// sets both unconditionally, because the worker's whole job is to apply
+/// sandbox manifests -- there is no working production deployment where the
+/// gate is ever actually closed. That's a documented, deliberate choice
+/// (see the SECURITY NOTE in the manifest), not silent: this returns a
+/// message to surface on every process start so operators see it in logs
+/// rather than only in a YAML comment.
+fn mutation_gate_force_enabled_warning(
+    confirm_apply: bool,
+    mutation_enabled: bool,
+    sandbox_namespace: &str,
+) -> Option<String> {
+    if confirm_apply && mutation_enabled {
+        Some(format!(
+            "warning: Kubernetes mutation gate is force-enabled (--confirm-apply and \
+             {KUBERNETES_MUTATION_ENV}=1 are both set); this process will apply/delete real \
+             resources in namespace \"{sandbox_namespace}\" for every claimed job with no \
+             further per-job confirmation. This is the intended configuration for the \
+             checked-in worker Deployment (see deploy/kubernetes/worker.yaml and GH-76 for the \
+             residual-risk rationale) -- if this is unexpected, unset {KUBERNETES_MUTATION_ENV} \
+             or drop --confirm-apply."
+        ))
+    } else {
+        None
+    }
+}
+
 fn apply_provider_from_args(args: ProviderApplyArgs) -> KubernetesApplyProvider {
-    KubernetesApplyProvider::new(provider_from_args(args.provider), args.kubectl)
+    let provider = provider_from_args(args.provider);
+    let mutation_enabled = KubernetesApplyProvider::mutation_enabled_from_env();
+    if let Some(warning) = mutation_gate_force_enabled_warning(
+        args.confirm_apply,
+        mutation_enabled,
+        provider.effective_sandbox_namespace(),
+    ) {
+        eprintln!("{warning}");
+    }
+    KubernetesApplyProvider::new(provider, args.kubectl)
         .with_kubectl_context(args.kubectl_context)
-        .with_mutation_gate(
-            args.confirm_apply,
-            KubernetesApplyProvider::mutation_enabled_from_env(),
-        )
+        .with_mutation_gate(args.confirm_apply, mutation_enabled)
 }
 
 fn runtime_provider_from_args(args: RuntimeProviderArgs) -> RuntimeProvider {
     let provider = provider_from_args(args.provider);
     match args.provider_mode {
         ProviderModeArg::DryRun => RuntimeProvider::DryRun(provider),
-        ProviderModeArg::Apply => RuntimeProvider::Apply(
-            KubernetesApplyProvider::new(provider, args.kubectl)
-                .with_kubectl_context(args.kubectl_context)
-                .with_mutation_gate(
-                    args.confirm_apply,
-                    KubernetesApplyProvider::mutation_enabled_from_env(),
-                ),
-        ),
+        ProviderModeArg::Apply => {
+            let mutation_enabled = KubernetesApplyProvider::mutation_enabled_from_env();
+            if let Some(warning) = mutation_gate_force_enabled_warning(
+                args.confirm_apply,
+                mutation_enabled,
+                provider.effective_sandbox_namespace(),
+            ) {
+                eprintln!("{warning}");
+            }
+            RuntimeProvider::Apply(
+                KubernetesApplyProvider::new(provider, args.kubectl)
+                    .with_kubectl_context(args.kubectl_context)
+                    .with_mutation_gate(args.confirm_apply, mutation_enabled),
+            )
+        }
     }
 }
 
@@ -1196,13 +1241,7 @@ fn capabilities_from_args(
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
-    value.and_then(|value| {
-        if value.trim().is_empty() {
-            None
-        } else {
-            Some(value)
-        }
-    })
+    value.filter(|value| !value.trim().is_empty())
 }
 
 async fn print_json<T>(response: reqwest::Response) -> anyhow::Result<()>
@@ -1567,5 +1606,25 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn mutation_gate_warning_fires_only_when_both_halves_are_set() {
+        assert!(
+            mutation_gate_force_enabled_warning(false, false, "sandboxwich-sandboxes").is_none()
+        );
+        assert!(
+            mutation_gate_force_enabled_warning(true, false, "sandboxwich-sandboxes").is_none()
+        );
+        assert!(
+            mutation_gate_force_enabled_warning(false, true, "sandboxwich-sandboxes").is_none()
+        );
+
+        let warning = mutation_gate_force_enabled_warning(true, true, "sandboxwich-sandboxes")
+            .expect("both halves set should produce a warning");
+        assert!(warning.contains("force-enabled"));
+        assert!(warning.contains(KUBERNETES_MUTATION_ENV));
+        assert!(warning.contains("sandboxwich-sandboxes"));
+        assert!(warning.contains("GH-76"));
     }
 }
