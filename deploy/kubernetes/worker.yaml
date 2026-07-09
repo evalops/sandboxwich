@@ -94,6 +94,18 @@ spec:
         app.kubernetes.io/part-of: sandboxwich
     spec:
       serviceAccountName: sandboxwich-worker
+      # Must exceed --drain-timeout-secs below so Kubernetes doesn't SIGKILL
+      # the worker mid-drain: on SIGTERM/SIGINT the worker stops claiming new
+      # leases and waits for any in-flight lease to finish, bounded by that
+      # timeout, before exiting on its own.
+      terminationGracePeriodSeconds: 330
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: worker
           image: ghcr.io/evalops/sandboxwich-worker:latest
@@ -103,6 +115,11 @@ spec:
           # node's cached (possibly stale) :latest image.
           imagePullPolicy: Always
           env:
+            # kubectl (shelled out to by the apply provider) wants a writable
+            # $HOME for its discovery cache. readOnlyRootFilesystem below
+            # means that has to be redirected to the /tmp emptyDir.
+            - name: HOME
+              value: /tmp
             - name: SANDBOXWICH_API
               value: http://sandboxwich-api:3217
             - name: SANDBOXWICH_API_TOKEN
@@ -198,6 +215,22 @@ spec:
             - cluster=$(SANDBOXWICH_CLUSTER)
             - --label
             - pod=$(POD_NAME)
+            # Kept comfortably under terminationGracePeriodSeconds above so the
+            # worker's own drain logic (not Kubernetes' SIGKILL) is what ends
+            # the process in the common case.
+            - --drain-timeout-secs
+            - "300"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           resources:
             requests:
               cpu: 100m
@@ -205,3 +238,6 @@ spec:
             limits:
               cpu: 1
               memory: 512Mi
+      volumes:
+        - name: tmp
+          emptyDir: {}

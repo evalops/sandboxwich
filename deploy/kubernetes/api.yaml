@@ -21,6 +21,16 @@ spec:
         app.kubernetes.io/part-of: sandboxwich
     spec:
       restartPolicy: OnFailure
+      # Runs to completion once and exits; no signal handling to worry about,
+      # but it gets the same pod/container hardening as the long-running api
+      # Deployment below since it's the same image.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: migrate
           image: ghcr.io/evalops/sandboxwich-api:latest
@@ -39,6 +49,17 @@ spec:
                   key: database-url
             - name: SANDBOXWICH_DATABASE_MAX_CONNECTIONS
               value: "2"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           resources:
             requests:
               cpu: 50m
@@ -46,6 +67,9 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
+      volumes:
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -66,6 +90,19 @@ spec:
         app.kubernetes.io/name: sandboxwich-api
         app.kubernetes.io/part-of: sandboxwich
     spec:
+      # Bounds how long Kubernetes waits after sending SIGTERM before it force
+      # kills (SIGKILL) the pod. The api now handles SIGTERM by draining
+      # in-flight axum connections (see shutdown_signal()/with_graceful_shutdown
+      # in main.rs); this gives that drain a real window instead of the default
+      # 30s being an implicit, undocumented coincidence.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: api
           image: ghcr.io/evalops/sandboxwich-api:latest
@@ -109,6 +146,17 @@ spec:
               port: http
             initialDelaySeconds: 10
             periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           resources:
             requests:
               cpu: 100m
@@ -116,6 +164,9 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
+      volumes:
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
