@@ -59,6 +59,14 @@ struct AppState {
 #[derive(Clone, Debug)]
 struct TenantContext {
     tenant_id: String,
+    /// Set when the request authenticated with a worker-scoped token (see
+    /// GH-64), identifying exactly which worker it is bound to. `None` for
+    /// tenant-wide, shared, or (if allowed) unauthenticated dev access. Guest-
+    /// facing routes (lease claim/renew/complete/fail/output, guest-health)
+    /// require this to be `Some` and matched against the resource being acted
+    /// on, so a tenant-wide token can never be used to impersonate a worker
+    /// and a worker-scoped token can never reach past its own worker.
+    worker_id: Option<WorkerId>,
 }
 
 #[derive(Clone)]
@@ -930,7 +938,10 @@ mod tests {
             registered_at: now,
             last_heartbeat_at: Some(now),
         };
-        insert_worker(db, &worker).await.expect("insert worker");
+        let token_hash = hash_worker_token(&format!("test-token-{}", worker.id));
+        insert_worker(db, &worker, &token_hash)
+            .await
+            .expect("insert worker");
         worker.id
     }
 
@@ -1189,14 +1200,37 @@ fn app(state: AppState) -> Router {
 
 const PROBE_PATHS: &[&str] = &["/healthz", "/readyz"];
 
+/// Prefix on every minted worker-scoped token (see GH-64), used to route an
+/// incoming bearer token to hash-based worker lookup instead of the static
+/// tenant/shared-token lists without needing to try both on every request.
+const WORKER_TOKEN_PREFIX: &str = "sbw_wtok_";
+
 async fn auth_and_tenant(
     State(state): State<AppState>,
     mut request: Request,
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    let tenant_id = if PROBE_PATHS.contains(&path) {
-        state.default_tenant_id.clone()
+    let (tenant_id, worker_id) = if PROBE_PATHS.contains(&path) {
+        (state.default_tenant_id.clone(), None)
+    } else if let Some(token) =
+        bearer_token(&request).filter(|token| token.starts_with(WORKER_TOKEN_PREFIX))
+    {
+        // Worker-scoped credential (GH-64): resolves to (tenant_id,
+        // worker_id) rather than to a tenant alone, by looking up the
+        // SHA-256 hash stored at registration (the raw token itself is
+        // never persisted). A token with this prefix that fails to resolve
+        // is always unauthorized here -- it must never silently fall
+        // through to the tenant-token checks below, which would let a
+        // rejected worker-token attempt be retried as a tenant-wide lookup.
+        match resolve_worker_token(&state.db, token).await {
+            Ok(Some((tenant_id, worker_id))) => (tenant_id, Some(worker_id)),
+            Ok(None) => {
+                return ApiError::unauthorized("valid worker bearer token is required")
+                    .into_response();
+            }
+            Err(error) => return error.into_response(),
+        }
     } else if !state.auth.tenant_tokens.is_empty() {
         let Some(token) = bearer_token(&request) else {
             return ApiError::unauthorized("valid bearer token is required").into_response();
@@ -1209,27 +1243,28 @@ async fn auth_and_tenant(
         else {
             return ApiError::unauthorized("valid tenant bearer token is required").into_response();
         };
-        tenant.tenant_id.clone()
+        (tenant.tenant_id.clone(), None)
     } else if let Some(expected_token) = &state.auth.shared_token {
         let authorized = bearer_token(&request)
             .is_some_and(|token| constant_time_eq(token.as_bytes(), expected_token.as_bytes()));
         if !authorized {
             return ApiError::unauthorized("valid bearer token is required").into_response();
         }
-        state.default_tenant_id.clone()
+        (state.default_tenant_id.clone(), None)
     } else if state.auth.allow_insecure_no_auth {
         // Explicit, off-by-default opt-out (SANDBOXWICH_ALLOW_INSECURE_NO_AUTH) for
         // local development and benchmark harnesses: with no credential configured,
         // trust the client-supplied tenant header. Never enable this in a shared
         // deployment.
-        request
+        let tenant_id = request
             .headers()
             .get("x-sandboxwich-tenant")
             .and_then(|value| value.to_str().ok())
             .map(str::trim)
             .filter(|tenant| !tenant.is_empty())
             .unwrap_or(&state.default_tenant_id)
-            .to_string()
+            .to_string();
+        (tenant_id, None)
     } else {
         // Fail closed: with no SANDBOXWICH_API_TOKEN and no SANDBOXWICH_TENANT_TOKENS
         // configured, there is no credential to authenticate against, so we must
@@ -1243,9 +1278,80 @@ async fn auth_and_tenant(
         )
         .into_response();
     };
-    request.extensions_mut().insert(TenantContext { tenant_id });
+    request.extensions_mut().insert(TenantContext {
+        tenant_id,
+        worker_id,
+    });
 
     next.run(request).await
+}
+
+/// Resolves a worker-scoped bearer token (see GH-64) to the `(tenant_id,
+/// worker_id)` it was minted for by looking it up via its SHA-256 hash.
+/// Unlike the small, static, in-memory tenant/operator token lists (which
+/// use [`constant_time_eq`] to compare the raw secret directly), worker
+/// tokens are dynamic per-worker DB rows, so the lookup key is the
+/// cryptographic hash rather than the token itself -- the security property
+/// here comes from SHA-256 preimage resistance, not timing-safe comparison,
+/// so a plain indexed equality lookup is the correct and standard approach
+/// (the same pattern used for hashed API keys generally).
+async fn resolve_worker_token(
+    db: &Database,
+    token: &str,
+) -> Result<Option<(String, WorkerId)>, ApiError> {
+    let hash = hash_worker_token(token);
+    let sql = format!(
+        "select id, tenant_id from workers where token_hash = {}",
+        db.placeholder(1)
+    );
+    let Some(row) = sqlx::query(&sql)
+        .bind(hash)
+        .fetch_optional(&db.pool)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let id: String = row.try_get("id")?;
+    let tenant_id: String = row.try_get("tenant_id")?;
+    Ok(Some((tenant_id, WorkerId(parse_uuid(&id)?))))
+}
+
+/// Mints a new worker-scoped credential (see GH-64): high-entropy (256 bits),
+/// prefixed so the auth middleware can route it to hash-based worker lookup,
+/// and never persisted in this form -- only [`hash_worker_token`]'s output is
+/// stored, in `workers.token_hash`.
+fn generate_worker_token() -> String {
+    format!(
+        "{WORKER_TOKEN_PREFIX}{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    )
+}
+
+/// Hex-encoded SHA-256 digest of a worker token, used both to persist it
+/// (`workers.token_hash`) and to look it up (`resolve_worker_token`).
+fn hash_worker_token(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(token.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Requires the request to have authenticated with a worker-scoped token
+/// bound to exactly `worker_id` (see GH-64). Used on every guest-facing route
+/// (lease claim/renew/complete/fail/output, guest-health) to reject
+/// tenant-wide tokens outright and to stop a worker-scoped token from acting
+/// on any worker other than its own. Mirrors [`ensure_tenant`]'s convention
+/// of returning `not_found` (rather than a distinct "forbidden") for
+/// cross-worker ownership violations, so the response never confirms or
+/// denies that a given worker/lease/sandbox id exists.
+fn ensure_worker_scope(ctx: &TenantContext, worker_id: WorkerId) -> Result<(), ApiError> {
+    match ctx.worker_id {
+        Some(bound) if bound == worker_id => Ok(()),
+        Some(_) => Err(ApiError::not_found("resource not found")),
+        None => Err(ApiError::unauthorized(
+            "this route requires a worker-scoped token; tenant-wide tokens are not accepted",
+        )),
+    }
 }
 
 fn bearer_token(request: &Request) -> Option<&str> {
@@ -1525,6 +1631,87 @@ async fn ensure_lease_tenant(
     let lease = fetch_lease(db, lease_id).await?;
     ensure_job_tenant(&lease.job, ctx)?;
     Ok(lease)
+}
+
+/// Like [`ensure_lease_tenant`], but additionally requires (see GH-64) that
+/// the request authenticated as the worker that actually holds `lease_id`:
+/// used on every guest-facing lease route (renew/complete/fail/output) so a
+/// worker-scoped token can only touch its own leases, and a tenant-wide token
+/// is rejected outright rather than being allowed to act on any worker's
+/// lease.
+async fn ensure_lease_worker_scope(
+    db: &Database,
+    lease_id: LeaseId,
+    ctx: &TenantContext,
+) -> Result<JobLease, ApiError> {
+    let lease = ensure_lease_tenant(db, lease_id, ctx).await?;
+    ensure_worker_scope(ctx, lease.worker_id)?;
+    Ok(lease)
+}
+
+/// Like [`ensure_sandbox_tenant`], but additionally requires (see GH-64) that
+/// the request authenticated as the worker that provisioned or forked
+/// `sandbox_id` (determined from completed provision/fork job leases, the
+/// only source of truth for "which worker is running this sandbox's guest").
+/// Used on the guest-facing guest-health route so a worker-scoped token can
+/// only report health for sandboxes it actually owns, and a tenant-wide
+/// token is rejected outright.
+async fn ensure_sandbox_worker_scope(
+    db: &Database,
+    sandbox_id: SandboxId,
+    ctx: &TenantContext,
+) -> Result<Sandbox, ApiError> {
+    let sandbox = ensure_sandbox_tenant(db, sandbox_id, ctx).await?;
+    let Some(worker_id) = ctx.worker_id else {
+        return Err(ApiError::unauthorized(
+            "this route requires a worker-scoped token; tenant-wide tokens are not accepted",
+        ));
+    };
+    if !worker_owns_sandbox(db, worker_id, sandbox_id).await? {
+        return Err(ApiError::not_found("resource not found"));
+    }
+    Ok(sandbox)
+}
+
+/// Whether `worker_id` has ever successfully completed a `provision_sandbox`
+/// or `fork_sandbox` job lease that produced (or targeted, for a fork) this
+/// exact sandbox. Sandboxes carry no persistent "owning worker" column;
+/// completed-lease history is the source of truth for which worker's guest
+/// environment a sandbox's agent actually runs in, and it can never name two
+/// different current workers for the same sandbox id (re-provisioning always
+/// mints a new sandbox id).
+async fn worker_owns_sandbox(
+    db: &Database,
+    worker_id: WorkerId,
+    sandbox_id: SandboxId,
+) -> Result<bool, ApiError> {
+    let sql = format!(
+        "select j.kind, j.payload
+         from job_leases jl
+         join jobs j on j.id = jl.job_id
+         where jl.worker_id = {} and jl.status = 'completed'
+           and j.kind in ('provision_sandbox', 'fork_sandbox')",
+        db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(worker_id.to_string())
+        .fetch_all(&db.pool)
+        .await?;
+    let sandbox_id_str = sandbox_id.to_string();
+    for row in rows {
+        let kind: String = row.try_get("kind")?;
+        let payload_raw: String = row.try_get("payload")?;
+        let payload: serde_json::Value = serde_json::from_str(&payload_raw)?;
+        let field = if kind == "fork_sandbox" {
+            "childSandboxId"
+        } else {
+            "sandboxId"
+        };
+        if payload.get(field).and_then(serde_json::Value::as_str) == Some(sandbox_id_str.as_str()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn provision_spec_from_request(
@@ -2632,9 +2819,19 @@ async fn register_worker(
         registered_at: now,
         last_heartbeat_at: None,
     };
-    insert_worker(&state.db, &worker).await?;
+    // Mint this worker's scoped credential now (GH-64): the raw token is
+    // returned once, below, and never persisted -- only its hash is stored,
+    // so the API itself cannot produce the plaintext token again after this
+    // response.
+    let worker_token = generate_worker_token();
+    let token_hash = hash_worker_token(&worker_token);
+    insert_worker(&state.db, &worker, &token_hash).await?;
 
-    Ok(Json(WorkerResponse { ok: true, worker }))
+    Ok(Json(WorkerResponse {
+        ok: true,
+        worker,
+        worker_token: Some(worker_token),
+    }))
 }
 
 async fn heartbeat_worker(
@@ -2693,7 +2890,11 @@ async fn heartbeat_worker(
     insert_worker_heartbeat(&state.db, worker_id, &labels, now).await?;
     let worker = fetch_worker(&state.db, worker_id).await?;
 
-    Ok(Json(WorkerResponse { ok: true, worker }))
+    Ok(Json(WorkerResponse {
+        ok: true,
+        worker,
+        worker_token: None,
+    }))
 }
 
 async fn reconcile_runtime_resources(
@@ -2959,7 +3160,11 @@ async fn update_guest_health(
     Json(request): Json<UpdateGuestHealthRequest>,
 ) -> Result<Json<GuestHealthResponse>, ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
-    ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
+    // GH-64: guest-facing route -- only the worker that provisioned/forked
+    // this sandbox may report its guest health; tenant-wide tokens are
+    // rejected. (The read side, `get_guest_health`, stays on tenant auth --
+    // CLI/dashboard callers need to read it too.)
+    ensure_sandbox_worker_scope(&state.db, sandbox_id, &ctx).await?;
     let now = Utc::now();
     let guest_health = GuestHealth {
         sandbox_id,
@@ -3119,7 +3324,11 @@ async fn claim_lease(
     Path(worker_id): Path<Uuid>,
     Json(request): Json<ClaimLeaseRequest>,
 ) -> Result<Json<ClaimLeaseResponse>, ApiError> {
-    let worker = ensure_worker_tenant(&state.db, WorkerId(worker_id), &ctx).await?;
+    let worker_id = WorkerId(worker_id);
+    // GH-64: guest-facing route -- only a token scoped to exactly this
+    // worker may claim on its behalf; tenant-wide tokens are rejected.
+    ensure_worker_scope(&ctx, worker_id)?;
+    let worker = ensure_worker_tenant(&state.db, worker_id, &ctx).await?;
     let sql = format!(
         "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
@@ -3160,7 +3369,9 @@ async fn renew_lease(
     Json(request): Json<RenewLeaseRequest>,
 ) -> Result<Json<LeaseResponse>, ApiError> {
     let lease_id = LeaseId(lease_id);
-    ensure_lease_tenant(&state.db, lease_id, &ctx).await?;
+    // GH-64: guest-facing route -- only the worker holding this lease may
+    // renew it; tenant-wide tokens are rejected.
+    ensure_lease_worker_scope(&state.db, lease_id, &ctx).await?;
     let now = Utc::now();
     let expires_at = now + chrono::Duration::seconds(request.lease_seconds.unwrap_or(60) as i64);
     let sql = format!(
@@ -3194,7 +3405,9 @@ async fn append_lease_output(
             "command output chunk cannot be empty",
         ));
     }
-    let lease = ensure_lease_tenant(&state.db, LeaseId(lease_id), &ctx).await?;
+    // GH-64: guest-facing route -- only the worker holding this lease may
+    // append output for it; tenant-wide tokens are rejected.
+    let lease = ensure_lease_worker_scope(&state.db, LeaseId(lease_id), &ctx).await?;
     if lease.status != LeaseStatus::Active {
         return Err(ApiError::bad_request("lease is not active"));
     }
@@ -3224,7 +3437,9 @@ async fn complete_lease(
     Json(request): Json<CompleteLeaseRequest>,
 ) -> Result<Json<LeaseResponse>, ApiError> {
     let lease_id = LeaseId(lease_id);
-    ensure_lease_tenant(&state.db, lease_id, &ctx).await?;
+    // GH-64: guest-facing route -- only the worker holding this lease may
+    // complete it; tenant-wide tokens are rejected.
+    ensure_lease_worker_scope(&state.db, lease_id, &ctx).await?;
     let result = request
         .result
         .ok_or_else(|| ApiError::bad_request("completion result is required"))?;
@@ -3279,7 +3494,9 @@ async fn fail_lease(
         return Err(ApiError::bad_request("error is required"));
     }
     let lease_id = LeaseId(lease_id);
-    ensure_lease_tenant(&state.db, lease_id, &ctx).await?;
+    // GH-64: guest-facing route -- only the worker holding this lease may
+    // fail it; tenant-wide tokens are rejected.
+    ensure_lease_worker_scope(&state.db, lease_id, &ctx).await?;
     let lease =
         fail_lease_in_transaction(&state.db, lease_id, request.retry, &request.error).await?;
     Ok(Json(LeaseResponse { ok: true, lease }))
@@ -7246,12 +7463,14 @@ impl Database {
     }
 }
 
-async fn insert_worker(db: &Database, worker: &Worker) -> Result<(), ApiError> {
+/// `token_hash` is the SHA-256 hash (see [`hash_worker_token`]) of this
+/// worker's scoped credential (GH-64), never the raw token itself.
+async fn insert_worker(db: &Database, worker: &Worker, token_hash: &str) -> Result<(), ApiError> {
     let sql = format!(
         "insert into workers
-         (id, tenant_id, name, status, provider, capabilities, max_concurrent_jobs, labels, registered_at, last_heartbeat_at)
+         (id, tenant_id, name, status, provider, capabilities, max_concurrent_jobs, labels, registered_at, last_heartbeat_at, token_hash)
          values ({})",
-        db.placeholders(10)
+        db.placeholders(11)
     );
     sqlx::query(&sql)
         .bind(worker.id.to_string())
@@ -7264,6 +7483,7 @@ async fn insert_worker(db: &Database, worker: &Worker) -> Result<(), ApiError> {
         .bind(serde_json::to_string(&worker.labels)?)
         .bind(worker.registered_at.to_rfc3339())
         .bind(worker.last_heartbeat_at.map(|time| time.to_rfc3339()))
+        .bind(token_hash)
         .execute(&db.pool)
         .await?;
     Ok(())
