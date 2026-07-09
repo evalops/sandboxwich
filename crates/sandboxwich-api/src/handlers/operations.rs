@@ -16,20 +16,36 @@ use uuid::Uuid;
 
 pub(crate) fn operation_from_job(job: &Job) -> Result<Operation, ApiError> {
     let references = job_references(job)?;
-    let kind = match job.kind {
-        JobKind::ProvisionSandbox => OperationKind::ProvisionSandbox,
-        JobKind::StopSandbox => OperationKind::StopSandbox,
-        JobKind::ResumeSandbox => OperationKind::ResumeSandbox,
-        JobKind::RunCommand => OperationKind::RunCommand,
-        JobKind::CreateSnapshot => OperationKind::CreateSnapshot,
-        JobKind::ForkSandbox => OperationKind::ForkSandbox,
-        JobKind::RunPrompt => {
-            return Err(ApiError::not_implemented(
-                "agent_prompt_unavailable",
-                "agent prompt execution is not implemented",
-            ));
-        }
-    };
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct OperationMetadata {
+        kind: OperationKind,
+        resource_id: Uuid,
+    }
+    let metadata = job
+        .payload
+        .get("operation")
+        .cloned()
+        .map(serde_json::from_value::<OperationMetadata>)
+        .transpose()
+        .map_err(|_| ApiError::internal("job contains invalid operation metadata"))?;
+    let kind = metadata
+        .as_ref()
+        .map(|value| value.kind.clone())
+        .unwrap_or(match job.kind {
+            JobKind::ProvisionSandbox => OperationKind::ProvisionSandbox,
+            JobKind::StopSandbox => OperationKind::StopSandbox,
+            JobKind::ResumeSandbox => OperationKind::ResumeSandbox,
+            JobKind::RunCommand => OperationKind::RunCommand,
+            JobKind::CreateSnapshot => OperationKind::CreateSnapshot,
+            JobKind::ForkSandbox => OperationKind::ForkSandbox,
+            JobKind::RunPrompt => {
+                return Err(ApiError::not_implemented(
+                    "agent_prompt_unavailable",
+                    "agent prompt execution is not implemented",
+                ));
+            }
+        });
     let status = match job.status {
         JobStatus::Queued => OperationStatus::Queued,
         JobStatus::Leased => OperationStatus::Running,
@@ -41,12 +57,14 @@ pub(crate) fn operation_from_job(job: &Job) -> Result<Operation, ApiError> {
         id: job.id.0,
         kind,
         status,
-        resource_id: references
-            .command_id
-            .map(|id| id.0)
-            .or_else(|| references.snapshot_id.map(|id| id.0))
-            .or_else(|| references.child_sandbox_id.map(|id| id.0))
-            .or_else(|| references.sandbox_id.map(|id| id.0)),
+        resource_id: metadata.map(|value| value.resource_id).or_else(|| {
+            references
+                .command_id
+                .map(|id| id.0)
+                .or_else(|| references.snapshot_id.map(|id| id.0))
+                .or_else(|| references.child_sandbox_id.map(|id| id.0))
+                .or_else(|| references.sandbox_id.map(|id| id.0))
+        }),
         created_at: job.created_at,
         updated_at: job.updated_at,
         error_code: job
@@ -149,6 +167,7 @@ pub(crate) async fn operation_events(
     let tenant = ctx.tenant_id;
     let output = stream! {
         let mut last = last_id;
+        let mut poll_interval = Duration::from_millis(500);
         loop {
             let job = fetch_job(&db, JobId(id)).await;
             let Ok(job) = job else { break; };
@@ -159,9 +178,12 @@ pub(crate) async fn operation_events(
                 let data = serde_json::to_string(&operation).unwrap_or_else(|_| "{}".to_string());
                 yield Ok(Event::default().id(event_id.clone()).event("operation").data(data));
                 last = Some(event_id);
+                poll_interval = Duration::from_millis(500);
+            } else {
+                poll_interval = (poll_interval * 2).min(Duration::from_secs(5));
             }
             if matches!(job.status, JobStatus::Succeeded | JobStatus::Failed | JobStatus::Dead | JobStatus::Cancelled) { break; }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(poll_interval).await;
         }
     };
     Ok(Sse::new(output).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))

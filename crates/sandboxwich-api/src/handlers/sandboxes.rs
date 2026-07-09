@@ -310,6 +310,7 @@ pub(crate) async fn fork_sandbox(
         kind: JobKind::CreateSnapshot,
         status: JobStatus::Queued,
         payload: json!({"sandboxId": parent.id, "snapshotId": snapshot.id,
+            "operation": { "kind": OperationKind::ForkSandbox, "resourceId": child.id },
             "provisionSpec": SandboxProvisionSpec { memory_limit: parent.memory_limit.clone(), network_egress: parent.network_egress.clone() }}),
         required_capability: WorkerCapability::Snapshot,
         priority: 0,
