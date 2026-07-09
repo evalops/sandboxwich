@@ -103,7 +103,7 @@ Use the dry-run output to validate control-plane wiring before granting a worker
 The starter guest runtime lives in `deploy/runtime/ubuntu-dev/`. It is an Ubuntu image contract for sandbox Pods:
 
 - SSH daemon on port `2222`.
-- noVNC desktop bridge on port `6080`, backed by `x11vnc` bound to `localhost:5900` only (not reachable from other pods) and requiring a password: either `SANDBOXWICH_VNC_PASSWORD` (wire it from a Secret with `--vnc-password-secret`) or a random one generated per container start. The noVNC web client prompts for this password.
+- noVNC desktop bridge on port `6080`, backed by `x11vnc` bound to `localhost:5900` only (not reachable from other pods) and requiring a password: either read from the file at `SANDBOXWICH_VNC_PASSWORD_FILE` (wire a Secret with `--vnc-password-secret`, mounted read-only rather than exposed as a plain env var) or a random one generated per container start. The noVNC web client prompts for this password.
 - Persistent workspace mounted at `/workspace`.
 - Optional authorized keys file mounted from a caller-owned Secret.
 - Development tooling installed from package repositories, including Git, Rust, Node/npm, GitHub CLI, Docker CLI/daemon packages, Python, tmux, and shell utilities.
@@ -133,7 +133,7 @@ kubectl -n sandboxwich-sandboxes create secret generic sandboxwich-vnc-password 
   --from-literal=vnc-password='replace-with-a-strong-password'
 ```
 
-Pass `--vnc-password-secret sandboxwich-vnc-password` (or set `SANDBOXWICH_VNC_PASSWORD_SECRET`) so the worker injects it as `SANDBOXWICH_VNC_PASSWORD` in the sandbox container.
+Pass `--vnc-password-secret sandboxwich-vnc-password` (or set `SANDBOXWICH_VNC_PASSWORD_SECRET`) so the worker mounts it read-only at `/run/sandboxwich/vnc/vnc-password` in the sandbox container (exposed via `SANDBOXWICH_VNC_PASSWORD_FILE`), the same way the SSH authorized-keys Secret is mounted rather than injected as a plain env var.
 
 ## Sandbox Namespace Isolation
 
@@ -142,7 +142,7 @@ Sandbox Pods, Services, PVCs, and NetworkPolicies render into a dedicated namesp
 The rendered per-sandbox NetworkPolicy also:
 
 - Always allows DNS egress to `kube-dns` (scoped with `--dns-namespace` / `SANDBOXWICH_DNS_NAMESPACE`, default `kube-system`) regardless of egress mode, so an `allowlist` policy no longer silently breaks name resolution.
-- Carves the control-plane/link-local/cluster CIDRs (`--egress-excluded-cidr` / `SANDBOXWICH_EGRESS_EXCLUDED_CIDRS`, default `169.254.0.0/16,10.42.0.0/16,10.43.0.0/16`) out of any `0.0.0.0/0` egress rule, so `AllowAll` (or an allowlist that includes `0.0.0.0/0`) can never reach the apiserver or cloud metadata endpoints.
+- Carves the control-plane/link-local/cluster CIDRs (`--egress-excluded-cidr` / `SANDBOXWICH_EGRESS_EXCLUDED_CIDRS`, default `169.254.0.0/16,10.42.0.0/16,10.43.0.0/16`, merged with any operator-supplied CIDRs unless `--egress-excluded-cidrs-replace` is set) out of *every* egress allow rule that overlaps them, not just `0.0.0.0/0` -- an allowlist entry as broad as `10.0.0.0/8` also gets the overlapping ranges carved out -- so sandboxes can never reach the apiserver or cloud metadata endpoints regardless of egress mode.
 - Adds an ingress policy restricting the sandbox's ssh/desktop/vnc ports (2222/6080/5900) to pods matching `--ingress-namespace`/`--ingress-selector-label` (default: the control-plane namespace, pods labeled `app.kubernetes.io/part-of=sandboxwich`), closing the previous cross-tenant path where any pod on the cluster network could reach another tenant's sandbox desktop directly.
 
 ## Guarded Provider Apply Smoke

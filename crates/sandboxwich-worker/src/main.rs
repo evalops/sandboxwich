@@ -242,15 +242,31 @@ struct ProviderArgs {
     #[arg(long, env = "SANDBOXWICH_DNS_NAMESPACE")]
     dns_namespace: Option<String>,
 
-    /// CIDRs excluded from any `0.0.0.0/0` egress rule via NetworkPolicy
-    /// `except`, so sandboxes can never reach the control plane or cloud
-    /// metadata endpoints even in AllowAll mode (GH-66).
+    /// Additional CIDRs excluded from every egress allow rule that
+    /// overlaps them, via NetworkPolicy `except`, so sandboxes can never
+    /// reach the control plane or cloud metadata endpoints regardless of
+    /// egress mode (GH-66). Merged with (not replacing)
+    /// `DEFAULT_EGRESS_EXCLUDED_CIDRS`; see
+    /// `--egress-excluded-cidrs-replace` to opt out of the merge.
     #[arg(
         long = "egress-excluded-cidr",
         env = "SANDBOXWICH_EGRESS_EXCLUDED_CIDRS",
         value_delimiter = ','
     )]
     egress_excluded_cidrs: Vec<String>,
+
+    /// Replace the default excluded CIDR set outright instead of merging
+    /// `--egress-excluded-cidr` into it. Only set this if you are
+    /// deliberately replacing the metadata/control-plane carve-out with an
+    /// equivalent value for your environment (e.g. a non-k3s cluster where
+    /// the k3s-shaped defaults are meaningless) -- leaving this unset is
+    /// the safe default and always keeps `169.254.0.0/16` excluded.
+    #[arg(
+        long = "egress-excluded-cidrs-replace",
+        default_value_t = false,
+        env = "SANDBOXWICH_EGRESS_EXCLUDED_CIDRS_REPLACE"
+    )]
+    egress_excluded_cidrs_replace: bool,
 
     /// Namespace containing pods allowed to reach a sandbox's ssh/desktop
     /// ports via the rendered ingress NetworkPolicy (GH-67). Defaults to
@@ -264,8 +280,8 @@ struct ProviderArgs {
     #[arg(long = "ingress-selector-label", value_parser = parse_label)]
     ingress_selector_label: Vec<(String, String)>,
 
-    /// Secret providing SANDBOXWICH_VNC_PASSWORD to the sandbox container
-    /// (GH-67).
+    /// Secret mounted read-only as a file (SANDBOXWICH_VNC_PASSWORD_FILE)
+    /// in the sandbox container (GH-67).
     #[arg(long, env = "SANDBOXWICH_VNC_PASSWORD_SECRET")]
     vnc_password_secret: Option<String>,
 }
@@ -663,7 +679,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
-    KubernetesDryRunProvider::with_snapshot_class(
+    let provider = KubernetesDryRunProvider::with_snapshot_class(
         args.cluster,
         args.namespace,
         non_empty(args.storage_class),
@@ -674,11 +690,16 @@ fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
     .with_ssh_authorized_keys_secret(non_empty(args.ssh_authorized_keys_secret))
     .with_runtime_class_name(non_empty(args.runtime_class_name))
     .with_sandbox_namespace(non_empty(args.sandbox_namespace))
-    .with_dns_namespace(non_empty(args.dns_namespace))
-    .with_egress_excluded_cidrs(args.egress_excluded_cidrs)
-    .with_ingress_namespace(non_empty(args.ingress_namespace))
-    .with_ingress_pod_selector(args.ingress_selector_label)
-    .with_vnc_password_secret(non_empty(args.vnc_password_secret))
+    .with_dns_namespace(non_empty(args.dns_namespace));
+    let provider = if args.egress_excluded_cidrs_replace {
+        provider.with_egress_excluded_cidrs_replace(args.egress_excluded_cidrs)
+    } else {
+        provider.with_egress_excluded_cidrs(args.egress_excluded_cidrs)
+    };
+    provider
+        .with_ingress_namespace(non_empty(args.ingress_namespace))
+        .with_ingress_pod_selector(args.ingress_selector_label)
+        .with_vnc_password_secret(non_empty(args.vnc_password_secret))
 }
 
 /// GH-76: `--confirm-apply` and `SANDBOXWICH_K8S_ENABLE_MUTATION=1` are a
