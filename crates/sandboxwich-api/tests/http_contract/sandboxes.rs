@@ -326,7 +326,10 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
         .json(&RegisterWorkerRequest {
             name: "race-fork-worker".to_string(),
             provider: "kubernetes".to_string(),
-            capabilities: vec![WorkerCapability::Snapshot],
+            capabilities: vec![
+                WorkerCapability::Snapshot,
+                WorkerCapability::ProvisionSandbox,
+            ],
             max_concurrent_jobs: Some(1),
             labels: [("cluster".to_string(), "k3s-dev".to_string())].into(),
         })
@@ -486,7 +489,7 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
         .json()
         .await
         .unwrap();
-    assert_eq!(archived_child.sandbox.state, SandboxState::Archived);
+    assert_eq!(archived_child.sandbox.state, SandboxState::Archiving);
 
     // The ForkSandbox job completes *after* the concurrent archive landed.
     // It must succeed (the job itself isn't at fault) without clobbering the
@@ -509,6 +512,43 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
                         "namespace": "sandboxwich-contract"
                     }),
                 },
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let stop_claim: ClaimLeaseResponse = race_worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, race_worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let stop_lease = stop_claim
+        .lease
+        .expect("concurrent stop must remain queued");
+    assert_eq!(stop_lease.job.kind, JobKind::StopSandbox);
+    race_worker_client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, stop_lease.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::StopSandbox {
+                provider: "kubernetes".to_string(),
+                sandbox_id: forked.sandbox.id,
             }),
         })
         .send()

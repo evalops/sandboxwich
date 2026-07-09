@@ -470,6 +470,38 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .unwrap()
         .error_for_status()
         .unwrap();
+    let worker_client = worker_client(worker);
+    let claimed: ClaimLeaseResponse = worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claimed.lease.expect("cleanup sandbox stop must be claimed");
+    assert_eq!(lease.job.kind, JobKind::StopSandbox);
+    worker_client
+        .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::StopSandbox {
+                provider: "kubernetes".to_string(),
+                sandbox_id: archived.sandbox.id,
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
     let cleanup: SnapshotCleanupResponse = client
         .post(format!("{}/snapshots/cleanup", server.base_url))
         .header(OPERATOR_TOKEN_HEADER, TEST_OPERATOR_TOKEN)
