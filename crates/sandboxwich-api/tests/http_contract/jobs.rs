@@ -102,11 +102,13 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
         .unwrap();
 
     let worker_client = worker_client(worker);
+    let claim_operation_id = uuid::Uuid::now_v7();
     let claimed: ClaimLeaseResponse = worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, worker.worker.id
         ))
+        .header("idempotency-key", claim_operation_id.to_string())
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
         })
@@ -122,6 +124,25 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
         .lease
         .expect("expected worker to claim rollback probe job");
     assert_eq!(lease.job.id, queued.job.id);
+
+    let replayed_claim: ClaimLeaseResponse = worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .header("idempotency-key", claim_operation_id.to_string())
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replayed_claim.lease.unwrap().id, lease.id);
 
     let mut resources = provision_resources(sandbox.sandbox.id);
     resources[0].provider = String::new();
@@ -157,6 +178,22 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
         .await
         .unwrap();
     assert_eq!(failed.lease.job.status, JobStatus::Failed);
+
+    let replayed: LeaseResponse = worker_client
+        .post(format!("{}/leases/{}/fail", server.base_url, lease.id))
+        .json(&FailLeaseRequest {
+            error: "rollback probe".to_string(),
+            retry: false,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replayed.lease.status, LeaseStatus::Failed);
 }
 
 pub(crate) async fn assert_retryable_failure_requeues_command(
@@ -299,6 +336,24 @@ pub(crate) async fn assert_retryable_failure_requeues_command(
         .await
         .unwrap();
     assert_eq!(completed.lease.job.status, JobStatus::Succeeded);
+
+    let replayed: LeaseResponse = worker_client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, retry_lease.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(command_result("retried\n", "", 0)),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replayed.lease.status, LeaseStatus::Completed);
 }
 
 pub(crate) async fn assert_expired_lease_requeues_command(

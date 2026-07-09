@@ -105,6 +105,7 @@ pub(crate) fn app(state: AppState) -> Router {
 
     let worker_routes = Router::new()
         .route("/workers/{worker_id}/heartbeat", post(heartbeat_worker))
+        .route("/workers/{worker_id}/drain", post(drain_worker))
         .route(
             "/workers/{worker_id}/runtime-resources/reconcile",
             post(reconcile_runtime_resources),

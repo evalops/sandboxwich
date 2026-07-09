@@ -2,6 +2,7 @@ use crate::db::*;
 use crate::handlers::desktop::*;
 use crate::handlers::leases::*;
 use crate::handlers::snapshots::*;
+use crate::handlers::workers::*;
 use std::time::Duration;
 
 /// Runs the lease/snapshot/desktop-session expiry sweeps on a fixed interval in
@@ -21,6 +22,7 @@ pub(crate) fn spawn_expiry_sweeper(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The first tick fires immediately; that's fine, it just means the
         // first sweep runs right away instead of waiting a full interval.
         loop {
@@ -33,6 +35,9 @@ pub(crate) fn spawn_expiry_sweeper(
             }
             if let Err(error) = expire_due_desktop_sessions(&db).await {
                 tracing::warn!(?error, "desktop session expiry sweep failed");
+            }
+            if let Err(error) = reconcile_worker_liveness(&db).await {
+                tracing::warn!(?error, "worker liveness reconciliation failed");
             }
         }
     })

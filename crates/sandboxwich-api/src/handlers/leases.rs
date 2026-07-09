@@ -10,6 +10,7 @@ use crate::rows::*;
 use crate::state::*;
 use axum::Json;
 use axum::extract::{Extension, Path, State};
+use axum::http::HeaderMap;
 use chrono::{DateTime, Utc};
 use sandboxwich_core::*;
 use serde_json::json;
@@ -21,6 +22,7 @@ pub(crate) async fn claim_lease(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
     Path(worker_id): Path<Uuid>,
+    headers: HeaderMap,
     Json(request): Json<ClaimLeaseRequest>,
 ) -> Result<Json<ClaimLeaseResponse>, ApiError> {
     let worker_id = WorkerId(worker_id);
@@ -28,12 +30,49 @@ pub(crate) async fn claim_lease(
     // worker may claim on its behalf; tenant-wide tokens are rejected.
     ensure_worker_scope(&ctx, worker_id)?;
     let worker = ensure_worker_tenant(&state.db, worker_id, &ctx).await?;
+    let operation_id = headers
+        .get("idempotency-key")
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| ApiError::bad_request("invalid idempotency-key"))
+        })
+        .transpose()?
+        .map(|value| {
+            Uuid::parse_str(value)
+                .map_err(|_| ApiError::bad_request("idempotency-key must be a UUID"))
+        })
+        .transpose()?;
+    if let Some(operation_id) = operation_id
+        && let Some(lease) = fetch_claim_operation(&state.db, worker_id, operation_id).await?
+    {
+        return Ok(Json(ClaimLeaseResponse {
+            ok: true,
+            lease: Some(lease),
+        }));
+    }
+    let now = Utc::now();
+    let capabilities = worker
+        .capabilities
+        .iter()
+        .map(worker_capability_to_str)
+        .collect::<Vec<_>>();
+    if capabilities.is_empty() {
+        return Ok(Json(ClaimLeaseResponse {
+            ok: true,
+            lease: None,
+        }));
+    }
+    let capability_placeholders = (0..capabilities.len())
+        .map(|index| state.db.placeholder(index + 3))
+        .collect::<Vec<_>>()
+        .join(", ");
     let sql = format!(
         "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
          from jobs
          where tenant_id = {} and status = 'queued' and scheduled_at <= {}
-           and required_capability in ({})
+           and required_capability in ({capability_placeholders})
            and (
              kind in ('provision_sandbox', 'run_prompt', 'stop_sandbox')
              or exists (
@@ -46,16 +85,15 @@ pub(crate) async fn claim_lease(
          limit 25",
         state.db.placeholder(1),
         state.db.placeholder(2),
-        worker.capabilities.iter().enumerate().map(|(index, _)| state.db.placeholder(index + 3)).collect::<Vec<_>>().join(", "),
-        state.db.placeholder(worker.capabilities.len() + 3),
-        state.db.placeholder(worker.capabilities.len() + 4),
-        state.db.placeholder(worker.capabilities.len() + 5)
+        state.db.placeholder(capabilities.len() + 3),
+        state.db.placeholder(capabilities.len() + 4),
+        state.db.placeholder(capabilities.len() + 5)
     );
     let mut query = sqlx::query(&sql)
         .bind(&worker.tenant_id)
-        .bind(Utc::now().to_rfc3339());
-    for capability in &worker.capabilities {
-        query = query.bind(worker_capability_to_str(capability));
+        .bind(now.to_rfc3339());
+    for capability in capabilities {
+        query = query.bind(capability);
     }
     let rows = query
         .bind(worker.id.to_string())
@@ -72,7 +110,15 @@ pub(crate) async fn claim_lease(
         if !worker.capabilities.contains(&job.required_capability) {
             continue;
         }
-        if let Some(lease) = try_claim_job(&state.db, &worker, &job, request.lease_seconds).await? {
+        if let Some(lease) = try_claim_job(
+            &state.db,
+            &worker,
+            &job,
+            request.lease_seconds,
+            operation_id,
+        )
+        .await?
+        {
             return Ok(Json(ClaimLeaseResponse {
                 ok: true,
                 lease: Some(lease),
@@ -84,6 +130,32 @@ pub(crate) async fn claim_lease(
         ok: true,
         lease: None,
     }))
+}
+
+async fn fetch_claim_operation(
+    db: &Database,
+    worker_id: WorkerId,
+    operation_id: Uuid,
+) -> Result<Option<JobLease>, ApiError> {
+    let sql = format!(
+        "select lease_id from lease_claim_operations where worker_id = {} and operation_id = {}",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    let row = sqlx::query(&sql)
+        .bind(worker_id.to_string())
+        .bind(operation_id.to_string())
+        .fetch_optional(&db.pool)
+        .await?;
+    match row {
+        Some(row) => {
+            let lease_id: String = row.try_get("lease_id")?;
+            Ok(Some(
+                fetch_lease(db, LeaseId(parse_uuid(&lease_id)?)).await?,
+            ))
+        }
+        None => Ok(None),
+    }
 }
 
 pub(crate) async fn renew_lease(
@@ -122,6 +194,7 @@ pub(crate) async fn append_lease_output(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
     Path(lease_id): Path<Uuid>,
+    headers: HeaderMap,
     Json(request): Json<AppendCommandOutputRequest>,
 ) -> Result<Json<CommandOutputChunkResponse>, ApiError> {
     if request.chunk.is_empty() {
@@ -142,6 +215,19 @@ pub(crate) async fn append_lease_output(
     }
     let command_id = command_id_from_job(&lease.job)?;
     let sandbox_id = sandbox_id_from_job(&lease.job)?;
+    let operation_id = headers
+        .get("idempotency-key")
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| ApiError::bad_request("invalid idempotency-key"))
+        })
+        .transpose()?
+        .map(|value| {
+            Uuid::parse_str(value)
+                .map_err(|_| ApiError::bad_request("idempotency-key must be a UUID"))
+        })
+        .transpose()?;
     let chunk = append_command_output_chunk(
         &state.db,
         command_id,
@@ -149,6 +235,7 @@ pub(crate) async fn append_lease_output(
         request.stream,
         request.chunk,
         request.annotations,
+        operation_id.map(|id| (LeaseId(lease_id), id)),
     )
     .await?;
     Ok(Json(CommandOutputChunkResponse { ok: true, chunk }))
@@ -180,8 +267,13 @@ pub(crate) async fn complete_lease_in_transaction(
 
     let completed = async {
         let lease = fetch_lease_on_connection(db, &mut tx, lease_id).await?;
+        if lease.status == LeaseStatus::Completed {
+            return Ok(lease);
+        }
         if lease.status != LeaseStatus::Active {
-            return Err(ApiError::bad_request("lease is not active"));
+            return Err(ApiError::bad_request(
+                "lease is already terminal with a different outcome",
+            ));
         }
 
         let now = Utc::now();
@@ -236,8 +328,13 @@ pub(crate) async fn fail_lease_in_transaction(
 
     let failed = async {
         let lease = fetch_lease_on_connection(db, &mut tx, lease_id).await?;
+        if lease.status == LeaseStatus::Failed {
+            return Ok(lease);
+        }
         if lease.status != LeaseStatus::Active {
-            return Err(ApiError::bad_request("lease is not active"));
+            return Err(ApiError::bad_request(
+                "lease is already terminal with a different outcome",
+            ));
         }
 
         let now = Utc::now();
@@ -312,21 +409,27 @@ pub(crate) async fn insert_lease_on_connection(
 }
 
 pub(crate) async fn expire_due_leases(db: &Database) -> Result<(), ApiError> {
+    // At the default one-second interval this can catch up 60,000 leases per
+    // minute while bounding each tick. Deployments that increase
+    // SANDBOXWICH_SWEEP_INTERVAL_MS should tune the interval against their
+    // maximum concurrent lease population.
+    const LEASE_EXPIRY_BATCH_SIZE: u32 = 1_000;
     let now = Utc::now();
-    let rows = sqlx::query(
+    let sql = format!(
         "select id, job_id, worker_id, status, attempt, leased_at, expires_at, completed_at, error
          from job_leases
-         where status = 'active'
-         order by expires_at asc, id asc",
-    )
-    .fetch_all(&db.pool)
-    .await?;
+         where status = 'active' and expires_at <= {}
+         order by expires_at asc, id asc
+         limit {LEASE_EXPIRY_BATCH_SIZE}",
+        db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(now.to_rfc3339())
+        .fetch_all(&db.pool)
+        .await?;
 
     for row in rows {
         let lease = row_to_lease_without_job(row)?;
-        if lease.expires_at > now {
-            continue;
-        }
         expire_lease_if_still_active(db, lease.id, now).await?;
     }
 
@@ -637,19 +740,24 @@ pub(crate) async fn command_output_for_stream_on_connection(
     command_id: CommandId,
     stream: &CommandOutputStream,
 ) -> Result<String, ApiError> {
-    let column = stream.as_db_str();
     let sql = format!(
-        "select {column} as output
-         from commands
-         where id = {}",
-        db.placeholder(1)
+        "select chunk from command_output_chunks
+         where command_id = {} and stream = {}
+         order by sequence asc",
+        db.placeholder(1),
+        db.placeholder(2)
     );
-    let row = sqlx::query(&sql)
+    let rows = sqlx::query(&sql)
         .bind(command_id.to_string())
-        .fetch_optional(&mut *connection)
-        .await?
-        .ok_or_else(|| ApiError::not_found("command not found"))?;
-    Ok(row.try_get("output")?)
+        .bind(command_output_stream_to_str(stream))
+        .fetch_all(&mut *connection)
+        .await?;
+    let mut output = String::new();
+    for row in rows {
+        let chunk: String = row.try_get("chunk")?;
+        output.push_str(&chunk);
+    }
+    Ok(output)
 }
 
 pub(crate) async fn replace_command_output_stream_on_connection(
