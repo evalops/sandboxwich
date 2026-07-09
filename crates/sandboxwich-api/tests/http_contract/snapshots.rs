@@ -54,7 +54,10 @@ pub(crate) async fn assert_provision_job_persists_runtime_resources(
         }
         let response = worker_client
             .post(format!("{}/leases/{}/fail", server.base_url, lease.id))
-            .json(&FailLeaseRequest { error: "unrelated contract fixture job".to_string(), retry: false })
+            .json(&FailLeaseRequest {
+                error: "unrelated contract fixture job".to_string(),
+                retry: false,
+            })
             .send()
             .await
             .unwrap();
