@@ -26,9 +26,7 @@ pub(crate) fn app(state: AppState) -> Router {
     let upload_body_limit = usize::try_from(MAX_SANDBOX_FILE_BYTES + 1024 * 1024)
         .expect("file upload limit should fit usize");
 
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
+    let tenant_routes = Router::new()
         .route("/metrics", get(metrics))
         .route("/sandboxes", get(list_sandboxes).post(create_sandbox))
         .route("/sandboxes/{sandbox_id}", get(get_sandbox))
@@ -88,21 +86,11 @@ pub(crate) fn app(state: AppState) -> Router {
         .route("/workers", get(list_workers))
         .route("/capacity", get(get_capacity))
         .route("/workers/register", post(register_worker))
-        .route("/workers/{worker_id}/heartbeat", post(heartbeat_worker))
-        .route(
-            "/workers/{worker_id}/runtime-resources/reconcile",
-            post(reconcile_runtime_resources),
-        )
         .route("/jobs", get(list_jobs).post(create_job))
         .route("/jobs/{job_id}", get(get_job))
-        .route("/workers/{worker_id}/leases/claim", post(claim_lease))
-        .route("/leases/{lease_id}/renew", post(renew_lease))
-        .route("/leases/{lease_id}/output", post(append_lease_output))
-        .route("/leases/{lease_id}/complete", post(complete_lease))
-        .route("/leases/{lease_id}/fail", post(fail_lease))
         .route(
             "/sandboxes/{sandbox_id}/guest-health",
-            get(get_guest_health).post(update_guest_health),
+            get(get_guest_health),
         )
         .route(
             "/sandboxes/{sandbox_id}/ssh-keys",
@@ -113,6 +101,30 @@ pub(crate) fn app(state: AppState) -> Router {
             post(create_ssh_access),
         )
         .route("/ssh-keys/{ssh_key_id}/status", post(update_ssh_key_status))
+        .route_layer(middleware::from_fn(require_tenant_principal));
+
+    let worker_routes = Router::new()
+        .route("/workers/{worker_id}/heartbeat", post(heartbeat_worker))
+        .route(
+            "/workers/{worker_id}/runtime-resources/reconcile",
+            post(reconcile_runtime_resources),
+        )
+        .route("/workers/{worker_id}/leases/claim", post(claim_lease))
+        .route("/leases/{lease_id}/renew", post(renew_lease))
+        .route("/leases/{lease_id}/output", post(append_lease_output))
+        .route("/leases/{lease_id}/complete", post(complete_lease))
+        .route("/leases/{lease_id}/fail", post(fail_lease))
+        .route(
+            "/sandboxes/{sandbox_id}/guest-health",
+            post(update_guest_health),
+        )
+        .route_layer(middleware::from_fn(require_worker_principal));
+
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .merge(tenant_routes)
+        .merge(worker_routes)
         .layer(DefaultBodyLimit::max(DEFAULT_BODY_LIMIT_BYTES))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, auth_and_tenant))
