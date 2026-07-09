@@ -1131,6 +1131,25 @@ async fn run_contract(server: TestServer) {
         "ready"
     );
 
+    // A sandbox can only be resumed from Archived. Calling resume again now
+    // that it is back to Ready must be rejected as a conflict rather than
+    // silently succeeding (the previous unconditional-write behavior let
+    // resume force *any* state to Ready, including Ready itself and Error).
+    let resume_conflict = client
+        .post(format!(
+            "{}/sandboxes/{}/resume",
+            server.base_url, created.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resume_conflict.status(), StatusCode::CONFLICT);
+
+    assert_job_completion_does_not_resurrect_concurrently_archived_sandbox(
+        &client, &server, &created,
+    )
+    .await;
+
     let events: EventListResponse = client
         .get(format!(
             "{}/sandboxes/{}/events",
@@ -3143,6 +3162,231 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .await
         .unwrap();
     assert_eq!(failed_child.sandbox.state, SandboxState::Error);
+}
+
+/// A `ForkSandbox` job completing after its child sandbox was concurrently
+/// archived must not resurrect it. This is the lost-update bug fixed by the
+/// compare-and-swap state writes: previously every state write was an
+/// unconditional `UPDATE ... SET state = ?`, so a job completion landing
+/// after a user-initiated stop would silently overwrite the archive.
+async fn assert_job_completion_does_not_resurrect_concurrently_archived_sandbox(
+    client: &reqwest::Client,
+    server: &TestServer,
+    sandbox: &SandboxResponse,
+) {
+    let race_worker: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "race-fork-worker".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![WorkerCapability::Snapshot],
+            max_concurrent_jobs: Some(1),
+            labels: [("cluster".to_string(), "k3s-dev".to_string())].into(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let forked: SandboxResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/fork",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&CreateSandboxRequest {
+            name: Some("race-child".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(forked.sandbox.state, SandboxState::Planning);
+    let fork_snapshot_id = forked
+        .sandbox
+        .parent_snapshot_id
+        .expect("fork should point at a real snapshot");
+
+    let jobs: JobListResponse = client
+        .get(format!("{}/jobs", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let snapshot_job = job_for_snapshot(&jobs.jobs, &fork_snapshot_id.to_string());
+
+    let claimed_snapshot: ClaimLeaseResponse = client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, race_worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let snapshot_lease = claimed_snapshot
+        .lease
+        .expect("expected race worker to claim the fork's snapshot job");
+    assert_eq!(snapshot_lease.job.id, snapshot_job.id);
+
+    client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, snapshot_lease.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::CreateSnapshot {
+                handle: ProviderSnapshotHandle {
+                    provider: "kubernetes".to_string(),
+                    snapshot_id: fork_snapshot_id,
+                    resources: snapshot_resources(sandbox.sandbox.id, fork_snapshot_id),
+                    metadata: serde_json::json!({
+                        "cluster": "k3s-dev",
+                        "namespace": "sandboxwich-contract"
+                    }),
+                },
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let jobs: JobListResponse = client
+        .get(format!("{}/jobs", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let fork_job = job_for_child_sandbox(&jobs.jobs, &forked.sandbox.id.to_string());
+
+    let claimed_fork: ClaimLeaseResponse = client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, race_worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let fork_lease = claimed_fork
+        .lease
+        .expect("expected race worker to claim the fork job");
+    assert_eq!(fork_lease.job.id, fork_job.id);
+
+    let provisioning_child: SandboxResponse = client
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, forked.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(provisioning_child.sandbox.state, SandboxState::Provisioning);
+
+    // Race: archive the child while its ForkSandbox job is still in flight,
+    // *before* the lease is completed below.
+    let archived_child: SandboxResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/stop",
+            server.base_url, forked.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(archived_child.sandbox.state, SandboxState::Archived);
+
+    // The ForkSandbox job completes *after* the concurrent archive landed.
+    // It must succeed (the job itself isn't at fault) without clobbering the
+    // sandbox's archived state.
+    client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, fork_lease.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::ForkSandbox {
+                handle: ProviderForkHandle {
+                    provider: "kubernetes".to_string(),
+                    parent_sandbox_id: sandbox.sandbox.id,
+                    child_sandbox_id: forked.sandbox.id,
+                    snapshot_id: fork_snapshot_id,
+                    resources: fork_resources(forked.sandbox.id, fork_snapshot_id),
+                    metadata: serde_json::json!({
+                        "cluster": "k3s-dev",
+                        "namespace": "sandboxwich-contract"
+                    }),
+                },
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let after: SandboxResponse = client
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, forked.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        after.sandbox.state,
+        SandboxState::Archived,
+        "a ForkSandbox job completing after a concurrent stop must not resurrect the sandbox"
+    );
 }
 
 fn job_for_command(jobs: &[Job], command_id: CommandId) -> Job {
