@@ -662,9 +662,15 @@ async fn main() -> anyhow::Result<()> {
             )?;
             let worker_client = build_api_client(Some(&worker_token), cli.tenant.as_deref())
                 .context("failed to build worker-scoped API client")?;
+            // GH-101: the same worker-scoped token now propagates one level
+            // further -- into the sandboxes this worker provisions -- so the
+            // guest agent running inside a pod can authenticate to
+            // guest-facing routes as itself instead of not authenticating at
+            // all (or, pre-GH-64, as the whole tenant).
             work_loop(
                 &worker_client,
                 &api,
+                Some(worker_token),
                 WorkLoopArgs {
                     worker_id: response.worker.id.0,
                     lease_seconds: args.lease_seconds,
@@ -678,7 +684,15 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
         Command::WorkOnce(args) => {
-            let provider = Arc::new(runtime_provider_from_args(args.provider));
+            // GH-101: `work-once`, like `work-loop`, is invoked directly with
+            // the worker-scoped token already in `cli.api_token` (see the
+            // doc comment on `Cli::api_token`), so it's what gets wired into
+            // provisioned sandboxes here.
+            let provider = Arc::new(runtime_provider_from_args(
+                args.provider,
+                args.worker_id,
+                cli.api_token.clone(),
+            ));
             let response = claim(
                 &client,
                 &api,
@@ -696,7 +710,9 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&response)?);
         }
         Command::WorkLoop(args) => {
-            work_loop(&client, &api, args).await?;
+            // Same as `work-once` above: `cli.api_token` is already the
+            // worker-scoped token for this direct-invocation path.
+            work_loop(&client, &api, cli.api_token.clone(), args).await?;
         }
     }
 
@@ -785,8 +801,21 @@ fn apply_provider_from_args(args: ProviderApplyArgs) -> KubernetesApplyProvider 
         .with_max_captured_output_bytes(args.max_captured_output_bytes)
 }
 
-fn runtime_provider_from_args(args: RuntimeProviderArgs) -> RuntimeProvider {
-    let provider = provider_from_args(args.provider);
+/// Builds the provider used to run claimed jobs. `worker_id`/`worker_token`
+/// (GH-101) are the credentials this worker itself authenticates with; when
+/// `worker_token` is `Some`, the provider wires the same worker-scoped token
+/// (GH-64) into every sandbox it provisions, so the guest agent running
+/// inside a pod can authenticate to guest-facing routes as itself. `None`
+/// (e.g. a caller with no worker-scoped token available) provisions
+/// sandboxes with no token wired in at all, matching pre-GH-101 behavior
+/// rather than falling back to a tenant-wide token.
+fn runtime_provider_from_args(
+    args: RuntimeProviderArgs,
+    worker_id: Uuid,
+    worker_token: Option<String>,
+) -> RuntimeProvider {
+    let provider = provider_from_args(args.provider)
+        .with_worker_credentials(worker_id.to_string(), worker_token);
     match args.provider_mode {
         ProviderModeArg::DryRun => RuntimeProvider::DryRun(provider),
         ProviderModeArg::Apply => {
@@ -1031,8 +1060,17 @@ async fn drain_watchdog(shutdown: Arc<std::sync::atomic::AtomicBool>, drain_time
     tokio::time::sleep(drain_timeout).await;
 }
 
-async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> anyhow::Result<()> {
-    let provider = Arc::new(runtime_provider_from_args(args.provider));
+async fn work_loop(
+    client: &reqwest::Client,
+    api: &str,
+    worker_token: Option<String>,
+    args: WorkLoopArgs,
+) -> anyhow::Result<()> {
+    let provider = Arc::new(runtime_provider_from_args(
+        args.provider,
+        args.worker_id,
+        worker_token,
+    ));
     let labels: BTreeMap<_, _> = args.label.into_iter().collect();
     let drain_timeout = Duration::from_secs(args.drain_timeout_secs);
     let shutdown = spawn_shutdown_listener();

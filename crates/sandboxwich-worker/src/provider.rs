@@ -66,7 +66,13 @@ pub const DEFAULT_INGRESS_SELECTOR_KEY: &str = "app.kubernetes.io/part-of";
 pub const DEFAULT_INGRESS_SELECTOR_VALUE: &str = "sandboxwich";
 /// Kubernetes resource kinds (as a `kubectl get/delete` type list) that carry the
 /// `sandboxwich.dev/sandbox-id` label and must be torn down when a sandbox is stopped.
-pub const SANDBOX_TEARDOWN_RESOURCE_KINDS: &str = "pod,persistentvolumeclaim,service,networkpolicy";
+/// Includes `secret` (GH-101) so the per-sandbox worker-token Secret (see
+/// `worker_token_secret_manifest`) is cleaned up alongside the pod that mounts
+/// it, without needing separate lifecycle tracking; this is safe because the
+/// delete is always scoped to this specific sandbox's label, never a bare
+/// `kubectl delete secret --all`.
+pub const SANDBOX_TEARDOWN_RESOURCE_KINDS: &str =
+    "pod,persistentvolumeclaim,service,networkpolicy,secret";
 
 /// Cheaply cloneable signal a job's background lease-renewal task (see
 /// `handle_lease` in `main.rs`) uses to tell an in-flight `exec_handoff` call
@@ -175,6 +181,20 @@ pub struct KubernetesDryRunProvider {
     /// `ssh_authorized_keys_secret` is mounted as a file rather than an env
     /// var (GH-67).
     vnc_password_secret: Option<String>,
+    /// `(worker_id, worker_token)` for the worker-scoped API token (GH-64)
+    /// this provider injects into every sandbox it provisions, so the guest
+    /// agent running inside the pod can authenticate to guest-facing routes
+    /// as itself rather than with a tenant-wide token (GH-101). Unlike
+    /// `ssh_authorized_keys_secret`/`vnc_password_secret`, which reference
+    /// operator-managed secrets that already exist in the cluster, this
+    /// provider synthesizes and applies the Secret itself (see
+    /// `worker_token_secret_manifest`), because the token is minted fresh at
+    /// worker registration and cannot be pre-provisioned. `None` when no
+    /// worker credentials are configured (e.g. dry-run smoke commands with
+    /// no registered worker), in which case no token is wired into the pod
+    /// at all -- matching pre-GH-101 behavior rather than injecting a
+    /// tenant-wide token as a fallback.
+    worker_credentials: Option<(String, String)>,
 }
 
 impl KubernetesDryRunProvider {
@@ -207,6 +227,7 @@ impl KubernetesDryRunProvider {
                 DEFAULT_INGRESS_SELECTOR_VALUE.to_string(),
             )]),
             vnc_password_secret: None,
+            worker_credentials: None,
         }
     }
 
@@ -343,6 +364,32 @@ impl KubernetesDryRunProvider {
         self
     }
 
+    /// Configures the worker-scoped API token (GH-64) delivered into every
+    /// sandbox this provider provisions (GH-101). `worker_token` is
+    /// typically the credential minted by `POST /workers/register` and
+    /// resolved to `(tenant_id, worker_id)` by the API's guest-facing
+    /// routes; `worker_id` is the same id the token resolves to, delivered
+    /// alongside it so the guest agent can address itself in
+    /// `/workers/{id}/leases/claim` without needing to be told separately.
+    /// A `None`/empty `worker_token` clears any previously configured
+    /// credentials rather than wiring in a worker id with no token.
+    pub fn with_worker_credentials(
+        mut self,
+        worker_id: impl Into<String>,
+        worker_token: Option<String>,
+    ) -> Self {
+        let worker_id = worker_id.into();
+        self.worker_credentials = worker_token.and_then(|token| {
+            let token = token.trim();
+            if token.is_empty() {
+                None
+            } else {
+                Some((worker_id, token.to_string()))
+            }
+        });
+        self
+    }
+
     pub(crate) fn effective_sandbox_namespace(&self) -> &str {
         self.sandbox_namespace
             .as_deref()
@@ -420,7 +467,8 @@ impl KubernetesDryRunProvider {
                 "pvc": self.pvc_manifest(format!("sandboxwich-pvc-{sandbox_id}"), Some(sandbox_id), &spec.memory_limit),
                 "sshService": self.ssh_service_manifest(sandbox_id),
                 "desktopService": self.desktop_service_manifest(sandbox_id),
-                "networkPolicy": network_policy
+                "networkPolicy": network_policy,
+                "workerTokenSecret": self.worker_token_secret_manifest(sandbox_id)
             }
         }))
     }
@@ -586,6 +634,42 @@ impl KubernetesDryRunProvider {
             }));
         }
 
+        if let Some((worker_id, _token)) = &self.worker_credentials {
+            // GH-101: the worker-scoped token (GH-64) is mounted as a
+            // read-only file rather than a plain env var or `secretKeyRef`,
+            // for the same reason as the VNC password above -- it must not
+            // show up in `kubectl get pod -o yaml`/`kubectl describe pod` or
+            // anything else that can read this pod's spec through the
+            // Kubernetes API, only to a process that can exec into the
+            // container or read the volume directly. `SANDBOXWICH_WORKER_ID`
+            // is not a credential (it identifies the worker, not the
+            // secret), so it travels as a plain env var like
+            // `SANDBOXWICH_WORKSPACE`/`SANDBOXWICH_SSH_PORT` above.
+            volume_mounts.push(json!({
+                "name": "worker-token",
+                "mountPath": "/run/sandboxwich/token",
+                "readOnly": true
+            }));
+            volumes.push(json!({
+                "name": "worker-token",
+                "secret": {
+                    "secretName": self.worker_token_secret_name(sandbox_id),
+                    "items": [{
+                        "key": "api-token",
+                        "path": "api-token"
+                    }]
+                }
+            }));
+            env.push(json!({
+                "name": "SANDBOXWICH_API_TOKEN_FILE",
+                "value": "/run/sandboxwich/token/api-token"
+            }));
+            env.push(json!({
+                "name": "SANDBOXWICH_WORKER_ID",
+                "value": worker_id
+            }));
+        }
+
         let ephemeral_storage = Self::ephemeral_storage_limit(&spec.memory_limit);
         let mut pod_spec = Map::from_iter([
             ("automountServiceAccountToken".to_string(), json!(false)),
@@ -649,6 +733,41 @@ impl KubernetesDryRunProvider {
             "metadata": self.object_metadata(format!("sandboxwich-{sandbox_id}"), Some(sandbox_id)),
             "spec": pod_spec
         })
+    }
+
+    /// Name of the per-sandbox Secret carrying this worker's scoped API
+    /// token (see `worker_token_secret_manifest`). Scoped to `sandbox_id`
+    /// (not shared across every sandbox this worker provisions) so it is
+    /// torn down by the same label-selected `kubectl delete` that already
+    /// cleans up a sandbox's pod/PVC/services/network policy (see
+    /// `SANDBOX_TEARDOWN_RESOURCE_KINDS`), without needing separate
+    /// lifecycle tracking.
+    fn worker_token_secret_name(&self, sandbox_id: SandboxId) -> String {
+        format!("sandboxwich-worker-token-{sandbox_id}")
+    }
+
+    /// Renders the Secret carrying this worker's scoped API token (GH-64)
+    /// for `sandbox_id`, or `None` when no worker credentials are
+    /// configured. Unlike `ssh_authorized_keys_secret`/`vnc_password_secret`
+    /// -- which reference operator-managed secrets assumed to already exist
+    /// in the cluster -- this provider must synthesize and apply this
+    /// Secret itself, since the token is minted fresh at worker
+    /// registration (GH-64) and cannot be pre-provisioned by an operator
+    /// ahead of time (GH-101).
+    fn worker_token_secret_manifest(&self, sandbox_id: SandboxId) -> Option<serde_json::Value> {
+        let (_, token) = self.worker_credentials.as_ref()?;
+        Some(json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "type": "Opaque",
+            "metadata": self.object_metadata(
+                self.worker_token_secret_name(sandbox_id),
+                Some(sandbox_id)
+            ),
+            "stringData": {
+                "api-token": token
+            }
+        }))
     }
 
     fn pvc_manifest(
@@ -1393,18 +1512,52 @@ impl KubernetesApplyProvider {
         sandbox_id: SandboxId,
         spec: &SandboxProvisionSpec,
     ) -> anyhow::Result<Vec<Value>> {
-        Ok(vec![
-            self.dry_run.pvc_manifest(
-                format!("sandboxwich-pvc-{sandbox_id}"),
-                Some(sandbox_id),
-                &spec.memory_limit,
-            ),
-            self.dry_run.pod_manifest(sandbox_id, spec),
+        let mut manifests = vec![self.dry_run.pvc_manifest(
+            format!("sandboxwich-pvc-{sandbox_id}"),
+            Some(sandbox_id),
+            &spec.memory_limit,
+        )];
+        // Applied ahead of the pod that mounts it (GH-101): kubectl apply of a
+        // multi-document manifest set is not strictly atomic/ordered, but a
+        // pod referencing a not-yet-applied Secret only stalls in
+        // `ContainerCreating` until the Secret shows up (well within
+        // `wait_for_pod_ready`'s timeout) rather than failing outright, so
+        // this ordering is a courtesy, not a correctness requirement.
+        manifests.extend(self.dry_run.worker_token_secret_manifest(sandbox_id));
+        manifests.push(self.dry_run.pod_manifest(sandbox_id, spec));
+        manifests.push(
             self.dry_run
                 .network_policy_manifest(sandbox_id, &spec.network_egress)?,
-            self.dry_run.ssh_service_manifest(sandbox_id),
-            self.dry_run.desktop_service_manifest(sandbox_id),
-        ])
+        );
+        manifests.push(self.dry_run.ssh_service_manifest(sandbox_id));
+        manifests.push(self.dry_run.desktop_service_manifest(sandbox_id));
+        Ok(manifests)
+    }
+
+    fn fork_manifests(
+        &self,
+        child_sandbox_id: SandboxId,
+        snapshot_id: SnapshotId,
+        spec: &SandboxProvisionSpec,
+    ) -> anyhow::Result<Vec<Value>> {
+        let mut manifests =
+            vec![
+                self.dry_run
+                    .fork_pvc_manifest(child_sandbox_id, snapshot_id, &spec.memory_limit),
+            ];
+        // GH-101: same courtesy ordering as `provision_manifests` -- the
+        // child sandbox gets its own worker-token Secret, scoped to its own
+        // `child_sandbox_id`, since it's a distinct pod with its own
+        // teardown lifecycle.
+        manifests.extend(self.dry_run.worker_token_secret_manifest(child_sandbox_id));
+        manifests.push(self.dry_run.pod_manifest(child_sandbox_id, spec));
+        manifests.push(
+            self.dry_run
+                .network_policy_manifest(child_sandbox_id, &spec.network_egress)?,
+        );
+        manifests.push(self.dry_run.ssh_service_manifest(child_sandbox_id));
+        manifests.push(self.dry_run.desktop_service_manifest(child_sandbox_id));
+        Ok(manifests)
     }
 
     fn wait_for_pod_ready(&self, sandbox_id: SandboxId) -> anyhow::Result<KubectlOutput> {
@@ -2037,7 +2190,8 @@ impl SandboxProvider for KubernetesDryRunProvider {
                     "pod": self.pod_manifest(child_sandbox_id, spec),
                     "sshService": self.ssh_service_manifest(child_sandbox_id),
                     "desktopService": self.desktop_service_manifest(child_sandbox_id),
-                    "networkPolicy": network_policy
+                    "networkPolicy": network_policy,
+                    "workerTokenSecret": self.worker_token_secret_manifest(child_sandbox_id)
                 }
             }),
         })
@@ -2233,17 +2387,7 @@ impl SandboxProvider for KubernetesApplyProvider {
     ) -> anyhow::Result<ProviderForkHandle> {
         KubernetesDryRunProvider::validate_network_policy_egress(&spec.network_egress)?;
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
-        let network_policy = self
-            .dry_run
-            .network_policy_manifest(child_sandbox_id, &spec.network_egress)?;
-        let manifests = vec![
-            self.dry_run
-                .fork_pvc_manifest(child_sandbox_id, snapshot_id, &spec.memory_limit),
-            self.dry_run.pod_manifest(child_sandbox_id, spec),
-            network_policy,
-            self.dry_run.ssh_service_manifest(child_sandbox_id),
-            self.dry_run.desktop_service_manifest(child_sandbox_id),
-        ];
+        let manifests = self.fork_manifests(child_sandbox_id, snapshot_id, spec)?;
         let apply = run_kubectl_documents(
             &self.kubectl,
             &self.kubectl_args("apply"),
@@ -3407,6 +3551,251 @@ mod tests {
                 && volume["secret"]["items"][0]["key"] == "vnc-password"
                 && volume["secret"]["items"][0]["path"] == "vnc-password"
         }));
+    }
+
+    #[test]
+    fn worker_token_is_mounted_as_a_read_only_secret_file_not_an_env_var() {
+        // GH-101: mirrors `vnc_password_secret_is_mounted_as_a_read_only_file_not_an_env_var`.
+        // The worker-scoped token (GH-64) must never appear as a plain pod
+        // env var or on any argv -- only a mounted file, readable solely by
+        // whoever can exec into the container or read the volume directly.
+        let sandbox_id = SandboxId::new();
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_worker_credentials(
+                    "8f14e45f-ceea-467e-adc5-96718431224b",
+                    Some("sbw_wtok_supersecret".to_string()),
+                );
+        let provisioned = provider
+            .provision(sandbox_id, &SandboxProvisionSpec::default())
+            .expect("dry-run provision should succeed");
+        let pod = &provisioned.metadata["manifests"]["pod"];
+        let env = pod["spec"]["containers"][0]["env"]
+            .as_array()
+            .expect("env should be an array");
+
+        assert!(
+            !env.iter()
+                .any(|entry| entry["name"] == "SANDBOXWICH_API_TOKEN"),
+            "the raw worker token must never be injected as a plain env var"
+        );
+        assert!(env.iter().any(|entry| {
+            entry["name"] == "SANDBOXWICH_API_TOKEN_FILE"
+                && entry["value"] == "/run/sandboxwich/token/api-token"
+        }));
+        assert!(env.iter().any(|entry| {
+            entry["name"] == "SANDBOXWICH_WORKER_ID"
+                && entry["value"] == "8f14e45f-ceea-467e-adc5-96718431224b"
+        }));
+
+        let volume_mounts = pod["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .expect("volumeMounts should be an array");
+        assert!(volume_mounts.iter().any(|mount| {
+            mount["name"] == "worker-token"
+                && mount["mountPath"] == "/run/sandboxwich/token"
+                && mount["readOnly"] == true
+        }));
+
+        let expected_secret_name = format!("sandboxwich-worker-token-{sandbox_id}");
+        let volumes = pod["spec"]["volumes"]
+            .as_array()
+            .expect("volumes should be an array");
+        assert!(volumes.iter().any(|volume| {
+            volume["name"] == "worker-token"
+                && volume["secret"]["secretName"] == expected_secret_name
+                && volume["secret"]["items"][0]["key"] == "api-token"
+                && volume["secret"]["items"][0]["path"] == "api-token"
+        }));
+
+        assert!(
+            !serde_json::to_string(pod)
+                .expect("pod manifest should serialize")
+                .contains("sbw_wtok_supersecret"),
+            "the raw token must not appear anywhere in the pod manifest itself"
+        );
+    }
+
+    #[test]
+    fn worker_token_secret_manifest_carries_the_raw_token_and_sandbox_label() {
+        let sandbox_id = SandboxId::new();
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_worker_credentials(
+                    "8f14e45f-ceea-467e-adc5-96718431224b",
+                    Some("sbw_wtok_supersecret".to_string()),
+                );
+        let provisioned = provider
+            .provision(sandbox_id, &SandboxProvisionSpec::default())
+            .expect("dry-run provision should succeed");
+        let secret = &provisioned.metadata["manifests"]["workerTokenSecret"];
+
+        assert_eq!(secret["kind"], "Secret");
+        assert_eq!(secret["apiVersion"], "v1");
+        assert_eq!(secret["type"], "Opaque");
+        assert_eq!(secret["stringData"]["api-token"], "sbw_wtok_supersecret");
+        assert_eq!(
+            secret["metadata"]["name"],
+            format!("sandboxwich-worker-token-{sandbox_id}")
+        );
+        assert_eq!(
+            secret["metadata"]["labels"]["sandboxwich.dev/sandbox-id"],
+            sandbox_id.to_string()
+        );
+    }
+
+    #[test]
+    fn no_worker_token_wiring_when_credentials_are_not_configured() {
+        // Absence of `with_worker_credentials` must not fall back to
+        // injecting any token at all (e.g. a tenant-wide one) -- it should
+        // behave exactly as it did before GH-101.
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        let provisioned = provider
+            .provision(SandboxId::new(), &SandboxProvisionSpec::default())
+            .expect("dry-run provision should succeed");
+        let pod = &provisioned.metadata["manifests"]["pod"];
+        let env = pod["spec"]["containers"][0]["env"]
+            .as_array()
+            .expect("env should be an array");
+
+        assert!(
+            !env.iter()
+                .any(|entry| entry["name"] == "SANDBOXWICH_API_TOKEN_FILE")
+        );
+        assert!(
+            !env.iter()
+                .any(|entry| entry["name"] == "SANDBOXWICH_WORKER_ID")
+        );
+        assert!(
+            !pod["spec"]["volumes"]
+                .as_array()
+                .expect("volumes should be an array")
+                .iter()
+                .any(|volume| volume["name"] == "worker-token")
+        );
+        assert!(provisioned.metadata["manifests"]["workerTokenSecret"].is_null());
+    }
+
+    #[test]
+    fn with_worker_credentials_clears_configured_token_when_given_none_or_blank() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_worker_credentials("worker-a", Some("sbw_wtok_a".to_string()))
+                .with_worker_credentials("worker-a", Some("   ".to_string()));
+        let provisioned = provider
+            .provision(SandboxId::new(), &SandboxProvisionSpec::default())
+            .expect("dry-run provision should succeed");
+
+        assert!(provisioned.metadata["manifests"]["workerTokenSecret"].is_null());
+    }
+
+    #[test]
+    fn fork_child_pod_gets_its_own_worker_token_secret_scoped_to_the_child_sandbox() {
+        let parent_sandbox_id = SandboxId::new();
+        let child_sandbox_id = SandboxId::new();
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_worker_credentials(
+                    "8f14e45f-ceea-467e-adc5-96718431224b",
+                    Some("sbw_wtok_supersecret".to_string()),
+                );
+        let forked = provider
+            .fork(
+                parent_sandbox_id,
+                child_sandbox_id,
+                SnapshotId::new(),
+                &SandboxProvisionSpec::default(),
+            )
+            .expect("dry-run fork should succeed");
+
+        let secret = &forked.metadata["manifests"]["workerTokenSecret"];
+        assert_eq!(
+            secret["metadata"]["name"],
+            format!("sandboxwich-worker-token-{child_sandbox_id}")
+        );
+        assert_eq!(secret["stringData"]["api-token"], "sbw_wtok_supersecret");
+
+        let pod = &forked.metadata["manifests"]["pod"];
+        assert!(
+            pod["spec"]["volumes"]
+                .as_array()
+                .expect("volumes should be an array")
+                .iter()
+                .any(|volume| volume["name"] == "worker-token"
+                    && volume["secret"]["secretName"]
+                        == format!("sandboxwich-worker-token-{child_sandbox_id}"))
+        );
+    }
+
+    #[test]
+    fn apply_provision_manifests_apply_the_worker_token_secret_before_the_pod_that_mounts_it() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_worker_credentials(
+                    "8f14e45f-ceea-467e-adc5-96718431224b",
+                    Some("sbw_wtok_supersecret".to_string()),
+                );
+        let apply = KubernetesApplyProvider::new(provider, "kubectl");
+        let sandbox_id = SandboxId::new();
+
+        let manifests = apply
+            .provision_manifests(sandbox_id, &SandboxProvisionSpec::default())
+            .expect("manifests should render");
+
+        let secret_index = manifests
+            .iter()
+            .position(|manifest| manifest["kind"] == "Secret")
+            .expect("a Secret manifest should be included when worker credentials are configured");
+        let pod_index = manifests
+            .iter()
+            .position(|manifest| manifest["kind"] == "Pod")
+            .expect("a Pod manifest should always be included");
+        assert!(
+            secret_index < pod_index,
+            "the Secret should be applied before the Pod that mounts it"
+        );
+        assert_eq!(
+            manifests[secret_index]["stringData"]["api-token"],
+            "sbw_wtok_supersecret"
+        );
+    }
+
+    #[test]
+    fn apply_fork_manifests_include_a_worker_token_secret_for_the_child_sandbox() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_worker_credentials(
+                    "8f14e45f-ceea-467e-adc5-96718431224b",
+                    Some("sbw_wtok_supersecret".to_string()),
+                );
+        let apply = KubernetesApplyProvider::new(provider, "kubectl");
+        let child_sandbox_id = SandboxId::new();
+
+        let manifests = apply
+            .fork_manifests(
+                child_sandbox_id,
+                SnapshotId::new(),
+                &SandboxProvisionSpec::default(),
+            )
+            .expect("manifests should render");
+
+        assert!(manifests.iter().any(|manifest| {
+            manifest["kind"] == "Secret"
+                && manifest["metadata"]["name"]
+                    == format!("sandboxwich-worker-token-{child_sandbox_id}")
+        }));
+    }
+
+    #[test]
+    fn teardown_resource_kinds_include_secret_so_worker_token_secrets_are_cleaned_up() {
+        assert!(
+            SANDBOX_TEARDOWN_RESOURCE_KINDS
+                .split(',')
+                .any(|kind| kind == "secret"),
+            "the per-sandbox worker-token Secret must be torn down alongside the pod that \
+             mounts it, or it will be leaked on every sandbox stop"
+        );
     }
 
     #[test]

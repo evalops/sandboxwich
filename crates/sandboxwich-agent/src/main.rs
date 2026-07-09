@@ -80,6 +80,13 @@ struct HeartbeatArgs {
     #[arg(long, env = "SANDBOXWICH_API_TOKEN")]
     api_token: Option<String>,
 
+    /// Path to a file containing the API token (GH-101), taking precedence
+    /// over `--api-token`/`SANDBOXWICH_API_TOKEN` when set. This is how the
+    /// Kubernetes provider delivers a worker-scoped token (GH-64) mounted
+    /// as a read-only Secret volume rather than a plain env var.
+    #[arg(long, env = "SANDBOXWICH_API_TOKEN_FILE")]
+    api_token_file: Option<PathBuf>,
+
     #[arg(long, env = "SANDBOXWICH_TENANT")]
     tenant: Option<String>,
 
@@ -94,6 +101,13 @@ struct DaemonArgs {
 
     #[arg(long, env = "SANDBOXWICH_API_TOKEN")]
     api_token: Option<String>,
+
+    /// Path to a file containing the API token (GH-101), taking precedence
+    /// over `--api-token`/`SANDBOXWICH_API_TOKEN` when set. This is how the
+    /// Kubernetes provider delivers a worker-scoped token (GH-64) mounted
+    /// as a read-only Secret volume rather than a plain env var.
+    #[arg(long, env = "SANDBOXWICH_API_TOKEN_FILE")]
+    api_token_file: Option<PathBuf>,
 
     #[arg(long, env = "SANDBOXWICH_TENANT")]
     tenant: Option<String>,
@@ -153,6 +167,13 @@ struct ExecArgs {
 
     #[arg(long, env = "SANDBOXWICH_API_TOKEN")]
     api_token: Option<String>,
+
+    /// Path to a file containing the API token (GH-101), taking precedence
+    /// over `--api-token`/`SANDBOXWICH_API_TOKEN` when set. This is how the
+    /// Kubernetes provider delivers a worker-scoped token (GH-64) mounted
+    /// as a read-only Secret volume rather than a plain env var.
+    #[arg(long, env = "SANDBOXWICH_API_TOKEN_FILE")]
+    api_token_file: Option<PathBuf>,
 
     #[arg(long, env = "SANDBOXWICH_TENANT")]
     tenant: Option<String>,
@@ -242,7 +263,8 @@ async fn heartbeat(args: HeartbeatArgs) -> anyhow::Result<()> {
         ready: true,
     };
     if let (Some(api), Some(sandbox_id)) = (args.api.as_deref(), args.sandbox_id) {
-        let client = build_api_client(args.api_token.as_deref(), args.tenant.as_deref())?;
+        let api_token = resolve_api_token(args.api_token_file, args.api_token)?;
+        let client = build_api_client(api_token.as_deref(), args.tenant.as_deref())?;
         post_guest_health(
             &client,
             api.trim_end_matches('/'),
@@ -258,7 +280,8 @@ async fn heartbeat(args: HeartbeatArgs) -> anyhow::Result<()> {
 
 async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
     let api = args.api.trim_end_matches('/').to_string();
-    let client = build_api_client(args.api_token.as_deref(), args.tenant.as_deref())?;
+    let api_token = resolve_api_token(args.api_token_file, args.api_token)?;
+    let client = build_api_client(api_token.as_deref(), args.tenant.as_deref())?;
     let sandbox_id = SandboxId(args.sandbox_id);
     let mut iterations = 0_u64;
     let heartbeat_interval = Duration::from_millis(args.heartbeat_interval_ms.max(1));
@@ -533,8 +556,9 @@ where
 async fn exec(args: ExecArgs) -> anyhow::Result<()> {
     let lease = args.lease_id.map(LeaseId);
     let client = if args.api.is_some() && lease.is_some() {
+        let api_token = resolve_api_token(args.api_token_file, args.api_token)?;
         Some(build_api_client(
-            args.api_token.as_deref(),
+            api_token.as_deref(),
             args.tenant.as_deref(),
         )?)
     } else {
@@ -1152,6 +1176,32 @@ fn agent_version() -> String {
     concat!("sandboxwich-agent/", env!("CARGO_PKG_VERSION")).to_string()
 }
 
+/// Resolves the effective API token for guest-facing calls (claim/renew/
+/// complete/fail/output, guest-health). Prefers the contents of the file at
+/// `token_file` (`--api-token-file`/`SANDBOXWICH_API_TOKEN_FILE`) -- how the
+/// Kubernetes provider delivers a worker-scoped token (GH-64) into a
+/// sandbox pod as a mounted, read-only Secret volume rather than a plain
+/// env var (GH-101), so the token never shows up in `kubectl get pod -o
+/// yaml`/`kubectl describe pod` or anything else that reads this pod's
+/// spec/status through the Kubernetes API -- falling back to `cli_token`
+/// (`--api-token`/`SANDBOXWICH_API_TOKEN`) for non-Kubernetes deployments
+/// where no such file exists.
+fn resolve_api_token(
+    token_file: Option<PathBuf>,
+    cli_token: Option<String>,
+) -> anyhow::Result<Option<String>> {
+    let Some(path) = token_file else {
+        return Ok(cli_token);
+    };
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read --api-token-file at {}", path.display()))?;
+    let token = contents.trim();
+    if token.is_empty() {
+        bail!("--api-token-file at {} is empty", path.display());
+    }
+    Ok(Some(token.to_string()))
+}
+
 fn agent_request_from_payload(payload: &serde_json::Value) -> anyhow::Result<AgentCommandRequest> {
     let argv = payload
         .get("argv")
@@ -1205,6 +1255,71 @@ fn parse_env(value: &str) -> Result<(String, String), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes `contents` to a fresh, uniquely-named temp file and returns its
+    /// path. Mirrors the temp-file-per-test pattern `sandboxwich-worker`'s
+    /// provider tests use for their fake `kubectl` script, so tests can run
+    /// in parallel without colliding on a shared path.
+    fn write_temp_file(contents: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("sandboxwich-agent-test-{}", Uuid::new_v4()));
+        std::fs::write(&path, contents).expect("write temp file");
+        path
+    }
+
+    #[test]
+    fn resolve_api_token_returns_cli_token_when_no_token_file_given() {
+        let token = resolve_api_token(None, Some("cli-token".to_string()))
+            .expect("resolution should succeed with no token file");
+        assert_eq!(token.as_deref(), Some("cli-token"));
+    }
+
+    #[test]
+    fn resolve_api_token_returns_none_when_neither_source_is_set() {
+        let token =
+            resolve_api_token(None, None).expect("resolution should succeed with nothing set");
+        assert_eq!(token, None);
+    }
+
+    #[test]
+    fn resolve_api_token_prefers_file_contents_over_the_cli_token() {
+        // GH-101: this is how the Kubernetes provider's mounted Secret
+        // (SANDBOXWICH_API_TOKEN_FILE) takes priority over any
+        // --api-token/SANDBOXWICH_API_TOKEN also present in the pod env.
+        let path = write_temp_file("  sbw_wtok_from_file  \n");
+
+        let token = resolve_api_token(Some(path.clone()), Some("cli-token".to_string()))
+            .expect("resolution should succeed");
+
+        assert_eq!(token.as_deref(), Some("sbw_wtok_from_file"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn resolve_api_token_errors_when_the_token_file_is_empty() {
+        let path = write_temp_file("   \n");
+
+        let error = resolve_api_token(Some(path.clone()), Some("cli-token".to_string()))
+            .expect_err("an empty token file should not be silently treated as no token");
+
+        assert!(error.to_string().contains("is empty"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn resolve_api_token_errors_when_the_token_file_does_not_exist() {
+        let path =
+            std::env::temp_dir().join(format!("sandboxwich-agent-test-missing-{}", Uuid::new_v4()));
+
+        let error = resolve_api_token(Some(path), Some("cli-token".to_string())).expect_err(
+            "a configured but unreadable token file should be a hard error, not a silent fallback",
+        );
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to read --api-token-file")
+        );
+    }
 
     #[test]
     fn utf8_stream_decoder_preserves_split_multibyte_characters() {

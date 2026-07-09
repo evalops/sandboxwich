@@ -40,6 +40,13 @@ rules:
       - pods/log
       - services
       - persistentvolumeclaims
+      # GH-101: one Secret per sandbox, holding this worker's own
+      # worker-scoped API token (GH-64), mounted read-only into that
+      # sandbox's pod. Scoped to this namespace only, same as the other
+      # sandbox-manipulating resources above -- a compromised worker can
+      # still only touch secrets it creates in sandboxwich-sandboxes, never
+      # the sandboxwich-secrets Secret in the control-plane namespace.
+      - secrets
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # pods/exec is scoped to "create" only, and to this namespace, which
   # contains nothing but sandbox pods. RBAC has no per-resource wildcard
