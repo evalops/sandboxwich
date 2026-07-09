@@ -1022,6 +1022,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expire_active_lease_on_connection_does_not_clobber_a_renewal_race() {
+        // Regression test for the renewal-vs-expiry race: `expire_due_leases`
+        // SELECTs active leases (and their `expires_at`) on the pool, then
+        // later applies `expire_active_lease_on_connection`'s guarded UPDATE.
+        // If a `renew_lease` call commits a later `expires_at` in between
+        // those two steps, the sweep must not still expire the
+        // freshly-renewed lease -- otherwise the job gets re-queued and a
+        // second worker ends up running it alongside the first.
+        let db = test_sqlite_db().await;
+        let worker_id = seed_worker(&db).await;
+        let job = seed_provision_job(&db).await;
+        let lease_id = LeaseId::new();
+
+        // The sweep observes the lease as due at this point in time...
+        let stale_now = Utc::now();
+        seed_expired_active_lease(&db, lease_id, job.id, worker_id, stale_now).await;
+
+        // ...but before the sweep's UPDATE runs, `renew_lease` commits,
+        // pushing `expires_at` into the future.
+        let renewed_expires_at = stale_now + chrono::Duration::seconds(60);
+        let sql = format!(
+            "update job_leases set expires_at = {} where id = {} and status = 'active'",
+            db.placeholder(1),
+            db.placeholder(2)
+        );
+        let renewed = sqlx::query(&sql)
+            .bind(renewed_expires_at.to_rfc3339())
+            .bind(lease_id.to_string())
+            .execute(&db.pool)
+            .await
+            .expect("renew lease");
+        assert_eq!(renewed.rows_affected(), 1, "renewal must apply");
+
+        // The sweep now runs its guarded expire UPDATE using the stale `now`
+        // it captured before the renewal landed.
+        let mut tx = db.pool.begin().await.expect("begin tx");
+        let won =
+            expire_active_lease_on_connection(&db, &mut tx, lease_id, stale_now, "lease expired")
+                .await
+                .expect("expire attempt");
+        tx.commit().await.expect("commit expire attempt");
+
+        assert!(
+            !won,
+            "a renewed lease must not be expired by a sweep using a stale notion of time"
+        );
+
+        let (status, expires_at): (String, String) = {
+            let row = sqlx::query("select status, expires_at from job_leases where id = ?")
+                .bind(lease_id.to_string())
+                .fetch_one(&db.pool)
+                .await
+                .expect("fetch lease");
+            (
+                row.try_get("status").expect("read status"),
+                row.try_get("expires_at").expect("read expires_at"),
+            )
+        };
+        assert_eq!(
+            status, "active",
+            "renewed lease must remain active, not be expired and its job re-queued"
+        );
+        assert_eq!(
+            expires_at,
+            renewed_expires_at.to_rfc3339(),
+            "renewed expires_at must survive the racing sweep"
+        );
+
+        // The job must still be in its leased state -- it must not have been
+        // re-queued for a second worker to pick up alongside the one holding
+        // the still-active, renewed lease.
+        let job_after = fetch_job(&db, job.id).await.expect("fetch job");
+        assert_eq!(job_after.status, JobStatus::Leased);
+    }
+
+    #[tokio::test]
     async fn expire_due_leases_does_not_double_process_concurrent_sweeps() {
         let db = test_sqlite_db().await;
         let worker_id = seed_worker(&db).await;
@@ -5289,14 +5365,15 @@ async fn expire_due_snapshots(db: &Database) -> Result<Vec<Snapshot>, ApiError> 
         }
         let mut tx = db.pool.begin().await?;
         let expired_snapshot = async {
-            update_snapshot_status_on_connection(
-                db,
-                &mut tx,
-                snapshot.id,
-                SnapshotStatus::Expired,
-                None,
-            )
-            .await?;
+            let won_transition =
+                expire_active_snapshot_on_connection(db, &mut tx, snapshot.id, now).await?;
+            if !won_transition {
+                // The snapshot's TTL was extended, or another caller (e.g. an
+                // overlapping sweep instance) already expired it, since this
+                // sweep's SELECT was taken. Don't re-apply expiry side
+                // effects on top of that.
+                return Ok(None);
+            }
             dead_queued_snapshot_jobs_on_connection(db, &mut tx, snapshot.id, "snapshot expired")
                 .await?;
             fail_sandboxes_waiting_on_snapshot_on_connection(
@@ -5320,13 +5397,16 @@ async fn expire_due_snapshots(db: &Database) -> Result<Vec<Snapshot>, ApiError> 
                 }),
             )
             .await?;
-            Ok(expired_snapshot)
+            Ok(Some(expired_snapshot))
         }
         .await;
         match expired_snapshot {
-            Ok(expired_snapshot) => {
+            Ok(Some(expired_snapshot)) => {
                 tx.commit().await?;
                 expired.push(expired_snapshot);
+            }
+            Ok(None) => {
+                tx.commit().await?;
             }
             Err(error) => {
                 if let Err(rollback_error) = tx.rollback().await {
@@ -5338,6 +5418,40 @@ async fn expire_due_snapshots(db: &Database) -> Result<Vec<Snapshot>, ApiError> 
     }
 
     Ok(expired)
+}
+
+/// Guarded, atomic `pending`/`ready` -> `expired` transition for a snapshot
+/// that a sweep has observed as due. Returns `true` only if this call
+/// performed the transition (`rows_affected() == 1`); returns `false` if the
+/// snapshot's TTL was extended or it was already expired by another caller
+/// since the sweep's SELECT was taken, in which case no further side effects
+/// (dead-lettering queued jobs, failing waiting sandboxes, emitting events)
+/// should run. This mirrors `expire_active_lease_on_connection`'s guard
+/// against the renewal-vs-expiry race.
+async fn expire_active_snapshot_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    snapshot_id: SnapshotId,
+    now: DateTime<Utc>,
+) -> Result<bool, ApiError> {
+    let sql = format!(
+        "update snapshots
+         set status = {}, error = {}
+         where id = {} and status in ('pending', 'ready')
+           and expires_at is not null and expires_at <= {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4)
+    );
+    let result = sqlx::query(&sql)
+        .bind(snapshot_status_to_str(&SnapshotStatus::Expired))
+        .bind(Option::<String>::None)
+        .bind(snapshot_id.to_string())
+        .bind(now.to_rfc3339())
+        .execute(&mut *connection)
+        .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 async fn update_snapshot_status_on_connection(
@@ -5659,22 +5773,119 @@ async fn expire_due_desktop_sessions(db: &Database) -> Result<Vec<DesktopSession
 
     let mut expired = Vec::new();
     for row in rows {
-        let mut desktop_session = row_to_desktop_session(row)?;
+        let desktop_session = row_to_desktop_session(row)?;
         let Some(expires_at) = desktop_session.expires_at else {
             continue;
         };
         if expires_at > now {
             continue;
         }
-        desktop_session.status = DesktopSessionStatus::Expired;
-        desktop_session.updated_at = now;
-        desktop_session.error = Some("desktop session expired".to_string());
-        update_desktop_session(db, &desktop_session).await?;
-        insert_desktop_event(db, &desktop_session, SandboxEventKind::DesktopExpired).await?;
-        expired.push(fetch_desktop_session(db, desktop_session.id).await?);
+
+        let mut tx = db.pool.begin().await?;
+        let expired_session = async {
+            let won_transition =
+                expire_active_desktop_session_on_connection(db, &mut tx, desktop_session.id, now)
+                    .await?;
+            if !won_transition {
+                // The session's TTL was extended (or its status/broker/etc. was
+                // otherwise updated), or another caller already expired it,
+                // since this sweep's SELECT was taken. A blind full-row
+                // overwrite here would clobber that concurrent update, so skip
+                // side effects entirely instead.
+                return Ok(None);
+            }
+            let expired_session =
+                fetch_desktop_session_on_connection(db, &mut tx, desktop_session.id).await?;
+            insert_desktop_event_on_connection(
+                db,
+                &mut tx,
+                &expired_session,
+                SandboxEventKind::DesktopExpired,
+            )
+            .await?;
+            Ok(Some(expired_session))
+        }
+        .await;
+        match expired_session {
+            Ok(Some(expired_session)) => {
+                tx.commit().await?;
+                expired.push(expired_session);
+            }
+            Ok(None) => {
+                tx.commit().await?;
+            }
+            Err(error) => {
+                if let Err(rollback_error) = tx.rollback().await {
+                    tracing::warn!(%rollback_error, "failed to roll back desktop session expiration");
+                }
+                return Err(error);
+            }
+        }
     }
 
     Ok(expired)
+}
+
+/// Guarded, atomic `pending`/`ready` -> `expired` transition for a desktop
+/// session that a sweep has observed as due. Returns `true` only if this call
+/// performed the transition (`rows_affected() == 1`); returns `false` if the
+/// session's TTL was extended (via `update_desktop_session_status`) or it was
+/// already expired by another caller since the sweep's SELECT was taken. This
+/// only touches `status`, `updated_at`, and `error` (unlike the previous
+/// implementation, which blindly overwrote every column from the sweep's
+/// stale in-memory copy via `update_desktop_session`), so a concurrent update
+/// to e.g. `connection_metadata` is not lost either. Mirrors
+/// `expire_active_lease_on_connection`'s guard against the renewal-vs-expiry
+/// race.
+async fn expire_active_desktop_session_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    desktop_session_id: DesktopSessionId,
+    now: DateTime<Utc>,
+) -> Result<bool, ApiError> {
+    let sql = format!(
+        "update desktop_sessions
+         set status = {}, updated_at = {}, error = {}
+         where id = {} and status in ('pending', 'ready')
+           and expires_at is not null and expires_at <= {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4),
+        db.placeholder(5)
+    );
+    let result = sqlx::query(&sql)
+        .bind(desktop_session_status_to_str(
+            &DesktopSessionStatus::Expired,
+        ))
+        .bind(now.to_rfc3339())
+        .bind("desktop session expired")
+        .bind(desktop_session_id.to_string())
+        .bind(now.to_rfc3339())
+        .execute(&mut *connection)
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+async fn fetch_desktop_session_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    desktop_session_id: DesktopSessionId,
+) -> Result<DesktopSession, ApiError> {
+    let sql = format!(
+        "select id, sandbox_id, status, broker, broker_url, access_mode, connection_metadata,
+                created_at, updated_at, expires_at, error
+         from desktop_sessions
+         where id = {}",
+        db.placeholder(1)
+    );
+    let row = sqlx::query(&sql)
+        .bind(desktop_session_id.to_string())
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| ApiError::not_found("desktop session not found"))?;
+
+    row_to_desktop_session(row)
 }
 
 async fn insert_desktop_event(
@@ -5684,6 +5895,30 @@ async fn insert_desktop_event(
 ) -> Result<SandboxEvent, ApiError> {
     insert_event(
         db,
+        desktop_session.sandbox_id,
+        kind,
+        json!({
+            "desktopSessionId": desktop_session.id,
+            "status": desktop_session.status,
+            "broker": desktop_session.broker,
+            "accessMode": desktop_session.access_mode,
+            "connectionMetadata": desktop_session.connection_metadata,
+            "expiresAt": desktop_session.expires_at,
+            "error": desktop_session.error
+        }),
+    )
+    .await
+}
+
+async fn insert_desktop_event_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    desktop_session: &DesktopSession,
+    kind: SandboxEventKind,
+) -> Result<SandboxEvent, ApiError> {
+    insert_event_on_connection(
+        db,
+        connection,
         desktop_session.sandbox_id,
         kind,
         json!({
@@ -6225,6 +6460,17 @@ async fn expire_lease_if_still_active(
 /// call performed the transition (`rows_affected() == 1`); returns `false` if the
 /// lease was already expired/completed/failed by another caller, in which case
 /// no further side effects should run.
+///
+/// The `expires_at <= completed_at` guard closes a renewal-vs-expiry race: the
+/// sweep that calls this function reads candidate leases (and their
+/// `expires_at`) on the pool *before* opening this transaction, so a
+/// concurrent `renew_lease` call can commit a later `expires_at` in between
+/// the sweep's SELECT and this UPDATE. Without re-checking `expires_at` here,
+/// that freshly-renewed lease would still be expired, its job re-queued, and
+/// two workers would end up running the same job. Re-checking `expires_at`
+/// against the *current* row (not the sweep's stale in-memory copy) means a
+/// renewal that lands first makes this UPDATE affect zero rows, so
+/// `won_transition` is `false` and no side effects run.
 async fn expire_active_lease_on_connection(
     db: &Database,
     connection: &mut AnyConnection,
@@ -6235,17 +6481,19 @@ async fn expire_active_lease_on_connection(
     let sql = format!(
         "update job_leases
          set status = {}, completed_at = {}, error = {}
-         where id = {} and status = 'active'",
+         where id = {} and status = 'active' and expires_at <= {}",
         db.placeholder(1),
         db.placeholder(2),
         db.placeholder(3),
-        db.placeholder(4)
+        db.placeholder(4),
+        db.placeholder(5)
     );
     let result = sqlx::query(&sql)
         .bind(lease_status_to_str(&LeaseStatus::Expired))
         .bind(completed_at.to_rfc3339())
         .bind(error)
         .bind(lease_id.to_string())
+        .bind(completed_at.to_rfc3339())
         .execute(&mut *connection)
         .await?;
     Ok(result.rows_affected() == 1)
