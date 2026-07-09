@@ -397,7 +397,9 @@ async fn ensure_database_constraints(db: &Database) -> anyhow::Result<()> {
 }
 
 const DB_ENUM_SCHEMA_METADATA_KEY: &str = "db_enum_constraints_fingerprint";
-const DB_ENUM_SCHEMA_FINGERPRINT_VERSION: &str = "db-enum-v1";
+// v2 adds the sandbox state transition guard (trigger backstop); bumping the
+// version forces `ensure_database_constraints` to reconcile it on upgrade.
+const DB_ENUM_SCHEMA_FINGERPRINT_VERSION: &str = "db-enum-v2";
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x00000100000001b3;
 
@@ -414,6 +416,11 @@ fn db_enum_schema_fingerprint() -> String {
         }
     }
     feed_hash(&mut hash, "runtime_resources.cluster:not_empty");
+    for (from, to) in sandbox_legal_transition_pairs() {
+        feed_hash(&mut hash, "sandboxes.state:transition");
+        feed_hash(&mut hash, from);
+        feed_hash(&mut hash, to);
+    }
     format!("{DB_ENUM_SCHEMA_FINGERPRINT_VERSION}:{hash:016x}")
 }
 
@@ -686,6 +693,10 @@ async fn ensure_postgres_constraints(db: &Database) -> anyhow::Result<()> {
         sqlx::query(statement).execute(&db.pool).await?;
     }
 
+    for statement in postgres_sandbox_transition_guard_statements() {
+        sqlx::query(&statement).execute(&db.pool).await?;
+    }
+
     Ok(())
 }
 
@@ -738,6 +749,10 @@ async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
         sqlx::query(statement).execute(&db.pool).await?;
     }
 
+    for statement in sqlite_sandbox_transition_guard_statements() {
+        sqlx::query(&statement).execute(&db.pool).await?;
+    }
+
     Ok(())
 }
 
@@ -784,6 +799,81 @@ fn sql_literal_list(values: &[&str]) -> String {
 
 fn sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Every legal `(from, to)` sandbox state transition per
+/// [`SandboxState::can_transition_to`], as raw DB string pairs. This is the
+/// database-level backstop for the sandbox lifecycle state machine: even if
+/// application code somehow bypasses the compare-and-swap helpers in
+/// `set_sandbox_state`/`set_sandbox_state_on_connection` (a bug, a manual
+/// SQL statement, a future code path), this coarse union of every action's
+/// legal edges still rejects nonsensical writes (e.g. `archived -> planning`)
+/// at the database itself. It is coarser than the application-level checks
+/// -- e.g. it allows `planning -> ready` (legal for `ProvisionSandbox`
+/// completion) even though a `resume` call is additionally restricted to
+/// `archived -> ready` only in Rust -- so it is a backstop, not a substitute,
+/// for the CAS-based enforcement.
+fn sandbox_legal_transition_pairs() -> Vec<(&'static str, &'static str)> {
+    let mut pairs = Vec::new();
+    for from in SandboxState::ALL {
+        for to in SandboxState::ALL {
+            if from.can_transition_to(&to) {
+                pairs.push((state_to_str(&from), state_to_str(&to)));
+            }
+        }
+    }
+    pairs
+}
+
+fn sql_tuple_list(pairs: &[(&str, &str)]) -> String {
+    pairs
+        .iter()
+        .map(|(a, b)| format!("({}, {})", sql_literal(a), sql_literal(b)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn sqlite_sandbox_transition_guard_statements() -> Vec<String> {
+    let tuple_list = sql_tuple_list(&sandbox_legal_transition_pairs());
+    vec![
+        "drop trigger if exists validate_sandboxes_state_transition_update".to_string(),
+        format!(
+            "create trigger validate_sandboxes_state_transition_update
+             before update of state on sandboxes
+             for each row
+             when (old.state, new.state) not in ({tuple_list})
+             begin
+                 select raise(abort, 'illegal sandbox state transition');
+             end;"
+        ),
+    ]
+}
+
+/// Postgres equivalent of [`sqlite_sandbox_transition_guard_statements`].
+/// Postgres `check` constraints cannot reference the pre-update row, so this
+/// uses a `plpgsql` trigger function instead of a `check` constraint (unlike
+/// the plain enum-value guards in [`postgres_enum_constraint_statements`]).
+fn postgres_sandbox_transition_guard_statements() -> Vec<String> {
+    let tuple_list = sql_tuple_list(&sandbox_legal_transition_pairs());
+    vec![
+        format!(
+            "create or replace function sandboxwich_validate_sandbox_state_transition()
+             returns trigger as $$
+             begin
+                 if (old.state, new.state) not in ({tuple_list}) then
+                     raise exception 'illegal sandbox state transition from % to %', old.state, new.state;
+                 end if;
+                 return new;
+             end;
+             $$ language plpgsql"
+        ),
+        "drop trigger if exists validate_sandboxes_state_transition on sandboxes".to_string(),
+        "create trigger validate_sandboxes_state_transition
+         before update of state on sandboxes
+         for each row
+         execute function sandboxwich_validate_sandbox_state_transition()"
+            .to_string(),
+    ]
 }
 
 #[cfg(test)]
@@ -887,7 +977,7 @@ mod tests {
     #[test]
     fn db_enum_fingerprint_is_versioned_and_stable_for_current_registry() {
         let fingerprint = db_enum_schema_fingerprint();
-        assert!(fingerprint.starts_with("db-enum-v1:"));
+        assert!(fingerprint.starts_with("db-enum-v2:"));
         assert_eq!(fingerprint, db_enum_schema_fingerprint());
     }
 
@@ -1083,6 +1173,153 @@ mod tests {
             event_count, 1,
             "guarded expiry must apply requeue side effects exactly once, not once per racing sweep"
         );
+    }
+
+    async fn seed_sandbox_with_state(db: &Database, state: SandboxState) -> Sandbox {
+        let now = Utc::now();
+        let sandbox = Sandbox {
+            id: SandboxId::new(),
+            tenant_id: "default".to_string(),
+            name: "test-sandbox".to_string(),
+            state,
+            template: "default".to_string(),
+            memory_limit: MemoryLimit::default(),
+            network_egress: NetworkEgress::default(),
+            created_at: now,
+            updated_at: now,
+            ttl_seconds: None,
+            parent_snapshot_id: None,
+        };
+        insert_sandbox(db, &sandbox).await.expect("insert sandbox");
+        sandbox
+    }
+
+    #[tokio::test]
+    async fn resume_returns_conflict_when_sandbox_is_not_archived() {
+        let db = test_sqlite_db().await;
+        let sandbox = seed_sandbox_with_state(&db, SandboxState::Error).await;
+
+        let result = transition_sandbox(
+            &db,
+            sandbox.id,
+            SandboxState::RESUME_LEGAL_FROM,
+            SandboxState::Ready,
+            "resumed",
+        )
+        .await;
+
+        let error = result.expect_err("resume from Error must be rejected");
+        assert_eq!(error.status, StatusCode::CONFLICT);
+
+        let unchanged = fetch_sandbox(&db, sandbox.id).await.expect("fetch sandbox");
+        assert_eq!(
+            unchanged.state,
+            SandboxState::Error,
+            "a rejected resume must not touch the sandbox's state"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_succeeds_from_archived() {
+        let db = test_sqlite_db().await;
+        let sandbox = seed_sandbox_with_state(&db, SandboxState::Archived).await;
+
+        let _ = transition_sandbox(
+            &db,
+            sandbox.id,
+            SandboxState::RESUME_LEGAL_FROM,
+            SandboxState::Ready,
+            "resumed",
+        )
+        .await
+        .expect("resume from Archived must succeed");
+
+        let updated = fetch_sandbox(&db, sandbox.id).await.expect("fetch sandbox");
+        assert_eq!(updated.state, SandboxState::Ready);
+    }
+
+    #[tokio::test]
+    async fn stop_returns_conflict_on_double_stop() {
+        let db = test_sqlite_db().await;
+        let sandbox = seed_sandbox_with_state(&db, SandboxState::Archived).await;
+
+        let result = transition_sandbox(
+            &db,
+            sandbox.id,
+            SandboxState::STOP_LEGAL_FROM,
+            SandboxState::Archived,
+            "stopped",
+        )
+        .await;
+
+        let error = result.expect_err("stopping an already-archived sandbox must conflict");
+        assert_eq!(error.status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn job_completion_racing_a_concurrent_archive_does_not_resurrect_the_sandbox() {
+        // Simulates the lost-update bug this change fixes: a ForkSandbox job is
+        // in flight (child sandbox in Provisioning) and, before its completion
+        // lands, the sandbox is archived by an unrelated user request. The
+        // job's completion must not clobber the archive.
+        let db = test_sqlite_db().await;
+        let child = seed_sandbox_with_state(&db, SandboxState::Provisioning).await;
+
+        let _ = transition_sandbox(
+            &db,
+            child.id,
+            SandboxState::STOP_LEGAL_FROM,
+            SandboxState::Archived,
+            "stopped",
+        )
+        .await
+        .expect("stop concurrently while the fork job is still in flight");
+
+        let mut connection = db.pool.acquire().await.expect("acquire connection");
+        set_sandbox_state_on_connection(
+            &db,
+            &mut connection,
+            child.id,
+            SandboxState::FORK_COMPLETED_LEGAL_FROM,
+            SandboxState::Ready,
+            json!({ "state": "ready", "reason": "fork_ready" }),
+        )
+        .await
+        .expect("job-completion path must not error on a lost race");
+        // The test db pool has exactly one connection; release it explicitly
+        // before fetching through the shared pool below.
+        drop(connection);
+
+        let after = fetch_sandbox(&db, child.id).await.expect("fetch sandbox");
+        assert_eq!(
+            after.state,
+            SandboxState::Archived,
+            "a completing fork job must never resurrect a concurrently-archived sandbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn database_trigger_rejects_a_transition_no_action_ever_performs() {
+        // Defense-in-depth check for the trigger backstop installed by
+        // `ensure_sqlite_constraints`: even a raw UPDATE that bypasses every
+        // Rust-level CAS helper must be rejected for an edge that is not in
+        // `sandbox_legal_transition_pairs()` (e.g. archived -> provisioning,
+        // which no handler ever performs).
+        let db = test_sqlite_db().await;
+        let sandbox = seed_sandbox_with_state(&db, SandboxState::Archived).await;
+
+        let result = sqlx::query("update sandboxes set state = 'provisioning' where id = ?")
+            .bind(sandbox.id.to_string())
+            .execute(&db.pool)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "the database trigger backstop must reject archived -> provisioning"
+        );
+
+        let unchanged = fetch_sandbox(&db, sandbox.id).await.expect("fetch sandbox");
+        assert_eq!(unchanged.state, SandboxState::Archived);
     }
 }
 
@@ -2035,6 +2272,7 @@ async fn stop_sandbox(
     transition_sandbox(
         &state.db,
         SandboxId(sandbox_id),
+        SandboxState::STOP_LEGAL_FROM,
         SandboxState::Archived,
         "stopped",
     )
@@ -2050,6 +2288,7 @@ async fn resume_sandbox(
     transition_sandbox(
         &state.db,
         SandboxId(sandbox_id),
+        SandboxState::RESUME_LEGAL_FROM,
         SandboxState::Ready,
         "resumed",
     )
@@ -3344,9 +3583,21 @@ async fn fail_lease_in_transaction(
     }
 }
 
+/// Drives a user-initiated sandbox state change (stop/resume) via a
+/// compare-and-swap update. `allowed_from` is the exact set of states this
+/// specific action may legally transition out of (e.g.
+/// [`SandboxState::RESUME_LEGAL_FROM`]) -- callers must pick the constant for
+/// their action rather than deriving one from `next_state` alone, since more
+/// than one action can legally target the same state with different
+/// preconditions (see [`SandboxState::can_transition_to`]'s docs).
+///
+/// If the sandbox is not currently in one of `allowed_from`, this returns a
+/// 409 Conflict describing the sandbox's actual state rather than silently
+/// clobbering it.
 async fn transition_sandbox(
     db: &Database,
     sandbox_id: SandboxId,
+    allowed_from: &'static [SandboxState],
     next_state: SandboxState,
     reason: &'static str,
 ) -> Result<Json<SandboxResponse>, ApiError> {
@@ -3355,6 +3606,7 @@ async fn transition_sandbox(
     set_sandbox_state(
         db,
         sandbox_id,
+        allowed_from,
         next_state,
         json!({
             "state": event_state,
@@ -3370,16 +3622,19 @@ async fn transition_sandbox(
 async fn set_sandbox_state(
     db: &Database,
     sandbox_id: SandboxId,
+    allowed_from: &'static [SandboxState],
     next_state: SandboxState,
     event_data: serde_json::Value,
 ) -> Result<(), ApiError> {
     let now = Utc::now();
     let state = state_to_str(&next_state);
+    let allowed_values: Vec<&str> = allowed_from.iter().map(state_to_str).collect();
     let sql = format!(
-        "update sandboxes set state = {}, updated_at = {} where id = {}",
+        "update sandboxes set state = {}, updated_at = {} where id = {} and state in ({})",
         db.placeholder(1),
         db.placeholder(2),
-        db.placeholder(3)
+        db.placeholder(3),
+        sql_literal_list(&allowed_values)
     );
     let result = sqlx::query(&sql)
         .bind(state)
@@ -3389,7 +3644,7 @@ async fn set_sandbox_state(
         .await?;
 
     if result.rows_affected() == 0 {
-        return Err(ApiError::not_found("sandbox not found"));
+        return Err(sandbox_state_conflict(db, sandbox_id, allowed_from, &next_state).await?);
     }
 
     insert_event(
@@ -3402,20 +3657,77 @@ async fn set_sandbox_state(
     Ok(())
 }
 
+/// Builds the 404/409 error for a failed user-facing compare-and-swap state
+/// update: 404 if the sandbox no longer exists at all, otherwise 409 with the
+/// sandbox's actual current state so the caller understands what conflicted.
+async fn sandbox_state_conflict(
+    db: &Database,
+    sandbox_id: SandboxId,
+    allowed_from: &'static [SandboxState],
+    next_state: &SandboxState,
+) -> Result<ApiError, ApiError> {
+    let current = fetch_sandbox_state(db, sandbox_id).await?;
+    Ok(match current {
+        None => ApiError::not_found("sandbox not found"),
+        Some(actual) => {
+            let allowed = allowed_from
+                .iter()
+                .map(state_to_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            ApiError::conflict(format!(
+                "cannot transition sandbox {sandbox_id} to {}: sandbox is currently {} (expected one of [{allowed}])",
+                state_to_str(next_state),
+                state_to_str(&actual),
+            ))
+        }
+    })
+}
+
+async fn fetch_sandbox_state(
+    db: &Database,
+    sandbox_id: SandboxId,
+) -> Result<Option<SandboxState>, ApiError> {
+    let sql = format!(
+        "select state from sandboxes where id = {}",
+        db.placeholder(1)
+    );
+    let Some(row) = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .fetch_optional(&db.pool)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let raw: String = row.try_get("state")?;
+    Ok(Some(parse_state(&raw)?))
+}
+
+/// Drives a worker/job-completion-triggered sandbox state change via a
+/// compare-and-swap update, mirroring [`set_sandbox_state`]. Unlike the
+/// user-facing routes, a job-completion path must never error out or clobber
+/// a sandbox that has moved on since the job started -- e.g. a
+/// `ProvisionSandbox`/`ForkSandbox` job completing after the sandbox was
+/// concurrently archived must leave it archived, not resurrect it. So on a
+/// compare-and-swap miss this logs a warning and returns `Ok(())` instead of
+/// applying the write or raising an error.
 async fn set_sandbox_state_on_connection(
     db: &Database,
     connection: &mut AnyConnection,
     sandbox_id: SandboxId,
+    allowed_from: &'static [SandboxState],
     next_state: SandboxState,
     event_data: serde_json::Value,
 ) -> Result<(), ApiError> {
     let now = Utc::now();
     let state = state_to_str(&next_state);
+    let allowed_values: Vec<&str> = allowed_from.iter().map(state_to_str).collect();
     let sql = format!(
-        "update sandboxes set state = {}, updated_at = {} where id = {}",
+        "update sandboxes set state = {}, updated_at = {} where id = {} and state in ({})",
         db.placeholder(1),
         db.placeholder(2),
-        db.placeholder(3)
+        db.placeholder(3),
+        sql_literal_list(&allowed_values)
     );
     let result = sqlx::query(&sql)
         .bind(state)
@@ -3425,7 +3737,14 @@ async fn set_sandbox_state_on_connection(
         .await?;
 
     if result.rows_affected() == 0 {
-        return Err(ApiError::not_found("sandbox not found"));
+        tracing::warn!(
+            %sandbox_id,
+            next_state = state,
+            allowed_from = ?allowed_values,
+            "skipping sandbox state transition: sandbox is no longer in an expected \
+             predecessor state (likely concurrently stopped/resumed by another request)"
+        );
+        return Ok(());
     }
 
     insert_event_on_connection(
@@ -6640,6 +6959,7 @@ async fn apply_completed_job_on_connection(
                 db,
                 connection,
                 child_id,
+                SandboxState::FORK_COMPLETED_LEGAL_FROM,
                 next_state.clone(),
                 json!({
                     "state": next_state,
@@ -6663,6 +6983,7 @@ async fn apply_completed_job_on_connection(
                 db,
                 connection,
                 sandbox_id,
+                SandboxState::PROVISION_COMPLETED_LEGAL_FROM,
                 next_state.clone(),
                 json!({
                     "state": next_state,
@@ -6759,6 +7080,7 @@ async fn apply_claimed_job_on_connection(
                 db,
                 connection,
                 child_id,
+                SandboxState::FORK_CLAIMED_LEGAL_FROM,
                 next_state.clone(),
                 json!({
                     "state": next_state,
@@ -6831,6 +7153,7 @@ async fn apply_retryable_job_on_connection(
                 db,
                 connection,
                 child_id,
+                SandboxState::FORK_RETRIED_LEGAL_FROM,
                 next_state.clone(),
                 json!({
                     "state": next_state,
@@ -6929,6 +7252,7 @@ async fn apply_failed_job_on_connection(
                 db,
                 connection,
                 child_id,
+                SandboxState::FORK_FAILED_LEGAL_FROM,
                 next_state.clone(),
                 json!({
                     "state": next_state,
@@ -7089,6 +7413,7 @@ async fn fail_sandboxes_waiting_on_snapshot_on_connection(
             db,
             connection,
             child.id,
+            SandboxState::SNAPSHOT_FAILED_CHILD_LEGAL_FROM,
             next_state.clone(),
             json!({
                 "state": next_state,
