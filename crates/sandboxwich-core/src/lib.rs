@@ -1153,6 +1153,15 @@ pub struct WorkerHeartbeatRequest {
 pub struct WorkerResponse {
     pub ok: bool,
     pub worker: Worker,
+    /// Present only in the response to `POST /workers/register`: a
+    /// worker-scoped credential distinct from tenant tokens, bound to this
+    /// worker's id (see GH-64). The worker must store it and use it (instead
+    /// of its tenant token) for the guest-facing routes it and the sandboxes
+    /// it provisions call: lease claim/renew/complete/fail/output and
+    /// guest-health. It is never returned again after registration, so a
+    /// worker that loses it must re-register to obtain a new one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
