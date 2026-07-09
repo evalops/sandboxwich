@@ -8,17 +8,8 @@ pub(crate) async fn assert_provision_job_persists_runtime_resources(
     sandbox: &SandboxResponse,
     worker: &WorkerResponse,
 ) {
-    let queued: JobResponse = client
-        .post(format!("{}/jobs", server.base_url))
-        .json(&CreateJobRequest {
-            kind: JobKind::ProvisionSandbox,
-            payload: serde_json::json!({
-                "sandboxId": sandbox.sandbox.id
-            }),
-            required_capability: WorkerCapability::ProvisionSandbox,
-            priority: Some(10),
-            max_attempts: None,
-        })
+    let jobs: JobListResponse = client
+        .get(format!("{}/jobs", server.base_url))
         .send()
         .await
         .unwrap()
@@ -27,29 +18,53 @@ pub(crate) async fn assert_provision_job_persists_runtime_resources(
         .json()
         .await
         .unwrap();
-    assert_eq!(queued.job.status, JobStatus::Queued);
+    let queued = jobs
+        .jobs
+        .into_iter()
+        .find(|job| {
+            job.kind == JobKind::ProvisionSandbox
+                && job.payload["sandboxId"] == serde_json::json!(sandbox.sandbox.id)
+        })
+        .expect("create must atomically queue a provision job");
+    assert_eq!(queued.status, JobStatus::Queued);
 
     let worker_client = worker_client(worker);
-    let claimed: ClaimLeaseResponse = worker_client
-        .post(format!(
-            "{}/workers/{}/leases/claim",
-            server.base_url, worker.worker.id
-        ))
-        .json(&ClaimLeaseRequest {
-            lease_seconds: Some(60),
-        })
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let lease = claimed
-        .lease
-        .expect("expected worker to claim provision job");
-    assert_eq!(lease.job.id, queued.job.id);
+    let lease = loop {
+        let claimed: ClaimLeaseResponse = worker_client
+            .post(format!(
+                "{}/workers/{}/leases/claim",
+                server.base_url, worker.worker.id
+            ))
+            .json(&ClaimLeaseRequest {
+                lease_seconds: Some(60),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let lease = claimed
+            .lease
+            .expect("expected worker to claim provision job");
+        if lease.job.id == queued.id {
+            break lease;
+        }
+        let response = worker_client
+            .post(format!("{}/leases/{}/fail", server.base_url, lease.id))
+            .json(&FailLeaseRequest { error: "unrelated contract fixture job".to_string(), retry: false })
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "unexpected drain completion: {} {}",
+            response.status(),
+            response.text().await.unwrap()
+        );
+    };
 
     let completed: LeaseResponse = worker_client
         .post(format!("{}/leases/{}/complete", server.base_url, lease.id))

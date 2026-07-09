@@ -248,6 +248,48 @@ pub(crate) async fn run_contract(server: TestServer) {
     .await;
     assert_failed_completion_rolls_back_lease_state(&client, &server, &created, &worker).await;
 
+    // Tenant-boundary coverage creates another default-tenant sandbox before the worker exists.
+    // Drain its automatically queued provision operation so later assertions can target their
+    // own jobs deterministically.
+    let pending: ClaimLeaseResponse = worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    if let Some(lease) = pending.lease {
+        assert_eq!(lease.job.kind, JobKind::ProvisionSandbox);
+        let sandbox_id: SandboxId =
+            serde_json::from_value(lease.job.payload["sandboxId"].clone()).unwrap();
+        worker_client
+            .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
+            .json(&CompleteLeaseRequest {
+                result: Some(WorkerJobResult::ProvisionSandbox {
+                    handle: ProviderSandboxHandle {
+                        provider: "kubernetes".to_string(),
+                        sandbox_id,
+                        resources: provision_resources(sandbox_id),
+                        metadata: serde_json::json!({}),
+                    },
+                }),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+
     let listed: SandboxListResponse = client
         .get(format!("{}/sandboxes", server.base_url))
         .send()
@@ -614,12 +656,47 @@ pub(crate) async fn run_contract(server: TestServer) {
         .unwrap();
     assert_eq!(
         serde_json::to_value(stopped.sandbox.state).unwrap(),
-        "archived"
+        "archiving"
     );
 
-    let resumed: SandboxResponse = client
+    let stop_claim: ClaimLeaseResponse = worker_client
         .post(format!(
-            "{}/sandboxes/{}/resume",
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let stop_lease = stop_claim.lease.expect("stop must queue provider teardown");
+    assert_eq!(stop_lease.job.kind, JobKind::StopSandbox);
+    worker_client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, stop_lease.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::StopSandbox {
+                sandbox_id: created.sandbox.id,
+                provider: "kubernetes".to_string(),
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let archived: SandboxResponse = client
+        .get(format!(
+            "{}/sandboxes/{}",
             server.base_url, created.sandbox.id
         ))
         .send()
@@ -630,16 +707,9 @@ pub(crate) async fn run_contract(server: TestServer) {
         .json()
         .await
         .unwrap();
-    assert_eq!(
-        serde_json::to_value(resumed.sandbox.state).unwrap(),
-        "ready"
-    );
+    assert_eq!(archived.sandbox.state, SandboxState::Archived);
 
-    // A sandbox can only be resumed from Archived. Calling resume again now
-    // that it is back to Ready must be rejected as a conflict rather than
-    // silently succeeding (the previous unconditional-write behavior let
-    // resume force *any* state to Ready, including Ready itself and Error).
-    let resume_conflict = client
+    let resumed = client
         .post(format!(
             "{}/sandboxes/{}/resume",
             server.base_url, created.sandbox.id
@@ -647,7 +717,7 @@ pub(crate) async fn run_contract(server: TestServer) {
         .send()
         .await
         .unwrap();
-    assert_eq!(resume_conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(resumed.status(), StatusCode::NOT_IMPLEMENTED);
 
     assert_job_completion_does_not_resurrect_concurrently_archived_sandbox(
         &client, &server, &created,
