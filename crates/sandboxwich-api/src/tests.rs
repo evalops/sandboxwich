@@ -497,6 +497,24 @@ async fn job_completion_racing_a_concurrent_archive_does_not_resurrect_the_sandb
         &db,
         &mut connection,
         child.id,
+        SandboxState::PROVISION_COMPLETED_LEGAL_FROM,
+        SandboxState::Ready,
+        json!({ "state": "ready", "reason": "provision_ready" }),
+    )
+    .await
+    .expect("late provision completion must be an idempotent lost race");
+    let stopping = fetch_sandbox_on_connection(&db, &mut connection, child.id)
+        .await
+        .expect("fetch stopping sandbox");
+    assert_eq!(
+        stopping.state,
+        SandboxState::Archiving,
+        "a late provision completion must not undo an accepted stop"
+    );
+    set_sandbox_state_on_connection(
+        &db,
+        &mut connection,
+        child.id,
         SandboxState::STOP_COMPLETED_LEGAL_FROM,
         SandboxState::Archived,
         json!({ "state": "archived", "reason": "stop_completed" }),

@@ -35,7 +35,7 @@ pub(crate) async fn claim_lease(
          where tenant_id = {} and status = 'queued' and scheduled_at <= {}
            and required_capability in ({})
            and (
-             kind in ('provision_sandbox', 'run_prompt')
+             kind in ('provision_sandbox', 'run_prompt', 'stop_sandbox')
              or exists (
                select 1 from sandbox_placements p
                where p.sandbox_id = coalesce(jobs.sandbox_id, jobs.parent_sandbox_id)
@@ -66,6 +66,9 @@ pub(crate) async fn claim_lease(
 
     for row in rows {
         let job = row_to_job(row)?;
+        // Defense in depth: SQL is the efficient scheduling filter, but keep the typed
+        // capability check at the claim boundary so a future query refactor cannot lease
+        // work to an incompatible worker.
         if !worker.capabilities.contains(&job.required_capability) {
             continue;
         }

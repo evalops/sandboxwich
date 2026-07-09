@@ -196,11 +196,11 @@ pub(crate) async fn stop_sandbox(
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<SandboxResponse>, ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
-    let sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
+    let mut sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
     let now = Utc::now();
     let job = Job {
         id: JobId::new(),
-        tenant_id: sandbox.tenant_id,
+        tenant_id: sandbox.tenant_id.clone(),
         kind: JobKind::StopSandbox,
         status: JobStatus::Queued,
         payload: json!({"sandboxId": sandbox_id}),
@@ -225,7 +225,8 @@ pub(crate) async fn stop_sandbox(
     .await?;
     insert_job_on_connection(&state.db, &mut tx, &job).await?;
     tx.commit().await?;
-    let sandbox = fetch_sandbox(&state.db, sandbox_id).await?;
+    sandbox.state = SandboxState::Archiving;
+    sandbox.updated_at = now;
     Ok(Json(SandboxResponse { ok: true, sandbox }))
 }
 

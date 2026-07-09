@@ -538,7 +538,6 @@ impl SandboxState {
         SandboxState::Ready,
         SandboxState::Running,
         SandboxState::Idle,
-        SandboxState::Archiving,
         SandboxState::Error,
     ];
 
@@ -555,22 +554,20 @@ impl SandboxState {
     /// | Planning     | Provisioning | `ForkSandbox` job claimed                              |
     /// | Planning     | Ready        | `ProvisionSandbox` job completed                       |
     /// | Planning     | Error        | parent `CreateSnapshot` job failed                     |
-    /// | Planning     | Archived     | user stop                                              |
+    /// | Planning     | Archiving    | user stop requested                                    |
     /// | Provisioning | Ready        | `ForkSandbox`/`ProvisionSandbox` job completed          |
     /// | Provisioning | Planning     | `ForkSandbox` job retried                              |
     /// | Provisioning | Error        | `ForkSandbox` job permanently failed                    |
-    /// | Provisioning | Archived     | user stop                                              |
+    /// | Provisioning | Archiving    | user stop requested                                    |
     /// | Ready        | Ready        | `ProvisionSandbox` job completed (reprovision, no-op)   |
-    /// | Ready        | Archived     | user stop                                              |
+    /// | Ready        | Archiving    | user stop requested                                    |
     /// | Running      | Ready        | `ProvisionSandbox` job completed                       |
-    /// | Running      | Archived     | user stop                                              |
+    /// | Running      | Archiving    | user stop requested                                    |
     /// | Idle         | Ready        | `ProvisionSandbox` job completed                       |
-    /// | Idle         | Archived     | user stop                                              |
-    /// | Archiving    | Ready        | `ProvisionSandbox` job completed                       |
-    /// | Archiving    | Archived     | user stop                                              |
+    /// | Idle         | Archiving    | user stop requested                                    |
+    /// | Archiving    | Archived     | provider-confirmed stop completion                     |
     /// | Error        | Ready        | `ProvisionSandbox` job completed (manual retry)         |
-    /// | Error        | Archived     | user stop (archive/cleanup a failed sandbox)            |
-    /// | Archived     | Ready        | user resume                                            |
+    /// | Error        | Archiving    | user stop requested                                    |
     ///
     /// This is a coarse union of every `_LEGAL_FROM` constant above and is
     /// used as a database-level backstop trigger (see
@@ -1902,7 +1899,6 @@ mod tests {
             (Running, Archiving),
             (Idle, Ready),
             (Idle, Archiving),
-            (Archiving, Ready),
             (Archiving, Archived),
             (Error, Ready),
             (Error, Archiving),
@@ -1931,7 +1927,6 @@ mod tests {
                 SandboxState::Ready,
                 SandboxState::Running,
                 SandboxState::Idle,
-                SandboxState::Archiving,
                 SandboxState::Error,
             ],
             "archived sandboxes cannot become ready until a real restore contract exists"
@@ -1951,13 +1946,13 @@ mod tests {
     }
 
     #[test]
-    fn provision_completed_excludes_only_archived() {
+    fn provision_completed_excludes_archiving_and_archived() {
         for from in SandboxState::ALL {
-            let expected = from != SandboxState::Archived;
+            let expected = !matches!(from, SandboxState::Archiving | SandboxState::Archived);
             assert_eq!(
                 SandboxState::PROVISION_COMPLETED_LEGAL_FROM.contains(&from),
                 expected,
-                "a concurrently-archived sandbox must never be resurrected by a \
+                "a stopping or archived sandbox must never be resurrected by a \
                  completing ProvisionSandbox job: {from:?} should be {expected}"
             );
         }

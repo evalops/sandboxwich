@@ -138,6 +138,164 @@ pub(crate) async fn list_sandboxes_hydrates_each_allowlist_sandboxes_own_rules()
     );
 }
 
+#[tokio::test]
+async fn stop_before_first_provision_is_claimable_and_cannot_be_undone() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("sandboxwich-pre-provision-stop.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+    let created: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("stop-before-provision".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(created.sandbox.state, SandboxState::Planning);
+
+    let accepted: SandboxResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/stop",
+            server.base_url, created.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(accepted.sandbox.state, SandboxState::Archiving);
+
+    let worker: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "pre-provision-stop-worker".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![WorkerCapability::ProvisionSandbox],
+            max_concurrent_jobs: Some(1),
+            labels: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let worker_client = worker_client(&worker);
+    let stop_claim: ClaimLeaseResponse = worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let stop_lease = stop_claim
+        .lease
+        .expect("unplaced stop job must be claimable");
+    assert_eq!(stop_lease.job.kind, JobKind::StopSandbox);
+    worker_client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, stop_lease.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::StopSandbox {
+                provider: "kubernetes".to_string(),
+                sandbox_id: created.sandbox.id,
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let provision_claim: ClaimLeaseResponse = worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let provision_lease = provision_claim
+        .lease
+        .expect("original provision job remains drainable");
+    assert_eq!(provision_lease.job.kind, JobKind::ProvisionSandbox);
+    worker_client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, provision_lease.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::ProvisionSandbox {
+                handle: ProviderSandboxHandle {
+                    provider: "kubernetes".to_string(),
+                    sandbox_id: created.sandbox.id,
+                    resources: provision_resources(created.sandbox.id),
+                    metadata: serde_json::json!({}),
+                },
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let final_state: SandboxResponse = client
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, created.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(final_state.sandbox.state, SandboxState::Archived);
+}
+
 pub(crate) async fn assert_resource_tiers_and_file_contracts(
     client: &reqwest::Client,
     server: &TestServer,
