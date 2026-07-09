@@ -12,6 +12,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 KUBE_CONTEXT="kind-${CLUSTER_NAME}"
 TMP_DIR="$(mktemp -d)"
 PORT_FORWARD_PID=""
+CURL_CONFIG="${TMP_DIR}/curl.conf"
 
 cleanup() {
   if [[ -n "${PORT_FORWARD_PID}" ]]; then
@@ -40,9 +41,12 @@ kubectl config use-context "${KUBE_CONTEXT}" >/dev/null
 
 kubectl create namespace sandboxwich
 kubectl create namespace sandboxwich-sandboxes
+printf '%s' 'postgres://postgres:postgres@postgres:5432/sandboxwich' >"${TMP_DIR}/database-url"
+printf '%s' "${API_TOKEN}" >"${TMP_DIR}/api-token"
+chmod 0600 "${TMP_DIR}/database-url" "${TMP_DIR}/api-token"
 kubectl -n sandboxwich create secret generic sandboxwich-secrets \
-  --from-literal=database-url='postgres://postgres:postgres@postgres:5432/sandboxwich' \
-  --from-literal=api-token="${API_TOKEN}"
+  --from-file="database-url=${TMP_DIR}/database-url" \
+  --from-file="api-token=${TMP_DIR}/api-token"
 kubectl -n sandboxwich create deployment postgres --image="${POSTGRES_IMAGE}" --dry-run=client -o yaml | \
   kubectl set env --local -f - POSTGRES_DB=sandboxwich POSTGRES_USER=postgres \
     POSTGRES_PASSWORD=postgres -o yaml | kubectl apply -f -
@@ -59,7 +63,6 @@ sed \
   -e 's/imagePullPolicy: Always/imagePullPolicy: IfNotPresent/g' \
   -e 's/value: k3s-dev/value: kind-conformance/' \
   -e 's/value: local-path/value: standard/' \
-  -e "s#value: ghcr.io/evalops/sandboxwich-ubuntu-dev:latest#value: ${RUNTIME_IMAGE}#" \
   "${ROOT_DIR}/deploy/kubernetes/worker.yaml" >"${TMP_DIR}/worker.yaml"
 
 kubectl apply -f "${TMP_DIR}/api.yaml"
@@ -70,16 +73,27 @@ kubectl -n sandboxwich set env deployment/sandboxwich-worker \
   "SANDBOXWICH_RUNTIME_IMAGE=${RUNTIME_IMAGE}"
 kubectl -n sandboxwich rollout status deployment/sandboxwich-worker --timeout=120s
 
-kubectl -n sandboxwich port-forward service/sandboxwich-api 32170:3217 >"${TMP_DIR}/port-forward.log" 2>&1 &
-PORT_FORWARD_PID=$!
-for _ in $(seq 1 40); do
-  curl -fsS http://127.0.0.1:32170/readyz >/dev/null 2>&1 && break
-  sleep 1
-done
-curl -fsS http://127.0.0.1:32170/readyz >/dev/null || fail "API port-forward did not become ready"
+printf 'header = "Authorization: Bearer %s"\nheader = "content-type: application/json"\n' \
+  "${API_TOKEN}" >"${CURL_CONFIG}"
+chmod 0600 "${CURL_CONFIG}"
+
+start_port_forward() {
+  if [[ -n "${PORT_FORWARD_PID}" ]]; then
+    kill "${PORT_FORWARD_PID}" >/dev/null 2>&1 || true
+  fi
+  kubectl -n sandboxwich port-forward service/sandboxwich-api 32170:3217 \
+    >"${TMP_DIR}/port-forward.log" 2>&1 &
+  PORT_FORWARD_PID=$!
+  for _ in $(seq 1 40); do
+    curl -fsS http://127.0.0.1:32170/readyz >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  fail "API port-forward did not become ready"
+}
+start_port_forward
 
 api() {
-  curl -fsS -H "Authorization: Bearer ${API_TOKEN}" -H 'content-type: application/json' "$@"
+  curl -fsS --config "${CURL_CONFIG}" "$@"
 }
 
 wait_json() {
@@ -161,6 +175,7 @@ api http://127.0.0.1:32170/jobs | jq -e --arg marker "${lost_marker}" \
 # Control-plane and worker restarts must recover against durable Postgres state.
 kubectl -n sandboxwich rollout restart deployment/sandboxwich-api
 kubectl -n sandboxwich rollout status deployment/sandboxwich-api --timeout=120s
+start_port_forward
 api "http://127.0.0.1:32170/sandboxes/${source_id}" >/dev/null || fail "API restart lost durable state"
 kubectl -n sandboxwich delete pod -l app.kubernetes.io/name=sandboxwich-worker --wait=true
 kubectl -n sandboxwich rollout status deployment/sandboxwich-worker --timeout=120s
