@@ -1683,7 +1683,9 @@ const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// called from a synchronous `SandboxProvider` method that itself always runs
 /// either inside `tokio::task::spawn_blocking` (see `handle_lease`) or
 /// directly within `#[tokio::main]`'s task, so a Tokio runtime `Handle` is
-/// always available to drive the bounded async wait below.
+/// normally available to drive the bounded async wait below; callers with no
+/// ambient runtime at all (synchronous unit tests) get a throwaway
+/// current-thread runtime instead.
 fn run_kubectl_command(
     kubectl: &str,
     args: &[String],
@@ -1716,7 +1718,7 @@ fn run_kubectl_command_with_stdin(
     cancelled: Option<&CancelSignal>,
     max_output_bytes: u64,
 ) -> anyhow::Result<KubectlOutput> {
-    tokio::runtime::Handle::current().block_on(run_kubectl_command_async(
+    let command = run_kubectl_command_async(
         kubectl,
         args,
         stdin_payload,
@@ -1724,7 +1726,15 @@ fn run_kubectl_command_with_stdin(
         timeout,
         cancelled,
         max_output_bytes,
-    ))
+    );
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(command),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build a runtime to drive a kubectl invocation")?
+            .block_on(command),
+    }
 }
 
 async fn run_kubectl_command_async(
@@ -1748,12 +1758,7 @@ async fn run_kubectl_command_async(
         .spawn()
         .with_context(|| format!("failed to spawn kubectl for {context}"))?;
     let stdin_pipe = match stdin_payload {
-        Some(_) => Some(
-            child
-                .stdin
-                .take()
-                .context("failed to open kubectl stdin")?,
-        ),
+        Some(_) => Some(child.stdin.take().context("failed to open kubectl stdin")?),
         None => None,
     };
     let mut stdout_pipe = child
