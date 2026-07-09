@@ -1,10 +1,13 @@
 [package]
 name = "sandboxwich-worker"
 version = "0.1.0"
+description = "Provider worker for the sandboxwich control plane"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+homepage.workspace = true
+authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true

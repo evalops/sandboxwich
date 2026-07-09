@@ -1,10 +1,13 @@
 [package]
 name = "sandboxwich-bench"
 version = "0.1.0"
+description = "Benchmark and regression harness for sandboxwich"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+homepage.workspace = true
+authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true

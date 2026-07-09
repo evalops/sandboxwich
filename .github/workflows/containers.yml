@@ -18,6 +18,7 @@ on:
 permissions:
   contents: read
   packages: write
+  id-token: write
 
 env:
   REGISTRY: ghcr.io
@@ -60,11 +61,12 @@ jobs:
             echo "EOF"
           } >> "${GITHUB_OUTPUT}"
       - name: Build service image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           build-args: |
             BIN=${{ matrix.bin }}
@@ -74,6 +76,16 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          provenance: mode=max
+          sbom: true
+      - uses: sigstore/cosign-installer@v3
+        if: github.event_name != 'pull_request'
+      - name: Sign service image
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
 
   runtime-image:
     name: runtime image (ubuntu-dev)
@@ -103,11 +115,12 @@ jobs:
             echo "EOF"
           } >> "${GITHUB_OUTPUT}"
       - name: Build runtime image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: deploy/runtime/ubuntu-dev
           file: deploy/runtime/ubuntu-dev/Dockerfile
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.tags.outputs.tags }}
           labels: |
@@ -115,3 +128,13 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha,scope=sandboxwich-ubuntu-dev
           cache-to: type=gha,mode=max,scope=sandboxwich-ubuntu-dev
+          provenance: mode=max
+          sbom: true
+      - uses: sigstore/cosign-installer@v3
+        if: github.event_name != 'pull_request'
+      - name: Sign runtime image
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/sandboxwich-ubuntu-dev
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
