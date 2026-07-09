@@ -3,6 +3,7 @@ pub(crate) mod desktop;
 pub(crate) mod files;
 pub(crate) mod jobs;
 pub(crate) mod leases;
+pub(crate) mod operations;
 pub(crate) mod sandboxes;
 pub(crate) mod snapshots;
 pub(crate) mod ssh;

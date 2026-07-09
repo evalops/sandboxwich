@@ -450,25 +450,7 @@ pub(crate) async fn assert_prompt_job_lifecycle(
     server: &TestServer,
     sandbox: &SandboxResponse,
 ) {
-    let prompt_worker: WorkerResponse = client
-        .post(format!("{}/workers/register", server.base_url))
-        .json(&RegisterWorkerRequest {
-            name: "prompt-worker".to_string(),
-            provider: "kubernetes".to_string(),
-            capabilities: vec![WorkerCapability::AgentPrompt],
-            max_concurrent_jobs: Some(1),
-            labels: [("cluster".to_string(), "k3s-dev".to_string())].into(),
-        })
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-
-    let prompt: PromptQueuedResponse = client
+    let prompt = client
         .post(format!(
             "{}/sandboxes/{}/prompt",
             server.base_url, sandbox.sandbox.id
@@ -481,93 +463,8 @@ pub(crate) async fn assert_prompt_job_lifecycle(
         })
         .send()
         .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
         .unwrap();
-    assert_eq!(prompt.event.kind, SandboxEventKind::PromptQueued);
-
-    let jobs: JobListResponse = client
-        .get(format!("{}/jobs", server.base_url))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let prompt_job = job_for_prompt(&jobs.jobs, &prompt.event.id.to_string());
-    assert_eq!(prompt_job.status, JobStatus::Queued);
-
-    let prompt_worker_client = worker_client(&prompt_worker);
-    let claimed: ClaimLeaseResponse = prompt_worker_client
-        .post(format!(
-            "{}/workers/{}/leases/claim",
-            server.base_url, prompt_worker.worker.id
-        ))
-        .json(&ClaimLeaseRequest {
-            lease_seconds: Some(60),
-        })
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let lease = claimed
-        .lease
-        .expect("expected prompt worker to claim prompt job");
-    assert_eq!(lease.job.id, prompt_job.id);
-
-    let completed: LeaseResponse = prompt_worker_client
-        .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
-        .json(&CompleteLeaseRequest {
-            result: Some(WorkerJobResult::RunPrompt {
-                output: "workspace summary".to_string(),
-            }),
-        })
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(completed.lease.job.status, JobStatus::Succeeded);
-
-    let events: EventListResponse = client
-        .get(format!(
-            "{}/sandboxes/{}/events",
-            server.base_url, sandbox.sandbox.id
-        ))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(events.events.iter().any(|event| {
-        event.kind == SandboxEventKind::PromptStarted
-            && event
-                .data
-                .get("promptEventId")
-                .and_then(|value| value.as_str())
-                == Some(&prompt.event.id.to_string())
-    }));
-    assert!(events.events.iter().any(|event| {
-        event.kind == SandboxEventKind::PromptFinished
-            && event
-                .data
-                .get("promptEventId")
-                .and_then(|value| value.as_str())
-                == Some(&prompt.event.id.to_string())
-    }));
+    assert_eq!(prompt.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
+    let error: ErrorEnvelope = prompt.json().await.unwrap();
+    assert_eq!(error.code, "agent_prompt_unavailable");
 }

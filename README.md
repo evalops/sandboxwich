@@ -70,6 +70,29 @@ Sandbox create accepts typed memory tiers (`1g`, `4g`, `16g`, `64g`) and typed n
 
 Worker completions use typed result variants. Provider-created Pods, PVCs, Services, NetworkPolicies, and VolumeSnapshots are persisted as `runtime_resources` rows with constrained kind, purpose, and status columns; provider metadata is diagnostic compatibility data, not the durable source of runtime state. Runtime resources marked `deleted` were reconciled as missing or removed outside the cleanup path; resources marked `destroyed` were explicitly torn down by archived-sandbox cleanup. Kubernetes providers render deny-by-default egress, pod/container security contexts, resource requests/limits, and optional RuntimeClass isolation such as gVisor or Kata.
 
+## Public API contract
+
+The stable HTTP surface is versioned under `/v1`. Unversioned routes remain as
+temporary compatibility aliases and will be removed in a future major release.
+Every response includes `x-request-id`; callers may supply that header to carry
+their own correlation ID. Errors use a stable `{ "ok": false, "code", "message" }`
+envelope, so clients should branch on `code`, never message text.
+
+The runtime-generated OpenAPI document is served at `/v1/openapi.json`. It is
+compiled from Rust handler and schema types rather than a checked-in JSON file.
+
+Asynchronous command acceptance returns HTTP `202` and an `operation` resource.
+Poll `GET /v1/operations/{id}`, reconnect to
+`GET /v1/operations/{id}/events` with SSE `Last-Event-ID`, or cancel a queued
+command with `POST /v1/operations/{id}/cancel`. Cancellation is rejected once
+work is leased and for operation kinds that cannot be safely rolled back.
+
+Sandbox creation currently completes synchronously and returns HTTP `201`.
+Stop/resume are also synchronous today; they will expose Operations when the
+provider-backed lifecycle reconciler becomes authoritative. The prompt endpoint
+returns typed `501 agent_prompt_unavailable`, and workers do not advertise the
+prompt capability.
+
 ## Design principles
 
 - Typed state over text scraping.

@@ -9,6 +9,7 @@ use crate::rows::*;
 use crate::state::*;
 use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
+use axum::http::StatusCode;
 use chrono::Utc;
 use sandboxwich_core::*;
 use serde_json::json;
@@ -84,11 +85,12 @@ pub(crate) fn looks_like_cidr(value: &str) -> bool {
     }
 }
 
+#[utoipa::path(post, path = "/v1/sandboxes", responses((status = 201, description = "Sandbox created synchronously"), (status = 400, body = ErrorEnvelope)))]
 pub(crate) async fn create_sandbox(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
     Json(request): Json<CreateSandboxRequest>,
-) -> Result<Json<SandboxResponse>, ApiError> {
+) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
     let now = Utc::now();
     let provision_spec = provision_spec_from_request(&request, None)?;
     let sandbox = Sandbox {
@@ -119,7 +121,10 @@ pub(crate) async fn create_sandbox(
     )
     .await?;
 
-    Ok(Json(SandboxResponse { ok: true, sandbox }))
+    Ok((
+        StatusCode::CREATED,
+        Json(SandboxResponse { ok: true, sandbox }),
+    ))
 }
 
 pub(crate) async fn list_sandboxes(

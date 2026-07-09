@@ -8,6 +8,7 @@ use crate::state::*;
 use crate::util::*;
 use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
+use axum::http::StatusCode;
 use chrono::Utc;
 use sandboxwich_core::*;
 use serde_json::json;
@@ -55,12 +56,13 @@ pub(crate) fn effective_command_timeout_secs(requested: Option<u64>) -> u64 {
         .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS)
 }
 
+#[utoipa::path(post, path = "/v1/sandboxes/{sandbox_id}/commands", params(("sandbox_id" = Uuid, Path)), responses((status = 202, description = "Command accepted with an Operation resource"), (status = 400, body = ErrorEnvelope)))]
 pub(crate) async fn queue_command(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
     Json(request): Json<CommandRequest>,
-) -> Result<Json<QueueCommandResponse>, ApiError> {
+) -> Result<(StatusCode, Json<QueueCommandResponse>), ApiError> {
     if request.argv.is_empty() {
         return Err(ApiError::bad_request("argv must contain at least one item"));
     }
@@ -124,18 +126,31 @@ pub(crate) async fn queue_command(
     )
     .await?;
     let command_id = command.id;
-    Ok(Json(QueueCommandResponse {
-        ok: true,
-        command,
-        queued_job: QueuedCommandJob {
-            id: job.id,
-            sandbox_id,
-            command_id,
-            kind: JobKind::RunCommand,
-            status: JobStatus::Queued,
-            required_capability: WorkerCapability::RunCommand,
-        },
-    }))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(QueueCommandResponse {
+            ok: true,
+            command,
+            queued_job: QueuedCommandJob {
+                id: job.id,
+                sandbox_id,
+                command_id,
+                kind: JobKind::RunCommand,
+                status: JobStatus::Queued,
+                required_capability: WorkerCapability::RunCommand,
+            },
+            operation: Operation {
+                id: job.id.0,
+                kind: OperationKind::RunCommand,
+                status: OperationStatus::Queued,
+                resource_id: Some(command_id.0),
+                created_at: job.created_at,
+                updated_at: job.updated_at,
+                error_code: None,
+                error_message: None,
+            },
+        }),
+    ))
 }
 
 pub(crate) async fn list_commands(
@@ -206,60 +221,17 @@ pub(crate) async fn list_command_output(
     }))
 }
 
+#[utoipa::path(post, path = "/v1/sandboxes/{sandbox_id}/prompt", params(("sandbox_id" = Uuid, Path)), responses((status = 501, body = ErrorEnvelope)))]
 pub(crate) async fn queue_prompt(
-    State(state): State<AppState>,
-    Extension(ctx): Extension<TenantContext>,
-    Path(sandbox_id): Path<Uuid>,
-    Json(request): Json<PromptRequest>,
+    State(_state): State<AppState>,
+    Extension(_ctx): Extension<TenantContext>,
+    Path(_sandbox_id): Path<Uuid>,
+    Json(_request): Json<PromptRequest>,
 ) -> Result<Json<PromptQueuedResponse>, ApiError> {
-    if request.instructions.trim().is_empty() {
-        return Err(ApiError::bad_request("instructions are required"));
-    }
-
-    let sandbox_id = SandboxId(sandbox_id);
-    let sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
-
-    let event = insert_event(
-        &state.db,
-        sandbox_id,
-        SandboxEventKind::PromptQueued,
-        json!({
-            "engine": request.engine,
-            "model": request.model,
-            "effort": request.effort,
-            "instructions": request.instructions
-        }),
-    )
-    .await?;
-    let now = Utc::now();
-    insert_job(
-        &state.db,
-        &Job {
-            id: JobId::new(),
-            tenant_id: sandbox.tenant_id,
-            kind: JobKind::RunPrompt,
-            status: JobStatus::Queued,
-            payload: json!({
-                "sandboxId": sandbox_id,
-                "promptEventId": event.id,
-                "instructions": request.instructions,
-                "engine": request.engine,
-                "model": request.model,
-                "effort": request.effort
-            }),
-            required_capability: WorkerCapability::AgentPrompt,
-            priority: 0,
-            attempts: 0,
-            max_attempts: 3,
-            scheduled_at: now,
-            created_at: now,
-            updated_at: now,
-            last_error: None,
-        },
-    )
-    .await?;
-
-    Ok(Json(PromptQueuedResponse { ok: true, event }))
+    Err(ApiError::not_implemented(
+        "agent_prompt_unavailable",
+        "agent prompt execution is not implemented",
+    ))
 }
 
 pub(crate) async fn list_events(
