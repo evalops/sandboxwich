@@ -2,6 +2,10 @@ use std::{
     collections::BTreeMap,
     io::Write,
     process::{Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -56,6 +60,35 @@ pub const DEFAULT_INGRESS_SELECTOR_VALUE: &str = "sandboxwich";
 /// `sandboxwich.dev/sandbox-id` label and must be torn down when a sandbox is stopped.
 pub const SANDBOX_TEARDOWN_RESOURCE_KINDS: &str = "pod,persistentvolumeclaim,service,networkpolicy";
 
+/// Cheaply cloneable signal a job's background lease-renewal task (see
+/// `handle_lease` in `main.rs`) uses to tell an in-flight `exec_handoff` call
+/// that the lease is gone -- renewal failed after retries -- so the
+/// long-running `kubectl exec` behind it should stop instead of running to
+/// (possibly duplicated) completion against a lease this worker can no
+/// longer prove is still its own.
+#[derive(Clone, Debug, Default)]
+pub struct CancelSignal(Arc<AtomicBool>);
+
+impl CancelSignal {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// A signal that never fires; for callers (dry-run execution, smoke
+    /// tests) with no lease-renewal loop backing them.
+    pub fn never_cancelled() -> Self {
+        Self::new()
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 pub trait SandboxProvider {
     fn capability_report(&self) -> ProviderCapabilityReport;
     fn health_report(&self) -> ProviderHealthReport;
@@ -69,6 +102,7 @@ pub trait SandboxProvider {
         sandbox_id: SandboxId,
         spec: &SandboxProvisionSpec,
         request: AgentCommandRequest,
+        cancelled: &CancelSignal,
     ) -> anyhow::Result<AgentCommandResult>;
     fn create_snapshot(
         &self,
@@ -1084,6 +1118,7 @@ impl KubernetesApplyProvider {
                     env: BTreeMap::new(),
                     timeout_secs: None,
                 },
+                &CancelSignal::never_cancelled(),
             )
             .expect("dry-run exec handoff should not fail");
         let apply_manifests = vec![
@@ -1273,6 +1308,7 @@ impl KubernetesApplyProvider {
             &args,
             "wait for sandbox pod readiness",
             self.kubectl_command_timeout,
+            None,
         )
     }
 
@@ -1294,6 +1330,7 @@ impl KubernetesApplyProvider {
             &args,
             "check sandbox pod existence",
             self.kubectl_command_timeout,
+            None,
         )?;
         if !output.success {
             bail!(
@@ -1408,14 +1445,20 @@ fn run_kubectl_documents(
 /// either inside `tokio::task::spawn_blocking` (see `handle_lease`) or
 /// directly within `#[tokio::main]`'s task, so a Tokio runtime `Handle` is
 /// always available to drive the bounded async wait below.
+/// How often a kubectl invocation polls a `CancelSignal` for cancellation
+/// while waiting on the child.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
 fn run_kubectl_command(
     kubectl: &str,
     args: &[String],
     context: &'static str,
     timeout: Duration,
+    cancelled: Option<&CancelSignal>,
 ) -> anyhow::Result<KubectlOutput> {
-    tokio::runtime::Handle::current()
-        .block_on(run_kubectl_command_async(kubectl, args, context, timeout))
+    tokio::runtime::Handle::current().block_on(run_kubectl_command_async(
+        kubectl, args, context, timeout, cancelled,
+    ))
 }
 
 async fn run_kubectl_command_async(
@@ -1423,6 +1466,7 @@ async fn run_kubectl_command_async(
     args: &[String],
     context: &'static str,
     timeout: Duration,
+    cancelled: Option<&CancelSignal>,
 ) -> anyhow::Result<KubectlOutput> {
     let mut child = tokio::process::Command::new(kubectl)
         .args(args)
@@ -1454,32 +1498,68 @@ async fn run_kubectl_command_async(
         .map(|(status, _, _)| (status, stdout, stderr))
     };
 
-    match tokio::time::timeout(timeout, drive).await {
-        Ok(result) => {
-            let (status, stdout, stderr) =
-                result.with_context(|| format!("failed to run kubectl for {context}"))?;
-            Ok(KubectlOutput {
-                success: status.success(),
-                code: status.code(),
-                status: status.to_string(),
-                stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&stderr).into_owned(),
-            })
+    // If the caller's lease renewal is lost while this kubectl invocation is
+    // in flight (e.g. a `kubectl exec` running a long command), cancelling
+    // here means the process gets killed promptly instead of running to
+    // (possibly duplicated) completion against a lease this worker can no
+    // longer prove is still its own. Callers with no lease-renewal loop
+    // behind them (e.g. `wait_for_pod_ready`, `stop`) pass `None`, which
+    // never fires.
+    let wait_for_cancellation = async {
+        match cancelled {
+            Some(cancelled) => loop {
+                if cancelled.is_cancelled() {
+                    return;
+                }
+                tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
+            },
+            None => std::future::pending().await,
         }
-        Err(_elapsed) => {
-            // `drive` (and the mutable borrow of `child` it held via
-            // `child.wait()`) was dropped when the timeout fired, so `child`
-            // is free to use again here.
+    };
+
+    tokio::select! {
+        result = tokio::time::timeout(timeout, drive) => {
+            match result {
+                Ok(result) => {
+                    let (status, stdout, stderr) =
+                        result.with_context(|| format!("failed to run kubectl for {context}"))?;
+                    Ok(KubectlOutput {
+                        success: status.success(),
+                        code: status.code(),
+                        status: status.to_string(),
+                        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                    })
+                }
+                Err(_elapsed) => {
+                    // `drive` (and the mutable borrow of `child` it held via
+                    // `child.wait()`) was dropped when the timeout fired, so
+                    // `child` is free to use again here.
+                    if let Err(kill_error) = child.start_kill() {
+                        eprintln!(
+                            "warning: failed to kill timed-out kubectl process ({context}): {kill_error}"
+                        );
+                    }
+                    // Reap the process so it doesn't linger as a zombie.
+                    let _ = child.wait().await;
+                    bail!(
+                        "kubectl {context} timed out after {timeout:?} and was killed; this is \
+                         treated as a transient infrastructure failure and retried like other \
+                         timeouts"
+                    );
+                }
+            }
+        }
+        () = wait_for_cancellation => {
             if let Err(kill_error) = child.start_kill() {
                 eprintln!(
-                    "warning: failed to kill timed-out kubectl process ({context}): {kill_error}"
+                    "warning: failed to kill cancelled kubectl process ({context}): {kill_error}"
                 );
             }
-            // Reap the process so it doesn't linger as a zombie.
             let _ = child.wait().await;
             bail!(
-                "kubectl {context} timed out after {timeout:?} and was killed; this is treated \
-                 as a transient infrastructure failure and retried like other timeouts"
+                "kubectl {context} was cancelled because lease renewal was lost; the job is \
+                 being abandoned so it isn't run twice"
             );
         }
     }
@@ -1562,6 +1642,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
         sandbox_id: SandboxId,
         spec: &SandboxProvisionSpec,
         request: AgentCommandRequest,
+        _cancelled: &CancelSignal,
     ) -> anyhow::Result<AgentCommandResult> {
         let started_at = Utc::now();
         let finished_at = Utc::now();
@@ -1760,6 +1841,7 @@ impl SandboxProvider for KubernetesApplyProvider {
         sandbox_id: SandboxId,
         spec: &SandboxProvisionSpec,
         request: AgentCommandRequest,
+        cancelled: &CancelSignal,
     ) -> anyhow::Result<AgentCommandResult> {
         // Only provision when the pod is actually missing. Re-applying the full
         // manifest set (and re-waiting up to 120s) before every command is both slow
@@ -1782,6 +1864,7 @@ impl SandboxProvider for KubernetesApplyProvider {
             &self.exec_args(sandbox_id, &request),
             "execute sandbox command",
             timeout,
+            Some(cancelled),
         )?;
         let finished_at = Utc::now();
         Ok(AgentCommandResult {
@@ -1896,6 +1979,7 @@ impl SandboxProvider for KubernetesApplyProvider {
             &args,
             "delete sandbox resources",
             self.kubectl_command_timeout,
+            None,
         )?;
         if !output.success {
             bail!(
@@ -1919,6 +2003,7 @@ mod tests {
             &["-c".to_string(), "echo hi && exit 0".to_string()],
             "test fast command",
             Duration::from_secs(5),
+            None,
         )
         .await
         .expect("fast command should succeed well within the timeout");
@@ -1941,6 +2026,7 @@ mod tests {
             &["-c".to_string(), "sleep 30".to_string()],
             "test slow command",
             Duration::from_millis(200),
+            None,
         )
         .await
         .expect_err("a command that outlives the timeout must be treated as a failure");
@@ -1954,6 +2040,46 @@ mod tests {
             elapsed < Duration::from_secs(10),
             "the timed-out child should have been killed almost immediately instead of \
              the caller waiting anywhere near its full 30s sleep; elapsed = {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_kubectl_command_async_is_cancelled_when_lease_renewal_is_lost() {
+        // Regression test for item 4(b): before this fix, `handle_lease`'s
+        // renewal task just logged and looped when renewal failed, while the
+        // job kept executing regardless -- it could be re-queued and picked
+        // up by another worker while this one was still running `kubectl
+        // exec` for it. A lost-renewal signal must cancel the in-flight
+        // kubectl invocation promptly instead of letting it run to
+        // completion.
+        let cancelled = CancelSignal::new();
+        let flip_cancelled = cancelled.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            flip_cancelled.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let error = run_kubectl_command_async(
+            "sh",
+            &["-c".to_string(), "sleep 30".to_string()],
+            "test slow command",
+            Duration::from_secs(60), // Long enough that the timeout branch can't win the race.
+            Some(&cancelled),
+        )
+        .await
+        .expect_err("a cancelled kubectl invocation must be treated as a failure");
+        let elapsed = started.elapsed();
+
+        assert!(
+            error.to_string().contains("cancelled"),
+            "error should be distinctly reported as a cancellation, got: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the cancelled child should have been killed almost immediately instead of \
+             the caller waiting anywhere near its full 30s sleep or 60s timeout; \
+             elapsed = {elapsed:?}"
         );
     }
 
@@ -2043,6 +2169,7 @@ mod tests {
                     env: BTreeMap::new(),
                     timeout_secs: None,
                 },
+                &CancelSignal::never_cancelled(),
             )
             .expect("dry-run exec should succeed");
         assert_eq!(exec.exit_code, Some(0));
