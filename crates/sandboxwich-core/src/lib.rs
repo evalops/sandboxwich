@@ -1939,9 +1939,9 @@ mod tests {
     }
 
     #[test]
-    fn stop_excludes_only_archived() {
+    fn stop_excludes_archiving_and_archived() {
         for from in SandboxState::ALL {
-            let expected = from != SandboxState::Archived;
+            let expected = !matches!(from, SandboxState::Archiving | SandboxState::Archived);
             assert_eq!(
                 SandboxState::STOP_LEGAL_FROM.contains(&from),
                 expected,
