@@ -1,0 +1,59 @@
+name: kubernetes-conformance
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/kubernetes-conformance.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "Dockerfile"
+      - "crates/**"
+      - "deploy/kubernetes/**"
+      - "deploy/runtime/ubuntu-dev/**"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kubernetes-conformance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kind:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install pinned kind
+        run: |
+          curl -fsSLo kind https://kind.sigs.k8s.io/dl/v0.29.0/kind-linux-amd64
+          echo c72eda46430f065fb45c5f70e7c957cc9209402ef309294821978677c8fb3284  kind | sha256sum --check
+          sudo install -m 0755 kind /usr/local/bin/kind
+      - name: Build conformance binaries and images
+        run: |
+          cargo build -p sandboxwich-worker
+          docker build --build-arg BIN=sandboxwich-api -t sandboxwich-api:conformance .
+          docker build --build-arg BIN=sandboxwich-worker -t sandboxwich-worker:conformance .
+          docker build -t sandboxwich-runtime:conformance deploy/runtime/ubuntu-dev
+          docker build -f deploy/kubernetes/postgres.Dockerfile -t postgres:conformance .
+      - name: Create disposable cluster
+        run: >-
+          kind create cluster --name sandboxwich-conformance
+          --config deploy/kubernetes/kind-conformance.yaml --wait 120s
+      - name: Run live conformance and chaos checks
+        run: deploy/kubernetes/kind-conformance.sh
+      - name: Collect cluster diagnostics
+        if: failure()
+        run: |
+          kubectl get all -A -o wide
+          kubectl get events -A --sort-by=.lastTimestamp
+          kubectl -n sandboxwich logs deployment/sandboxwich-api --tail=200 || true
+          kubectl -n sandboxwich logs deployment/sandboxwich-worker --tail=200 || true
+      - name: Delete disposable cluster
+        if: always()
+        run: kind delete cluster --name sandboxwich-conformance
