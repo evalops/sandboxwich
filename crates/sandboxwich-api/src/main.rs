@@ -1339,8 +1339,23 @@ async fn readyz(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
-    let body = collect_prometheus_metrics(&state.db).await?;
+async fn metrics(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    // Ordinary tenant credentials only ever see their own tenant's counts: an
+    // authenticated tenant token must never be able to read another tenant's
+    // sandbox/worker/job/lease volumes. The dedicated operator credential
+    // (already used to gate `/snapshots/cleanup`) additionally unlocks the
+    // unscoped, cross-tenant view that operator tooling (e.g. a Prometheus
+    // scraper) legitimately needs.
+    let tenant_scope = if is_operator_request(&state, &headers) {
+        None
+    } else {
+        Some(ctx.tenant_id.as_str())
+    };
+    let body = collect_prometheus_metrics(&state.db, tenant_scope).await?;
     Ok((
         [(
             header::CONTENT_TYPE,
@@ -1359,8 +1374,11 @@ async fn check_database_health(db: &Database) -> Result<HealthComponent, ApiErro
     })
 }
 
-async fn collect_prometheus_metrics(db: &Database) -> Result<String, ApiError> {
-    let metrics = fetch_prometheus_metrics(db).await?;
+async fn collect_prometheus_metrics(
+    db: &Database,
+    tenant_id: Option<&str>,
+) -> Result<String, ApiError> {
+    let metrics = fetch_prometheus_metrics(db, tenant_id).await?;
     let mut body = String::new();
     append_count_family(
         &mut body,
@@ -1423,35 +1441,89 @@ impl PrometheusMetrics {
     }
 }
 
-async fn fetch_prometheus_metrics(db: &Database) -> Result<PrometheusMetrics, ApiError> {
-    let rows = sqlx::query(
-        "select 'sandbox' as family, state as label, count(*) as value
-         from sandboxes
-         group by state
-         union all
-         select 'worker' as family, status as label, count(*) as value
-         from workers
-         group by status
-         union all
-         select 'job' as family, status as label, count(*) as value
-         from jobs
-         group by status
-         union all
-         select 'runtime_resource' as family, status as label, count(*) as value
-         from runtime_resources
-         group by status
-         union all
-         select 'job_leases_active' as family, '' as label, count(*) as value
-         from job_leases
-         where status = 'active'
-         union all
-         select 'worker_capacity_slots' as family, '' as label, coalesce(sum(max_concurrent_jobs), 0) as value
-         from workers
-         where status = 'online'
-         order by family asc, label asc",
-    )
-    .fetch_all(&db.pool)
-    .await?;
+/// Fetch aggregate counts for the Prometheus exposition.
+///
+/// `tenant_id: None` returns global, cross-tenant totals and must only ever be reached via the
+/// operator credential (see [`metrics`]); `Some(tenant_id)` scopes every aggregate to that
+/// tenant's own resources so an ordinary tenant bearer token can never observe another tenant's
+/// sandbox/worker/job/lease volumes.
+async fn fetch_prometheus_metrics(
+    db: &Database,
+    tenant_id: Option<&str>,
+) -> Result<PrometheusMetrics, ApiError> {
+    let sql = match tenant_id {
+        None => "select 'sandbox' as family, state as label, count(*) as value
+             from sandboxes
+             group by state
+             union all
+             select 'worker' as family, status as label, count(*) as value
+             from workers
+             group by status
+             union all
+             select 'job' as family, status as label, count(*) as value
+             from jobs
+             group by status
+             union all
+             select 'runtime_resource' as family, status as label, count(*) as value
+             from runtime_resources
+             group by status
+             union all
+             select 'job_leases_active' as family, '' as label, count(*) as value
+             from job_leases
+             where status = 'active'
+             union all
+             select 'worker_capacity_slots' as family, '' as label, coalesce(sum(max_concurrent_jobs), 0) as value
+             from workers
+             where status = 'online'
+             order by family asc, label asc"
+            .to_string(),
+        Some(_) => format!(
+            "select 'sandbox' as family, state as label, count(*) as value
+             from sandboxes
+             where tenant_id = {p1}
+             group by state
+             union all
+             select 'worker' as family, status as label, count(*) as value
+             from workers
+             where tenant_id = {p2}
+             group by status
+             union all
+             select 'job' as family, status as label, count(*) as value
+             from jobs
+             where tenant_id = {p3}
+             group by status
+             union all
+             select 'runtime_resource' as family, runtime_resources.status as label, count(*) as value
+             from runtime_resources
+             join sandboxes on sandboxes.id = runtime_resources.sandbox_id
+             where sandboxes.tenant_id = {p4}
+             group by runtime_resources.status
+             union all
+             select 'job_leases_active' as family, '' as label, count(*) as value
+             from job_leases
+             join jobs on jobs.id = job_leases.job_id
+             where job_leases.status = 'active' and jobs.tenant_id = {p5}
+             union all
+             select 'worker_capacity_slots' as family, '' as label, coalesce(sum(max_concurrent_jobs), 0) as value
+             from workers
+             where status = 'online' and tenant_id = {p6}
+             order by family asc, label asc",
+            p1 = db.placeholder(1),
+            p2 = db.placeholder(2),
+            p3 = db.placeholder(3),
+            p4 = db.placeholder(4),
+            p5 = db.placeholder(5),
+            p6 = db.placeholder(6),
+        ),
+    };
+
+    let mut query = sqlx::query(&sql);
+    if let Some(tenant_id) = tenant_id {
+        for _ in 0..6 {
+            query = query.bind(tenant_id.to_string());
+        }
+    }
+    let rows = query.fetch_all(&db.pool).await?;
 
     let mut values = BTreeMap::new();
     for row in rows {
@@ -2265,18 +2337,28 @@ async fn get_snapshot(
 /// sufficient to run it. See issue #65.
 const OPERATOR_TOKEN_HEADER: &str = "x-sandboxwich-operator-token";
 
-fn ensure_operator_authorized(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+/// Whether `headers` carries a valid operator credential, if one is configured at all. Unlike
+/// [`ensure_operator_authorized`], a missing/unconfigured operator token is not an error here --
+/// callers (e.g. [`metrics`]) treat that as "not an operator" and fall back to tenant-scoped
+/// behavior instead of failing the request.
+fn is_operator_request(state: &AppState, headers: &HeaderMap) -> bool {
     let Some(expected_token) = &state.auth.operator_token else {
+        return false;
+    };
+    headers
+        .get(OPERATOR_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected_token.as_bytes()))
+}
+
+fn ensure_operator_authorized(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    if state.auth.operator_token.is_none() {
         return Err(ApiError::internal(
             "snapshot cleanup is disabled: set SANDBOXWICH_OPERATOR_TOKEN to a dedicated \
              operator credential (distinct from tenant tokens) to enable /snapshots/cleanup",
         ));
-    };
-    let authorized = headers
-        .get(OPERATOR_TOKEN_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected_token.as_bytes()));
-    if !authorized {
+    }
+    if !is_operator_request(state, headers) {
         return Err(ApiError::unauthorized(format!(
             "a valid {OPERATOR_TOKEN_HEADER} header is required to run snapshot cleanup"
         )));
