@@ -113,10 +113,12 @@ pub(crate) async fn queue_command(
         last_error: None,
     };
 
-    insert_command(&state.db, &command).await?;
-    insert_job(&state.db, &job).await?;
-    insert_event(
+    let mut tx = state.db.pool.begin().await?;
+    insert_command_on_connection(&state.db, &mut tx, &command).await?;
+    insert_job_on_connection(&state.db, &mut tx, &job).await?;
+    insert_event_on_connection(
         &state.db,
+        &mut tx,
         sandbox_id,
         SandboxEventKind::CommandQueued,
         json!({
@@ -125,6 +127,7 @@ pub(crate) async fn queue_command(
         }),
     )
     .await?;
+    tx.commit().await?;
     let command_id = command.id;
     Ok((
         StatusCode::ACCEPTED,
@@ -580,7 +583,11 @@ pub(crate) async fn reset_command_for_retry_on_connection(
     Ok(())
 }
 
-pub(crate) async fn insert_command(db: &Database, command: &CommandRun) -> Result<(), ApiError> {
+pub(crate) async fn insert_command_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    command: &CommandRun,
+) -> Result<(), ApiError> {
     let sql = format!(
         "insert into commands
          (id, sandbox_id, status, argv, cwd, exit_code, stdout, stderr, created_at, finished_at)
@@ -598,7 +605,7 @@ pub(crate) async fn insert_command(db: &Database, command: &CommandRun) -> Resul
         .bind(&command.stderr)
         .bind(command.created_at.to_rfc3339())
         .bind(command.finished_at.map(|time| time.to_rfc3339()))
-        .execute(&db.pool)
+        .execute(&mut *connection)
         .await?;
     Ok(())
 }
