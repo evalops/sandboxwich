@@ -497,16 +497,16 @@ impl SandboxState {
         SandboxState::Ready,
         SandboxState::Running,
         SandboxState::Idle,
-        SandboxState::Archiving,
         SandboxState::Error,
     ];
+
+    /// A provider-confirmed teardown completes an archival already in progress.
+    pub const STOP_COMPLETED_LEGAL_FROM: &'static [SandboxState] = &[SandboxState::Archiving];
 
     /// A sandbox can only be resumed from `Archived`. Resuming from any other
     /// state (in particular `Error`) would either race a job that is still
     /// writing to the sandbox, or paper over a failure that a fresh
     /// fork/create should handle instead.
-    pub const RESUME_LEGAL_FROM: &'static [SandboxState] = &[SandboxState::Archived];
-
     /// A `ForkSandbox` job being claimed by a worker moves its child sandbox
     /// out of `Planning` (queued, waiting on the parent snapshot) into
     /// `Provisioning`.
@@ -538,7 +538,6 @@ impl SandboxState {
         SandboxState::Ready,
         SandboxState::Running,
         SandboxState::Idle,
-        SandboxState::Archiving,
         SandboxState::Error,
     ];
 
@@ -555,22 +554,20 @@ impl SandboxState {
     /// | Planning     | Provisioning | `ForkSandbox` job claimed                              |
     /// | Planning     | Ready        | `ProvisionSandbox` job completed                       |
     /// | Planning     | Error        | parent `CreateSnapshot` job failed                     |
-    /// | Planning     | Archived     | user stop                                              |
+    /// | Planning     | Archiving    | user stop requested                                    |
     /// | Provisioning | Ready        | `ForkSandbox`/`ProvisionSandbox` job completed          |
     /// | Provisioning | Planning     | `ForkSandbox` job retried                              |
     /// | Provisioning | Error        | `ForkSandbox` job permanently failed                    |
-    /// | Provisioning | Archived     | user stop                                              |
+    /// | Provisioning | Archiving    | user stop requested                                    |
     /// | Ready        | Ready        | `ProvisionSandbox` job completed (reprovision, no-op)   |
-    /// | Ready        | Archived     | user stop                                              |
+    /// | Ready        | Archiving    | user stop requested                                    |
     /// | Running      | Ready        | `ProvisionSandbox` job completed                       |
-    /// | Running      | Archived     | user stop                                              |
+    /// | Running      | Archiving    | user stop requested                                    |
     /// | Idle         | Ready        | `ProvisionSandbox` job completed                       |
-    /// | Idle         | Archived     | user stop                                              |
-    /// | Archiving    | Ready        | `ProvisionSandbox` job completed                       |
-    /// | Archiving    | Archived     | user stop                                              |
+    /// | Idle         | Archiving    | user stop requested                                    |
+    /// | Archiving    | Archived     | provider-confirmed stop completion                     |
     /// | Error        | Ready        | `ProvisionSandbox` job completed (manual retry)         |
-    /// | Error        | Archived     | user stop (archive/cleanup a failed sandbox)            |
-    /// | Archived     | Ready        | user resume                                            |
+    /// | Error        | Archiving    | user stop requested                                    |
     ///
     /// This is a coarse union of every `_LEGAL_FROM` constant above and is
     /// used as a database-level backstop trigger (see
@@ -582,8 +579,8 @@ impl SandboxState {
     /// Application code must use the specific `_LEGAL_FROM` constant for the
     /// action it is performing.
     pub fn can_transition_to(&self, next: &SandboxState) -> bool {
-        (Self::STOP_LEGAL_FROM.contains(self) && *next == SandboxState::Archived)
-            || (Self::RESUME_LEGAL_FROM.contains(self) && *next == SandboxState::Ready)
+        (Self::STOP_LEGAL_FROM.contains(self) && *next == SandboxState::Archiving)
+            || (Self::STOP_COMPLETED_LEGAL_FROM.contains(self) && *next == SandboxState::Archived)
             || (Self::FORK_CLAIMED_LEGAL_FROM.contains(self) && *next == SandboxState::Provisioning)
             || (Self::FORK_COMPLETED_LEGAL_FROM.contains(self) && *next == SandboxState::Ready)
             || (Self::FORK_RETRIED_LEGAL_FROM.contains(self) && *next == SandboxState::Planning)
@@ -1905,22 +1902,20 @@ mod tests {
             (Planning, Provisioning),
             (Planning, Ready),
             (Planning, Error),
-            (Planning, Archived),
+            (Planning, Archiving),
             (Provisioning, Ready),
             (Provisioning, Planning),
             (Provisioning, Error),
-            (Provisioning, Archived),
+            (Provisioning, Archiving),
             (Ready, Ready),
-            (Ready, Archived),
+            (Ready, Archiving),
             (Running, Ready),
-            (Running, Archived),
+            (Running, Archiving),
             (Idle, Ready),
-            (Idle, Archived),
-            (Archiving, Ready),
+            (Idle, Archiving),
             (Archiving, Archived),
             (Error, Ready),
-            (Error, Archived),
-            (Archived, Ready),
+            (Error, Archiving),
         ];
 
         for from in SandboxState::ALL {
@@ -1936,15 +1931,8 @@ mod tests {
     }
 
     #[test]
-    fn resume_is_legal_only_from_archived() {
-        for from in SandboxState::ALL {
-            let expected = from == SandboxState::Archived;
-            assert_eq!(
-                SandboxState::RESUME_LEGAL_FROM.contains(&from),
-                expected,
-                "resume legality for {from:?} should be {expected}"
-            );
-        }
+    fn archived_has_no_legal_resume_edge() {
+        assert!(!SandboxState::Archived.can_transition_to(&SandboxState::Ready));
         assert_eq!(
             SandboxState::legal_predecessors(&SandboxState::Ready),
             vec![
@@ -1953,20 +1941,16 @@ mod tests {
                 SandboxState::Ready,
                 SandboxState::Running,
                 SandboxState::Idle,
-                SandboxState::Archiving,
-                SandboxState::Archived,
                 SandboxState::Error,
             ],
-            "every state can reach Ready via some action (resume or provision-complete), \
-             which is exactly why resume must use RESUME_LEGAL_FROM directly instead of \
-             this general reverse lookup"
+            "archived sandboxes cannot become ready until a real restore contract exists"
         );
     }
 
     #[test]
-    fn stop_excludes_only_archived() {
+    fn stop_excludes_archiving_and_archived() {
         for from in SandboxState::ALL {
-            let expected = from != SandboxState::Archived;
+            let expected = !matches!(from, SandboxState::Archiving | SandboxState::Archived);
             assert_eq!(
                 SandboxState::STOP_LEGAL_FROM.contains(&from),
                 expected,
@@ -1976,13 +1960,13 @@ mod tests {
     }
 
     #[test]
-    fn provision_completed_excludes_only_archived() {
+    fn provision_completed_excludes_archiving_and_archived() {
         for from in SandboxState::ALL {
-            let expected = from != SandboxState::Archived;
+            let expected = !matches!(from, SandboxState::Archiving | SandboxState::Archived);
             assert_eq!(
                 SandboxState::PROVISION_COMPLETED_LEGAL_FROM.contains(&from),
                 expected,
-                "a concurrently-archived sandbox must never be resurrected by a \
+                "a stopping or archived sandbox must never be resurrected by a \
                  completing ProvisionSandbox job: {from:?} should be {expected}"
             );
         }

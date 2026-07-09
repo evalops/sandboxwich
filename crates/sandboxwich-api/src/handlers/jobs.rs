@@ -324,6 +324,7 @@ pub(crate) async fn try_claim_job(
             job: fetch_job_on_connection(db, &mut tx, job.id).await?,
         };
         insert_lease_on_connection(db, &mut tx, &lease).await?;
+        bind_sandbox_placement_on_connection(db, &mut tx, &lease.job, worker).await?;
         if let Some(operation_id) = operation_id {
             let sql = format!(
                 "insert into lease_claim_operations (worker_id, operation_id, lease_id, created_at)
@@ -358,6 +359,42 @@ pub(crate) async fn try_claim_job(
             Err(error)
         }
     }
+}
+
+async fn bind_sandbox_placement_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    job: &Job,
+    worker: &Worker,
+) -> Result<(), ApiError> {
+    let sandbox_id = match job.kind {
+        JobKind::ProvisionSandbox => Some(sandbox_id_from_job(job)?),
+        JobKind::ForkSandbox => Some(child_sandbox_id_from_job(job)?),
+        _ => None,
+    };
+    let Some(sandbox_id) = sandbox_id else {
+        return Ok(());
+    };
+    let now = Utc::now().to_rfc3339();
+    let sql = format!(
+        "insert into sandbox_placements (sandbox_id, worker_id, provider, cluster, generation, created_at, updated_at)
+         values ({})
+         on conflict (sandbox_id) do update set worker_id = excluded.worker_id,
+           provider = excluded.provider, cluster = excluded.cluster,
+           generation = sandbox_placements.generation + 1, updated_at = excluded.updated_at",
+        db.placeholders(7)
+    );
+    sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .bind(worker.id.to_string())
+        .bind(&worker.provider)
+        .bind(worker.labels.get("cluster"))
+        .bind(1_i64)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *connection)
+        .await?;
+    Ok(())
 }
 
 pub(crate) async fn lock_worker_for_claim_on_connection(
