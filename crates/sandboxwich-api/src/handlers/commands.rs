@@ -172,6 +172,10 @@ pub(crate) async fn list_command_output(
         list_command_output_chunks(&state.db, command_id, limit, &cursor).await?;
     Ok(Json(CommandOutputListResponse {
         ok: true,
+        complete: matches!(
+            command.status,
+            CommandStatus::Finished | CommandStatus::Failed
+        ),
         chunks,
         next_cursor,
     }))
@@ -283,7 +287,32 @@ pub(crate) async fn fetch_command(
         .await?
         .ok_or_else(|| ApiError::not_found("command not found"))?;
 
-    row_to_command(row)
+    let mut command = row_to_command(row)?;
+    // Chunks are the canonical streaming representation. Materialize the
+    // compatibility stdout/stderr fields on reads without rewriting an
+    // ever-growing aggregate for every append.
+    let sql = format!(
+        "select stream, chunk from command_output_chunks
+         where command_id = {} order by stream asc, sequence asc",
+        db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(command_id.to_string())
+        .fetch_all(&db.pool)
+        .await?;
+    if !rows.is_empty() {
+        command.stdout.clear();
+        command.stderr.clear();
+        for row in rows {
+            let stream: String = row.try_get("stream")?;
+            let chunk: String = row.try_get("chunk")?;
+            match parse_command_output_stream(&stream)? {
+                CommandOutputStream::Stdout => command.stdout.push_str(&chunk),
+                CommandOutputStream::Stderr => command.stderr.push_str(&chunk),
+            }
+        }
+    }
+    Ok(command)
 }
 
 pub(crate) async fn list_command_output_chunks(
@@ -380,14 +409,6 @@ pub(crate) async fn append_command_output_chunk_on_connection(
         .execute(&mut *connection)
         .await?;
 
-    append_command_output_to_command_on_connection(
-        db,
-        connection,
-        command_id,
-        &output_chunk.stream,
-        &output_chunk.chunk,
-    )
-    .await?;
     insert_event_on_connection(
         db,
         connection,
@@ -396,8 +417,7 @@ pub(crate) async fn append_command_output_chunk_on_connection(
         json!({
             "commandId": command_id,
             "stream": output_chunk.stream,
-            "sequence": output_chunk.sequence,
-            "chunk": output_chunk.chunk
+            "sequence": output_chunk.sequence
         }),
     )
     .await?;
@@ -450,32 +470,6 @@ pub(crate) async fn next_command_output_sequence_on_connection(
         .ok_or_else(|| ApiError::internal("command output sequence overflow"))?;
     u64::try_from(next)
         .map_err(|_| ApiError::internal("database contains invalid command output sequence"))
-}
-
-pub(crate) async fn append_command_output_to_command_on_connection(
-    db: &Database,
-    connection: &mut AnyConnection,
-    command_id: CommandId,
-    stream: &CommandOutputStream,
-    chunk: &str,
-) -> Result<(), ApiError> {
-    let column = stream.as_db_str();
-    let sql = format!(
-        "update commands
-         set {column} = {column} || {}
-         where id = {}",
-        db.placeholder(1),
-        db.placeholder(2)
-    );
-    let result = sqlx::query(&sql)
-        .bind(chunk)
-        .bind(command_id.to_string())
-        .execute(&mut *connection)
-        .await?;
-    if result.rows_affected() == 0 {
-        return Err(ApiError::not_found("command not found"));
-    }
-    Ok(())
 }
 
 pub(crate) async fn reset_command_for_retry_on_connection(

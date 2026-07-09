@@ -246,7 +246,7 @@ pub(crate) async fn maybe_insert_guest_failure_event(
     insert_event(
         db,
         guest_health.sandbox_id,
-        SandboxEventKind::DesktopExpired,
+        SandboxEventKind::GuestHealthFailed,
         json!({
             "reason": reason,
             "guestStatus": &guest_health.status,
@@ -456,5 +456,45 @@ pub(crate) async fn insert_worker_heartbeat(
         .bind(created_at.to_rfc3339())
         .execute(&db.pool)
         .await?;
+    Ok(())
+}
+
+/// Reconciles liveness from durable heartbeat timestamps and bounds the
+/// append-only heartbeat history. This is deliberately idempotent so every
+/// API replica may run the periodic controller safely.
+pub(crate) async fn reconcile_worker_liveness(db: &Database) -> Result<(), ApiError> {
+    let now = Utc::now();
+    let offline_before = now - chrono::Duration::seconds(90);
+    let sql = format!(
+        "update workers set status = {}
+         where status in ('online', 'draining')
+           and (last_heartbeat_at is null or last_heartbeat_at < {})",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    sqlx::query(&sql)
+        .bind(worker_status_to_str(&WorkerStatus::Offline))
+        .bind(offline_before.to_rfc3339())
+        .execute(&db.pool)
+        .await?;
+
+    let retain_after = now - chrono::Duration::days(7);
+    let select_sql = format!(
+        "select id from worker_heartbeats where created_at < {}
+         order by created_at asc, id asc limit 1000",
+        db.placeholder(1)
+    );
+    let rows = sqlx::query(&select_sql)
+        .bind(retain_after.to_rfc3339())
+        .fetch_all(&db.pool)
+        .await?;
+    for row in rows {
+        let id: String = row.try_get("id")?;
+        let delete_sql = format!(
+            "delete from worker_heartbeats where id = {}",
+            db.placeholder(1)
+        );
+        sqlx::query(&delete_sql).bind(id).execute(&db.pool).await?;
+    }
     Ok(())
 }

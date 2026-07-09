@@ -1258,6 +1258,8 @@ pub struct CommandOutputChunkResponse {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CommandOutputListResponse {
     pub ok: bool,
+    /// False while the command may still append more chunks.
+    pub complete: bool,
     pub chunks: Vec<CommandOutputChunk>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
@@ -1303,6 +1305,7 @@ pub enum SandboxEventKind {
     DesktopFailed => "desktop_failed",
     DesktopClosed => "desktop_closed",
     DesktopExpired => "desktop_expired",
+    GuestHealthFailed => "guest_health_failed",
     FileUploaded => "file_uploaded",
 }
 }

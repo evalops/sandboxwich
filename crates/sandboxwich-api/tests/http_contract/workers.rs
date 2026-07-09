@@ -528,7 +528,7 @@ pub(crate) async fn assert_guest_health_and_ssh_key_lifecycle(
         .await
         .unwrap();
     assert!(health_events.events.iter().any(|event| {
-        event.kind == SandboxEventKind::DesktopExpired
+        event.kind == SandboxEventKind::GuestHealthFailed
             && event.data["reason"] == serde_json::json!("guest_unhealthy")
     }));
 

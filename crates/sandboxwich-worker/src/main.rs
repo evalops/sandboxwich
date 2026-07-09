@@ -131,6 +131,9 @@ struct ClaimArgs {
 
     #[arg(long)]
     lease_seconds: Option<u64>,
+
+    #[arg(skip)]
+    operation_id: Option<Uuid>,
 }
 
 #[derive(Debug, Args)]
@@ -567,7 +570,10 @@ async fn main() -> anyhow::Result<()> {
                 args.provider,
                 capabilities_from_args(args.capability, None),
                 args.label.into_iter().collect(),
-                args.max_concurrent_jobs,
+                // This process executes one lease at a time. Advertise the
+                // capacity it can actually deliver instead of oversubscribing
+                // the scheduler when a larger CLI value is supplied.
+                Some(1),
             )
             .await?;
             println!("{}", serde_json::to_string_pretty(&response)?);
@@ -699,6 +705,7 @@ async fn main() -> anyhow::Result<()> {
                 ClaimArgs {
                     worker_id: args.worker_id,
                     lease_seconds: args.lease_seconds,
+                    operation_id: Some(Uuid::now_v7()),
                 },
             )
             .await?;
@@ -847,6 +854,10 @@ async fn claim(
 ) -> anyhow::Result<ClaimLeaseResponse> {
     let response = client
         .post(format!("{api}/workers/{}/leases/claim", args.worker_id))
+        .header(
+            "idempotency-key",
+            args.operation_id.unwrap_or_else(Uuid::now_v7).to_string(),
+        )
         .json(&ClaimLeaseRequest {
             lease_seconds: args.lease_seconds,
         })
@@ -1116,6 +1127,7 @@ async fn work_loop(
         let claim_args = ClaimArgs {
             worker_id: args.worker_id,
             lease_seconds: args.lease_seconds,
+            operation_id: Some(Uuid::now_v7()),
         };
         let response = match with_retries("claim lease", API_RETRY_ATTEMPTS, || {
             claim(client, api, claim_args)
