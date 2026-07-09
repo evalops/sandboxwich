@@ -174,7 +174,9 @@ async fn main() -> anyhow::Result<()> {
         spawn_expiry_sweeper(db.clone(), Duration::from_millis(config.sweep_interval_ms));
     }
 
-    let listener = tokio::net::TcpListener::bind(config.bind).await?;
+    let listener = tokio::net::TcpListener::bind(config.bind)
+        .await
+        .with_context(|| format!("failed to bind SANDBOXWICH_BIND={}", config.bind))?;
     tracing::info!(addr = %config.bind, database_url = %config.database_url, "sandboxwich-api listening");
     axum::serve(
         listener,
