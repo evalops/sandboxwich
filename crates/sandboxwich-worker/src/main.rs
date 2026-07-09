@@ -5,7 +5,8 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use provider::{
-    KUBERNETES_MUTATION_ENV, KubernetesApplyProvider, KubernetesDryRunProvider, SandboxProvider,
+    DEFAULT_MAX_CAPTURED_OUTPUT_BYTES, KUBERNETES_MUTATION_ENV, KubernetesApplyProvider,
+    KubernetesDryRunProvider, SandboxProvider,
 };
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse,
@@ -23,6 +24,14 @@ struct Cli {
     #[arg(long, env = "SANDBOXWICH_API", default_value = "http://127.0.0.1:3217")]
     api: String,
 
+    /// For `register`/`run`: a tenant-wide token, used only to authenticate
+    /// the initial `POST /workers/register` call. `run` then mints and
+    /// switches to a worker-scoped token (GH-64) for everything after
+    /// registration, so this value is never reused for lease/guest-health
+    /// calls in that path. For every other subcommand (`work-loop`, `claim`,
+    /// `renew`, `complete`, `fail`, `heartbeat`), pass the worker-scoped
+    /// token returned by `register` here instead -- those routes reject
+    /// tenant-wide tokens.
     #[arg(long, env = "SANDBOXWICH_API_TOKEN")]
     api_token: Option<String>,
 
@@ -96,6 +105,11 @@ struct RunArgs {
     #[arg(long)]
     max_iterations: Option<u64>,
 
+    /// How long to wait for an in-flight lease to finish after a shutdown signal
+    /// (SIGTERM/SIGINT) is received before giving up and exiting anyway.
+    #[arg(long, default_value_t = DEFAULT_DRAIN_TIMEOUT_SECS)]
+    drain_timeout_secs: u64,
+
     #[command(flatten)]
     provider: RuntimeProviderArgs,
 }
@@ -145,6 +159,11 @@ struct WorkLoopArgs {
 
     #[arg(long = "label", value_parser = parse_label)]
     label: Vec<(String, String)>,
+
+    /// How long to wait for an in-flight lease to finish after a shutdown signal
+    /// (SIGTERM/SIGINT) is received before giving up and exiting anyway.
+    #[arg(long, default_value_t = DEFAULT_DRAIN_TIMEOUT_SECS)]
+    drain_timeout_secs: u64,
 
     #[command(flatten)]
     provider: RuntimeProviderArgs,
@@ -283,6 +302,16 @@ struct RuntimeProviderArgs {
 
     #[arg(long, default_value_t = false)]
     confirm_apply: bool,
+
+    /// Cap on the stdout/stderr captured from each kubectl invocation before it's
+    /// stored in job results and provider metadata. Mirrors sandboxwich-agent's
+    /// equivalent flag.
+    #[arg(
+        long,
+        env = "SANDBOXWICH_MAX_CAPTURED_OUTPUT_BYTES",
+        default_value_t = DEFAULT_MAX_CAPTURED_OUTPUT_BYTES
+    )]
+    max_captured_output_bytes: u64,
 }
 
 #[derive(Debug, Args)]
@@ -301,6 +330,16 @@ struct ProviderApplyArgs {
 
     #[arg(long, default_value_t = false)]
     keep_resources: bool,
+
+    /// Cap on the stdout/stderr captured from each kubectl invocation before it's
+    /// stored in job results and provider metadata. Mirrors sandboxwich-agent's
+    /// equivalent flag.
+    #[arg(
+        long,
+        env = "SANDBOXWICH_MAX_CAPTURED_OUTPUT_BYTES",
+        default_value_t = DEFAULT_MAX_CAPTURED_OUTPUT_BYTES
+    )]
+    max_captured_output_bytes: u64,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -584,14 +623,29 @@ async fn main() -> anyhow::Result<()> {
                     "registered": response.worker
                 }))?
             );
+            // GH-64: registration mints a credential scoped to this worker's
+            // id, distinct from the tenant token used above to register.
+            // Guest-facing routes (lease claim/renew/complete/fail/output,
+            // guest-health) now reject tenant-wide tokens outright, so the
+            // rest of this process -- its own heartbeat/claim/renew/
+            // complete/fail calls, and whatever it injects into the
+            // sandboxes it provisions -- must use the worker token instead
+            // of `cli.api_token` from here on.
+            let worker_token = response.worker_token.context(
+                "registration response did not include a worker-scoped token; is \
+                 sandboxwich-api up to date? (see GH-64)",
+            )?;
+            let worker_client = build_api_client(Some(&worker_token), cli.tenant.as_deref())
+                .context("failed to build worker-scoped API client")?;
             work_loop(
-                &client,
+                &worker_client,
                 &api,
                 WorkLoopArgs {
                     worker_id: response.worker.id.0,
                     lease_seconds: args.lease_seconds,
                     idle_sleep_ms: args.idle_sleep_ms,
                     max_iterations: args.max_iterations,
+                    drain_timeout_secs: args.drain_timeout_secs,
                     label: labels.into_iter().collect(),
                     provider: args.provider,
                 },
@@ -691,6 +745,7 @@ fn apply_provider_from_args(args: ProviderApplyArgs) -> KubernetesApplyProvider 
     KubernetesApplyProvider::new(provider, args.kubectl)
         .with_kubectl_context(args.kubectl_context)
         .with_mutation_gate(args.confirm_apply, mutation_enabled)
+        .with_max_captured_output_bytes(args.max_captured_output_bytes)
 }
 
 fn runtime_provider_from_args(args: RuntimeProviderArgs) -> RuntimeProvider {
@@ -709,7 +764,8 @@ fn runtime_provider_from_args(args: RuntimeProviderArgs) -> RuntimeProvider {
             RuntimeProvider::Apply(
                 KubernetesApplyProvider::new(provider, args.kubectl)
                     .with_kubectl_context(args.kubectl_context)
-                    .with_mutation_gate(args.confirm_apply, mutation_enabled),
+                    .with_mutation_gate(args.confirm_apply, mutation_enabled)
+                    .with_max_captured_output_bytes(args.max_captured_output_bytes),
             )
         }
     }
@@ -779,6 +835,14 @@ const RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(10);
 /// Minimum lease-renewal interval, so short/dry-run leases don't hammer the API.
 const MIN_RENEW_INTERVAL: Duration = Duration::from_secs(5);
+/// Default bound on how long `work_loop` waits for an in-flight lease to finish
+/// after a shutdown signal before giving up and exiting anyway (see
+/// `wait_for_shutdown_signal` and the `--drain-timeout-secs` flag).
+const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 300;
+/// How often the drain watchdog polls the shutdown flag while a lease is being
+/// handled. Small relative to any realistic drain timeout, so it doesn't add
+/// meaningful latency to the shutdown-requested -> timeout-elapsed window.
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Fallback lease duration used to size the renewal interval if a lease's
 /// `expires_at`/`leased_at` pair is somehow non-positive.
 const FALLBACK_LEASE_DURATION: Duration = Duration::from_secs(30);
@@ -843,12 +907,94 @@ fn classify_retry(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Waits for SIGTERM or SIGINT (`Ctrl-C`). On non-Unix targets, only `Ctrl-C`
+/// is available. Kubernetes sends SIGTERM to stop a pod, so this must not
+/// only cover `ctrl_c()` -- that alone never fires under a real Deployment.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(signal) => signal,
+            Err(error) => {
+                eprintln!("warning: failed to install SIGTERM handler: {error:#}");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+
+        tokio::select! {
+            _ = sigterm.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Spawns a background task that sets `shutdown` once a shutdown signal
+/// arrives, so the main work loop (which is not itself listening for
+/// signals mid-iteration) can observe it via a plain flag check.
+fn spawn_shutdown_listener() -> Arc<std::sync::atomic::AtomicBool> {
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = shutdown.clone();
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        eprintln!(
+            "worker: received shutdown signal; will stop claiming new leases and let any \
+             in-flight lease finish (bounded by --drain-timeout-secs)"
+        );
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    shutdown
+}
+
+/// Sleeps for `duration`, but wakes early (and returns) as soon as `shutdown`
+/// is observed, so an idle worker doesn't sit through a full idle-sleep
+/// interval after a shutdown signal before exiting.
+async fn sleep_or_shutdown(duration: Duration, shutdown: &std::sync::atomic::AtomicBool) {
+    let deadline = tokio::time::Instant::now() + duration;
+    while tokio::time::Instant::now() < deadline {
+        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(SHUTDOWN_POLL_INTERVAL.min(duration)).await;
+    }
+}
+
+/// Resolves once `shutdown` has been observed *and* an additional
+/// `drain_timeout` has elapsed since. Raced against an in-flight lease's
+/// future so a job that never finishes can't hang the worker forever once a
+/// shutdown has been requested; the lease itself is left to expire and be
+/// reclaimed by another worker if this fires.
+async fn drain_watchdog(shutdown: Arc<std::sync::atomic::AtomicBool>, drain_timeout: Duration) {
+    loop {
+        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(SHUTDOWN_POLL_INTERVAL).await;
+    }
+    tokio::time::sleep(drain_timeout).await;
+}
+
 async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> anyhow::Result<()> {
     let provider = Arc::new(runtime_provider_from_args(args.provider));
     let labels: BTreeMap<_, _> = args.label.into_iter().collect();
+    let drain_timeout = Duration::from_secs(args.drain_timeout_secs);
+    let shutdown = spawn_shutdown_listener();
     let mut iterations = 0_u64;
 
     loop {
+        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            eprintln!(
+                "worker: shutdown requested, exiting work loop before claiming further leases"
+            );
+            break;
+        }
         if args
             .max_iterations
             .map(|max_iterations| iterations >= max_iterations)
@@ -866,8 +1012,17 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
             eprintln!(
                 "error: heartbeat failed after {API_RETRY_ATTEMPTS} attempts, skipping this iteration: {error:#}"
             );
-            tokio::time::sleep(Duration::from_millis(args.idle_sleep_ms)).await;
+            sleep_or_shutdown(Duration::from_millis(args.idle_sleep_ms), &shutdown).await;
             continue;
+        }
+
+        // Re-check right before claiming: a signal received during the heartbeat
+        // call/sleep above must still stop us from picking up new work.
+        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            eprintln!(
+                "worker: shutdown requested, exiting work loop before claiming further leases"
+            );
+            break;
         }
 
         let claim_args = ClaimArgs {
@@ -884,7 +1039,7 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
                 eprintln!(
                     "error: claim failed after {API_RETRY_ATTEMPTS} attempts, skipping this iteration: {error:#}"
                 );
-                tokio::time::sleep(Duration::from_millis(args.idle_sleep_ms)).await;
+                sleep_or_shutdown(Duration::from_millis(args.idle_sleep_ms), &shutdown).await;
                 continue;
             }
         };
@@ -903,12 +1058,31 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
                 .map(|max_iterations| iterations < max_iterations)
                 .unwrap_or(true)
             {
-                tokio::time::sleep(Duration::from_millis(args.idle_sleep_ms)).await;
+                sleep_or_shutdown(Duration::from_millis(args.idle_sleep_ms), &shutdown).await;
             }
             continue;
         };
 
-        match handle_lease(client, api, lease, provider.clone()).await {
+        // Once a lease is claimed, always see it through (bounded by the drain
+        // watchdog below) rather than abandoning it -- the claim already
+        // happened, so not finishing it just delays the job until the lease
+        // expires and gets reclaimed by another worker.
+        let lease_id = lease.id;
+        let handle_future = handle_lease(client, api, lease, provider.clone());
+        let outcome = tokio::select! {
+            result = handle_future => Some(result),
+            _ = drain_watchdog(shutdown.clone(), drain_timeout) => None,
+        };
+        let Some(outcome) = outcome else {
+            eprintln!(
+                "warning: lease {lease_id} did not finish within the {drain_timeout:?} drain \
+                 timeout after shutdown was requested; exiting anyway (the lease will expire and \
+                 be reclaimed by another worker)"
+            );
+            break;
+        };
+
+        match outcome {
             Ok(response) => {
                 println!(
                     "{}",

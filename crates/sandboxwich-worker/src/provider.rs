@@ -20,6 +20,12 @@ use serde_json::{Map, Value, json};
 
 pub const KUBERNETES_MUTATION_ENV: &str = "SANDBOXWICH_K8S_ENABLE_MUTATION";
 pub const DEFAULT_SANDBOX_GUEST_IMAGE: &str = "ghcr.io/evalops/sandboxwich-ubuntu-dev:latest";
+/// Default cap on the stdout/stderr captured from a single `kubectl` invocation
+/// before it's stored in a `KubectlOutput` (and, from there, in job results and
+/// provider metadata sent back to the control plane). Mirrors
+/// `sandboxwich-agent`'s `DEFAULT_MAX_CAPTURED_OUTPUT_BYTES`: without a cap, a
+/// chatty or misbehaving `kubectl` command could grow these unboundedly.
+pub const DEFAULT_MAX_CAPTURED_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Default dedicated namespace sandbox workloads are provisioned into, kept
 /// separate from the control-plane namespace (see GH-76). Not read directly
@@ -1080,6 +1086,7 @@ pub struct KubernetesApplyProvider {
     kubectl_context: Option<String>,
     confirm_apply: bool,
     mutation_enabled: bool,
+    max_captured_output_bytes: u64,
 }
 
 impl KubernetesApplyProvider {
@@ -1091,6 +1098,7 @@ impl KubernetesApplyProvider {
             kubectl_context,
             confirm_apply: false,
             mutation_enabled: false,
+            max_captured_output_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
         }
     }
 
@@ -1109,6 +1117,13 @@ impl KubernetesApplyProvider {
     pub fn with_mutation_gate(mut self, confirm_apply: bool, mutation_enabled: bool) -> Self {
         self.confirm_apply = confirm_apply;
         self.mutation_enabled = mutation_enabled;
+        self
+    }
+
+    /// Caps the stdout/stderr captured from every `kubectl` invocation this
+    /// provider makes. See `DEFAULT_MAX_CAPTURED_OUTPUT_BYTES`.
+    pub fn with_max_captured_output_bytes(mut self, max_captured_output_bytes: u64) -> Self {
+        self.max_captured_output_bytes = max_captured_output_bytes;
         self
     }
 
@@ -1227,6 +1242,7 @@ impl KubernetesApplyProvider {
             &plan.apply_args,
             &plan.apply_manifests,
             "apply smoke manifests",
+            self.max_captured_output_bytes,
         )?;
         let mut cleanup_status = String::new();
         let mut cleanup_stdout = String::new();
@@ -1239,6 +1255,7 @@ impl KubernetesApplyProvider {
                 &plan.cleanup_args,
                 &plan.cleanup_manifests,
                 "cleanup smoke manifests",
+                self.max_captured_output_bytes,
             )?;
             cleanup_status = cleanup_output.status;
             cleanup_stdout = cleanup_output.stdout;
@@ -1338,7 +1355,12 @@ impl KubernetesApplyProvider {
             format!("pod/{}", self.pod_name(sandbox_id)),
             "--timeout=120s".to_string(),
         ]);
-        run_kubectl_command(&self.kubectl, &args, "wait for sandbox pod readiness")
+        run_kubectl_command(
+            &self.kubectl,
+            &args,
+            "wait for sandbox pod readiness",
+            self.max_captured_output_bytes,
+        )
     }
 
     /// Returns true if the sandbox's pod already exists in the cluster. Used so that
@@ -1354,7 +1376,12 @@ impl KubernetesApplyProvider {
             "-o".to_string(),
             "name".to_string(),
         ]);
-        let output = run_kubectl_command(&self.kubectl, &args, "check sandbox pod existence")?;
+        let output = run_kubectl_command(
+            &self.kubectl,
+            &args,
+            "check sandbox pod existence",
+            self.max_captured_output_bytes,
+        )?;
         if !output.success {
             bail!(
                 "kubectl get pod failed with {}: {}",
@@ -1378,6 +1405,52 @@ impl KubernetesApplyProvider {
             "--ignore-not-found=true".to_string(),
         ]);
         args
+    }
+
+    /// Best-effort teardown of every resource labeled with `sandbox_id`, used to
+    /// roll back a partially-applied `provision`/`fork` after a later step (the
+    /// apply itself, or the readiness wait) fails. Without this, a failed
+    /// provision/fork leaked its PVC/Pod/Service/NetworkPolicy forever, since the
+    /// caller only ever saw the original error and never got a handle to clean
+    /// up.
+    ///
+    /// Deliberately swallows its own failures (beyond logging to stderr): a
+    /// rollback that itself fails must never mask or replace the original
+    /// provisioning error that triggered it, since that original error is what
+    /// the caller (and its retry/alerting logic) needs to see. `--ignore-not-found`
+    /// on the underlying `kubectl delete` also makes this safe to call even when
+    /// nothing was actually applied yet (e.g. `provision`'s own `kubectl apply`
+    /// failed to spawn at all).
+    fn rollback_applied_resources(&self, sandbox_id: SandboxId, context: &'static str) {
+        let args = self.teardown_args(sandbox_id);
+        match run_kubectl_command(
+            &self.kubectl,
+            &args,
+            "rollback applied resources after failed provision/fork",
+            self.max_captured_output_bytes,
+        ) {
+            Ok(output) if output.success => {
+                eprintln!(
+                    "sandboxwich-worker: rolled back resources for sandbox {sandbox_id} after \
+                     failed {context}"
+                );
+            }
+            Ok(output) => {
+                eprintln!(
+                    "warning: rollback of sandbox {sandbox_id} resources after failed {context} \
+                     itself failed with {}: {} (resources may be leaked; original error is not \
+                     masked by this)",
+                    output.status, output.stderr
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "warning: rollback of sandbox {sandbox_id} resources after failed {context} \
+                     could not run kubectl: {error:#} (resources may be leaked; original error is \
+                     not masked by this)"
+                );
+            }
+        }
     }
 
     /// Renders the `kubectl exec` argument list for `request`. Env var
@@ -1479,11 +1552,26 @@ struct KubectlOutput {
     stderr: String,
 }
 
+/// Decodes `bytes` as (possibly lossy) UTF-8, capping the result at
+/// `max_bytes`. When truncated, appends a marker noting how many bytes were
+/// cut so a truncated capture is never mistaken for the complete output.
+fn cap_output_bytes(bytes: &[u8], max_bytes: u64) -> String {
+    let max_bytes = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    if bytes.len() <= max_bytes {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let omitted = bytes.len() - max_bytes;
+    let mut text = String::from_utf8_lossy(&bytes[..max_bytes]).into_owned();
+    text.push_str(&format!("\n[truncated {omitted} bytes]\n"));
+    text
+}
+
 fn run_kubectl_documents(
     kubectl: &str,
     args: &[String],
     manifests: &[Value],
     context: &'static str,
+    max_output_bytes: u64,
 ) -> anyhow::Result<KubectlOutput> {
     let mut child = Command::new(kubectl)
         .args(args)
@@ -1502,8 +1590,8 @@ fn run_kubectl_documents(
     let output = child
         .wait_with_output()
         .with_context(|| format!("failed to wait for kubectl {context}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stdout = cap_output_bytes(&output.stdout, max_output_bytes);
+    let stderr = cap_output_bytes(&output.stderr, max_output_bytes);
 
     Ok(KubectlOutput {
         success: output.status.success(),
@@ -1518,8 +1606,9 @@ fn run_kubectl_command(
     kubectl: &str,
     args: &[String],
     context: &'static str,
+    max_output_bytes: u64,
 ) -> anyhow::Result<KubectlOutput> {
-    run_kubectl_command_with_stdin(kubectl, args, None, context)
+    run_kubectl_command_with_stdin(kubectl, args, None, context, max_output_bytes)
 }
 
 /// Like `run_kubectl_command`, but when `stdin_payload` is `Some`, pipes it
@@ -1531,6 +1620,7 @@ fn run_kubectl_command_with_stdin(
     args: &[String],
     stdin_payload: Option<&[u8]>,
     context: &'static str,
+    max_output_bytes: u64,
 ) -> anyhow::Result<KubectlOutput> {
     let Some(payload) = stdin_payload else {
         let output = Command::new(kubectl)
@@ -1541,8 +1631,8 @@ fn run_kubectl_command_with_stdin(
             success: output.status.success(),
             code: output.status.code(),
             status: output.status.to_string(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            stdout: cap_output_bytes(&output.stdout, max_output_bytes),
+            stderr: cap_output_bytes(&output.stderr, max_output_bytes),
         });
     };
 
@@ -1568,8 +1658,8 @@ fn run_kubectl_command_with_stdin(
         success: output.status.success(),
         code: output.status.code(),
         status: output.status.to_string(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        stdout: cap_output_bytes(&output.stdout, max_output_bytes),
+        stderr: cap_output_bytes(&output.stderr, max_output_bytes),
     })
 }
 
@@ -1810,16 +1900,28 @@ impl SandboxProvider for KubernetesApplyProvider {
             &self.kubectl_args("apply"),
             &manifests,
             "apply sandbox manifests",
+            self.max_captured_output_bytes,
         )?;
         if !apply.success {
+            // kubectl apply of a multi-document manifest set is not atomic: some
+            // objects may have been created before the command as a whole failed.
+            // Best-effort tear those down rather than leaking them (GH rollback fix).
+            self.rollback_applied_resources(sandbox_id, "provision (kubectl apply)");
             bail!(
                 "kubectl apply sandbox manifests failed with {}: {}",
                 apply.status,
                 apply.stderr
             );
         }
-        let wait = self.wait_for_pod_ready(sandbox_id)?;
+        let wait = match self.wait_for_pod_ready(sandbox_id) {
+            Ok(wait) => wait,
+            Err(error) => {
+                self.rollback_applied_resources(sandbox_id, "provision (wait for pod ready)");
+                return Err(error);
+            }
+        };
         if !wait.success {
+            self.rollback_applied_resources(sandbox_id, "provision (wait for pod ready)");
             bail!(
                 "sandbox pod did not become ready with {}: {}",
                 wait.status,
@@ -1863,6 +1965,7 @@ impl SandboxProvider for KubernetesApplyProvider {
             &self.exec_args(sandbox_id, &request),
             stdin_payload.as_deref(),
             "execute sandbox command",
+            self.max_captured_output_bytes,
         )?;
         let finished_at = Utc::now();
         Ok(AgentCommandResult {
@@ -1888,6 +1991,7 @@ impl SandboxProvider for KubernetesApplyProvider {
             &self.kubectl_args("apply"),
             std::slice::from_ref(&snapshot),
             "apply snapshot manifest",
+            self.max_captured_output_bytes,
         )?;
         if !apply.success {
             bail!(
@@ -1935,16 +2039,29 @@ impl SandboxProvider for KubernetesApplyProvider {
             &self.kubectl_args("apply"),
             &manifests,
             "apply fork manifests",
+            self.max_captured_output_bytes,
         )?;
         if !apply.success {
+            // Same non-atomicity concern as provision(): some of the fork's
+            // manifests may already have been created before the apply as a
+            // whole failed. Roll back everything labeled with the child sandbox
+            // id rather than leaking it.
+            self.rollback_applied_resources(child_sandbox_id, "fork (kubectl apply)");
             bail!(
                 "kubectl apply fork manifests failed with {}: {}",
                 apply.status,
                 apply.stderr
             );
         }
-        let wait = self.wait_for_pod_ready(child_sandbox_id)?;
+        let wait = match self.wait_for_pod_ready(child_sandbox_id) {
+            Ok(wait) => wait,
+            Err(error) => {
+                self.rollback_applied_resources(child_sandbox_id, "fork (wait for pod ready)");
+                return Err(error);
+            }
+        };
         if !wait.success {
+            self.rollback_applied_resources(child_sandbox_id, "fork (wait for pod ready)");
             bail!(
                 "forked sandbox pod did not become ready with {}: {}",
                 wait.status,
@@ -1972,7 +2089,12 @@ impl SandboxProvider for KubernetesApplyProvider {
     fn stop(&self, sandbox_id: SandboxId) -> anyhow::Result<()> {
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
         let args = self.teardown_args(sandbox_id);
-        let output = run_kubectl_command(&self.kubectl, &args, "delete sandbox resources")?;
+        let output = run_kubectl_command(
+            &self.kubectl,
+            &args,
+            "delete sandbox resources",
+            self.max_captured_output_bytes,
+        )?;
         if !output.success {
             bail!(
                 "kubectl delete sandbox resources failed with {}: {}",
@@ -3072,5 +3194,261 @@ mod tests {
         provider
             .stop(SandboxId::new())
             .expect("dry-run stop should never fail");
+    }
+
+    #[test]
+    fn cap_output_bytes_passes_through_short_output_unchanged() {
+        let text = "hello world";
+        assert_eq!(cap_output_bytes(text.as_bytes(), 1024), text);
+        // A cap exactly equal to the byte length is still "no truncation".
+        assert_eq!(cap_output_bytes(text.as_bytes(), text.len() as u64), text);
+    }
+
+    #[test]
+    fn cap_output_bytes_truncates_and_marks_omitted_byte_count() {
+        let text = "0123456789";
+        let capped = cap_output_bytes(text.as_bytes(), 4);
+
+        assert!(capped.starts_with("0123"));
+        assert!(
+            capped.contains("[truncated 6 bytes]"),
+            "expected a marker noting the 6 omitted bytes, got: {capped:?}"
+        );
+    }
+
+    /// Writes an executable fake `kubectl` script to a fresh temp directory,
+    /// returning `(script_path, log_path)`. The script:
+    /// - appends every invocation's space-joined argv as one line to `log_path`
+    ///   (bracketed with leading/trailing spaces so tests can match whole
+    ///   tokens like " delete " without false positives on substrings), and
+    /// - drains stdin for the "apply" verb, mirroring how
+    ///   `run_kubectl_documents` actually pipes manifests in via stdin so the
+    ///   real caller's `write_all` doesn't block on a full pipe;
+    /// - exits non-zero if `fail_verb` is present in argv, and zero otherwise.
+    ///
+    /// This lets rollback behavior be exercised end-to-end (provision/fork
+    /// calling through to a real rollback `kubectl delete`) without requiring
+    /// a real cluster or kubectl binary.
+    fn write_fake_kubectl(
+        fail_verb: Option<&'static str>,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("sandboxwich-fake-kubectl-{}", SandboxId::new()));
+        std::fs::create_dir_all(&dir).expect("create fake kubectl temp dir");
+        let log_path = dir.join("log.txt");
+        let fail_check = match fail_verb {
+            Some(verb) => format!("case \" $* \" in *\" {verb} \"*) exit 1 ;; esac\n"),
+            None => String::new(),
+        };
+        let script = format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             case \" $* \" in\n\
+             \x20\x20*\" apply \"*) cat >/dev/null 2>&1 || true ;;\n\
+             esac\n\
+             {fail_check}exit 0\n",
+            log = log_path.display(),
+        );
+        let script_path = dir.join("kubectl");
+        std::fs::write(&script_path, script).expect("write fake kubectl script");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)
+                .expect("stat fake kubectl script")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).expect("chmod fake kubectl script");
+        }
+        (script_path, log_path)
+    }
+
+    fn apply_provider_with_fake_kubectl(kubectl: &std::path::Path) -> KubernetesApplyProvider {
+        let dry_run =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        KubernetesApplyProvider::new(dry_run, kubectl.to_string_lossy().into_owned())
+            .with_kubectl_context(Some("in-cluster".to_string()))
+            .with_mutation_gate(true, true)
+    }
+
+    #[test]
+    fn provision_rolls_back_applied_resources_when_pod_never_becomes_ready() {
+        let (kubectl, log_path) = write_fake_kubectl(Some("wait"));
+        let provider = apply_provider_with_fake_kubectl(&kubectl);
+        let sandbox_id = SandboxId::new();
+
+        let error = provider
+            .provision(sandbox_id, &SandboxProvisionSpec::default())
+            .expect_err("a pod that never becomes ready should fail provision");
+        assert!(error.to_string().contains("did not become ready"));
+
+        let log = std::fs::read_to_string(&log_path).expect("read fake kubectl log");
+        assert!(
+            log.contains(" apply "),
+            "expected an apply invocation, got: {log}"
+        );
+        assert!(
+            log.contains(" wait "),
+            "expected a wait invocation, got: {log}"
+        );
+        assert!(
+            log.contains(" delete "),
+            "expected a rollback delete invocation after the failed wait, got: {log}"
+        );
+        assert!(
+            log.contains(&format!("sandboxwich.dev/sandbox-id={sandbox_id}")),
+            "rollback delete should be scoped to the sandbox that failed to provision, got: {log}"
+        );
+
+        let _ = std::fs::remove_dir_all(kubectl.parent().expect("kubectl script has a parent dir"));
+    }
+
+    #[test]
+    fn provision_rolls_back_applied_resources_when_apply_itself_fails() {
+        // kubectl apply -f - with multiple documents is not atomic: some objects
+        // can already exist by the time the command as a whole reports failure.
+        let (kubectl, log_path) = write_fake_kubectl(Some("apply"));
+        let provider = apply_provider_with_fake_kubectl(&kubectl);
+        let sandbox_id = SandboxId::new();
+
+        let error = provider
+            .provision(sandbox_id, &SandboxProvisionSpec::default())
+            .expect_err("a failing kubectl apply should fail provision");
+        assert!(error.to_string().contains("kubectl apply"));
+
+        let log = std::fs::read_to_string(&log_path).expect("read fake kubectl log");
+        assert!(
+            log.contains(" delete "),
+            "expected a rollback delete invocation after the failed apply, got: {log}"
+        );
+        assert!(log.contains(&format!("sandboxwich.dev/sandbox-id={sandbox_id}")));
+
+        let _ = std::fs::remove_dir_all(kubectl.parent().expect("kubectl script has a parent dir"));
+    }
+
+    #[test]
+    fn fork_rolls_back_applied_resources_when_child_pod_never_becomes_ready() {
+        let (kubectl, log_path) = write_fake_kubectl(Some("wait"));
+        let provider = apply_provider_with_fake_kubectl(&kubectl);
+        let parent_sandbox_id = SandboxId::new();
+        let child_sandbox_id = SandboxId::new();
+        let snapshot_id = SnapshotId::new();
+
+        let error = provider
+            .fork(
+                parent_sandbox_id,
+                child_sandbox_id,
+                snapshot_id,
+                &SandboxProvisionSpec::default(),
+            )
+            .expect_err("a forked pod that never becomes ready should fail fork");
+        assert!(error.to_string().contains("did not become ready"));
+
+        let log = std::fs::read_to_string(&log_path).expect("read fake kubectl log");
+        assert!(
+            log.contains(" delete "),
+            "expected a rollback delete invocation for the fork, got: {log}"
+        );
+        assert!(
+            log.contains(&format!("sandboxwich.dev/sandbox-id={child_sandbox_id}")),
+            "rollback should be scoped to the child sandbox id (the one that was actually \
+             applied for the fork), got: {log}"
+        );
+        assert!(
+            !log.contains(&format!("sandboxwich.dev/sandbox-id={parent_sandbox_id}")),
+            "rollback must not touch the parent sandbox's resources, got: {log}"
+        );
+
+        let _ = std::fs::remove_dir_all(kubectl.parent().expect("kubectl script has a parent dir"));
+    }
+
+    #[test]
+    fn successful_provision_does_not_trigger_any_rollback_delete() {
+        let (kubectl, log_path) = write_fake_kubectl(None);
+        let provider = apply_provider_with_fake_kubectl(&kubectl);
+        let sandbox_id = SandboxId::new();
+
+        provider
+            .provision(sandbox_id, &SandboxProvisionSpec::default())
+            .expect("apply and wait both succeeding should provision successfully");
+
+        let log = std::fs::read_to_string(&log_path).expect("read fake kubectl log");
+        assert!(log.contains(" apply "));
+        assert!(log.contains(" wait "));
+        assert!(
+            !log.contains(" delete "),
+            "a successful provision must not roll anything back, got: {log}"
+        );
+
+        let _ = std::fs::remove_dir_all(kubectl.parent().expect("kubectl script has a parent dir"));
+    }
+
+    /// Like `write_fake_kubectl`, but the "wait" verb also writes `stdout_bytes`
+    /// bytes of `x` to stdout before exiting 0. Used to exercise the byte cap
+    /// end-to-end through `provision`'s real kubectl-invocation plumbing rather
+    /// than just unit-testing `cap_output_bytes` in isolation.
+    fn write_fake_kubectl_with_wait_stdout(
+        stdout_bytes: usize,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("sandboxwich-fake-kubectl-{}", SandboxId::new()));
+        std::fs::create_dir_all(&dir).expect("create fake kubectl temp dir");
+        let log_path = dir.join("log.txt");
+        let script = format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             case \" $* \" in\n\
+             \x20\x20*\" apply \"*) cat >/dev/null 2>&1 || true ;;\n\
+             esac\n\
+             case \" $* \" in\n\
+             \x20\x20*\" wait \"*) head -c {stdout_bytes} /dev/zero | tr '\\0' 'x' ;;\n\
+             esac\n\
+             exit 0\n",
+            log = log_path.display(),
+        );
+        let script_path = dir.join("kubectl");
+        std::fs::write(&script_path, script).expect("write fake kubectl script");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)
+                .expect("stat fake kubectl script")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).expect("chmod fake kubectl script");
+        }
+        (script_path, log_path)
+    }
+
+    #[test]
+    fn kubectl_output_is_capped_at_the_configured_byte_limit() {
+        let (kubectl, _log_path) = write_fake_kubectl_with_wait_stdout(1024);
+        let dry_run =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        let provider =
+            KubernetesApplyProvider::new(dry_run, kubectl.to_string_lossy().into_owned())
+                .with_kubectl_context(Some("in-cluster".to_string()))
+                .with_mutation_gate(true, true)
+                .with_max_captured_output_bytes(16);
+        let sandbox_id = SandboxId::new();
+
+        let handle = provider
+            .provision(sandbox_id, &SandboxProvisionSpec::default())
+            .expect("provision against the fake kubectl should succeed");
+
+        let wait_stdout = handle.metadata["waitStdout"]
+            .as_str()
+            .expect("waitStdout should be a string");
+        // 1024 bytes of "x" produced by the fake kubectl must be capped well
+        // below that, with a marker noting how much was cut.
+        assert!(
+            wait_stdout.len() < 1024,
+            "expected captured waitStdout to be capped, got {} bytes",
+            wait_stdout.len()
+        );
+        assert!(
+            wait_stdout.contains("[truncated 1008 bytes]"),
+            "expected a truncation marker for the omitted bytes, got: {wait_stdout:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(kubectl.parent().expect("kubectl script has a parent dir"));
     }
 }
