@@ -1891,22 +1891,21 @@ mod tests {
             (Planning, Provisioning),
             (Planning, Ready),
             (Planning, Error),
-            (Planning, Archived),
+            (Planning, Archiving),
             (Provisioning, Ready),
             (Provisioning, Planning),
             (Provisioning, Error),
-            (Provisioning, Archived),
+            (Provisioning, Archiving),
             (Ready, Ready),
-            (Ready, Archived),
+            (Ready, Archiving),
             (Running, Ready),
-            (Running, Archived),
+            (Running, Archiving),
             (Idle, Ready),
-            (Idle, Archived),
+            (Idle, Archiving),
             (Archiving, Ready),
             (Archiving, Archived),
             (Error, Ready),
-            (Error, Archived),
-            (Archived, Ready),
+            (Error, Archiving),
         ];
 
         for from in SandboxState::ALL {
@@ -1922,15 +1921,8 @@ mod tests {
     }
 
     #[test]
-    fn resume_is_legal_only_from_archived() {
-        for from in SandboxState::ALL {
-            let expected = from == SandboxState::Archived;
-            assert_eq!(
-                SandboxState::RESUME_LEGAL_FROM.contains(&from),
-                expected,
-                "resume legality for {from:?} should be {expected}"
-            );
-        }
+    fn archived_has_no_legal_resume_edge() {
+        assert!(!SandboxState::Archived.can_transition_to(&SandboxState::Ready));
         assert_eq!(
             SandboxState::legal_predecessors(&SandboxState::Ready),
             vec![
@@ -1940,12 +1932,9 @@ mod tests {
                 SandboxState::Running,
                 SandboxState::Idle,
                 SandboxState::Archiving,
-                SandboxState::Archived,
                 SandboxState::Error,
             ],
-            "every state can reach Ready via some action (resume or provision-complete), \
-             which is exactly why resume must use RESUME_LEGAL_FROM directly instead of \
-             this general reverse lookup"
+            "archived sandboxes cannot become ready until a real restore contract exists"
         );
     }
 

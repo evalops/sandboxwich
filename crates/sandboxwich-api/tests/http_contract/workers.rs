@@ -93,15 +93,8 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
         worker: &WorkerResponse,
         sandbox: &SandboxResponse,
     ) {
-        let queued: JobResponse = client
-            .post(format!("{}/jobs", server.base_url))
-            .json(&CreateJobRequest {
-                kind: JobKind::ProvisionSandbox,
-                payload: serde_json::json!({ "sandboxId": sandbox.sandbox.id }),
-                required_capability: WorkerCapability::ProvisionSandbox,
-                priority: None,
-                max_attempts: None,
-            })
+        let jobs: JobListResponse = client
+            .get(format!("{}/jobs", server.base_url))
             .send()
             .await
             .unwrap()
@@ -109,6 +102,14 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
             .unwrap()
             .json()
             .await
+            .unwrap();
+        let queued = jobs
+            .jobs
+            .into_iter()
+            .find(|job| {
+                job.kind == JobKind::ProvisionSandbox
+                    && job.payload["sandboxId"] == serde_json::json!(sandbox.sandbox.id)
+            })
             .unwrap();
         let claimed: ClaimLeaseResponse = worker_client
             .post(format!(
@@ -129,7 +130,7 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
         let lease = claimed
             .lease
             .expect("worker should claim its own provision job");
-        assert_eq!(lease.job.id, queued.job.id);
+        assert_eq!(lease.job.id, queued.id);
         let completed: LeaseResponse = worker_client
             .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
             .json(&CompleteLeaseRequest {

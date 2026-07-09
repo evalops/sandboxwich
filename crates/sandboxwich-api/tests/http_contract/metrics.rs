@@ -73,7 +73,7 @@ pub(crate) async fn metrics_are_scoped_to_the_authenticated_tenant() {
         .await
         .unwrap();
     assert_eq!(
-        ready_sandbox_gauge(&default_metrics),
+        planning_sandbox_gauge(&default_metrics),
         DEFAULT_TENANT_SANDBOXES as i64,
         "default tenant's /metrics must count only its own sandboxes, not tenant-b's:\n{default_metrics}"
     );
@@ -90,7 +90,7 @@ pub(crate) async fn metrics_are_scoped_to_the_authenticated_tenant() {
         .await
         .unwrap();
     assert_eq!(
-        ready_sandbox_gauge(&tenant_b_metrics),
+        planning_sandbox_gauge(&tenant_b_metrics),
         TENANT_B_SANDBOXES as i64,
         "tenant-b's /metrics must count only its own sandboxes, not the default tenant's:\n{tenant_b_metrics}"
     );
@@ -108,7 +108,7 @@ pub(crate) async fn metrics_are_scoped_to_the_authenticated_tenant() {
         .await
         .unwrap();
     assert_eq!(
-        ready_sandbox_gauge(&operator_metrics),
+        planning_sandbox_gauge(&operator_metrics),
         (DEFAULT_TENANT_SANDBOXES + TENANT_B_SANDBOXES) as i64,
         "the operator credential must see totals across every tenant:\n{operator_metrics}"
     );
@@ -127,7 +127,7 @@ pub(crate) async fn metrics_are_scoped_to_the_authenticated_tenant() {
         .await
         .unwrap();
     assert_eq!(
-        ready_sandbox_gauge(&wrong_operator_metrics),
+        planning_sandbox_gauge(&wrong_operator_metrics),
         DEFAULT_TENANT_SANDBOXES as i64,
         "a wrong operator token must not unlock the cross-tenant view:\n{wrong_operator_metrics}"
     );
@@ -135,14 +135,14 @@ pub(crate) async fn metrics_are_scoped_to_the_authenticated_tenant() {
 
 /// Extracts the value of `sandboxwich_sandbox_count{state="ready"}` from a Prometheus text
 /// exposition body produced by `/metrics`.
-pub(crate) fn ready_sandbox_gauge(metrics_text: &str) -> i64 {
+pub(crate) fn planning_sandbox_gauge(metrics_text: &str) -> i64 {
     metrics_text
         .lines()
-        .find(|line| line.starts_with("sandboxwich_sandbox_count{state=\"ready\"}"))
+        .find(|line| line.starts_with("sandboxwich_sandbox_count{state=\"planning\"}"))
         .and_then(|line| line.rsplit(' ').next())
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or_else(|| {
-            panic!("sandboxwich_sandbox_count{{state=\"ready\"}} not found in:\n{metrics_text}")
+            panic!("sandboxwich_sandbox_count{{state=\"planning\"}} not found in:\n{metrics_text}")
         })
 }
 
