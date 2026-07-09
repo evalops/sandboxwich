@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, net::SocketAddr, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    net::SocketAddr,
+    time::Duration,
+};
 
 use anyhow::Context;
 use axum::{
@@ -7437,14 +7441,60 @@ fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
     })
 }
 
+/// Hydrate every `Allowlist` sandbox's network egress rules with a single batched query instead
+/// of one `select` per sandbox, so listing a full page (up to `MAX_PAGE_LIMIT` sandboxes) never
+/// issues more than one extra round-trip regardless of how many of them are on the allowlist tier.
 async fn hydrate_sandboxes_network_egress(
     db: &Database,
     sandboxes: &mut [Sandbox],
 ) -> Result<(), ApiError> {
+    let allowlist_ids: Vec<SandboxId> = sandboxes
+        .iter()
+        .filter(|sandbox| matches!(sandbox.network_egress, NetworkEgress::Allowlist { .. }))
+        .map(|sandbox| sandbox.id)
+        .collect();
+    if allowlist_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut rules_by_sandbox = list_network_allow_rules_for_sandboxes(db, &allowlist_ids).await?;
     for sandbox in sandboxes {
-        hydrate_sandbox_network_egress(db, sandbox).await?;
+        if matches!(sandbox.network_egress, NetworkEgress::Allowlist { .. }) {
+            let rules = rules_by_sandbox.remove(&sandbox.id).unwrap_or_default();
+            sandbox.network_egress = NetworkEgress::Allowlist { rules };
+        }
     }
     Ok(())
+}
+
+/// Batched counterpart to [`list_network_allow_rules`]: fetches rules for every id in
+/// `sandbox_ids` with a single `sandbox_id in (...)` query and groups them in memory, rather than
+/// issuing one query per sandbox.
+async fn list_network_allow_rules_for_sandboxes(
+    db: &Database,
+    sandbox_ids: &[SandboxId],
+) -> Result<HashMap<SandboxId, Vec<NetworkAllowRule>>, ApiError> {
+    let sql = format!(
+        "select sandbox_id, kind, value
+         from sandbox_network_egress_rules
+         where sandbox_id in ({})
+         order by sandbox_id asc, kind asc, value asc",
+        db.placeholders(sandbox_ids.len())
+    );
+    let mut query = sqlx::query(&sql);
+    for sandbox_id in sandbox_ids {
+        query = query.bind(sandbox_id.to_string());
+    }
+    let rows = query.fetch_all(&db.pool).await?;
+
+    let mut grouped: HashMap<SandboxId, Vec<NetworkAllowRule>> = HashMap::new();
+    for row in rows {
+        let sandbox_id: String = row.try_get("sandbox_id")?;
+        let sandbox_id = SandboxId(parse_uuid(&sandbox_id)?);
+        let rule = row_to_network_allow_rule(row)?;
+        grouped.entry(sandbox_id).or_default().push(rule);
+    }
+    Ok(grouped)
 }
 
 async fn hydrate_sandbox_network_egress(

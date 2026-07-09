@@ -531,6 +531,142 @@ fn ready_sandbox_gauge(metrics_text: &str) -> i64 {
         })
 }
 
+/// Regression test for the `list_sandboxes` N+1: hydrating every allowlist sandbox's network
+/// egress rules used to run one query per sandbox. Batching that into a single
+/// `sandbox_id in (...)` query and grouping in memory must still attach each sandbox's *own*
+/// rules -- not another sandbox's -- and must leave non-allowlist sandboxes untouched.
+#[tokio::test]
+async fn list_sandboxes_hydrates_each_allowlist_sandboxes_own_rules() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("sandboxwich-egress-batch-test.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+
+    let single_rule: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("egress-batch-single-rule".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: Some(NetworkEgress::Allowlist {
+                rules: vec![NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Cidr,
+                    value: "10.0.0.0/8".to_string(),
+                }],
+            }),
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let multi_rule: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("egress-batch-multi-rule".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: Some(NetworkEgress::Allowlist {
+                rules: vec![
+                    NetworkAllowRule {
+                        kind: NetworkAllowRuleKind::Cidr,
+                        value: "172.16.0.0/12".to_string(),
+                    },
+                    NetworkAllowRule {
+                        kind: NetworkAllowRuleKind::Cidr,
+                        value: "192.168.0.0/16".to_string(),
+                    },
+                ],
+            }),
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let no_rules: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("egress-batch-deny-all".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: Some(NetworkEgress::DenyAll),
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let listed: SandboxListResponse = client
+        .get(format!("{}/sandboxes", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let find = |id: sandboxwich_core::SandboxId| {
+        listed
+            .sandboxes
+            .iter()
+            .find(|sandbox| sandbox.id == id)
+            .unwrap_or_else(|| panic!("sandbox {id} missing from list_sandboxes response"))
+    };
+
+    assert_eq!(
+        find(single_rule.sandbox.id).network_egress,
+        NetworkEgress::Allowlist {
+            rules: vec![NetworkAllowRule {
+                kind: NetworkAllowRuleKind::Cidr,
+                value: "10.0.0.0/8".to_string(),
+            }]
+        }
+    );
+    assert_eq!(
+        find(multi_rule.sandbox.id).network_egress,
+        NetworkEgress::Allowlist {
+            rules: vec![
+                NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Cidr,
+                    value: "172.16.0.0/12".to_string(),
+                },
+                NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Cidr,
+                    value: "192.168.0.0/16".to_string(),
+                },
+            ]
+        }
+    );
+    assert_eq!(
+        find(no_rules.sandbox.id).network_egress,
+        NetworkEgress::DenyAll
+    );
+}
+
 #[tokio::test]
 async fn migrate_command_prepares_database_for_no_auto_migrate_server() {
     let data_dir = tempfile::tempdir().unwrap();
