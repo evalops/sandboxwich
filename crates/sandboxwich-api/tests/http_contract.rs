@@ -2746,15 +2746,32 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .json()
         .await
         .unwrap();
-    assert!(
-        cleanup
-            .expired
-            .iter()
-            .any(|seen| seen.id == expiring.snapshot.id)
-    );
     assert_eq!(cleanup.cleanup_run.status, CleanupRunStatus::Succeeded);
     assert!(cleanup.cleanup_run.finished_at.is_some());
-    assert!(cleanup.cleanup_run.expired_snapshots >= 1);
+    // This server runs the background expiry sweeper (see
+    // `start_with_expiry_sweeper`), and `expire_due_snapshots` is shared by
+    // that sweeper and the cleanup controller. Whichever fires first expires
+    // the due snapshot, so whether it shows up in *this* cleanup run's
+    // `expired` list is a race by design. Assert on the outcome — the due
+    // snapshot ends up expired — instead of on which actor expired it.
+    poll_until(|| async {
+        let response: SnapshotResponse = client
+            .get(format!(
+                "{}/snapshots/{}",
+                server.base_url, expiring.snapshot.id
+            ))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        (response.snapshot.status == SnapshotStatus::Expired).then_some(response)
+    })
+    .await
+    .expect("due snapshot should be expired by the cleanup run or the background sweep");
 
     let archived: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
