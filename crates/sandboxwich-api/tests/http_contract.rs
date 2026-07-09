@@ -3673,6 +3673,7 @@ async fn assert_job_completion_does_not_resurrect_concurrently_archived_sandbox(
         .json()
         .await
         .unwrap();
+    let race_worker_client = worker_client(&race_worker);
 
     let forked: SandboxResponse = client
         .post(format!(
@@ -3712,7 +3713,7 @@ async fn assert_job_completion_does_not_resurrect_concurrently_archived_sandbox(
         .unwrap();
     let snapshot_job = job_for_snapshot(&jobs.jobs, &fork_snapshot_id.to_string());
 
-    let claimed_snapshot: ClaimLeaseResponse = client
+    let claimed_snapshot: ClaimLeaseResponse = race_worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, race_worker.worker.id
@@ -3733,7 +3734,7 @@ async fn assert_job_completion_does_not_resurrect_concurrently_archived_sandbox(
         .expect("expected race worker to claim the fork's snapshot job");
     assert_eq!(snapshot_lease.job.id, snapshot_job.id);
 
-    client
+    race_worker_client
         .post(format!(
             "{}/leases/{}/complete",
             server.base_url, snapshot_lease.id
@@ -3769,7 +3770,7 @@ async fn assert_job_completion_does_not_resurrect_concurrently_archived_sandbox(
         .unwrap();
     let fork_job = job_for_child_sandbox(&jobs.jobs, &forked.sandbox.id.to_string());
 
-    let claimed_fork: ClaimLeaseResponse = client
+    let claimed_fork: ClaimLeaseResponse = race_worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, race_worker.worker.id
@@ -3825,7 +3826,7 @@ async fn assert_job_completion_does_not_resurrect_concurrently_archived_sandbox(
     // The ForkSandbox job completes *after* the concurrent archive landed.
     // It must succeed (the job itself isn't at fault) without clobbering the
     // sandbox's archived state.
-    client
+    race_worker_client
         .post(format!(
             "{}/leases/{}/complete",
             server.base_url, fork_lease.id
