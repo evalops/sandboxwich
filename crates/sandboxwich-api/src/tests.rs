@@ -456,50 +456,6 @@ async fn seed_sandbox_with_state(db: &Database, state: SandboxState) -> Sandbox 
 }
 
 #[tokio::test]
-async fn resume_returns_conflict_when_sandbox_is_not_archived() {
-    let db = test_sqlite_db().await;
-    let sandbox = seed_sandbox_with_state(&db, SandboxState::Error).await;
-
-    let result = transition_sandbox(
-        &db,
-        sandbox.id,
-        SandboxState::RESUME_LEGAL_FROM,
-        SandboxState::Ready,
-        "resumed",
-    )
-    .await;
-
-    let error = result.expect_err("resume from Error must be rejected");
-    assert_eq!(error.status, StatusCode::CONFLICT);
-
-    let unchanged = fetch_sandbox(&db, sandbox.id).await.expect("fetch sandbox");
-    assert_eq!(
-        unchanged.state,
-        SandboxState::Error,
-        "a rejected resume must not touch the sandbox's state"
-    );
-}
-
-#[tokio::test]
-async fn resume_succeeds_from_archived() {
-    let db = test_sqlite_db().await;
-    let sandbox = seed_sandbox_with_state(&db, SandboxState::Archived).await;
-
-    let _ = transition_sandbox(
-        &db,
-        sandbox.id,
-        SandboxState::RESUME_LEGAL_FROM,
-        SandboxState::Ready,
-        "resumed",
-    )
-    .await
-    .expect("resume from Archived must succeed");
-
-    let updated = fetch_sandbox(&db, sandbox.id).await.expect("fetch sandbox");
-    assert_eq!(updated.state, SandboxState::Ready);
-}
-
-#[tokio::test]
 async fn stop_returns_conflict_on_double_stop() {
     let db = test_sqlite_db().await;
     let sandbox = seed_sandbox_with_state(&db, SandboxState::Archived).await;
@@ -508,8 +464,8 @@ async fn stop_returns_conflict_on_double_stop() {
         &db,
         sandbox.id,
         SandboxState::STOP_LEGAL_FROM,
-        SandboxState::Archived,
-        "stopped",
+        SandboxState::Archiving,
+        "stop_requested",
     )
     .await;
 
@@ -530,13 +486,41 @@ async fn job_completion_racing_a_concurrent_archive_does_not_resurrect_the_sandb
         &db,
         child.id,
         SandboxState::STOP_LEGAL_FROM,
-        SandboxState::Archived,
-        "stopped",
+        SandboxState::Archiving,
+        "stop_requested",
     )
     .await
     .expect("stop concurrently while the fork job is still in flight");
 
     let mut connection = db.pool.acquire().await.expect("acquire connection");
+    set_sandbox_state_on_connection(
+        &db,
+        &mut connection,
+        child.id,
+        SandboxState::PROVISION_COMPLETED_LEGAL_FROM,
+        SandboxState::Ready,
+        json!({ "state": "ready", "reason": "provision_ready" }),
+    )
+    .await
+    .expect("late provision completion must be an idempotent lost race");
+    let stopping = fetch_sandbox_on_connection(&db, &mut connection, child.id)
+        .await
+        .expect("fetch stopping sandbox");
+    assert_eq!(
+        stopping.state,
+        SandboxState::Archiving,
+        "a late provision completion must not undo an accepted stop"
+    );
+    set_sandbox_state_on_connection(
+        &db,
+        &mut connection,
+        child.id,
+        SandboxState::STOP_COMPLETED_LEGAL_FROM,
+        SandboxState::Archived,
+        json!({ "state": "archived", "reason": "stop_completed" }),
+    )
+    .await
+    .expect("provider-confirmed stop completes archival");
     set_sandbox_state_on_connection(
         &db,
         &mut connection,

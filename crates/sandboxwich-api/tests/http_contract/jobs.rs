@@ -467,7 +467,6 @@ pub(crate) async fn assert_prompt_job_lifecycle(
         .json()
         .await
         .unwrap();
-
     let prompt: PromptQueuedResponse = client
         .post(format!(
             "{}/sandboxes/{}/prompt",
