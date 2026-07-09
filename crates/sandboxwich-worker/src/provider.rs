@@ -73,6 +73,13 @@ pub const DEFAULT_INGRESS_SELECTOR_VALUE: &str = "sandboxwich";
 /// `kubectl delete secret --all`.
 pub const SANDBOX_TEARDOWN_RESOURCE_KINDS: &str =
     "pod,persistentvolumeclaim,service,networkpolicy,secret";
+/// Placeholder substituted for the raw worker-scoped token in every
+/// serialized/persisted/printed rendering of the per-sandbox worker-token
+/// Secret (provider handle metadata, which the API persists into the
+/// sandboxes table's `provider_metadata` column and returns to tenant
+/// clients). The raw token exists only in the manifest set piped to
+/// `kubectl apply` stdin (GH-101).
+pub const WORKER_TOKEN_REDACTED: &str = "[redacted]";
 
 /// Cheaply cloneable signal a job's background lease-renewal task (see
 /// `handle_lease` in `main.rs`) uses to tell an in-flight `exec_handoff` call
@@ -468,7 +475,10 @@ impl KubernetesDryRunProvider {
                 "sshService": self.ssh_service_manifest(sandbox_id),
                 "desktopService": self.desktop_service_manifest(sandbox_id),
                 "networkPolicy": network_policy,
-                "workerTokenSecret": self.worker_token_secret_manifest(sandbox_id)
+                // Redacted: this metadata is persisted by the API into the
+                // sandboxes table and returned to tenant clients, so the
+                // raw token must never appear here (GH-101).
+                "workerTokenSecret": self.worker_token_secret_manifest_redacted(sandbox_id)
             }
         }))
     }
@@ -754,9 +764,40 @@ impl KubernetesDryRunProvider {
     /// Secret itself, since the token is minted fresh at worker
     /// registration (GH-64) and cannot be pre-provisioned by an operator
     /// ahead of time (GH-101).
+    ///
+    /// SECURITY: this manifest carries the RAW token and must only ever be
+    /// piped to `kubectl apply` stdin (see `provision_manifests`/
+    /// `fork_manifests`). Anything that serializes a manifest as *data* --
+    /// provider handle metadata (persisted verbatim into the control-plane
+    /// database's `provider_metadata` column and returned to tenant clients
+    /// on sandbox reads), smoke-plan output, logs -- must use
+    /// [`Self::worker_token_secret_manifest_redacted`] instead, or the
+    /// token ends up stored/served in plaintext: the exact exposure class
+    /// GH-64/GH-99 were closing.
     fn worker_token_secret_manifest(&self, sandbox_id: SandboxId) -> Option<serde_json::Value> {
         let (_, token) = self.worker_credentials.as_ref()?;
-        Some(json!({
+        Some(self.render_worker_token_secret(sandbox_id, token))
+    }
+
+    /// Like [`Self::worker_token_secret_manifest`], but with the token value
+    /// replaced by [`WORKER_TOKEN_REDACTED`]. This is the only variant that
+    /// may appear in provider handle metadata (`"manifests"` blocks in
+    /// provision/fork metadata) or any other serialized/persisted/printed
+    /// output: handle metadata leaves the worker as data -- the API stores
+    /// it in the sandboxes table and returns it to tenant clients -- so the
+    /// raw token must never travel through it. The secret's name/kind/labels
+    /// are preserved so operators can still see *which* Secret a sandbox
+    /// uses without seeing its contents.
+    fn worker_token_secret_manifest_redacted(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Option<serde_json::Value> {
+        self.worker_credentials.as_ref()?;
+        Some(self.render_worker_token_secret(sandbox_id, WORKER_TOKEN_REDACTED))
+    }
+
+    fn render_worker_token_secret(&self, sandbox_id: SandboxId, token: &str) -> serde_json::Value {
+        json!({
             "apiVersion": "v1",
             "kind": "Secret",
             "type": "Opaque",
@@ -767,7 +808,7 @@ impl KubernetesDryRunProvider {
             "stringData": {
                 "api-token": token
             }
-        }))
+        })
     }
 
     fn pvc_manifest(
@@ -1304,6 +1345,16 @@ impl KubernetesApplyProvider {
         self
     }
 
+    /// Renders the smoke-test plan printed by `provider-apply-plan` and
+    /// applied/cleaned by `provider-apply-smoke`.
+    ///
+    /// Deliberately does NOT include the per-sandbox worker-token Secret
+    /// (GH-101): the plan is serialized to stdout/logs as data, so the raw
+    /// token must never appear in it, and the smoke CLI paths never
+    /// configure worker credentials in the first place (the pod manifest's
+    /// Secret *reference* by name is harmless -- if credentials were ever
+    /// configured here, the smoke pod would simply stall on the missing
+    /// Secret rather than leak anything).
     pub fn smoke_plan(
         &self,
         sandbox_id: SandboxId,
@@ -2191,7 +2242,9 @@ impl SandboxProvider for KubernetesDryRunProvider {
                     "sshService": self.ssh_service_manifest(child_sandbox_id),
                     "desktopService": self.desktop_service_manifest(child_sandbox_id),
                     "networkPolicy": network_policy,
-                    "workerTokenSecret": self.worker_token_secret_manifest(child_sandbox_id)
+                    // Redacted: fork handle metadata is persisted/served by
+                    // the API exactly like provision metadata (GH-101).
+                    "workerTokenSecret": self.worker_token_secret_manifest_redacted(child_sandbox_id)
                 }
             }),
         })
@@ -3617,7 +3670,14 @@ mod tests {
     }
 
     #[test]
-    fn worker_token_secret_manifest_carries_the_raw_token_and_sandbox_label() {
+    fn provision_metadata_redacts_the_worker_token_but_keeps_the_secret_identity() {
+        // GH-101 leak regression: provider handle metadata is persisted
+        // verbatim by the API into the sandboxes table's `provider_metadata`
+        // column and returned to tenant clients on sandbox reads, so the raw
+        // token must never appear anywhere in it -- only in the manifest set
+        // actually piped to `kubectl apply` stdin. The Secret's identity
+        // (kind/name/labels) stays visible so operators can tell which
+        // Secret a sandbox uses without seeing its contents.
         let sandbox_id = SandboxId::new();
         let provider =
             KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
@@ -3633,7 +3693,7 @@ mod tests {
         assert_eq!(secret["kind"], "Secret");
         assert_eq!(secret["apiVersion"], "v1");
         assert_eq!(secret["type"], "Opaque");
-        assert_eq!(secret["stringData"]["api-token"], "sbw_wtok_supersecret");
+        assert_eq!(secret["stringData"]["api-token"], WORKER_TOKEN_REDACTED);
         assert_eq!(
             secret["metadata"]["name"],
             format!("sandboxwich-worker-token-{sandbox_id}")
@@ -3641,6 +3701,13 @@ mod tests {
         assert_eq!(
             secret["metadata"]["labels"]["sandboxwich.dev/sandbox-id"],
             sandbox_id.to_string()
+        );
+
+        assert!(
+            !serde_json::to_string(&provisioned.metadata)
+                .expect("provision metadata should serialize")
+                .contains("sbw_wtok_supersecret"),
+            "the raw worker token must not appear anywhere in provision handle metadata"
         );
     }
 
@@ -3714,7 +3781,15 @@ mod tests {
             secret["metadata"]["name"],
             format!("sandboxwich-worker-token-{child_sandbox_id}")
         );
-        assert_eq!(secret["stringData"]["api-token"], "sbw_wtok_supersecret");
+        // Fork handle metadata is persisted/served by the API exactly like
+        // provision metadata, so it carries the redacted rendering only.
+        assert_eq!(secret["stringData"]["api-token"], WORKER_TOKEN_REDACTED);
+        assert!(
+            !serde_json::to_string(&forked.metadata)
+                .expect("fork metadata should serialize")
+                .contains("sbw_wtok_supersecret"),
+            "the raw worker token must not appear anywhere in fork handle metadata"
+        );
 
         let pod = &forked.metadata["manifests"]["pod"];
         assert!(
@@ -3785,6 +3860,36 @@ mod tests {
                 && manifest["metadata"]["name"]
                     == format!("sandboxwich-worker-token-{child_sandbox_id}")
         }));
+    }
+
+    #[test]
+    fn smoke_plan_never_contains_the_raw_worker_token() {
+        // The smoke plan is serialized wholesale to stdout/logs by
+        // `provider-apply-plan`/`provider-apply-smoke`, so even a provider
+        // configured with worker credentials must not leak the raw token
+        // through it (the plan deliberately omits the worker-token Secret;
+        // pod manifests reference it by name only).
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_worker_credentials(
+                    "8f14e45f-ceea-467e-adc5-96718431224b",
+                    Some("sbw_wtok_supersecret".to_string()),
+                );
+        let apply = KubernetesApplyProvider::new(provider, "kubectl");
+        let plan = apply.smoke_plan(SandboxId::new(), SandboxId::new(), SnapshotId::new());
+
+        let serialized = serde_json::to_string(&plan).expect("smoke plan should serialize");
+        assert!(
+            !serialized.contains("sbw_wtok_supersecret"),
+            "the raw worker token must not appear anywhere in the serialized smoke plan"
+        );
+        assert!(
+            !plan
+                .apply_manifests
+                .iter()
+                .any(|manifest| manifest["kind"] == "Secret"),
+            "the smoke plan must not include the worker-token Secret manifest at all"
+        );
     }
 
     #[test]
