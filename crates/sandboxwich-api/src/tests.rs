@@ -582,3 +582,35 @@ async fn database_trigger_rejects_a_transition_no_action_ever_performs() {
     let unchanged = fetch_sandbox(&db, sandbox.id).await.expect("fetch sandbox");
     assert_eq!(unchanged.state, SandboxState::Archived);
 }
+
+#[test]
+fn command_output_bounds_cap_bytes_chunks_and_individual_payloads() {
+    assert!(validate_command_output_bounds(0, 0, 1).is_ok());
+    assert!(validate_command_output_bounds(MAX_COMMAND_OUTPUT_CHUNKS, 0, 1).is_err());
+    assert!(validate_command_output_bounds(0, MAX_COMMAND_OUTPUT_BYTES as i64, 1).is_err());
+    assert!(validate_command_output_bounds(0, 0, MAX_COMMAND_OUTPUT_CHUNK_BYTES + 1).is_err());
+}
+
+#[tokio::test]
+async fn worker_liveness_reconciliation_batch_deletes_only_expired_history() {
+    let db = test_sqlite_db().await;
+    let worker_id = seed_worker(&db).await;
+    let now = Utc::now();
+    insert_worker_heartbeat(&db, worker_id, "{}", now - chrono::Duration::days(8))
+        .await
+        .expect("insert old heartbeat");
+    insert_worker_heartbeat(&db, worker_id, "{}", now)
+        .await
+        .expect("insert current heartbeat");
+
+    reconcile_worker_liveness(&db)
+        .await
+        .expect("reconcile liveness");
+    let remaining: i64 = sqlx::query("select count(*) as count from worker_heartbeats")
+        .fetch_one(&db.pool)
+        .await
+        .expect("count heartbeats")
+        .try_get("count")
+        .expect("integer count");
+    assert_eq!(remaining, 1);
+}

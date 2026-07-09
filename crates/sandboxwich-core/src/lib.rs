@@ -1259,6 +1259,7 @@ pub struct CommandOutputChunkResponse {
 pub struct CommandOutputListResponse {
     pub ok: bool,
     /// False while the command may still append more chunks.
+    #[serde(default)]
     pub complete: bool,
     pub chunks: Vec<CommandOutputChunk>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1869,6 +1870,16 @@ mod tests {
 
         build_api_client_with_timeouts(None, None, None, None)
             .expect("client with timeouts disabled should still build");
+    }
+
+    #[test]
+    fn command_output_list_defaults_complete_for_older_servers() {
+        let response: CommandOutputListResponse = serde_json::from_value(serde_json::json!({
+            "ok": true,
+            "chunks": []
+        }))
+        .expect("older response should remain readable");
+        assert!(!response.complete);
     }
 
     #[test]

@@ -15,6 +15,31 @@ use sqlx::AnyConnection;
 use sqlx::Row;
 use uuid::Uuid;
 
+pub(crate) const MAX_COMMAND_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_COMMAND_OUTPUT_CHUNKS: i64 = 4_096;
+pub(crate) const MAX_COMMAND_OUTPUT_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MATERIALIZED_OUTPUT_CHUNKS: i64 = 64;
+pub(crate) const MATERIALIZED_CHUNK_CHARS: usize = 64 * 1024;
+
+pub(crate) fn validate_command_output_bounds(
+    existing_chunks: i64,
+    existing_bytes: i64,
+    new_chunk_bytes: usize,
+) -> Result<(), ApiError> {
+    if new_chunk_bytes > MAX_COMMAND_OUTPUT_CHUNK_BYTES {
+        return Err(ApiError::bad_request("command output chunk exceeds 2 MiB"));
+    }
+    if existing_chunks >= MAX_COMMAND_OUTPUT_CHUNKS {
+        return Err(ApiError::bad_request("command output exceeds 4096 chunks"));
+    }
+    let new_chunk_bytes = i64::try_from(new_chunk_bytes)
+        .map_err(|_| ApiError::bad_request("command output chunk is too large"))?;
+    if existing_bytes.saturating_add(new_chunk_bytes) > MAX_COMMAND_OUTPUT_BYTES as i64 {
+        return Err(ApiError::bad_request("command output exceeds 4 MiB"));
+    }
+    Ok(())
+}
+
 /// Clamps a client-requested command execution timeout to
 /// `(0, MAX_COMMAND_TIMEOUT_SECS]`, falling back to
 /// `DEFAULT_COMMAND_TIMEOUT_SECS` when the client omits one. This is what
@@ -290,11 +315,15 @@ pub(crate) async fn fetch_command(
     let mut command = row_to_command(row)?;
     // Chunks are the canonical streaming representation. Materialize the
     // compatibility stdout/stderr fields on reads without rewriting an
-    // ever-growing aggregate for every append.
+    // ever-growing aggregate for every append. This view is explicitly
+    // bounded to 64 x 64Ki-character slices; callers needing every byte use
+    // the paginated /commands/{id}/output endpoint.
     let sql = format!(
-        "select stream, chunk from command_output_chunks
-         where command_id = {} order by stream asc, sequence asc",
-        db.placeholder(1)
+        "select stream, substr(chunk, 1, {MATERIALIZED_CHUNK_CHARS}) as chunk
+         from command_output_chunks where command_id = {}
+         order by stream asc, sequence asc limit {}",
+        db.placeholder(1),
+        MATERIALIZED_OUTPUT_CHUNKS,
     );
     let rows = sqlx::query(&sql)
         .bind(command_id.to_string())
@@ -433,6 +462,24 @@ pub(crate) async fn append_command_output_chunk_on_connection(
     annotations: Vec<CommandOutputAnnotation>,
 ) -> Result<CommandOutputChunk, ApiError> {
     lock_command_output_for_append_on_connection(db, connection, command_id).await?;
+    let byte_length = match db.dialect {
+        SqlDialect::Postgres => "octet_length(chunk)",
+        SqlDialect::Sqlite => "length(cast(chunk as blob))",
+    };
+    let bounds_sql = format!(
+        "select count(*) as chunk_count, coalesce(sum({byte_length}), 0) as byte_count
+         from command_output_chunks where command_id = {}",
+        db.placeholder(1)
+    );
+    let bounds = sqlx::query(&bounds_sql)
+        .bind(command_id.to_string())
+        .fetch_one(&mut *connection)
+        .await?;
+    validate_command_output_bounds(
+        bounds.try_get("chunk_count")?,
+        bounds.try_get("byte_count")?,
+        chunk.len(),
+    )?;
     let sequence =
         next_command_output_sequence_on_connection(db, connection, command_id, &stream).await?;
     let now = Utc::now();

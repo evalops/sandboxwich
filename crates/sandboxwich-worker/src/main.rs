@@ -571,10 +571,10 @@ async fn main() -> anyhow::Result<()> {
                 args.provider,
                 capabilities_from_args(args.capability, None),
                 args.label.into_iter().collect(),
-                // This process executes one lease at a time. Advertise the
-                // capacity it can actually deliver instead of oversubscribing
-                // the scheduler when a larger CLI value is supplied.
-                Some(1),
+                // Standalone registration may be consumed by multiple
+                // work-once/work-loop processes, so preserve the operator's
+                // declared aggregate capacity.
+                args.max_concurrent_jobs,
             )
             .await?;
             println!("{}", serde_json::to_string_pretty(&response)?);

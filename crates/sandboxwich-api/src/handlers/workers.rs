@@ -581,22 +581,16 @@ pub(crate) async fn reconcile_worker_liveness(db: &Database) -> Result<(), ApiEr
         .await?;
 
     let retain_after = now - chrono::Duration::days(7);
-    let select_sql = format!(
-        "select id from worker_heartbeats where created_at < {}
-         order by created_at asc, id asc limit 1000",
+    let delete_sql = format!(
+        "delete from worker_heartbeats where id in (
+             select id from worker_heartbeats where created_at < {}
+             order by created_at asc, id asc limit 1000
+         )",
         db.placeholder(1)
     );
-    let rows = sqlx::query(&select_sql)
+    sqlx::query(&delete_sql)
         .bind(retain_after.to_rfc3339())
-        .fetch_all(&db.pool)
+        .execute(&db.pool)
         .await?;
-    for row in rows {
-        let id: String = row.try_get("id")?;
-        let delete_sql = format!(
-            "delete from worker_heartbeats where id = {}",
-            db.placeholder(1)
-        );
-        sqlx::query(&delete_sql).bind(id).execute(&db.pool).await?;
-    }
     Ok(())
 }

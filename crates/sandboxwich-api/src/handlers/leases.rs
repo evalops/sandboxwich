@@ -387,13 +387,18 @@ pub(crate) async fn insert_lease_on_connection(
 }
 
 pub(crate) async fn expire_due_leases(db: &Database) -> Result<(), ApiError> {
+    // At the default one-second interval this can catch up 60,000 leases per
+    // minute while bounding each tick. Deployments that increase
+    // SANDBOXWICH_SWEEP_INTERVAL_MS should tune the interval against their
+    // maximum concurrent lease population.
+    const LEASE_EXPIRY_BATCH_SIZE: u32 = 1_000;
     let now = Utc::now();
     let sql = format!(
         "select id, job_id, worker_id, status, attempt, leased_at, expires_at, completed_at, error
          from job_leases
          where status = 'active' and expires_at <= {}
          order by expires_at asc, id asc
-         limit 100",
+         limit {LEASE_EXPIRY_BATCH_SIZE}",
         db.placeholder(1)
     );
     let rows = sqlx::query(&sql)
