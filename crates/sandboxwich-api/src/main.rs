@@ -885,6 +885,35 @@ mod tests {
     }
 
     #[test]
+    fn looks_like_cidr_accepts_valid_v4_and_v6_networks() {
+        assert!(looks_like_cidr("10.0.0.0/8"));
+        assert!(looks_like_cidr("192.168.1.0/24"));
+        assert!(looks_like_cidr("0.0.0.0/0"));
+        assert!(looks_like_cidr("203.0.113.5/32"));
+        assert!(looks_like_cidr("2001:db8::/32"));
+        assert!(looks_like_cidr("::1/128"));
+        assert!(looks_like_cidr("::/0"));
+    }
+
+    #[test]
+    fn looks_like_cidr_rejects_garbage_and_out_of_range_prefixes() {
+        // Not an IP address at all.
+        assert!(!looks_like_cidr("notanip/24"));
+        assert!(!looks_like_cidr("/24"));
+        assert!(!looks_like_cidr("10.0.0.0"));
+        assert!(!looks_like_cidr(""));
+        // IPv4 prefix must be <= 32, even though it "looks" like a plausible
+        // (0..=128) prefix -- this was the exact gap in the old prefix-only check.
+        assert!(!looks_like_cidr("10.0.0.0/33"));
+        assert!(!looks_like_cidr("10.0.0.0/128"));
+        // IPv6 prefix must be <= 128.
+        assert!(!looks_like_cidr("2001:db8::/129"));
+        // Prefix must parse as an integer at all.
+        assert!(!looks_like_cidr("10.0.0.0/abc"));
+        assert!(!looks_like_cidr("10.0.0.0/-1"));
+    }
+
+    #[test]
     fn db_enum_fingerprint_is_versioned_and_stable_for_current_registry() {
         let fingerprint = db_enum_schema_fingerprint();
         assert!(fingerprint.starts_with("db-enum-v1:"));
@@ -1584,10 +1613,14 @@ fn looks_like_cidr(value: &str) -> bool {
     let Some((address, prefix)) = value.split_once('/') else {
         return false;
     };
-    !address.trim().is_empty()
-        && prefix
-            .parse::<u8>()
-            .is_ok_and(|prefix| matches!(prefix, 0..=128))
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    match address.trim().parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(_)) => prefix <= 32,
+        Ok(std::net::IpAddr::V6(_)) => prefix <= 128,
+        Err(_) => false,
+    }
 }
 
 const ALLOWED_FILE_MIME_TYPES: &[&str] = &[
