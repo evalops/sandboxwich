@@ -392,6 +392,139 @@ pub enum SandboxState {
 }
 }
 
+impl SandboxState {
+    /// Every declared sandbox lifecycle state.
+    pub const ALL: [SandboxState; 8] = [
+        SandboxState::Planning,
+        SandboxState::Provisioning,
+        SandboxState::Ready,
+        SandboxState::Running,
+        SandboxState::Idle,
+        SandboxState::Archiving,
+        SandboxState::Archived,
+        SandboxState::Error,
+    ];
+
+    /// States from which a user-initiated `POST /sandboxes/{id}/stop` may
+    /// legally move a sandbox to `Archived`. A sandbox that is already
+    /// `Archived` is deliberately excluded: a double-stop surfaces as a 409
+    /// conflict rather than a silent no-op, so a caller notices it raced
+    /// someone (or something) else.
+    pub const STOP_LEGAL_FROM: &'static [SandboxState] = &[
+        SandboxState::Planning,
+        SandboxState::Provisioning,
+        SandboxState::Ready,
+        SandboxState::Running,
+        SandboxState::Idle,
+        SandboxState::Archiving,
+        SandboxState::Error,
+    ];
+
+    /// A sandbox can only be resumed from `Archived`. Resuming from any other
+    /// state (in particular `Error`) would either race a job that is still
+    /// writing to the sandbox, or paper over a failure that a fresh
+    /// fork/create should handle instead.
+    pub const RESUME_LEGAL_FROM: &'static [SandboxState] = &[SandboxState::Archived];
+
+    /// A `ForkSandbox` job being claimed by a worker moves its child sandbox
+    /// out of `Planning` (queued, waiting on the parent snapshot) into
+    /// `Provisioning`.
+    pub const FORK_CLAIMED_LEGAL_FROM: &'static [SandboxState] = &[SandboxState::Planning];
+
+    /// A `ForkSandbox` job completing successfully moves its child sandbox
+    /// from `Provisioning` to `Ready`.
+    pub const FORK_COMPLETED_LEGAL_FROM: &'static [SandboxState] = &[SandboxState::Provisioning];
+
+    /// A `ForkSandbox` job that failed but is being retried moves its child
+    /// sandbox back from `Provisioning` to `Planning`.
+    pub const FORK_RETRIED_LEGAL_FROM: &'static [SandboxState] = &[SandboxState::Provisioning];
+
+    /// A `ForkSandbox` job that failed permanently moves its child sandbox
+    /// from `Provisioning` to `Error`.
+    pub const FORK_FAILED_LEGAL_FROM: &'static [SandboxState] = &[SandboxState::Provisioning];
+
+    /// A `ProvisionSandbox` job completing successfully moves a sandbox to
+    /// `Ready`. Unlike `ForkSandbox`, this job kind can be queued directly
+    /// against a sandbox in effectively any state via `POST /jobs` (e.g. to
+    /// reprovision an already-`Ready` sandbox's runtime resources), so its
+    /// legal predecessor set is deliberately broad. `Archived` is the one
+    /// state excluded: a sandbox that was stopped while a provision job was
+    /// in flight must stay archived, not get resurrected by that job's
+    /// completion landing afterwards.
+    pub const PROVISION_COMPLETED_LEGAL_FROM: &'static [SandboxState] = &[
+        SandboxState::Planning,
+        SandboxState::Provisioning,
+        SandboxState::Ready,
+        SandboxState::Running,
+        SandboxState::Idle,
+        SandboxState::Archiving,
+        SandboxState::Error,
+    ];
+
+    /// A child sandbox still `Planning` (queued, waiting on its parent's
+    /// snapshot) moves to `Error` when that parent's `CreateSnapshot` job
+    /// fails.
+    pub const SNAPSHOT_FAILED_CHILD_LEGAL_FROM: &'static [SandboxState] = &[SandboxState::Planning];
+
+    /// The sandbox lifecycle state machine: is `self -> next` a transition
+    /// exercised by *some* legitimate caller?
+    ///
+    /// | From         | To           | Trigger                                              |
+    /// |--------------|--------------|-------------------------------------------------------|
+    /// | Planning     | Provisioning | `ForkSandbox` job claimed                              |
+    /// | Planning     | Ready        | `ProvisionSandbox` job completed                       |
+    /// | Planning     | Error        | parent `CreateSnapshot` job failed                     |
+    /// | Planning     | Archived     | user stop                                              |
+    /// | Provisioning | Ready        | `ForkSandbox`/`ProvisionSandbox` job completed          |
+    /// | Provisioning | Planning     | `ForkSandbox` job retried                              |
+    /// | Provisioning | Error        | `ForkSandbox` job permanently failed                    |
+    /// | Provisioning | Archived     | user stop                                              |
+    /// | Ready        | Ready        | `ProvisionSandbox` job completed (reprovision, no-op)   |
+    /// | Ready        | Archived     | user stop                                              |
+    /// | Running      | Ready        | `ProvisionSandbox` job completed                       |
+    /// | Running      | Archived     | user stop                                              |
+    /// | Idle         | Ready        | `ProvisionSandbox` job completed                       |
+    /// | Idle         | Archived     | user stop                                              |
+    /// | Archiving    | Ready        | `ProvisionSandbox` job completed                       |
+    /// | Archiving    | Archived     | user stop                                              |
+    /// | Error        | Ready        | `ProvisionSandbox` job completed (manual retry)         |
+    /// | Error        | Archived     | user stop (archive/cleanup a failed sandbox)            |
+    /// | Archived     | Ready        | user resume                                            |
+    ///
+    /// This is a coarse union of every `_LEGAL_FROM` constant above and is
+    /// used as a database-level backstop trigger (see
+    /// `sandbox_legal_transition_pairs`, `sqlite_sandbox_transition_guard_statements`,
+    /// and `postgres_sandbox_transition_guard_statements` in sandboxwich-api)
+    /// and in tests. It is deliberately *not* used to enforce any single action's precise
+    /// preconditions — e.g. resume is legal only from `Archived` even though
+    /// `Planning -> Ready` is legal in the broader provision-complete sense.
+    /// Application code must use the specific `_LEGAL_FROM` constant for the
+    /// action it is performing.
+    pub fn can_transition_to(&self, next: &SandboxState) -> bool {
+        (Self::STOP_LEGAL_FROM.contains(self) && *next == SandboxState::Archived)
+            || (Self::RESUME_LEGAL_FROM.contains(self) && *next == SandboxState::Ready)
+            || (Self::FORK_CLAIMED_LEGAL_FROM.contains(self) && *next == SandboxState::Provisioning)
+            || (Self::FORK_COMPLETED_LEGAL_FROM.contains(self) && *next == SandboxState::Ready)
+            || (Self::FORK_RETRIED_LEGAL_FROM.contains(self) && *next == SandboxState::Planning)
+            || (Self::FORK_FAILED_LEGAL_FROM.contains(self) && *next == SandboxState::Error)
+            || (Self::PROVISION_COMPLETED_LEGAL_FROM.contains(self) && *next == SandboxState::Ready)
+            || (Self::SNAPSHOT_FAILED_CHILD_LEGAL_FROM.contains(self)
+                && *next == SandboxState::Error)
+    }
+
+    /// Every state that can legally transition into `next` per
+    /// [`can_transition_to`](Self::can_transition_to). Used to build the
+    /// database backstop trigger's `(old_state, new_state) IN (...)`
+    /// predicate.
+    pub fn legal_predecessors(next: &SandboxState) -> Vec<SandboxState> {
+        Self::ALL
+            .iter()
+            .filter(|from| from.can_transition_to(next))
+            .cloned()
+            .collect()
+    }
+}
+
 db_variant_enum! {
 pub enum SnapshotStatus {
     Pending => "pending",
@@ -1596,6 +1729,136 @@ mod tests {
         let decoded: AgentFileReadResponse =
             serde_json::from_value(json).expect("file payload should deserialize");
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn sandbox_state_legal_edges_match_the_documented_table() {
+        use SandboxState::*;
+
+        let legal_edges = [
+            (Planning, Provisioning),
+            (Planning, Ready),
+            (Planning, Error),
+            (Planning, Archived),
+            (Provisioning, Ready),
+            (Provisioning, Planning),
+            (Provisioning, Error),
+            (Provisioning, Archived),
+            (Ready, Ready),
+            (Ready, Archived),
+            (Running, Ready),
+            (Running, Archived),
+            (Idle, Ready),
+            (Idle, Archived),
+            (Archiving, Ready),
+            (Archiving, Archived),
+            (Error, Ready),
+            (Error, Archived),
+            (Archived, Ready),
+        ];
+
+        for from in SandboxState::ALL {
+            for to in SandboxState::ALL {
+                let expected = legal_edges.iter().any(|(f, t)| *f == from && *t == to);
+                assert_eq!(
+                    from.can_transition_to(&to),
+                    expected,
+                    "can_transition_to({from:?}, {to:?}) should be {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resume_is_legal_only_from_archived() {
+        for from in SandboxState::ALL {
+            let expected = from == SandboxState::Archived;
+            assert_eq!(
+                SandboxState::RESUME_LEGAL_FROM.contains(&from),
+                expected,
+                "resume legality for {from:?} should be {expected}"
+            );
+        }
+        assert_eq!(
+            SandboxState::legal_predecessors(&SandboxState::Ready),
+            vec![
+                SandboxState::Planning,
+                SandboxState::Provisioning,
+                SandboxState::Ready,
+                SandboxState::Running,
+                SandboxState::Idle,
+                SandboxState::Archiving,
+                SandboxState::Archived,
+                SandboxState::Error,
+            ],
+            "every state can reach Ready via some action (resume or provision-complete), \
+             which is exactly why resume must use RESUME_LEGAL_FROM directly instead of \
+             this general reverse lookup"
+        );
+    }
+
+    #[test]
+    fn stop_excludes_only_archived() {
+        for from in SandboxState::ALL {
+            let expected = from != SandboxState::Archived;
+            assert_eq!(
+                SandboxState::STOP_LEGAL_FROM.contains(&from),
+                expected,
+                "stop legality for {from:?} should be {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn provision_completed_excludes_only_archived() {
+        for from in SandboxState::ALL {
+            let expected = from != SandboxState::Archived;
+            assert_eq!(
+                SandboxState::PROVISION_COMPLETED_LEGAL_FROM.contains(&from),
+                expected,
+                "a concurrently-archived sandbox must never be resurrected by a \
+                 completing ProvisionSandbox job: {from:?} should be {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn fork_lifecycle_only_moves_through_planning_and_provisioning() {
+        assert_eq!(
+            SandboxState::FORK_CLAIMED_LEGAL_FROM,
+            [SandboxState::Planning].as_slice()
+        );
+        assert_eq!(
+            SandboxState::FORK_COMPLETED_LEGAL_FROM,
+            [SandboxState::Provisioning].as_slice()
+        );
+        assert_eq!(
+            SandboxState::FORK_RETRIED_LEGAL_FROM,
+            [SandboxState::Provisioning].as_slice()
+        );
+        assert_eq!(
+            SandboxState::FORK_FAILED_LEGAL_FROM,
+            [SandboxState::Provisioning].as_slice()
+        );
+        assert_eq!(
+            SandboxState::SNAPSHOT_FAILED_CHILD_LEGAL_FROM,
+            [SandboxState::Planning].as_slice()
+        );
+    }
+
+    #[test]
+    fn no_state_can_transition_to_itself_except_ready_reprovision() {
+        for state in SandboxState::ALL {
+            let self_loop = state.can_transition_to(&state);
+            if state == SandboxState::Ready {
+                assert!(
+                    self_loop,
+                    "Ready -> Ready is legal: reprovisioning an already-ready sandbox"
+                );
+            } else {
+                assert!(!self_loop, "{state:?} -> {state:?} should not be legal");
+            }
+        }
     }
 }
 
