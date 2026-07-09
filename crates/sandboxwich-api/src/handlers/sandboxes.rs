@@ -3,6 +3,7 @@ use crate::db::*;
 use crate::error::*;
 use crate::handlers::commands::*;
 use crate::handlers::jobs::*;
+use crate::handlers::operations::operation_from_job;
 use crate::handlers::snapshots::*;
 use crate::pagination::*;
 use crate::rows::*;
@@ -85,7 +86,7 @@ pub(crate) fn looks_like_cidr(value: &str) -> bool {
     }
 }
 
-#[utoipa::path(post, path = "/v1/sandboxes", responses((status = 201, description = "Sandbox created synchronously"), (status = 400, body = ErrorEnvelope)))]
+#[utoipa::path(post, path = "/v1/sandboxes", responses((status = 202, description = "Sandbox provisioning accepted"), (status = 400, body = ErrorEnvelope)))]
 pub(crate) async fn create_sandbox(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
@@ -148,8 +149,12 @@ pub(crate) async fn create_sandbox(
     tx.commit().await?;
 
     Ok((
-        StatusCode::CREATED,
-        Json(SandboxResponse { ok: true, sandbox }),
+        StatusCode::ACCEPTED,
+        Json(SandboxResponse {
+            ok: true,
+            sandbox,
+            operation: Some(operation_from_job(&job)?),
+        }),
     ))
 }
 
@@ -192,7 +197,11 @@ pub(crate) async fn get_sandbox(
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<SandboxResponse>, ApiError> {
     let sandbox = ensure_sandbox_tenant(&state.db, SandboxId(sandbox_id), &ctx).await?;
-    Ok(Json(SandboxResponse { ok: true, sandbox }))
+    Ok(Json(SandboxResponse {
+        ok: true,
+        sandbox,
+        operation: None,
+    }))
 }
 
 pub(crate) async fn stop_sandbox(
@@ -232,7 +241,11 @@ pub(crate) async fn stop_sandbox(
     tx.commit().await?;
     sandbox.state = SandboxState::Archiving;
     sandbox.updated_at = now;
-    Ok(Json(SandboxResponse { ok: true, sandbox }))
+    Ok(Json(SandboxResponse {
+        ok: true,
+        sandbox,
+        operation: Some(operation_from_job(&job)?),
+    }))
 }
 
 pub(crate) async fn resume_sandbox(
@@ -335,6 +348,7 @@ pub(crate) async fn fork_sandbox(
     Ok(Json(SandboxResponse {
         ok: true,
         sandbox: child,
+        operation: Some(operation_from_job(&job)?),
     }))
 }
 
@@ -372,7 +386,11 @@ pub(crate) async fn transition_sandbox(
     .await?;
 
     let sandbox = fetch_sandbox(db, sandbox_id).await?;
-    Ok(Json(SandboxResponse { ok: true, sandbox }))
+    Ok(Json(SandboxResponse {
+        ok: true,
+        sandbox,
+        operation: None,
+    }))
 }
 
 #[cfg(test)]

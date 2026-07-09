@@ -87,9 +87,9 @@ Poll `GET /v1/operations/{id}`, reconnect to
 command with `POST /v1/operations/{id}/cancel`. Cancellation is rejected once
 work is leased and for operation kinds that cannot be safely rolled back.
 
-Sandbox creation currently completes synchronously and returns HTTP `201`.
-Stop/resume are also synchronous today; they will expose Operations when the
-provider-backed lifecycle reconciler becomes authoritative. The prompt endpoint
+Sandbox creation and stop are asynchronous and return HTTP `202` with an
+Operation. Resource-only creation endpoints return `201`. Resume is explicitly
+unsupported until a provider can restore durable state. The prompt endpoint
 returns typed `501 agent_prompt_unavailable`, and workers do not advertise the
 prompt capability.
 

@@ -48,9 +48,13 @@ async fn v1_contract_exposes_operations_openapi_request_ids_and_honest_prompt_st
         .send()
         .await
         .unwrap();
-    assert_eq!(created.status(), StatusCode::CREATED);
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
     assert!(created.headers().contains_key("x-request-id"));
     let created: SandboxResponse = created.json().await.unwrap();
+    assert_eq!(
+        created.operation.as_ref().unwrap().kind,
+        OperationKind::ProvisionSandbox
+    );
 
     let queued = client
         .post(format!(

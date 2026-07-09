@@ -896,6 +896,8 @@ pub struct CreateSandboxRequest {
 pub struct SandboxResponse {
     pub ok: bool,
     pub sandbox: Sandbox,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<Operation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
