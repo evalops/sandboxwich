@@ -5,7 +5,7 @@ use crate::handlers::sandboxes::*;
 use crate::handlers::workers::*;
 use crate::rows::*;
 use crate::state::*;
-use axum::extract::{Request, State};
+use axum::extract::{Extension, Request, State};
 use axum::http::{HeaderMap, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -93,9 +93,14 @@ pub(crate) async fn auth_and_tenant(
         )
         .into_response();
     };
+    let principal = match worker_id {
+        Some(worker_id) => Principal::Worker(worker_id),
+        None if is_operator_request(&state, request.headers()) => Principal::Operator,
+        None => Principal::Tenant,
+    };
     request.extensions_mut().insert(TenantContext {
         tenant_id,
-        worker_id,
+        principal,
     });
 
     next.run(request).await
@@ -163,7 +168,7 @@ pub(crate) fn ensure_worker_scope(
     ctx: &TenantContext,
     worker_id: WorkerId,
 ) -> Result<(), ApiError> {
-    match ctx.worker_id {
+    match ctx.worker_id() {
         Some(bound) if bound == worker_id => Ok(()),
         Some(_) => Err(ApiError::not_found("resource not found")),
         None => Err(ApiError::unauthorized(
@@ -261,7 +266,7 @@ pub(crate) async fn ensure_sandbox_worker_scope(
     ctx: &TenantContext,
 ) -> Result<Sandbox, ApiError> {
     let sandbox = ensure_sandbox_tenant(db, sandbox_id, ctx).await?;
-    let Some(worker_id) = ctx.worker_id else {
+    let Some(worker_id) = ctx.worker_id() else {
         return Err(ApiError::unauthorized(
             "this route requires a worker-scoped token; tenant-wide tokens are not accepted",
         ));
@@ -270,6 +275,34 @@ pub(crate) async fn ensure_sandbox_worker_scope(
         return Err(ApiError::not_found("resource not found"));
     }
     Ok(sandbox)
+}
+
+pub(crate) async fn require_tenant_principal(
+    Extension(ctx): Extension<TenantContext>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match ctx.principal {
+        Principal::Tenant | Principal::Operator => next.run(request).await,
+        Principal::Worker(_) => ApiError::unauthorized(
+            "worker-scoped tokens are not accepted on tenant or operator routes",
+        )
+        .into_response(),
+    }
+}
+
+pub(crate) async fn require_worker_principal(
+    Extension(ctx): Extension<TenantContext>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match ctx.principal {
+        Principal::Worker(_) => next.run(request).await,
+        Principal::Tenant | Principal::Operator => ApiError::unauthorized(
+            "this route requires a worker-scoped token; tenant-wide tokens are not accepted",
+        )
+        .into_response(),
+    }
 }
 
 /// Whether `worker_id` has ever successfully completed a `provision_sandbox`
