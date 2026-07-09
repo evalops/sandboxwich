@@ -267,6 +267,17 @@ struct RuntimeProviderArgs {
 
     #[arg(long, default_value_t = false)]
     confirm_apply: bool,
+
+    /// Bound applied to every `kubectl` invocation (wait/get/exec/delete); a
+    /// hung `kubectl` (e.g. talking to an unreachable API server) is killed
+    /// once this elapses instead of wedging the worker forever. A value of
+    /// `0` falls back to the default rather than disabling the bound.
+    #[arg(
+        long,
+        env = "SANDBOXWICH_KUBECTL_COMMAND_TIMEOUT_SECS",
+        default_value_t = provider::DEFAULT_KUBECTL_COMMAND_TIMEOUT_SECS
+    )]
+    kubectl_command_timeout_secs: u64,
 }
 
 #[derive(Debug, Args)]
@@ -285,6 +296,17 @@ struct ProviderApplyArgs {
 
     #[arg(long, default_value_t = false)]
     keep_resources: bool,
+
+    /// Bound applied to every `kubectl` invocation (wait/get/exec/delete); a
+    /// hung `kubectl` (e.g. talking to an unreachable API server) is killed
+    /// once this elapses instead of wedging the worker forever. A value of
+    /// `0` falls back to the default rather than disabling the bound.
+    #[arg(
+        long,
+        env = "SANDBOXWICH_KUBECTL_COMMAND_TIMEOUT_SECS",
+        default_value_t = provider::DEFAULT_KUBECTL_COMMAND_TIMEOUT_SECS
+    )]
+    kubectl_command_timeout_secs: u64,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -435,6 +457,7 @@ async fn main() -> anyhow::Result<()> {
                     argv: vec!["echo".to_string(), "sandboxwich".to_string()],
                     cwd: None,
                     env: BTreeMap::new(),
+                    timeout_secs: None,
                 },
             )?;
             let provision = provider.provision(sandbox_id, &spec)?;
@@ -657,6 +680,17 @@ fn mutation_gate_force_enabled_warning(
     }
 }
 
+/// `0` is documented as "fall back to the default" rather than "disable the
+/// bound": an unbounded `kubectl` wait is exactly the hang this timeout
+/// exists to prevent, so silently accepting `0` as infinite would defeat it.
+fn kubectl_command_timeout(secs: u64) -> Duration {
+    if secs == 0 {
+        Duration::from_secs(provider::DEFAULT_KUBECTL_COMMAND_TIMEOUT_SECS)
+    } else {
+        Duration::from_secs(secs)
+    }
+}
+
 fn apply_provider_from_args(args: ProviderApplyArgs) -> KubernetesApplyProvider {
     let provider = provider_from_args(args.provider);
     let mutation_enabled = KubernetesApplyProvider::mutation_enabled_from_env();
@@ -670,6 +704,7 @@ fn apply_provider_from_args(args: ProviderApplyArgs) -> KubernetesApplyProvider 
     KubernetesApplyProvider::new(provider, args.kubectl)
         .with_kubectl_context(args.kubectl_context)
         .with_mutation_gate(args.confirm_apply, mutation_enabled)
+        .with_kubectl_command_timeout(kubectl_command_timeout(args.kubectl_command_timeout_secs))
 }
 
 fn runtime_provider_from_args(args: RuntimeProviderArgs) -> RuntimeProvider {
@@ -688,7 +723,10 @@ fn runtime_provider_from_args(args: RuntimeProviderArgs) -> RuntimeProvider {
             RuntimeProvider::Apply(
                 KubernetesApplyProvider::new(provider, args.kubectl)
                     .with_kubectl_context(args.kubectl_context)
-                    .with_mutation_gate(args.confirm_apply, mutation_enabled),
+                    .with_mutation_gate(args.confirm_apply, mutation_enabled)
+                    .with_kubectl_command_timeout(kubectl_command_timeout(
+                        args.kubectl_command_timeout_secs,
+                    )),
             )
         }
     }
@@ -1132,8 +1170,14 @@ fn agent_request_from_payload(payload: &serde_json::Value) -> anyhow::Result<Age
         .transpose()
         .context("job payload env is invalid")?
         .unwrap_or_else(BTreeMap::new);
+    let timeout_secs = payload.get("timeoutSecs").and_then(|value| value.as_u64());
 
-    Ok(AgentCommandRequest { argv, cwd, env })
+    Ok(AgentCommandRequest {
+        argv,
+        cwd,
+        env,
+        timeout_secs,
+    })
 }
 
 fn prompt_output_from_payload(payload: &serde_json::Value) -> anyhow::Result<String> {

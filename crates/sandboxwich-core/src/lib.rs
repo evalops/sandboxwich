@@ -1008,12 +1008,31 @@ pub struct SshAccessResponse {
     pub ssh_access: SshAccess,
 }
 
+/// Default per-command execution timeout `queue_command` fills in when a
+/// client omits `timeout_secs`, and `sandboxwich-agent`'s `execute_streaming`
+/// falls back to when a `RunCommand` job's payload has no `timeoutSecs`
+/// (e.g. the standalone `exec` CLI path, which never goes through
+/// `queue_command`). Exists so `child.wait()` always has a bound instead of
+/// being able to hang forever on a wedged command.
+pub const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 300;
+
+/// Upper bound `queue_command` clamps a client-requested `timeout_secs`
+/// against, so a command execution can't be configured as effectively
+/// unbounded.
+pub const MAX_COMMAND_TIMEOUT_SECS: u64 = 3600;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CommandRequest {
     pub argv: Vec<String>,
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Maximum time the command may run before the executor kills it and
+    /// reports a timeout failure. Clamped to
+    /// `(0, MAX_COMMAND_TIMEOUT_SECS]` by `queue_command`; `None`/omitted
+    /// falls back to `DEFAULT_COMMAND_TIMEOUT_SECS`.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 db_variant_enum! {
@@ -1386,6 +1405,11 @@ pub struct AgentCommandRequest {
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Bound applied by `execute_streaming` around `child.wait()`; the child
+    /// is killed and a distinct timeout failure reported if it runs longer
+    /// than this. `None` falls back to `DEFAULT_COMMAND_TIMEOUT_SECS`.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

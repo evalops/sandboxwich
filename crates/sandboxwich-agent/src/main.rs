@@ -11,8 +11,9 @@ use clap::{Args, Parser, Subcommand};
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, AgentFileReadResponse, AgentFileWriteRequest,
     AgentHealthResponse, AppendCommandOutputRequest, ClaimLeaseRequest, ClaimLeaseResponse,
-    CommandOutputStream, CompleteLeaseRequest, FailLeaseRequest, GuestStatus, JobKind, LeaseId,
-    LeaseResponse, SandboxId, UpdateGuestHealthRequest, WorkerJobResult, build_api_client,
+    CommandOutputStream, CompleteLeaseRequest, DEFAULT_COMMAND_TIMEOUT_SECS, FailLeaseRequest,
+    GuestStatus, JobKind, LeaseId, LeaseResponse, SandboxId, UpdateGuestHealthRequest,
+    WorkerJobResult, build_api_client,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -147,6 +148,11 @@ struct ExecArgs {
         default_value_t = DEFAULT_MAX_CAPTURED_OUTPUT_BYTES
     )]
     max_captured_output_bytes: u64,
+
+    /// Maximum time the command may run before it is killed and a timeout
+    /// failure is reported. Unset falls back to `DEFAULT_COMMAND_TIMEOUT_SECS`.
+    #[arg(long)]
+    timeout_secs: Option<u64>,
 
     #[arg(trailing_var_arg = true, required = true)]
     argv: Vec<String>,
@@ -525,6 +531,7 @@ async fn exec(args: ExecArgs) -> anyhow::Result<()> {
             argv: args.argv,
             cwd: args.cwd,
             env: args.env.into_iter().collect(),
+            timeout_secs: args.timeout_secs,
         },
         client.as_ref(),
         api,
@@ -784,6 +791,7 @@ async fn execute_streaming(
     let Some((program, args)) = request.argv.split_first() else {
         bail!("argv must contain at least one item");
     };
+    let timeout = Duration::from_secs(request.timeout_secs.unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS));
 
     let started_at = Utc::now();
     let mut command = ProcessCommand::new(program);
@@ -815,7 +823,25 @@ async fn execute_streaming(
         max_captured_output_bytes,
     ));
 
-    let status = child.wait().await.context("failed to wait for command")?;
+    // Before this bound existed, a wedged command (or one that simply runs
+    // longer than the caller expects) left `child.wait()` waiting forever,
+    // wedging this worker/agent slot for good.
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(status_result) => status_result.context("failed to wait for command")?,
+        Err(_elapsed) => {
+            // Kill (and reap, so it doesn't linger as a zombie) the timed-out
+            // child. This closes its stdout/stderr pipes, but the streaming
+            // tasks are aborted directly below rather than drained, since
+            // we're reporting a distinct failure instead of a result anyway.
+            if let Err(kill_error) = child.start_kill() {
+                eprintln!("warning: failed to kill timed-out command: {kill_error}");
+            }
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            bail!("command timed out after {timeout:?} and was killed (argv[0] = {program:?})");
+        }
+    };
     let stdout = stdout_task.await.context("stdout stream task failed")??;
     let stderr = stderr_task.await.context("stderr stream task failed")??;
     let finished_at = Utc::now();
@@ -1011,7 +1037,13 @@ fn agent_request_from_payload(payload: &serde_json::Value) -> anyhow::Result<Age
         .transpose()
         .context("job payload env is invalid")?
         .unwrap_or_else(BTreeMap::new);
-    Ok(AgentCommandRequest { argv, cwd, env })
+    let timeout_secs = payload.get("timeoutSecs").and_then(|value| value.as_u64());
+    Ok(AgentCommandRequest {
+        argv,
+        cwd,
+        env,
+        timeout_secs,
+    })
 }
 
 async fn decode_json<T>(response: reqwest::Response) -> Result<T, AgentRequestError>
@@ -1255,6 +1287,53 @@ mod tests {
             captured.len() < 200,
             "captured buffer should stay small even though only 10 bytes were sent, got {} bytes",
             captured.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_streaming_completes_normally_within_its_timeout() {
+        let request = AgentCommandRequest {
+            argv: vec!["sh".to_string(), "-c".to_string(), "echo ok".to_string()],
+            cwd: None,
+            env: BTreeMap::new(),
+            timeout_secs: Some(5),
+        };
+        let result =
+            execute_streaming(request, None, None, None, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES)
+                .await
+                .expect("fast command should complete well within its timeout");
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.stdout.trim(), "ok");
+    }
+
+    #[tokio::test]
+    async fn execute_streaming_kills_and_errors_on_timeout() {
+        // Regression test for item 3(a): before this fix, `execute_streaming`
+        // called `child.wait().await` with no bound at all, so a wedged (or
+        // simply too-slow) command hung the agent's job-execution loop
+        // forever. A command that would run far longer than its requested
+        // timeout must be killed and reported as a distinct timeout failure
+        // well before it would naturally exit.
+        let request = AgentCommandRequest {
+            argv: vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+            cwd: None,
+            env: BTreeMap::new(),
+            timeout_secs: Some(1),
+        };
+        let started = std::time::Instant::now();
+        let error = execute_streaming(request, None, None, None, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES)
+            .await
+            .expect_err("a command that outlives its timeout must be treated as a failure");
+        let elapsed = started.elapsed();
+
+        assert!(
+            error.to_string().contains("timed out"),
+            "error should be distinctly reported as a timeout, got: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the timed-out child should have been killed almost immediately instead of \
+             the caller waiting anywhere near its full 30s sleep; elapsed = {elapsed:?}"
         );
     }
 }

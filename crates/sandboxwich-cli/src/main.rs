@@ -231,6 +231,13 @@ struct ExecArgs {
     #[arg(long, default_value_t = DEFAULT_WAIT_TIMEOUT_SECS)]
     wait_timeout_secs: u64,
 
+    /// Maximum time the command itself may run before the executor kills it
+    /// and reports a timeout failure. Unset falls back to the server's
+    /// `DEFAULT_COMMAND_TIMEOUT_SECS`. Distinct from --wait-timeout-secs,
+    /// which only bounds how long this CLI invocation polls for a result.
+    #[arg(long)]
+    command_timeout_secs: Option<u64>,
+
     #[arg(trailing_var_arg = true, required = true)]
     argv: Vec<String>,
 }
@@ -542,6 +549,7 @@ async fn main() -> anyhow::Result<()> {
                     argv: args.argv,
                     cwd: None,
                     env: Default::default(),
+                    timeout_secs: args.command_timeout_secs,
                 })
                 .send()
                 .await?;

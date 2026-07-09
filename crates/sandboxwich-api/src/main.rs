@@ -18,25 +18,25 @@ use sandboxwich_core::{
     CommandOutputAnnotation, CommandOutputChunk, CommandOutputChunkId, CommandOutputChunkResponse,
     CommandOutputListResponse, CommandOutputStream, CommandRequest, CommandResponse, CommandRun,
     CommandStatus, CompleteLeaseRequest, CreateDesktopSessionRequest, CreateJobRequest,
-    CreateSandboxRequest, CreateSnapshotRequest, DbVariant, DesktopAccess, DesktopAccessMode,
-    DesktopAccessRequest, DesktopAccessResponse, DesktopSession, DesktopSessionId,
-    DesktopSessionListResponse, DesktopSessionResponse, DesktopSessionStatus, ErrorEnvelope,
-    EventId, EventListResponse, FailLeaseRequest, FileId, FileResponse, GuestHealth,
+    CreateSandboxRequest, CreateSnapshotRequest, DEFAULT_COMMAND_TIMEOUT_SECS, DbVariant,
+    DesktopAccess, DesktopAccessMode, DesktopAccessRequest, DesktopAccessResponse, DesktopSession,
+    DesktopSessionId, DesktopSessionListResponse, DesktopSessionResponse, DesktopSessionStatus,
+    ErrorEnvelope, EventId, EventListResponse, FailLeaseRequest, FileId, FileResponse, GuestHealth,
     GuestHealthResponse, GuestStatus, HealthComponent, HealthResponse, Job, JobId, JobKind,
     JobLease, JobListResponse, JobResponse, JobStatus, LeaseId, LeaseResponse, LeaseStatus,
-    ListFilesResponse, MAX_SANDBOX_FILE_BYTES, MemoryLimit, NetworkAllowRule, NetworkAllowRuleKind,
-    NetworkEgress, NetworkEgressMode, PromptQueuedResponse, PromptRequest, ProviderRuntimeResource,
-    QueueCommandResponse, QueuedCommandJob, ReconcileRuntimeResourcesRequest,
-    ReconcileRuntimeResourcesResponse, RegisterWorkerRequest, RenewLeaseRequest,
-    RequestSshKeyRequest, RuntimeResource, RuntimeResourceId, RuntimeResourceKind,
-    RuntimeResourceListResponse, RuntimeResourcePurpose, RuntimeResourceStatus, Sandbox,
-    SandboxEvent, SandboxEventKind, SandboxFile, SandboxId, SandboxListResponse,
-    SandboxProvisionSpec, SandboxResponse, SandboxState, Snapshot, SnapshotCleanupResponse,
-    SnapshotId, SnapshotListResponse, SnapshotResponse, SnapshotStatus, SshAccess,
-    SshAccessRequest, SshAccessResponse, SshKey, SshKeyId, SshKeyListResponse, SshKeyResponse,
-    SshKeyStatus, UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest,
-    Worker, WorkerCapability, WorkerCapacity, WorkerHeartbeatRequest, WorkerId, WorkerJobResult,
-    WorkerListResponse, WorkerResponse, WorkerStatus,
+    ListFilesResponse, MAX_COMMAND_TIMEOUT_SECS, MAX_SANDBOX_FILE_BYTES, MemoryLimit,
+    NetworkAllowRule, NetworkAllowRuleKind, NetworkEgress, NetworkEgressMode, PromptQueuedResponse,
+    PromptRequest, ProviderRuntimeResource, QueueCommandResponse, QueuedCommandJob,
+    ReconcileRuntimeResourcesRequest, ReconcileRuntimeResourcesResponse, RegisterWorkerRequest,
+    RenewLeaseRequest, RequestSshKeyRequest, RuntimeResource, RuntimeResourceId,
+    RuntimeResourceKind, RuntimeResourceListResponse, RuntimeResourcePurpose,
+    RuntimeResourceStatus, Sandbox, SandboxEvent, SandboxEventKind, SandboxFile, SandboxId,
+    SandboxListResponse, SandboxProvisionSpec, SandboxResponse, SandboxState, Snapshot,
+    SnapshotCleanupResponse, SnapshotId, SnapshotListResponse, SnapshotResponse, SnapshotStatus,
+    SshAccess, SshAccessRequest, SshAccessResponse, SshKey, SshKeyId, SshKeyListResponse,
+    SshKeyResponse, SshKeyStatus, UpdateDesktopSessionRequest, UpdateGuestHealthRequest,
+    UpdateSshKeyStatusRequest, Worker, WorkerCapability, WorkerCapacity, WorkerHeartbeatRequest,
+    WorkerId, WorkerJobResult, WorkerListResponse, WorkerResponse, WorkerStatus,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -889,6 +889,26 @@ mod tests {
         let fingerprint = db_enum_schema_fingerprint();
         assert!(fingerprint.starts_with("db-enum-v1:"));
         assert_eq!(fingerprint, db_enum_schema_fingerprint());
+    }
+
+    #[test]
+    fn effective_command_timeout_secs_defaults_clamps_and_rejects_unbounded() {
+        // Omitted falls back to the default.
+        assert_eq!(
+            effective_command_timeout_secs(None),
+            DEFAULT_COMMAND_TIMEOUT_SECS
+        );
+        // A reasonable explicit value passes through untouched.
+        assert_eq!(effective_command_timeout_secs(Some(45)), 45);
+        // `0` would mean "always times out instantly", not "unbounded"; a
+        // client can't use it (or any other absurd value) to make a command
+        // execution hang forever -- it's clamped to a floor of 1s and a
+        // ceiling of MAX_COMMAND_TIMEOUT_SECS either way.
+        assert_eq!(effective_command_timeout_secs(Some(0)), 1);
+        assert_eq!(
+            effective_command_timeout_secs(Some(u64::MAX)),
+            MAX_COMMAND_TIMEOUT_SECS
+        );
     }
 
     async fn test_sqlite_db() -> Database {
@@ -2432,6 +2452,21 @@ async fn create_desktop_access(
     Ok(Json(DesktopAccessResponse { ok: true, access }))
 }
 
+/// Clamps a client-requested command execution timeout to
+/// `(0, MAX_COMMAND_TIMEOUT_SECS]`, falling back to
+/// `DEFAULT_COMMAND_TIMEOUT_SECS` when the client omits one. This is what
+/// stands between a client and requesting an effectively-unbounded command
+/// execution (or, via `Some(0)`, one that always times out immediately):
+/// every `RunCommand` job's payload carries the result of this function as
+/// `timeoutSecs`, which `sandboxwich-agent`'s `execute_streaming` and
+/// `sandboxwich-worker`'s `kubectl exec` wrapper both bound their command
+/// execution to.
+fn effective_command_timeout_secs(requested: Option<u64>) -> u64 {
+    requested
+        .map(|value| value.clamp(1, MAX_COMMAND_TIMEOUT_SECS))
+        .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS)
+}
+
 async fn queue_command(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
@@ -2447,6 +2482,7 @@ async fn queue_command(
 
     let now = Utc::now();
     let env = request.env;
+    let timeout_secs = effective_command_timeout_secs(request.timeout_secs);
     let command = CommandRun {
         id: CommandId::new(),
         sandbox_id,
@@ -2471,6 +2507,7 @@ async fn queue_command(
             "argv": command.argv,
             "cwd": command.cwd,
             "env": env,
+            "timeoutSecs": timeout_secs,
             "provisionSpec": SandboxProvisionSpec {
                 memory_limit: sandbox.memory_limit.clone(),
                 network_egress: sandbox.network_egress.clone(),
