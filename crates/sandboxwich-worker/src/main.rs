@@ -5,7 +5,8 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use provider::{
-    KUBERNETES_MUTATION_ENV, KubernetesApplyProvider, KubernetesDryRunProvider, SandboxProvider,
+    DEFAULT_MAX_CAPTURED_OUTPUT_BYTES, KUBERNETES_MUTATION_ENV, KubernetesApplyProvider,
+    KubernetesDryRunProvider, SandboxProvider,
 };
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse,
@@ -277,6 +278,16 @@ struct RuntimeProviderArgs {
 
     #[arg(long, default_value_t = false)]
     confirm_apply: bool,
+
+    /// Cap on the stdout/stderr captured from each kubectl invocation before it's
+    /// stored in job results and provider metadata. Mirrors sandboxwich-agent's
+    /// equivalent flag.
+    #[arg(
+        long,
+        env = "SANDBOXWICH_MAX_CAPTURED_OUTPUT_BYTES",
+        default_value_t = DEFAULT_MAX_CAPTURED_OUTPUT_BYTES
+    )]
+    max_captured_output_bytes: u64,
 }
 
 #[derive(Debug, Args)]
@@ -295,6 +306,16 @@ struct ProviderApplyArgs {
 
     #[arg(long, default_value_t = false)]
     keep_resources: bool,
+
+    /// Cap on the stdout/stderr captured from each kubectl invocation before it's
+    /// stored in job results and provider metadata. Mirrors sandboxwich-agent's
+    /// equivalent flag.
+    #[arg(
+        long,
+        env = "SANDBOXWICH_MAX_CAPTURED_OUTPUT_BYTES",
+        default_value_t = DEFAULT_MAX_CAPTURED_OUTPUT_BYTES
+    )]
+    max_captured_output_bytes: u64,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -681,6 +702,7 @@ fn apply_provider_from_args(args: ProviderApplyArgs) -> KubernetesApplyProvider 
     KubernetesApplyProvider::new(provider, args.kubectl)
         .with_kubectl_context(args.kubectl_context)
         .with_mutation_gate(args.confirm_apply, mutation_enabled)
+        .with_max_captured_output_bytes(args.max_captured_output_bytes)
 }
 
 fn runtime_provider_from_args(args: RuntimeProviderArgs) -> RuntimeProvider {
@@ -699,7 +721,8 @@ fn runtime_provider_from_args(args: RuntimeProviderArgs) -> RuntimeProvider {
             RuntimeProvider::Apply(
                 KubernetesApplyProvider::new(provider, args.kubectl)
                     .with_kubectl_context(args.kubectl_context)
-                    .with_mutation_gate(args.confirm_apply, mutation_enabled),
+                    .with_mutation_gate(args.confirm_apply, mutation_enabled)
+                    .with_max_captured_output_bytes(args.max_captured_output_bytes),
             )
         }
     }
