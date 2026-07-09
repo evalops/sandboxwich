@@ -17,13 +17,13 @@ use sandboxwich_core::{
     NetworkAllowRule, NetworkAllowRuleKind, NetworkEgress, PromptQueuedResponse, PromptRequest,
     ProviderForkHandle, ProviderRuntimeResource, ProviderSandboxHandle, ProviderSnapshotHandle,
     QueueCommandResponse, ReconcileRuntimeResourcesRequest, ReconcileRuntimeResourcesResponse,
-    RegisterWorkerRequest, RequestSshKeyRequest, RuntimeResourceKind, RuntimeResourceListResponse,
-    RuntimeResourcePurpose, RuntimeResourceStatus, SandboxEventKind, SandboxListResponse,
-    SandboxResponse, SandboxState, SnapshotCleanupResponse, SnapshotId, SnapshotListResponse,
-    SnapshotResponse, SnapshotStatus, SshAccessRequest, SshAccessResponse, SshKeyListResponse,
-    SshKeyResponse, SshKeyStatus, UpdateDesktopSessionRequest, UpdateGuestHealthRequest,
-    UpdateSshKeyStatusRequest, WorkerCapability, WorkerHeartbeatRequest, WorkerJobResult,
-    WorkerListResponse, WorkerResponse,
+    RegisterWorkerRequest, RenewLeaseRequest, RequestSshKeyRequest, RuntimeResourceKind,
+    RuntimeResourceListResponse, RuntimeResourcePurpose, RuntimeResourceStatus, SandboxEventKind,
+    SandboxListResponse, SandboxResponse, SandboxState, SnapshotCleanupResponse, SnapshotId,
+    SnapshotListResponse, SnapshotResponse, SnapshotStatus, SshAccessRequest, SshAccessResponse,
+    SshKeyListResponse, SshKeyResponse, SshKeyStatus, UpdateDesktopSessionRequest,
+    UpdateGuestHealthRequest, UpdateSshKeyStatusRequest, WorkerCapability, WorkerHeartbeatRequest,
+    WorkerJobResult, WorkerListResponse, WorkerResponse,
 };
 use sqlx::any::AnyPoolOptions;
 use tempfile::TempDir;
@@ -46,6 +46,10 @@ const OPERATOR_TOKEN_HEADER: &str = "x-sandboxwich-operator-token";
 
 struct TestServer {
     base_url: String,
+    /// The URL the spawned server process is actually connected to. For
+    /// Postgres this is the uniquely named per-test database created by
+    /// `isolate_postgres_test_database`, not the shared admin URL from
+    /// `SANDBOXWICH_TEST_POSTGRES_URL`.
     database_url: String,
     child: Child,
     /// Bearer token that authenticates as the default tenant, if any auth is
@@ -54,6 +58,9 @@ struct TestServer {
     /// SANDBOXWICH_API_TOKEN and SANDBOXWICH_TENANT_TOKENS unset.
     auth_token: Option<String>,
     _data_dir: Option<TempDir>,
+    /// Drops the uniquely named per-test Postgres database (best-effort) when
+    /// the `TestServer` goes out of scope. `None` for SQLite-backed servers.
+    _postgres_guard: Option<PostgresTestDatabaseGuard>,
 }
 
 impl Drop for TestServer {
@@ -70,7 +77,7 @@ async fn lifecycle_command_and_event_contracts_work_over_sqlite() {
         "sqlite://{}",
         data_dir.path().join("sandboxwich-test.db").display()
     );
-    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let server = TestServer::start_with_expiry_sweeper(database_url, Some(data_dir)).await;
     run_contract(server).await;
 }
 
@@ -80,7 +87,11 @@ async fn lifecycle_command_and_event_contracts_work_over_postgres_when_configure
         return;
     };
 
-    let server = TestServer::start(database_url, None).await;
+    // `TestServer` transparently isolates this into its own uniquely named
+    // database (see `isolate_postgres_test_database`) so this test can run
+    // concurrently with any other Postgres-backed test without racing on
+    // shared rows.
+    let server = TestServer::start_with_expiry_sweeper(database_url, None).await;
     run_contract(server).await;
 }
 
@@ -227,6 +238,439 @@ async fn job_can_be_fetched_by_id_with_tenant_isolation() {
         .await
         .unwrap();
     assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+}
+
+/// Regression test for issue #64: the guest agent running inside a sandbox
+/// previously authenticated with the same tenant-wide bearer token the CLI
+/// uses for everything, so any compromised sandbox could act as the whole
+/// tenant (claim/forge any lease, post guest-health for any sandbox, etc).
+/// Workers now get a distinct, worker-scoped credential minted at
+/// registration, and every guest-facing route (lease
+/// claim/renew/complete/fail/output, guest-health) rejects tenant-wide
+/// tokens outright and enforces that a worker-scoped token can only act on
+/// its own worker id, its own leases, and sandboxes it has actually
+/// provisioned.
+#[tokio::test]
+async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("sandboxwich-worker-scope-test.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+
+    async fn register(client: &reqwest::Client, server: &TestServer, name: &str) -> WorkerResponse {
+        client
+            .post(format!("{}/workers/register", server.base_url))
+            .json(&RegisterWorkerRequest {
+                name: name.to_string(),
+                provider: "kubernetes".to_string(),
+                capabilities: vec![
+                    WorkerCapability::ProvisionSandbox,
+                    WorkerCapability::RunCommand,
+                ],
+                max_concurrent_jobs: Some(2),
+                labels: Default::default(),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    let worker_a = register(&client, &server, "worker-scope-a").await;
+    let worker_b = register(&client, &server, "worker-scope-b").await;
+    assert!(worker_a.worker_token.is_some());
+    assert!(worker_b.worker_token.is_some());
+    assert_ne!(worker_a.worker_token, worker_b.worker_token);
+    let worker_a_client = worker_client(&worker_a);
+    let worker_b_client = worker_client(&worker_b);
+
+    async fn create_sandbox(
+        client: &reqwest::Client,
+        server: &TestServer,
+        name: &str,
+    ) -> SandboxResponse {
+        client
+            .post(format!("{}/sandboxes", server.base_url))
+            .json(&CreateSandboxRequest {
+                name: Some(name.to_string()),
+                template: None,
+                memory_limit: None,
+                network_egress: None,
+                ttl_seconds: Some(120),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    let sandbox_a = create_sandbox(&client, &server, "worker-scope-sandbox-a").await;
+    let sandbox_b = create_sandbox(&client, &server, "worker-scope-sandbox-b").await;
+
+    // A worker only "owns" a sandbox (for guest-health purposes) once it has
+    // completed a provision lease for it, so give each worker exactly one
+    // sandbox this way before attacking across the boundary.
+    async fn provision(
+        client: &reqwest::Client,
+        worker_client: &reqwest::Client,
+        server: &TestServer,
+        worker: &WorkerResponse,
+        sandbox: &SandboxResponse,
+    ) {
+        let queued: JobResponse = client
+            .post(format!("{}/jobs", server.base_url))
+            .json(&CreateJobRequest {
+                kind: JobKind::ProvisionSandbox,
+                payload: serde_json::json!({ "sandboxId": sandbox.sandbox.id }),
+                required_capability: WorkerCapability::ProvisionSandbox,
+                priority: None,
+                max_attempts: None,
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let claimed: ClaimLeaseResponse = worker_client
+            .post(format!(
+                "{}/workers/{}/leases/claim",
+                server.base_url, worker.worker.id
+            ))
+            .json(&ClaimLeaseRequest {
+                lease_seconds: Some(60),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let lease = claimed
+            .lease
+            .expect("worker should claim its own provision job");
+        assert_eq!(lease.job.id, queued.job.id);
+        let completed: LeaseResponse = worker_client
+            .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
+            .json(&CompleteLeaseRequest {
+                result: Some(WorkerJobResult::ProvisionSandbox {
+                    handle: ProviderSandboxHandle {
+                        provider: "kubernetes".to_string(),
+                        sandbox_id: sandbox.sandbox.id,
+                        resources: provision_resources(sandbox.sandbox.id),
+                        metadata: serde_json::json!({}),
+                    },
+                }),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(completed.lease.job.status, JobStatus::Succeeded);
+    }
+
+    provision(&client, &worker_a_client, &server, &worker_a, &sandbox_a).await;
+    provision(&client, &worker_b_client, &server, &worker_b, &sandbox_b).await;
+
+    // Give worker A a real active lease (a RunCommand job for its own
+    // sandbox) to attack from worker B and from a tenant-wide token.
+    let command: QueueCommandResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/commands",
+            server.base_url, sandbox_a.sandbox.id
+        ))
+        .json(&CommandRequest {
+            argv: vec!["true".to_string()],
+            cwd: None,
+            env: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let claimed: ClaimLeaseResponse = worker_a_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker_a.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease_a = claimed
+        .lease
+        .expect("worker A should claim its own command job");
+    assert_eq!(lease_a.job.id, command.queued_job.id);
+
+    // (a) worker B's token cannot claim on worker A's behalf, ...
+    let cross_claim = worker_b_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker_a.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_claim.status(), StatusCode::NOT_FOUND);
+
+    // ... cannot renew worker A's lease, ...
+    let cross_renew = worker_b_client
+        .post(format!("{}/leases/{}/renew", server.base_url, lease_a.id))
+        .json(&RenewLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_renew.status(), StatusCode::NOT_FOUND);
+
+    // ... cannot append output to worker A's lease, ...
+    let cross_output = worker_b_client
+        .post(format!("{}/leases/{}/output", server.base_url, lease_a.id))
+        .json(&AppendCommandOutputRequest {
+            stream: CommandOutputStream::Stdout,
+            chunk: "attack".to_string(),
+            annotations: Vec::new(),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_output.status(), StatusCode::NOT_FOUND);
+
+    // ... cannot complete worker A's lease, ...
+    let cross_complete = worker_b_client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, lease_a.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(command_result("owned\n", "", 0)),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_complete.status(), StatusCode::NOT_FOUND);
+
+    // ... cannot fail worker A's lease, ...
+    let cross_fail = worker_b_client
+        .post(format!("{}/leases/{}/fail", server.base_url, lease_a.id))
+        .json(&FailLeaseRequest {
+            error: "attack".to_string(),
+            retry: false,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_fail.status(), StatusCode::NOT_FOUND);
+
+    // ... and cannot post guest-health for sandbox A, which worker B never
+    // provisioned.
+    let cross_health = worker_b_client
+        .post(format!(
+            "{}/sandboxes/{}/guest-health",
+            server.base_url, sandbox_a.sandbox.id
+        ))
+        .json(&UpdateGuestHealthRequest {
+            status: GuestStatus::Ready,
+            agent_version: None,
+            checks: None,
+            message: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_health.status(), StatusCode::NOT_FOUND);
+
+    // (b) a tenant-wide token is rejected outright on every guest-facing
+    // route, even acting on its own tenant's worker/lease/sandbox -- the
+    // whole point is that a sandbox holding only the tenant token (the
+    // pre-fix state) must never be able to reach these routes at all.
+    let tenant_claim = client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker_a.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tenant_claim.status(), StatusCode::UNAUTHORIZED);
+
+    let tenant_renew = client
+        .post(format!("{}/leases/{}/renew", server.base_url, lease_a.id))
+        .json(&RenewLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tenant_renew.status(), StatusCode::UNAUTHORIZED);
+
+    let tenant_output = client
+        .post(format!("{}/leases/{}/output", server.base_url, lease_a.id))
+        .json(&AppendCommandOutputRequest {
+            stream: CommandOutputStream::Stdout,
+            chunk: "attack".to_string(),
+            annotations: Vec::new(),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tenant_output.status(), StatusCode::UNAUTHORIZED);
+
+    let tenant_fail = client
+        .post(format!("{}/leases/{}/fail", server.base_url, lease_a.id))
+        .json(&FailLeaseRequest {
+            error: "attack".to_string(),
+            retry: false,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tenant_fail.status(), StatusCode::UNAUTHORIZED);
+
+    let tenant_health = client
+        .post(format!(
+            "{}/sandboxes/{}/guest-health",
+            server.base_url, sandbox_a.sandbox.id
+        ))
+        .json(&UpdateGuestHealthRequest {
+            status: GuestStatus::Ready,
+            agent_version: None,
+            checks: None,
+            message: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tenant_health.status(), StatusCode::UNAUTHORIZED);
+
+    // Checked last (and left the lease untouched by every attack above): a
+    // tenant-wide token cannot complete worker A's lease either.
+    let tenant_complete = client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, lease_a.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(command_result("owned\n", "", 0)),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tenant_complete.status(), StatusCode::UNAUTHORIZED);
+
+    // (c) the happy path still works end to end: worker A can append
+    // output to, renew, and complete its own lease; worker B can post
+    // guest-health for its own sandbox.
+    let output: sandboxwich_core::CommandOutputChunkResponse = worker_a_client
+        .post(format!("{}/leases/{}/output", server.base_url, lease_a.id))
+        .json(&AppendCommandOutputRequest {
+            stream: CommandOutputStream::Stdout,
+            chunk: "ok".to_string(),
+            annotations: Vec::new(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(output.chunk.sequence, 1);
+
+    let renewed: LeaseResponse = worker_a_client
+        .post(format!("{}/leases/{}/renew", server.base_url, lease_a.id))
+        .json(&RenewLeaseRequest {
+            lease_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(renewed.lease.id, lease_a.id);
+
+    let completed: LeaseResponse = worker_a_client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, lease_a.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(command_result("ok\n", "", 0)),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(completed.lease.job.status, JobStatus::Succeeded);
+
+    let health: GuestHealthResponse = worker_b_client
+        .post(format!(
+            "{}/sandboxes/{}/guest-health",
+            server.base_url, sandbox_b.sandbox.id
+        ))
+        .json(&UpdateGuestHealthRequest {
+            status: GuestStatus::Ready,
+            agent_version: Some("sandboxwich-agent/test".to_string()),
+            checks: None,
+            message: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health.guest_health.status, GuestStatus::Ready);
 }
 
 /// Regression test for issue #63: with neither `SANDBOXWICH_API_TOKEN` nor
@@ -679,7 +1123,6 @@ async fn run_contract(server: TestServer) {
     assert_tenant_boundaries_are_enforced(&client, &server, &created).await;
     let uploaded_file = assert_resource_tiers_and_file_contracts(&client, &server, &created).await;
     assert_metrics_are_exposed(&client, &server).await;
-    assert_guest_health_and_ssh_key_lifecycle(&client, &server, &created).await;
 
     let worker: WorkerResponse = client
         .post(format!("{}/workers/register", server.base_url))
@@ -703,6 +1146,11 @@ async fn run_contract(server: TestServer) {
         .await
         .unwrap();
     assert_eq!(worker.worker.name, "k3s-worker-a");
+    // GH-64: lease claim/renew/complete/fail/output and guest-health are
+    // guest-facing and now reject tenant-wide tokens, so every call to one
+    // of those routes on this worker's behalf below uses this instead of
+    // `client`.
+    let worker_client = worker_client(&worker);
 
     let heartbeat: WorkerResponse = client
         .post(format!(
@@ -740,6 +1188,11 @@ async fn run_contract(server: TestServer) {
             .any(|seen| seen.id == worker.worker.id)
     );
     assert_provision_job_persists_runtime_resources(&client, &server, &created, &worker).await;
+    // Must run after the ProvisionSandbox lease above completes: guest-health
+    // is guest-facing (GH-64) and now requires a worker-scoped token from a
+    // worker that has actually completed a provision/fork lease for this
+    // sandbox, which is what the call above just did.
+    assert_guest_health_and_ssh_key_lifecycle(&client, &server, &created, &worker).await;
     assert_runtime_resource_reconcile_marks_missing_resources_deleted(
         &client, &server, &created, &worker,
     )
@@ -815,7 +1268,7 @@ async fn run_contract(server: TestServer) {
         serde_json::json!("deny_all")
     );
 
-    let claimed: ClaimLeaseResponse = client
+    let claimed: ClaimLeaseResponse = worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, worker.worker.id
@@ -850,7 +1303,7 @@ async fn run_contract(server: TestServer) {
         .unwrap();
     assert_eq!(running_command.command.status, CommandStatus::Running);
 
-    let first_chunk: sandboxwich_core::CommandOutputChunkResponse = client
+    let first_chunk: sandboxwich_core::CommandOutputChunkResponse = worker_client
         .post(format!("{}/leases/{}/output", server.base_url, lease.id))
         .json(&AppendCommandOutputRequest {
             stream: CommandOutputStream::Stdout,
@@ -872,7 +1325,7 @@ async fn run_contract(server: TestServer) {
         .unwrap();
     assert_eq!(first_chunk.chunk.sequence, 1);
     assert_eq!(first_chunk.chunk.annotations.len(), 1);
-    let second_chunk: sandboxwich_core::CommandOutputChunkResponse = client
+    let second_chunk: sandboxwich_core::CommandOutputChunkResponse = worker_client
         .post(format!("{}/leases/{}/output", server.base_url, lease.id))
         .json(&AppendCommandOutputRequest {
             stream: CommandOutputStream::Stdout,
@@ -945,7 +1398,7 @@ async fn run_contract(server: TestServer) {
     assert_eq!(saturated_worker.active_leases, 1);
     assert_eq!(saturated_worker.available_slots, 0);
 
-    let saturated_claim: ClaimLeaseResponse = client
+    let saturated_claim: ClaimLeaseResponse = worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, worker.worker.id
@@ -963,7 +1416,7 @@ async fn run_contract(server: TestServer) {
         .unwrap();
     assert!(saturated_claim.lease.is_none());
 
-    let completed: LeaseResponse = client
+    let completed: LeaseResponse = worker_client
         .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
         .json(&CompleteLeaseRequest {
             result: Some(command_result("hello\n", "", 0)),
@@ -978,7 +1431,7 @@ async fn run_contract(server: TestServer) {
         .unwrap();
     assert_eq!(completed.lease.job.status, JobStatus::Succeeded);
 
-    let second_claimed: ClaimLeaseResponse = client
+    let second_claimed: ClaimLeaseResponse = worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, worker.worker.id
@@ -997,7 +1450,7 @@ async fn run_contract(server: TestServer) {
     let second_lease = second_claimed
         .lease
         .expect("worker should claim queued command after capacity frees");
-    let second_completed: LeaseResponse = client
+    let second_completed: LeaseResponse = worker_client
         .post(format!(
             "{}/leases/{}/complete",
             server.base_url, second_lease.id
@@ -1479,7 +1932,14 @@ async fn assert_guest_health_and_ssh_key_lifecycle(
     client: &reqwest::Client,
     server: &TestServer,
     sandbox: &SandboxResponse,
+    worker: &WorkerResponse,
 ) {
+    // GH-64: guest-health updates are guest-facing and require a
+    // worker-scoped token bound to the worker that provisioned/forked this
+    // sandbox; the read side (GET) stays on the tenant client since
+    // CLI/dashboard callers need to read it too.
+    let worker_client = worker_client(worker);
+
     let default_health: GuestHealthResponse = client
         .get(format!(
             "{}/sandboxes/{}/guest-health",
@@ -1495,7 +1955,7 @@ async fn assert_guest_health_and_ssh_key_lifecycle(
         .unwrap();
     assert_eq!(default_health.guest_health.status, GuestStatus::Pending);
 
-    let ready_health: GuestHealthResponse = client
+    let ready_health: GuestHealthResponse = worker_client
         .post(format!(
             "{}/sandboxes/{}/guest-health",
             server.base_url, sandbox.sandbox.id
@@ -1523,7 +1983,7 @@ async fn assert_guest_health_and_ssh_key_lifecycle(
         .unwrap();
     assert_eq!(ready_health.guest_health.status, GuestStatus::Ready);
 
-    let unhealthy_health: GuestHealthResponse = client
+    let unhealthy_health: GuestHealthResponse = worker_client
         .post(format!(
             "{}/sandboxes/{}/guest-health",
             server.base_url, sandbox.sandbox.id
@@ -1564,7 +2024,7 @@ async fn assert_guest_health_and_ssh_key_lifecycle(
             && event.data["reason"] == serde_json::json!("guest_unhealthy")
     }));
 
-    let _: GuestHealthResponse = client
+    let _: GuestHealthResponse = worker_client
         .post(format!(
             "{}/sandboxes/{}/guest-health",
             server.base_url, sandbox.sandbox.id
@@ -1703,7 +2163,8 @@ async fn assert_provision_job_persists_runtime_resources(
         .unwrap();
     assert_eq!(queued.job.status, JobStatus::Queued);
 
-    let claimed: ClaimLeaseResponse = client
+    let worker_client = worker_client(worker);
+    let claimed: ClaimLeaseResponse = worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, worker.worker.id
@@ -1724,7 +2185,7 @@ async fn assert_provision_job_persists_runtime_resources(
         .expect("expected worker to claim provision job");
     assert_eq!(lease.job.id, queued.job.id);
 
-    let completed: LeaseResponse = client
+    let completed: LeaseResponse = worker_client
         .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
         .json(&CompleteLeaseRequest {
             result: Some(WorkerJobResult::ProvisionSandbox {
@@ -1805,7 +2266,8 @@ async fn assert_failed_completion_rolls_back_lease_state(
         .await
         .unwrap();
 
-    let claimed: ClaimLeaseResponse = client
+    let worker_client = worker_client(worker);
+    let claimed: ClaimLeaseResponse = worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, worker.worker.id
@@ -1828,7 +2290,7 @@ async fn assert_failed_completion_rolls_back_lease_state(
 
     let mut resources = provision_resources(sandbox.sandbox.id);
     resources[0].provider = String::new();
-    let rejected = client
+    let rejected = worker_client
         .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
         .json(&CompleteLeaseRequest {
             result: Some(WorkerJobResult::ProvisionSandbox {
@@ -1845,7 +2307,7 @@ async fn assert_failed_completion_rolls_back_lease_state(
         .unwrap();
     assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
 
-    let failed: LeaseResponse = client
+    let failed: LeaseResponse = worker_client
         .post(format!("{}/leases/{}/fail", server.base_url, lease.id))
         .json(&FailLeaseRequest {
             error: "rollback probe".to_string(),
@@ -2009,7 +2471,8 @@ async fn assert_retryable_failure_requeues_command(
     assert_eq!(command.queued_job.sandbox_id, sandbox.sandbox.id);
     assert_eq!(command.queued_job.command_id, command.command.id);
 
-    let claimed: ClaimLeaseResponse = client
+    let worker_client = worker_client(worker);
+    let claimed: ClaimLeaseResponse = worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, worker.worker.id
@@ -2027,7 +2490,7 @@ async fn assert_retryable_failure_requeues_command(
         .unwrap();
     let lease = claimed.lease.expect("expected retry test lease");
     assert_eq!(lease.job.id, command.queued_job.id);
-    client
+    worker_client
         .post(format!("{}/leases/{}/output", server.base_url, lease.id))
         .json(&AppendCommandOutputRequest {
             stream: CommandOutputStream::Stdout,
@@ -2039,7 +2502,7 @@ async fn assert_retryable_failure_requeues_command(
         .unwrap()
         .error_for_status()
         .unwrap();
-    let failed: LeaseResponse = client
+    let failed: LeaseResponse = worker_client
         .post(format!("{}/leases/{}/fail", server.base_url, lease.id))
         .json(&FailLeaseRequest {
             error: "temporary failure".to_string(),
@@ -2085,7 +2548,7 @@ async fn assert_retryable_failure_requeues_command(
         .unwrap();
     assert!(chunks_after_retry.chunks.is_empty());
 
-    let claimed_again: ClaimLeaseResponse = client
+    let claimed_again: ClaimLeaseResponse = worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, worker.worker.id
@@ -2103,7 +2566,7 @@ async fn assert_retryable_failure_requeues_command(
         .unwrap();
     let retry_lease = claimed_again.lease.expect("expected retry lease");
     assert_eq!(retry_lease.job.id, lease.job.id);
-    let completed: LeaseResponse = client
+    let completed: LeaseResponse = worker_client
         .post(format!(
             "{}/leases/{}/complete",
             server.base_url, retry_lease.id
@@ -2149,7 +2612,7 @@ async fn assert_expired_lease_requeues_command(
     assert_eq!(command.queued_job.sandbox_id, sandbox.sandbox.id);
     assert_eq!(command.queued_job.command_id, command.command.id);
 
-    let claimed: ClaimLeaseResponse = client
+    let claimed: ClaimLeaseResponse = worker_client(worker)
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, worker.worker.id
@@ -2284,7 +2747,8 @@ async fn assert_prompt_job_lifecycle(
     let prompt_job = job_for_prompt(&jobs.jobs, &prompt.event.id.to_string());
     assert_eq!(prompt_job.status, JobStatus::Queued);
 
-    let claimed: ClaimLeaseResponse = client
+    let prompt_worker_client = worker_client(&prompt_worker);
+    let claimed: ClaimLeaseResponse = prompt_worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, prompt_worker.worker.id
@@ -2305,7 +2769,7 @@ async fn assert_prompt_job_lifecycle(
         .expect("expected prompt worker to claim prompt job");
     assert_eq!(lease.job.id, prompt_job.id);
 
-    let completed: LeaseResponse = client
+    let completed: LeaseResponse = prompt_worker_client
         .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
         .json(&CompleteLeaseRequest {
             result: Some(WorkerJobResult::RunPrompt {
@@ -2614,6 +3078,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .json()
         .await
         .unwrap();
+    let snapshot_worker_client = worker_client(&snapshot_worker);
 
     let snapshot: SnapshotResponse = client
         .post(format!(
@@ -2637,7 +3102,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
     assert_eq!(snapshot.snapshot.status, SnapshotStatus::Pending);
     assert_eq!(snapshot.snapshot.sandbox_id, sandbox.sandbox.id);
 
-    let snapshot_claimed: ClaimLeaseResponse = client
+    let snapshot_claimed: ClaimLeaseResponse = snapshot_worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, snapshot_worker.worker.id
@@ -2666,7 +3131,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
             .and_then(|value| value.as_str()),
         Some(snapshot_id.as_str())
     );
-    let completed_snapshot: LeaseResponse = client
+    let completed_snapshot: LeaseResponse = snapshot_worker_client
         .post(format!(
             "{}/leases/{}/complete",
             server.base_url, snapshot_lease.id
@@ -2760,15 +3225,32 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .json()
         .await
         .unwrap();
-    assert!(
-        cleanup
-            .expired
-            .iter()
-            .any(|seen| seen.id == expiring.snapshot.id)
-    );
     assert_eq!(cleanup.cleanup_run.status, CleanupRunStatus::Succeeded);
     assert!(cleanup.cleanup_run.finished_at.is_some());
-    assert!(cleanup.cleanup_run.expired_snapshots >= 1);
+    // This server runs the background expiry sweeper (see
+    // `start_with_expiry_sweeper`), and `expire_due_snapshots` is shared by
+    // that sweeper and the cleanup controller. Whichever fires first expires
+    // the due snapshot, so whether it shows up in *this* cleanup run's
+    // `expired` list is a race by design. Assert on the outcome — the due
+    // snapshot ends up expired — instead of on which actor expired it.
+    poll_until(|| async {
+        let response: SnapshotResponse = client
+            .get(format!(
+                "{}/snapshots/{}",
+                server.base_url, expiring.snapshot.id
+            ))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        (response.snapshot.status == SnapshotStatus::Expired).then_some(response)
+    })
+    .await
+    .expect("due snapshot should be expired by the cleanup run or the background sweep");
 
     let archived: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
@@ -2892,7 +3374,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
     assert_eq!(fork_snapshot_job.kind, JobKind::CreateSnapshot);
     assert_eq!(fork_snapshot_job.status, JobStatus::Queued);
 
-    let claimed_snapshot: ClaimLeaseResponse = client
+    let claimed_snapshot: ClaimLeaseResponse = snapshot_worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, snapshot_worker.worker.id
@@ -2913,7 +3395,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .expect("expected snapshot worker to claim fork snapshot job");
     assert_eq!(snapshot_lease.job.id, fork_snapshot_job.id);
 
-    let completed_fork_snapshot: LeaseResponse = client
+    let completed_fork_snapshot: LeaseResponse = snapshot_worker_client
         .post(format!(
             "{}/leases/{}/complete",
             server.base_url, snapshot_lease.id
@@ -2977,7 +3459,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
     let fork_job = job_for_child_sandbox(&jobs.jobs, &forked.sandbox.id.to_string());
     assert_eq!(fork_job.status, JobStatus::Queued);
 
-    let claimed: ClaimLeaseResponse = client
+    let claimed: ClaimLeaseResponse = snapshot_worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, snapshot_worker.worker.id
@@ -3013,7 +3495,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .unwrap();
     assert_eq!(provisioning_child.sandbox.state, SandboxState::Provisioning);
 
-    let completed: LeaseResponse = client
+    let completed: LeaseResponse = snapshot_worker_client
         .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
         .json(&CompleteLeaseRequest {
             result: Some(WorkerJobResult::ForkSandbox {
@@ -3110,7 +3592,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .await
         .unwrap();
     let failed_snapshot_job = job_for_snapshot(&jobs.jobs, &failed_snapshot_id.to_string());
-    let claimed_failed_snapshot: ClaimLeaseResponse = client
+    let claimed_failed_snapshot: ClaimLeaseResponse = snapshot_worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, snapshot_worker.worker.id
@@ -3130,7 +3612,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .lease
         .expect("expected snapshot worker to claim failing fork snapshot job");
     assert_eq!(failed_snapshot_lease.job.id, failed_snapshot_job.id);
-    let failed: LeaseResponse = client
+    let failed: LeaseResponse = snapshot_worker_client
         .post(format!(
             "{}/leases/{}/fail",
             server.base_url, failed_snapshot_lease.id
@@ -3602,6 +4084,17 @@ impl TestServer {
         Self::start_with_auth(database_url, data_dir, None).await
     }
 
+    /// Like `start`, but leaves the background expiry sweeper running (see
+    /// `SANDBOXWICH_DISABLE_EXPIRY_SWEEPER` in `spawn`) instead of the
+    /// disabled-by-default test posture. `run_contract` exercises lease and
+    /// desktop-session expiry that only happens via that background sweep;
+    /// every other test asserts on synchronous request/response behavior and
+    /// is better off with no background task mutating rows underneath it.
+    async fn start_with_expiry_sweeper(database_url: String, data_dir: Option<TempDir>) -> Self {
+        Self::start_with_auth_and_auto_migrate_and_sweeper(database_url, data_dir, None, true, true)
+            .await
+    }
+
     async fn start_with_auto_migrate(
         database_url: String,
         data_dir: Option<TempDir>,
@@ -3628,21 +4121,44 @@ impl TestServer {
         auth_token: Option<&str>,
         auto_migrate: bool,
     ) -> Self {
+        Self::start_with_auth_and_auto_migrate_and_sweeper(
+            database_url,
+            data_dir,
+            auth_token,
+            auto_migrate,
+            false,
+        )
+        .await
+    }
+
+    async fn start_with_auth_and_auto_migrate_and_sweeper(
+        database_url: String,
+        data_dir: Option<TempDir>,
+        auth_token: Option<&str>,
+        auto_migrate: bool,
+        enable_sweeper: bool,
+    ) -> Self {
         let default_tenant_token = auth_token
             .map(str::to_string)
             .unwrap_or_else(|| TEST_DEFAULT_TENANT_TOKEN.to_string());
         let resolved_auth_token = default_tenant_token.clone();
-        Self::spawn(database_url, data_dir, auto_migrate, move |command| {
-            if let Some(auth_token) = auth_token {
-                command.env("SANDBOXWICH_API_TOKEN", auth_token);
-            } else {
-                command.env(
-                    "SANDBOXWICH_TENANT_TOKENS",
-                    format!("default={default_tenant_token},tenant-b={TEST_TENANT_B_TOKEN}"),
-                );
-            }
-            command.env("SANDBOXWICH_OPERATOR_TOKEN", TEST_OPERATOR_TOKEN);
-        })
+        Self::spawn(
+            database_url,
+            data_dir,
+            auto_migrate,
+            enable_sweeper,
+            move |command| {
+                if let Some(auth_token) = auth_token {
+                    command.env("SANDBOXWICH_API_TOKEN", auth_token);
+                } else {
+                    command.env(
+                        "SANDBOXWICH_TENANT_TOKENS",
+                        format!("default={default_tenant_token},tenant-b={TEST_TENANT_B_TOKEN}"),
+                    );
+                }
+                command.env("SANDBOXWICH_OPERATOR_TOKEN", TEST_OPERATOR_TOKEN);
+            },
+        )
         .await
         .with_auth_token(Some(resolved_auth_token))
     }
@@ -3656,7 +4172,7 @@ impl TestServer {
         database_url: String,
         data_dir: Option<TempDir>,
     ) -> Self {
-        Self::spawn(database_url, data_dir, true, |_command| {})
+        Self::spawn(database_url, data_dir, true, false, |_command| {})
             .await
             .with_auth_token(None)
     }
@@ -3670,8 +4186,16 @@ impl TestServer {
         database_url: String,
         data_dir: Option<TempDir>,
         auto_migrate: bool,
+        enable_sweeper: bool,
         configure: impl FnOnce(&mut Command),
     ) -> Self {
+        // Transparent for SQLite (returns the URL unchanged, no guard). For
+        // Postgres, carves out a uniquely named database on the same server
+        // so this server's rows can never collide with another test's rows,
+        // regardless of how many Postgres-backed `TestServer`s run
+        // concurrently against the same `SANDBOXWICH_TEST_POSTGRES_URL`.
+        let (database_url, postgres_guard) = isolate_postgres_test_database(database_url).await;
+
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let bind = listener.local_addr().unwrap();
         drop(listener);
@@ -3683,8 +4207,17 @@ impl TestServer {
             // Expiry sweeps (leases, snapshots, desktop sessions) now run on a
             // background interval instead of inline on every read request; run
             // it fast in tests so assertions that expect prompt expiry don't
-            // need long sleeps.
+            // need long sleeps, for the tests that opt into the sweeper below.
             .env("SANDBOXWICH_SWEEP_INTERVAL_MS", "25")
+            // Disabled by default: most tests assert on synchronous
+            // request/response behavior and don't want a background sweeper
+            // mutating rows underneath them. Only `run_contract` (via
+            // `start_with_expiry_sweeper`) asserts on sweep-driven expiry and
+            // opts back in.
+            .env(
+                "SANDBOXWICH_DISABLE_EXPIRY_SWEEPER",
+                if enable_sweeper { "false" } else { "true" },
+            )
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         if !auto_migrate {
@@ -3711,6 +4244,7 @@ impl TestServer {
                     child,
                     auth_token: None,
                     _data_dir: data_dir,
+                    _postgres_guard: postgres_guard,
                 };
             }
             if let Some(status) = child.try_wait().unwrap() {
@@ -3744,6 +4278,151 @@ impl TestServer {
             None => reqwest::Client::new(),
         }
     }
+}
+
+/// A client authenticated with `worker`'s scoped credential (see GH-64),
+/// returned once by `POST /workers/register`. Guest-facing routes -- lease
+/// claim/renew/complete/fail/output and guest-health -- now reject
+/// tenant-wide tokens outright, so every test that exercises those routes on
+/// behalf of a specific worker must use this instead of `TestServer::client`.
+fn worker_client(worker: &WorkerResponse) -> reqwest::Client {
+    let token = worker
+        .worker_token
+        .as_deref()
+        .expect("register_worker response must include a worker-scoped token (see GH-64)");
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap()
+}
+
+/// Drops the uniquely named per-test Postgres database created by
+/// `isolate_postgres_test_database` when the owning `TestServer` goes out of
+/// scope.
+///
+/// Best-effort only: `Drop` can't be async, and this is the difference
+/// between a passing test suite with a handful of leftover empty databases in
+/// a throwaway CI Postgres container versus a hang, so failures here are
+/// swallowed rather than propagated.
+struct PostgresTestDatabaseGuard {
+    /// The original `SANDBOXWICH_TEST_POSTGRES_URL`-style URL, used to open
+    /// an admin connection capable of dropping the per-test database.
+    admin_url: String,
+    database_name: String,
+}
+
+impl Drop for PostgresTestDatabaseGuard {
+    fn drop(&mut self) {
+        let admin_url = self.admin_url.clone();
+        let database_name = self.database_name.clone();
+        // Run the teardown on a dedicated OS thread with its own throwaway
+        // Tokio runtime. We can't `.await` inside `Drop`, and blocking on the
+        // runtime that's already driving the current test (e.g. via
+        // `Handle::current().block_on`) panics because it would nest
+        // runtimes. A brand new runtime on a brand new thread sidesteps both
+        // problems; joining it keeps cleanup synchronous with the rest of
+        // `Drop` without leaking a dangling thread.
+        let teardown = std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(async move {
+                let Ok(pool) = sqlx::any::AnyPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&admin_url)
+                    .await
+                else {
+                    return;
+                };
+                // `WITH (FORCE)` (Postgres 13+; the CI service runs 17) drops
+                // the database even if the just-killed server process hasn't
+                // finished tearing down its connections yet.
+                let _ = sqlx::query(&format!(
+                    r#"drop database if exists "{database_name}" with (force)"#
+                ))
+                .execute(&pool)
+                .await;
+            });
+        });
+        let _ = teardown.join();
+    }
+}
+
+/// If `database_url` looks like a Postgres URL, provisions a uniquely named
+/// database on the same server and returns a URL pointing at it, plus a
+/// guard that drops that database (best-effort) on teardown.
+///
+/// `SANDBOXWICH_TEST_POSTGRES_URL` points every Postgres-backed test at one
+/// shared, already-existing admin database. If every `TestServer` connected
+/// its spawned API process directly to that URL, concurrent
+/// Postgres-backed tests (and each server's own background expiry sweeper,
+/// see `SANDBOXWICH_DISABLE_EXPIRY_SWEEPER`) would mutate the same rows.
+/// Instead, connect to the admin URL (any existing database on a Postgres
+/// cluster can issue `CREATE DATABASE`) to create a fresh, empty database
+/// per `TestServer`, and point the spawned process at that instead; it runs
+/// its own migrations at startup exactly as it would against any other empty
+/// database.
+///
+/// SQLite URLs pass through unchanged with no guard, so SQLite-backed tests
+/// are unaffected.
+async fn isolate_postgres_test_database(
+    database_url: String,
+) -> (String, Option<PostgresTestDatabaseGuard>) {
+    if !database_url.starts_with("postgres:") && !database_url.starts_with("postgresql:") {
+        return (database_url, None);
+    }
+
+    sqlx::any::install_default_drivers();
+    let admin_pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("connect to SANDBOXWICH_TEST_POSTGRES_URL to provision a per-test database");
+
+    // `Uuid::now_v7().simple()` renders as 32 lowercase hex characters with no
+    // hyphens, so the resulting identifier needs no quoting concerns beyond
+    // wrapping it in double quotes defensively.
+    let database_name = format!("sandboxwich_test_{}", Uuid::now_v7().simple());
+    sqlx::query(&format!(r#"create database "{database_name}""#))
+        .execute(&admin_pool)
+        .await
+        .expect("create per-test Postgres database");
+    drop(admin_pool);
+
+    let per_test_url = replace_postgres_database_name(&database_url, &database_name);
+    (
+        per_test_url,
+        Some(PostgresTestDatabaseGuard {
+            admin_url: database_url,
+            database_name,
+        }),
+    )
+}
+
+/// Swaps the path segment (database name) of a Postgres connection URL,
+/// preserving any query string (e.g. `?sslmode=disable`).
+fn replace_postgres_database_name(database_url: &str, database_name: &str) -> String {
+    let (base, query) = match database_url.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (database_url, None),
+    };
+    let last_slash = base
+        .rfind('/')
+        .expect("Postgres URL is expected to contain a path segment (database name)");
+    let mut url = format!("{}/{database_name}", &base[..last_slash]);
+    if let Some(query) = query {
+        url.push('?');
+        url.push_str(query);
+    }
+    url
 }
 
 async fn assert_database_rejects_invalid_typed_values(database_url: &str, sandbox_id: &str) {
