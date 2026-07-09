@@ -23,6 +23,14 @@ struct Cli {
     #[arg(long, env = "SANDBOXWICH_API", default_value = "http://127.0.0.1:3217")]
     api: String,
 
+    /// For `register`/`run`: a tenant-wide token, used only to authenticate
+    /// the initial `POST /workers/register` call. `run` then mints and
+    /// switches to a worker-scoped token (GH-64) for everything after
+    /// registration, so this value is never reused for lease/guest-health
+    /// calls in that path. For every other subcommand (`work-loop`, `claim`,
+    /// `renew`, `complete`, `fail`, `heartbeat`), pass the worker-scoped
+    /// token returned by `register` here instead -- those routes reject
+    /// tenant-wide tokens.
     #[arg(long, env = "SANDBOXWICH_API_TOKEN")]
     api_token: Option<String>,
 
@@ -568,8 +576,22 @@ async fn main() -> anyhow::Result<()> {
                     "registered": response.worker
                 }))?
             );
+            // GH-64: registration mints a credential scoped to this worker's
+            // id, distinct from the tenant token used above to register.
+            // Guest-facing routes (lease claim/renew/complete/fail/output,
+            // guest-health) now reject tenant-wide tokens outright, so the
+            // rest of this process -- its own heartbeat/claim/renew/
+            // complete/fail calls, and whatever it injects into the
+            // sandboxes it provisions -- must use the worker token instead
+            // of `cli.api_token` from here on.
+            let worker_token = response.worker_token.context(
+                "registration response did not include a worker-scoped token; is \
+                 sandboxwich-api up to date? (see GH-64)",
+            )?;
+            let worker_client = build_api_client(Some(&worker_token), cli.tenant.as_deref())
+                .context("failed to build worker-scoped API client")?;
             work_loop(
-                &client,
+                &worker_client,
                 &api,
                 WorkLoopArgs {
                     worker_id: response.worker.id.0,

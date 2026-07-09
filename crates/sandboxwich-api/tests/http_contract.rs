@@ -17,13 +17,13 @@ use sandboxwich_core::{
     NetworkAllowRule, NetworkAllowRuleKind, NetworkEgress, PromptQueuedResponse, PromptRequest,
     ProviderForkHandle, ProviderRuntimeResource, ProviderSandboxHandle, ProviderSnapshotHandle,
     QueueCommandResponse, ReconcileRuntimeResourcesRequest, ReconcileRuntimeResourcesResponse,
-    RegisterWorkerRequest, RequestSshKeyRequest, RuntimeResourceKind, RuntimeResourceListResponse,
-    RuntimeResourcePurpose, RuntimeResourceStatus, SandboxEventKind, SandboxListResponse,
-    SandboxResponse, SandboxState, SnapshotCleanupResponse, SnapshotId, SnapshotListResponse,
-    SnapshotResponse, SnapshotStatus, SshAccessRequest, SshAccessResponse, SshKeyListResponse,
-    SshKeyResponse, SshKeyStatus, UpdateDesktopSessionRequest, UpdateGuestHealthRequest,
-    UpdateSshKeyStatusRequest, WorkerCapability, WorkerHeartbeatRequest, WorkerJobResult,
-    WorkerListResponse, WorkerResponse,
+    RegisterWorkerRequest, RenewLeaseRequest, RequestSshKeyRequest, RuntimeResourceKind,
+    RuntimeResourceListResponse, RuntimeResourcePurpose, RuntimeResourceStatus, SandboxEventKind,
+    SandboxListResponse, SandboxResponse, SandboxState, SnapshotCleanupResponse, SnapshotId,
+    SnapshotListResponse, SnapshotResponse, SnapshotStatus, SshAccessRequest, SshAccessResponse,
+    SshKeyListResponse, SshKeyResponse, SshKeyStatus, UpdateDesktopSessionRequest,
+    UpdateGuestHealthRequest, UpdateSshKeyStatusRequest, WorkerCapability, WorkerHeartbeatRequest,
+    WorkerJobResult, WorkerListResponse, WorkerResponse,
 };
 use sqlx::any::AnyPoolOptions;
 use tempfile::TempDir;
@@ -238,6 +238,439 @@ async fn job_can_be_fetched_by_id_with_tenant_isolation() {
         .await
         .unwrap();
     assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+}
+
+/// Regression test for issue #64: the guest agent running inside a sandbox
+/// previously authenticated with the same tenant-wide bearer token the CLI
+/// uses for everything, so any compromised sandbox could act as the whole
+/// tenant (claim/forge any lease, post guest-health for any sandbox, etc).
+/// Workers now get a distinct, worker-scoped credential minted at
+/// registration, and every guest-facing route (lease
+/// claim/renew/complete/fail/output, guest-health) rejects tenant-wide
+/// tokens outright and enforces that a worker-scoped token can only act on
+/// its own worker id, its own leases, and sandboxes it has actually
+/// provisioned.
+#[tokio::test]
+async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("sandboxwich-worker-scope-test.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+
+    async fn register(client: &reqwest::Client, server: &TestServer, name: &str) -> WorkerResponse {
+        client
+            .post(format!("{}/workers/register", server.base_url))
+            .json(&RegisterWorkerRequest {
+                name: name.to_string(),
+                provider: "kubernetes".to_string(),
+                capabilities: vec![
+                    WorkerCapability::ProvisionSandbox,
+                    WorkerCapability::RunCommand,
+                ],
+                max_concurrent_jobs: Some(2),
+                labels: Default::default(),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    let worker_a = register(&client, &server, "worker-scope-a").await;
+    let worker_b = register(&client, &server, "worker-scope-b").await;
+    assert!(worker_a.worker_token.is_some());
+    assert!(worker_b.worker_token.is_some());
+    assert_ne!(worker_a.worker_token, worker_b.worker_token);
+    let worker_a_client = worker_client(&worker_a);
+    let worker_b_client = worker_client(&worker_b);
+
+    async fn create_sandbox(
+        client: &reqwest::Client,
+        server: &TestServer,
+        name: &str,
+    ) -> SandboxResponse {
+        client
+            .post(format!("{}/sandboxes", server.base_url))
+            .json(&CreateSandboxRequest {
+                name: Some(name.to_string()),
+                template: None,
+                memory_limit: None,
+                network_egress: None,
+                ttl_seconds: Some(120),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    let sandbox_a = create_sandbox(&client, &server, "worker-scope-sandbox-a").await;
+    let sandbox_b = create_sandbox(&client, &server, "worker-scope-sandbox-b").await;
+
+    // A worker only "owns" a sandbox (for guest-health purposes) once it has
+    // completed a provision lease for it, so give each worker exactly one
+    // sandbox this way before attacking across the boundary.
+    async fn provision(
+        client: &reqwest::Client,
+        worker_client: &reqwest::Client,
+        server: &TestServer,
+        worker: &WorkerResponse,
+        sandbox: &SandboxResponse,
+    ) {
+        let queued: JobResponse = client
+            .post(format!("{}/jobs", server.base_url))
+            .json(&CreateJobRequest {
+                kind: JobKind::ProvisionSandbox,
+                payload: serde_json::json!({ "sandboxId": sandbox.sandbox.id }),
+                required_capability: WorkerCapability::ProvisionSandbox,
+                priority: None,
+                max_attempts: None,
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let claimed: ClaimLeaseResponse = worker_client
+            .post(format!(
+                "{}/workers/{}/leases/claim",
+                server.base_url, worker.worker.id
+            ))
+            .json(&ClaimLeaseRequest {
+                lease_seconds: Some(60),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let lease = claimed
+            .lease
+            .expect("worker should claim its own provision job");
+        assert_eq!(lease.job.id, queued.job.id);
+        let completed: LeaseResponse = worker_client
+            .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
+            .json(&CompleteLeaseRequest {
+                result: Some(WorkerJobResult::ProvisionSandbox {
+                    handle: ProviderSandboxHandle {
+                        provider: "kubernetes".to_string(),
+                        sandbox_id: sandbox.sandbox.id,
+                        resources: provision_resources(sandbox.sandbox.id),
+                        metadata: serde_json::json!({}),
+                    },
+                }),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(completed.lease.job.status, JobStatus::Succeeded);
+    }
+
+    provision(&client, &worker_a_client, &server, &worker_a, &sandbox_a).await;
+    provision(&client, &worker_b_client, &server, &worker_b, &sandbox_b).await;
+
+    // Give worker A a real active lease (a RunCommand job for its own
+    // sandbox) to attack from worker B and from a tenant-wide token.
+    let command: QueueCommandResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/commands",
+            server.base_url, sandbox_a.sandbox.id
+        ))
+        .json(&CommandRequest {
+            argv: vec!["true".to_string()],
+            cwd: None,
+            env: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let claimed: ClaimLeaseResponse = worker_a_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker_a.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease_a = claimed
+        .lease
+        .expect("worker A should claim its own command job");
+    assert_eq!(lease_a.job.id, command.queued_job.id);
+
+    // (a) worker B's token cannot claim on worker A's behalf, ...
+    let cross_claim = worker_b_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker_a.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_claim.status(), StatusCode::NOT_FOUND);
+
+    // ... cannot renew worker A's lease, ...
+    let cross_renew = worker_b_client
+        .post(format!("{}/leases/{}/renew", server.base_url, lease_a.id))
+        .json(&RenewLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_renew.status(), StatusCode::NOT_FOUND);
+
+    // ... cannot append output to worker A's lease, ...
+    let cross_output = worker_b_client
+        .post(format!("{}/leases/{}/output", server.base_url, lease_a.id))
+        .json(&AppendCommandOutputRequest {
+            stream: CommandOutputStream::Stdout,
+            chunk: "attack".to_string(),
+            annotations: Vec::new(),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_output.status(), StatusCode::NOT_FOUND);
+
+    // ... cannot complete worker A's lease, ...
+    let cross_complete = worker_b_client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, lease_a.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(command_result("owned\n", "", 0)),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_complete.status(), StatusCode::NOT_FOUND);
+
+    // ... cannot fail worker A's lease, ...
+    let cross_fail = worker_b_client
+        .post(format!("{}/leases/{}/fail", server.base_url, lease_a.id))
+        .json(&FailLeaseRequest {
+            error: "attack".to_string(),
+            retry: false,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_fail.status(), StatusCode::NOT_FOUND);
+
+    // ... and cannot post guest-health for sandbox A, which worker B never
+    // provisioned.
+    let cross_health = worker_b_client
+        .post(format!(
+            "{}/sandboxes/{}/guest-health",
+            server.base_url, sandbox_a.sandbox.id
+        ))
+        .json(&UpdateGuestHealthRequest {
+            status: GuestStatus::Ready,
+            agent_version: None,
+            checks: None,
+            message: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_health.status(), StatusCode::NOT_FOUND);
+
+    // (b) a tenant-wide token is rejected outright on every guest-facing
+    // route, even acting on its own tenant's worker/lease/sandbox -- the
+    // whole point is that a sandbox holding only the tenant token (the
+    // pre-fix state) must never be able to reach these routes at all.
+    let tenant_claim = client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker_a.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tenant_claim.status(), StatusCode::UNAUTHORIZED);
+
+    let tenant_renew = client
+        .post(format!("{}/leases/{}/renew", server.base_url, lease_a.id))
+        .json(&RenewLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tenant_renew.status(), StatusCode::UNAUTHORIZED);
+
+    let tenant_output = client
+        .post(format!("{}/leases/{}/output", server.base_url, lease_a.id))
+        .json(&AppendCommandOutputRequest {
+            stream: CommandOutputStream::Stdout,
+            chunk: "attack".to_string(),
+            annotations: Vec::new(),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tenant_output.status(), StatusCode::UNAUTHORIZED);
+
+    let tenant_fail = client
+        .post(format!("{}/leases/{}/fail", server.base_url, lease_a.id))
+        .json(&FailLeaseRequest {
+            error: "attack".to_string(),
+            retry: false,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tenant_fail.status(), StatusCode::UNAUTHORIZED);
+
+    let tenant_health = client
+        .post(format!(
+            "{}/sandboxes/{}/guest-health",
+            server.base_url, sandbox_a.sandbox.id
+        ))
+        .json(&UpdateGuestHealthRequest {
+            status: GuestStatus::Ready,
+            agent_version: None,
+            checks: None,
+            message: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tenant_health.status(), StatusCode::UNAUTHORIZED);
+
+    // Checked last (and left the lease untouched by every attack above): a
+    // tenant-wide token cannot complete worker A's lease either.
+    let tenant_complete = client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, lease_a.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(command_result("owned\n", "", 0)),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tenant_complete.status(), StatusCode::UNAUTHORIZED);
+
+    // (c) the happy path still works end to end: worker A can append
+    // output to, renew, and complete its own lease; worker B can post
+    // guest-health for its own sandbox.
+    let output: sandboxwich_core::CommandOutputChunkResponse = worker_a_client
+        .post(format!("{}/leases/{}/output", server.base_url, lease_a.id))
+        .json(&AppendCommandOutputRequest {
+            stream: CommandOutputStream::Stdout,
+            chunk: "ok".to_string(),
+            annotations: Vec::new(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(output.chunk.sequence, 1);
+
+    let renewed: LeaseResponse = worker_a_client
+        .post(format!("{}/leases/{}/renew", server.base_url, lease_a.id))
+        .json(&RenewLeaseRequest {
+            lease_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(renewed.lease.id, lease_a.id);
+
+    let completed: LeaseResponse = worker_a_client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, lease_a.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(command_result("ok\n", "", 0)),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(completed.lease.job.status, JobStatus::Succeeded);
+
+    let health: GuestHealthResponse = worker_b_client
+        .post(format!(
+            "{}/sandboxes/{}/guest-health",
+            server.base_url, sandbox_b.sandbox.id
+        ))
+        .json(&UpdateGuestHealthRequest {
+            status: GuestStatus::Ready,
+            agent_version: Some("sandboxwich-agent/test".to_string()),
+            checks: None,
+            message: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health.guest_health.status, GuestStatus::Ready);
 }
 
 /// Regression test for issue #63: with neither `SANDBOXWICH_API_TOKEN` nor
@@ -690,7 +1123,6 @@ async fn run_contract(server: TestServer) {
     assert_tenant_boundaries_are_enforced(&client, &server, &created).await;
     let uploaded_file = assert_resource_tiers_and_file_contracts(&client, &server, &created).await;
     assert_metrics_are_exposed(&client, &server).await;
-    assert_guest_health_and_ssh_key_lifecycle(&client, &server, &created).await;
 
     let worker: WorkerResponse = client
         .post(format!("{}/workers/register", server.base_url))
@@ -714,6 +1146,11 @@ async fn run_contract(server: TestServer) {
         .await
         .unwrap();
     assert_eq!(worker.worker.name, "k3s-worker-a");
+    // GH-64: lease claim/renew/complete/fail/output and guest-health are
+    // guest-facing and now reject tenant-wide tokens, so every call to one
+    // of those routes on this worker's behalf below uses this instead of
+    // `client`.
+    let worker_client = worker_client(&worker);
 
     let heartbeat: WorkerResponse = client
         .post(format!(
@@ -751,6 +1188,11 @@ async fn run_contract(server: TestServer) {
             .any(|seen| seen.id == worker.worker.id)
     );
     assert_provision_job_persists_runtime_resources(&client, &server, &created, &worker).await;
+    // Must run after the ProvisionSandbox lease above completes: guest-health
+    // is guest-facing (GH-64) and now requires a worker-scoped token from a
+    // worker that has actually completed a provision/fork lease for this
+    // sandbox, which is what the call above just did.
+    assert_guest_health_and_ssh_key_lifecycle(&client, &server, &created, &worker).await;
     assert_runtime_resource_reconcile_marks_missing_resources_deleted(
         &client, &server, &created, &worker,
     )
@@ -826,7 +1268,7 @@ async fn run_contract(server: TestServer) {
         serde_json::json!("deny_all")
     );
 
-    let claimed: ClaimLeaseResponse = client
+    let claimed: ClaimLeaseResponse = worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, worker.worker.id
@@ -861,7 +1303,7 @@ async fn run_contract(server: TestServer) {
         .unwrap();
     assert_eq!(running_command.command.status, CommandStatus::Running);
 
-    let first_chunk: sandboxwich_core::CommandOutputChunkResponse = client
+    let first_chunk: sandboxwich_core::CommandOutputChunkResponse = worker_client
         .post(format!("{}/leases/{}/output", server.base_url, lease.id))
         .json(&AppendCommandOutputRequest {
             stream: CommandOutputStream::Stdout,
@@ -883,7 +1325,7 @@ async fn run_contract(server: TestServer) {
         .unwrap();
     assert_eq!(first_chunk.chunk.sequence, 1);
     assert_eq!(first_chunk.chunk.annotations.len(), 1);
-    let second_chunk: sandboxwich_core::CommandOutputChunkResponse = client
+    let second_chunk: sandboxwich_core::CommandOutputChunkResponse = worker_client
         .post(format!("{}/leases/{}/output", server.base_url, lease.id))
         .json(&AppendCommandOutputRequest {
             stream: CommandOutputStream::Stdout,
@@ -956,7 +1398,7 @@ async fn run_contract(server: TestServer) {
     assert_eq!(saturated_worker.active_leases, 1);
     assert_eq!(saturated_worker.available_slots, 0);
 
-    let saturated_claim: ClaimLeaseResponse = client
+    let saturated_claim: ClaimLeaseResponse = worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, worker.worker.id
@@ -974,7 +1416,7 @@ async fn run_contract(server: TestServer) {
         .unwrap();
     assert!(saturated_claim.lease.is_none());
 
-    let completed: LeaseResponse = client
+    let completed: LeaseResponse = worker_client
         .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
         .json(&CompleteLeaseRequest {
             result: Some(command_result("hello\n", "", 0)),
@@ -989,7 +1431,7 @@ async fn run_contract(server: TestServer) {
         .unwrap();
     assert_eq!(completed.lease.job.status, JobStatus::Succeeded);
 
-    let second_claimed: ClaimLeaseResponse = client
+    let second_claimed: ClaimLeaseResponse = worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, worker.worker.id
@@ -1008,7 +1450,7 @@ async fn run_contract(server: TestServer) {
     let second_lease = second_claimed
         .lease
         .expect("worker should claim queued command after capacity frees");
-    let second_completed: LeaseResponse = client
+    let second_completed: LeaseResponse = worker_client
         .post(format!(
             "{}/leases/{}/complete",
             server.base_url, second_lease.id
@@ -1471,7 +1913,14 @@ async fn assert_guest_health_and_ssh_key_lifecycle(
     client: &reqwest::Client,
     server: &TestServer,
     sandbox: &SandboxResponse,
+    worker: &WorkerResponse,
 ) {
+    // GH-64: guest-health updates are guest-facing and require a
+    // worker-scoped token bound to the worker that provisioned/forked this
+    // sandbox; the read side (GET) stays on the tenant client since
+    // CLI/dashboard callers need to read it too.
+    let worker_client = worker_client(worker);
+
     let default_health: GuestHealthResponse = client
         .get(format!(
             "{}/sandboxes/{}/guest-health",
@@ -1487,7 +1936,7 @@ async fn assert_guest_health_and_ssh_key_lifecycle(
         .unwrap();
     assert_eq!(default_health.guest_health.status, GuestStatus::Pending);
 
-    let ready_health: GuestHealthResponse = client
+    let ready_health: GuestHealthResponse = worker_client
         .post(format!(
             "{}/sandboxes/{}/guest-health",
             server.base_url, sandbox.sandbox.id
@@ -1515,7 +1964,7 @@ async fn assert_guest_health_and_ssh_key_lifecycle(
         .unwrap();
     assert_eq!(ready_health.guest_health.status, GuestStatus::Ready);
 
-    let unhealthy_health: GuestHealthResponse = client
+    let unhealthy_health: GuestHealthResponse = worker_client
         .post(format!(
             "{}/sandboxes/{}/guest-health",
             server.base_url, sandbox.sandbox.id
@@ -1556,7 +2005,7 @@ async fn assert_guest_health_and_ssh_key_lifecycle(
             && event.data["reason"] == serde_json::json!("guest_unhealthy")
     }));
 
-    let _: GuestHealthResponse = client
+    let _: GuestHealthResponse = worker_client
         .post(format!(
             "{}/sandboxes/{}/guest-health",
             server.base_url, sandbox.sandbox.id
@@ -1695,7 +2144,8 @@ async fn assert_provision_job_persists_runtime_resources(
         .unwrap();
     assert_eq!(queued.job.status, JobStatus::Queued);
 
-    let claimed: ClaimLeaseResponse = client
+    let worker_client = worker_client(worker);
+    let claimed: ClaimLeaseResponse = worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, worker.worker.id
@@ -1716,7 +2166,7 @@ async fn assert_provision_job_persists_runtime_resources(
         .expect("expected worker to claim provision job");
     assert_eq!(lease.job.id, queued.job.id);
 
-    let completed: LeaseResponse = client
+    let completed: LeaseResponse = worker_client
         .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
         .json(&CompleteLeaseRequest {
             result: Some(WorkerJobResult::ProvisionSandbox {
@@ -1797,7 +2247,8 @@ async fn assert_failed_completion_rolls_back_lease_state(
         .await
         .unwrap();
 
-    let claimed: ClaimLeaseResponse = client
+    let worker_client = worker_client(worker);
+    let claimed: ClaimLeaseResponse = worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, worker.worker.id
@@ -1820,7 +2271,7 @@ async fn assert_failed_completion_rolls_back_lease_state(
 
     let mut resources = provision_resources(sandbox.sandbox.id);
     resources[0].provider = String::new();
-    let rejected = client
+    let rejected = worker_client
         .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
         .json(&CompleteLeaseRequest {
             result: Some(WorkerJobResult::ProvisionSandbox {
@@ -1837,7 +2288,7 @@ async fn assert_failed_completion_rolls_back_lease_state(
         .unwrap();
     assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
 
-    let failed: LeaseResponse = client
+    let failed: LeaseResponse = worker_client
         .post(format!("{}/leases/{}/fail", server.base_url, lease.id))
         .json(&FailLeaseRequest {
             error: "rollback probe".to_string(),
@@ -2001,7 +2452,8 @@ async fn assert_retryable_failure_requeues_command(
     assert_eq!(command.queued_job.sandbox_id, sandbox.sandbox.id);
     assert_eq!(command.queued_job.command_id, command.command.id);
 
-    let claimed: ClaimLeaseResponse = client
+    let worker_client = worker_client(worker);
+    let claimed: ClaimLeaseResponse = worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, worker.worker.id
@@ -2019,7 +2471,7 @@ async fn assert_retryable_failure_requeues_command(
         .unwrap();
     let lease = claimed.lease.expect("expected retry test lease");
     assert_eq!(lease.job.id, command.queued_job.id);
-    client
+    worker_client
         .post(format!("{}/leases/{}/output", server.base_url, lease.id))
         .json(&AppendCommandOutputRequest {
             stream: CommandOutputStream::Stdout,
@@ -2031,7 +2483,7 @@ async fn assert_retryable_failure_requeues_command(
         .unwrap()
         .error_for_status()
         .unwrap();
-    let failed: LeaseResponse = client
+    let failed: LeaseResponse = worker_client
         .post(format!("{}/leases/{}/fail", server.base_url, lease.id))
         .json(&FailLeaseRequest {
             error: "temporary failure".to_string(),
@@ -2077,7 +2529,7 @@ async fn assert_retryable_failure_requeues_command(
         .unwrap();
     assert!(chunks_after_retry.chunks.is_empty());
 
-    let claimed_again: ClaimLeaseResponse = client
+    let claimed_again: ClaimLeaseResponse = worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, worker.worker.id
@@ -2095,7 +2547,7 @@ async fn assert_retryable_failure_requeues_command(
         .unwrap();
     let retry_lease = claimed_again.lease.expect("expected retry lease");
     assert_eq!(retry_lease.job.id, lease.job.id);
-    let completed: LeaseResponse = client
+    let completed: LeaseResponse = worker_client
         .post(format!(
             "{}/leases/{}/complete",
             server.base_url, retry_lease.id
@@ -2141,7 +2593,7 @@ async fn assert_expired_lease_requeues_command(
     assert_eq!(command.queued_job.sandbox_id, sandbox.sandbox.id);
     assert_eq!(command.queued_job.command_id, command.command.id);
 
-    let claimed: ClaimLeaseResponse = client
+    let claimed: ClaimLeaseResponse = worker_client(worker)
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, worker.worker.id
@@ -2276,7 +2728,8 @@ async fn assert_prompt_job_lifecycle(
     let prompt_job = job_for_prompt(&jobs.jobs, &prompt.event.id.to_string());
     assert_eq!(prompt_job.status, JobStatus::Queued);
 
-    let claimed: ClaimLeaseResponse = client
+    let prompt_worker_client = worker_client(&prompt_worker);
+    let claimed: ClaimLeaseResponse = prompt_worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, prompt_worker.worker.id
@@ -2297,7 +2750,7 @@ async fn assert_prompt_job_lifecycle(
         .expect("expected prompt worker to claim prompt job");
     assert_eq!(lease.job.id, prompt_job.id);
 
-    let completed: LeaseResponse = client
+    let completed: LeaseResponse = prompt_worker_client
         .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
         .json(&CompleteLeaseRequest {
             result: Some(WorkerJobResult::RunPrompt {
@@ -2606,6 +3059,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .json()
         .await
         .unwrap();
+    let snapshot_worker_client = worker_client(&snapshot_worker);
 
     let snapshot: SnapshotResponse = client
         .post(format!(
@@ -2629,7 +3083,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
     assert_eq!(snapshot.snapshot.status, SnapshotStatus::Pending);
     assert_eq!(snapshot.snapshot.sandbox_id, sandbox.sandbox.id);
 
-    let snapshot_claimed: ClaimLeaseResponse = client
+    let snapshot_claimed: ClaimLeaseResponse = snapshot_worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, snapshot_worker.worker.id
@@ -2658,7 +3112,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
             .and_then(|value| value.as_str()),
         Some(snapshot_id.as_str())
     );
-    let completed_snapshot: LeaseResponse = client
+    let completed_snapshot: LeaseResponse = snapshot_worker_client
         .post(format!(
             "{}/leases/{}/complete",
             server.base_url, snapshot_lease.id
@@ -2901,7 +3355,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
     assert_eq!(fork_snapshot_job.kind, JobKind::CreateSnapshot);
     assert_eq!(fork_snapshot_job.status, JobStatus::Queued);
 
-    let claimed_snapshot: ClaimLeaseResponse = client
+    let claimed_snapshot: ClaimLeaseResponse = snapshot_worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, snapshot_worker.worker.id
@@ -2922,7 +3376,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .expect("expected snapshot worker to claim fork snapshot job");
     assert_eq!(snapshot_lease.job.id, fork_snapshot_job.id);
 
-    let completed_fork_snapshot: LeaseResponse = client
+    let completed_fork_snapshot: LeaseResponse = snapshot_worker_client
         .post(format!(
             "{}/leases/{}/complete",
             server.base_url, snapshot_lease.id
@@ -2986,7 +3440,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
     let fork_job = job_for_child_sandbox(&jobs.jobs, &forked.sandbox.id.to_string());
     assert_eq!(fork_job.status, JobStatus::Queued);
 
-    let claimed: ClaimLeaseResponse = client
+    let claimed: ClaimLeaseResponse = snapshot_worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, snapshot_worker.worker.id
@@ -3022,7 +3476,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .unwrap();
     assert_eq!(provisioning_child.sandbox.state, SandboxState::Provisioning);
 
-    let completed: LeaseResponse = client
+    let completed: LeaseResponse = snapshot_worker_client
         .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
         .json(&CompleteLeaseRequest {
             result: Some(WorkerJobResult::ForkSandbox {
@@ -3119,7 +3573,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .await
         .unwrap();
     let failed_snapshot_job = job_for_snapshot(&jobs.jobs, &failed_snapshot_id.to_string());
-    let claimed_failed_snapshot: ClaimLeaseResponse = client
+    let claimed_failed_snapshot: ClaimLeaseResponse = snapshot_worker_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, snapshot_worker.worker.id
@@ -3139,7 +3593,7 @@ async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .lease
         .expect("expected snapshot worker to claim failing fork snapshot job");
     assert_eq!(failed_snapshot_lease.job.id, failed_snapshot_job.id);
-    let failed: LeaseResponse = client
+    let failed: LeaseResponse = snapshot_worker_client
         .post(format!(
             "{}/leases/{}/fail",
             server.base_url, failed_snapshot_lease.id
@@ -3580,6 +4034,27 @@ impl TestServer {
             None => reqwest::Client::new(),
         }
     }
+}
+
+/// A client authenticated with `worker`'s scoped credential (see GH-64),
+/// returned once by `POST /workers/register`. Guest-facing routes -- lease
+/// claim/renew/complete/fail/output and guest-health -- now reject
+/// tenant-wide tokens outright, so every test that exercises those routes on
+/// behalf of a specific worker must use this instead of `TestServer::client`.
+fn worker_client(worker: &WorkerResponse) -> reqwest::Client {
+    let token = worker
+        .worker_token
+        .as_deref()
+        .expect("register_worker response must include a worker-scoped token (see GH-64)");
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap()
 }
 
 /// Drops the uniquely named per-test Postgres database created by

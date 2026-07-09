@@ -105,6 +105,14 @@ spec:
           env:
             - name: SANDBOXWICH_API
               value: http://sandboxwich-api:3217
+            # GH-64: this tenant-wide credential authenticates only the
+            # `run` subcommand's initial `POST /workers/register` call.
+            # Immediately after registering, the worker process mints and
+            # switches internally to a worker-scoped token bound to its own
+            # worker id, and uses that (never this value) for every
+            # guest-facing call it makes afterward (heartbeat, lease
+            # claim/renew/complete/fail/output) -- those routes reject
+            # tenant-wide tokens outright.
             - name: SANDBOXWICH_API_TOKEN
               valueFrom:
                 secretKeyRef:
