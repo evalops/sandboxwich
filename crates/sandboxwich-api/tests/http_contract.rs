@@ -830,6 +830,287 @@ async fn cleanup_is_not_usable_cross_tenant() {
     assert_eq!(wrong_operator_token.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// Regression test: `/metrics` aggregated sandbox/worker/job/lease counts across every tenant and
+/// served them to any authenticated tenant token, an information leak across the tenant boundary.
+/// Each tenant's own bearer token must now only ever see its own tenant's counts; only the
+/// dedicated operator credential unlocks the cross-tenant, unscoped view.
+#[tokio::test]
+async fn metrics_are_scoped_to_the_authenticated_tenant() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("sandboxwich-metrics-tenant-test.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let default_client = server.client();
+    let tenant_b_client = reqwest::Client::new();
+
+    const DEFAULT_TENANT_SANDBOXES: usize = 2;
+    const TENANT_B_SANDBOXES: usize = 3;
+
+    for index in 0..DEFAULT_TENANT_SANDBOXES {
+        let _: SandboxResponse = default_client
+            .post(format!("{}/sandboxes", server.base_url))
+            .json(&CreateSandboxRequest {
+                name: Some(format!("metrics-default-{index}")),
+                template: None,
+                memory_limit: None,
+                network_egress: None,
+                ttl_seconds: Some(120),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    }
+    for index in 0..TENANT_B_SANDBOXES {
+        let _: SandboxResponse = tenant_b_client
+            .post(format!("{}/sandboxes", server.base_url))
+            .bearer_auth(TEST_TENANT_B_TOKEN)
+            .json(&CreateSandboxRequest {
+                name: Some(format!("metrics-tenant-b-{index}")),
+                template: None,
+                memory_limit: None,
+                network_egress: None,
+                ttl_seconds: Some(120),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    }
+
+    let default_metrics = default_client
+        .get(format!("{}/metrics", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        ready_sandbox_gauge(&default_metrics),
+        DEFAULT_TENANT_SANDBOXES as i64,
+        "default tenant's /metrics must count only its own sandboxes, not tenant-b's:\n{default_metrics}"
+    );
+
+    let tenant_b_metrics = tenant_b_client
+        .get(format!("{}/metrics", server.base_url))
+        .bearer_auth(TEST_TENANT_B_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        ready_sandbox_gauge(&tenant_b_metrics),
+        TENANT_B_SANDBOXES as i64,
+        "tenant-b's /metrics must count only its own sandboxes, not the default tenant's:\n{tenant_b_metrics}"
+    );
+
+    // The dedicated operator credential additionally unlocks the unscoped, cross-tenant view.
+    let operator_metrics = default_client
+        .get(format!("{}/metrics", server.base_url))
+        .header(OPERATOR_TOKEN_HEADER, TEST_OPERATOR_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        ready_sandbox_gauge(&operator_metrics),
+        (DEFAULT_TENANT_SANDBOXES + TENANT_B_SANDBOXES) as i64,
+        "the operator credential must see totals across every tenant:\n{operator_metrics}"
+    );
+
+    // A wrong operator token header must not grant the global view -- it falls back to
+    // tenant-scoped output exactly as if no operator header had been sent at all.
+    let wrong_operator_metrics = default_client
+        .get(format!("{}/metrics", server.base_url))
+        .header(OPERATOR_TOKEN_HEADER, "not-the-operator-token")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        ready_sandbox_gauge(&wrong_operator_metrics),
+        DEFAULT_TENANT_SANDBOXES as i64,
+        "a wrong operator token must not unlock the cross-tenant view:\n{wrong_operator_metrics}"
+    );
+}
+
+/// Extracts the value of `sandboxwich_sandbox_count{state="ready"}` from a Prometheus text
+/// exposition body produced by `/metrics`.
+fn ready_sandbox_gauge(metrics_text: &str) -> i64 {
+    metrics_text
+        .lines()
+        .find(|line| line.starts_with("sandboxwich_sandbox_count{state=\"ready\"}"))
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or_else(|| {
+            panic!("sandboxwich_sandbox_count{{state=\"ready\"}} not found in:\n{metrics_text}")
+        })
+}
+
+/// Regression test for the `list_sandboxes` N+1: hydrating every allowlist sandbox's network
+/// egress rules used to run one query per sandbox. Batching that into a single
+/// `sandbox_id in (...)` query and grouping in memory must still attach each sandbox's *own*
+/// rules -- not another sandbox's -- and must leave non-allowlist sandboxes untouched.
+#[tokio::test]
+async fn list_sandboxes_hydrates_each_allowlist_sandboxes_own_rules() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("sandboxwich-egress-batch-test.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+
+    let single_rule: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("egress-batch-single-rule".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: Some(NetworkEgress::Allowlist {
+                rules: vec![NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Cidr,
+                    value: "10.0.0.0/8".to_string(),
+                }],
+            }),
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let multi_rule: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("egress-batch-multi-rule".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: Some(NetworkEgress::Allowlist {
+                rules: vec![
+                    NetworkAllowRule {
+                        kind: NetworkAllowRuleKind::Cidr,
+                        value: "172.16.0.0/12".to_string(),
+                    },
+                    NetworkAllowRule {
+                        kind: NetworkAllowRuleKind::Cidr,
+                        value: "192.168.0.0/16".to_string(),
+                    },
+                ],
+            }),
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let no_rules: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("egress-batch-deny-all".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: Some(NetworkEgress::DenyAll),
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let listed: SandboxListResponse = client
+        .get(format!("{}/sandboxes", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let find = |id: sandboxwich_core::SandboxId| {
+        listed
+            .sandboxes
+            .iter()
+            .find(|sandbox| sandbox.id == id)
+            .unwrap_or_else(|| panic!("sandbox {id} missing from list_sandboxes response"))
+    };
+
+    assert_eq!(
+        find(single_rule.sandbox.id).network_egress,
+        NetworkEgress::Allowlist {
+            rules: vec![NetworkAllowRule {
+                kind: NetworkAllowRuleKind::Cidr,
+                value: "10.0.0.0/8".to_string(),
+            }]
+        }
+    );
+    assert_eq!(
+        find(multi_rule.sandbox.id).network_egress,
+        NetworkEgress::Allowlist {
+            rules: vec![
+                NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Cidr,
+                    value: "172.16.0.0/12".to_string(),
+                },
+                NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Cidr,
+                    value: "192.168.0.0/16".to_string(),
+                },
+            ]
+        }
+    );
+    assert_eq!(
+        find(no_rules.sandbox.id).network_egress,
+        NetworkEgress::DenyAll
+    );
+}
+
 #[tokio::test]
 async fn migrate_command_prepares_database_for_no_auto_migrate_server() {
     let data_dir = tempfile::tempdir().unwrap();
