@@ -118,6 +118,7 @@ struct ApiConfig {
     allow_insecure_no_auth: bool,
     default_tenant_id: String,
     sweep_interval_ms: u64,
+    disable_expiry_sweeper: bool,
 }
 
 #[tokio::main]
@@ -159,7 +160,15 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    spawn_expiry_sweeper(db.clone(), Duration::from_millis(config.sweep_interval_ms));
+    if config.disable_expiry_sweeper {
+        tracing::info!(
+            "SANDBOXWICH_DISABLE_EXPIRY_SWEEPER is set: not spawning the lease/snapshot/desktop-\
+             session expiry sweeper. Nothing will expire leases, snapshots, or desktop sessions \
+             on this instance except explicit callers of /snapshots/cleanup."
+        );
+    } else {
+        spawn_expiry_sweeper(db.clone(), Duration::from_millis(config.sweep_interval_ms));
+    }
 
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     tracing::info!(addr = %config.bind, database_url = %config.database_url, "sandboxwich-api listening");
@@ -187,6 +196,11 @@ async fn main() -> anyhow::Result<()> {
 /// mutating work proportional to total table size on every GET, and it means
 /// only one caller (this task) ever performs a given sweep at a time instead of
 /// every concurrent reader racing to expire the same rows.
+///
+/// Set `SANDBOXWICH_DISABLE_EXPIRY_SWEEPER=true` to skip spawning this task
+/// entirely. Integration tests that don't assert on sweep-driven expiry
+/// disable it by default so the sweeper's periodic writes can't race with
+/// foreground test assertions against the same server.
 fn spawn_expiry_sweeper(db: Database, interval: Duration) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -234,6 +248,7 @@ fn load_api_config() -> anyhow::Result<ApiConfig> {
         .filter(|tenant| !tenant.trim().is_empty())
         .unwrap_or_else(|| "default".to_string());
     let sweep_interval_ms = u64::from(parse_env_u32("SANDBOXWICH_SWEEP_INTERVAL_MS", 1000)?.max(1));
+    let disable_expiry_sweeper = parse_env_bool("SANDBOXWICH_DISABLE_EXPIRY_SWEEPER", false)?;
 
     Ok(ApiConfig {
         command,
@@ -247,6 +262,7 @@ fn load_api_config() -> anyhow::Result<ApiConfig> {
         allow_insecure_no_auth,
         default_tenant_id,
         sweep_interval_ms,
+        disable_expiry_sweeper,
     })
 }
 
