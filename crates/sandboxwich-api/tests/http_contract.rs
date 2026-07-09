@@ -1,4 +1,5 @@
 use std::{
+    io::Read,
     net::TcpListener,
     process::{Child, Command, Stdio},
     time::Duration,
@@ -4363,6 +4364,145 @@ fn provider_resource(
     resource
 }
 
+/// Outcome of one bind-drop-spawn cycle in `try_spawn_once`.
+enum SpawnAttempt {
+    Healthy {
+        base_url: String,
+        child: Child,
+    },
+    /// The child exited early because another process won the race for the
+    /// ephemeral port `try_spawn_once` picked, between our `drop(listener)`
+    /// and the child's own bind a moment later. Retryable with a fresh port.
+    LostBindRace(String),
+    /// The child exited early, or never became healthy, for any other
+    /// reason. Not retried -- surfaced immediately so a real startup bug
+    /// fails fast instead of being masked behind retries.
+    Failed(String),
+}
+
+/// The signature a bind failure leaves in the child's stderr when it loses
+/// the ephemeral-port race `try_spawn_once` describes. Matched loosely
+/// (case-insensitive substring, not an exact OS-error code) because the
+/// exact wording differs slightly between Linux and macOS.
+fn is_lost_bind_race(stderr: &str) -> bool {
+    stderr.to_ascii_lowercase().contains("already in use")
+}
+
+/// Binds a fresh ephemeral port, drops the listener, and spawns the API
+/// server process pointed at that port via `SANDBOXWICH_BIND`, then polls
+/// `/healthz` until the server is up (or gives up).
+///
+/// This bind-then-drop-then-rebind sequence is an inherent TOCTOU: another
+/// process on the machine can steal the port in the window between our
+/// `drop(listener)` and the child's own bind. The usual fix -- bind once and
+/// hand the already-bound `TcpListener` straight to the server, which
+/// `axum::serve` accepts directly -- isn't available here, because
+/// `TestServer` starts the API as a genuine child *process*
+/// (`CARGO_BIN_EXE_sandboxwich-api`), not an in-process `axum::serve` task:
+///
+///   - Handing a bound socket across an `exec()` boundary means passing its
+///     raw file descriptor (`from_raw_fd`/`fcntl`), which requires `unsafe`.
+///     This workspace forbids `unsafe_code` outright
+///     (`[workspace.lints.rust] unsafe_code = "forbid"` at the repo root,
+///     with no existing `unsafe` anywhere to build on), so fd-passing isn't
+///     an option.
+///   - Running the server in-process instead would mean tearing out its
+///     env-var-based bootstrap (`SANDBOXWICH_BIND`,
+///     `SANDBOXWICH_DATABASE_URL`, ...), since concurrent `TestServer`s
+///     inside the same test-binary process can't each set process-global
+///     env vars without racing each other. That's a real redesign of the
+///     server's startup, not a test-harness fix, and out of scope here.
+///
+/// So `spawn` below retries this whole cycle with a fresh port instead, but
+/// only on the specific failure signature of a lost bind race -- see
+/// `is_lost_bind_race`.
+async fn try_spawn_once(
+    database_url: &str,
+    auto_migrate: bool,
+    enable_sweeper: bool,
+    configure: &impl Fn(&mut Command),
+) -> SpawnAttempt {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let bind = listener.local_addr().unwrap();
+    drop(listener);
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sandboxwich-api"));
+    command
+        .env("SANDBOXWICH_DATABASE_URL", database_url)
+        .env("SANDBOXWICH_BIND", bind.to_string())
+        // Expiry sweeps (leases, snapshots, desktop sessions) now run on a
+        // background interval instead of inline on every read request; run
+        // it fast in tests so assertions that expect prompt expiry don't
+        // need long sleeps, for the tests that opt into the sweeper below.
+        .env("SANDBOXWICH_SWEEP_INTERVAL_MS", "25")
+        // Disabled by default: most tests assert on synchronous
+        // request/response behavior and don't want a background sweeper
+        // mutating rows underneath them. Only `run_contract` (via
+        // `start_with_expiry_sweeper`) asserts on sweep-driven expiry and
+        // opts back in.
+        .env(
+            "SANDBOXWICH_DISABLE_EXPIRY_SWEEPER",
+            if enable_sweeper { "false" } else { "true" },
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if !auto_migrate {
+        command.env("SANDBOXWICH_AUTO_MIGRATE", "false");
+    }
+    configure(&mut command);
+    let mut child = command.spawn().unwrap();
+
+    // Drain stderr on a background thread as it's produced, so a failure
+    // that writes more than the pipe buffer can't deadlock the child before
+    // we get around to reading it.
+    let stderr_reader = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = stderr.read_to_string(&mut buf);
+            buf
+        })
+    });
+
+    let base_url = format!("http://{bind}");
+    // /healthz is a probe path exempt from auth in every mode, so no
+    // credential is needed here regardless of how the server was
+    // configured above.
+    let health_client = reqwest::Client::new();
+    for _ in 0..100 {
+        if let Ok(response) = health_client
+            .get(format!("{base_url}/healthz"))
+            .send()
+            .await
+            && response.status().is_success()
+        {
+            return SpawnAttempt::Healthy { base_url, child };
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            let stderr = stderr_reader
+                .and_then(|handle| handle.join().ok())
+                .unwrap_or_default();
+            return if is_lost_bind_race(&stderr) {
+                SpawnAttempt::LostBindRace(format!(
+                    "child exited with {status} after losing the ephemeral-port bind race \
+                     for {bind}\nstderr:\n{stderr}"
+                ))
+            } else {
+                SpawnAttempt::Failed(format!(
+                    "server exited before becoming healthy: {status}\nstderr:\n{stderr}"
+                ))
+            };
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let stderr = stderr_reader
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    SpawnAttempt::Failed(format!("server did not become healthy\nstderr:\n{stderr}"))
+}
+
 impl TestServer {
     /// Starts a server with real multi-tenant auth configured (the default
     /// tenant plus "tenant-b"), so every existing behavioral test continues
@@ -4475,7 +4615,7 @@ impl TestServer {
         data_dir: Option<TempDir>,
         auto_migrate: bool,
         enable_sweeper: bool,
-        configure: impl FnOnce(&mut Command),
+        configure: impl Fn(&mut Command),
     ) -> Self {
         // Transparent for SQLite (returns the URL unchanged, no guard). For
         // Postgres, carves out a uniquely named database on the same server
@@ -4484,66 +4624,34 @@ impl TestServer {
         // concurrently against the same `SANDBOXWICH_TEST_POSTGRES_URL`.
         let (database_url, postgres_guard) = isolate_postgres_test_database(database_url).await;
 
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let bind = listener.local_addr().unwrap();
-        drop(listener);
-
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sandboxwich-api"));
-        command
-            .env("SANDBOXWICH_DATABASE_URL", &database_url)
-            .env("SANDBOXWICH_BIND", bind.to_string())
-            // Expiry sweeps (leases, snapshots, desktop sessions) now run on a
-            // background interval instead of inline on every read request; run
-            // it fast in tests so assertions that expect prompt expiry don't
-            // need long sleeps, for the tests that opt into the sweeper below.
-            .env("SANDBOXWICH_SWEEP_INTERVAL_MS", "25")
-            // Disabled by default: most tests assert on synchronous
-            // request/response behavior and don't want a background sweeper
-            // mutating rows underneath them. Only `run_contract` (via
-            // `start_with_expiry_sweeper`) asserts on sweep-driven expiry and
-            // opts back in.
-            .env(
-                "SANDBOXWICH_DISABLE_EXPIRY_SWEEPER",
-                if enable_sweeper { "false" } else { "true" },
-            )
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if !auto_migrate {
-            command.env("SANDBOXWICH_AUTO_MIGRATE", "false");
-        }
-        configure(&mut command);
-        let mut child = command.spawn().unwrap();
-
-        let base_url = format!("http://{bind}");
-        // /healthz is a probe path exempt from auth in every mode, so no
-        // credential is needed here regardless of how the server was
-        // configured above.
-        let health_client = reqwest::Client::new();
-        for _ in 0..100 {
-            if let Ok(response) = health_client
-                .get(format!("{base_url}/healthz"))
-                .send()
-                .await
-                && response.status().is_success()
-            {
-                return Self {
-                    base_url,
-                    database_url,
-                    child,
-                    auth_token: None,
-                    _data_dir: data_dir,
-                    _postgres_guard: postgres_guard,
-                };
+        // See `try_spawn_once` for why this retries on a lost bind race
+        // instead of eliminating the TOCTOU window outright.
+        const MAX_SPAWN_ATTEMPTS: u32 = 5;
+        let mut last_bind_race: Option<String> = None;
+        for _ in 0..MAX_SPAWN_ATTEMPTS {
+            match try_spawn_once(&database_url, auto_migrate, enable_sweeper, &configure).await {
+                SpawnAttempt::Healthy { base_url, child } => {
+                    return Self {
+                        base_url,
+                        database_url,
+                        child,
+                        auth_token: None,
+                        _data_dir: data_dir,
+                        _postgres_guard: postgres_guard,
+                    };
+                }
+                SpawnAttempt::LostBindRace(detail) => {
+                    last_bind_race = Some(detail);
+                }
+                SpawnAttempt::Failed(detail) => panic!("{detail}"),
             }
-            if let Some(status) = child.try_wait().unwrap() {
-                panic!("server exited before becoming healthy: {status}");
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("server did not become healthy");
+        panic!(
+            "server never became healthy after {MAX_SPAWN_ATTEMPTS} attempts, each time losing \
+             the ephemeral-port bind race: {}",
+            last_bind_race.unwrap_or_else(|| "<no attempts recorded>".to_string())
+        );
     }
 
     /// A client that authenticates as the default tenant when the server has
