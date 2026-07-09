@@ -208,7 +208,7 @@ pub(crate) async fn stop_sandbox(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
-) -> Result<Json<SandboxResponse>, ApiError> {
+) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
     let mut sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
     let now = Utc::now();
@@ -241,11 +241,14 @@ pub(crate) async fn stop_sandbox(
     tx.commit().await?;
     sandbox.state = SandboxState::Archiving;
     sandbox.updated_at = now;
-    Ok(Json(SandboxResponse {
-        ok: true,
-        sandbox,
-        operation: Some(operation_from_job(&job)?),
-    }))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SandboxResponse {
+            ok: true,
+            sandbox,
+            operation: Some(operation_from_job(&job)?),
+        }),
+    ))
 }
 
 pub(crate) async fn resume_sandbox(
@@ -264,7 +267,7 @@ pub(crate) async fn fork_sandbox(
     Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
     Json(request): Json<CreateSandboxRequest>,
-) -> Result<Json<SandboxResponse>, ApiError> {
+) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
     let parent = ensure_sandbox_tenant(&state.db, SandboxId(sandbox_id), &ctx).await?;
     let provision_spec = provision_spec_from_request(&request, Some(&parent))?;
     let now = Utc::now();
@@ -345,11 +348,14 @@ pub(crate) async fn fork_sandbox(
     insert_job_on_connection(&state.db, &mut tx, &job).await?;
     tx.commit().await?;
 
-    Ok(Json(SandboxResponse {
-        ok: true,
-        sandbox: child,
-        operation: Some(operation_from_job(&job)?),
-    }))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SandboxResponse {
+            ok: true,
+            sandbox: child,
+            operation: Some(operation_from_job(&job)?),
+        }),
+    ))
 }
 
 /// Drives a user-initiated sandbox state change (stop/resume) via a

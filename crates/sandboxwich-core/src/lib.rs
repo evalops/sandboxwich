@@ -1019,6 +1019,8 @@ pub struct CreateSnapshotRequest {
 pub struct SnapshotResponse {
     pub ok: bool,
     pub snapshot: Snapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<Operation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
