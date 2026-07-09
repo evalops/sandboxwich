@@ -247,7 +247,7 @@ impl KubernetesDryRunProvider {
         self
     }
 
-    fn effective_sandbox_namespace(&self) -> &str {
+    pub(crate) fn effective_sandbox_namespace(&self) -> &str {
         self.sandbox_namespace
             .as_deref()
             .unwrap_or(self.namespace.as_str())

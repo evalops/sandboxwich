@@ -57,13 +57,16 @@ SANDBOXWICH_K8S_ENABLE_MUTATION=1 sandboxwich-worker --api http://sandboxwich-ap
   --kubectl-context in-cluster \
   --cluster k3s-dev \
   --namespace sandboxwich \
+  --sandbox-namespace sandboxwich-sandboxes \
   --storage-class local-path \
   --runtime-class-name gvisor \
   --workspace-storage 2Gi \
   --label cluster=k3s-dev
 ```
 
-Apply mode uses the pod ServiceAccount and `kubectl` to create the sandbox PVC, Pod, NetworkPolicy, and Services in the worker namespace, waits for the sandbox Pod to become Ready, records the runtime resources through the API, and executes command jobs with `kubectl exec` against the sandbox container. The double opt-in (`--confirm-apply` plus `SANDBOXWICH_K8S_ENABLE_MUTATION=1`) is intentional so a worker cannot mutate Kubernetes resources by accident.
+Apply mode uses the pod ServiceAccount and `kubectl` to create the sandbox PVC, Pod, NetworkPolicy, and Services in the dedicated sandbox namespace (`--sandbox-namespace`, falling back to `--namespace` when unset), waits for the sandbox Pod to become Ready, records the runtime resources through the API, and executes command jobs with `kubectl exec` against the sandbox container. The worker's RBAC in `deploy/kubernetes/worker.yaml` is scoped to the sandbox namespace only — it has no Role in the control-plane namespace where the API and its secrets live (GH-76).
+
+The double opt-in (`--confirm-apply` plus `SANDBOXWICH_K8S_ENABLE_MUTATION=1`) exists so a worker cannot mutate Kubernetes resources by accident in local runs, CI, and smoke tests. Be aware of its limits in production: the checked-in worker Deployment sets both halves unconditionally, because an apply-mode worker with the gate closed cannot process any work. In that deployment the gate is documentation, not a control — the Role scoping to the sandbox namespace is what bounds a compromised worker's blast radius. The worker logs a startup warning whenever both halves are force-enabled so the state is visible in pod logs.
 
 Sandbox creation carries a typed provision spec: memory tier (`1g`, `4g`, `16g`, `64g`) and network egress (`deny_all`, `allow_all`, or `allowlist`). The Kubernetes provider maps tiers to CPU/memory requests and PVC size, renders deny-by-default egress with explicit CIDR allow rules, sets `runAsNonRoot`, drops all container capabilities, and uses `RuntimeDefault` seccomp. `--runtime-class-name gvisor` or `--runtime-class-name kata` enables a RuntimeClass-backed isolation backend when the cluster supports it.
 

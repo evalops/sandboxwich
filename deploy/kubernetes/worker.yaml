@@ -141,18 +141,26 @@ spec:
               value: ""
             - name: SANDBOXWICH_RUNTIME_CLASS_NAME
               value: ""
-            # SECURITY NOTE (GH-76): this hardcodes both halves of the
-            # mutation double opt-in (this env var and --confirm-apply
-            # below) permanently ON in the only production deployment of
-            # this manifest, which defeats their purpose as a
-            # confirmation gate -- the worker must apply manifests to do
-            # its job, so as shipped there is no environment where the
-            # gate is ever actually closed. Left enabled because flipping
-            # it off would break the only working deployment path; tracked
-            # as follow-up to move this behind an explicit per-environment
-            # promotion step (e.g. a separate overlay/values file that
-            # must be deliberately set to true) rather than a static value
-            # in the checked-in base manifest.
+            # SECURITY NOTE (GH-76): this sets both halves of the mutation
+            # double opt-in (this env var and --confirm-apply below)
+            # permanently ON in this deployment. That is a deliberate,
+            # documented choice, not an accident: the worker's entire job
+            # in apply mode is to create/delete sandbox resources, so a
+            # deployment of this manifest with the gate closed cannot
+            # process any work. The gate still protects every other
+            # context (local runs, CI, provider-apply-smoke), where both
+            # halves must be supplied explicitly.
+            #
+            # The contract for operators of THIS manifest:
+            #   - mutations are confined to the sandbox namespace above
+            #     (sandboxwich-sandboxes) by the worker's RBAC; the gate is
+            #     not what protects the control plane, the Role scoping is.
+            #   - the worker logs a startup warning whenever both halves
+            #     are force-enabled, so this state is visible in pod logs,
+            #     not only in this comment.
+            #   - to run a worker that can never mutate the cluster, remove
+            #     this env var (or --confirm-apply) and switch
+            #     --provider-mode to dry-run.
             - name: SANDBOXWICH_K8S_ENABLE_MUTATION
               value: "1"
           args:
