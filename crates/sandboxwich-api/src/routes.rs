@@ -89,6 +89,7 @@ pub(crate) fn app(state: AppState) -> Router {
         .route("/capacity", get(get_capacity))
         .route("/workers/register", post(register_worker))
         .route("/workers/{worker_id}/heartbeat", post(heartbeat_worker))
+        .route("/workers/{worker_id}/drain", post(drain_worker))
         .route(
             "/workers/{worker_id}/runtime-resources/reconcile",
             post(reconcile_runtime_resources),

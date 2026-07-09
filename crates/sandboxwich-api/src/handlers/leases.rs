@@ -172,6 +172,7 @@ pub(crate) async fn append_lease_output(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
     Path(lease_id): Path<Uuid>,
+    headers: HeaderMap,
     Json(request): Json<AppendCommandOutputRequest>,
 ) -> Result<Json<CommandOutputChunkResponse>, ApiError> {
     if request.chunk.is_empty() {
@@ -192,6 +193,19 @@ pub(crate) async fn append_lease_output(
     }
     let command_id = command_id_from_job(&lease.job)?;
     let sandbox_id = sandbox_id_from_job(&lease.job)?;
+    let operation_id = headers
+        .get("idempotency-key")
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| ApiError::bad_request("invalid idempotency-key"))
+        })
+        .transpose()?
+        .map(|value| {
+            Uuid::parse_str(value)
+                .map_err(|_| ApiError::bad_request("idempotency-key must be a UUID"))
+        })
+        .transpose()?;
     let chunk = append_command_output_chunk(
         &state.db,
         command_id,
@@ -199,6 +213,7 @@ pub(crate) async fn append_lease_output(
         request.stream,
         request.chunk,
         request.annotations,
+        operation_id.map(|id| (LeaseId(lease_id), id)),
     )
     .await?;
     Ok(Json(CommandOutputChunkResponse { ok: true, chunk }))

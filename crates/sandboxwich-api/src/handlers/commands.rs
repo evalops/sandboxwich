@@ -345,8 +345,27 @@ pub(crate) async fn append_command_output_chunk(
     stream: CommandOutputStream,
     chunk: String,
     annotations: Vec<CommandOutputAnnotation>,
+    operation: Option<(LeaseId, Uuid)>,
 ) -> Result<CommandOutputChunk, ApiError> {
     let mut tx = db.pool.begin().await?;
+    if let Some((lease_id, operation_id)) = operation {
+        let sql = format!(
+            "select chunk_id from command_output_operations where lease_id = {} and operation_id = {}",
+            db.placeholder(1),
+            db.placeholder(2)
+        );
+        if let Some(row) = sqlx::query(&sql)
+            .bind(lease_id.to_string())
+            .bind(operation_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            let chunk_id: String = row.try_get("chunk_id")?;
+            let chunk = fetch_output_chunk_on_connection(db, &mut tx, &chunk_id).await?;
+            tx.commit().await?;
+            return Ok(chunk);
+        }
+    }
     let appended = append_command_output_chunk_on_connection(
         db,
         &mut tx,
@@ -359,6 +378,19 @@ pub(crate) async fn append_command_output_chunk(
     .await;
     match appended {
         Ok(chunk) => {
+            if let Some((lease_id, operation_id)) = operation {
+                let sql = format!(
+                    "insert into command_output_operations (lease_id, operation_id, chunk_id, created_at) values ({})",
+                    db.placeholders(4)
+                );
+                sqlx::query(&sql)
+                    .bind(lease_id.to_string())
+                    .bind(operation_id.to_string())
+                    .bind(chunk.id.to_string())
+                    .bind(chunk.created_at.to_rfc3339())
+                    .execute(&mut *tx)
+                    .await?;
+            }
             tx.commit().await?;
             Ok(chunk)
         }
@@ -369,6 +401,26 @@ pub(crate) async fn append_command_output_chunk(
             Err(error)
         }
     }
+}
+
+async fn fetch_output_chunk_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    chunk_id: &str,
+) -> Result<CommandOutputChunk, ApiError> {
+    let sql = format!(
+        "select id, command_id, stream, sequence, chunk, annotations, created_at
+         from command_output_chunks where id = {}",
+        db.placeholder(1)
+    );
+    let row = sqlx::query(&sql)
+        .bind(chunk_id)
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| {
+            ApiError::internal("output idempotency record references a missing chunk")
+        })?;
+    row_to_command_output_chunk(row)
 }
 
 pub(crate) async fn append_command_output_chunk_on_connection(
