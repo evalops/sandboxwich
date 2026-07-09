@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, net::SocketAddr, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    net::SocketAddr,
+    time::Duration,
+};
 
 use anyhow::Context;
 use axum::{
@@ -59,6 +63,14 @@ struct AppState {
 #[derive(Clone, Debug)]
 struct TenantContext {
     tenant_id: String,
+    /// Set when the request authenticated with a worker-scoped token (see
+    /// GH-64), identifying exactly which worker it is bound to. `None` for
+    /// tenant-wide, shared, or (if allowed) unauthenticated dev access. Guest-
+    /// facing routes (lease claim/renew/complete/fail/output, guest-health)
+    /// require this to be `Some` and matched against the resource being acted
+    /// on, so a tenant-wide token can never be used to impersonate a worker
+    /// and a worker-scoped token can never reach past its own worker.
+    worker_id: Option<WorkerId>,
 }
 
 #[derive(Clone)]
@@ -110,6 +122,7 @@ struct ApiConfig {
     allow_insecure_no_auth: bool,
     default_tenant_id: String,
     sweep_interval_ms: u64,
+    disable_expiry_sweeper: bool,
 }
 
 #[tokio::main]
@@ -151,7 +164,15 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    spawn_expiry_sweeper(db.clone(), Duration::from_millis(config.sweep_interval_ms));
+    if config.disable_expiry_sweeper {
+        tracing::info!(
+            "SANDBOXWICH_DISABLE_EXPIRY_SWEEPER is set: not spawning the lease/snapshot/desktop-\
+             session expiry sweeper. Nothing will expire leases, snapshots, or desktop sessions \
+             on this instance except explicit callers of /snapshots/cleanup."
+        );
+    } else {
+        spawn_expiry_sweeper(db.clone(), Duration::from_millis(config.sweep_interval_ms));
+    }
 
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     tracing::info!(addr = %config.bind, database_url = %config.database_url, "sandboxwich-api listening");
@@ -179,6 +200,11 @@ async fn main() -> anyhow::Result<()> {
 /// mutating work proportional to total table size on every GET, and it means
 /// only one caller (this task) ever performs a given sweep at a time instead of
 /// every concurrent reader racing to expire the same rows.
+///
+/// Set `SANDBOXWICH_DISABLE_EXPIRY_SWEEPER=true` to skip spawning this task
+/// entirely. Integration tests that don't assert on sweep-driven expiry
+/// disable it by default so the sweeper's periodic writes can't race with
+/// foreground test assertions against the same server.
 fn spawn_expiry_sweeper(db: Database, interval: Duration) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -226,6 +252,7 @@ fn load_api_config() -> anyhow::Result<ApiConfig> {
         .filter(|tenant| !tenant.trim().is_empty())
         .unwrap_or_else(|| "default".to_string());
     let sweep_interval_ms = u64::from(parse_env_u32("SANDBOXWICH_SWEEP_INTERVAL_MS", 1000)?.max(1));
+    let disable_expiry_sweeper = parse_env_bool("SANDBOXWICH_DISABLE_EXPIRY_SWEEPER", false)?;
 
     Ok(ApiConfig {
         command,
@@ -239,6 +266,7 @@ fn load_api_config() -> anyhow::Result<ApiConfig> {
         allow_insecure_no_auth,
         default_tenant_id,
         sweep_interval_ms,
+        disable_expiry_sweeper,
     })
 }
 
@@ -397,7 +425,9 @@ async fn ensure_database_constraints(db: &Database) -> anyhow::Result<()> {
 }
 
 const DB_ENUM_SCHEMA_METADATA_KEY: &str = "db_enum_constraints_fingerprint";
-const DB_ENUM_SCHEMA_FINGERPRINT_VERSION: &str = "db-enum-v1";
+// v2 adds the sandbox state transition guard (trigger backstop); bumping the
+// version forces `ensure_database_constraints` to reconcile it on upgrade.
+const DB_ENUM_SCHEMA_FINGERPRINT_VERSION: &str = "db-enum-v2";
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x00000100000001b3;
 
@@ -414,6 +444,11 @@ fn db_enum_schema_fingerprint() -> String {
         }
     }
     feed_hash(&mut hash, "runtime_resources.cluster:not_empty");
+    for (from, to) in sandbox_legal_transition_pairs() {
+        feed_hash(&mut hash, "sandboxes.state:transition");
+        feed_hash(&mut hash, from);
+        feed_hash(&mut hash, to);
+    }
     format!("{DB_ENUM_SCHEMA_FINGERPRINT_VERSION}:{hash:016x}")
 }
 
@@ -686,6 +721,10 @@ async fn ensure_postgres_constraints(db: &Database) -> anyhow::Result<()> {
         sqlx::query(statement).execute(&db.pool).await?;
     }
 
+    for statement in postgres_sandbox_transition_guard_statements() {
+        sqlx::query(&statement).execute(&db.pool).await?;
+    }
+
     Ok(())
 }
 
@@ -738,6 +777,10 @@ async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
         sqlx::query(statement).execute(&db.pool).await?;
     }
 
+    for statement in sqlite_sandbox_transition_guard_statements() {
+        sqlx::query(&statement).execute(&db.pool).await?;
+    }
+
     Ok(())
 }
 
@@ -784,6 +827,81 @@ fn sql_literal_list(values: &[&str]) -> String {
 
 fn sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Every legal `(from, to)` sandbox state transition per
+/// [`SandboxState::can_transition_to`], as raw DB string pairs. This is the
+/// database-level backstop for the sandbox lifecycle state machine: even if
+/// application code somehow bypasses the compare-and-swap helpers in
+/// `set_sandbox_state`/`set_sandbox_state_on_connection` (a bug, a manual
+/// SQL statement, a future code path), this coarse union of every action's
+/// legal edges still rejects nonsensical writes (e.g. `archived -> planning`)
+/// at the database itself. It is coarser than the application-level checks
+/// -- e.g. it allows `planning -> ready` (legal for `ProvisionSandbox`
+/// completion) even though a `resume` call is additionally restricted to
+/// `archived -> ready` only in Rust -- so it is a backstop, not a substitute,
+/// for the CAS-based enforcement.
+fn sandbox_legal_transition_pairs() -> Vec<(&'static str, &'static str)> {
+    let mut pairs = Vec::new();
+    for from in SandboxState::ALL {
+        for to in SandboxState::ALL {
+            if from.can_transition_to(&to) {
+                pairs.push((state_to_str(&from), state_to_str(&to)));
+            }
+        }
+    }
+    pairs
+}
+
+fn sql_tuple_list(pairs: &[(&str, &str)]) -> String {
+    pairs
+        .iter()
+        .map(|(a, b)| format!("({}, {})", sql_literal(a), sql_literal(b)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn sqlite_sandbox_transition_guard_statements() -> Vec<String> {
+    let tuple_list = sql_tuple_list(&sandbox_legal_transition_pairs());
+    vec![
+        "drop trigger if exists validate_sandboxes_state_transition_update".to_string(),
+        format!(
+            "create trigger validate_sandboxes_state_transition_update
+             before update of state on sandboxes
+             for each row
+             when (old.state, new.state) not in ({tuple_list})
+             begin
+                 select raise(abort, 'illegal sandbox state transition');
+             end;"
+        ),
+    ]
+}
+
+/// Postgres equivalent of [`sqlite_sandbox_transition_guard_statements`].
+/// Postgres `check` constraints cannot reference the pre-update row, so this
+/// uses a `plpgsql` trigger function instead of a `check` constraint (unlike
+/// the plain enum-value guards in [`postgres_enum_constraint_statements`]).
+fn postgres_sandbox_transition_guard_statements() -> Vec<String> {
+    let tuple_list = sql_tuple_list(&sandbox_legal_transition_pairs());
+    vec![
+        format!(
+            "create or replace function sandboxwich_validate_sandbox_state_transition()
+             returns trigger as $$
+             begin
+                 if (old.state, new.state) not in ({tuple_list}) then
+                     raise exception 'illegal sandbox state transition from % to %', old.state, new.state;
+                 end if;
+                 return new;
+             end;
+             $$ language plpgsql"
+        ),
+        "drop trigger if exists validate_sandboxes_state_transition on sandboxes".to_string(),
+        "create trigger validate_sandboxes_state_transition
+         before update of state on sandboxes
+         for each row
+         execute function sandboxwich_validate_sandbox_state_transition()"
+            .to_string(),
+    ]
 }
 
 #[cfg(test)]
@@ -885,9 +1003,38 @@ mod tests {
     }
 
     #[test]
+    fn looks_like_cidr_accepts_valid_v4_and_v6_networks() {
+        assert!(looks_like_cidr("10.0.0.0/8"));
+        assert!(looks_like_cidr("192.168.1.0/24"));
+        assert!(looks_like_cidr("0.0.0.0/0"));
+        assert!(looks_like_cidr("203.0.113.5/32"));
+        assert!(looks_like_cidr("2001:db8::/32"));
+        assert!(looks_like_cidr("::1/128"));
+        assert!(looks_like_cidr("::/0"));
+    }
+
+    #[test]
+    fn looks_like_cidr_rejects_garbage_and_out_of_range_prefixes() {
+        // Not an IP address at all.
+        assert!(!looks_like_cidr("notanip/24"));
+        assert!(!looks_like_cidr("/24"));
+        assert!(!looks_like_cidr("10.0.0.0"));
+        assert!(!looks_like_cidr(""));
+        // IPv4 prefix must be <= 32, even though it "looks" like a plausible
+        // (0..=128) prefix -- this was the exact gap in the old prefix-only check.
+        assert!(!looks_like_cidr("10.0.0.0/33"));
+        assert!(!looks_like_cidr("10.0.0.0/128"));
+        // IPv6 prefix must be <= 128.
+        assert!(!looks_like_cidr("2001:db8::/129"));
+        // Prefix must parse as an integer at all.
+        assert!(!looks_like_cidr("10.0.0.0/abc"));
+        assert!(!looks_like_cidr("10.0.0.0/-1"));
+    }
+
+    #[test]
     fn db_enum_fingerprint_is_versioned_and_stable_for_current_registry() {
         let fingerprint = db_enum_schema_fingerprint();
-        assert!(fingerprint.starts_with("db-enum-v1:"));
+        assert!(fingerprint.starts_with("db-enum-v2:"));
         assert_eq!(fingerprint, db_enum_schema_fingerprint());
     }
 
@@ -950,7 +1097,10 @@ mod tests {
             registered_at: now,
             last_heartbeat_at: Some(now),
         };
-        insert_worker(db, &worker).await.expect("insert worker");
+        let token_hash = hash_worker_token(&format!("test-token-{}", worker.id));
+        insert_worker(db, &worker, &token_hash)
+            .await
+            .expect("insert worker");
         worker.id
     }
 
@@ -1180,6 +1330,153 @@ mod tests {
             "guarded expiry must apply requeue side effects exactly once, not once per racing sweep"
         );
     }
+
+    async fn seed_sandbox_with_state(db: &Database, state: SandboxState) -> Sandbox {
+        let now = Utc::now();
+        let sandbox = Sandbox {
+            id: SandboxId::new(),
+            tenant_id: "default".to_string(),
+            name: "test-sandbox".to_string(),
+            state,
+            template: "default".to_string(),
+            memory_limit: MemoryLimit::default(),
+            network_egress: NetworkEgress::default(),
+            created_at: now,
+            updated_at: now,
+            ttl_seconds: None,
+            parent_snapshot_id: None,
+        };
+        insert_sandbox(db, &sandbox).await.expect("insert sandbox");
+        sandbox
+    }
+
+    #[tokio::test]
+    async fn resume_returns_conflict_when_sandbox_is_not_archived() {
+        let db = test_sqlite_db().await;
+        let sandbox = seed_sandbox_with_state(&db, SandboxState::Error).await;
+
+        let result = transition_sandbox(
+            &db,
+            sandbox.id,
+            SandboxState::RESUME_LEGAL_FROM,
+            SandboxState::Ready,
+            "resumed",
+        )
+        .await;
+
+        let error = result.expect_err("resume from Error must be rejected");
+        assert_eq!(error.status, StatusCode::CONFLICT);
+
+        let unchanged = fetch_sandbox(&db, sandbox.id).await.expect("fetch sandbox");
+        assert_eq!(
+            unchanged.state,
+            SandboxState::Error,
+            "a rejected resume must not touch the sandbox's state"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_succeeds_from_archived() {
+        let db = test_sqlite_db().await;
+        let sandbox = seed_sandbox_with_state(&db, SandboxState::Archived).await;
+
+        let _ = transition_sandbox(
+            &db,
+            sandbox.id,
+            SandboxState::RESUME_LEGAL_FROM,
+            SandboxState::Ready,
+            "resumed",
+        )
+        .await
+        .expect("resume from Archived must succeed");
+
+        let updated = fetch_sandbox(&db, sandbox.id).await.expect("fetch sandbox");
+        assert_eq!(updated.state, SandboxState::Ready);
+    }
+
+    #[tokio::test]
+    async fn stop_returns_conflict_on_double_stop() {
+        let db = test_sqlite_db().await;
+        let sandbox = seed_sandbox_with_state(&db, SandboxState::Archived).await;
+
+        let result = transition_sandbox(
+            &db,
+            sandbox.id,
+            SandboxState::STOP_LEGAL_FROM,
+            SandboxState::Archived,
+            "stopped",
+        )
+        .await;
+
+        let error = result.expect_err("stopping an already-archived sandbox must conflict");
+        assert_eq!(error.status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn job_completion_racing_a_concurrent_archive_does_not_resurrect_the_sandbox() {
+        // Simulates the lost-update bug this change fixes: a ForkSandbox job is
+        // in flight (child sandbox in Provisioning) and, before its completion
+        // lands, the sandbox is archived by an unrelated user request. The
+        // job's completion must not clobber the archive.
+        let db = test_sqlite_db().await;
+        let child = seed_sandbox_with_state(&db, SandboxState::Provisioning).await;
+
+        let _ = transition_sandbox(
+            &db,
+            child.id,
+            SandboxState::STOP_LEGAL_FROM,
+            SandboxState::Archived,
+            "stopped",
+        )
+        .await
+        .expect("stop concurrently while the fork job is still in flight");
+
+        let mut connection = db.pool.acquire().await.expect("acquire connection");
+        set_sandbox_state_on_connection(
+            &db,
+            &mut connection,
+            child.id,
+            SandboxState::FORK_COMPLETED_LEGAL_FROM,
+            SandboxState::Ready,
+            json!({ "state": "ready", "reason": "fork_ready" }),
+        )
+        .await
+        .expect("job-completion path must not error on a lost race");
+        // The test db pool has exactly one connection; release it explicitly
+        // before fetching through the shared pool below.
+        drop(connection);
+
+        let after = fetch_sandbox(&db, child.id).await.expect("fetch sandbox");
+        assert_eq!(
+            after.state,
+            SandboxState::Archived,
+            "a completing fork job must never resurrect a concurrently-archived sandbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn database_trigger_rejects_a_transition_no_action_ever_performs() {
+        // Defense-in-depth check for the trigger backstop installed by
+        // `ensure_sqlite_constraints`: even a raw UPDATE that bypasses every
+        // Rust-level CAS helper must be rejected for an edge that is not in
+        // `sandbox_legal_transition_pairs()` (e.g. archived -> provisioning,
+        // which no handler ever performs).
+        let db = test_sqlite_db().await;
+        let sandbox = seed_sandbox_with_state(&db, SandboxState::Archived).await;
+
+        let result = sqlx::query("update sandboxes set state = 'provisioning' where id = ?")
+            .bind(sandbox.id.to_string())
+            .execute(&db.pool)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "the database trigger backstop must reject archived -> provisioning"
+        );
+
+        let unchanged = fetch_sandbox(&db, sandbox.id).await.expect("fetch sandbox");
+        assert_eq!(unchanged.state, SandboxState::Archived);
+    }
 }
 
 /// Default request body limit applied to every route. Kept small (1 MiB) because most endpoints
@@ -1285,14 +1582,37 @@ fn app(state: AppState) -> Router {
 
 const PROBE_PATHS: &[&str] = &["/healthz", "/readyz"];
 
+/// Prefix on every minted worker-scoped token (see GH-64), used to route an
+/// incoming bearer token to hash-based worker lookup instead of the static
+/// tenant/shared-token lists without needing to try both on every request.
+const WORKER_TOKEN_PREFIX: &str = "sbw_wtok_";
+
 async fn auth_and_tenant(
     State(state): State<AppState>,
     mut request: Request,
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    let tenant_id = if PROBE_PATHS.contains(&path) {
-        state.default_tenant_id.clone()
+    let (tenant_id, worker_id) = if PROBE_PATHS.contains(&path) {
+        (state.default_tenant_id.clone(), None)
+    } else if let Some(token) =
+        bearer_token(&request).filter(|token| token.starts_with(WORKER_TOKEN_PREFIX))
+    {
+        // Worker-scoped credential (GH-64): resolves to (tenant_id,
+        // worker_id) rather than to a tenant alone, by looking up the
+        // SHA-256 hash stored at registration (the raw token itself is
+        // never persisted). A token with this prefix that fails to resolve
+        // is always unauthorized here -- it must never silently fall
+        // through to the tenant-token checks below, which would let a
+        // rejected worker-token attempt be retried as a tenant-wide lookup.
+        match resolve_worker_token(&state.db, token).await {
+            Ok(Some((tenant_id, worker_id))) => (tenant_id, Some(worker_id)),
+            Ok(None) => {
+                return ApiError::unauthorized("valid worker bearer token is required")
+                    .into_response();
+            }
+            Err(error) => return error.into_response(),
+        }
     } else if !state.auth.tenant_tokens.is_empty() {
         let Some(token) = bearer_token(&request) else {
             return ApiError::unauthorized("valid bearer token is required").into_response();
@@ -1305,27 +1625,28 @@ async fn auth_and_tenant(
         else {
             return ApiError::unauthorized("valid tenant bearer token is required").into_response();
         };
-        tenant.tenant_id.clone()
+        (tenant.tenant_id.clone(), None)
     } else if let Some(expected_token) = &state.auth.shared_token {
         let authorized = bearer_token(&request)
             .is_some_and(|token| constant_time_eq(token.as_bytes(), expected_token.as_bytes()));
         if !authorized {
             return ApiError::unauthorized("valid bearer token is required").into_response();
         }
-        state.default_tenant_id.clone()
+        (state.default_tenant_id.clone(), None)
     } else if state.auth.allow_insecure_no_auth {
         // Explicit, off-by-default opt-out (SANDBOXWICH_ALLOW_INSECURE_NO_AUTH) for
         // local development and benchmark harnesses: with no credential configured,
         // trust the client-supplied tenant header. Never enable this in a shared
         // deployment.
-        request
+        let tenant_id = request
             .headers()
             .get("x-sandboxwich-tenant")
             .and_then(|value| value.to_str().ok())
             .map(str::trim)
             .filter(|tenant| !tenant.is_empty())
             .unwrap_or(&state.default_tenant_id)
-            .to_string()
+            .to_string();
+        (tenant_id, None)
     } else {
         // Fail closed: with no SANDBOXWICH_API_TOKEN and no SANDBOXWICH_TENANT_TOKENS
         // configured, there is no credential to authenticate against, so we must
@@ -1339,9 +1660,80 @@ async fn auth_and_tenant(
         )
         .into_response();
     };
-    request.extensions_mut().insert(TenantContext { tenant_id });
+    request.extensions_mut().insert(TenantContext {
+        tenant_id,
+        worker_id,
+    });
 
     next.run(request).await
+}
+
+/// Resolves a worker-scoped bearer token (see GH-64) to the `(tenant_id,
+/// worker_id)` it was minted for by looking it up via its SHA-256 hash.
+/// Unlike the small, static, in-memory tenant/operator token lists (which
+/// use [`constant_time_eq`] to compare the raw secret directly), worker
+/// tokens are dynamic per-worker DB rows, so the lookup key is the
+/// cryptographic hash rather than the token itself -- the security property
+/// here comes from SHA-256 preimage resistance, not timing-safe comparison,
+/// so a plain indexed equality lookup is the correct and standard approach
+/// (the same pattern used for hashed API keys generally).
+async fn resolve_worker_token(
+    db: &Database,
+    token: &str,
+) -> Result<Option<(String, WorkerId)>, ApiError> {
+    let hash = hash_worker_token(token);
+    let sql = format!(
+        "select id, tenant_id from workers where token_hash = {}",
+        db.placeholder(1)
+    );
+    let Some(row) = sqlx::query(&sql)
+        .bind(hash)
+        .fetch_optional(&db.pool)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let id: String = row.try_get("id")?;
+    let tenant_id: String = row.try_get("tenant_id")?;
+    Ok(Some((tenant_id, WorkerId(parse_uuid(&id)?))))
+}
+
+/// Mints a new worker-scoped credential (see GH-64): high-entropy (256 bits),
+/// prefixed so the auth middleware can route it to hash-based worker lookup,
+/// and never persisted in this form -- only [`hash_worker_token`]'s output is
+/// stored, in `workers.token_hash`.
+fn generate_worker_token() -> String {
+    format!(
+        "{WORKER_TOKEN_PREFIX}{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    )
+}
+
+/// Hex-encoded SHA-256 digest of a worker token, used both to persist it
+/// (`workers.token_hash`) and to look it up (`resolve_worker_token`).
+fn hash_worker_token(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(token.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Requires the request to have authenticated with a worker-scoped token
+/// bound to exactly `worker_id` (see GH-64). Used on every guest-facing route
+/// (lease claim/renew/complete/fail/output, guest-health) to reject
+/// tenant-wide tokens outright and to stop a worker-scoped token from acting
+/// on any worker other than its own. Mirrors [`ensure_tenant`]'s convention
+/// of returning `not_found` (rather than a distinct "forbidden") for
+/// cross-worker ownership violations, so the response never confirms or
+/// denies that a given worker/lease/sandbox id exists.
+fn ensure_worker_scope(ctx: &TenantContext, worker_id: WorkerId) -> Result<(), ApiError> {
+    match ctx.worker_id {
+        Some(bound) if bound == worker_id => Ok(()),
+        Some(_) => Err(ApiError::not_found("resource not found")),
+        None => Err(ApiError::unauthorized(
+            "this route requires a worker-scoped token; tenant-wide tokens are not accepted",
+        )),
+    }
 }
 
 fn bearer_token(request: &Request) -> Option<&str> {
@@ -1363,9 +1755,50 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
+/// Waits for whichever shutdown signal the runtime environment sends first.
+///
+/// Kubernetes sends SIGTERM (not SIGINT) to stop a pod, so graceful shutdown
+/// never fired in the shipped deployment when this only awaited `ctrl_c()`.
+/// On Unix, race SIGTERM and SIGINT (dev/local `Ctrl-C`) together; non-Unix
+/// targets fall back to `ctrl_c()` alone since `tokio::signal::unix` isn't
+/// available there.
 async fn shutdown_signal() {
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        tracing::warn!(%error, "failed to install shutdown signal handler");
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(signal) => signal,
+            Err(error) => {
+                tracing::warn!(%error, "failed to install SIGTERM handler");
+                // Fall back to ctrl_c() alone rather than returning immediately
+                // (which would make graceful shutdown a no-op).
+                if let Err(error) = tokio::signal::ctrl_c().await {
+                    tracing::warn!(%error, "failed to install shutdown signal handler");
+                }
+                return;
+            }
+        };
+
+        tokio::select! {
+            _ = sigterm.recv() => {
+                tracing::info!("received SIGTERM, starting graceful shutdown");
+            }
+            result = tokio::signal::ctrl_c() => {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "failed to install shutdown signal handler");
+                } else {
+                    tracing::info!("received SIGINT, starting graceful shutdown");
+                }
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(%error, "failed to install shutdown signal handler");
+        }
     }
 }
 
@@ -1406,8 +1839,23 @@ async fn readyz(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
-    let body = collect_prometheus_metrics(&state.db).await?;
+async fn metrics(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    // Ordinary tenant credentials only ever see their own tenant's counts: an
+    // authenticated tenant token must never be able to read another tenant's
+    // sandbox/worker/job/lease volumes. The dedicated operator credential
+    // (already used to gate `/snapshots/cleanup`) additionally unlocks the
+    // unscoped, cross-tenant view that operator tooling (e.g. a Prometheus
+    // scraper) legitimately needs.
+    let tenant_scope = if is_operator_request(&state, &headers) {
+        None
+    } else {
+        Some(ctx.tenant_id.as_str())
+    };
+    let body = collect_prometheus_metrics(&state.db, tenant_scope).await?;
     Ok((
         [(
             header::CONTENT_TYPE,
@@ -1426,8 +1874,11 @@ async fn check_database_health(db: &Database) -> Result<HealthComponent, ApiErro
     })
 }
 
-async fn collect_prometheus_metrics(db: &Database) -> Result<String, ApiError> {
-    let metrics = fetch_prometheus_metrics(db).await?;
+async fn collect_prometheus_metrics(
+    db: &Database,
+    tenant_id: Option<&str>,
+) -> Result<String, ApiError> {
+    let metrics = fetch_prometheus_metrics(db, tenant_id).await?;
     let mut body = String::new();
     append_count_family(
         &mut body,
@@ -1490,35 +1941,89 @@ impl PrometheusMetrics {
     }
 }
 
-async fn fetch_prometheus_metrics(db: &Database) -> Result<PrometheusMetrics, ApiError> {
-    let rows = sqlx::query(
-        "select 'sandbox' as family, state as label, count(*) as value
-         from sandboxes
-         group by state
-         union all
-         select 'worker' as family, status as label, count(*) as value
-         from workers
-         group by status
-         union all
-         select 'job' as family, status as label, count(*) as value
-         from jobs
-         group by status
-         union all
-         select 'runtime_resource' as family, status as label, count(*) as value
-         from runtime_resources
-         group by status
-         union all
-         select 'job_leases_active' as family, '' as label, count(*) as value
-         from job_leases
-         where status = 'active'
-         union all
-         select 'worker_capacity_slots' as family, '' as label, coalesce(sum(max_concurrent_jobs), 0) as value
-         from workers
-         where status = 'online'
-         order by family asc, label asc",
-    )
-    .fetch_all(&db.pool)
-    .await?;
+/// Fetch aggregate counts for the Prometheus exposition.
+///
+/// `tenant_id: None` returns global, cross-tenant totals and must only ever be reached via the
+/// operator credential (see [`metrics`]); `Some(tenant_id)` scopes every aggregate to that
+/// tenant's own resources so an ordinary tenant bearer token can never observe another tenant's
+/// sandbox/worker/job/lease volumes.
+async fn fetch_prometheus_metrics(
+    db: &Database,
+    tenant_id: Option<&str>,
+) -> Result<PrometheusMetrics, ApiError> {
+    let sql = match tenant_id {
+        None => "select 'sandbox' as family, state as label, count(*) as value
+             from sandboxes
+             group by state
+             union all
+             select 'worker' as family, status as label, count(*) as value
+             from workers
+             group by status
+             union all
+             select 'job' as family, status as label, count(*) as value
+             from jobs
+             group by status
+             union all
+             select 'runtime_resource' as family, status as label, count(*) as value
+             from runtime_resources
+             group by status
+             union all
+             select 'job_leases_active' as family, '' as label, count(*) as value
+             from job_leases
+             where status = 'active'
+             union all
+             select 'worker_capacity_slots' as family, '' as label, coalesce(sum(max_concurrent_jobs), 0) as value
+             from workers
+             where status = 'online'
+             order by family asc, label asc"
+            .to_string(),
+        Some(_) => format!(
+            "select 'sandbox' as family, state as label, count(*) as value
+             from sandboxes
+             where tenant_id = {p1}
+             group by state
+             union all
+             select 'worker' as family, status as label, count(*) as value
+             from workers
+             where tenant_id = {p2}
+             group by status
+             union all
+             select 'job' as family, status as label, count(*) as value
+             from jobs
+             where tenant_id = {p3}
+             group by status
+             union all
+             select 'runtime_resource' as family, runtime_resources.status as label, count(*) as value
+             from runtime_resources
+             join sandboxes on sandboxes.id = runtime_resources.sandbox_id
+             where sandboxes.tenant_id = {p4}
+             group by runtime_resources.status
+             union all
+             select 'job_leases_active' as family, '' as label, count(*) as value
+             from job_leases
+             join jobs on jobs.id = job_leases.job_id
+             where job_leases.status = 'active' and jobs.tenant_id = {p5}
+             union all
+             select 'worker_capacity_slots' as family, '' as label, coalesce(sum(max_concurrent_jobs), 0) as value
+             from workers
+             where status = 'online' and tenant_id = {p6}
+             order by family asc, label asc",
+            p1 = db.placeholder(1),
+            p2 = db.placeholder(2),
+            p3 = db.placeholder(3),
+            p4 = db.placeholder(4),
+            p5 = db.placeholder(5),
+            p6 = db.placeholder(6),
+        ),
+    };
+
+    let mut query = sqlx::query(&sql);
+    if let Some(tenant_id) = tenant_id {
+        for _ in 0..6 {
+            query = query.bind(tenant_id.to_string());
+        }
+    }
+    let rows = query.fetch_all(&db.pool).await?;
 
     let mut values = BTreeMap::new();
     for row in rows {
@@ -1623,6 +2128,87 @@ async fn ensure_lease_tenant(
     Ok(lease)
 }
 
+/// Like [`ensure_lease_tenant`], but additionally requires (see GH-64) that
+/// the request authenticated as the worker that actually holds `lease_id`:
+/// used on every guest-facing lease route (renew/complete/fail/output) so a
+/// worker-scoped token can only touch its own leases, and a tenant-wide token
+/// is rejected outright rather than being allowed to act on any worker's
+/// lease.
+async fn ensure_lease_worker_scope(
+    db: &Database,
+    lease_id: LeaseId,
+    ctx: &TenantContext,
+) -> Result<JobLease, ApiError> {
+    let lease = ensure_lease_tenant(db, lease_id, ctx).await?;
+    ensure_worker_scope(ctx, lease.worker_id)?;
+    Ok(lease)
+}
+
+/// Like [`ensure_sandbox_tenant`], but additionally requires (see GH-64) that
+/// the request authenticated as the worker that provisioned or forked
+/// `sandbox_id` (determined from completed provision/fork job leases, the
+/// only source of truth for "which worker is running this sandbox's guest").
+/// Used on the guest-facing guest-health route so a worker-scoped token can
+/// only report health for sandboxes it actually owns, and a tenant-wide
+/// token is rejected outright.
+async fn ensure_sandbox_worker_scope(
+    db: &Database,
+    sandbox_id: SandboxId,
+    ctx: &TenantContext,
+) -> Result<Sandbox, ApiError> {
+    let sandbox = ensure_sandbox_tenant(db, sandbox_id, ctx).await?;
+    let Some(worker_id) = ctx.worker_id else {
+        return Err(ApiError::unauthorized(
+            "this route requires a worker-scoped token; tenant-wide tokens are not accepted",
+        ));
+    };
+    if !worker_owns_sandbox(db, worker_id, sandbox_id).await? {
+        return Err(ApiError::not_found("resource not found"));
+    }
+    Ok(sandbox)
+}
+
+/// Whether `worker_id` has ever successfully completed a `provision_sandbox`
+/// or `fork_sandbox` job lease that produced (or targeted, for a fork) this
+/// exact sandbox. Sandboxes carry no persistent "owning worker" column;
+/// completed-lease history is the source of truth for which worker's guest
+/// environment a sandbox's agent actually runs in, and it can never name two
+/// different current workers for the same sandbox id (re-provisioning always
+/// mints a new sandbox id).
+async fn worker_owns_sandbox(
+    db: &Database,
+    worker_id: WorkerId,
+    sandbox_id: SandboxId,
+) -> Result<bool, ApiError> {
+    let sql = format!(
+        "select j.kind, j.payload
+         from job_leases jl
+         join jobs j on j.id = jl.job_id
+         where jl.worker_id = {} and jl.status = 'completed'
+           and j.kind in ('provision_sandbox', 'fork_sandbox')",
+        db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(worker_id.to_string())
+        .fetch_all(&db.pool)
+        .await?;
+    let sandbox_id_str = sandbox_id.to_string();
+    for row in rows {
+        let kind: String = row.try_get("kind")?;
+        let payload_raw: String = row.try_get("payload")?;
+        let payload: serde_json::Value = serde_json::from_str(&payload_raw)?;
+        let field = if kind == "fork_sandbox" {
+            "childSandboxId"
+        } else {
+            "sandboxId"
+        };
+        if payload.get(field).and_then(serde_json::Value::as_str) == Some(sandbox_id_str.as_str()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn provision_spec_from_request(
     request: &CreateSandboxRequest,
     parent: Option<&Sandbox>,
@@ -1680,10 +2266,14 @@ fn looks_like_cidr(value: &str) -> bool {
     let Some((address, prefix)) = value.split_once('/') else {
         return false;
     };
-    !address.trim().is_empty()
-        && prefix
-            .parse::<u8>()
-            .is_ok_and(|prefix| matches!(prefix, 0..=128))
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    match address.trim().parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(_)) => prefix <= 32,
+        Ok(std::net::IpAddr::V6(_)) => prefix <= 128,
+        Err(_) => false,
+    }
 }
 
 const ALLOWED_FILE_MIME_TYPES: &[&str] = &[
@@ -2131,6 +2721,7 @@ async fn stop_sandbox(
     transition_sandbox(
         &state.db,
         SandboxId(sandbox_id),
+        SandboxState::STOP_LEGAL_FROM,
         SandboxState::Archived,
         "stopped",
     )
@@ -2146,6 +2737,7 @@ async fn resume_sandbox(
     transition_sandbox(
         &state.db,
         SandboxId(sandbox_id),
+        SandboxState::RESUME_LEGAL_FROM,
         SandboxState::Ready,
         "resumed",
     )
@@ -2328,18 +2920,28 @@ async fn get_snapshot(
 /// sufficient to run it. See issue #65.
 const OPERATOR_TOKEN_HEADER: &str = "x-sandboxwich-operator-token";
 
-fn ensure_operator_authorized(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+/// Whether `headers` carries a valid operator credential, if one is configured at all. Unlike
+/// [`ensure_operator_authorized`], a missing/unconfigured operator token is not an error here --
+/// callers (e.g. [`metrics`]) treat that as "not an operator" and fall back to tenant-scoped
+/// behavior instead of failing the request.
+fn is_operator_request(state: &AppState, headers: &HeaderMap) -> bool {
     let Some(expected_token) = &state.auth.operator_token else {
+        return false;
+    };
+    headers
+        .get(OPERATOR_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected_token.as_bytes()))
+}
+
+fn ensure_operator_authorized(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    if state.auth.operator_token.is_none() {
         return Err(ApiError::internal(
             "snapshot cleanup is disabled: set SANDBOXWICH_OPERATOR_TOKEN to a dedicated \
              operator credential (distinct from tenant tokens) to enable /snapshots/cleanup",
         ));
-    };
-    let authorized = headers
-        .get(OPERATOR_TOKEN_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected_token.as_bytes()));
-    if !authorized {
+    }
+    if !is_operator_request(state, headers) {
         return Err(ApiError::unauthorized(format!(
             "a valid {OPERATOR_TOKEN_HEADER} header is required to run snapshot cleanup"
         )));
@@ -2745,9 +3347,19 @@ async fn register_worker(
         registered_at: now,
         last_heartbeat_at: None,
     };
-    insert_worker(&state.db, &worker).await?;
+    // Mint this worker's scoped credential now (GH-64): the raw token is
+    // returned once, below, and never persisted -- only its hash is stored,
+    // so the API itself cannot produce the plaintext token again after this
+    // response.
+    let worker_token = generate_worker_token();
+    let token_hash = hash_worker_token(&worker_token);
+    insert_worker(&state.db, &worker, &token_hash).await?;
 
-    Ok(Json(WorkerResponse { ok: true, worker }))
+    Ok(Json(WorkerResponse {
+        ok: true,
+        worker,
+        worker_token: Some(worker_token),
+    }))
 }
 
 async fn heartbeat_worker(
@@ -2806,7 +3418,11 @@ async fn heartbeat_worker(
     insert_worker_heartbeat(&state.db, worker_id, &labels, now).await?;
     let worker = fetch_worker(&state.db, worker_id).await?;
 
-    Ok(Json(WorkerResponse { ok: true, worker }))
+    Ok(Json(WorkerResponse {
+        ok: true,
+        worker,
+        worker_token: None,
+    }))
 }
 
 async fn reconcile_runtime_resources(
@@ -3072,7 +3688,11 @@ async fn update_guest_health(
     Json(request): Json<UpdateGuestHealthRequest>,
 ) -> Result<Json<GuestHealthResponse>, ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
-    ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
+    // GH-64: guest-facing route -- only the worker that provisioned/forked
+    // this sandbox may report its guest health; tenant-wide tokens are
+    // rejected. (The read side, `get_guest_health`, stays on tenant auth --
+    // CLI/dashboard callers need to read it too.)
+    ensure_sandbox_worker_scope(&state.db, sandbox_id, &ctx).await?;
     let now = Utc::now();
     let guest_health = GuestHealth {
         sandbox_id,
@@ -3232,7 +3852,11 @@ async fn claim_lease(
     Path(worker_id): Path<Uuid>,
     Json(request): Json<ClaimLeaseRequest>,
 ) -> Result<Json<ClaimLeaseResponse>, ApiError> {
-    let worker = ensure_worker_tenant(&state.db, WorkerId(worker_id), &ctx).await?;
+    let worker_id = WorkerId(worker_id);
+    // GH-64: guest-facing route -- only a token scoped to exactly this
+    // worker may claim on its behalf; tenant-wide tokens are rejected.
+    ensure_worker_scope(&ctx, worker_id)?;
+    let worker = ensure_worker_tenant(&state.db, worker_id, &ctx).await?;
     let sql = format!(
         "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
@@ -3273,7 +3897,9 @@ async fn renew_lease(
     Json(request): Json<RenewLeaseRequest>,
 ) -> Result<Json<LeaseResponse>, ApiError> {
     let lease_id = LeaseId(lease_id);
-    ensure_lease_tenant(&state.db, lease_id, &ctx).await?;
+    // GH-64: guest-facing route -- only the worker holding this lease may
+    // renew it; tenant-wide tokens are rejected.
+    ensure_lease_worker_scope(&state.db, lease_id, &ctx).await?;
     let now = Utc::now();
     let expires_at = now + chrono::Duration::seconds(request.lease_seconds.unwrap_or(60) as i64);
     let sql = format!(
@@ -3307,7 +3933,9 @@ async fn append_lease_output(
             "command output chunk cannot be empty",
         ));
     }
-    let lease = ensure_lease_tenant(&state.db, LeaseId(lease_id), &ctx).await?;
+    // GH-64: guest-facing route -- only the worker holding this lease may
+    // append output for it; tenant-wide tokens are rejected.
+    let lease = ensure_lease_worker_scope(&state.db, LeaseId(lease_id), &ctx).await?;
     if lease.status != LeaseStatus::Active {
         return Err(ApiError::bad_request("lease is not active"));
     }
@@ -3337,7 +3965,9 @@ async fn complete_lease(
     Json(request): Json<CompleteLeaseRequest>,
 ) -> Result<Json<LeaseResponse>, ApiError> {
     let lease_id = LeaseId(lease_id);
-    ensure_lease_tenant(&state.db, lease_id, &ctx).await?;
+    // GH-64: guest-facing route -- only the worker holding this lease may
+    // complete it; tenant-wide tokens are rejected.
+    ensure_lease_worker_scope(&state.db, lease_id, &ctx).await?;
     let result = request
         .result
         .ok_or_else(|| ApiError::bad_request("completion result is required"))?;
@@ -3392,7 +4022,9 @@ async fn fail_lease(
         return Err(ApiError::bad_request("error is required"));
     }
     let lease_id = LeaseId(lease_id);
-    ensure_lease_tenant(&state.db, lease_id, &ctx).await?;
+    // GH-64: guest-facing route -- only the worker holding this lease may
+    // fail it; tenant-wide tokens are rejected.
+    ensure_lease_worker_scope(&state.db, lease_id, &ctx).await?;
     let lease =
         fail_lease_in_transaction(&state.db, lease_id, request.retry, &request.error).await?;
     Ok(Json(LeaseResponse { ok: true, lease }))
@@ -3457,9 +4089,21 @@ async fn fail_lease_in_transaction(
     }
 }
 
+/// Drives a user-initiated sandbox state change (stop/resume) via a
+/// compare-and-swap update. `allowed_from` is the exact set of states this
+/// specific action may legally transition out of (e.g.
+/// [`SandboxState::RESUME_LEGAL_FROM`]) -- callers must pick the constant for
+/// their action rather than deriving one from `next_state` alone, since more
+/// than one action can legally target the same state with different
+/// preconditions (see [`SandboxState::can_transition_to`]'s docs).
+///
+/// If the sandbox is not currently in one of `allowed_from`, this returns a
+/// 409 Conflict describing the sandbox's actual state rather than silently
+/// clobbering it.
 async fn transition_sandbox(
     db: &Database,
     sandbox_id: SandboxId,
+    allowed_from: &'static [SandboxState],
     next_state: SandboxState,
     reason: &'static str,
 ) -> Result<Json<SandboxResponse>, ApiError> {
@@ -3468,6 +4112,7 @@ async fn transition_sandbox(
     set_sandbox_state(
         db,
         sandbox_id,
+        allowed_from,
         next_state,
         json!({
             "state": event_state,
@@ -3483,16 +4128,19 @@ async fn transition_sandbox(
 async fn set_sandbox_state(
     db: &Database,
     sandbox_id: SandboxId,
+    allowed_from: &'static [SandboxState],
     next_state: SandboxState,
     event_data: serde_json::Value,
 ) -> Result<(), ApiError> {
     let now = Utc::now();
     let state = state_to_str(&next_state);
+    let allowed_values: Vec<&str> = allowed_from.iter().map(state_to_str).collect();
     let sql = format!(
-        "update sandboxes set state = {}, updated_at = {} where id = {}",
+        "update sandboxes set state = {}, updated_at = {} where id = {} and state in ({})",
         db.placeholder(1),
         db.placeholder(2),
-        db.placeholder(3)
+        db.placeholder(3),
+        sql_literal_list(&allowed_values)
     );
     let result = sqlx::query(&sql)
         .bind(state)
@@ -3502,7 +4150,7 @@ async fn set_sandbox_state(
         .await?;
 
     if result.rows_affected() == 0 {
-        return Err(ApiError::not_found("sandbox not found"));
+        return Err(sandbox_state_conflict(db, sandbox_id, allowed_from, &next_state).await?);
     }
 
     insert_event(
@@ -3515,20 +4163,77 @@ async fn set_sandbox_state(
     Ok(())
 }
 
+/// Builds the 404/409 error for a failed user-facing compare-and-swap state
+/// update: 404 if the sandbox no longer exists at all, otherwise 409 with the
+/// sandbox's actual current state so the caller understands what conflicted.
+async fn sandbox_state_conflict(
+    db: &Database,
+    sandbox_id: SandboxId,
+    allowed_from: &'static [SandboxState],
+    next_state: &SandboxState,
+) -> Result<ApiError, ApiError> {
+    let current = fetch_sandbox_state(db, sandbox_id).await?;
+    Ok(match current {
+        None => ApiError::not_found("sandbox not found"),
+        Some(actual) => {
+            let allowed = allowed_from
+                .iter()
+                .map(state_to_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            ApiError::conflict(format!(
+                "cannot transition sandbox {sandbox_id} to {}: sandbox is currently {} (expected one of [{allowed}])",
+                state_to_str(next_state),
+                state_to_str(&actual),
+            ))
+        }
+    })
+}
+
+async fn fetch_sandbox_state(
+    db: &Database,
+    sandbox_id: SandboxId,
+) -> Result<Option<SandboxState>, ApiError> {
+    let sql = format!(
+        "select state from sandboxes where id = {}",
+        db.placeholder(1)
+    );
+    let Some(row) = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .fetch_optional(&db.pool)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let raw: String = row.try_get("state")?;
+    Ok(Some(parse_state(&raw)?))
+}
+
+/// Drives a worker/job-completion-triggered sandbox state change via a
+/// compare-and-swap update, mirroring [`set_sandbox_state`]. Unlike the
+/// user-facing routes, a job-completion path must never error out or clobber
+/// a sandbox that has moved on since the job started -- e.g. a
+/// `ProvisionSandbox`/`ForkSandbox` job completing after the sandbox was
+/// concurrently archived must leave it archived, not resurrect it. So on a
+/// compare-and-swap miss this logs a warning and returns `Ok(())` instead of
+/// applying the write or raising an error.
 async fn set_sandbox_state_on_connection(
     db: &Database,
     connection: &mut AnyConnection,
     sandbox_id: SandboxId,
+    allowed_from: &'static [SandboxState],
     next_state: SandboxState,
     event_data: serde_json::Value,
 ) -> Result<(), ApiError> {
     let now = Utc::now();
     let state = state_to_str(&next_state);
+    let allowed_values: Vec<&str> = allowed_from.iter().map(state_to_str).collect();
     let sql = format!(
-        "update sandboxes set state = {}, updated_at = {} where id = {}",
+        "update sandboxes set state = {}, updated_at = {} where id = {} and state in ({})",
         db.placeholder(1),
         db.placeholder(2),
-        db.placeholder(3)
+        db.placeholder(3),
+        sql_literal_list(&allowed_values)
     );
     let result = sqlx::query(&sql)
         .bind(state)
@@ -3538,7 +4243,14 @@ async fn set_sandbox_state_on_connection(
         .await?;
 
     if result.rows_affected() == 0 {
-        return Err(ApiError::not_found("sandbox not found"));
+        tracing::warn!(
+            %sandbox_id,
+            next_state = state,
+            allowed_from = ?allowed_values,
+            "skipping sandbox state transition: sandbox is no longer in an expected \
+             predecessor state (likely concurrently stopped/resumed by another request)"
+        );
+        return Ok(());
     }
 
     insert_event_on_connection(
@@ -6925,6 +7637,7 @@ async fn apply_completed_job_on_connection(
                 db,
                 connection,
                 child_id,
+                SandboxState::FORK_COMPLETED_LEGAL_FROM,
                 next_state.clone(),
                 json!({
                     "state": next_state,
@@ -6948,6 +7661,7 @@ async fn apply_completed_job_on_connection(
                 db,
                 connection,
                 sandbox_id,
+                SandboxState::PROVISION_COMPLETED_LEGAL_FROM,
                 next_state.clone(),
                 json!({
                     "state": next_state,
@@ -7044,6 +7758,7 @@ async fn apply_claimed_job_on_connection(
                 db,
                 connection,
                 child_id,
+                SandboxState::FORK_CLAIMED_LEGAL_FROM,
                 next_state.clone(),
                 json!({
                     "state": next_state,
@@ -7116,6 +7831,7 @@ async fn apply_retryable_job_on_connection(
                 db,
                 connection,
                 child_id,
+                SandboxState::FORK_RETRIED_LEGAL_FROM,
                 next_state.clone(),
                 json!({
                     "state": next_state,
@@ -7214,6 +7930,7 @@ async fn apply_failed_job_on_connection(
                 db,
                 connection,
                 child_id,
+                SandboxState::FORK_FAILED_LEGAL_FROM,
                 next_state.clone(),
                 json!({
                     "state": next_state,
@@ -7374,6 +8091,7 @@ async fn fail_sandboxes_waiting_on_snapshot_on_connection(
             db,
             connection,
             child.id,
+            SandboxState::SNAPSHOT_FAILED_CHILD_LEGAL_FROM,
             next_state.clone(),
             json!({
                 "state": next_state,
@@ -7531,12 +8249,14 @@ impl Database {
     }
 }
 
-async fn insert_worker(db: &Database, worker: &Worker) -> Result<(), ApiError> {
+/// `token_hash` is the SHA-256 hash (see [`hash_worker_token`]) of this
+/// worker's scoped credential (GH-64), never the raw token itself.
+async fn insert_worker(db: &Database, worker: &Worker, token_hash: &str) -> Result<(), ApiError> {
     let sql = format!(
         "insert into workers
-         (id, tenant_id, name, status, provider, capabilities, max_concurrent_jobs, labels, registered_at, last_heartbeat_at)
+         (id, tenant_id, name, status, provider, capabilities, max_concurrent_jobs, labels, registered_at, last_heartbeat_at, token_hash)
          values ({})",
-        db.placeholders(10)
+        db.placeholders(11)
     );
     sqlx::query(&sql)
         .bind(worker.id.to_string())
@@ -7549,6 +8269,7 @@ async fn insert_worker(db: &Database, worker: &Worker) -> Result<(), ApiError> {
         .bind(serde_json::to_string(&worker.labels)?)
         .bind(worker.registered_at.to_rfc3339())
         .bind(worker.last_heartbeat_at.map(|time| time.to_rfc3339()))
+        .bind(token_hash)
         .execute(&db.pool)
         .await?;
     Ok(())
@@ -7607,14 +8328,60 @@ fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
     })
 }
 
+/// Hydrate every `Allowlist` sandbox's network egress rules with a single batched query instead
+/// of one `select` per sandbox, so listing a full page (up to `MAX_PAGE_LIMIT` sandboxes) never
+/// issues more than one extra round-trip regardless of how many of them are on the allowlist tier.
 async fn hydrate_sandboxes_network_egress(
     db: &Database,
     sandboxes: &mut [Sandbox],
 ) -> Result<(), ApiError> {
+    let allowlist_ids: Vec<SandboxId> = sandboxes
+        .iter()
+        .filter(|sandbox| matches!(sandbox.network_egress, NetworkEgress::Allowlist { .. }))
+        .map(|sandbox| sandbox.id)
+        .collect();
+    if allowlist_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut rules_by_sandbox = list_network_allow_rules_for_sandboxes(db, &allowlist_ids).await?;
     for sandbox in sandboxes {
-        hydrate_sandbox_network_egress(db, sandbox).await?;
+        if matches!(sandbox.network_egress, NetworkEgress::Allowlist { .. }) {
+            let rules = rules_by_sandbox.remove(&sandbox.id).unwrap_or_default();
+            sandbox.network_egress = NetworkEgress::Allowlist { rules };
+        }
     }
     Ok(())
+}
+
+/// Batched counterpart to [`list_network_allow_rules`]: fetches rules for every id in
+/// `sandbox_ids` with a single `sandbox_id in (...)` query and groups them in memory, rather than
+/// issuing one query per sandbox.
+async fn list_network_allow_rules_for_sandboxes(
+    db: &Database,
+    sandbox_ids: &[SandboxId],
+) -> Result<HashMap<SandboxId, Vec<NetworkAllowRule>>, ApiError> {
+    let sql = format!(
+        "select sandbox_id, kind, value
+         from sandbox_network_egress_rules
+         where sandbox_id in ({})
+         order by sandbox_id asc, kind asc, value asc",
+        db.placeholders(sandbox_ids.len())
+    );
+    let mut query = sqlx::query(&sql);
+    for sandbox_id in sandbox_ids {
+        query = query.bind(sandbox_id.to_string());
+    }
+    let rows = query.fetch_all(&db.pool).await?;
+
+    let mut grouped: HashMap<SandboxId, Vec<NetworkAllowRule>> = HashMap::new();
+    for row in rows {
+        let sandbox_id: String = row.try_get("sandbox_id")?;
+        let sandbox_id = SandboxId(parse_uuid(&sandbox_id)?);
+        let rule = row_to_network_allow_rule(row)?;
+        grouped.entry(sandbox_id).or_default().push(rule);
+    }
+    Ok(grouped)
 }
 
 async fn hydrate_sandbox_network_egress(

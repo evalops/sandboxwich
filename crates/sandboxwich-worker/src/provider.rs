@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     io::Write,
     process::{Command, Stdio},
+    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -11,6 +12,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use chrono::Utc;
+use ipnet::IpNet;
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, MemoryLimit, NetworkAllowRuleKind, NetworkEgress,
     ProviderCapabilityReport, ProviderForkHandle, ProviderHealthReport, ProviderHealthStatus,
@@ -20,10 +22,16 @@ use sandboxwich_core::{
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const KUBERNETES_MUTATION_ENV: &str = "SANDBOXWICH_K8S_ENABLE_MUTATION";
 pub const DEFAULT_SANDBOX_GUEST_IMAGE: &str = "ghcr.io/evalops/sandboxwich-ubuntu-dev:latest";
+/// Default cap on the stdout/stderr captured from a single `kubectl` invocation
+/// before it's stored in a `KubectlOutput` (and, from there, in job results and
+/// provider metadata sent back to the control plane). Mirrors
+/// `sandboxwich-agent`'s `DEFAULT_MAX_CAPTURED_OUTPUT_BYTES`: without a cap, a
+/// chatty or misbehaving `kubectl` command could grow these unboundedly.
+pub const DEFAULT_MAX_CAPTURED_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Default bound applied to every `kubectl` invocation made by
 /// [`KubernetesApplyProvider`] (see [`run_kubectl_command`]). Deliberately
@@ -144,10 +152,15 @@ pub struct KubernetesDryRunProvider {
     /// Namespace running cluster DNS, used to scope the always-on DNS
     /// egress rule (GH-66).
     dns_namespace: String,
-    /// CIDRs carved out (via NetworkPolicy `except`) of any `0.0.0.0/0`
-    /// egress rule so sandboxes can never reach the control plane /
-    /// metadata endpoints even in `AllowAll` or an allowlist that includes
-    /// `0.0.0.0/0` (GH-66).
+    /// CIDRs carved out (via NetworkPolicy `except`) of every egress allow
+    /// rule that overlaps them, so sandboxes can never reach the control
+    /// plane / metadata endpoints regardless of egress mode -- not just
+    /// `AllowAll`/`0.0.0.0/0`, but any allowlist CIDR that happens to
+    /// contain one of these ranges too (GH-66). Seeded from
+    /// `DEFAULT_EGRESS_EXCLUDED_CIDRS` and merged (not replaced) with any
+    /// operator-supplied CIDRs via `with_egress_excluded_cidrs`, so the
+    /// metadata carve-out can't be silently dropped by an override; use
+    /// `with_egress_excluded_cidrs_replace` to opt out of that merge.
     egress_excluded_cidrs: Vec<String>,
     /// Namespace containing pods allowed to reach a sandbox's ssh/desktop
     /// ports via the rendered ingress NetworkPolicy. Falls back to
@@ -156,8 +169,11 @@ pub struct KubernetesDryRunProvider {
     /// Pod selector labels identifying which pods in `ingress_namespace`
     /// may reach a sandbox's ssh/desktop ports (GH-67).
     ingress_pod_selector: BTreeMap<String, String>,
-    /// Optional Secret name providing `SANDBOXWICH_VNC_PASSWORD` to the
-    /// sandbox container, mirroring `ssh_authorized_keys_secret` (GH-67).
+    /// Optional Secret name mounted read-only at
+    /// `/run/sandboxwich/vnc/vnc-password` in the sandbox container (path
+    /// exposed via `SANDBOXWICH_VNC_PASSWORD_FILE`), mirroring how
+    /// `ssh_authorized_keys_secret` is mounted as a file rather than an env
+    /// var (GH-67).
     vnc_password_secret: Option<String>,
 }
 
@@ -251,16 +267,49 @@ impl KubernetesDryRunProvider {
         self
     }
 
+    /// Merges operator-supplied CIDRs into the excluded set (deduped
+    /// against what's already there, including `DEFAULT_EGRESS_EXCLUDED_CIDRS`)
+    /// rather than replacing it, so passing a custom list can only ever
+    /// exclude *more* addresses than the default, never accidentally drop
+    /// the `169.254.0.0/16` metadata carve-out. Use
+    /// `with_egress_excluded_cidrs_replace` if you deliberately need to
+    /// replace the set outright.
     pub fn with_egress_excluded_cidrs(mut self, cidrs: Vec<String>) -> Self {
-        let cidrs: Vec<String> = cidrs
-            .into_iter()
-            .map(|cidr| cidr.trim().to_string())
-            .filter(|cidr| !cidr.is_empty())
-            .collect();
+        for cidr in Self::normalize_cidrs(cidrs) {
+            if !self.egress_excluded_cidrs.contains(&cidr) {
+                self.egress_excluded_cidrs.push(cidr);
+            }
+        }
+        self
+    }
+
+    /// Escape hatch that replaces the excluded CIDR set outright instead of
+    /// merging with `DEFAULT_EGRESS_EXCLUDED_CIDRS` (see
+    /// `with_egress_excluded_cidrs`). Only use this if you are deliberately
+    /// replacing the metadata/control-plane carve-out with an equivalent
+    /// value for your environment -- e.g. a non-k3s cluster where the
+    /// k3s-shaped defaults (`10.42.0.0/16`, `10.43.0.0/16`) are meaningless
+    /// and you're supplying the real pod/service CIDRs instead. Passing an
+    /// empty list is a no-op (kept for parity with the merge variant); to
+    /// truly disable the carve-out, pass a value that can never match
+    /// (there's no supported way to leave the metadata endpoint reachable
+    /// by omission, that would have to be an explicit, obviously-named
+    /// escape hatch of its own, which nothing currently requests).
+    pub fn with_egress_excluded_cidrs_replace(mut self, cidrs: Vec<String>) -> Self {
+        let cidrs = Self::normalize_cidrs(cidrs);
         if !cidrs.is_empty() {
             self.egress_excluded_cidrs = cidrs;
         }
         self
+    }
+
+    fn normalize_cidrs(cidrs: Vec<String>) -> Vec<String> {
+        let mut seen = std::collections::BTreeSet::new();
+        cidrs
+            .into_iter()
+            .map(|cidr| cidr.trim().to_string())
+            .filter(|cidr| !cidr.is_empty() && seen.insert(cidr.clone()))
+            .collect()
     }
 
     pub fn with_ingress_namespace(mut self, ingress_namespace: Option<String>) -> Self {
@@ -508,14 +557,32 @@ impl KubernetesDryRunProvider {
         }
 
         if let Some(secret_name) = &self.vnc_password_secret {
-            env.push(json!({
-                "name": "SANDBOXWICH_VNC_PASSWORD",
-                "valueFrom": {
-                    "secretKeyRef": {
-                        "name": secret_name,
-                        "key": "vnc-password"
-                    }
+            // Mounted as a read-only file rather than a `secretKeyRef` env
+            // var, mirroring the SSH authorized-keys handling above:
+            // container env vars are visible to anything that can read
+            // this pod's spec/status via the Kubernetes API (e.g.
+            // `kubectl describe pod`, or any ServiceAccount with `get pods`
+            // in this namespace), not just the process itself, whereas a
+            // mounted file is only readable by whoever can exec into the
+            // container or read the volume directly.
+            volume_mounts.push(json!({
+                "name": "vnc-password",
+                "mountPath": "/run/sandboxwich/vnc",
+                "readOnly": true
+            }));
+            volumes.push(json!({
+                "name": "vnc-password",
+                "secret": {
+                    "secretName": secret_name,
+                    "items": [{
+                        "key": "vnc-password",
+                        "path": "vnc-password"
+                    }]
                 }
+            }));
+            env.push(json!({
+                "name": "SANDBOXWICH_VNC_PASSWORD_FILE",
+                "value": "/run/sandboxwich/vnc/vnc-password"
             }));
         }
 
@@ -613,22 +680,56 @@ impl KubernetesDryRunProvider {
         })
     }
 
-    /// Builds an `ipBlock` for `cidr`. When `cidr` is the wide-open
-    /// `0.0.0.0/0` (used by `AllowAll` and by allowlists that intentionally
-    /// include it), the configured `egress_excluded_cidrs` are carved out
-    /// via `except` so sandboxes can never reach the control plane / cloud
-    /// metadata endpoint regardless of egress mode (GH-66). `except` must
-    /// be a subset of `cidr`, which only holds generically for `0.0.0.0/0`,
-    /// so narrower allowlist CIDRs are left as-is.
-    fn ip_block(&self, cidr: &str) -> serde_json::Value {
-        if cidr == "0.0.0.0/0" && !self.egress_excluded_cidrs.is_empty() {
-            json!({
-                "cidr": cidr,
-                "except": self.egress_excluded_cidrs
-            })
+    /// Builds an `ipBlock` for `cidr`, carving the configured
+    /// `egress_excluded_cidrs` (control-plane / cloud metadata / cluster
+    /// service ranges) out via `except` wherever they actually overlap
+    /// `cidr` -- not just for the wide-open `0.0.0.0/0` case (GH-66,
+    /// GH-<this fix>). A narrower allowlist entry like `10.0.0.0/8` fully
+    /// contains the default excluded ranges (`10.42.0.0/16`,
+    /// `10.43.0.0/16`) and, if it happened to include `169.254.0.0/16`,
+    /// would otherwise expose the cloud metadata endpoint
+    /// (`169.254.169.254`) to every sandbox -- a direct path to credential
+    /// theft. CIDR blocks are power-of-two aligned, so two CIDRs can only
+    /// ever be identical, nested (one strictly contains the other), or
+    /// disjoint; there is no partial-overlap case to handle. Returns an
+    /// error if an excluded CIDR fully contains (or equals) `cidr`, since
+    /// Kubernetes NetworkPolicy requires every `except` entry to be a
+    /// strict subset of `cidr` and there would be nothing left to allow.
+    fn ip_block(&self, cidr: &str) -> anyhow::Result<serde_json::Value> {
+        let except = self.excepted_cidrs_for(cidr)?;
+        if except.is_empty() {
+            Ok(json!({ "cidr": cidr }))
         } else {
-            json!({ "cidr": cidr })
+            Ok(json!({
+                "cidr": cidr,
+                "except": except
+            }))
         }
+    }
+
+    /// Computes which of the configured `egress_excluded_cidrs` must be
+    /// rendered as `except` entries for the allow rule `cidr`, per the
+    /// containment rules described on `ip_block`.
+    fn excepted_cidrs_for(&self, cidr: &str) -> anyhow::Result<Vec<String>> {
+        if self.egress_excluded_cidrs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let allowed =
+            IpNet::from_str(cidr).with_context(|| format!("invalid egress allow CIDR {cidr}"))?;
+        let mut except = Vec::new();
+        for excluded_str in &self.egress_excluded_cidrs {
+            let excluded = IpNet::from_str(excluded_str)
+                .with_context(|| format!("invalid egress excluded CIDR {excluded_str}"))?;
+            if excluded.contains(&allowed) {
+                bail!(
+                    "egress allow rule {cidr} is entirely covered by excluded control-plane/metadata CIDR {excluded_str}; refusing to render a NetworkPolicy that would either expose it or leave nothing allowed"
+                );
+            }
+            if allowed.contains(&excluded) {
+                except.push(excluded_str.clone());
+            }
+        }
+        Ok(except)
     }
 
     /// Egress rule always appended so sandboxes can resolve DNS even under
@@ -688,19 +789,19 @@ impl KubernetesDryRunProvider {
         let egress = match network_egress {
             NetworkEgress::DenyAll => Vec::new(),
             NetworkEgress::AllowAll => vec![
-                json!({ "to": [{ "ipBlock": self.ip_block("0.0.0.0/0") }] }),
+                json!({ "to": [{ "ipBlock": self.ip_block("0.0.0.0/0")? }] }),
                 self.dns_egress_rule(),
             ],
             NetworkEgress::Allowlist { rules } => {
                 let mut egress: Vec<serde_json::Value> = rules
                     .iter()
                     .filter(|rule| rule.kind == NetworkAllowRuleKind::Cidr)
-                    .map(|rule| {
-                        json!({
-                            "to": [{ "ipBlock": self.ip_block(&rule.value) }]
-                        })
+                    .map(|rule| -> anyhow::Result<serde_json::Value> {
+                        Ok(json!({
+                            "to": [{ "ipBlock": self.ip_block(&rule.value)? }]
+                        }))
                     })
-                    .collect();
+                    .collect::<anyhow::Result<Vec<_>>>()?;
                 egress.push(self.dns_egress_rule());
                 egress
             }
@@ -1033,6 +1134,7 @@ pub struct KubernetesApplyProvider {
     confirm_apply: bool,
     mutation_enabled: bool,
     kubectl_command_timeout: Duration,
+    max_captured_output_bytes: u64,
 }
 
 impl KubernetesApplyProvider {
@@ -1045,6 +1147,7 @@ impl KubernetesApplyProvider {
             confirm_apply: false,
             mutation_enabled: false,
             kubectl_command_timeout: Duration::from_secs(DEFAULT_KUBECTL_COMMAND_TIMEOUT_SECS),
+            max_captured_output_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
         }
     }
 
@@ -1072,6 +1175,13 @@ impl KubernetesApplyProvider {
     /// elapses instead of wedging the worker's job-execution thread forever.
     pub fn with_kubectl_command_timeout(mut self, timeout: Duration) -> Self {
         self.kubectl_command_timeout = timeout;
+        self
+    }
+
+    /// Caps the stdout/stderr captured from every `kubectl` invocation this
+    /// provider makes. See `DEFAULT_MAX_CAPTURED_OUTPUT_BYTES`.
+    pub fn with_max_captured_output_bytes(mut self, max_captured_output_bytes: u64) -> Self {
+        self.max_captured_output_bytes = max_captured_output_bytes;
         self
     }
 
@@ -1192,6 +1302,7 @@ impl KubernetesApplyProvider {
             &plan.apply_args,
             &plan.apply_manifests,
             "apply smoke manifests",
+            self.max_captured_output_bytes,
         )?;
         let mut cleanup_status = String::new();
         let mut cleanup_stdout = String::new();
@@ -1204,6 +1315,7 @@ impl KubernetesApplyProvider {
                 &plan.cleanup_args,
                 &plan.cleanup_manifests,
                 "cleanup smoke manifests",
+                self.max_captured_output_bytes,
             )?;
             cleanup_status = cleanup_output.status;
             cleanup_stdout = cleanup_output.stdout;
@@ -1309,6 +1421,7 @@ impl KubernetesApplyProvider {
             "wait for sandbox pod readiness",
             self.kubectl_command_timeout,
             None,
+            self.max_captured_output_bytes,
         )
     }
 
@@ -1331,6 +1444,7 @@ impl KubernetesApplyProvider {
             "check sandbox pod existence",
             self.kubectl_command_timeout,
             None,
+            self.max_captured_output_bytes,
         )?;
         if !output.success {
             bail!(
@@ -1357,38 +1471,144 @@ impl KubernetesApplyProvider {
         args
     }
 
+    /// Best-effort teardown of every resource labeled with `sandbox_id`, used to
+    /// roll back a partially-applied `provision`/`fork` after a later step (the
+    /// apply itself, or the readiness wait) fails. Without this, a failed
+    /// provision/fork leaked its PVC/Pod/Service/NetworkPolicy forever, since the
+    /// caller only ever saw the original error and never got a handle to clean
+    /// up.
+    ///
+    /// Deliberately swallows its own failures (beyond logging to stderr): a
+    /// rollback that itself fails must never mask or replace the original
+    /// provisioning error that triggered it, since that original error is what
+    /// the caller (and its retry/alerting logic) needs to see. `--ignore-not-found`
+    /// on the underlying `kubectl delete` also makes this safe to call even when
+    /// nothing was actually applied yet (e.g. `provision`'s own `kubectl apply`
+    /// failed to spawn at all).
+    fn rollback_applied_resources(&self, sandbox_id: SandboxId, context: &'static str) {
+        let args = self.teardown_args(sandbox_id);
+        match run_kubectl_command(
+            &self.kubectl,
+            &args,
+            "rollback applied resources after failed provision/fork",
+            self.kubectl_command_timeout,
+            None,
+            self.max_captured_output_bytes,
+        ) {
+            Ok(output) if output.success => {
+                eprintln!(
+                    "sandboxwich-worker: rolled back resources for sandbox {sandbox_id} after \
+                     failed {context}"
+                );
+            }
+            Ok(output) => {
+                eprintln!(
+                    "warning: rollback of sandbox {sandbox_id} resources after failed {context} \
+                     itself failed with {}: {} (resources may be leaked; original error is not \
+                     masked by this)",
+                    output.status, output.stderr
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "warning: rollback of sandbox {sandbox_id} resources after failed {context} \
+                     could not run kubectl: {error:#} (resources may be leaked; original error is \
+                     not masked by this)"
+                );
+            }
+        }
+    }
+
+    /// Renders the `kubectl exec` argument list for `request`. Env var
+    /// *values* are never placed on this argv: any process on the guest
+    /// (or on the worker host itself, via its own `ps`/argv) can read
+    /// another process's `/proc/*/cmdline`, so passing secrets as
+    /// positional `KEY=VALUE` args to `env` -- as this used to do -- leaks
+    /// them to anything with process-listing access. When `request.env`
+    /// is non-empty, this instead wires up `kubectl exec -i` plus a small
+    /// `bash -c` wrapper that reads NUL-delimited `KEY=VALUE` pairs from
+    /// stdin and `export`s them before `exec`ing the real command; the
+    /// caller must pipe `exec_stdin_payload(request)` to that invocation's
+    /// stdin. NUL is a safe delimiter because POSIX environment variable
+    /// values can never contain an embedded NUL byte, unlike newlines.
     fn exec_args(&self, sandbox_id: SandboxId, request: &AgentCommandRequest) -> Vec<String> {
         let mut args = self.kubectl_base_args();
+        let needs_env = !request.env.is_empty();
+        if needs_env {
+            args.push("-i".to_string());
+        }
         args.extend([
             "exec".to_string(),
             self.pod_name(sandbox_id),
             "--".to_string(),
         ]);
 
-        if request.cwd.is_some() || !request.env.is_empty() {
-            if !request.env.is_empty() {
-                args.push("env".to_string());
-                for (key, value) in &request.env {
-                    args.push(format!("{key}={value}"));
-                }
-            }
+        if needs_env {
+            args.extend([
+                "bash".to_string(),
+                "-c".to_string(),
+                EXEC_ENV_WRAPPER_SCRIPT.to_string(),
+                "sandboxwich-exec".to_string(),
+            ]);
             if let Some(cwd) = &request.cwd {
-                args.extend([
-                    "sh".to_string(),
-                    "-lc".to_string(),
-                    "cd \"$1\" && shift && exec \"$@\"".to_string(),
-                    "sandboxwich-cwd".to_string(),
-                    cwd.clone(),
-                ]);
-                args.extend(request.argv.clone());
-                return args;
+                args.push("1".to_string());
+                args.push(cwd.clone());
+            } else {
+                args.push("0".to_string());
             }
+            args.extend(request.argv.clone());
+            return args;
+        }
+
+        if let Some(cwd) = &request.cwd {
+            args.extend([
+                "sh".to_string(),
+                "-lc".to_string(),
+                "cd \"$1\" && shift && exec \"$@\"".to_string(),
+                "sandboxwich-cwd".to_string(),
+                cwd.clone(),
+            ]);
+            args.extend(request.argv.clone());
+            return args;
         }
 
         args.extend(request.argv.clone());
         args
     }
+
+    /// Builds the NUL-delimited `KEY=VALUE` payload that must be piped to
+    /// the stdin of the `kubectl exec` invocation built by `exec_args` when
+    /// `request.env` is non-empty. Returns `None` when there's nothing to
+    /// send, so callers know not to bother opening a piped stdin at all.
+    fn exec_stdin_payload(request: &AgentCommandRequest) -> Option<Vec<u8>> {
+        if request.env.is_empty() {
+            return None;
+        }
+        let mut payload = Vec::new();
+        for (key, value) in &request.env {
+            payload.extend_from_slice(key.as_bytes());
+            payload.push(b'=');
+            payload.extend_from_slice(value.as_bytes());
+            payload.push(0);
+        }
+        Some(payload)
+    }
 }
+
+/// Guest-side wrapper invoked via `bash -c` by `exec_args` when the request
+/// carries env vars. Argument order (after the `bash -c` command string
+/// itself, `$0` is `sandboxwich-exec`): `$1` is `"1"`/`"0"` for
+/// has-cwd, `$2` is the cwd (only present when `$1 == "1"`), and the
+/// remaining args are the real command to run. Env `KEY=VALUE` pairs are
+/// read from stdin, NUL-delimited, before anything else runs.
+const EXEC_ENV_WRAPPER_SCRIPT: &str = concat!(
+    "while IFS= read -r -d '' kv; do ",
+    "case \"$kv\" in *=*) export \"${kv%%=*}\"=\"${kv#*=}\" ;; esac; ",
+    "done; ",
+    "has_cwd=\"$1\"; shift; ",
+    "if [ \"$has_cwd\" = \"1\" ]; then cd \"$1\" || exit 1; shift; fi; ",
+    "exec \"$@\""
+);
 
 #[derive(Debug)]
 struct KubectlOutput {
@@ -1399,11 +1619,26 @@ struct KubectlOutput {
     stderr: String,
 }
 
+/// Decodes `bytes` as (possibly lossy) UTF-8, capping the result at
+/// `max_bytes`. When truncated, appends a marker noting how many bytes were
+/// cut so a truncated capture is never mistaken for the complete output.
+fn cap_output_bytes(bytes: &[u8], max_bytes: u64) -> String {
+    let max_bytes = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    if bytes.len() <= max_bytes {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let omitted = bytes.len() - max_bytes;
+    let mut text = String::from_utf8_lossy(&bytes[..max_bytes]).into_owned();
+    text.push_str(&format!("\n[truncated {omitted} bytes]\n"));
+    text
+}
+
 fn run_kubectl_documents(
     kubectl: &str,
     args: &[String],
     manifests: &[Value],
     context: &'static str,
+    max_output_bytes: u64,
 ) -> anyhow::Result<KubectlOutput> {
     let mut child = Command::new(kubectl)
         .args(args)
@@ -1422,8 +1657,8 @@ fn run_kubectl_documents(
     let output = child
         .wait_with_output()
         .with_context(|| format!("failed to wait for kubectl {context}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stdout = cap_output_bytes(&output.stdout, max_output_bytes);
+    let stderr = cap_output_bytes(&output.stderr, max_output_bytes);
 
     Ok(KubectlOutput {
         success: output.status.success(),
@@ -1433,6 +1668,10 @@ fn run_kubectl_documents(
         stderr,
     })
 }
+
+/// How often a kubectl invocation polls a `CancelSignal` for cancellation
+/// while waiting on the child.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Runs a `kubectl` invocation with a bounded wait, killing the child and
 /// returning a "timed out" error if it hasn't exited within `timeout`.
@@ -1445,35 +1684,78 @@ fn run_kubectl_documents(
 /// either inside `tokio::task::spawn_blocking` (see `handle_lease`) or
 /// directly within `#[tokio::main]`'s task, so a Tokio runtime `Handle` is
 /// always available to drive the bounded async wait below.
-/// How often a kubectl invocation polls a `CancelSignal` for cancellation
-/// while waiting on the child.
-const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(500);
-
 fn run_kubectl_command(
     kubectl: &str,
     args: &[String],
     context: &'static str,
     timeout: Duration,
     cancelled: Option<&CancelSignal>,
+    max_output_bytes: u64,
+) -> anyhow::Result<KubectlOutput> {
+    run_kubectl_command_with_stdin(
+        kubectl,
+        args,
+        None,
+        context,
+        timeout,
+        cancelled,
+        max_output_bytes,
+    )
+}
+
+/// Like `run_kubectl_command`, but when `stdin_payload` is `Some`, pipes it
+/// to the child's stdin and closes it (sending EOF) before waiting for
+/// output. Used by `exec_handoff` to hand env var values to the guest's
+/// `bash -c` wrapper over stdin instead of argv (see `exec_args`).
+fn run_kubectl_command_with_stdin(
+    kubectl: &str,
+    args: &[String],
+    stdin_payload: Option<&[u8]>,
+    context: &'static str,
+    timeout: Duration,
+    cancelled: Option<&CancelSignal>,
+    max_output_bytes: u64,
 ) -> anyhow::Result<KubectlOutput> {
     tokio::runtime::Handle::current().block_on(run_kubectl_command_async(
-        kubectl, args, context, timeout, cancelled,
+        kubectl,
+        args,
+        stdin_payload,
+        context,
+        timeout,
+        cancelled,
+        max_output_bytes,
     ))
 }
 
 async fn run_kubectl_command_async(
     kubectl: &str,
     args: &[String],
+    stdin_payload: Option<&[u8]>,
     context: &'static str,
     timeout: Duration,
     cancelled: Option<&CancelSignal>,
+    max_output_bytes: u64,
 ) -> anyhow::Result<KubectlOutput> {
-    let mut child = tokio::process::Command::new(kubectl)
+    let mut command = tokio::process::Command::new(kubectl);
+    command
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if stdin_payload.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn kubectl for {context}"))?;
+    let stdin_pipe = match stdin_payload {
+        Some(_) => Some(
+            child
+                .stdin
+                .take()
+                .context("failed to open kubectl stdin")?,
+        ),
+        None => None,
+    };
     let mut stdout_pipe = child
         .stdout
         .take()
@@ -1483,19 +1765,28 @@ async fn run_kubectl_command_async(
         .take()
         .context("failed to capture kubectl stderr")?;
 
-    // Drain stdout/stderr concurrently with waiting on the child: kubectl can
+    // Feed stdin (dropping the pipe afterwards sends EOF) and drain
+    // stdout/stderr concurrently with waiting on the child: kubectl can
     // write more than a single pipe buffer's worth of output, and waiting for
     // exit before ever reading the pipes risks a classic deadlock (kubectl
     // blocks writing to a full pipe while we block waiting for it to exit).
+    // The same reasoning applies to writing the stdin payload.
     let drive = async {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        let feed_stdin = async {
+            if let (Some(mut stdin), Some(payload)) = (stdin_pipe, stdin_payload) {
+                stdin.write_all(payload).await?;
+            }
+            Ok::<_, std::io::Error>(())
+        };
         tokio::try_join!(
             child.wait(),
+            feed_stdin,
             stdout_pipe.read_to_end(&mut stdout),
             stderr_pipe.read_to_end(&mut stderr),
         )
-        .map(|(status, _, _)| (status, stdout, stderr))
+        .map(|(status, (), _, _)| (status, stdout, stderr))
     };
 
     // If the caller's lease renewal is lost while this kubectl invocation is
@@ -1527,8 +1818,8 @@ async fn run_kubectl_command_async(
                         success: status.success(),
                         code: status.code(),
                         status: status.to_string(),
-                        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                        stdout: cap_output_bytes(&stdout, max_output_bytes),
+                        stderr: cap_output_bytes(&stderr, max_output_bytes),
                     })
                 }
                 Err(_elapsed) => {
@@ -1803,16 +2094,28 @@ impl SandboxProvider for KubernetesApplyProvider {
             &self.kubectl_args("apply"),
             &manifests,
             "apply sandbox manifests",
+            self.max_captured_output_bytes,
         )?;
         if !apply.success {
+            // kubectl apply of a multi-document manifest set is not atomic: some
+            // objects may have been created before the command as a whole failed.
+            // Best-effort tear those down rather than leaking them (GH rollback fix).
+            self.rollback_applied_resources(sandbox_id, "provision (kubectl apply)");
             bail!(
                 "kubectl apply sandbox manifests failed with {}: {}",
                 apply.status,
                 apply.stderr
             );
         }
-        let wait = self.wait_for_pod_ready(sandbox_id)?;
+        let wait = match self.wait_for_pod_ready(sandbox_id) {
+            Ok(wait) => wait,
+            Err(error) => {
+                self.rollback_applied_resources(sandbox_id, "provision (wait for pod ready)");
+                return Err(error);
+            }
+        };
         if !wait.success {
+            self.rollback_applied_resources(sandbox_id, "provision (wait for pod ready)");
             bail!(
                 "sandbox pod did not become ready with {}: {}",
                 wait.status,
@@ -1859,12 +2162,15 @@ impl SandboxProvider for KubernetesApplyProvider {
             .timeout_secs
             .map(Duration::from_secs)
             .unwrap_or(self.kubectl_command_timeout);
-        let output = run_kubectl_command(
+        let stdin_payload = Self::exec_stdin_payload(&request);
+        let output = run_kubectl_command_with_stdin(
             &self.kubectl,
             &self.exec_args(sandbox_id, &request),
+            stdin_payload.as_deref(),
             "execute sandbox command",
             timeout,
             Some(cancelled),
+            self.max_captured_output_bytes,
         )?;
         let finished_at = Utc::now();
         Ok(AgentCommandResult {
@@ -1890,6 +2196,7 @@ impl SandboxProvider for KubernetesApplyProvider {
             &self.kubectl_args("apply"),
             std::slice::from_ref(&snapshot),
             "apply snapshot manifest",
+            self.max_captured_output_bytes,
         )?;
         if !apply.success {
             bail!(
@@ -1937,16 +2244,29 @@ impl SandboxProvider for KubernetesApplyProvider {
             &self.kubectl_args("apply"),
             &manifests,
             "apply fork manifests",
+            self.max_captured_output_bytes,
         )?;
         if !apply.success {
+            // Same non-atomicity concern as provision(): some of the fork's
+            // manifests may already have been created before the apply as a
+            // whole failed. Roll back everything labeled with the child sandbox
+            // id rather than leaking it.
+            self.rollback_applied_resources(child_sandbox_id, "fork (kubectl apply)");
             bail!(
                 "kubectl apply fork manifests failed with {}: {}",
                 apply.status,
                 apply.stderr
             );
         }
-        let wait = self.wait_for_pod_ready(child_sandbox_id)?;
+        let wait = match self.wait_for_pod_ready(child_sandbox_id) {
+            Ok(wait) => wait,
+            Err(error) => {
+                self.rollback_applied_resources(child_sandbox_id, "fork (wait for pod ready)");
+                return Err(error);
+            }
+        };
         if !wait.success {
+            self.rollback_applied_resources(child_sandbox_id, "fork (wait for pod ready)");
             bail!(
                 "forked sandbox pod did not become ready with {}: {}",
                 wait.status,
@@ -1980,6 +2300,7 @@ impl SandboxProvider for KubernetesApplyProvider {
             "delete sandbox resources",
             self.kubectl_command_timeout,
             None,
+            self.max_captured_output_bytes,
         )?;
         if !output.success {
             bail!(
@@ -2001,9 +2322,11 @@ mod tests {
         let output = run_kubectl_command_async(
             "sh",
             &["-c".to_string(), "echo hi && exit 0".to_string()],
+            None,
             "test fast command",
             Duration::from_secs(5),
             None,
+            DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
         )
         .await
         .expect("fast command should succeed well within the timeout");
@@ -2024,9 +2347,11 @@ mod tests {
         let error = run_kubectl_command_async(
             "sh",
             &["-c".to_string(), "sleep 30".to_string()],
+            None,
             "test slow command",
             Duration::from_millis(200),
             None,
+            DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
         )
         .await
         .expect_err("a command that outlives the timeout must be treated as a failure");
@@ -2063,9 +2388,11 @@ mod tests {
         let error = run_kubectl_command_async(
             "sh",
             &["-c".to_string(), "sleep 30".to_string()],
+            None,
             "test slow command",
             Duration::from_secs(60), // Long enough that the timeout branch can't win the race.
             Some(&cancelled),
+            DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
         )
         .await
         .expect_err("a cancelled kubectl invocation must be treated as a failure");
@@ -2473,6 +2800,133 @@ mod tests {
     }
 
     #[test]
+    fn exec_args_never_render_env_values_on_argv() {
+        let provider = KubernetesDryRunProvider::with_snapshot_class(
+            "k3s-ci",
+            "sandboxwich-ci",
+            Some("local-path".to_string()),
+            None,
+        );
+        let apply = KubernetesApplyProvider::new(provider, "kubectl");
+        let sandbox_id = SandboxId::new();
+        let mut env = BTreeMap::new();
+        env.insert(
+            "SUPER_SECRET_TOKEN".to_string(),
+            "sk-do-not-leak-this-value".to_string(),
+        );
+        env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+        let request = AgentCommandRequest {
+            argv: vec!["printf".to_string(), "ok".to_string()],
+            cwd: None,
+            env,
+            timeout_secs: None,
+        };
+
+        let exec_args = apply.exec_args(sandbox_id, &request);
+
+        // The secret value (and even the innocuous one) must never appear
+        // anywhere on argv, whether as a whole arg or embedded in one --
+        // /proc/*/cmdline and any local `ps` visibility would otherwise
+        // leak it to every other process on the guest, plus the worker
+        // host's own process table.
+        assert!(
+            !exec_args
+                .iter()
+                .any(|arg| arg.contains("sk-do-not-leak-this-value")),
+            "secret value leaked onto kubectl exec argv: {exec_args:?}"
+        );
+        assert!(
+            !exec_args
+                .iter()
+                .any(|arg| arg.contains("SUPER_SECRET_TOKEN")),
+            "env var name leaked onto kubectl exec argv: {exec_args:?}"
+        );
+        assert!(
+            !exec_args.iter().any(|arg| arg == "env"),
+            "must not shell out to `env KEY=VALUE ...` positional args anymore"
+        );
+
+        // `-i` must be set so kubectl actually connects the payload stdin.
+        assert!(exec_args.contains(&"-i".to_string()));
+        assert!(exec_args.contains(&"bash".to_string()));
+        // The real command must still be intact at the tail of argv.
+        assert_eq!(
+            &exec_args[exec_args.len() - 2..],
+            ["printf".to_string(), "ok".to_string()]
+        );
+    }
+
+    #[test]
+    fn exec_args_without_env_do_not_request_stdin_or_a_wrapper() {
+        let provider = KubernetesDryRunProvider::with_snapshot_class(
+            "k3s-ci",
+            "sandboxwich-ci",
+            Some("local-path".to_string()),
+            None,
+        );
+        let apply = KubernetesApplyProvider::new(provider, "kubectl");
+        let request = AgentCommandRequest {
+            argv: vec!["printf".to_string(), "ok".to_string()],
+            cwd: None,
+            env: BTreeMap::new(),
+            timeout_secs: None,
+        };
+
+        let exec_args = apply.exec_args(SandboxId::new(), &request);
+
+        assert!(!exec_args.contains(&"-i".to_string()));
+        assert!(!exec_args.contains(&"bash".to_string()));
+        assert!(KubernetesApplyProvider::exec_stdin_payload(&request).is_none());
+    }
+
+    #[test]
+    fn exec_args_carry_cwd_through_the_env_wrapper_when_both_are_set() {
+        let provider = KubernetesDryRunProvider::with_snapshot_class(
+            "k3s-ci",
+            "sandboxwich-ci",
+            Some("local-path".to_string()),
+            None,
+        );
+        let apply = KubernetesApplyProvider::new(provider, "kubectl");
+        let mut env = BTreeMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        let request = AgentCommandRequest {
+            argv: vec!["pwd".to_string()],
+            cwd: Some("/workspace/project".to_string()),
+            env,
+            timeout_secs: None,
+        };
+
+        let exec_args = apply.exec_args(SandboxId::new(), &request);
+
+        assert!(exec_args.contains(&"-i".to_string()));
+        assert!(exec_args.iter().any(|arg| arg == "/workspace/project"));
+        assert_eq!(exec_args[exec_args.len() - 1], "pwd");
+        assert!(!exec_args.iter().any(|arg| arg.contains("FOO=bar")));
+    }
+
+    #[test]
+    fn exec_stdin_payload_nul_delimits_key_value_pairs() {
+        let mut env = BTreeMap::new();
+        env.insert("A".to_string(), "1".to_string());
+        env.insert("B".to_string(), "two".to_string());
+        let request = AgentCommandRequest {
+            argv: vec!["true".to_string()],
+            cwd: None,
+            env,
+            timeout_secs: None,
+        };
+
+        let payload = KubernetesApplyProvider::exec_stdin_payload(&request)
+            .expect("non-empty env should produce a stdin payload");
+        let text = String::from_utf8(payload).expect("payload should be valid utf-8");
+        let entries: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
+
+        assert!(entries.contains(&"A=1"));
+        assert!(entries.contains(&"B=two"));
+    }
+
+    #[test]
     fn kubernetes_apply_gate_requires_explicit_double_opt_in() {
         let missing_flag = KubernetesApplyProvider::validate_apply_gate(false, true)
             .expect_err("missing --confirm-apply should fail");
@@ -2543,7 +2997,12 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_egress_always_includes_dns_rule_and_preserves_narrow_cidrs() {
+    fn allowlist_egress_carves_out_control_plane_ranges_contained_within_allowed_cidr() {
+        // GH-<egress carve-out fix>: `10.0.0.0/8` fully contains the default
+        // k3s pod/service ranges (`10.42.0.0/16`, `10.43.0.0/16`), so an
+        // allowlist entry that broad must carve them out via `except` just
+        // like `0.0.0.0/0` does -- an allowlist CIDR is not exempt from the
+        // carve-out just because it isn't exactly `0.0.0.0/0`.
         let provider =
             KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
         let spec = SandboxProvisionSpec {
@@ -2563,15 +3022,96 @@ mod tests {
             .as_array()
             .expect("egress should be an array");
 
-        // Narrow allowlist CIDRs are left untouched (an `except` carve-out
-        // would only be valid if it were a subset of the allowed CIDR).
         assert_eq!(egress[0]["to"][0]["ipBlock"]["cidr"], "10.0.0.0/8");
-        assert!(egress[0]["to"][0]["ipBlock"]["except"].is_null());
+        let except: Vec<&str> = egress[0]["to"][0]["ipBlock"]["except"]
+            .as_array()
+            .expect("10.0.0.0/8 fully contains the k3s pod/service ranges and must carve them out")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(except.contains(&"10.42.0.0/16"));
+        assert!(except.contains(&"10.43.0.0/16"));
+        // 169.254.0.0/16 doesn't overlap 10.0.0.0/8 at all, so it must not
+        // appear as an (invalid, non-subset) except entry.
+        assert!(!except.contains(&"169.254.0.0/16"));
 
         assert!(
             egress.iter().any(|rule| rule["ports"][0]["port"] == 53),
             "allowlist egress must still include a DNS rule so name resolution keeps working"
         );
+    }
+
+    #[test]
+    fn allowlist_egress_leaves_disjoint_narrow_cidrs_untouched() {
+        // A CIDR that shares no addresses with any excluded range gets no
+        // `except` at all -- the carve-out logic must not add irrelevant
+        // exceptions.
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        let spec = SandboxProvisionSpec {
+            memory_limit: MemoryLimit::OneG,
+            network_egress: NetworkEgress::Allowlist {
+                rules: vec![sandboxwich_core::NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Cidr,
+                    value: "192.168.1.0/24".to_string(),
+                }],
+            },
+        };
+
+        let provisioned = provider
+            .provision(SandboxId::new(), &spec)
+            .expect("dry-run provision should succeed");
+        let egress = provisioned.metadata["manifests"]["networkPolicy"]["spec"]["egress"]
+            .as_array()
+            .expect("egress should be an array");
+
+        assert_eq!(egress[0]["to"][0]["ipBlock"]["cidr"], "192.168.1.0/24");
+        assert!(egress[0]["to"][0]["ipBlock"]["except"].is_null());
+    }
+
+    #[test]
+    fn allowlist_egress_rejects_cidr_fully_covered_by_an_excluded_range() {
+        // If the allowed CIDR is entirely inside (or equal to) an excluded
+        // range, there is nothing left to allow once the carve-out is
+        // applied -- k8s NetworkPolicy also requires `except` entries to be
+        // a strict subset of `cidr`, so `except == cidr` isn't just
+        // pointless, it's invalid. Reject rather than silently exposing the
+        // excluded range or producing a broken manifest.
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        let spec = SandboxProvisionSpec {
+            memory_limit: MemoryLimit::OneG,
+            network_egress: NetworkEgress::Allowlist {
+                rules: vec![sandboxwich_core::NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Cidr,
+                    value: "169.254.169.0/24".to_string(),
+                }],
+            },
+        };
+
+        let err = provider
+            .provision(SandboxId::new(), &spec)
+            .expect_err("allowlisting a range fully covered by an excluded CIDR must be rejected");
+        assert!(err.to_string().contains("169.254.0.0/16"));
+    }
+
+    #[test]
+    fn allowlist_egress_rejects_cidr_exactly_equal_to_an_excluded_range() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        let spec = SandboxProvisionSpec {
+            memory_limit: MemoryLimit::OneG,
+            network_egress: NetworkEgress::Allowlist {
+                rules: vec![sandboxwich_core::NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Cidr,
+                    value: "10.42.0.0/16".to_string(),
+                }],
+            },
+        };
+
+        provider
+            .provision(SandboxId::new(), &spec)
+            .expect_err("allowlisting a CIDR identical to an excluded range must be rejected");
     }
 
     #[test]
@@ -2601,6 +3141,120 @@ mod tests {
                 .expect("0.0.0.0/0 allowlist entry should carve out control-plane ranges")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn ipv6_allowlist_cidr_containing_an_ipv6_excluded_range_carves_it_out() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_egress_excluded_cidrs(vec!["fd00:ec2::254/128".to_string()]);
+        let spec = SandboxProvisionSpec {
+            memory_limit: MemoryLimit::OneG,
+            network_egress: NetworkEgress::Allowlist {
+                rules: vec![sandboxwich_core::NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Cidr,
+                    value: "fd00::/8".to_string(),
+                }],
+            },
+        };
+
+        let provisioned = provider
+            .provision(SandboxId::new(), &spec)
+            .expect("dry-run provision should succeed");
+        let egress = provisioned.metadata["manifests"]["networkPolicy"]["spec"]["egress"]
+            .as_array()
+            .expect("egress should be an array");
+
+        assert_eq!(egress[0]["to"][0]["ipBlock"]["cidr"], "fd00::/8");
+        let except: Vec<&str> = egress[0]["to"][0]["ipBlock"]["except"]
+            .as_array()
+            .expect("ipv6 allowlist entry should carve out the overlapping ipv6 excluded range")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(except.contains(&"fd00:ec2::254/128"));
+        // The default (ipv4) excluded CIDRs never overlap an ipv6 allow
+        // rule, so they must not show up either.
+        assert!(!except.contains(&"169.254.0.0/16"));
+    }
+
+    #[test]
+    fn ipv6_allow_rule_is_unaffected_by_default_ipv4_excluded_cidrs() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        let spec = SandboxProvisionSpec {
+            memory_limit: MemoryLimit::OneG,
+            network_egress: NetworkEgress::Allowlist {
+                rules: vec![sandboxwich_core::NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Cidr,
+                    value: "2001:db8::/32".to_string(),
+                }],
+            },
+        };
+
+        let provisioned = provider
+            .provision(SandboxId::new(), &spec)
+            .expect("dry-run provision should succeed");
+        let egress = provisioned.metadata["manifests"]["networkPolicy"]["spec"]["egress"]
+            .as_array()
+            .expect("egress should be an array");
+
+        assert_eq!(egress[0]["to"][0]["ipBlock"]["cidr"], "2001:db8::/32");
+        assert!(egress[0]["to"][0]["ipBlock"]["except"].is_null());
+    }
+
+    #[test]
+    fn operator_supplied_egress_excluded_cidrs_merge_with_defaults() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_egress_excluded_cidrs(vec!["172.16.0.0/12".to_string()]);
+        let spec = SandboxProvisionSpec {
+            memory_limit: MemoryLimit::OneG,
+            network_egress: NetworkEgress::AllowAll,
+        };
+
+        let provisioned = provider
+            .provision(SandboxId::new(), &spec)
+            .expect("dry-run provision should succeed");
+        let except: Vec<&str> = provisioned.metadata["manifests"]["networkPolicy"]["spec"]
+            ["egress"][0]["to"][0]["ipBlock"]["except"]
+            .as_array()
+            .expect("except should be an array")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+
+        // The operator-supplied CIDR is merged in...
+        assert!(except.contains(&"172.16.0.0/12"));
+        // ...alongside every default, including the metadata carve-out --
+        // an override can never silently drop it.
+        assert!(except.contains(&"169.254.0.0/16"));
+        assert!(except.contains(&"10.42.0.0/16"));
+        assert!(except.contains(&"10.43.0.0/16"));
+    }
+
+    #[test]
+    fn with_egress_excluded_cidrs_replace_drops_the_defaults() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_egress_excluded_cidrs_replace(vec!["172.16.0.0/12".to_string()]);
+        let spec = SandboxProvisionSpec {
+            memory_limit: MemoryLimit::OneG,
+            network_egress: NetworkEgress::AllowAll,
+        };
+
+        let provisioned = provider
+            .provision(SandboxId::new(), &spec)
+            .expect("dry-run provision should succeed");
+        let except: Vec<&str> = provisioned.metadata["manifests"]["networkPolicy"]["spec"]
+            ["egress"][0]["to"][0]["ipBlock"]["except"]
+            .as_array()
+            .expect("except should be an array")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+
+        assert_eq!(except, vec!["172.16.0.0/12"]);
     }
 
     #[test]
@@ -2703,21 +3357,50 @@ mod tests {
     }
 
     #[test]
-    fn vnc_password_secret_is_injected_as_env_var_when_configured() {
+    fn vnc_password_secret_is_mounted_as_a_read_only_file_not_an_env_var() {
+        // The VNC password must be mounted as a file (mirroring the SSH
+        // authorized-keys handling) rather than injected via
+        // `secretKeyRef`: pod env vars are visible to anything that can
+        // read this pod's spec through the Kubernetes API, not just the
+        // process itself.
         let provider =
             KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
                 .with_vnc_password_secret(Some("sandboxwich-vnc-password".to_string()));
         let provisioned = provider
             .provision(SandboxId::new(), &SandboxProvisionSpec::default())
             .expect("dry-run provision should succeed");
-        let env = provisioned.metadata["manifests"]["pod"]["spec"]["containers"][0]["env"]
+        let pod = &provisioned.metadata["manifests"]["pod"];
+        let env = pod["spec"]["containers"][0]["env"]
             .as_array()
             .expect("env should be an array");
 
+        assert!(
+            !env.iter()
+                .any(|entry| entry["name"] == "SANDBOXWICH_VNC_PASSWORD"),
+            "the raw VNC password must never be injected as a plain env var"
+        );
         assert!(env.iter().any(|entry| {
-            entry["name"] == "SANDBOXWICH_VNC_PASSWORD"
-                && entry["valueFrom"]["secretKeyRef"]["name"] == "sandboxwich-vnc-password"
-                && entry["valueFrom"]["secretKeyRef"]["key"] == "vnc-password"
+            entry["name"] == "SANDBOXWICH_VNC_PASSWORD_FILE"
+                && entry["value"] == "/run/sandboxwich/vnc/vnc-password"
+        }));
+
+        let volume_mounts = pod["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .expect("volumeMounts should be an array");
+        assert!(volume_mounts.iter().any(|mount| {
+            mount["name"] == "vnc-password"
+                && mount["mountPath"] == "/run/sandboxwich/vnc"
+                && mount["readOnly"] == true
+        }));
+
+        let volumes = pod["spec"]["volumes"]
+            .as_array()
+            .expect("volumes should be an array");
+        assert!(volumes.iter().any(|volume| {
+            volume["name"] == "vnc-password"
+                && volume["secret"]["secretName"] == "sandboxwich-vnc-password"
+                && volume["secret"]["items"][0]["key"] == "vnc-password"
+                && volume["secret"]["items"][0]["path"] == "vnc-password"
         }));
     }
 
@@ -2818,5 +3501,261 @@ mod tests {
         provider
             .stop(SandboxId::new())
             .expect("dry-run stop should never fail");
+    }
+
+    #[test]
+    fn cap_output_bytes_passes_through_short_output_unchanged() {
+        let text = "hello world";
+        assert_eq!(cap_output_bytes(text.as_bytes(), 1024), text);
+        // A cap exactly equal to the byte length is still "no truncation".
+        assert_eq!(cap_output_bytes(text.as_bytes(), text.len() as u64), text);
+    }
+
+    #[test]
+    fn cap_output_bytes_truncates_and_marks_omitted_byte_count() {
+        let text = "0123456789";
+        let capped = cap_output_bytes(text.as_bytes(), 4);
+
+        assert!(capped.starts_with("0123"));
+        assert!(
+            capped.contains("[truncated 6 bytes]"),
+            "expected a marker noting the 6 omitted bytes, got: {capped:?}"
+        );
+    }
+
+    /// Writes an executable fake `kubectl` script to a fresh temp directory,
+    /// returning `(script_path, log_path)`. The script:
+    /// - appends every invocation's space-joined argv as one line to `log_path`
+    ///   (bracketed with leading/trailing spaces so tests can match whole
+    ///   tokens like " delete " without false positives on substrings), and
+    /// - drains stdin for the "apply" verb, mirroring how
+    ///   `run_kubectl_documents` actually pipes manifests in via stdin so the
+    ///   real caller's `write_all` doesn't block on a full pipe;
+    /// - exits non-zero if `fail_verb` is present in argv, and zero otherwise.
+    ///
+    /// This lets rollback behavior be exercised end-to-end (provision/fork
+    /// calling through to a real rollback `kubectl delete`) without requiring
+    /// a real cluster or kubectl binary.
+    fn write_fake_kubectl(
+        fail_verb: Option<&'static str>,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("sandboxwich-fake-kubectl-{}", SandboxId::new()));
+        std::fs::create_dir_all(&dir).expect("create fake kubectl temp dir");
+        let log_path = dir.join("log.txt");
+        let fail_check = match fail_verb {
+            Some(verb) => format!("case \" $* \" in *\" {verb} \"*) exit 1 ;; esac\n"),
+            None => String::new(),
+        };
+        let script = format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             case \" $* \" in\n\
+             \x20\x20*\" apply \"*) cat >/dev/null 2>&1 || true ;;\n\
+             esac\n\
+             {fail_check}exit 0\n",
+            log = log_path.display(),
+        );
+        let script_path = dir.join("kubectl");
+        std::fs::write(&script_path, script).expect("write fake kubectl script");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)
+                .expect("stat fake kubectl script")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).expect("chmod fake kubectl script");
+        }
+        (script_path, log_path)
+    }
+
+    fn apply_provider_with_fake_kubectl(kubectl: &std::path::Path) -> KubernetesApplyProvider {
+        let dry_run =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        KubernetesApplyProvider::new(dry_run, kubectl.to_string_lossy().into_owned())
+            .with_kubectl_context(Some("in-cluster".to_string()))
+            .with_mutation_gate(true, true)
+    }
+
+    #[test]
+    fn provision_rolls_back_applied_resources_when_pod_never_becomes_ready() {
+        let (kubectl, log_path) = write_fake_kubectl(Some("wait"));
+        let provider = apply_provider_with_fake_kubectl(&kubectl);
+        let sandbox_id = SandboxId::new();
+
+        let error = provider
+            .provision(sandbox_id, &SandboxProvisionSpec::default())
+            .expect_err("a pod that never becomes ready should fail provision");
+        assert!(error.to_string().contains("did not become ready"));
+
+        let log = std::fs::read_to_string(&log_path).expect("read fake kubectl log");
+        assert!(
+            log.contains(" apply "),
+            "expected an apply invocation, got: {log}"
+        );
+        assert!(
+            log.contains(" wait "),
+            "expected a wait invocation, got: {log}"
+        );
+        assert!(
+            log.contains(" delete "),
+            "expected a rollback delete invocation after the failed wait, got: {log}"
+        );
+        assert!(
+            log.contains(&format!("sandboxwich.dev/sandbox-id={sandbox_id}")),
+            "rollback delete should be scoped to the sandbox that failed to provision, got: {log}"
+        );
+
+        let _ = std::fs::remove_dir_all(kubectl.parent().expect("kubectl script has a parent dir"));
+    }
+
+    #[test]
+    fn provision_rolls_back_applied_resources_when_apply_itself_fails() {
+        // kubectl apply -f - with multiple documents is not atomic: some objects
+        // can already exist by the time the command as a whole reports failure.
+        let (kubectl, log_path) = write_fake_kubectl(Some("apply"));
+        let provider = apply_provider_with_fake_kubectl(&kubectl);
+        let sandbox_id = SandboxId::new();
+
+        let error = provider
+            .provision(sandbox_id, &SandboxProvisionSpec::default())
+            .expect_err("a failing kubectl apply should fail provision");
+        assert!(error.to_string().contains("kubectl apply"));
+
+        let log = std::fs::read_to_string(&log_path).expect("read fake kubectl log");
+        assert!(
+            log.contains(" delete "),
+            "expected a rollback delete invocation after the failed apply, got: {log}"
+        );
+        assert!(log.contains(&format!("sandboxwich.dev/sandbox-id={sandbox_id}")));
+
+        let _ = std::fs::remove_dir_all(kubectl.parent().expect("kubectl script has a parent dir"));
+    }
+
+    #[test]
+    fn fork_rolls_back_applied_resources_when_child_pod_never_becomes_ready() {
+        let (kubectl, log_path) = write_fake_kubectl(Some("wait"));
+        let provider = apply_provider_with_fake_kubectl(&kubectl);
+        let parent_sandbox_id = SandboxId::new();
+        let child_sandbox_id = SandboxId::new();
+        let snapshot_id = SnapshotId::new();
+
+        let error = provider
+            .fork(
+                parent_sandbox_id,
+                child_sandbox_id,
+                snapshot_id,
+                &SandboxProvisionSpec::default(),
+            )
+            .expect_err("a forked pod that never becomes ready should fail fork");
+        assert!(error.to_string().contains("did not become ready"));
+
+        let log = std::fs::read_to_string(&log_path).expect("read fake kubectl log");
+        assert!(
+            log.contains(" delete "),
+            "expected a rollback delete invocation for the fork, got: {log}"
+        );
+        assert!(
+            log.contains(&format!("sandboxwich.dev/sandbox-id={child_sandbox_id}")),
+            "rollback should be scoped to the child sandbox id (the one that was actually \
+             applied for the fork), got: {log}"
+        );
+        assert!(
+            !log.contains(&format!("sandboxwich.dev/sandbox-id={parent_sandbox_id}")),
+            "rollback must not touch the parent sandbox's resources, got: {log}"
+        );
+
+        let _ = std::fs::remove_dir_all(kubectl.parent().expect("kubectl script has a parent dir"));
+    }
+
+    #[test]
+    fn successful_provision_does_not_trigger_any_rollback_delete() {
+        let (kubectl, log_path) = write_fake_kubectl(None);
+        let provider = apply_provider_with_fake_kubectl(&kubectl);
+        let sandbox_id = SandboxId::new();
+
+        provider
+            .provision(sandbox_id, &SandboxProvisionSpec::default())
+            .expect("apply and wait both succeeding should provision successfully");
+
+        let log = std::fs::read_to_string(&log_path).expect("read fake kubectl log");
+        assert!(log.contains(" apply "));
+        assert!(log.contains(" wait "));
+        assert!(
+            !log.contains(" delete "),
+            "a successful provision must not roll anything back, got: {log}"
+        );
+
+        let _ = std::fs::remove_dir_all(kubectl.parent().expect("kubectl script has a parent dir"));
+    }
+
+    /// Like `write_fake_kubectl`, but the "wait" verb also writes `stdout_bytes`
+    /// bytes of `x` to stdout before exiting 0. Used to exercise the byte cap
+    /// end-to-end through `provision`'s real kubectl-invocation plumbing rather
+    /// than just unit-testing `cap_output_bytes` in isolation.
+    fn write_fake_kubectl_with_wait_stdout(
+        stdout_bytes: usize,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("sandboxwich-fake-kubectl-{}", SandboxId::new()));
+        std::fs::create_dir_all(&dir).expect("create fake kubectl temp dir");
+        let log_path = dir.join("log.txt");
+        let script = format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             case \" $* \" in\n\
+             \x20\x20*\" apply \"*) cat >/dev/null 2>&1 || true ;;\n\
+             esac\n\
+             case \" $* \" in\n\
+             \x20\x20*\" wait \"*) head -c {stdout_bytes} /dev/zero | tr '\\0' 'x' ;;\n\
+             esac\n\
+             exit 0\n",
+            log = log_path.display(),
+        );
+        let script_path = dir.join("kubectl");
+        std::fs::write(&script_path, script).expect("write fake kubectl script");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)
+                .expect("stat fake kubectl script")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).expect("chmod fake kubectl script");
+        }
+        (script_path, log_path)
+    }
+
+    #[test]
+    fn kubectl_output_is_capped_at_the_configured_byte_limit() {
+        let (kubectl, _log_path) = write_fake_kubectl_with_wait_stdout(1024);
+        let dry_run =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+        let provider =
+            KubernetesApplyProvider::new(dry_run, kubectl.to_string_lossy().into_owned())
+                .with_kubectl_context(Some("in-cluster".to_string()))
+                .with_mutation_gate(true, true)
+                .with_max_captured_output_bytes(16);
+        let sandbox_id = SandboxId::new();
+
+        let handle = provider
+            .provision(sandbox_id, &SandboxProvisionSpec::default())
+            .expect("provision against the fake kubectl should succeed");
+
+        let wait_stdout = handle.metadata["waitStdout"]
+            .as_str()
+            .expect("waitStdout should be a string");
+        // 1024 bytes of "x" produced by the fake kubectl must be capped well
+        // below that, with a marker noting how much was cut.
+        assert!(
+            wait_stdout.len() < 1024,
+            "expected captured waitStdout to be capped, got {} bytes",
+            wait_stdout.len()
+        );
+        assert!(
+            wait_stdout.contains("[truncated 1008 bytes]"),
+            "expected a truncation marker for the omitted bytes, got: {wait_stdout:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(kubectl.parent().expect("kubectl script has a parent dir"));
     }
 }
