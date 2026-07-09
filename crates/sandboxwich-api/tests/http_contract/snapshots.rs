@@ -112,12 +112,13 @@ pub(crate) async fn assert_runtime_resource_reconcile_marks_missing_resources_de
     sandbox: &SandboxResponse,
     worker: &WorkerResponse,
 ) {
+    let worker_api = worker_client(worker);
     let mut observed = provision_resources(sandbox.sandbox.id);
     observed.retain(|resource| {
         resource.resource_kind != RuntimeResourceKind::Service
             || resource.purpose == RuntimeResourcePurpose::Ssh
     });
-    let reconciled: ReconcileRuntimeResourcesResponse = client
+    let reconciled: ReconcileRuntimeResourcesResponse = worker_api
         .post(format!(
             "{}/workers/{}/runtime-resources/reconcile",
             server.base_url, worker.worker.id
@@ -173,7 +174,7 @@ pub(crate) async fn assert_runtime_resource_reconcile_marks_missing_resources_de
     for resource in &mut edge_observed {
         resource.cluster = Some("k3s-edge".to_string());
     }
-    let edge_reconciled: ReconcileRuntimeResourcesResponse = client
+    let edge_reconciled: ReconcileRuntimeResourcesResponse = worker_api
         .post(format!(
             "{}/workers/{}/runtime-resources/reconcile",
             server.base_url, worker.worker.id
