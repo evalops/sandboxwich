@@ -37,6 +37,10 @@ pub(crate) fn app(state: AppState) -> Router {
         .route("/sandboxes", get(list_sandboxes).post(create_sandbox))
         .route("/sandboxes/{sandbox_id}", get(get_sandbox))
         .route(
+            "/sandboxes/{sandbox_id}/observed-state",
+            get(get_sandbox_observed_state),
+        )
+        .route(
             "/sandboxes/{sandbox_id}/files",
             get(list_files)
                 .post(upload_file)

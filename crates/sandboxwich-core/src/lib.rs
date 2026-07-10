@@ -900,6 +900,17 @@ pub struct SandboxResponse {
     pub operation: Option<Operation>,
 }
 
+/// Provider-facing projection used by external control planes to reconcile a
+/// sandbox without depending on the full tenant-visible Sandbox resource.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxObservedState {
+    pub sandbox_id: Uuid,
+    pub tenant_id: String,
+    pub state: SandboxState,
+    pub observed_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SandboxListResponse {
     pub ok: bool,

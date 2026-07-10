@@ -4,7 +4,7 @@ use utoipa::{OpenApi, openapi::OpenApi as OpenApiDocument};
 use sandboxwich_core::{
     CommandRequest, DivergenceFinding, DivergenceFindingListResponse, DivergenceReconcileRequest,
     DivergenceReconcileResponse, ErrorEnvelope, Operation, OperationResponse, ReceiptScope,
-    SensorObservation, ToolCallLedgerEntryRequest,
+    SandboxObservedState, SensorObservation, ToolCallLedgerEntryRequest,
 };
 
 #[derive(OpenApi)]
@@ -12,6 +12,7 @@ use sandboxwich_core::{
     info(title = "Sandboxwich API", version = "1.0.0"),
     paths(
         crate::handlers::sandboxes::create_sandbox,
+        crate::handlers::sandboxes::get_sandbox_observed_state,
         crate::handlers::commands::queue_command,
         crate::handlers::commands::queue_prompt,
         crate::handlers::operations::get_operation,
@@ -27,6 +28,7 @@ use sandboxwich_core::{
         ErrorEnvelope,
         Operation,
         OperationResponse,
+        SandboxObservedState,
         ReceiptScope,
         ToolCallLedgerEntryRequest,
         SensorObservation,

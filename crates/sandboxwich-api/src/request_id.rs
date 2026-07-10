@@ -7,6 +7,7 @@ use sandboxwich_core::ErrorEnvelope;
 use uuid::Uuid;
 
 pub(crate) static REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
+pub(crate) static TRACEPARENT_HEADER: HeaderName = HeaderName::from_static("traceparent");
 
 pub(crate) async fn attach_request_id(request: Request, next: Next) -> Response {
     let request_id = request
@@ -17,10 +18,16 @@ pub(crate) async fn attach_request_id(request: Request, next: Next) -> Response 
         .unwrap_or_else(|| {
             HeaderValue::from_str(&Uuid::now_v7().to_string()).expect("UUID is a valid header")
         });
+    let traceparent = request.headers().get(&TRACEPARENT_HEADER).cloned();
     let mut response = next.run(request).await;
     response
         .headers_mut()
         .insert(REQUEST_ID_HEADER.clone(), request_id);
+    if let Some(traceparent) = traceparent {
+        response
+            .headers_mut()
+            .insert(TRACEPARENT_HEADER.clone(), traceparent);
+    }
     response
 }
 

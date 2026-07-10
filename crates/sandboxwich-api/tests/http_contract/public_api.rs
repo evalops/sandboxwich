@@ -139,3 +139,114 @@ async fn v1_contract_exposes_operations_openapi_request_ids_and_honest_prompt_st
     let error: ErrorEnvelope = prompt.json().await.unwrap();
     assert_eq!(error.code, "agent_prompt_unavailable");
 }
+
+#[tokio::test]
+async fn platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_correlated() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("platform-provider-contract.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+    let create_url = format!("{}/v1/sandboxes", server.base_url);
+
+    let unauthorized = reqwest::Client::new()
+        .post(&create_url)
+        .json(&CreateSandboxRequest {
+            name: Some("missing-tenant-identity".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let idempotency_key = uuid::Uuid::now_v7().to_string();
+    let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    let request = CreateSandboxRequest {
+        name: Some("platform-provider-contract".to_string()),
+        template: None,
+        memory_limit: None,
+        network_egress: None,
+        ttl_seconds: Some(120),
+    };
+    let first = client
+        .post(&create_url)
+        .header("idempotency-key", &idempotency_key)
+        .header("x-request-id", "platform-create-request")
+        .header("traceparent", traceparent)
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    assert_eq!(first.headers()["x-request-id"], "platform-create-request");
+    assert_eq!(first.headers()["traceparent"], traceparent);
+    let first_body = first.bytes().await.unwrap();
+    let created: SandboxResponse = serde_json::from_slice(&first_body).unwrap();
+
+    let replay = client
+        .post(&create_url)
+        .header("idempotency-key", &idempotency_key)
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    assert_eq!(replay.bytes().await.unwrap(), first_body);
+
+    let observed = client
+        .get(format!(
+            "{}/v1/sandboxes/{}/observed-state",
+            server.base_url, created.sandbox.id
+        ))
+        .header("x-request-id", "platform-observe-request")
+        .header("traceparent", traceparent)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(observed.status(), StatusCode::OK);
+    assert_eq!(
+        observed.headers()["x-request-id"],
+        "platform-observe-request"
+    );
+    assert_eq!(observed.headers()["traceparent"], traceparent);
+    let observed: serde_json::Value = observed.json().await.unwrap();
+    assert_eq!(observed["sandboxId"], created.sandbox.id.to_string());
+    assert_eq!(observed["tenantId"], "default");
+    assert_eq!(observed["state"], "planning");
+    assert!(observed["observedAt"].is_string());
+
+    let stopped = client
+        .post(format!(
+            "{}/v1/sandboxes/{}/stop",
+            server.base_url, created.sandbox.id
+        ))
+        .header("idempotency-key", uuid::Uuid::now_v7().to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stopped.status(), StatusCode::ACCEPTED);
+    let stopped: SandboxResponse = stopped.json().await.unwrap();
+    assert_eq!(stopped.sandbox.state, SandboxState::Archiving);
+
+    let docs: serde_json::Value = client
+        .get(format!("{}/v1/openapi.json", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(docs["paths"]["/v1/sandboxes/{sandbox_id}/observed-state"].is_object());
+    assert!(docs["components"]["schemas"]["SandboxObservedState"].is_object());
+}

@@ -204,6 +204,26 @@ pub(crate) async fn get_sandbox(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/sandboxes/{sandbox_id}/observed-state",
+    params(("sandbox_id" = Uuid, Path)),
+    responses((status = 200, body = SandboxObservedState), (status = 404, body = ErrorEnvelope))
+)]
+pub(crate) async fn get_sandbox_observed_state(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path(sandbox_id): Path<Uuid>,
+) -> Result<Json<SandboxObservedState>, ApiError> {
+    let sandbox = ensure_sandbox_tenant(&state.db, SandboxId(sandbox_id), &ctx).await?;
+    Ok(Json(SandboxObservedState {
+        sandbox_id,
+        tenant_id: sandbox.tenant_id,
+        state: sandbox.state,
+        observed_at: Utc::now(),
+    }))
+}
+
 pub(crate) async fn stop_sandbox(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
