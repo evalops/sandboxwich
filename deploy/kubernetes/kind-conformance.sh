@@ -58,18 +58,38 @@ sed \
   -e 's/imagePullPolicy: Always/imagePullPolicy: IfNotPresent/g' \
   -e 's/replicas: 2/replicas: 1/' \
   "${ROOT_DIR}/deploy/kubernetes/api.yaml" >"${TMP_DIR}/api.yaml"
-# Bake SANDBOXWICH_RUNTIME_IMAGE into the manifest before apply so the first
-# worker pod never provisions with the default GHCR guest image (which kind
-# cannot pull). A post-apply `kubectl set env` would roll the deployment and
-# leave a race where the initial pod claims work with the wrong image.
+# Bake SANDBOXWICH_RUNTIME_IMAGE into the Deployment env before apply so the
+# first worker pod never provisions with the default GHCR guest image (which
+# kind cannot pull). A post-apply `kubectl set env` rolls the deployment and
+# races: the initial pod can claim work with the wrong image. Note: worker.yaml
+# is multi-document (Namespace/RBAC/Deployment), so `kubectl set env --local`
+# cannot be used on the whole file.
 sed \
   -e "s#ghcr.io/evalops/sandboxwich-worker:latest#${WORKER_IMAGE}#g" \
   -e 's/imagePullPolicy: Always/imagePullPolicy: IfNotPresent/g' \
   -e 's/value: k3s-dev/value: kind-conformance/' \
   -e 's/value: local-path/value: standard/' \
   "${ROOT_DIR}/deploy/kubernetes/worker.yaml" | \
-  kubectl set env --local -f - "SANDBOXWICH_RUNTIME_IMAGE=${RUNTIME_IMAGE}" -o yaml \
-  >"${TMP_DIR}/worker.yaml"
+  RUNTIME_IMAGE="${RUNTIME_IMAGE}" python3 -c '
+import os, sys
+img = os.environ["RUNTIME_IMAGE"]
+text = sys.stdin.read()
+needle = """            - name: SANDBOXWICH_RUNTIME_CLASS_NAME
+              value: \"\"
+"""
+insert = needle + f"""            - name: SANDBOXWICH_RUNTIME_IMAGE
+              value: {img}
+"""
+if needle not in text:
+    sys.stderr.write("kind-conformance: failed to inject SANDBOXWICH_RUNTIME_IMAGE\n")
+    sys.exit(1)
+sys.stdout.write(text.replace(needle, insert, 1))
+' >"${TMP_DIR}/worker.yaml"
+# Guard: refuse to apply a worker without the local runtime image pin.
+grep -Fq "name: SANDBOXWICH_RUNTIME_IMAGE" "${TMP_DIR}/worker.yaml" || \
+  fail "worker manifest missing SANDBOXWICH_RUNTIME_IMAGE"
+grep -Fq "value: ${RUNTIME_IMAGE}" "${TMP_DIR}/worker.yaml" || \
+  fail "worker manifest missing runtime image value ${RUNTIME_IMAGE}"
 
 kubectl apply -f "${TMP_DIR}/api.yaml"
 kubectl -n sandboxwich wait --for=condition=complete job/sandboxwich-api-migrate --timeout=120s
