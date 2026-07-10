@@ -2,7 +2,7 @@ mod provider;
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use provider::{
     CancelSignal, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES, KUBERNETES_MUTATION_ENV,
@@ -866,7 +866,7 @@ async fn claim(
     client: &reqwest::Client,
     api: &str,
     args: ClaimArgs,
-) -> anyhow::Result<ClaimLeaseResponse> {
+) -> Result<ClaimLeaseResponse, WorkerRequestError> {
     let response = client
         .post(format!("{api}/workers/{}/leases/claim", args.worker_id))
         .header(
@@ -889,7 +889,7 @@ async fn register_worker(
     capabilities: Vec<WorkerCapability>,
     labels: BTreeMap<String, String>,
     max_concurrent_jobs: Option<u32>,
-) -> anyhow::Result<WorkerResponse> {
+) -> Result<WorkerResponse, WorkerRequestError> {
     let response = client
         .post(format!("{api}/workers/register"))
         .json(&RegisterWorkerRequest {
@@ -909,7 +909,7 @@ async fn heartbeat_worker(
     api: &str,
     worker_id: Uuid,
     labels: BTreeMap<String, String>,
-) -> anyhow::Result<WorkerResponse> {
+) -> Result<WorkerResponse, WorkerRequestError> {
     let response = client
         .post(format!("{api}/workers/{worker_id}/heartbeat"))
         .json(&WorkerHeartbeatRequest {
@@ -921,7 +921,11 @@ async fn heartbeat_worker(
     decode_json::<WorkerResponse>(response).await
 }
 
-async fn drain_worker(client: &reqwest::Client, api: &str, worker_id: Uuid) -> anyhow::Result<()> {
+async fn drain_worker(
+    client: &reqwest::Client,
+    api: &str,
+    worker_id: Uuid,
+) -> Result<(), WorkerRequestError> {
     let response = client
         .post(format!("{api}/workers/{worker_id}/drain"))
         .send()
@@ -951,14 +955,87 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// `expires_at`/`leased_at` pair is somehow non-positive.
 const FALLBACK_LEASE_DURATION: Duration = Duration::from_secs(30);
 
+/// Error from a control-plane HTTP call, distinguishing transient/recoverable
+/// failures (connection issues, timeouts, 5xx, 429) from failures that should
+/// not be retried. Mirrors `sandboxwich-agent`'s `AgentRequestError`: before
+/// this type existed, every HTTP failure collapsed into a plain
+/// `anyhow::Error` string in `decode_json`, so `with_retries` could not tell a
+/// dropped connection (worth retrying) apart from a `401`/`404`/`409` (a
+/// permanent rejection -- e.g. `lease_expired`, `idempotency_key_reused` --
+/// that retrying only delays cancel propagation and burns the full retry
+/// budget on). `with_retries` uses `is_recoverable` to stop immediately on the
+/// latter.
+#[derive(Debug)]
+enum WorkerRequestError {
+    Transport(reqwest::Error),
+    Status {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    Decode(serde_json::Error),
+}
+
+impl std::fmt::Display for WorkerRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkerRequestError::Transport(error) => write!(f, "request failed: {error}"),
+            WorkerRequestError::Status { status, body } => {
+                write!(f, "request failed with {status}: {body}")
+            }
+            WorkerRequestError::Decode(error) => {
+                write!(f, "failed to decode response body: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WorkerRequestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            WorkerRequestError::Transport(error) => Some(error),
+            WorkerRequestError::Status { .. } => None,
+            WorkerRequestError::Decode(error) => Some(error),
+        }
+    }
+}
+
+impl From<reqwest::Error> for WorkerRequestError {
+    fn from(error: reqwest::Error) -> Self {
+        WorkerRequestError::Transport(error)
+    }
+}
+
+impl WorkerRequestError {
+    /// Whether this failure looks transient (worth retrying) rather than a
+    /// durable rejection. A decode failure is never recoverable: the server
+    /// answered successfully with a body this worker cannot parse, and
+    /// retrying the identical request will get the identical body.
+    fn is_recoverable(&self) -> bool {
+        match self {
+            WorkerRequestError::Transport(error) => {
+                error.is_timeout() || error.is_connect() || error.is_request()
+            }
+            WorkerRequestError::Status { status, .. } => {
+                status.is_server_error()
+                    || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || *status == reqwest::StatusCode::REQUEST_TIMEOUT
+            }
+            WorkerRequestError::Decode(_) => false,
+        }
+    }
+}
+
 /// Runs `f` up to `attempts` times with exponential backoff between failures.
 /// Transient control-plane hiccups (a dropped connection, a 5xx, a timeout) should
 /// not be fatal to the worker process; this bounds how long we tolerate them before
-/// surfacing the error to the caller.
+/// surfacing the error to the caller. A permanent failure (see
+/// `WorkerRequestError::is_recoverable`) stops the retry loop immediately instead
+/// of burning the full attempt budget and backoff delay on a request that will
+/// never succeed.
 async fn with_retries<T, F, Fut>(operation: &str, attempts: u32, f: F) -> anyhow::Result<T>
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<T>>,
+    Fut: std::future::Future<Output = Result<T, WorkerRequestError>>,
 {
     let mut delay = RETRY_BASE_DELAY;
     let mut last_error = None;
@@ -966,12 +1043,19 @@ where
         match f().await {
             Ok(value) => return Ok(value),
             Err(error) => {
+                if !error.is_recoverable() {
+                    eprintln!(
+                        "warning: {operation} failed with a permanent error, not retrying: {error}"
+                    );
+                    last_error = Some(error);
+                    break;
+                }
                 if attempt == attempts.max(1) {
                     last_error = Some(error);
                     break;
                 }
                 eprintln!(
-                    "warning: {operation} failed (attempt {attempt}/{attempts}), retrying in {delay:?}: {error:#}"
+                    "warning: {operation} failed (attempt {attempt}/{attempts}), retrying in {delay:?}: {error}"
                 );
                 tokio::time::sleep(delay).await;
                 delay = (delay * 2).min(RETRY_MAX_DELAY);
@@ -979,7 +1063,9 @@ where
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("{operation} failed with no error recorded")))
+    Err(last_error
+        .map(anyhow::Error::new)
+        .unwrap_or_else(|| anyhow::anyhow!("{operation} failed with no error recorded")))
 }
 
 /// Uses the provider's typed retry contract. Untyped errors are permanent;
@@ -1575,20 +1661,17 @@ where
     Ok(())
 }
 
-async fn decode_json<T>(response: reqwest::Response) -> anyhow::Result<T>
+async fn decode_json<T>(response: reqwest::Response) -> Result<T, WorkerRequestError>
 where
     T: serde::de::DeserializeOwned,
 {
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .context("failed to read response body")?;
+    let body = response.text().await?;
     if !status.is_success() {
-        bail!("request failed with {status}: {body}");
+        return Err(WorkerRequestError::Status { status, body });
     }
 
-    serde_json::from_str(&body).context("failed to decode response body")
+    serde_json::from_str(&body).map_err(WorkerRequestError::Decode)
 }
 
 fn to_capability(value: CapabilityArg) -> WorkerCapability {
@@ -2011,6 +2094,66 @@ mod tests {
         assert!(!classify_retry(&malformed_payload));
     }
 
+    fn recoverable_status_error() -> WorkerRequestError {
+        WorkerRequestError::Status {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            body: "internal error".to_string(),
+        }
+    }
+
+    fn permanent_status_error() -> WorkerRequestError {
+        WorkerRequestError::Status {
+            status: reqwest::StatusCode::NOT_FOUND,
+            body: "lease_expired".to_string(),
+        }
+    }
+
+    #[test]
+    fn worker_request_error_treats_5xx_429_and_408_as_recoverable() {
+        for status in [
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+        ] {
+            let error = WorkerRequestError::Status {
+                status,
+                body: String::new(),
+            };
+            assert!(error.is_recoverable(), "{status} should be recoverable");
+        }
+    }
+
+    #[test]
+    fn worker_request_error_treats_4xx_rejections_as_permanent() {
+        // These are exactly the durable rejections the audit called out:
+        // 401 (bad/expired credentials), 404 (lease_expired), 409
+        // (idempotency_key_reused). Retrying them delays cancel propagation
+        // and burns the whole retry budget on a request that can never
+        // succeed.
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::CONFLICT,
+            reqwest::StatusCode::BAD_REQUEST,
+        ] {
+            let error = WorkerRequestError::Status {
+                status,
+                body: String::new(),
+            };
+            assert!(!error.is_recoverable(), "{status} should be permanent");
+        }
+    }
+
+    #[test]
+    fn worker_request_error_decode_failures_are_permanent() {
+        let error = WorkerRequestError::Decode(
+            serde_json::from_str::<serde_json::Value>("not json").unwrap_err(),
+        );
+        assert!(!error.is_recoverable());
+    }
+
     #[tokio::test]
     async fn with_retries_recovers_after_transient_failures() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -2020,7 +2163,7 @@ mod tests {
             let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
             async move {
                 if attempt < 3 {
-                    Err(anyhow::anyhow!("connection reset by peer"))
+                    Err(recoverable_status_error())
                 } else {
                     Ok(attempt)
                 }
@@ -2039,12 +2182,36 @@ mod tests {
         let attempts = AtomicU32::new(0);
         let result: anyhow::Result<()> = with_retries("test op", 3, || {
             attempts.fetch_add(1, Ordering::SeqCst);
-            async { Err(anyhow::anyhow!("still broken")) }
+            async { Err(recoverable_status_error()) }
         })
         .await;
 
         assert!(result.is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn with_retries_stops_immediately_on_a_permanent_error() {
+        // Regression test for "worker retries permanent 4xx responses": a
+        // 401/404/409 must not be retried at all, so cancel propagation isn't
+        // delayed and the retry budget isn't wasted on a request that can
+        // never succeed.
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let attempts = AtomicU32::new(0);
+        let result: anyhow::Result<()> = with_retries("test op", 5, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async { Err(permanent_status_error()) }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a permanent error must stop the retry loop after the first attempt, not spend the \
+             full 5-attempt budget"
+        );
     }
 
     #[test]
