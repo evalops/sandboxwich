@@ -36,8 +36,12 @@ RUN apt-get update \
          amd64|arm64) kubectl_arch="${TARGETARCH}" ;; \
          *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
        esac \
-    && curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${kubectl_arch}/kubectl" \
+    && curl -fsSLo /tmp/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${kubectl_arch}/kubectl" \
+    && curl -fsSLo /tmp/kubectl.sha256 "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${kubectl_arch}/kubectl.sha256" \
+    && echo "$(cat /tmp/kubectl.sha256)  /tmp/kubectl" | sha256sum --check --strict \
+    && mv /tmp/kubectl /usr/local/bin/kubectl \
     && chmod 0755 /usr/local/bin/kubectl \
+    && rm -f /tmp/kubectl.sha256 \
     && rm -rf /var/lib/apt/lists/*
 # NOTE: curl is intentionally kept (not purged) in the final image -- HEALTHCHECK
 # below needs it to probe the api's /healthz. This is a deliberate trade-off

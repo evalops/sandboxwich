@@ -1,10 +1,19 @@
 [package]
 name = "sandboxwich-cli"
 version = "0.1.0"
+description = "Command-line client for the sandboxwich disposable sandbox control plane"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords = ["sandbox", "kubernetes", "agent", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "sandboxwich"
+path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true

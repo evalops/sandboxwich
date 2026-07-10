@@ -1,10 +1,13 @@
 [package]
 name = "sandboxwich-core"
 version = "0.1.0"
+description = "Typed contracts for the sandboxwich control plane"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+homepage.workspace = true
+authors.workspace = true
 
 [dependencies]
 base64.workspace = true

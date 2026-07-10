@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::BTreeSet, process::Stdio, sync::OnceLock, time::Duration};
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -10,10 +10,11 @@ use sandboxwich_core::{
     DesktopAccessRequest, DesktopAccessResponse, DesktopSessionListResponse,
     DesktopSessionResponse, DesktopSessionStatus, EventListResponse, FileResponse,
     GuestHealthResponse, GuestStatus, JobListResponse, ListFilesResponse, MemoryLimit,
-    PromptQueuedResponse, PromptRequest, RequestSshKeyRequest, RuntimeResourceListResponse,
-    SandboxListResponse, SandboxResponse, SnapshotCleanupResponse, SnapshotListResponse,
-    SnapshotResponse, SshAccessRequest, SshAccessResponse, SshKeyListResponse, SshKeyResponse,
-    SshKeyStatus, UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest,
+    NetworkAllowRule, NetworkAllowRuleKind, NetworkEgress, QueueCommandResponse,
+    RequestSshKeyRequest, RuntimeResourceListResponse, SandboxListResponse, SandboxResponse,
+    SandboxState, SnapshotCleanupResponse, SnapshotListResponse, SnapshotResponse,
+    SshAccessRequest, SshAccessResponse, SshKeyListResponse, SshKeyResponse, SshKeyStatus,
+    UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest,
     WorkerListResponse,
 };
 use uuid::Uuid;
@@ -23,6 +24,21 @@ use uuid::Uuid;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Default ceiling on how long `--wait`/`--follow` (and `logs --follow`) poll for completion.
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 300;
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OutputFormat {
+    Table,
+    Json,
+    Jsonl,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OutputOptions {
+    format: OutputFormat,
+    quiet: bool,
+}
+
+static OUTPUT_OPTIONS: OnceLock<OutputOptions> = OnceLock::new();
 
 #[derive(Debug, Parser)]
 #[command(name = "sandboxwich")]
@@ -44,6 +60,14 @@ struct Cli {
         default_value_t = DEFAULT_REQUEST_TIMEOUT_SECS
     )]
     request_timeout_secs: u64,
+
+    /// Output format for structured responses.
+    #[arg(long, short = 'o', value_enum, default_value_t = OutputFormat::Json)]
+    output: OutputFormat,
+
+    /// Suppress structured success output.
+    #[arg(long, short = 'q')]
+    quiet: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -72,9 +96,8 @@ enum Command {
     SetDesktopStatus(SetDesktopStatusArgs),
     DesktopAccess(DesktopAccessArgs),
     Ssh(SshAccessArgs),
-    Scp(SshAccessArgs),
+    Scp(ScpArgs),
     Cp(CpArgs),
-    Prompt(PromptArgs),
     Exec(ExecArgs),
     Commands { sandbox_id: Uuid },
     Command { command_id: Uuid },
@@ -103,6 +126,20 @@ struct NewArgs {
 
     #[arg(long)]
     ttl_seconds: Option<u64>,
+
+    /// Wait until the sandbox reaches Ready or Error.
+    #[arg(long)]
+    wait: bool,
+
+    #[arg(long, default_value_t = DEFAULT_WAIT_TIMEOUT_SECS)]
+    wait_timeout_secs: u64,
+
+    #[arg(long, value_enum, default_value_t = NetworkEgressArg::DenyAll)]
+    network_egress: NetworkEgressArg,
+
+    /// CIDR allowed when --network-egress=allowlist. May be repeated.
+    #[arg(long = "allow-cidr")]
+    allow_cidrs: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -184,6 +221,26 @@ struct SshAccessArgs {
 
     #[arg(long)]
     ttl_seconds: Option<u64>,
+
+    /// Print access metadata instead of opening an interactive SSH session.
+    #[arg(long)]
+    print_command: bool,
+}
+
+#[derive(Debug, Args)]
+struct ScpArgs {
+    sandbox_id: Uuid,
+    source: String,
+    destination: String,
+
+    #[arg(long)]
+    download: bool,
+
+    #[arg(long)]
+    principal: Option<String>,
+
+    #[arg(long)]
+    ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -197,22 +254,6 @@ struct CpArgs {
 
     #[arg(long)]
     mime_type: Option<String>,
-}
-
-#[derive(Debug, Args)]
-struct PromptArgs {
-    sandbox_id: Uuid,
-
-    instructions: String,
-
-    #[arg(long)]
-    engine: Option<String>,
-
-    #[arg(long)]
-    model: Option<String>,
-
-    #[arg(long)]
-    effort: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -237,6 +278,13 @@ struct ExecArgs {
     /// which only bounds how long this CLI invocation polls for a result.
     #[arg(long)]
     command_timeout_secs: Option<u64>,
+
+    #[arg(long)]
+    cwd: Option<String>,
+
+    /// Environment entry formatted as KEY=VALUE. May be repeated.
+    #[arg(long = "env", value_parser = parse_key_value)]
+    env: Vec<(String, String)>,
 
     #[arg(trailing_var_arg = true, required = true)]
     argv: Vec<String>,
@@ -336,9 +384,20 @@ enum MemoryLimitArg {
     SixtyFourG,
 }
 
+#[derive(Clone, Debug, ValueEnum)]
+enum NetworkEgressArg {
+    DenyAll,
+    Allowlist,
+    AllowAll,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let _ = OUTPUT_OPTIONS.set(OutputOptions {
+        format: cli.output,
+        quiet: cli.quiet,
+    });
     let request_timeout = if cli.request_timeout_secs == 0 {
         None
     } else {
@@ -353,18 +412,33 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::New(args) => {
+            let network_egress = network_egress_from_args(&args)?;
+            let wait = args.wait;
+            let wait_timeout = Duration::from_secs(args.wait_timeout_secs);
             let response = client
                 .post(format!("{api}/sandboxes"))
                 .json(&CreateSandboxRequest {
                     name: args.name,
                     template: args.template,
                     memory_limit: args.memory_limit.map(Into::into),
-                    network_egress: None,
+                    network_egress: Some(network_egress),
                     ttl_seconds: args.ttl_seconds,
                 })
                 .send()
                 .await?;
-            print_json::<SandboxResponse>(response).await?;
+            let created = decode_json::<SandboxResponse>(response).await?;
+            if wait {
+                let sandbox =
+                    poll_sandbox_until_ready(&client, api, created.sandbox.id.0, wait_timeout)
+                        .await?;
+                print_value(&SandboxResponse {
+                    ok: true,
+                    sandbox,
+                    operation: None,
+                })?;
+            } else {
+                print_value(&created)?;
+            }
         }
         Command::List => {
             let response = client.get(format!("{api}/sandboxes")).send().await?;
@@ -509,16 +583,33 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             print_json::<DesktopAccessResponse>(response).await?;
         }
-        Command::Ssh(args) | Command::Scp(args) => {
+        Command::Ssh(args) => {
             let response = client
                 .post(format!("{api}/sandboxes/{}/ssh-access", args.sandbox_id))
                 .json(&SshAccessRequest {
-                    principal: args.principal,
+                    principal: args.principal.clone(),
                     ttl_seconds: args.ttl_seconds,
                 })
                 .send()
                 .await?;
-            print_json::<SshAccessResponse>(response).await?;
+            let access = decode_json::<SshAccessResponse>(response).await?;
+            if args.print_command {
+                print_value(&access)?;
+            } else {
+                run_ssh(access).await?;
+            }
+        }
+        Command::Scp(args) => {
+            let response = client
+                .post(format!("{api}/sandboxes/{}/ssh-access", args.sandbox_id))
+                .json(&SshAccessRequest {
+                    principal: args.principal.clone(),
+                    ttl_seconds: args.ttl_seconds,
+                })
+                .send()
+                .await?;
+            let access = decode_json::<SshAccessResponse>(response).await?;
+            run_scp(access, args).await?;
         }
         Command::Cp(args) => {
             if args.download {
@@ -527,19 +618,6 @@ async fn main() -> anyhow::Result<()> {
                 upload_file(&client, api, args).await?;
             }
         }
-        Command::Prompt(args) => {
-            let response = client
-                .post(format!("{api}/sandboxes/{}/prompt", args.sandbox_id))
-                .json(&PromptRequest {
-                    instructions: args.instructions,
-                    engine: args.engine,
-                    model: args.model,
-                    effort: args.effort,
-                })
-                .send()
-                .await?;
-            print_json::<PromptQueuedResponse>(response).await?;
-        }
         Command::Exec(args) => {
             let follow = args.follow;
             let wait = args.wait || follow;
@@ -547,13 +625,13 @@ async fn main() -> anyhow::Result<()> {
                 .post(format!("{api}/sandboxes/{}/commands", args.sandbox_id))
                 .json(&CommandRequest {
                     argv: args.argv,
-                    cwd: None,
-                    env: Default::default(),
+                    cwd: args.cwd,
+                    env: args.env.into_iter().collect(),
                     timeout_secs: args.command_timeout_secs,
                 })
                 .send()
                 .await?;
-            let queued = decode_json::<CommandResponse>(response).await?;
+            let queued = decode_json::<QueueCommandResponse>(response).await?;
             if wait {
                 let command = poll_command_until_terminal(
                     &client,
@@ -741,6 +819,127 @@ impl From<MemoryLimitArg> for MemoryLimit {
     }
 }
 
+fn parse_key_value(value: &str) -> Result<(String, String), String> {
+    let (key, value) = value
+        .split_once('=')
+        .ok_or_else(|| "environment values must use KEY=VALUE".to_string())?;
+    if key.is_empty()
+        || !key.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_' || (byte.is_ascii_alphanumeric() && (index > 0 || !byte.is_ascii_digit()))
+        })
+    {
+        return Err("environment key must be a valid POSIX-style identifier".to_string());
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
+fn network_egress_from_args(args: &NewArgs) -> anyhow::Result<NetworkEgress> {
+    match args.network_egress {
+        NetworkEgressArg::DenyAll if args.allow_cidrs.is_empty() => Ok(NetworkEgress::DenyAll),
+        NetworkEgressArg::AllowAll if args.allow_cidrs.is_empty() => Ok(NetworkEgress::AllowAll),
+        NetworkEgressArg::Allowlist => {
+            if args.allow_cidrs.is_empty() {
+                bail!("--network-egress=allowlist requires at least one --allow-cidr");
+            }
+            Ok(NetworkEgress::Allowlist {
+                rules: args
+                    .allow_cidrs
+                    .iter()
+                    .map(|value| NetworkAllowRule {
+                        kind: NetworkAllowRuleKind::Cidr,
+                        value: value.clone(),
+                    })
+                    .collect(),
+            })
+        }
+        NetworkEgressArg::DenyAll | NetworkEgressArg::AllowAll => {
+            bail!("--allow-cidr is only valid with --network-egress=allowlist")
+        }
+    }
+}
+
+async fn poll_sandbox_until_ready(
+    client: &reqwest::Client,
+    api: &str,
+    sandbox_id: Uuid,
+    timeout: Duration,
+) -> anyhow::Result<sandboxwich_core::Sandbox> {
+    let start = tokio::time::Instant::now();
+    let mut delay = Duration::from_millis(200);
+    loop {
+        let response = client
+            .get(format!("{api}/sandboxes/{sandbox_id}"))
+            .send()
+            .await?;
+        let sandbox = decode_json::<SandboxResponse>(response).await?.sandbox;
+        match sandbox.state {
+            SandboxState::Ready => return Ok(sandbox),
+            SandboxState::Error => bail!("sandbox {sandbox_id} entered the error state"),
+            SandboxState::Archived => {
+                bail!("sandbox {sandbox_id} was archived before it became ready")
+            }
+            _ if start.elapsed() >= timeout => {
+                bail!(
+                    "timed out after {timeout:?} waiting for sandbox {sandbox_id} (last state: {:?})",
+                    sandbox.state
+                )
+            }
+            _ => {}
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(3));
+    }
+}
+
+async fn run_ssh(access: SshAccessResponse) -> anyhow::Result<()> {
+    let status = tokio::process::Command::new("ssh")
+        .arg("-p")
+        .arg(access.ssh_access.port.to_string())
+        .arg(format!(
+            "{}@{}",
+            access.ssh_access.username, access.ssh_access.host
+        ))
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .context("failed to launch ssh; install an OpenSSH client or use --print-command")?;
+    if !status.success() {
+        bail!("ssh exited with {status}");
+    }
+    Ok(())
+}
+
+async fn run_scp(access: SshAccessResponse, args: ScpArgs) -> anyhow::Result<()> {
+    let remote = |path: &str| {
+        format!(
+            "{}@{}:{path}",
+            access.ssh_access.username, access.ssh_access.host
+        )
+    };
+    let (source, destination) = if args.download {
+        (remote(&args.source), args.destination)
+    } else {
+        (args.source, remote(&args.destination))
+    };
+    let status = tokio::process::Command::new("scp")
+        .arg("-P")
+        .arg(access.ssh_access.port.to_string())
+        .arg(source)
+        .arg(destination)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .context("failed to launch scp; install an OpenSSH client")?;
+    if !status.success() {
+        bail!("scp exited with {status}");
+    }
+    Ok(())
+}
+
 async fn upload_file(client: &reqwest::Client, api: &str, args: CpArgs) -> anyhow::Result<()> {
     let content = tokio::fs::read(&args.source)
         .await
@@ -811,8 +1010,127 @@ where
 }
 
 fn print_value<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
+    let options = OUTPUT_OPTIONS.get().copied().unwrap_or(OutputOptions {
+        format: OutputFormat::Json,
+        quiet: false,
+    });
+    if options.quiet {
+        return Ok(());
+    }
+    let value = serde_json::to_value(value)?;
+    match options.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&value)?),
+        OutputFormat::Jsonl => print_jsonl(&value)?,
+        OutputFormat::Table => print_table(&value),
+    }
     Ok(())
+}
+
+fn primary_rows(value: &serde_json::Value) -> Vec<&serde_json::Value> {
+    match value {
+        serde_json::Value::Array(rows) => rows.iter().collect(),
+        serde_json::Value::Object(object) => {
+            let arrays = object
+                .iter()
+                .filter(|(key, _)| *key != "ok" && *key != "next_cursor")
+                .filter_map(|(_, value)| value.as_array())
+                .collect::<Vec<_>>();
+            if let [rows] = arrays.as_slice() {
+                rows.iter().collect()
+            } else {
+                // A response with several arrays has no unambiguous primary row set.
+                // Keep the complete object so table and JSONL output cannot drop fields.
+                vec![value]
+            }
+        }
+        _ => vec![value],
+    }
+}
+
+fn print_jsonl(value: &serde_json::Value) -> anyhow::Result<()> {
+    for row in primary_rows(value) {
+        println!("{}", serde_json::to_string(row)?);
+    }
+    Ok(())
+}
+
+fn display_cell(value: Option<&serde_json::Value>) -> String {
+    match value {
+        None | Some(serde_json::Value::Null) => "-".to_string(),
+        Some(serde_json::Value::String(value)) => value.clone(),
+        Some(value @ (serde_json::Value::Bool(_) | serde_json::Value::Number(_))) => {
+            value.to_string()
+        }
+        Some(value) => serde_json::to_string(value).unwrap_or_else(|_| "<invalid>".to_string()),
+    }
+}
+
+fn print_table(value: &serde_json::Value) {
+    let rows = primary_rows(value);
+    if rows.is_empty() {
+        println!("No results.");
+        return;
+    }
+    if !rows.iter().all(|row| row.is_object()) {
+        for row in rows {
+            println!("{}", display_cell(Some(row)));
+        }
+        return;
+    }
+
+    let headers: Vec<String> = rows
+        .iter()
+        .filter_map(|row| row.as_object())
+        .flat_map(|row| row.keys().cloned())
+        .filter(|key| key != "ok" && key != "next_cursor")
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let cells: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            let object = row.as_object().expect("rows were checked as objects");
+            headers
+                .iter()
+                .map(|header| display_cell(object.get(header)))
+                .collect()
+        })
+        .collect();
+    let widths: Vec<usize> = headers
+        .iter()
+        .enumerate()
+        .map(|(index, header)| {
+            cells
+                .iter()
+                .map(|row| row[index].chars().count())
+                .max()
+                .unwrap_or_default()
+                .max(header.chars().count())
+                .min(60)
+        })
+        .collect();
+    let render = |row: &[String]| {
+        row.iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let clipped: String = value.chars().take(widths[index]).collect();
+                format!("{clipped:<width$}", width = widths[index])
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    println!("{}", render(&headers));
+    println!(
+        "{}",
+        widths
+            .iter()
+            .map(|width| "-".repeat(*width))
+            .collect::<Vec<_>>()
+            .join("  ")
+    );
+    for row in cells {
+        println!("{}", render(&row));
+    }
 }
 
 fn is_terminal(status: &CommandStatus) -> bool {
@@ -968,5 +1286,59 @@ mod tests {
     fn build_client_rejects_invalid_api_token_header_value() {
         let client = build_client(Some("bad\ntoken"), None, None);
         assert!(client.is_err());
+    }
+
+    #[test]
+    fn environment_parser_accepts_values_with_equals_and_rejects_invalid_keys() {
+        assert_eq!(
+            parse_key_value("TOKEN=a=b").unwrap(),
+            ("TOKEN".to_string(), "a=b".to_string())
+        );
+        assert!(parse_key_value("1TOKEN=value").is_err());
+        assert!(parse_key_value("missing-delimiter").is_err());
+    }
+
+    #[test]
+    fn allowlist_requires_explicit_cidrs() {
+        let args = NewArgs {
+            name: None,
+            template: None,
+            memory_limit: None,
+            ttl_seconds: None,
+            wait: false,
+            wait_timeout_secs: DEFAULT_WAIT_TIMEOUT_SECS,
+            network_egress: NetworkEgressArg::Allowlist,
+            allow_cidrs: Vec::new(),
+        };
+        assert!(network_egress_from_args(&args).is_err());
+    }
+
+    #[test]
+    fn cli_exposes_machine_readable_output_and_exec_environment() {
+        let cli = Cli::try_parse_from([
+            "sandboxwich",
+            "--output",
+            "jsonl",
+            "exec",
+            "00000000-0000-0000-0000-000000000001",
+            "--cwd",
+            "/workspace",
+            "--env",
+            "MODE=test",
+            "--",
+            "true",
+        ]);
+        assert!(cli.is_ok());
+    }
+
+    #[test]
+    fn row_projection_preserves_multi_array_responses() {
+        let response = serde_json::json!({
+            "ok": true,
+            "expired": [{"id": 1}],
+            "runtime_resources_deleted": [{"id": 2}],
+        });
+
+        assert_eq!(primary_rows(&response), vec![&response]);
     }
 }

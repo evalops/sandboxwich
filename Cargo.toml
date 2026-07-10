@@ -14,6 +14,8 @@ edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/evalops/sandboxwich"
 rust-version = "1.95"
+homepage = "https://github.com/evalops/sandboxwich"
+authors = ["EvalOps contributors"]
 
 # Verified against this tree: `cargo build/test --workspace --all-targets`
 # and `cargo clippy --workspace --all-targets -- -D warnings` are clean,
@@ -38,7 +40,7 @@ chrono = { version = "0.4", features = ["serde"] }
 futures-core = "0.3"
 clap = { version = "4.5", features = ["derive", "env"] }
 ipnet = "2.12"
-reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 sandboxwich-core = { path = "crates/sandboxwich-core" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

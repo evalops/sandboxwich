@@ -1,6 +1,8 @@
 # sandboxwich
 
-A tiny, typed Rust control plane for disposable development sandboxes. It is intentionally early: the first slice gives us an API, CLI, durable event model, worker boundary, and guest-agent boundary that can grow into real VM orchestration.
+A typed Rust control plane for self-hosted, policy-controlled development and
+agent-evaluation sandboxes. The project is pre-1.0: Kubernetes apply mode is
+experimental, and simulated capabilities are identified explicitly.
 
 The name is dumb on purpose. The contracts should not be.
 
@@ -10,14 +12,19 @@ The name is dumb on purpose. The contracts should not be.
 - `sandboxwich-cli`: CLI for creating, listing, stopping, resuming, forking, copying files, running commands, reading events, and inspecting runtime resources.
 - `sandboxwich-core`: shared typed request/response/event contracts.
 - `sandboxwich-worker`: host-side worker registration and heartbeat CLI.
-- `sandboxwich-agent`: guest-side daemon/CLI for guest health, streaming exec, and file read/write operations.
+- `sandboxwich-agent`: experimental guest-side daemon/CLI. It is not included
+  in the starter Ubuntu runtime image yet.
+
+See the [capability maturity matrix](docs/capabilities.md) before selecting a
+provider or relying on an isolation claim.
 
 ## Quick start
 
-Run the API:
+Set a local-only token and run the API:
 
 ```sh
-cargo run -p sandboxwich-api
+export SANDBOXWICH_API_TOKEN="local-development-token"
+cargo run -p sandboxwich-api -- serve
 ```
 
 Prepare or repair the database schema without starting the server:
@@ -30,25 +37,32 @@ Shared deployments can run `migrate` as a one-shot job and start API pods with
 `SANDBOXWICH_AUTO_MIGRATE=false`; startup then only verifies that migrations and
 typed database constraints are current.
 
-In another shell:
+In a second shell, export the same token and start a dry-run worker. Dry-run
+mode validates the control-plane flow but does not create an isolated runtime:
 
 ```sh
+export SANDBOXWICH_API_TOKEN="local-development-token"
+cargo run -p sandboxwich-worker -- run \
+  --name local-dry-run \
+  --provider kubernetes \
+  --provider-mode dry-run
+```
+
+In a third shell, create a sandbox and execute the typed dry-run path:
+
+```sh
+export SANDBOXWICH_API_TOKEN="local-development-token"
 cargo run -p sandboxwich-cli -- new --name demo --memory-limit 4g
 cargo run -p sandboxwich-cli -- list
-cargo run -p sandboxwich-cli -- cp <sandbox-id> ./local.txt /workspace/local.txt
-cargo run -p sandboxwich-cli -- cp <sandbox-id> /workspace/local.txt ./downloaded.txt --download
-cargo run -p sandboxwich-cli -- exec <sandbox-id> -- echo hello
-cargo run -p sandboxwich-cli -- ssh <sandbox-id>
-cargo run -p sandboxwich-cli -- prompt <sandbox-id> "inspect the repo"
+# Copy the sandbox id from the previous output.
+cargo run -p sandboxwich-cli -- exec <sandbox-id> --wait -- echo hello
 cargo run -p sandboxwich-cli -- events <sandbox-id>
-cargo run -p sandboxwich-cli -- resources <sandbox-id>
-cargo run -p sandboxwich-worker -- register --name k3s-worker-a --provider kubernetes
-cargo run -p sandboxwich-worker -- provider-smoke --cluster k3s-dev --namespace sandboxwich
-cargo run -p sandboxwich-worker -- provider-apply-plan --cluster k3s-dev --namespace sandboxwich --ssh-authorized-keys-secret sandboxwich-authorized-keys
-cargo run -p sandboxwich-worker -- run --name k3s-worker-a --max-iterations 1
-cargo run -p sandboxwich-worker -- work-loop <worker-id> --max-iterations 1
-cargo run -p sandboxwich-cli -- workers
 ```
+
+For a real disposable-cluster workflow, follow
+[the Kubernetes apply-mode guide](docs/kubernetes.md). It requires explicit
+mutation opt-in, a sandbox namespace, and an appropriate RuntimeClass for
+hostile workloads.
 
 By default the CLI talks to `http://127.0.0.1:3217`. Override it with `SANDBOXWICH_API`.
 
@@ -115,7 +129,7 @@ prompt capability.
 - Typed state over text scraping.
 - Durable events over inferred readiness.
 - Worker and guest-agent boundaries from day one.
-- Real isolation before real users.
+- Fail-closed isolation requirements before shared or hostile workloads.
 - No committed runtime secrets.
 
 ## Roadmap
@@ -124,7 +138,8 @@ See [ROADMAP.md](ROADMAP.md) for the current milestones.
 
 For k3s and Kubernetes deployment notes, see [docs/kubernetes.md](docs/kubernetes.md).
 
-For API compatibility notes, see [CHANGELOG.md](CHANGELOG.md).
+For API compatibility notes, see [CHANGELOG.md](CHANGELOG.md). For security
+reporting and deployment boundaries, see [SECURITY.md](SECURITY.md).
 
 ## Benchmarks
 
