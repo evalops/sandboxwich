@@ -37,6 +37,10 @@ pub(crate) fn app(state: AppState) -> Router {
         .route("/sandboxes", get(list_sandboxes).post(create_sandbox))
         .route("/sandboxes/{sandbox_id}", get(get_sandbox))
         .route(
+            "/sandboxes/{sandbox_id}/observed-state",
+            get(get_sandbox_observed_state),
+        )
+        .route(
             "/sandboxes/{sandbox_id}/files",
             get(list_files)
                 .post(upload_file)
@@ -87,6 +91,7 @@ pub(crate) fn app(state: AppState) -> Router {
         )
         .route("/snapshots/cleanup", post(cleanup_snapshots))
         .route("/snapshots/{snapshot_id}", get(get_snapshot))
+        .route("/snapshots/{snapshot_id}/fork", post(fork_snapshot))
         .route("/commands/{command_id}", get(get_command))
         .route("/commands/{command_id}/output", get(list_command_output))
         .route("/workers", get(list_workers))

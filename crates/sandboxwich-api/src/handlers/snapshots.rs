@@ -23,6 +23,7 @@ use sqlx::AnyConnection;
 use sqlx::Row;
 use uuid::Uuid;
 
+#[utoipa::path(post, path = "/v1/sandboxes/{sandbox_id}/snapshots", params(("sandbox_id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = "Tenant-scoped replay key"), ("X-Request-Id" = Option<String>, Header), ("traceparent" = Option<String>, Header)), request_body = CreateSnapshotRequest, responses((status = 202, description = "Snapshot accepted with asynchronous operation", body = SnapshotResponse), (status = 404, body = ErrorEnvelope)))]
 pub(crate) async fn create_snapshot(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
@@ -94,6 +95,7 @@ pub(crate) async fn list_snapshots(
     }))
 }
 
+#[utoipa::path(get, path = "/v1/snapshots/{snapshot_id}", params(("snapshot_id" = Uuid, Path)), responses((status = 200, description = "Current typed snapshot lifecycle state", body = SnapshotResponse), (status = 404, body = ErrorEnvelope)))]
 pub(crate) async fn get_snapshot(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
@@ -106,6 +108,160 @@ pub(crate) async fn get_snapshot(
         snapshot,
         operation: None,
     }))
+}
+
+#[utoipa::path(post, path = "/v1/snapshots/{snapshot_id}/fork", params(("snapshot_id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = "Tenant-scoped replay key"), ("X-Request-Id" = Option<String>, Header), ("traceparent" = Option<String>, Header)), request_body = ForkSnapshotRequest, responses((status = 202, description = "Snapshot restore accepted with child sandbox and asynchronous fork operation", body = SandboxResponse), (status = 404, body = ErrorEnvelope), (status = 409, body = ErrorEnvelope)))]
+pub(crate) async fn fork_snapshot(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path(snapshot_id): Path<Uuid>,
+    Json(request): Json<ForkSnapshotRequest>,
+) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
+    let snapshot_id = SnapshotId(snapshot_id);
+    let now = Utc::now();
+    let mut tx = state.db.pool.begin().await?;
+    let restore_source =
+        claim_snapshot_restore_source_on_connection(&state.db, &mut tx, snapshot_id, &ctx, now)
+            .await?;
+    let child = Sandbox {
+        id: SandboxId::new(),
+        tenant_id: ctx.tenant_id.clone(),
+        name: request
+            .name
+            .unwrap_or_else(|| format!("snapshot-{snapshot_id}-fork")),
+        state: SandboxState::Planning,
+        template: request.template,
+        memory_limit: request.memory_limit,
+        network_egress: request.network_egress,
+        created_at: now,
+        updated_at: now,
+        ttl_seconds: request.ttl_seconds,
+        parent_snapshot_id: Some(snapshot_id),
+    };
+    let job = Job {
+        id: JobId::new(),
+        tenant_id: ctx.tenant_id.clone(),
+        kind: JobKind::ForkSandbox,
+        status: JobStatus::Queued,
+        payload: json!({
+            "parentSandboxId": restore_source.source_sandbox_id,
+            "childSandboxId": child.id,
+            "snapshotId": snapshot_id,
+            "provisionSpec": SandboxProvisionSpec {
+                memory_limit: child.memory_limit.clone(),
+                network_egress: child.network_egress.clone(),
+            }
+        }),
+        required_capability: WorkerCapability::Snapshot,
+        priority: 0,
+        attempts: 0,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+    };
+
+    insert_sandbox_on_connection(&state.db, &mut tx, &child).await?;
+    replace_sandbox_network_rules_on_connection(
+        &state.db,
+        &mut tx,
+        child.id,
+        child.network_egress.rules(),
+    )
+    .await?;
+    insert_event_on_connection(
+        &state.db,
+        &mut tx,
+        child.id,
+        SandboxEventKind::LifecycleChanged,
+        json!({
+            "state": child.state,
+            "reason": "snapshot_fork_queued",
+            "parentSandboxId": restore_source.source_sandbox_id,
+            "parentSnapshotId": snapshot_id
+        }),
+    )
+    .await?;
+    insert_job_on_connection(&state.db, &mut tx, &job).await?;
+    tx.commit().await?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SandboxResponse {
+            ok: true,
+            sandbox: child,
+            operation: Some(operation_from_job(&job)?),
+        }),
+    ))
+}
+
+#[derive(Debug)]
+pub(crate) struct SnapshotRestoreSource {
+    source_sandbox_id: SandboxId,
+}
+
+pub(crate) async fn claim_snapshot_restore_source_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    snapshot_id: SnapshotId,
+    ctx: &TenantContext,
+    now: DateTime<Utc>,
+) -> Result<SnapshotRestoreSource, ApiError> {
+    let lock_clause = match db.dialect {
+        SqlDialect::Postgres => "for update of snapshot_restore_sources",
+        SqlDialect::Sqlite => "",
+    };
+    let sql = format!(
+        "select snapshot_restore_sources.source_sandbox_id
+           from snapshot_restore_sources
+          where snapshot_restore_sources.snapshot_id = {}
+            and snapshot_restore_sources.tenant_id = {}
+            and snapshot_restore_sources.status = 'ready'
+            and (snapshot_restore_sources.expires_at is null or snapshot_restore_sources.expires_at > {})
+          {lock_clause}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3)
+    );
+    let row = sqlx::query(&sql)
+        .bind(snapshot_id.to_string())
+        .bind(&ctx.tenant_id)
+        .bind(now.to_rfc3339())
+        .fetch_optional(&mut *connection)
+        .await?;
+    let Some(row) = row else {
+        ensure_snapshot_restore_source_tenant(db, connection, snapshot_id, ctx).await?;
+        return Err(ApiError::conflict(format!(
+            "snapshot {snapshot_id} is not restorable"
+        )));
+    };
+    let source_sandbox_id: String = row.try_get("source_sandbox_id")?;
+    Ok(SnapshotRestoreSource {
+        source_sandbox_id: SandboxId(parse_uuid(&source_sandbox_id)?),
+    })
+}
+
+async fn ensure_snapshot_restore_source_tenant(
+    db: &Database,
+    connection: &mut AnyConnection,
+    snapshot_id: SnapshotId,
+    ctx: &TenantContext,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "select 1 from snapshot_restore_sources where snapshot_id = {} and tenant_id = {} limit 1",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    let row = sqlx::query(&sql)
+        .bind(snapshot_id.to_string())
+        .bind(&ctx.tenant_id)
+        .fetch_optional(&mut *connection)
+        .await?;
+    if row.is_none() {
+        return Err(ApiError::not_found("snapshot not found"));
+    }
+    Ok(())
 }
 
 pub(crate) async fn cleanup_snapshots(
@@ -162,14 +318,22 @@ pub(crate) async fn insert_snapshot_on_connection(
     connection: &mut AnyConnection,
     snapshot: &Snapshot,
 ) -> Result<(), ApiError> {
+    let remaining_placeholders = (4..=11)
+        .map(|index| db.placeholder(index))
+        .collect::<Vec<_>>()
+        .join(", ");
     let sql = format!(
         "insert into snapshots
-         (id, sandbox_id, status, label, inventory, provider_metadata, created_at, ready_at, expires_at, error)
-         values ({})",
-        db.placeholders(10)
+         (id, sandbox_id, tenant_id, status, label, inventory, provider_metadata, created_at, ready_at, expires_at, error)
+         values ({}, {}, (select tenant_id from sandboxes where id = {}), {})",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        remaining_placeholders
     );
     sqlx::query(&sql)
         .bind(snapshot.id.to_string())
+        .bind(snapshot.sandbox_id.to_string())
         .bind(snapshot.sandbox_id.to_string())
         .bind(snapshot_status_to_str(&snapshot.status))
         .bind(&snapshot.label)
@@ -179,6 +343,24 @@ pub(crate) async fn insert_snapshot_on_connection(
         .bind(snapshot.ready_at.map(|time| time.to_rfc3339()))
         .bind(snapshot.expires_at.map(|time| time.to_rfc3339()))
         .bind(&snapshot.error)
+        .execute(&mut *connection)
+        .await?;
+    let restore_sql = format!(
+        "insert into snapshot_restore_sources
+         (snapshot_id, tenant_id, source_sandbox_id, status, expires_at)
+         select {}, tenant_id, {}, {}, {} from sandboxes where id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4),
+        db.placeholder(5)
+    );
+    sqlx::query(&restore_sql)
+        .bind(snapshot.id.to_string())
+        .bind(snapshot.sandbox_id.to_string())
+        .bind(snapshot_status_to_str(&snapshot.status))
+        .bind(snapshot.expires_at.map(|time| time.to_rfc3339()))
+        .bind(snapshot.sandbox_id.to_string())
         .execute(&mut *connection)
         .await?;
     Ok(())
@@ -354,6 +536,18 @@ pub(crate) async fn expire_active_snapshot_on_connection(
         .bind(now.to_rfc3339())
         .execute(&mut *connection)
         .await?;
+    if result.rows_affected() == 1 {
+        let restore_sql = format!(
+            "update snapshot_restore_sources set status = {} where snapshot_id = {}",
+            db.placeholder(1),
+            db.placeholder(2)
+        );
+        sqlx::query(&restore_sql)
+            .bind(snapshot_status_to_str(&SnapshotStatus::Expired))
+            .bind(snapshot_id.to_string())
+            .execute(&mut *connection)
+            .await?;
+    }
     Ok(result.rows_affected() == 1)
 }
 
@@ -381,6 +575,16 @@ pub(crate) async fn update_snapshot_status_on_connection(
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found("snapshot not found"));
     }
+    let restore_sql = format!(
+        "update snapshot_restore_sources set status = {} where snapshot_id = {}",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    sqlx::query(&restore_sql)
+        .bind(snapshot_status_to_str(&status))
+        .bind(snapshot_id.to_string())
+        .execute(&mut *connection)
+        .await?;
     Ok(())
 }
 
@@ -499,6 +703,16 @@ pub(crate) async fn mark_snapshot_ready_from_provider_handle_on_connection(
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found("snapshot not found"));
     }
+    let restore_sql = format!(
+        "update snapshot_restore_sources set status = {} where snapshot_id = {}",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    sqlx::query(&restore_sql)
+        .bind(snapshot_status_to_str(&SnapshotStatus::Ready))
+        .bind(snapshot_id.to_string())
+        .execute(&mut *connection)
+        .await?;
     queue_forks_waiting_on_snapshot_on_connection(db, connection, snapshot_id, sandbox_id).await?;
     Ok(())
 }

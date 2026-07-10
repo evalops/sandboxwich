@@ -4,7 +4,7 @@ use utoipa::{OpenApi, openapi::OpenApi as OpenApiDocument};
 use sandboxwich_core::{
     CommandRequest, DivergenceFinding, DivergenceFindingListResponse, DivergenceReconcileRequest,
     DivergenceReconcileResponse, ErrorEnvelope, Operation, OperationResponse, ReceiptScope,
-    SensorObservation, ToolCallLedgerEntryRequest,
+    SandboxObservedState, SensorObservation, ToolCallLedgerEntryRequest,
 };
 
 #[derive(OpenApi)]
@@ -12,7 +12,14 @@ use sandboxwich_core::{
     info(title = "Sandboxwich API", version = "1.0.0"),
     paths(
         crate::handlers::sandboxes::create_sandbox,
+        crate::handlers::sandboxes::get_sandbox_observed_state,
         crate::handlers::commands::queue_command,
+        crate::handlers::commands::get_command,
+        crate::handlers::commands::list_command_output,
+        crate::handlers::snapshots::create_snapshot,
+        crate::handlers::snapshots::get_snapshot,
+        crate::handlers::snapshots::fork_snapshot,
+        crate::handlers::sandboxes::fork_sandbox,
         crate::handlers::commands::queue_prompt,
         crate::handlers::operations::get_operation,
         crate::handlers::operations::cancel_operation,
@@ -24,9 +31,17 @@ use sandboxwich_core::{
     ),
     components(schemas(
         CommandRequest,
+        sandboxwich_core::QueueCommandResponse,
+        sandboxwich_core::CommandResponse,
+        sandboxwich_core::CommandOutputListResponse,
+        sandboxwich_core::CreateSnapshotRequest,
+        sandboxwich_core::ForkSnapshotRequest,
+        sandboxwich_core::SnapshotResponse,
+        sandboxwich_core::SandboxResponse,
         ErrorEnvelope,
         Operation,
         OperationResponse,
+        SandboxObservedState,
         ReceiptScope,
         ToolCallLedgerEntryRequest,
         SensorObservation,

@@ -204,6 +204,26 @@ pub(crate) async fn get_sandbox(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/sandboxes/{sandbox_id}/observed-state",
+    params(("sandbox_id" = Uuid, Path)),
+    responses((status = 200, body = SandboxObservedState), (status = 404, body = ErrorEnvelope))
+)]
+pub(crate) async fn get_sandbox_observed_state(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path(sandbox_id): Path<Uuid>,
+) -> Result<Json<SandboxObservedState>, ApiError> {
+    let sandbox = ensure_sandbox_tenant(&state.db, SandboxId(sandbox_id), &ctx).await?;
+    Ok(Json(SandboxObservedState {
+        sandbox_id,
+        tenant_id: sandbox.tenant_id,
+        state: sandbox.state,
+        observed_at: Utc::now(),
+    }))
+}
+
 pub(crate) async fn stop_sandbox(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
@@ -262,6 +282,7 @@ pub(crate) async fn resume_sandbox(
     )))
 }
 
+#[utoipa::path(post, path = "/v1/sandboxes/{sandbox_id}/fork", params(("sandbox_id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = "Tenant-scoped replay key"), ("X-Request-Id" = Option<String>, Header), ("traceparent" = Option<String>, Header)), request_body = CreateSandboxRequest, responses((status = 202, description = "Fork accepted with child sandbox and asynchronous operation", body = SandboxResponse), (status = 404, body = ErrorEnvelope)))]
 pub(crate) async fn fork_sandbox(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,

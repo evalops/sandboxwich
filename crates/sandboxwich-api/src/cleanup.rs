@@ -242,7 +242,7 @@ pub(crate) async fn cleanup_archived_sandboxes(
         if sandbox_snapshot_is_referenced(db, sandbox.id).await? {
             skipped.push(ArchivedSandboxCleanupSkip {
                 sandbox,
-                reason: "sandbox has snapshots referenced by child sandboxes".to_string(),
+                reason: "sandbox has active snapshots referenced by restores".to_string(),
             });
             continue;
         }
@@ -300,15 +300,25 @@ pub(crate) async fn sandbox_snapshot_is_referenced(
     sandbox_id: SandboxId,
 ) -> Result<bool, ApiError> {
     let sql = format!(
-        "select snapshots.id
-         from snapshots
-         join sandboxes on sandboxes.parent_snapshot_id = snapshots.id
-         where snapshots.sandbox_id = {}
+        "select 1
+           from snapshots
+           join sandboxes on sandboxes.parent_snapshot_id = snapshots.id
+          where snapshots.sandbox_id = {}
+         union all
+         select 1
+           from snapshot_restore_sources
+          where source_sandbox_id = {}
+            and status in ('pending', 'ready')
+            and (expires_at is null or expires_at > {})
          limit 1",
-        db.placeholder(1)
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3)
     );
     let row = sqlx::query(&sql)
         .bind(sandbox_id.to_string())
+        .bind(sandbox_id.to_string())
+        .bind(chrono::Utc::now().to_rfc3339())
         .fetch_optional(&db.pool)
         .await?;
     Ok(row.is_some())

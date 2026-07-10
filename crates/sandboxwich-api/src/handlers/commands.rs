@@ -56,7 +56,7 @@ pub(crate) fn effective_command_timeout_secs(requested: Option<u64>) -> u64 {
         .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS)
 }
 
-#[utoipa::path(post, path = "/v1/sandboxes/{sandbox_id}/commands", params(("sandbox_id" = Uuid, Path)), responses((status = 202, description = "Command accepted with an Operation resource"), (status = 400, body = ErrorEnvelope)))]
+#[utoipa::path(post, path = "/v1/sandboxes/{sandbox_id}/commands", params(("sandbox_id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = "Tenant-scoped replay key"), ("X-Request-Id" = Option<String>, Header), ("traceparent" = Option<String>, Header)), request_body = CommandRequest, responses((status = 202, description = "Command accepted with an Operation resource", body = QueueCommandResponse), (status = 400, body = ErrorEnvelope)))]
 pub(crate) async fn queue_command(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
@@ -190,6 +190,7 @@ pub(crate) async fn list_commands(
     }))
 }
 
+#[utoipa::path(get, path = "/v1/commands/{command_id}", params(("command_id" = Uuid, Path)), responses((status = 200, description = "Current typed command status and exit result", body = CommandResponse), (status = 404, body = ErrorEnvelope)))]
 pub(crate) async fn get_command(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
@@ -200,6 +201,7 @@ pub(crate) async fn get_command(
     Ok(Json(CommandResponse { ok: true, command }))
 }
 
+#[utoipa::path(get, path = "/v1/commands/{command_id}/output", params(("command_id" = Uuid, Path), ("limit" = Option<u32>, Query), ("after" = Option<String>, Query), ("before" = Option<String>, Query)), responses((status = 200, description = "Ordered bounded command output page; complete is true only after terminal status", body = CommandOutputListResponse), (status = 404, body = ErrorEnvelope)))]
 pub(crate) async fn list_command_output(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
