@@ -3,6 +3,7 @@ use crate::handlers::desktop::*;
 use crate::handlers::leases::*;
 use crate::handlers::snapshots::*;
 use crate::handlers::workers::*;
+use crate::idempotency::expire_idempotency_records;
 use std::time::Duration;
 
 /// Runs the lease/snapshot/desktop-session expiry sweeps on a fixed interval in
@@ -38,6 +39,9 @@ pub(crate) fn spawn_expiry_sweeper(
             }
             if let Err(error) = reconcile_worker_liveness(&db).await {
                 tracing::warn!(?error, "worker liveness reconciliation failed");
+            }
+            if let Err(error) = expire_idempotency_records(&db).await {
+                tracing::warn!(?error, "idempotency retention sweep failed");
             }
         }
     })

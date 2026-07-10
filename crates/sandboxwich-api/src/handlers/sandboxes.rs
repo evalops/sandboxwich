@@ -751,18 +751,19 @@ pub(crate) async fn list_network_allow_rules_for_sandboxes(
     db: &Database,
     sandbox_ids: &[SandboxId],
 ) -> Result<HashMap<SandboxId, Vec<NetworkAllowRule>>, ApiError> {
-    let sql = format!(
+    let mut query = db.query_builder(
         "select sandbox_id, kind, value
          from sandbox_network_egress_rules
-         where sandbox_id in ({})
-         order by sandbox_id asc, kind asc, value asc",
-        db.placeholders(sandbox_ids.len())
+         where sandbox_id in (",
     );
-    let mut query = sqlx::query(&sql);
-    for sandbox_id in sandbox_ids {
-        query = query.bind(sandbox_id.to_string());
+    {
+        let mut ids = query.separated(", ");
+        for sandbox_id in sandbox_ids {
+            ids.push_bind(sandbox_id.to_string());
+        }
     }
-    let rows = query.fetch_all(&db.pool).await?;
+    query.push(") order by sandbox_id asc, kind asc, value asc");
+    let rows = query.build().fetch_all(&db.pool).await?;
 
     let mut grouped: HashMap<SandboxId, Vec<NetworkAllowRule>> = HashMap::new();
     for row in rows {

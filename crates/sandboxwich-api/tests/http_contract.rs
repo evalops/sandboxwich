@@ -14,6 +14,8 @@ mod commands;
 mod common;
 #[path = "http_contract/desktop.rs"]
 mod desktop;
+#[path = "http_contract/idempotency.rs"]
+mod idempotency;
 #[path = "http_contract/jobs.rs"]
 mod jobs;
 #[path = "http_contract/metrics.rs"]
