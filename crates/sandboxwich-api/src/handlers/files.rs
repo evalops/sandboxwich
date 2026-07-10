@@ -198,6 +198,12 @@ pub(crate) async fn download_file(
                     download_name(&stored.file.path)
                 ),
             ),
+            // The Content-Type above reflects the stored (client-supplied)
+            // mime type. Without nosniff, a browser that ever renders this
+            // response inline (rather than honoring the attachment
+            // disposition) may sniff the body and execute it as HTML/script
+            // regardless of the declared type.
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
         ],
         Bytes::from(stored.content),
     )
