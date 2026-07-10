@@ -2,6 +2,7 @@ use crate::api_contract::openapi;
 use crate::auth::*;
 use crate::handlers::commands::*;
 use crate::handlers::desktop::*;
+use crate::handlers::divergence::*;
 use crate::handlers::files::*;
 use crate::handlers::jobs::*;
 use crate::handlers::leases::*;
@@ -91,6 +92,15 @@ pub(crate) fn app(state: AppState) -> Router {
         .route("/workers/register", post(register_worker))
         .route("/jobs", get(list_jobs).post(create_job))
         .route("/jobs/{job_id}", get(get_job))
+        .route("/divergence/reconcile", post(reconcile_divergence))
+        .route(
+            "/sandboxes/{sandbox_id}/tool-call-ledger",
+            post(append_tool_call_ledger),
+        )
+        .route(
+            "/sandboxes/{sandbox_id}/divergence-findings",
+            get(list_divergence_findings),
+        )
         .route("/operations/{operation_id}", get(get_operation))
         .route("/operations/{operation_id}/events", get(operation_events))
         .route("/operations/{operation_id}/cancel", post(cancel_operation))
