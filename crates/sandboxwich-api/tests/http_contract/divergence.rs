@@ -61,6 +61,27 @@ async fn run_divergence_contract(server: TestServer) {
         .unwrap()
         .error_for_status()
         .unwrap();
+    client
+        .post(format!(
+            "{}/sandboxes/{}/tool-call-ledger",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&ToolCallLedgerEntryRequest {
+            external_id: "ledger-literal-prefix".to_string(),
+            session_id: "session-literal-prefix".to_string(),
+            receipt_id: "receipt-literal-prefix".to_string(),
+            started_at: now - Duration::seconds(5),
+            ended_at: now + Duration::seconds(5),
+            scopes: vec![ReceiptScope {
+                activity_class: ActivityClass::FileWrite,
+                resource_prefix: "/workspace/file_v2/".to_string(),
+            }],
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
 
     let observations = vec![
         SensorObservation {
@@ -69,6 +90,14 @@ async fn run_divergence_contract(server: TestServer) {
             session_id: "session-1".to_string(),
             activity_class: ActivityClass::FileWrite,
             resource: "/workspace/main.rs".to_string(),
+            observed_at: now,
+        },
+        SensorObservation {
+            external_id: "literal-prefix-mismatch".to_string(),
+            sandbox_id: sandbox.sandbox.id,
+            session_id: "session-literal-prefix".to_string(),
+            activity_class: ActivityClass::FileWrite,
+            resource: "/workspace/fileXv2/secret".to_string(),
             observed_at: now,
         },
         SensorObservation {
@@ -105,7 +134,7 @@ async fn run_divergence_contract(server: TestServer) {
         .unwrap();
     assert!(reconciled.ok);
     assert_eq!(reconciled.observations_matched, 1);
-    assert_eq!(reconciled.findings_created.len(), 2);
+    assert_eq!(reconciled.findings_created.len(), 3);
     assert!(
         reconciled
             .findings_created
@@ -169,11 +198,11 @@ async fn run_divergence_contract(server: TestServer) {
             .iter()
             .filter(|event| event.kind == SandboxEventKind::DivergenceDetected)
             .count(),
-        2
+        3
     );
 
     // Replaying a vendor batch is idempotent at every durable boundary.
-    client
+    let replayed: DivergenceReconcileResponse = client
         .post(format!("{}/divergence/reconcile", server.base_url))
         .header(OPERATOR_TOKEN_HEADER, TEST_OPERATOR_TOKEN)
         .json(&DivergenceReconcileRequest {
@@ -184,7 +213,11 @@ async fn run_divergence_contract(server: TestServer) {
         .await
         .unwrap()
         .error_for_status()
+        .unwrap()
+        .json()
+        .await
         .unwrap();
+    assert!(replayed.findings_created.is_empty());
     let listed: DivergenceFindingListResponse = client
         .get(format!(
             "{}/sandboxes/{}/divergence-findings",
@@ -198,5 +231,5 @@ async fn run_divergence_contract(server: TestServer) {
         .json()
         .await
         .unwrap();
-    assert_eq!(listed.findings.len(), 2);
+    assert_eq!(listed.findings.len(), 3);
 }

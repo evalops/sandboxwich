@@ -1,6 +1,6 @@
 use crate::auth::*;
 use crate::error::*;
-use crate::handlers::commands::insert_event;
+use crate::handlers::commands::insert_event_on_connection;
 use crate::handlers::jobs::insert_job_on_connection;
 use crate::handlers::sandboxes::{fetch_sandbox, set_sandbox_state_on_connection};
 use crate::state::*;
@@ -138,7 +138,14 @@ pub(crate) async fn reconcile_divergence(
     headers: HeaderMap,
     Json(request): Json<DivergenceReconcileRequest>,
 ) -> Result<Json<DivergenceReconcileResponse>, ApiError> {
-    ensure_operator_authorized(&state, &headers)?;
+    // Reconciliation is tenant-scoped and also operator-gated because a
+    // confirmed divergence can stop a sandbox.
+    ensure_operator_authorized_for(
+        &state,
+        &headers,
+        "divergence reconciliation",
+        "/divergence/reconcile",
+    )?;
     let adapter = WebhookBatchAdapter {
         config: LimaCharlieConfig {
             organization_id: request.source,
@@ -245,7 +252,7 @@ async fn correlate(
         let receipt_id: String = row.try_get("receipt_id")?;
         let sql = format!(
             "select 1 from tool_call_receipt_scopes where ledger_id = {} and activity_class = {}
-            and {} like resource_prefix || '%' limit 1",
+            and substr({}, 1, length(resource_prefix)) = resource_prefix limit 1",
             state.db.placeholder(1),
             state.db.placeholder(2),
             state.db.placeholder(3)
@@ -285,6 +292,9 @@ async fn correlate(
         (id, tenant_id, sandbox_id, observation_external_id, session_id, receipt_id, kind, activity_class, resource, status, detected_at)
         values ({}) on conflict (tenant_id, observation_external_id) do nothing",
         (1..=11).map(|i| state.db.placeholder(i)).collect::<Vec<_>>().join(", "));
+    let sandbox = fetch_sandbox(&state.db, finding.sandbox_id).await?;
+    ensure_tenant(&sandbox.tenant_id, ctx)?;
+    let mut tx = state.db.pool.begin().await?;
     let inserted = sqlx::query(&sql)
         .bind(finding.id.to_string())
         .bind(&ctx.tenant_id)
@@ -297,8 +307,12 @@ async fn correlate(
         .bind(&finding.resource)
         .bind(finding.status.as_db_str())
         .bind(finding.detected_at.to_rfc3339())
-        .execute(&state.db.pool)
+        .execute(&mut *tx)
         .await?;
+    if inserted.rows_affected() == 0 {
+        tx.commit().await?;
+        return Ok(None);
+    }
     if let Some(ledger_id) = ledger_id {
         let sql = format!(
             "update tool_call_ledger set revoked_at = {} where id = {} and revoked_at is null",
@@ -308,46 +322,43 @@ async fn correlate(
         sqlx::query(&sql)
             .bind(finding.detected_at.to_rfc3339())
             .bind(ledger_id)
-            .execute(&state.db.pool)
+            .execute(&mut *tx)
             .await?;
     }
-    mark_observation(state, ctx, observation, "divergent").await?;
-    if inserted.rows_affected() == 1 {
-        request_divergence_stop(state, ctx, finding.sandbox_id, finding.id).await?;
-        insert_event(
-            &state.db,
-            finding.sandbox_id,
-            SandboxEventKind::DivergenceDetected,
-            json!({
-                "findingId": finding.id,
-                "kind": finding.kind,
-                "observationExternalId": finding.observation_external_id,
-                "activityClass": finding.activity_class,
-            }),
-        )
-        .await?;
+    mark_observation_on_connection(state, &mut tx, ctx, observation, "divergent").await?;
+    if SandboxState::STOP_LEGAL_FROM.contains(&sandbox.state) {
+        request_divergence_stop_on_connection(state, &mut tx, ctx, &finding).await?;
     }
+    insert_event_on_connection(
+        &state.db,
+        &mut tx,
+        finding.sandbox_id,
+        SandboxEventKind::DivergenceDetected,
+        json!({
+            "findingId": finding.id,
+            "kind": finding.kind,
+            "observationExternalId": finding.observation_external_id,
+            "activityClass": finding.activity_class,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
     Ok(Some(finding))
 }
 
-async fn request_divergence_stop(
+async fn request_divergence_stop_on_connection(
     state: &AppState,
+    connection: &mut sqlx::AnyConnection,
     ctx: &TenantContext,
-    sandbox_id: SandboxId,
-    finding_id: Uuid,
+    finding: &DivergenceFinding,
 ) -> Result<(), ApiError> {
-    let sandbox = fetch_sandbox(&state.db, sandbox_id).await?;
-    ensure_tenant(&sandbox.tenant_id, ctx)?;
-    if !SandboxState::STOP_LEGAL_FROM.contains(&sandbox.state) {
-        return Ok(());
-    }
     let now = Utc::now();
     let job = Job {
         id: JobId::new(),
         tenant_id: ctx.tenant_id.clone(),
         kind: JobKind::StopSandbox,
         status: JobStatus::Queued,
-        payload: json!({"sandboxId": sandbox_id, "divergenceFindingId": finding_id}),
+        payload: json!({"sandboxId": finding.sandbox_id, "divergenceFindingId": finding.id}),
         required_capability: WorkerCapability::ProvisionSandbox,
         priority: 100,
         attempts: 0,
@@ -357,23 +368,32 @@ async fn request_divergence_stop(
         updated_at: now,
         last_error: None,
     };
-    let mut tx = state.db.pool.begin().await?;
     set_sandbox_state_on_connection(
         &state.db,
-        &mut tx,
-        sandbox_id,
+        connection,
+        finding.sandbox_id,
         SandboxState::STOP_LEGAL_FROM,
         SandboxState::Archiving,
-        json!({"state": SandboxState::Archiving, "reason": "divergence_detected", "findingId": finding_id}),
+        json!({"state": SandboxState::Archiving, "reason": "divergence_detected", "findingId": finding.id}),
     )
     .await?;
-    insert_job_on_connection(&state.db, &mut tx, &job).await?;
-    tx.commit().await?;
+    insert_job_on_connection(&state.db, connection, &job).await?;
     Ok(())
 }
 
 async fn mark_observation(
     state: &AppState,
+    ctx: &TenantContext,
+    value: &SensorObservation,
+    status: &str,
+) -> Result<(), ApiError> {
+    let mut connection = state.db.pool.acquire().await?;
+    mark_observation_on_connection(state, &mut connection, ctx, value, status).await
+}
+
+async fn mark_observation_on_connection(
+    state: &AppState,
+    connection: &mut sqlx::AnyConnection,
     ctx: &TenantContext,
     value: &SensorObservation,
     status: &str,
@@ -389,7 +409,7 @@ async fn mark_observation(
         .bind(status)
         .bind(&ctx.tenant_id)
         .bind(&value.external_id)
-        .execute(&state.db.pool)
+        .execute(&mut *connection)
         .await?;
     Ok(())
 }
