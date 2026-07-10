@@ -184,3 +184,90 @@ spec:
     - name: http
       port: 3217
       targetPort: http
+---
+# SECURITY.md promises deny-by-default network policy for shared deployments.
+# The Kubernetes worker provider already renders this per-sandbox (see
+# provider.rs, and the ingress policy noted in docs/kubernetes.md), but
+# nothing did it for the control plane itself -- this pair of NetworkPolicy
+# objects is that.
+#
+# Scoped to this repo's own labeled workloads (app.kubernetes.io/part-of:
+# sandboxwich -- the migrate Job above, this Deployment, and the worker
+# Deployment in worker.yaml, which also runs in this namespace) rather than
+# the whole namespace with an empty podSelector. That matters in this exact
+# namespace: deploy/kubernetes/kind-conformance.sh stands up an ad hoc,
+# unlabeled Postgres Deployment/Service directly in "sandboxwich" for CI
+# only, and a namespace-wide default deny would also strip its ingress and
+# break that database connection. Production deployments point
+# SANDBOXWICH_DATABASE_URL at an external, separately managed Postgres (see
+# the example in docs/kubernetes.md) -- there is no Postgres manifest owned
+# by this repo to write ingress (or egress) rules for.
+#
+# Ingress only, no `Egress` policyType: these pods make outbound calls to
+# destinations that vary per deployment and aren't fully known here (an
+# external Postgres host, the in-cluster kube-apiserver for kubectl-based
+# provider apply, image registries, cluster DNS). Getting egress
+# CIDRs/selectors wrong risks silently breaking a working deployment with no
+# clear symptom. Ingress is the narrow, fully-known surface instead: exactly
+# one thing calls into these pods over the pod network (the worker calling
+# the api Service on 3217) plus kubelet's own probes, so ingress-only default
+# deny is both correct and safe to express without guessing at egress
+# destinations.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sandboxwich-control-plane-default-deny-ingress
+  namespace: sandboxwich
+  labels:
+    app.kubernetes.io/part-of: sandboxwich
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: sandboxwich
+  policyTypes:
+    - Ingress
+  ingress: []
+---
+# Narrow allow carved out of the default-deny above via a second NetworkPolicy
+# (NetworkPolicies selecting the same pod are additive, so this only adds an
+# allowance rather than reopening everything): only the worker Deployment
+# (worker.yaml, same namespace) may reach the api Deployment on port 3217.
+# The migrate Job and the worker Deployment itself take no inbound traffic at
+# all, so they are covered by the default-deny policy above and get no
+# corresponding allow rule here.
+#
+# kubelet liveness/readiness probes (defined on the api Deployment above) are
+# not affected by this: they originate from the kubelet process on the node
+# connecting to the Pod IP directly, not from another pod's network identity,
+# and policy-enforcing CNIs (Calico, Cilium, etc.) special-case that exact
+# traffic specifically so default-deny policies cannot fail node health
+# checks. `kubectl port-forward` (used by
+# deploy/kubernetes/kind-conformance.sh to reach the api Service from outside
+# the cluster) is unaffected for the same underlying reason: it tunnels
+# through the API server/kubelet straight into the target pod and never
+# traverses the CNI's pod-to-pod network path that NetworkPolicy governs.
+# Separately, kind's default CNI (kindnet) does not enforce NetworkPolicy at
+# all, so in that specific CI job these two policies are inert (applied, but
+# not enforced) -- they matter on any real deployment using a policy-aware
+# CNI, which is what this manifest is written for.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sandboxwich-api-allow-worker
+  namespace: sandboxwich
+  labels:
+    app.kubernetes.io/part-of: sandboxwich
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: sandboxwich-api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: sandboxwich-worker
+      ports:
+        - protocol: TCP
+          port: 3217
