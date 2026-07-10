@@ -431,7 +431,11 @@ async fn main() -> anyhow::Result<()> {
                 let sandbox =
                     poll_sandbox_until_ready(&client, api, created.sandbox.id.0, wait_timeout)
                         .await?;
-                print_value(&SandboxResponse { ok: true, sandbox })?;
+                print_value(&SandboxResponse {
+                    ok: true,
+                    sandbox,
+                    operation: None,
+                })?;
             } else {
                 print_value(&created)?;
             }
