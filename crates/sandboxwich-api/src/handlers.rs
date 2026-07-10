@@ -1,5 +1,6 @@
 pub(crate) mod commands;
 pub(crate) mod desktop;
+pub(crate) mod divergence;
 pub(crate) mod files;
 pub(crate) mod jobs;
 pub(crate) mod leases;

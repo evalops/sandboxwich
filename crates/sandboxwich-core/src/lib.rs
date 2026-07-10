@@ -145,7 +145,7 @@ macro_rules! db_variant_enum {
         }
     ) => {
         $(#[$meta])*
-        #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+        #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
         #[serde(rename_all = "snake_case")]
         pub enum $name {
             $($variant),+
@@ -174,7 +174,7 @@ macro_rules! db_variant_enum {
     };
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(transparent)]
 pub struct SandboxId(pub Uuid);
 
@@ -980,6 +980,89 @@ pub struct ReconcileRuntimeResourcesResponse {
     pub deleted: Vec<RuntimeResource>,
 }
 
+db_variant_enum! {
+pub enum ActivityClass {
+    ProcessSpawn => "process_spawn",
+    NetworkConnect => "network_connect",
+    FileWrite => "file_write",
+}
+}
+
+db_variant_enum! {
+pub enum DivergenceKind {
+    UnaccountedActivity => "unaccounted_activity",
+    ReceiptScopeMismatch => "receipt_scope_mismatch",
+}
+}
+
+db_variant_enum! {
+pub enum DivergenceFindingStatus {
+    Open => "open",
+    Resolved => "resolved",
+}
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ReceiptScope {
+    pub activity_class: ActivityClass,
+    pub resource_prefix: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ToolCallLedgerEntryRequest {
+    pub external_id: String,
+    pub session_id: String,
+    pub receipt_id: String,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: DateTime<Utc>,
+    pub scopes: Vec<ReceiptScope>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SensorObservation {
+    pub external_id: String,
+    pub sandbox_id: SandboxId,
+    pub session_id: String,
+    pub activity_class: ActivityClass,
+    pub resource: String,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct DivergenceFinding {
+    pub id: Uuid,
+    pub sandbox_id: SandboxId,
+    pub observation_external_id: String,
+    pub session_id: String,
+    pub receipt_id: Option<String>,
+    pub kind: DivergenceKind,
+    pub activity_class: ActivityClass,
+    pub resource: String,
+    pub status: DivergenceFindingStatus,
+    pub detected_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct DivergenceReconcileResponse {
+    pub ok: bool,
+    pub observations_ingested: u64,
+    pub observations_matched: u64,
+    pub findings_created: Vec<DivergenceFinding>,
+    pub retry_after: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct DivergenceReconcileRequest {
+    pub source: String,
+    pub observations: Vec<SensorObservation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct DivergenceFindingListResponse {
+    pub ok: bool,
+    pub findings: Vec<DivergenceFinding>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CleanupRun {
     pub id: CleanupRunId,
@@ -1310,6 +1393,7 @@ pub enum SandboxEventKind {
     DesktopExpired => "desktop_expired",
     GuestHealthFailed => "guest_health_failed",
     FileUploaded => "file_uploaded",
+    DivergenceDetected => "divergence_detected",
 }
 }
 

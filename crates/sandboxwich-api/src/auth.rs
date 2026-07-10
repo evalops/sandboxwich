@@ -371,15 +371,23 @@ pub(crate) fn ensure_operator_authorized(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(), ApiError> {
+    ensure_operator_authorized_for(state, headers, "snapshot cleanup", "/snapshots/cleanup")
+}
+
+pub(crate) fn ensure_operator_authorized_for(
+    state: &AppState,
+    headers: &HeaderMap,
+    operation: &str,
+    endpoint: &str,
+) -> Result<(), ApiError> {
     if state.auth.operator_token.is_none() {
-        return Err(ApiError::internal(
-            "operator actions are disabled: set SANDBOXWICH_OPERATOR_TOKEN to a dedicated \
-             operator credential distinct from tenant tokens",
-        ));
+        return Err(ApiError::internal(format!(
+            "{operation} is disabled: set SANDBOXWICH_OPERATOR_TOKEN to a dedicated operator              credential (distinct from tenant tokens) to enable {endpoint}"
+        )));
     }
     if !is_operator_request(state, headers) {
         return Err(ApiError::unauthorized(format!(
-            "a valid {OPERATOR_TOKEN_HEADER} header is required for this operator action"
+            "a valid {OPERATOR_TOKEN_HEADER} header is required to run {operation}"
         )));
     }
     Ok(())
