@@ -896,6 +896,8 @@ pub struct CreateSandboxRequest {
 pub struct SandboxResponse {
     pub ok: bool,
     pub sandbox: Sandbox,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<Operation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1017,6 +1019,8 @@ pub struct CreateSnapshotRequest {
 pub struct SnapshotResponse {
     pub ok: bool,
     pub snapshot: Snapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<Operation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1151,7 +1155,7 @@ pub const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 300;
 /// unbounded.
 pub const MAX_COMMAND_TIMEOUT_SECS: u64 = 3600;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CommandRequest {
     pub argv: Vec<String>,
     pub cwd: Option<String>,
@@ -1216,6 +1220,7 @@ pub struct QueueCommandResponse {
     pub ok: bool,
     pub command: CommandRun,
     pub queued_job: QueuedCommandJob,
+    pub operation: Operation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1443,6 +1448,7 @@ pub enum JobStatus {
     Succeeded => "succeeded",
     Failed => "failed",
     Dead => "dead",
+    Cancelled => "cancelled",
 }
 }
 
@@ -1540,6 +1546,45 @@ pub struct LeaseResponse {
 pub struct ClaimLeaseResponse {
     pub ok: bool,
     pub lease: Option<JobLease>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationKind {
+    ProvisionSandbox,
+    StopSandbox,
+    ResumeSandbox,
+    RunCommand,
+    CreateSnapshot,
+    ForkSandbox,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct Operation {
+    pub id: Uuid,
+    pub kind: OperationKind,
+    pub status: OperationStatus,
+    pub resource_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct OperationResponse {
+    pub ok: bool,
+    pub operation: Operation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2032,7 +2077,7 @@ fn default_checked_at() -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp(0, 0).expect("unix epoch is valid")
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ErrorEnvelope {
     pub ok: bool,
     pub code: String,

@@ -18,6 +18,8 @@ mod desktop;
 mod jobs;
 #[path = "http_contract/metrics.rs"]
 mod metrics;
+#[path = "http_contract/public_api.rs"]
+mod public_api;
 #[path = "http_contract/sandboxes.rs"]
 mod sandboxes;
 #[path = "http_contract/snapshots.rs"]

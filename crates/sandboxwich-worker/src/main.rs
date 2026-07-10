@@ -372,7 +372,6 @@ struct ProviderApplyArgs {
 enum CapabilityArg {
     ProvisionSandbox,
     RunCommand,
-    AgentPrompt,
     Snapshot,
     DesktopStream,
     K8sPod,
@@ -1501,7 +1500,6 @@ fn capabilities_from_args(
             WorkerCapability::K8sPod,
             WorkerCapability::ProvisionSandbox,
             WorkerCapability::RunCommand,
-            WorkerCapability::AgentPrompt,
             WorkerCapability::Snapshot,
             WorkerCapability::DesktopStream,
         ];
@@ -1547,7 +1545,6 @@ fn to_capability(value: CapabilityArg) -> WorkerCapability {
     match value {
         CapabilityArg::ProvisionSandbox => WorkerCapability::ProvisionSandbox,
         CapabilityArg::RunCommand => WorkerCapability::RunCommand,
-        CapabilityArg::AgentPrompt => WorkerCapability::AgentPrompt,
         CapabilityArg::Snapshot => WorkerCapability::Snapshot,
         CapabilityArg::DesktopStream => WorkerCapability::DesktopStream,
         CapabilityArg::K8sPod => WorkerCapability::K8sPod,
@@ -1803,7 +1800,7 @@ mod tests {
 
         assert!(capabilities.contains(&WorkerCapability::ProvisionSandbox));
         assert!(capabilities.contains(&WorkerCapability::RunCommand));
-        assert!(capabilities.contains(&WorkerCapability::AgentPrompt));
+        assert!(!capabilities.contains(&WorkerCapability::AgentPrompt));
         assert!(capabilities.contains(&WorkerCapability::Snapshot));
         assert!(capabilities.contains(&WorkerCapability::K8sPod));
         assert!(!capabilities.contains(&WorkerCapability::GvisorSandbox));

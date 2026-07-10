@@ -30,9 +30,12 @@ unsafe_code = "forbid"
 
 [workspace.dependencies]
 anyhow = "1.0"
+async-stream = "0.3"
 axum = { version = "0.8", features = ["multipart"] }
 base64 = "0.22"
+cap-std = "4.0.2"
 chrono = { version = "0.4", features = ["serde"] }
+futures-core = "0.3"
 clap = { version = "4.5", features = ["derive", "env"] }
 ipnet = "2.12"
 reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"] }
@@ -46,3 +49,4 @@ tokio = { version = "1.48", features = ["fs", "io-std", "io-util", "macros", "pr
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.19", features = ["serde", "v4", "v7"] }
+utoipa = { version = "5.4", features = ["chrono", "uuid"] }

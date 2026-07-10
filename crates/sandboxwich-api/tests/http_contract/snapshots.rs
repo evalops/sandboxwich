@@ -556,6 +556,10 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .json()
         .await
         .unwrap();
+    assert_eq!(
+        forked.operation.as_ref().map(|operation| &operation.kind),
+        Some(&OperationKind::ForkSandbox)
+    );
     assert_eq!(forked.sandbox.state, SandboxState::Planning);
     let fork_snapshot_id = forked
         .sandbox
@@ -601,6 +605,7 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
             "{}/workers/{}/leases/claim",
             server.base_url, snapshot_worker.worker.id
         ))
+        .header("x-sandboxwich-job-id", fork_snapshot_job.id.to_string())
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
         })
@@ -686,6 +691,7 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
             "{}/workers/{}/leases/claim",
             server.base_url, snapshot_worker.worker.id
         ))
+        .header("x-sandboxwich-job-id", fork_job.id.to_string())
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
         })
@@ -819,6 +825,7 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
             "{}/workers/{}/leases/claim",
             server.base_url, snapshot_worker.worker.id
         ))
+        .header("x-sandboxwich-job-id", failed_snapshot_job.id.to_string())
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
         })
