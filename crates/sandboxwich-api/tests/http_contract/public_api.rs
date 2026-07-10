@@ -56,24 +56,46 @@ async fn v1_contract_exposes_operations_openapi_request_ids_and_honest_prompt_st
         OperationKind::ProvisionSandbox
     );
 
+    let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    let command_key = uuid::Uuid::now_v7().to_string();
+    let command_request = CommandRequest {
+        argv: vec!["echo".to_string(), "hello".to_string()],
+        cwd: None,
+        env: Default::default(),
+        timeout_secs: None,
+    };
     let queued = client
         .post(format!(
             "{}/v1/sandboxes/{}/commands",
             server.base_url, created.sandbox.id
         ))
-        .json(&CommandRequest {
-            argv: vec!["echo".to_string(), "hello".to_string()],
-            cwd: None,
-            env: Default::default(),
-            timeout_secs: None,
-        })
+        .header("idempotency-key", &command_key)
+        .header("x-request-id", "platform-command-request")
+        .header("traceparent", traceparent)
+        .json(&command_request)
         .send()
         .await
         .unwrap();
     assert_eq!(queued.status(), StatusCode::ACCEPTED);
-    let queued: QueueCommandResponse = queued.json().await.unwrap();
+    assert_eq!(queued.headers()["x-request-id"], "platform-command-request");
+    assert_eq!(queued.headers()["traceparent"], traceparent);
+    let queued_body = queued.bytes().await.unwrap();
+    let queued: QueueCommandResponse = serde_json::from_slice(&queued_body).unwrap();
     assert_eq!(queued.operation.status, OperationStatus::Queued);
     assert_eq!(queued.operation.id, queued.queued_job.id.0);
+
+    let command_replay = client
+        .post(format!(
+            "{}/v1/sandboxes/{}/commands",
+            server.base_url, created.sandbox.id
+        ))
+        .header("idempotency-key", &command_key)
+        .json(&command_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(command_replay.status(), StatusCode::ACCEPTED);
+    assert_eq!(command_replay.bytes().await.unwrap(), queued_body);
 
     let operation: OperationResponse = client
         .get(format!(
@@ -249,4 +271,31 @@ async fn platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_cor
         .unwrap();
     assert!(docs["paths"]["/v1/sandboxes/{sandbox_id}/observed-state"].is_object());
     assert!(docs["components"]["schemas"]["SandboxObservedState"].is_object());
+
+    for path in [
+        "/v1/sandboxes/{sandbox_id}/commands",
+        "/v1/commands/{command_id}",
+        "/v1/commands/{command_id}/output",
+        "/v1/sandboxes/{sandbox_id}/snapshots",
+        "/v1/snapshots/{snapshot_id}",
+        "/v1/sandboxes/{sandbox_id}/fork",
+    ] {
+        assert!(
+            docs["paths"][path].is_object(),
+            "missing provider path {path}"
+        );
+    }
+    for schema in [
+        "QueueCommandResponse",
+        "CommandResponse",
+        "CommandOutputListResponse",
+        "SnapshotResponse",
+        "CreateSnapshotRequest",
+        "SandboxResponse",
+    ] {
+        assert!(
+            docs["components"]["schemas"][schema].is_object(),
+            "missing provider schema {schema}"
+        );
+    }
 }

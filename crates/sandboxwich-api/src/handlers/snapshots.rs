@@ -23,6 +23,7 @@ use sqlx::AnyConnection;
 use sqlx::Row;
 use uuid::Uuid;
 
+#[utoipa::path(post, path = "/v1/sandboxes/{sandbox_id}/snapshots", params(("sandbox_id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = "Tenant-scoped replay key"), ("X-Request-Id" = Option<String>, Header), ("traceparent" = Option<String>, Header)), request_body = CreateSnapshotRequest, responses((status = 202, description = "Snapshot accepted with asynchronous operation", body = SnapshotResponse), (status = 404, body = ErrorEnvelope)))]
 pub(crate) async fn create_snapshot(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
@@ -94,6 +95,7 @@ pub(crate) async fn list_snapshots(
     }))
 }
 
+#[utoipa::path(get, path = "/v1/snapshots/{snapshot_id}", params(("snapshot_id" = Uuid, Path)), responses((status = 200, description = "Current typed snapshot lifecycle state", body = SnapshotResponse), (status = 404, body = ErrorEnvelope)))]
 pub(crate) async fn get_snapshot(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,

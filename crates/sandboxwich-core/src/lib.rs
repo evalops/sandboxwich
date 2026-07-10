@@ -196,7 +196,7 @@ impl fmt::Display for SandboxId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(transparent)]
 pub struct CommandId(pub Uuid);
 
@@ -218,7 +218,7 @@ impl fmt::Display for CommandId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(transparent)]
 pub struct CommandOutputChunkId(pub Uuid);
 
@@ -240,7 +240,7 @@ impl fmt::Display for CommandOutputChunkId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(transparent)]
 pub struct FileId(pub Uuid);
 
@@ -284,7 +284,7 @@ impl fmt::Display for EventId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(transparent)]
 pub struct SnapshotId(pub Uuid);
 
@@ -328,7 +328,7 @@ impl fmt::Display for WorkerId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(transparent)]
 pub struct JobId(pub Uuid);
 
@@ -670,7 +670,7 @@ pub enum CleanupRunStatus {
 }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Default)]
+#[derive(Clone, Debug, Eq, PartialEq, Default, utoipa::ToSchema)]
 pub enum MemoryLimit {
     #[default]
     OneG,
@@ -775,13 +775,13 @@ pub enum NetworkAllowRuleKind {
 }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct NetworkAllowRule {
     pub kind: NetworkAllowRuleKind,
     pub value: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default, utoipa::ToSchema)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum NetworkEgress {
     #[default]
@@ -867,7 +867,7 @@ pub struct RuntimeResource {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Sandbox {
     pub id: SandboxId,
     pub tenant_id: String,
@@ -883,7 +883,7 @@ pub struct Sandbox {
     pub parent_snapshot_id: Option<SnapshotId>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CreateSandboxRequest {
     pub name: Option<String>,
     pub template: Option<String>,
@@ -892,7 +892,7 @@ pub struct CreateSandboxRequest {
     pub ttl_seconds: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SandboxResponse {
     pub ok: bool,
     pub sandbox: Sandbox,
@@ -1087,7 +1087,7 @@ pub struct CleanupRun {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Snapshot {
     pub id: SnapshotId,
     pub sandbox_id: SandboxId,
@@ -1101,7 +1101,7 @@ pub struct Snapshot {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CreateSnapshotRequest {
     pub label: Option<String>,
     pub inventory: Option<serde_json::Value>,
@@ -1109,7 +1109,7 @@ pub struct CreateSnapshotRequest {
     pub ttl_seconds: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SnapshotResponse {
     pub ok: bool,
     pub snapshot: Snapshot,
@@ -1279,7 +1279,7 @@ pub enum CommandOutputStream {
 }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CommandRun {
     pub id: CommandId,
     pub sandbox_id: SandboxId,
@@ -1293,13 +1293,13 @@ pub struct CommandRun {
     pub finished_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CommandResponse {
     pub ok: bool,
     pub command: CommandRun,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct QueuedCommandJob {
     pub id: JobId,
     pub sandbox_id: SandboxId,
@@ -1309,7 +1309,7 @@ pub struct QueuedCommandJob {
     pub required_capability: WorkerCapability,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct QueueCommandResponse {
     pub ok: bool,
     pub command: CommandRun,
@@ -1325,7 +1325,7 @@ pub struct CommandListResponse {
     pub next_cursor: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CommandOutputChunk {
     pub id: CommandOutputChunkId,
     pub command_id: CommandId,
@@ -1351,7 +1351,7 @@ pub struct CommandOutputChunkResponse {
     pub chunk: CommandOutputChunk,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CommandOutputListResponse {
     pub ok: bool,
     /// False while the command may still append more chunks.
@@ -1362,7 +1362,7 @@ pub struct CommandOutputListResponse {
     pub next_cursor: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CommandOutputAnnotation {
     ContainerFileCitation {
