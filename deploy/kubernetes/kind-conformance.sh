@@ -116,7 +116,8 @@ create_sandbox() {
       '{name:$name,network_egress:{mode:$egress},ttl_seconds:600}')")"
   sandbox_id="$(jq -r .sandbox.id <<<"${response}")"
   wait_json "http://127.0.0.1:32170/sandboxes/${sandbox_id}" '.sandbox.state' ready
-  kubectl -n sandboxwich-sandboxes wait --for=condition=Ready "pod/sandboxwich-${sandbox_id}" --timeout=120s
+  kubectl -n sandboxwich-sandboxes wait --for=condition=Ready \
+    "pod/sandboxwich-${sandbox_id}" --timeout=120s >/dev/null
   printf '%s' "${sandbox_id}"
 }
 
