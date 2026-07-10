@@ -87,7 +87,7 @@ method, URI, query, and body replays the original status, selected response
 headers, and body. Reusing a key for a different request returns
 `409 idempotency_key_reused`; a duplicate that is still executing returns
 `409 idempotency_in_progress` with `Retry-After: 1`. Idempotent request bodies
-are capped at 64 MiB, so larger multipart uploads must omit the key or be split.
+follow the normal 1 MiB API limit, so larger multipart uploads must omit the key or be split.
 
 Asynchronous command acceptance returns HTTP `202` and an `operation` resource.
 Poll `GET /v1/operations/{id}`, reconnect to

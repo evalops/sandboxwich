@@ -15,7 +15,8 @@ use std::time::Duration;
 
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const IDEMPOTENCY_RETENTION_HOURS: i64 = 24;
-const MAX_IDEMPOTENT_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+const PROCESSING_LEASE_MINUTES: i64 = 5;
+const MAX_IDEMPOTENT_REQUEST_BYTES: usize = crate::routes::DEFAULT_BODY_LIMIT_BYTES;
 const MAX_STORED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const CONCURRENT_REPLAY_POLLS: usize = 40;
 
@@ -63,7 +64,10 @@ pub(crate) async fn enforce_idempotency(
     let Some(context) = request.extensions().get::<TenantContext>().cloned() else {
         return next.run(request).await;
     };
-    if context.principal == Principal::Operator {
+    if matches!(
+        context.principal,
+        Principal::Operator | Principal::Worker(_)
+    ) {
         return next.run(request).await;
     }
     let Some(key_header) = request.headers().get(IDEMPOTENCY_KEY_HEADER) else {
@@ -96,7 +100,7 @@ pub(crate) async fn enforce_idempotency(
             return coded_error(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "idempotency_payload_too_large",
-                "idempotent requests are limited to 64 MiB",
+                "idempotent requests are limited to 1 MiB",
                 None,
             );
         }
@@ -109,7 +113,7 @@ pub(crate) async fn enforce_idempotency(
         fingerprint_request(&parts.method, &parts.uri.to_string(), content_type, &body);
     let request = Request::from_parts(parts, Body::from(body));
     let now = Utc::now();
-    let expires_at = now + ChronoDuration::hours(IDEMPOTENCY_RETENTION_HOURS);
+    let expires_at = now + ChronoDuration::minutes(PROCESSING_LEASE_MINUTES);
     let insert_sql = format!(
         "insert into idempotency_records
          (tenant_id, idempotency_key, request_fingerprint, state, created_at, expires_at)
@@ -135,10 +139,7 @@ pub(crate) async fn enforce_idempotency(
     }
 
     let response = next.run(request).await;
-    let stored = match capture_response(response).await {
-        Ok(stored) => stored,
-        Err(response) => return response,
-    };
+    let stored = capture_response(response).await;
     if let Err(error) = complete_record(&state.db, &context.tenant_id, &key, &stored).await {
         tracing::error!(?error, tenant_id = %context.tenant_id, "failed to persist idempotent response");
     }
@@ -243,24 +244,31 @@ async fn fetch_record(
     Ok((row.try_get("request_fingerprint")?, state, response))
 }
 
-async fn capture_response(response: Response) -> Result<StoredResponse, Response> {
+async fn capture_response(response: Response) -> StoredResponse {
     let status = response.status();
     let content_type = header_value(&response, header::CONTENT_TYPE);
     let location = header_value(&response, header::LOCATION);
     let retry_after = header_value(&response, header::RETRY_AFTER);
-    let (parts, body) = response.into_parts();
+    let (_, body) = response.into_parts();
     match to_bytes(body, MAX_STORED_RESPONSE_BYTES).await {
-        Ok(body) => Ok(StoredResponse {
+        Ok(body) => StoredResponse {
             status,
             content_type,
             location,
             retry_after,
             body: body.to_vec(),
-        }),
-        Err(_) => Err(Response::from_parts(
-            parts,
-            Body::from("response too large for idempotent replay"),
-        )),
+        },
+        Err(_) => StoredResponse {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            content_type: Some("application/json".to_string()),
+            location: None,
+            retry_after: None,
+            body: serde_json::to_vec(&ErrorEnvelope::new(
+                "idempotency_response_too_large",
+                "response is too large for idempotent replay",
+            ))
+            .expect("error envelope serializes"),
+        },
     }
 }
 
@@ -280,10 +288,11 @@ async fn complete_record(
 ) -> Result<(), ApiError> {
     let sql = format!(
         "update idempotency_records set state = {}, response_status = {}, response_content_type = {},
-         response_location = {}, response_retry_after = {}, response_body_base64 = {}, completed_at = {}
+         response_location = {}, response_retry_after = {}, response_body_base64 = {}, completed_at = {}, expires_at = {}
          where tenant_id = {} and idempotency_key = {} and state = 'processing'",
         db.placeholder(1), db.placeholder(2), db.placeholder(3), db.placeholder(4),
-        db.placeholder(5), db.placeholder(6), db.placeholder(7), db.placeholder(8), db.placeholder(9)
+        db.placeholder(5), db.placeholder(6), db.placeholder(7), db.placeholder(8),
+        db.placeholder(9), db.placeholder(10)
     );
     sqlx::query(&sql)
         .bind(RecordState::Completed.as_str())
@@ -293,6 +302,7 @@ async fn complete_record(
         .bind(&response.retry_after)
         .bind(URL_SAFE_NO_PAD.encode(&response.body))
         .bind(Utc::now().to_rfc3339())
+        .bind((Utc::now() + ChronoDuration::hours(IDEMPOTENCY_RETENTION_HOURS)).to_rfc3339())
         .bind(tenant)
         .bind(key)
         .execute(&db.pool)
