@@ -7,6 +7,9 @@ name: ci
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
   rust:
     runs-on: ubuntu-latest
@@ -29,13 +32,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - run: cargo fmt --all -- --check
-      - run: cargo check --workspace
-      - run: cargo test --workspace
+      - run: cargo check --workspace --locked
+      - run: cargo test --workspace --locked
         env:
           SANDBOXWICH_TEST_POSTGRES_URL: >-
             postgres://postgres:postgres@localhost:5432/sandboxwich
       - run: |
-          cargo build \
+          cargo build --locked \
             -p sandboxwich-api \
             -p sandboxwich-worker \
             -p sandboxwich-bench
@@ -84,7 +87,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   audit:
     runs-on: ubuntu-latest
