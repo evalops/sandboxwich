@@ -408,10 +408,11 @@ impl SandboxProvider for RuntimeProvider {
         &self,
         sandbox_id: sandboxwich_core::SandboxId,
         spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
     ) -> anyhow::Result<sandboxwich_core::ProviderSandboxHandle> {
         match self {
-            Self::DryRun(provider) => provider.provision(sandbox_id, spec),
-            Self::Apply(provider) => provider.provision(sandbox_id, spec),
+            Self::DryRun(provider) => provider.provision(sandbox_id, spec, cancelled),
+            Self::Apply(provider) => provider.provision(sandbox_id, spec, cancelled),
         }
     }
 
@@ -432,10 +433,11 @@ impl SandboxProvider for RuntimeProvider {
         &self,
         sandbox_id: sandboxwich_core::SandboxId,
         snapshot_id: sandboxwich_core::SnapshotId,
+        cancelled: &CancelSignal,
     ) -> anyhow::Result<sandboxwich_core::ProviderSnapshotHandle> {
         match self {
-            Self::DryRun(provider) => provider.create_snapshot(sandbox_id, snapshot_id),
-            Self::Apply(provider) => provider.create_snapshot(sandbox_id, snapshot_id),
+            Self::DryRun(provider) => provider.create_snapshot(sandbox_id, snapshot_id, cancelled),
+            Self::Apply(provider) => provider.create_snapshot(sandbox_id, snapshot_id, cancelled),
         }
     }
 
@@ -445,21 +447,34 @@ impl SandboxProvider for RuntimeProvider {
         child_sandbox_id: sandboxwich_core::SandboxId,
         snapshot_id: sandboxwich_core::SnapshotId,
         spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
     ) -> anyhow::Result<sandboxwich_core::ProviderForkHandle> {
         match self {
-            Self::DryRun(provider) => {
-                provider.fork(parent_sandbox_id, child_sandbox_id, snapshot_id, spec)
-            }
-            Self::Apply(provider) => {
-                provider.fork(parent_sandbox_id, child_sandbox_id, snapshot_id, spec)
-            }
+            Self::DryRun(provider) => provider.fork(
+                parent_sandbox_id,
+                child_sandbox_id,
+                snapshot_id,
+                spec,
+                cancelled,
+            ),
+            Self::Apply(provider) => provider.fork(
+                parent_sandbox_id,
+                child_sandbox_id,
+                snapshot_id,
+                spec,
+                cancelled,
+            ),
         }
     }
 
-    fn stop(&self, sandbox_id: sandboxwich_core::SandboxId) -> anyhow::Result<()> {
+    fn stop(
+        &self,
+        sandbox_id: sandboxwich_core::SandboxId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<()> {
         match self {
-            Self::DryRun(provider) => provider.stop(sandbox_id),
-            Self::Apply(provider) => provider.stop(sandbox_id),
+            Self::DryRun(provider) => provider.stop(sandbox_id, cancelled),
+            Self::Apply(provider) => provider.stop(sandbox_id, cancelled),
         }
     }
 }
@@ -520,9 +535,20 @@ async fn main() -> anyhow::Result<()> {
                 },
                 &CancelSignal::never_cancelled(),
             )?;
-            let provision = provider.provision(sandbox_id, &spec)?;
-            let snapshot = provider.create_snapshot(sandbox_id, snapshot_id)?;
-            let fork = provider.fork(sandbox_id, child_sandbox_id, snapshot_id, &spec)?;
+            let provision =
+                provider.provision(sandbox_id, &spec, &CancelSignal::never_cancelled())?;
+            let snapshot = provider.create_snapshot(
+                sandbox_id,
+                snapshot_id,
+                &CancelSignal::never_cancelled(),
+            )?;
+            let fork = provider.fork(
+                sandbox_id,
+                child_sandbox_id,
+                snapshot_id,
+                &spec,
+                &CancelSignal::never_cancelled(),
+            )?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -1305,7 +1331,7 @@ fn execute_job(
         JobKind::ProvisionSandbox => {
             let sandbox_id = sandbox_id_from_payload(&job.payload)?;
             let spec = provision_spec_from_payload(&job.payload)?;
-            let handle = provider.provision(sandbox_id, &spec)?;
+            let handle = provider.provision(sandbox_id, &spec, cancelled)?;
             Ok(WorkerJobOutcome::Complete(
                 WorkerJobResult::ProvisionSandbox { handle },
             ))
@@ -1340,7 +1366,7 @@ fn execute_job(
         JobKind::CreateSnapshot => {
             let sandbox_id = sandbox_id_from_payload(&job.payload)?;
             let snapshot_id = snapshot_id_from_payload(&job.payload)?;
-            let handle = provider.create_snapshot(sandbox_id, snapshot_id)?;
+            let handle = provider.create_snapshot(sandbox_id, snapshot_id, cancelled)?;
             Ok(WorkerJobOutcome::Complete(
                 WorkerJobResult::CreateSnapshot { handle },
             ))
@@ -1350,7 +1376,13 @@ fn execute_job(
             let child_sandbox_id = child_sandbox_id_from_payload(&job.payload)?;
             let snapshot_id = snapshot_id_from_payload(&job.payload)?;
             let spec = provision_spec_from_payload(&job.payload)?;
-            let handle = provider.fork(parent_sandbox_id, child_sandbox_id, snapshot_id, &spec)?;
+            let handle = provider.fork(
+                parent_sandbox_id,
+                child_sandbox_id,
+                snapshot_id,
+                &spec,
+                cancelled,
+            )?;
             Ok(WorkerJobOutcome::Complete(WorkerJobResult::ForkSandbox {
                 handle,
             }))
@@ -1360,7 +1392,7 @@ fn execute_job(
             // Actually tear down the sandbox's resources; propagate provider errors so
             // the job is failed (and retried per its classification) instead of the
             // control plane recording a "stopped" sandbox that keeps running.
-            provider.stop(sandbox_id)?;
+            provider.stop(sandbox_id, cancelled)?;
             Ok(WorkerJobOutcome::Complete(WorkerJobResult::StopSandbox {
                 provider: "kubernetes".to_string(),
                 sandbox_id,
