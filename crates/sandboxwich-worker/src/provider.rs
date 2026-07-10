@@ -63,6 +63,25 @@ impl std::error::Error for ProviderError {
 
 pub const KUBERNETES_MUTATION_ENV: &str = "SANDBOXWICH_K8S_ENABLE_MUTATION";
 pub const DEFAULT_SANDBOX_GUEST_IMAGE: &str = "ghcr.io/evalops/sandboxwich-ubuntu-dev:latest";
+
+/// Kubernetes defaults `imagePullPolicy` to `Always` for `:latest` (and for
+/// untagged refs, which imply `:latest`) and to `IfNotPresent` otherwise. We
+/// set it explicitly so pinned tags and kind-local images never attempt a
+/// registry pull, while floating `:latest` tags still refresh.
+///
+/// Tag detection only looks at the last path segment so a registry host:port
+/// (`localhost:5000/myimage`) is not mistaken for an image tag.
+pub(crate) fn image_pull_policy_for(image: &str) -> &'static str {
+    if image.contains("@sha256:") {
+        return "IfNotPresent";
+    }
+    let name = image.rsplit('/').next().unwrap_or(image);
+    match name.rsplit_once(':') {
+        Some((_, tag)) if tag != "latest" && !tag.is_empty() => "IfNotPresent",
+        _ => "Always",
+    }
+}
+
 /// Default cap on the stdout/stderr captured from a single `kubectl` invocation
 /// before it's stored in a `KubectlOutput` (and, from there, in job results and
 /// provider metadata sent back to the control plane). Mirrors
@@ -643,6 +662,9 @@ impl KubernetesDryRunProvider {
                 json!([{
                     "name": "sandbox",
                     "image": self.runtime_image,
+                    // Mutable tags (`:latest`) must re-pull; pin/tags used by
+                    // kind and local loads must not force registry access.
+                    "imagePullPolicy": image_pull_policy_for(&self.runtime_image),
                     "ports": [
                         {"name": "ssh", "containerPort": 2222},
                         {"name": "desktop", "containerPort": 6080}
@@ -2615,6 +2637,33 @@ mod tests {
             provisioned.metadata["manifests"]["pod"]["spec"]["containers"][0]["image"],
             runtime_image.as_str()
         );
+        assert_eq!(
+            provisioned.metadata["manifests"]["pod"]["spec"]["containers"][0]["imagePullPolicy"],
+            "IfNotPresent"
+        );
+    }
+
+    #[test]
+    fn image_pull_policy_tracks_tag_mutability() {
+        assert_eq!(
+            image_pull_policy_for("ghcr.io/evalops/sandboxwich-ubuntu-dev:latest"),
+            "Always"
+        );
+        assert_eq!(
+            image_pull_policy_for("sandboxwich-runtime:conformance"),
+            "IfNotPresent"
+        );
+        assert_eq!(
+            image_pull_policy_for("ghcr.io/evalops/sandboxwich-ubuntu-dev@sha256:abc"),
+            "IfNotPresent"
+        );
+        // Registry host:port must not be treated as a tag.
+        assert_eq!(image_pull_policy_for("localhost:5000/myimage"), "Always");
+        assert_eq!(
+            image_pull_policy_for("localhost:5000/myimage:v1"),
+            "IfNotPresent"
+        );
+        assert_eq!(image_pull_policy_for("myimage"), "Always");
     }
 
     #[test]

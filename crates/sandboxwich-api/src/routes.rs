@@ -144,31 +144,32 @@ pub(crate) fn app(state: AppState) -> Router {
         )
         .route_layer(middleware::from_fn(require_worker_principal));
 
-    let versioned_routes = Router::new()
-        .merge(
-            tenant_routes
-                .clone()
-                .layer(middleware::from_fn_with_state(
-                    state.clone(),
-                    enforce_tenant_limits,
-                ))
-                .layer(middleware::from_fn_with_state(
-                    state.clone(),
-                    enforce_idempotency,
-                )),
-        )
-        .merge(worker_routes.clone().layer(middleware::from_fn_with_state(
+    // Tenant limits and idempotency apply to every mutating control-plane
+    // path, including the unversioned aliases. Idempotency only activates when
+    // an Idempotency-Key header is present; limits only activate when a policy
+    // exists — so local/dev without either is unchanged.
+    let tenant_routes = tenant_routes
+        .layer(middleware::from_fn_with_state(
             state.clone(),
             enforce_tenant_limits,
-        )))
-        .merge(
-            registration_routes
-                .clone()
-                .layer(middleware::from_fn_with_state(
-                    state.clone(),
-                    enforce_tenant_limits,
-                )),
-        );
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_idempotency,
+        ));
+    let worker_routes = worker_routes.layer(middleware::from_fn_with_state(
+        state.clone(),
+        enforce_tenant_limits,
+    ));
+    let registration_routes = registration_routes.layer(middleware::from_fn_with_state(
+        state.clone(),
+        enforce_tenant_limits,
+    ));
+
+    let versioned_routes = Router::new()
+        .merge(tenant_routes.clone())
+        .merge(worker_routes.clone())
+        .merge(registration_routes.clone());
 
     let operator_routes = Router::new()
         .route(

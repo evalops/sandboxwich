@@ -537,7 +537,7 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         Command::ProviderApplyPlan(args) => {
-            let provider = apply_provider_from_args(args);
+            let provider = apply_provider_from_args(args)?;
             let plan = provider.smoke_plan(
                 sandboxwich_core::SandboxId::new(),
                 sandboxwich_core::SandboxId::new(),
@@ -548,7 +548,7 @@ async fn main() -> anyhow::Result<()> {
         Command::ProviderApplySmoke(args) => {
             let confirm_apply = args.confirm_apply;
             let cleanup = !args.keep_resources;
-            let provider = apply_provider_from_args(args);
+            let provider = apply_provider_from_args(args)?;
             let plan = provider.smoke_plan(
                 sandboxwich_core::SandboxId::new(),
                 sandboxwich_core::SandboxId::new(),
@@ -684,7 +684,7 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
         Command::WorkOnce(args) => {
-            let provider = Arc::new(runtime_provider_from_args(args.provider));
+            let provider = Arc::new(runtime_provider_from_args(args.provider)?);
             let response = claim(
                 &client,
                 &api,
@@ -778,7 +778,19 @@ fn kubectl_command_timeout(secs: u64) -> Duration {
     }
 }
 
-fn apply_provider_from_args(args: ProviderApplyArgs) -> KubernetesApplyProvider {
+fn require_explicit_runtime_image_for_apply(args: &ProviderArgs) -> anyhow::Result<()> {
+    if non_empty(args.runtime_image.clone()).is_some() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "apply mode requires --runtime-image or SANDBOXWICH_RUNTIME_IMAGE; \
+         refusing the default private guest image so clusters without ghcr.io \
+         credentials cannot silently ImagePullBackOff"
+    )
+}
+
+fn apply_provider_from_args(args: ProviderApplyArgs) -> anyhow::Result<KubernetesApplyProvider> {
+    require_explicit_runtime_image_for_apply(&args.provider)?;
     let provider = provider_from_args(args.provider);
     let mutation_enabled = KubernetesApplyProvider::mutation_enabled_from_env();
     if let Some(warning) = mutation_gate_force_enabled_warning(
@@ -788,16 +800,19 @@ fn apply_provider_from_args(args: ProviderApplyArgs) -> KubernetesApplyProvider 
     ) {
         eprintln!("{warning}");
     }
-    KubernetesApplyProvider::new(provider, args.kubectl)
+    Ok(KubernetesApplyProvider::new(provider, args.kubectl)
         .with_kubectl_context(args.kubectl_context)
         .with_mutation_gate(args.confirm_apply, mutation_enabled)
         .with_kubectl_command_timeout(kubectl_command_timeout(args.kubectl_command_timeout_secs))
-        .with_max_captured_output_bytes(args.max_captured_output_bytes)
+        .with_max_captured_output_bytes(args.max_captured_output_bytes))
 }
 
-fn runtime_provider_from_args(args: RuntimeProviderArgs) -> RuntimeProvider {
+fn runtime_provider_from_args(args: RuntimeProviderArgs) -> anyhow::Result<RuntimeProvider> {
+    if matches!(args.provider_mode, ProviderModeArg::Apply) {
+        require_explicit_runtime_image_for_apply(&args.provider)?;
+    }
     let provider = provider_from_args(args.provider);
-    match args.provider_mode {
+    Ok(match args.provider_mode {
         ProviderModeArg::DryRun => RuntimeProvider::DryRun(provider),
         ProviderModeArg::Apply => {
             let mutation_enabled = KubernetesApplyProvider::mutation_enabled_from_env();
@@ -818,7 +833,7 @@ fn runtime_provider_from_args(args: RuntimeProviderArgs) -> RuntimeProvider {
                     .with_max_captured_output_bytes(args.max_captured_output_bytes),
             )
         }
-    }
+    })
 }
 
 async fn claim(
@@ -1027,7 +1042,7 @@ async fn drain_watchdog(shutdown: Arc<std::sync::atomic::AtomicBool>, drain_time
 }
 
 async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> anyhow::Result<()> {
-    let provider = Arc::new(runtime_provider_from_args(args.provider));
+    let provider = Arc::new(runtime_provider_from_args(args.provider)?);
     let labels: BTreeMap<_, _> = args.label.into_iter().collect();
     let drain_timeout = Duration::from_secs(args.drain_timeout_secs);
     let shutdown = spawn_shutdown_listener();
