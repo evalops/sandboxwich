@@ -11,6 +11,7 @@ use crate::handlers::snapshots::*;
 use crate::handlers::ssh::*;
 use crate::handlers::workers::*;
 use crate::health::*;
+use crate::idempotency::enforce_idempotency;
 use crate::reconcile::*;
 use crate::request_id::{attach_request_id, normalize_framework_errors};
 use crate::state::*;
@@ -129,7 +130,11 @@ pub(crate) fn app(state: AppState) -> Router {
 
     let versioned_routes = Router::new()
         .merge(tenant_routes.clone())
-        .merge(worker_routes.clone());
+        .merge(worker_routes.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_idempotency,
+        ));
 
     Router::new()
         .route("/healthz", get(healthz))
