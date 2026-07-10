@@ -185,8 +185,25 @@ run_command "${source_id}" '["true"]' >/dev/null
 stop_sandbox "${source_id}"
 stop_sandbox "${target_id}"
 
-# A configured-but-missing runtime handler must fail closed: the pod may be
-# created, but it must never become Ready or execute guest code.
+# Isolate the synthetic RuntimeClass case from every legitimate lifecycle job:
+# no queued/leased work and no normal sandbox resources may remain. This makes
+# it impossible to mistake a racing real sandbox rejection for the canary.
+for _ in $(seq 1 60); do
+  jobs="$(api 'http://127.0.0.1:32170/jobs?limit=100')"
+  jq -e '.jobs | all(.status == "succeeded")' <<<"${jobs}" >/dev/null && break
+  jq -e '.jobs | any(.status == "failed" or .status == "dead")' <<<"${jobs}" >/dev/null && \
+    fail "a lifecycle job failed before RuntimeClass isolation: ${jobs}"
+  sleep 1
+done
+jobs="$(api 'http://127.0.0.1:32170/jobs?limit=100')"
+jq -e '.jobs | all(.status == "succeeded")' <<<"${jobs}" >/dev/null || \
+  fail "lifecycle jobs did not drain before RuntimeClass isolation: ${jobs}"
+normal_resources="$(kubectl -n sandboxwich-sandboxes get pod,pvc,service,networkpolicy -o name)"
+[[ -z "${normal_resources}" ]] || \
+  fail "normal sandbox resources remained before RuntimeClass isolation: ${normal_resources}"
+
+# A configured-but-missing runtime handler must fail closed at admission: no
+# pod may be created or execute guest code.
 SANDBOXWICH_K8S_ENABLE_MUTATION=0 "${ROOT_DIR}/target/debug/sandboxwich-worker" \
   provider-apply-plan --cluster kind-conformance --namespace sandboxwich-sandboxes \
   --storage-class standard --runtime-image "${RUNTIME_IMAGE}" \
@@ -196,6 +213,11 @@ jq '[.apply_manifests[] | select(.kind == "PersistentVolumeClaim")][0]' \
 jq '[.apply_manifests[] | select(.kind == "Pod")][0]' \
   "${TMP_DIR}/runtimeclass-plan.json" >"${TMP_DIR}/runtimeclass-pod.json"
 runtimeclass_pod="$(jq -r '.metadata.name' "${TMP_DIR}/runtimeclass-pod.json")"
+runtimeclass_id="$(jq -r '.metadata.labels["sandboxwich.dev/sandbox-id"]' \
+  "${TMP_DIR}/runtimeclass-pod.json")"
+[[ "$(jq -r '.metadata.labels["sandboxwich.dev/sandbox-id"]' \
+  "${TMP_DIR}/runtimeclass-pvc.json")" == "${runtimeclass_id}" ]] || \
+  fail "RuntimeClass canary pod and PVC identities differ"
 [[ "$(jq -r '.spec.runtimeClassName' "${TMP_DIR}/runtimeclass-pod.json")" == "sandboxwich-missing-handler" ]] \
   || fail "runtimeClassName was dropped from the rendered pod"
 kubectl apply -f "${TMP_DIR}/runtimeclass-pvc.json"
@@ -207,6 +229,11 @@ grep -F 'RuntimeClass "sandboxwich-missing-handler" not found' \
 if kubectl -n sandboxwich-sandboxes get pod "${runtimeclass_pod}" >/dev/null 2>&1; then
   fail "a pod exists despite missing RuntimeClass admission failure"
 fi
+runtimeclass_resources="$(kubectl -n sandboxwich-sandboxes get pod,pvc,service,networkpolicy \
+  -l "sandboxwich.dev/sandbox-id=${runtimeclass_id}" -o name)"
+[[ "${runtimeclass_resources}" == "persistentvolumeclaim/$(jq -r '.metadata.name' \
+  "${TMP_DIR}/runtimeclass-pvc.json")" ]] || \
+  fail "unexpected resources exist in isolated RuntimeClass case: ${runtimeclass_resources}"
 kubectl delete -f "${TMP_DIR}/runtimeclass-pvc.json" --wait=true
 
 for sandbox_id in "${deny_id}" "${source_id}" "${target_id}"; do
