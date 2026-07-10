@@ -64,16 +64,20 @@ impl std::error::Error for ProviderError {
 pub const KUBERNETES_MUTATION_ENV: &str = "SANDBOXWICH_K8S_ENABLE_MUTATION";
 pub const DEFAULT_SANDBOX_GUEST_IMAGE: &str = "ghcr.io/evalops/sandboxwich-ubuntu-dev:latest";
 
-/// Kubernetes defaults `imagePullPolicy` to `Always` for `:latest` and to
-/// `IfNotPresent` otherwise. We set it explicitly so pinned tags and kind-local
-/// images never attempt a registry pull, while floating `:latest` tags still
-/// refresh.
+/// Kubernetes defaults `imagePullPolicy` to `Always` for `:latest` (and for
+/// untagged refs, which imply `:latest`) and to `IfNotPresent` otherwise. We
+/// set it explicitly so pinned tags and kind-local images never attempt a
+/// registry pull, while floating `:latest` tags still refresh.
+///
+/// Tag detection only looks at the last path segment so a registry host:port
+/// (`localhost:5000/myimage`) is not mistaken for an image tag.
 pub(crate) fn image_pull_policy_for(image: &str) -> &'static str {
-    let tag = image.rsplit_once(':').map(|(_, tag)| tag);
-    match tag {
-        Some(tag) if tag != "latest" && !tag.is_empty() => "IfNotPresent",
-        // Digest references (`image@sha256:...`) are immutable.
-        None if image.contains("@sha256:") => "IfNotPresent",
+    if image.contains("@sha256:") {
+        return "IfNotPresent";
+    }
+    let name = image.rsplit('/').next().unwrap_or(image);
+    match name.rsplit_once(':') {
+        Some((_, tag)) if tag != "latest" && !tag.is_empty() => "IfNotPresent",
         _ => "Always",
     }
 }
@@ -2653,6 +2657,13 @@ mod tests {
             image_pull_policy_for("ghcr.io/evalops/sandboxwich-ubuntu-dev@sha256:abc"),
             "IfNotPresent"
         );
+        // Registry host:port must not be treated as a tag.
+        assert_eq!(image_pull_policy_for("localhost:5000/myimage"), "Always");
+        assert_eq!(
+            image_pull_policy_for("localhost:5000/myimage:v1"),
+            "IfNotPresent"
+        );
+        assert_eq!(image_pull_policy_for("myimage"), "Always");
     }
 
     #[test]
