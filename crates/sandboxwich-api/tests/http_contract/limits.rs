@@ -143,6 +143,11 @@ async fn assert_limit_contract(server: TestServer) {
     } else {
         &second_key
     };
+    let limited_key = if accepted_key == &first_key {
+        &second_key
+    } else {
+        &first_key
+    };
     let statuses: Vec<_> = responses
         .iter()
         .map(|r| r.as_ref().unwrap().status())
@@ -179,6 +184,22 @@ async fn assert_limit_contract(server: TestServer) {
         "an idempotent replay must not consume the mutation quota twice"
     );
 
+    sqlx::query("update tenant_limit_counters set window_expires_at = '1970-01-01T00:00:00Z'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .post(&url)
+            .header("idempotency-key", limited_key)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::ACCEPTED,
+        "a throttled key must be executable after the quota window refills"
+    );
     sqlx::query("update tenant_limit_counters set window_expires_at = '1970-01-01T00:00:00Z'")
         .execute(&pool)
         .await
