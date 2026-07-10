@@ -1,3 +1,4 @@
+mod api_contract;
 mod auth;
 mod cleanup;
 mod config;
@@ -7,6 +8,7 @@ mod handlers;
 mod health;
 mod pagination;
 mod reconcile;
+mod request_id;
 mod routes;
 mod rows;
 mod scheduler;

@@ -1963,7 +1963,6 @@ impl SandboxProvider for KubernetesDryRunProvider {
             WorkerCapability::K8sPod,
             WorkerCapability::ProvisionSandbox,
             WorkerCapability::RunCommand,
-            WorkerCapability::AgentPrompt,
             WorkerCapability::Snapshot,
             WorkerCapability::DesktopStream,
         ];
@@ -2497,7 +2496,7 @@ mod tests {
                 .contains(&WorkerCapability::Snapshot)
         );
         assert!(
-            capabilities
+            !capabilities
                 .capabilities
                 .contains(&WorkerCapability::AgentPrompt)
         );

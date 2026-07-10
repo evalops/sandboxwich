@@ -3,12 +3,14 @@ use crate::db::*;
 use crate::error::*;
 use crate::handlers::commands::*;
 use crate::handlers::jobs::*;
+use crate::handlers::operations::operation_from_job;
 use crate::handlers::snapshots::*;
 use crate::pagination::*;
 use crate::rows::*;
 use crate::state::*;
 use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
+use axum::http::StatusCode;
 use chrono::Utc;
 use sandboxwich_core::*;
 use serde_json::json;
@@ -84,11 +86,12 @@ pub(crate) fn looks_like_cidr(value: &str) -> bool {
     }
 }
 
+#[utoipa::path(post, path = "/v1/sandboxes", responses((status = 202, description = "Sandbox provisioning accepted"), (status = 400, body = ErrorEnvelope)))]
 pub(crate) async fn create_sandbox(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
     Json(request): Json<CreateSandboxRequest>,
-) -> Result<Json<SandboxResponse>, ApiError> {
+) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
     let now = Utc::now();
     let provision_spec = provision_spec_from_request(&request, None)?;
     let sandbox = Sandbox {
@@ -145,7 +148,14 @@ pub(crate) async fn create_sandbox(
     insert_job_on_connection(&state.db, &mut tx, &job).await?;
     tx.commit().await?;
 
-    Ok(Json(SandboxResponse { ok: true, sandbox }))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SandboxResponse {
+            ok: true,
+            sandbox,
+            operation: Some(operation_from_job(&job)?),
+        }),
+    ))
 }
 
 pub(crate) async fn list_sandboxes(
@@ -187,14 +197,18 @@ pub(crate) async fn get_sandbox(
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<SandboxResponse>, ApiError> {
     let sandbox = ensure_sandbox_tenant(&state.db, SandboxId(sandbox_id), &ctx).await?;
-    Ok(Json(SandboxResponse { ok: true, sandbox }))
+    Ok(Json(SandboxResponse {
+        ok: true,
+        sandbox,
+        operation: None,
+    }))
 }
 
 pub(crate) async fn stop_sandbox(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
-) -> Result<Json<SandboxResponse>, ApiError> {
+) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
     let mut sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
     let now = Utc::now();
@@ -227,7 +241,14 @@ pub(crate) async fn stop_sandbox(
     tx.commit().await?;
     sandbox.state = SandboxState::Archiving;
     sandbox.updated_at = now;
-    Ok(Json(SandboxResponse { ok: true, sandbox }))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SandboxResponse {
+            ok: true,
+            sandbox,
+            operation: Some(operation_from_job(&job)?),
+        }),
+    ))
 }
 
 pub(crate) async fn resume_sandbox(
@@ -246,7 +267,7 @@ pub(crate) async fn fork_sandbox(
     Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
     Json(request): Json<CreateSandboxRequest>,
-) -> Result<Json<SandboxResponse>, ApiError> {
+) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
     let parent = ensure_sandbox_tenant(&state.db, SandboxId(sandbox_id), &ctx).await?;
     let provision_spec = provision_spec_from_request(&request, Some(&parent))?;
     let now = Utc::now();
@@ -289,6 +310,7 @@ pub(crate) async fn fork_sandbox(
         kind: JobKind::CreateSnapshot,
         status: JobStatus::Queued,
         payload: json!({"sandboxId": parent.id, "snapshotId": snapshot.id,
+            "operation": { "kind": OperationKind::ForkSandbox, "resourceId": child.id },
             "provisionSpec": SandboxProvisionSpec { memory_limit: parent.memory_limit.clone(), network_egress: parent.network_egress.clone() }}),
         required_capability: WorkerCapability::Snapshot,
         priority: 0,
@@ -327,10 +349,14 @@ pub(crate) async fn fork_sandbox(
     insert_job_on_connection(&state.db, &mut tx, &job).await?;
     tx.commit().await?;
 
-    Ok(Json(SandboxResponse {
-        ok: true,
-        sandbox: child,
-    }))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SandboxResponse {
+            ok: true,
+            sandbox: child,
+            operation: Some(operation_from_job(&job)?),
+        }),
+    ))
 }
 
 /// Drives a user-initiated sandbox state change (stop/resume) via a
@@ -367,7 +393,11 @@ pub(crate) async fn transition_sandbox(
     .await?;
 
     let sandbox = fetch_sandbox(db, sandbox_id).await?;
-    Ok(Json(SandboxResponse { ok: true, sandbox }))
+    Ok(Json(SandboxResponse {
+        ok: true,
+        sandbox,
+        operation: None,
+    }))
 }
 
 #[cfg(test)]
