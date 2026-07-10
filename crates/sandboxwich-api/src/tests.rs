@@ -13,7 +13,9 @@ use crate::handlers::commands::*;
 use crate::handlers::jobs::*;
 use crate::handlers::leases::*;
 use crate::handlers::sandboxes::*;
+use crate::handlers::snapshots::*;
 use crate::handlers::workers::*;
+use crate::state::{Principal, TenantContext};
 use sandboxwich_core::*;
 use std::collections::BTreeSet;
 
@@ -470,6 +472,44 @@ async fn stop_returns_conflict_on_double_stop() {
     .await;
 
     let error = result.expect_err("stopping an already-archived sandbox must conflict");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn snapshot_restore_claim_rejects_expired_ready_source() {
+    let db = test_sqlite_db().await;
+    let sandbox = seed_sandbox_with_state(&db, SandboxState::Ready).await;
+    let now = Utc::now();
+    let snapshot = Snapshot {
+        id: SnapshotId::new(),
+        sandbox_id: sandbox.id,
+        status: SnapshotStatus::Ready,
+        label: "expired-restore-source".to_string(),
+        inventory: json!({}),
+        provider_metadata: json!({}),
+        created_at: now,
+        ready_at: Some(now),
+        expires_at: Some(now - chrono::Duration::seconds(1)),
+        error: None,
+    };
+    let mut connection = db.pool.acquire().await.expect("acquire connection");
+    insert_snapshot_on_connection(&db, &mut connection, &snapshot)
+        .await
+        .expect("insert expired ready snapshot");
+
+    let error = claim_snapshot_restore_source_on_connection(
+        &db,
+        &mut connection,
+        snapshot.id,
+        &TenantContext {
+            tenant_id: sandbox.tenant_id.clone(),
+            principal: Principal::Tenant,
+        },
+        now,
+    )
+    .await
+    .expect_err("expired ready snapshot must not be restorable");
+
     assert_eq!(error.status, StatusCode::CONFLICT);
 }
 
