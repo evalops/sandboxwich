@@ -117,6 +117,41 @@ pub(crate) async fn claim_lease(
     if let Some(job_id) = requested_job_id {
         query.push(" and id = ").push_bind(job_id.to_string());
     }
+    // Guest-facing scoping (advisory, see the doc comment on
+    // `ClaimLeaseRequest::sandbox_id`): a caller such as `sandboxwich-agent`'s
+    // daemon loop can narrow claims to the sandbox and job kinds it actually
+    // handles, so a job destined for a different sandbox -- or a job kind the
+    // caller isn't equipped to execute -- is never handed to it in the first
+    // place. Matches any of the job's own sandbox, fork parent, or fork child
+    // columns so the filter also makes sense for provision/fork jobs.
+    if let Some(sandbox_id) = request.sandbox_id {
+        query
+            .push(" and (jobs.sandbox_id = ")
+            .push_bind(sandbox_id.to_string())
+            .push(" or jobs.parent_sandbox_id = ")
+            .push_bind(sandbox_id.to_string())
+            .push(" or jobs.child_sandbox_id = ")
+            .push_bind(sandbox_id.to_string())
+            .push(")");
+    }
+    if let Some(kinds) = request.kinds.as_deref() {
+        if kinds.is_empty() {
+            // An explicit empty kinds filter can never match anything; short-circuit
+            // rather than emit `and kind in ()`, which is invalid SQL.
+            return Ok(Json(ClaimLeaseResponse {
+                ok: true,
+                lease: None,
+            }));
+        }
+        query.push(" and kind in (");
+        {
+            let mut separated = query.separated(", ");
+            for kind in kinds {
+                separated.push_bind(job_kind_to_str(kind));
+            }
+        }
+        query.push(")");
+    }
     query.push(
         "
          order by priority desc, scheduled_at asc, created_at asc, id asc
@@ -130,6 +165,18 @@ pub(crate) async fn claim_lease(
         // capability check at the claim boundary so a future query refactor cannot lease
         // work to an incompatible worker.
         if !worker.capabilities.contains(&job.required_capability) {
+            continue;
+        }
+        // Defense in depth: re-check the caller's sandbox/kind filters (if any) against
+        // the typed job for the same reason as the capability check above.
+        if let Some(sandbox_id) = request.sandbox_id
+            && !job_matches_sandbox(&job, sandbox_id)
+        {
+            continue;
+        }
+        if let Some(kinds) = request.kinds.as_deref()
+            && !kinds.contains(&job.kind)
+        {
             continue;
         }
         if let Some(lease) = try_claim_job(
@@ -152,6 +199,15 @@ pub(crate) async fn claim_lease(
         ok: true,
         lease: None,
     }))
+}
+
+/// True if `job` references `sandbox_id` as its own sandbox, its fork parent, or its
+/// fork child. Used to re-check a claim request's `sandbox_id` filter against the
+/// typed job, mirroring the SQL `where` clause built in `claim_lease`.
+fn job_matches_sandbox(job: &Job, sandbox_id: SandboxId) -> bool {
+    sandbox_id_from_job(job).ok() == Some(sandbox_id)
+        || parent_sandbox_id_from_job(job).ok() == Some(sandbox_id)
+        || child_sandbox_id_from_job(job).ok() == Some(sandbox_id)
 }
 
 async fn fetch_claim_operation(
