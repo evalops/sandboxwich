@@ -20,6 +20,11 @@ provider or relying on an isolation claim.
 
 ## Quick start
 
+If you have [`just`](https://github.com/casey/just) installed, `just dev`
+runs the API and a dry-run worker together (Ctrl-C stops both), and `just pg`
+starts a dockerized Postgres for the contract tests below. See the
+`justfile` for details; the manual steps follow.
+
 Set a local-only token and run the API:
 
 ```sh

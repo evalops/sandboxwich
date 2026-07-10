@@ -26,9 +26,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Install pinned kind
         run: |
           curl -fsSLo kind https://kind.sigs.k8s.io/dl/v0.29.0/kind-linux-amd64
@@ -41,6 +41,10 @@ jobs:
           docker build --build-arg BIN=sandboxwich-worker -t sandboxwich-worker:conformance .
           docker build -t sandboxwich-runtime:conformance deploy/runtime/ubuntu-dev
           docker build -f deploy/kubernetes/postgres.Dockerfile -t postgres:conformance .
+          # kind imports the completed images into containerd, temporarily storing a
+          # second copy of every layer. The intermediate BuildKit cache is no longer
+          # needed after these builds and can exhaust the runner during that import.
+          docker builder prune --all --force
       - name: Create disposable cluster
         run: >-
           kind create cluster --name sandboxwich-conformance

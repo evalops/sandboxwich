@@ -420,7 +420,7 @@ pub(crate) async fn assert_resource_tiers_and_file_contracts(
         .unwrap();
     assert!(listed.files.iter().any(|file| file.id == uploaded.file.id));
 
-    let downloaded = client
+    let download_response = client
         .get(format!(
             "{}/sandboxes/{}/files/{}",
             server.base_url, default_sandbox.sandbox.id, uploaded.file.id
@@ -429,10 +429,24 @@ pub(crate) async fn assert_resource_tiers_and_file_contracts(
         .await
         .unwrap()
         .error_for_status()
-        .unwrap()
-        .bytes()
-        .await
         .unwrap();
+    assert_eq!(
+        download_response
+            .headers()
+            .get("content-disposition")
+            .and_then(|value| value.to_str().ok()),
+        Some("attachment; filename=\"hello.txt\"")
+    );
+    assert_eq!(
+        download_response
+            .headers()
+            .get("x-content-type-options")
+            .and_then(|value| value.to_str().ok()),
+        Some("nosniff"),
+        "file downloads must set X-Content-Type-Options: nosniff alongside the \
+         reflected, client-supplied Content-Type"
+    );
+    let downloaded = download_response.bytes().await.unwrap();
     assert_eq!(&downloaded[..], b"hello file\n");
 
     let bad_mime_form = reqwest::multipart::Form::new()

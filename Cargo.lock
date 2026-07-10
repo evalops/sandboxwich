@@ -1725,6 +1725,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlx",
+ "subtle",
  "tempfile",
  "tokio",
  "tracing",
@@ -1753,6 +1754,7 @@ name = "sandboxwich-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "reqwest",
  "sandboxwich-core",

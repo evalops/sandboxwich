@@ -830,7 +830,27 @@ pub(crate) async fn apply_completed_job_on_connection(
             let sandbox_id = sandbox_id_from_job(job)?;
             let stdout = result.stdout.as_str();
             let stderr = result.stderr.as_str();
-            let exit_code = result.exit_code.or(Some(0));
+            // A worker completes the lease this way whenever it actually ran the
+            // command to a terminal exit -- exit code 0 as well as non-zero. The
+            // command's own status must reflect that outcome instead of being
+            // unconditionally marked Finished: a `sandboxwich exec` whose command
+            // exited 1 is a completed lease but a failed command, and callers (CI
+            // gating on command status, `sandboxwich exec --wait`'s exit code)
+            // need to be able to tell the two apart. `None` (no exit code at all,
+            // e.g. a process killed by a signal, or a runner that could not
+            // capture the code) is treated the same as non-zero: a command that
+            // could not report how it finished is not a success either. The
+            // missing code is persisted and emitted as an honest null -- the
+            // `commands.exit_code` column and `CommandRun.exit_code` are already
+            // nullable, and the failed-lease path below emits `"exitCode": null`
+            // the same way -- rather than fabricating a 0 that would claim the
+            // command succeeded.
+            let exit_code = result.exit_code;
+            let status = if exit_code == Some(0) {
+                CommandStatus::Finished
+            } else {
+                CommandStatus::Failed
+            };
             append_completion_output_on_connection(
                 db,
                 connection,
@@ -850,11 +870,7 @@ pub(crate) async fn apply_completed_job_on_connection(
             )
             .await?;
             finish_command_from_lease_result_on_connection(
-                db,
-                connection,
-                command_id,
-                CommandStatus::Finished,
-                exit_code,
+                db, connection, command_id, status, exit_code,
             )
             .await?;
             insert_event_on_connection(

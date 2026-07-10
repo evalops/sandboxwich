@@ -182,6 +182,14 @@ The API exposes:
 - `/readyz` for database-backed readiness.
 - `/metrics` for Prometheus text metrics. If `SANDBOXWICH_API_TOKEN` is configured, scrape clients must send the bearer token.
 
+The control-plane NetworkPolicy permits in-cluster scrapes from pods in the
+`sandboxwich` namespace carrying the label
+`sandboxwich.dev/metrics-access: "true"`. Add that label to the Prometheus pod
+template (or the pod selected by your ServiceMonitor) and configure the bearer
+token there. Scrapers in another namespace require a deployment-specific
+companion NetworkPolicy with both namespace and pod selectors; the shipped
+policy does not grant cross-namespace ingress.
+
 Run the read-only homelab smoke through a port-forward after GitOps applies the manifests:
 
 ```sh
