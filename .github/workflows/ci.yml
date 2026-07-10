@@ -42,42 +42,6 @@ jobs:
             -p sandboxwich-api \
             -p sandboxwich-worker \
             -p sandboxwich-bench
-      - name: Generate benchmark report
-        env:
-          SANDBOXWICH_ALLOW_INSECURE_NO_AUTH: "true"
-        run: |
-          cargo run -p sandboxwich-bench -- all \
-            --api-bin target/debug/sandboxwich-api \
-            --worker-bin target/debug/sandboxwich-worker \
-            --runs 5 \
-            --ttft-runs 10 \
-            --requests 300 \
-            --concurrency 25 \
-            --seed-sandboxes 250 \
-            > sandboxwich-benchmark-report.md
-      - name: Enforce benchmark budgets
-        run: |
-          awk -F'|' '
-            function ms(value) { gsub(/ms| /, "", value); return value + 0 }
-            /^## / { section = substr($0, 4) }
-            /^\| [0-9]+ \|/ {
-              if ($3 + 0 != 0) { print section ": request failures=" $3; failed = 1 }
-              p95 = ms($7)
-              limit = (section == "warm startup" ? 2000 :
-                       section == "GET /sandboxes" ? 2000 :
-                       section ~ /^POST \/sandboxes/ ? 2000 : 500)
-              if (p95 > limit) { print section ": p95 " p95 "ms exceeds " limit "ms"; failed = 1 }
-            }
-            /^\| total TTFT \|/ {
-              p95 = ms($6)
-              if (p95 > 5000) { print "Sandbox TTFT: p95 " p95 "ms exceeds 5000ms"; failed = 1 }
-            }
-            END { exit failed }
-          ' sandboxwich-benchmark-report.md
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: sandboxwich-benchmark-report
-          path: sandboxwich-benchmark-report.md
 
   clippy:
     runs-on: ubuntu-latest
@@ -101,3 +65,77 @@ jobs:
       # this workspace only enables the postgres/sqlite sqlx features.
       # Upstream has no fixed version yet; re-evaluate when one ships.
       - run: cargo audit --ignore RUSTSEC-2023-0071
+
+  benchmark:
+    name: benchmark (non-blocking)
+    runs-on: ubuntu-latest
+    # Shared GitHub-hosted runners have enough CPU/IO variance that p95
+    # latency budgets flake independently of the PR under test. This job
+    # intentionally stays off the required-checks path: do not add
+    # "benchmark (non-blocking)" to branch protection required checks.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - run: |
+          cargo build --locked \
+            -p sandboxwich-api \
+            -p sandboxwich-worker \
+            -p sandboxwich-bench
+      - name: Generate benchmark report
+        env:
+          SANDBOXWICH_ALLOW_INSECURE_NO_AUTH: "true"
+        run: |
+          cargo run -p sandboxwich-bench -- all \
+            --api-bin target/debug/sandboxwich-api \
+            --worker-bin target/debug/sandboxwich-worker \
+            --runs 5 \
+            --ttft-runs 10 \
+            --requests 300 \
+            --concurrency 25 \
+            --seed-sandboxes 250 \
+            > sandboxwich-benchmark-report.md
+      - name: Enforce benchmark budgets
+        run: |
+          awk -F'|' '
+            function ms(value) { gsub(/ms| /, "", value); return value + 0 }
+            /^## / { section = substr($0, 4) }
+            /^\| [0-9]+ \|/ {
+              row_seen = 1
+              if ($3 + 0 != 0) { print section ": request failures=" $3; failed = 1 }
+              p95 = ms($7)
+              # Deliberately an if/else chain, not a multi-line `? :`
+              # ternary: mawk (Debian/Ubuntus default /usr/bin/awk) does not
+              # continue a statement across a bare line-ending `?` or `:`,
+              # so a ternary split across lines like that is a syntax error
+              # under mawk even though gawk accepts it.
+              if (section == "warm startup") {
+                limit = 2000
+              } else if (section == "GET /sandboxes") {
+                limit = 2000
+              } else if (section ~ /^POST \/sandboxes/) {
+                limit = 2000
+              } else {
+                limit = 500
+              }
+              if (p95 > limit) { print section ": p95 " p95 "ms exceeds " limit "ms"; failed = 1 }
+            }
+            /^\| total TTFT \|/ {
+              ttft_seen = 1
+              p95 = ms($6)
+              if (p95 > 5000) { print "Sandbox TTFT: p95 " p95 "ms exceeds 5000ms"; failed = 1 }
+            }
+            END {
+              # A report format change that silently stops matching either
+              # pattern above must fail the gate, not exit 0 having checked
+              # nothing (the whole point of this budget gate).
+              if (!row_seen) { print "no per-endpoint benchmark rows found in report; budget gate cannot run"; failed = 1 }
+              if (!ttft_seen) { print "no Sandbox TTFT row found in report; budget gate cannot run"; failed = 1 }
+              exit failed
+            }
+          ' sandboxwich-benchmark-report.md
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sandboxwich-benchmark-report
+          path: sandboxwich-benchmark-report.md
