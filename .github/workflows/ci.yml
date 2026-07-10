@@ -66,6 +66,23 @@ jobs:
       # Upstream has no fixed version yet; re-evaluate when one ships.
       - run: cargo audit --ignore RUSTSEC-2023-0071
 
+  msrv:
+    name: msrv (1.95)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      # Cargo.toml declares `rust-version = "1.95"`; every other job floats
+      # on `stable`. This job pins the actual MSRV floor instead of trusting
+      # the workspace-lints comment in Cargo.toml to stay true on its own.
+      # dtolnay/rust-toolchain's `stable`/`beta`/`nightly` branches hardcode
+      # their channel and ignore an explicit `toolchain:` override; `master`
+      # is the branch documented to honor an explicit version pin like this.
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - run: cargo check --workspace --all-targets --locked
+
   benchmark:
     name: benchmark (non-blocking)
     runs-on: ubuntu-latest
