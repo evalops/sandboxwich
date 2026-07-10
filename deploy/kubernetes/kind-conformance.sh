@@ -58,19 +58,23 @@ sed \
   -e 's/imagePullPolicy: Always/imagePullPolicy: IfNotPresent/g' \
   -e 's/replicas: 2/replicas: 1/' \
   "${ROOT_DIR}/deploy/kubernetes/api.yaml" >"${TMP_DIR}/api.yaml"
+# Bake SANDBOXWICH_RUNTIME_IMAGE into the manifest before apply so the first
+# worker pod never provisions with the default GHCR guest image (which kind
+# cannot pull). A post-apply `kubectl set env` would roll the deployment and
+# leave a race where the initial pod claims work with the wrong image.
 sed \
   -e "s#ghcr.io/evalops/sandboxwich-worker:latest#${WORKER_IMAGE}#g" \
   -e 's/imagePullPolicy: Always/imagePullPolicy: IfNotPresent/g' \
   -e 's/value: k3s-dev/value: kind-conformance/' \
   -e 's/value: local-path/value: standard/' \
-  "${ROOT_DIR}/deploy/kubernetes/worker.yaml" >"${TMP_DIR}/worker.yaml"
+  "${ROOT_DIR}/deploy/kubernetes/worker.yaml" | \
+  kubectl set env --local -f - "SANDBOXWICH_RUNTIME_IMAGE=${RUNTIME_IMAGE}" -o yaml \
+  >"${TMP_DIR}/worker.yaml"
 
 kubectl apply -f "${TMP_DIR}/api.yaml"
 kubectl -n sandboxwich wait --for=condition=complete job/sandboxwich-api-migrate --timeout=120s
 kubectl -n sandboxwich rollout status deployment/sandboxwich-api --timeout=120s
 kubectl apply -f "${TMP_DIR}/worker.yaml"
-kubectl -n sandboxwich set env deployment/sandboxwich-worker \
-  "SANDBOXWICH_RUNTIME_IMAGE=${RUNTIME_IMAGE}"
 kubectl -n sandboxwich rollout status deployment/sandboxwich-worker --timeout=120s
 
 printf 'header = "Authorization: Bearer %s"\nheader = "content-type: application/json"\n' \
