@@ -831,18 +831,6 @@ pub(crate) fn job_for_snapshot(jobs: &[Job], snapshot_id: &str) -> Job {
         .expect("expected snapshot job")
 }
 
-pub(crate) fn job_for_prompt(jobs: &[Job], prompt_event_id: &str) -> Job {
-    jobs.iter()
-        .find(|job| {
-            job.payload
-                .get("promptEventId")
-                .and_then(|value| value.as_str())
-                == Some(prompt_event_id)
-        })
-        .cloned()
-        .expect("expected prompt job")
-}
-
 pub(crate) fn assert_no_access_url(value: &serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {

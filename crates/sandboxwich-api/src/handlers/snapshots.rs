@@ -5,6 +5,7 @@ use crate::error::*;
 use crate::handlers::commands::*;
 use crate::handlers::jobs::*;
 use crate::handlers::leases::*;
+use crate::handlers::operations::operation_from_job;
 use crate::handlers::sandboxes::*;
 use crate::pagination::*;
 use crate::reconcile::*;
@@ -14,6 +15,7 @@ use crate::util::*;
 use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::HeaderMap;
+use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use sandboxwich_core::*;
 use serde_json::json;
@@ -26,7 +28,7 @@ pub(crate) async fn create_snapshot(
     Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
     Json(request): Json<CreateSnapshotRequest>,
-) -> Result<Json<SnapshotResponse>, ApiError> {
+) -> Result<(StatusCode, Json<SnapshotResponse>), ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
     let sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
     let snapshot = pending_snapshot_from_request(sandbox_id, request)?;
@@ -43,30 +45,34 @@ pub(crate) async fn create_snapshot(
         }),
     )
     .await?;
-    insert_job(
-        &state.db,
-        &Job {
-            id: JobId::new(),
-            tenant_id: sandbox.tenant_id,
-            kind: JobKind::CreateSnapshot,
-            status: JobStatus::Queued,
-            payload: json!({
-                "sandboxId": sandbox_id,
-                "snapshotId": snapshot.id
-            }),
-            required_capability: WorkerCapability::Snapshot,
-            priority: 0,
-            attempts: 0,
-            max_attempts: 3,
-            scheduled_at,
-            created_at: scheduled_at,
-            updated_at: scheduled_at,
-            last_error: None,
-        },
-    )
-    .await?;
+    let job = Job {
+        id: JobId::new(),
+        tenant_id: sandbox.tenant_id,
+        kind: JobKind::CreateSnapshot,
+        status: JobStatus::Queued,
+        payload: json!({
+            "sandboxId": sandbox_id,
+            "snapshotId": snapshot.id
+        }),
+        required_capability: WorkerCapability::Snapshot,
+        priority: 0,
+        attempts: 0,
+        max_attempts: 3,
+        scheduled_at,
+        created_at: scheduled_at,
+        updated_at: scheduled_at,
+        last_error: None,
+    };
+    insert_job(&state.db, &job).await?;
 
-    Ok(Json(SnapshotResponse { ok: true, snapshot }))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SnapshotResponse {
+            ok: true,
+            snapshot,
+            operation: Some(operation_from_job(&job)?),
+        }),
+    ))
 }
 
 pub(crate) async fn list_snapshots(
@@ -95,7 +101,11 @@ pub(crate) async fn get_snapshot(
 ) -> Result<Json<SnapshotResponse>, ApiError> {
     let snapshot = fetch_snapshot(&state.db, SnapshotId(snapshot_id)).await?;
     ensure_sandbox_tenant(&state.db, snapshot.sandbox_id, &ctx).await?;
-    Ok(Json(SnapshotResponse { ok: true, snapshot }))
+    Ok(Json(SnapshotResponse {
+        ok: true,
+        snapshot,
+        operation: None,
+    }))
 }
 
 pub(crate) async fn cleanup_snapshots(

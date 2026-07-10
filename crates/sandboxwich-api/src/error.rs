@@ -44,6 +44,14 @@ impl ApiError {
         }
     }
 
+    pub(crate) fn conflict_code(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code,
+            message: message.into(),
+        }
+    }
+
     pub(crate) fn unsupported(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_IMPLEMENTED,
@@ -56,6 +64,14 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "internal",
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn not_implemented(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_IMPLEMENTED,
+            code,
             message: message.into(),
         }
     }

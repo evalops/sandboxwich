@@ -556,6 +556,10 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .json()
         .await
         .unwrap();
+    assert_eq!(
+        forked.operation.as_ref().map(|operation| &operation.kind),
+        Some(&OperationKind::ForkSandbox)
+    );
     assert_eq!(forked.sandbox.state, SandboxState::Planning);
     let fork_snapshot_id = forked
         .sandbox
