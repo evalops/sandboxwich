@@ -11,6 +11,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use sandboxwich_core::*;
 use sqlx::Row;
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 pub(crate) const PROBE_PATHS: &[&str] = &["/healthz", "/readyz"];
@@ -185,15 +186,16 @@ pub(crate) fn bearer_token(request: &Request) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
 }
 
+/// Timing-safe byte comparison, backed by the `subtle` crate's
+/// [`ConstantTimeEq`] rather than a hand-rolled loop. `[u8]::ct_eq` still
+/// rejects unequal-length inputs (a cheap, non-secret-dependent length
+/// check), but for equal-length inputs it walks every byte and combines the
+/// per-byte differences without branching or returning early on the first
+/// mismatch -- unlike a naive loop over `0..max(left.len(), right.len())`,
+/// whose iteration count is itself a function of the attacker-supplied
+/// input length.
 pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let max_len = left.len().max(right.len());
-    let mut diff = left.len() ^ right.len();
-    for index in 0..max_len {
-        let left_byte = left.get(index).copied().unwrap_or(0);
-        let right_byte = right.get(index).copied().unwrap_or(0);
-        diff |= usize::from(left_byte ^ right_byte);
-    }
-    diff == 0
+    left.ct_eq(right).into()
 }
 
 pub(crate) fn ensure_tenant(resource_tenant_id: &str, ctx: &TenantContext) -> Result<(), ApiError> {
@@ -391,4 +393,56 @@ pub(crate) fn ensure_operator_authorized_for(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn equal_bytes_match() {
+        assert!(constant_time_eq(
+            b"local-development-token",
+            b"local-development-token"
+        ));
+    }
+
+    #[test]
+    fn unequal_content_same_length_does_not_match() {
+        assert!(!constant_time_eq(
+            b"local-development-token",
+            b"local-development-tokeN"
+        ));
+    }
+
+    #[test]
+    fn different_lengths_never_match() {
+        assert!(!constant_time_eq(
+            b"short",
+            b"a-much-longer-candidate-token"
+        ));
+        assert!(!constant_time_eq(
+            b"a-much-longer-candidate-token",
+            b"short"
+        ));
+    }
+
+    #[test]
+    fn empty_inputs() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(!constant_time_eq(b"x", b""));
+    }
+
+    #[test]
+    fn single_byte_prefix_difference() {
+        // A naive early-exit comparison would return as soon as it hits the
+        // first differing byte; this only checks correctness (not timing),
+        // but it does confirm a differing first byte on otherwise-matching
+        // longer inputs is still detected as unequal.
+        assert!(!constant_time_eq(
+            b"Xandboxwich-token-value",
+            b"sandboxwich-token-value"
+        ));
+    }
 }
