@@ -1902,13 +1902,19 @@ async fn run_kubectl_command_async(
             }
             Ok::<_, std::io::Error>(())
         };
-        tokio::try_join!(
+        let (status, feed_result, stdout_result, stderr_result) = tokio::join!(
             child.wait(),
             feed_stdin,
             stdout_pipe.read_to_end(&mut stdout),
             stderr_pipe.read_to_end(&mut stderr),
-        )
-        .map(|(status, (), _, _)| (status, stdout, stderr))
+        );
+        let status = status?;
+        stdout_result?;
+        stderr_result?;
+        if status.success() {
+            feed_result?;
+        }
+        Ok::<_, std::io::Error>((status, stdout, stderr))
     };
 
     // If the caller's lease renewal is lost while this kubectl invocation is
@@ -3765,10 +3771,12 @@ mod tests {
     /// - appends every invocation's space-joined argv as one line to `log_path`
     ///   (bracketed with leading/trailing spaces so tests can match whole
     ///   tokens like " delete " without false positives on substrings), and
-    /// - drains stdin for the "apply" verb, mirroring how
+    /// - drains stdin for a successful "apply" verb, mirroring how
     ///   `run_kubectl_documents` actually pipes manifests in via stdin so the
     ///   real caller's `write_all` doesn't block on a full pipe;
-    /// - exits non-zero if `fail_verb` is present in argv, and zero otherwise.
+    /// - exits immediately with a non-zero status if `fail_verb` is present in
+    ///   argv, including before draining stdin. This reproduces kubectl closing
+    ///   its input early after an argument/authentication/validation failure.
     ///
     /// This lets rollback behavior be exercised end-to-end (provision/fork
     /// calling through to a real rollback `kubectl delete`) without requiring
@@ -3787,10 +3795,11 @@ mod tests {
         let script = format!(
             "#!/bin/sh\n\
              printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             {fail_check}\
              case \" $* \" in\n\
              \x20\x20*\" apply \"*) cat >/dev/null 2>&1 || true ;;\n\
              esac\n\
-             {fail_check}exit 0\n",
+             exit 0\n",
             log = log_path.display(),
         );
         let script_path = dir.join("kubectl");

@@ -87,6 +87,22 @@ pub(crate) async fn connect_database(
                 sqlx::query("PRAGMA journal_mode = WAL;")
                     .execute(&mut *conn)
                     .await?;
+                // SQLite itself defaults `foreign_keys` to OFF for backward
+                // compatibility, and `sqlx`'s `SqliteConnectOptions` default
+                // (which the `Any` driver used here goes through) currently
+                // overrides that back to ON per connection -- so every
+                // `ON DELETE CASCADE` in the migrations already works on
+                // SQLite as of this sqlx version, verified by
+                // `cleanup::archived_sandbox_cleanup_cascades_dependent_rows_on_sqlite`.
+                // Set it explicitly anyway: relying on an upstream default we
+                // don't control for a correctness property this load-bearing
+                // (archived-sandbox cleanup silently orphaning
+                // commands/events/snapshots/sandbox_files rows if it were
+                // ever OFF) is fragile, and this pragma is idempotent and
+                // free if the default ever changes out from under us.
+                sqlx::query("PRAGMA foreign_keys = ON;")
+                    .execute(&mut *conn)
+                    .await?;
                 Ok(())
             })
         });

@@ -272,6 +272,36 @@ pub(crate) fn job_references(job: &Job) -> Result<JobReferences, ApiError> {
     Ok(references)
 }
 
+/// Floor a client-requested lease duration is clamped against. Zero (or
+/// negative, once cast) would let a lease expire immediately, so the
+/// sweeper could requeue the job before the worker even starts it.
+pub(crate) const MIN_LEASE_SECONDS: u64 = 1;
+
+/// Ceiling a client-requested lease duration is clamped against. Without
+/// this, a `lease_seconds` value greater than `i64::MAX` wraps to a
+/// negative offset when fed to `chrono::Duration::seconds` (an
+/// already-expired lease -- the sweeper requeues the job while the first
+/// worker is still running it, causing duplicate execution), and values
+/// just under that overflow `chrono::Duration::seconds` outright and
+/// panic. Mirrors the `effective_command_timeout_secs` clamp in
+/// `handlers/commands.rs`.
+pub(crate) const MAX_LEASE_SECONDS: u64 = 3600;
+
+/// Default lease duration when a client omits `lease_seconds`.
+pub(crate) const DEFAULT_LEASE_SECONDS: u64 = 60;
+
+/// Clamps a client-requested lease duration to
+/// `[MIN_LEASE_SECONDS, MAX_LEASE_SECONDS]`, falling back to
+/// `DEFAULT_LEASE_SECONDS` when the client omits one. Used by both
+/// `try_claim_job` and `renew_lease` so a lease can never be granted (or
+/// renewed) for an unbounded -- or, after truncation to `i64`, negative --
+/// duration.
+pub(crate) fn effective_lease_seconds(requested: Option<u64>) -> u64 {
+    requested
+        .map(|value| value.clamp(MIN_LEASE_SECONDS, MAX_LEASE_SECONDS))
+        .unwrap_or(DEFAULT_LEASE_SECONDS)
+}
+
 pub(crate) async fn try_claim_job(
     db: &Database,
     worker: &Worker,
@@ -290,7 +320,8 @@ pub(crate) async fn try_claim_job(
 
         let now = Utc::now();
         let attempt = job.attempts + 1;
-        let expires_at = now + chrono::Duration::seconds(lease_seconds.unwrap_or(60) as i64);
+        let expires_at =
+            now + chrono::Duration::seconds(effective_lease_seconds(lease_seconds) as i64);
         let sql = format!(
             "update jobs
              set status = {}, attempts = {}, updated_at = {}

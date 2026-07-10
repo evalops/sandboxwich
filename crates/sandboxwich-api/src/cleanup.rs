@@ -7,6 +7,7 @@ use crate::rows::*;
 use crate::util::*;
 use chrono::Utc;
 use sandboxwich_core::*;
+use sqlx::AnyConnection;
 
 pub(crate) async fn insert_cleanup_run(
     db: &Database,
@@ -239,6 +240,11 @@ pub(crate) async fn cleanup_archived_sandboxes(
         if expires_at.is_some_and(|expires_at| expires_at > now) {
             continue;
         }
+        // Cheap pool-level pre-check: skip opening a transaction at all for
+        // the common case of a sandbox that's obviously still referenced.
+        // This is purely an optimization -- it is *not* what makes the
+        // delete below safe, since the state it observes can be stale by
+        // the time the transaction underneath actually deletes the row.
         if sandbox_snapshot_is_referenced(db, sandbox.id).await? {
             skipped.push(ArchivedSandboxCleanupSkip {
                 sandbox,
@@ -259,6 +265,21 @@ pub(crate) async fn cleanup_archived_sandboxes(
             for resource in &deleted_resources {
                 insert_runtime_resource_tombstone_on_connection(db, &mut tx, resource, now).await?;
             }
+            // Authoritative re-check: run it on the *same* connection as the
+            // delete, as late as possible, right before the delete itself.
+            // The pre-check above runs against the pool before this
+            // transaction even opens, so a concurrent fork (`create_snapshot`
+            // -> `insert_snapshot_on_connection`, which inserts a
+            // `snapshot_restore_sources` row referencing this sandbox) can
+            // land in the gap between that pre-check and this transaction's
+            // commit -- the parent would otherwise get deleted anyway. Doing
+            // the check again here, inside the transaction that performs the
+            // delete, reads a consistent view immediately before the
+            // mutation instead of a possibly-stale one from before the
+            // transaction started.
+            if sandbox_snapshot_is_referenced_on_connection(db, &mut tx, sandbox.id).await? {
+                return Ok(CleanupOutcome::Referenced);
+            }
             let sql = format!(
                 "delete from sandboxes where id = {} and state = 'archived'",
                 db.placeholder(1)
@@ -267,16 +288,26 @@ pub(crate) async fn cleanup_archived_sandboxes(
                 .bind(sandbox.id.to_string())
                 .execute(&mut *tx)
                 .await?;
-            Ok((result.rows_affected() > 0, deleted_resources))
+            if result.rows_affected() == 0 {
+                return Ok(CleanupOutcome::NotFound);
+            }
+            Ok(CleanupOutcome::Deleted(deleted_resources))
         }
         .await;
         match cleaned {
-            Ok((true, deleted_resources)) => {
+            Ok(CleanupOutcome::Deleted(deleted_resources)) => {
                 tx.commit().await?;
                 runtime_resources_deleted.extend(deleted_resources);
                 deleted.push(sandbox);
             }
-            Ok((false, _)) => {
+            Ok(CleanupOutcome::Referenced) => {
+                tx.rollback().await?;
+                skipped.push(ArchivedSandboxCleanupSkip {
+                    sandbox,
+                    reason: "sandbox has active snapshots referenced by restores".to_string(),
+                });
+            }
+            Ok(CleanupOutcome::NotFound) => {
                 tx.rollback().await?;
             }
             Err(error) => {
@@ -295,8 +326,31 @@ pub(crate) async fn cleanup_archived_sandboxes(
     })
 }
 
+/// Outcome of attempting to delete a single archived sandbox inside its own
+/// transaction. Distinguishes "another actor already removed it" (lost race
+/// with a concurrent cleanup run or manual delete -- not an error) from "a
+/// reference showed up since the pool-level pre-check" (the TOCTOU this type
+/// exists to make unrepresentable as a silent delete).
+enum CleanupOutcome {
+    Deleted(Vec<RuntimeResource>),
+    Referenced,
+    NotFound,
+}
+
 pub(crate) async fn sandbox_snapshot_is_referenced(
     db: &Database,
+    sandbox_id: SandboxId,
+) -> Result<bool, ApiError> {
+    let mut connection = db.pool.acquire().await?;
+    sandbox_snapshot_is_referenced_on_connection(db, &mut connection, sandbox_id).await
+}
+
+/// Same check as `sandbox_snapshot_is_referenced`, but run on a caller-owned
+/// connection so it can be issued from inside an in-flight transaction (see
+/// `cleanup_archived_sandboxes`) instead of against the pool.
+pub(crate) async fn sandbox_snapshot_is_referenced_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
     sandbox_id: SandboxId,
 ) -> Result<bool, ApiError> {
     let sql = format!(
@@ -319,7 +373,7 @@ pub(crate) async fn sandbox_snapshot_is_referenced(
         .bind(sandbox_id.to_string())
         .bind(sandbox_id.to_string())
         .bind(chrono::Utc::now().to_rfc3339())
-        .fetch_optional(&db.pool)
+        .fetch_optional(&mut *connection)
         .await?;
     Ok(row.is_some())
 }
