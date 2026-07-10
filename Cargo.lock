@@ -1754,6 +1754,7 @@ name = "sandboxwich-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "reqwest",
  "sandboxwich-core",
