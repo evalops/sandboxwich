@@ -12,8 +12,10 @@ use sandboxwich_core::{CommandRequest, ErrorEnvelope, Operation, OperationRespon
         crate::handlers::commands::queue_prompt,
         crate::handlers::operations::get_operation,
         crate::handlers::operations::cancel_operation
+        ,crate::limits::get_tenant_limit_policy
+        ,crate::limits::put_tenant_limit_policy
     ),
-    components(schemas(CommandRequest, ErrorEnvelope, Operation, OperationResponse)),
+    components(schemas(CommandRequest, ErrorEnvelope, Operation, OperationResponse, crate::limits::TenantLimitPolicy, crate::limits::PutTenantLimitPolicy)),
     tags((name = "operations", description = "Asynchronous operation lifecycle"))
 )]
 pub(crate) struct ApiDoc;
