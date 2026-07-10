@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    io::{Read as _, Write as _},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -10,6 +11,10 @@ use std::{
 };
 
 use anyhow::{Context, bail};
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, OpenOptions},
+};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use sandboxwich_core::{
@@ -608,22 +613,24 @@ async fn write_file(args: FileWriteArgs) -> anyhow::Result<()> {
         );
     }
 
-    let target = confine_to_workspace(&args.workspace_root, &args.path).await?;
-
-    // Refuse to write through an existing non-regular file (directory, symlink, device, ...).
-    if let Ok(metadata) = tokio::fs::symlink_metadata(&target).await
-        && !metadata.is_file()
+    let (workspace, relative, target) = open_workspace(&args.workspace_root, &args.path)?;
+    if let Some(parent) = relative.parent()
+        && !parent.as_os_str().is_empty()
     {
+        workspace.create_dir_all(parent)?;
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    let mut file = workspace
+        .open_with(&relative, &options)
+        .with_context(|| format!("failed to open {} beneath workspace", args.path.display()))?;
+    if !file.metadata()?.is_file() {
         bail!(
             "refusing to write to non-regular file at {}",
             target.display()
         );
     }
-
-    if let Some(parent) = target.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    tokio::fs::write(&target, &content).await?;
+    file.write_all(&content)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&AgentFileWriteRequest {
@@ -635,11 +642,11 @@ async fn write_file(args: FileWriteArgs) -> anyhow::Result<()> {
 }
 
 async fn read_file(args: FileReadArgs) -> anyhow::Result<()> {
-    let target = confine_to_workspace(&args.workspace_root, &args.path).await?;
-
-    let metadata = tokio::fs::symlink_metadata(&target)
-        .await
-        .with_context(|| format!("failed to stat {}", target.display()))?;
+    let (workspace, relative, target) = open_workspace(&args.workspace_root, &args.path)?;
+    let file = workspace
+        .open(&relative)
+        .with_context(|| format!("failed to open {} beneath workspace", args.path.display()))?;
+    let metadata = file.metadata()?;
     if !metadata.is_file() {
         bail!("refusing to read non-regular file at {}", target.display());
     }
@@ -651,7 +658,15 @@ async fn read_file(args: FileReadArgs) -> anyhow::Result<()> {
         );
     }
 
-    let content = tokio::fs::read(&target).await?;
+    let mut content = Vec::with_capacity(metadata.len().min(args.max_bytes) as usize);
+    file.take(args.max_bytes.saturating_add(1))
+        .read_to_end(&mut content)?;
+    if content.len() as u64 > args.max_bytes {
+        bail!(
+            "refusing to read a file that grew beyond max-bytes limit of {}",
+            args.max_bytes
+        );
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&AgentFileReadResponse {
@@ -684,64 +699,37 @@ fn normalize_workspace_relative(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(normalized)
 }
 
-/// Resolves `requested` against `workspace_root`, confining the result to that root.
-///
-/// Rejects `..` components, absolute paths outside the root, and symlinks (at any ancestor,
-/// or at the target itself) that would otherwise let the resolved path escape the root once
-/// the filesystem follows them.
-async fn confine_to_workspace(workspace_root: &Path, requested: &Path) -> anyhow::Result<PathBuf> {
-    let canonical_root = tokio::fs::canonicalize(workspace_root)
-        .await
-        .with_context(|| {
+/// Opens the workspace as a directory capability and returns a normalized relative path.
+/// All subsequent filesystem resolution is descriptor-relative, so replacing any ancestor
+/// with a symlink between validation and use cannot redirect the operation outside this handle.
+fn open_workspace(
+    workspace_root: &Path,
+    requested: &Path,
+) -> anyhow::Result<(Dir, PathBuf, PathBuf)> {
+    let relative = if requested.is_absolute() {
+        requested
+            .strip_prefix(workspace_root)
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "path {} is outside workspace root {}",
+                    requested.display(),
+                    workspace_root.display()
+                )
+            })?
+            .to_path_buf()
+    } else {
+        requested.to_path_buf()
+    };
+    let relative = normalize_workspace_relative(&relative)?;
+    let workspace =
+        Dir::open_ambient_dir(workspace_root, ambient_authority()).with_context(|| {
             format!(
                 "workspace root {} is not accessible",
                 workspace_root.display()
             )
         })?;
-
-    let relative: &Path = if requested.is_absolute() {
-        requested
-            .strip_prefix(workspace_root)
-            .or_else(|_| requested.strip_prefix(&canonical_root))
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "path {} is outside workspace root {}",
-                    requested.display(),
-                    canonical_root.display()
-                )
-            })?
-    } else {
-        requested
-    };
-
-    let normalized = normalize_workspace_relative(relative)?;
-    let joined = canonical_root.join(&normalized);
-
-    // Walk up to the nearest ancestor that already exists on disk and canonicalize it, to
-    // catch a symlink planted at any intermediate directory (or at the target itself) that
-    // would otherwise let the join above resolve outside the workspace root.
-    let mut probe = joined.clone();
-    let existing_ancestor = loop {
-        if tokio::fs::try_exists(&probe).await.unwrap_or(false) {
-            break probe;
-        }
-        match probe.parent() {
-            Some(parent) if parent != probe => probe = parent.to_path_buf(),
-            _ => break canonical_root.clone(),
-        }
-    };
-    let canonical_ancestor = tokio::fs::canonicalize(&existing_ancestor)
-        .await
-        .with_context(|| format!("failed to canonicalize {}", existing_ancestor.display()))?;
-    if !canonical_ancestor.starts_with(&canonical_root) {
-        bail!(
-            "path {} escapes workspace root {} via a symlink",
-            requested.display(),
-            canonical_root.display()
-        );
-    }
-
-    Ok(joined)
+    let display_path = workspace_root.join(&relative);
+    Ok((workspace, relative, display_path))
 }
 
 async fn claim_lease(
@@ -1407,19 +1395,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confine_to_workspace_rejects_dot_dot_traversal() {
+    async fn workspace_capability_rejects_dot_dot_traversal() {
         let workspace = TempWorkspace::new();
 
-        let result = confine_to_workspace(workspace.path(), Path::new("../escape.txt")).await;
+        let result = open_workspace(workspace.path(), Path::new("../escape.txt"));
 
         assert!(result.is_err(), "'..' traversal should be rejected");
     }
 
     #[tokio::test]
-    async fn confine_to_workspace_rejects_absolute_path_outside_root() {
+    async fn workspace_capability_rejects_absolute_path_outside_root() {
         let workspace = TempWorkspace::new();
 
-        let result = confine_to_workspace(workspace.path(), Path::new("/etc/passwd")).await;
+        let result = open_workspace(workspace.path(), Path::new("/etc/passwd"));
 
         assert!(
             result.is_err(),
@@ -1428,14 +1416,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confine_to_workspace_rejects_symlink_escape() {
+    async fn workspace_capability_rejects_symlink_escape() {
         let workspace = TempWorkspace::new();
         let outside = TempWorkspace::new();
         let link_path = workspace.path().join("escape-link");
         std::os::unix::fs::symlink(outside.path(), &link_path).expect("failed to create symlink");
+        std::fs::write(outside.path().join("payload.txt"), b"secret").unwrap();
 
-        let result =
-            confine_to_workspace(workspace.path(), Path::new("escape-link/payload.txt")).await;
+        let result = read_file(FileReadArgs {
+            path: PathBuf::from("escape-link/payload.txt"),
+            workspace_root: workspace.path().to_path_buf(),
+            max_bytes: DEFAULT_MAX_FILE_BYTES,
+        })
+        .await;
 
         assert!(
             result.is_err(),
@@ -1444,16 +1437,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confine_to_workspace_allows_nested_relative_path() {
+    async fn workspace_capability_allows_nested_relative_path() {
         let workspace = TempWorkspace::new();
 
-        let resolved = confine_to_workspace(workspace.path(), Path::new("nested/file.txt"))
-            .await
-            .expect("a plain nested relative path should resolve inside the workspace root");
+        let (_workspace, relative, resolved) =
+            open_workspace(workspace.path(), Path::new("nested/file.txt"))
+                .expect("a plain nested relative path should resolve inside the workspace root");
 
-        let canonical_root = tokio::fs::canonicalize(workspace.path()).await.unwrap();
-        assert!(resolved.starts_with(&canonical_root));
+        assert_eq!(relative, Path::new("nested/file.txt"));
+        assert!(resolved.starts_with(workspace.path()));
         assert_eq!(resolved.file_name().unwrap(), "file.txt");
+    }
+
+    #[test]
+    fn workspace_descriptor_cannot_be_redirected_after_open() {
+        let workspace = TempWorkspace::new();
+        let outside = TempWorkspace::new();
+        std::fs::write(workspace.path().join("payload.txt"), b"inside").unwrap();
+        std::fs::write(outside.path().join("payload.txt"), b"outside-secret").unwrap();
+
+        let (directory, relative, _) =
+            open_workspace(workspace.path(), Path::new("payload.txt")).unwrap();
+        let moved_root = workspace.path().with_extension("moved");
+        std::fs::rename(workspace.path(), &moved_root).unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path()).unwrap();
+
+        let mut content = String::new();
+        directory
+            .open(relative)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        assert_eq!(
+            content, "inside",
+            "descriptor-relative lookup must stay bound to the opened workspace"
+        );
+
+        std::fs::remove_file(workspace.path()).unwrap();
+        std::fs::rename(moved_root, workspace.path()).unwrap();
     }
 
     #[tokio::test]
@@ -1509,7 +1530,10 @@ mod tests {
         .await
         .expect_err("writing through an existing directory should be rejected");
 
-        assert!(error.to_string().contains("non-regular file"));
+        assert!(
+            error.to_string().contains("failed to open")
+                || error.to_string().contains("non-regular file")
+        );
     }
 
     #[tokio::test]

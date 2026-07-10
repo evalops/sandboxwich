@@ -43,6 +43,20 @@ pub(crate) async fn claim_lease(
                 .map_err(|_| ApiError::bad_request("idempotency-key must be a UUID"))
         })
         .transpose()?;
+    let requested_job_id = headers
+        .get("x-sandboxwich-job-id")
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| ApiError::bad_request("invalid x-sandboxwich-job-id"))
+        })
+        .transpose()?
+        .map(|value| {
+            Uuid::parse_str(value)
+                .map(JobId)
+                .map_err(|_| ApiError::bad_request("x-sandboxwich-job-id must be a UUID"))
+        })
+        .transpose()?;
     if let Some(operation_id) = operation_id
         && let Some(lease) = fetch_claim_operation(&state.db, worker_id, operation_id).await?
     {
@@ -67,6 +81,9 @@ pub(crate) async fn claim_lease(
         .map(|index| state.db.placeholder(index + 3))
         .collect::<Vec<_>>()
         .join(", ");
+    let requested_job_filter = requested_job_id
+        .map(|_| format!(" and id = {}", state.db.placeholder(capabilities.len() + 6)))
+        .unwrap_or_default();
     let sql = format!(
         "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
@@ -81,6 +98,7 @@ pub(crate) async fn claim_lease(
                  and (p.worker_id = {} or (p.provider = {} and (p.cluster is null or p.cluster = {})))
              )
            )
+         {requested_job_filter}
          order by priority desc, scheduled_at asc, created_at asc, id asc
          limit 25",
         state.db.placeholder(1),
@@ -98,9 +116,15 @@ pub(crate) async fn claim_lease(
     let rows = query
         .bind(worker.id.to_string())
         .bind(&worker.provider)
-        .bind(worker.labels.get("cluster").cloned().unwrap_or_default())
-        .fetch_all(&state.db.pool)
-        .await?;
+        .bind(worker.labels.get("cluster").cloned().unwrap_or_default());
+    let rows = match requested_job_id {
+        Some(job_id) => {
+            rows.bind(job_id.to_string())
+                .fetch_all(&state.db.pool)
+                .await?
+        }
+        None => rows.fetch_all(&state.db.pool).await?,
+    };
 
     for row in rows {
         let job = row_to_job(row)?;

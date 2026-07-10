@@ -12,6 +12,7 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+cap-std.workspace = true
 clap.workspace = true
 reqwest.workspace = true
 sandboxwich-core.workspace = true
