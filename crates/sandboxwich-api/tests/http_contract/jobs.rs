@@ -75,6 +75,294 @@ pub(crate) async fn job_can_be_fetched_by_id_with_tenant_isolation() {
     assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
 }
 
+/// Registers a worker capable of `ProvisionSandbox`, `RunCommand`, and `K8sPod`
+/// jobs against `server`, returning it. Shared by the claim-filter tests below.
+async fn register_claim_filter_worker(
+    client: &reqwest::Client,
+    server: &TestServer,
+) -> WorkerResponse {
+    client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "claim-filter-worker".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![
+                WorkerCapability::K8sPod,
+                WorkerCapability::ProvisionSandbox,
+                WorkerCapability::RunCommand,
+            ],
+            max_concurrent_jobs: Some(4),
+            labels: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+async fn create_sandbox(
+    client: &reqwest::Client,
+    server: &TestServer,
+    name: &str,
+) -> SandboxResponse {
+    client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some(name.to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+fn payload_sandbox_id(job: &Job) -> SandboxId {
+    serde_json::from_value(job.payload["sandboxId"].clone())
+        .expect("job payload must carry a sandboxId")
+}
+
+/// The guest-side agent daemon claims leases from `POST
+/// /workers/{worker_id}/leases/claim` with an optional `sandbox_id` filter so
+/// it never runs a job destined for a different sandbox inside its own
+/// filesystem/environment. Prove the filter actually narrows what the claim
+/// endpoint returns: two sandboxes each have a queued (auto-created)
+/// `ProvisionSandbox` job, and claiming with `sandbox_id` set to the
+/// *second*-created sandbox must still return that sandbox's job -- not the
+/// first-created one, which is what unfiltered FIFO claim order would return.
+#[tokio::test]
+pub(crate) async fn claim_lease_sandbox_filter_excludes_other_sandbox_jobs() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("sandboxwich-claim-sandbox-filter-test.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+
+    let sandbox_a = create_sandbox(&client, &server, "claim-filter-a").await;
+    let sandbox_b = create_sandbox(&client, &server, "claim-filter-b").await;
+    let worker = register_claim_filter_worker(&client, &server).await;
+    let worker_client = worker_client(&worker);
+
+    // Unfiltered claim order is FIFO (scheduled_at asc), so without the
+    // sandbox_id filter this claim would return sandbox_a's job, created first.
+    let claimed: ClaimLeaseResponse = worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox_b.sandbox.id),
+            kinds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claimed
+        .lease
+        .expect("expected a lease for sandbox_b's provision job");
+    assert_eq!(lease.job.kind, JobKind::ProvisionSandbox);
+    assert_eq!(payload_sandbox_id(&lease.job), sandbox_b.sandbox.id);
+
+    // sandbox_a's job is still queued and untouched by the filtered claim above.
+    let claimed_a: ClaimLeaseResponse = worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox_a.sandbox.id),
+            kinds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease_a = claimed_a
+        .lease
+        .expect("expected a lease for sandbox_a's provision job");
+    assert_eq!(payload_sandbox_id(&lease_a.job), sandbox_a.sandbox.id);
+}
+
+/// Companion to `claim_lease_sandbox_filter_excludes_other_sandbox_jobs`: proves
+/// the `kinds` filter (used by `sandboxwich-agent`'s daemon to claim only
+/// `run_command` leases, never a `ProvisionSandbox`/`Snapshot`/`Fork` job it
+/// can't execute) excludes other kinds even when they would otherwise be
+/// claimed first.
+#[tokio::test]
+pub(crate) async fn claim_lease_kinds_filter_excludes_other_kinds() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("sandboxwich-claim-kinds-filter-test.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+    let worker = register_claim_filter_worker(&client, &server).await;
+    let worker_client = worker_client(&worker);
+
+    // Creating sandbox_a auto-queues a ProvisionSandbox job; ProvisionSandbox
+    // jobs are claimable without a sandbox_placements row (see the `kind in
+    // ('provision_sandbox', ...)` exemption in claim_lease's query), so this
+    // claim succeeds immediately and -- as a side effect of try_claim_job --
+    // records a sandbox_placement binding sandbox_a to this worker, which
+    // RunCommand jobs require.
+    let sandbox_a = create_sandbox(&client, &server, "claim-filter-kinds-a").await;
+    let provision_a: ClaimLeaseResponse = worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: Some(vec![JobKind::ProvisionSandbox]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        provision_a
+            .lease
+            .expect("expected sandbox_a's provision job")
+            .job
+            .kind,
+        JobKind::ProvisionSandbox
+    );
+
+    // sandbox_b's auto-queued ProvisionSandbox job is created next (and stays
+    // queued, unclaimed) so it is the earlier-scheduled "other kind" job that
+    // an unfiltered claim would return ahead of the RunCommand job queued
+    // after it.
+    create_sandbox(&client, &server, "claim-filter-kinds-b").await;
+
+    // Now that sandbox_a has a placement, its RunCommand job (queued last) is
+    // claimable by this worker.
+    let command: QueueCommandResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/commands",
+            server.base_url, sandbox_a.sandbox.id
+        ))
+        .json(&CommandRequest {
+            argv: vec!["echo".to_string(), "hi".to_string()],
+            cwd: None,
+            env: Default::default(),
+            timeout_secs: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let claimed: ClaimLeaseResponse = worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: Some(vec![JobKind::RunCommand]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claimed
+        .lease
+        .expect("expected the run_command job despite sandbox_b's earlier-scheduled provision job");
+    assert_eq!(lease.job.kind, JobKind::RunCommand);
+    assert_eq!(lease.job.id, command.queued_job.id);
+}
+
+/// Companion to the two filtered-claim tests above: an unfiltered claim
+/// (`sandbox_id: None, kinds: None`) must keep working exactly as it did before
+/// filters existed, since every non-`sandboxwich-agent` caller (the host-side
+/// `sandboxwich-worker`, and every existing test) relies on that.
+#[tokio::test]
+pub(crate) async fn claim_lease_without_filters_still_claims_any_matching_job() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("sandboxwich-claim-unfiltered-test.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+
+    let sandbox = create_sandbox(&client, &server, "claim-filter-unfiltered").await;
+    let worker = register_claim_filter_worker(&client, &server).await;
+    let worker_client = worker_client(&worker);
+
+    let claimed: ClaimLeaseResponse = worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claimed
+        .lease
+        .expect("unfiltered claim should still return the queued provision job");
+    assert_eq!(lease.job.kind, JobKind::ProvisionSandbox);
+    assert_eq!(payload_sandbox_id(&lease.job), sandbox.sandbox.id);
+}
+
 pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
     client: &reqwest::Client,
     server: &TestServer,
@@ -111,6 +399,8 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
         .header("idempotency-key", claim_operation_id.to_string())
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await
@@ -133,6 +423,8 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
         .header("idempotency-key", claim_operation_id.to_string())
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await
@@ -232,6 +524,8 @@ pub(crate) async fn assert_retryable_failure_requeues_command(
         ))
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await
@@ -308,6 +602,8 @@ pub(crate) async fn assert_retryable_failure_requeues_command(
         ))
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await
@@ -411,6 +707,8 @@ pub(crate) async fn assert_command_status_is_derived_from_exit_code(
             ))
             .json(&ClaimLeaseRequest {
                 lease_seconds: Some(60),
+                sandbox_id: None,
+                kinds: None,
             })
             .send()
             .await
@@ -522,6 +820,8 @@ pub(crate) async fn assert_expired_lease_requeues_command(
         ))
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(0),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await

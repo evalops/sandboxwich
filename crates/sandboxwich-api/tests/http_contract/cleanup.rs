@@ -141,6 +141,8 @@ async fn archived_sandbox_cleanup_cascades_dependent_rows_on_sqlite() {
         ))
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await
