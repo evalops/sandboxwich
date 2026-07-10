@@ -37,6 +37,8 @@ pub(crate) async fn assert_provision_job_persists_runtime_resources(
             ))
             .json(&ClaimLeaseRequest {
                 lease_seconds: Some(60),
+                sandbox_id: None,
+                kinds: None,
             })
             .send()
             .await
@@ -299,6 +301,8 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
         ))
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await
@@ -478,6 +482,8 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
         ))
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await
@@ -608,6 +614,8 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .header("x-sandboxwich-job-id", fork_snapshot_job.id.to_string())
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await
@@ -694,6 +702,8 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .header("x-sandboxwich-job-id", fork_job.id.to_string())
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await
@@ -828,6 +838,8 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .header("x-sandboxwich-job-id", failed_snapshot_job.id.to_string())
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await

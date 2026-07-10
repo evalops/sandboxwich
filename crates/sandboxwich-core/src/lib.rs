@@ -1612,6 +1612,24 @@ pub struct CreateJobRequest {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClaimLeaseRequest {
     pub lease_seconds: Option<u64>,
+    /// Restrict claimable jobs to the given sandbox (matched against the job's own
+    /// sandbox, or its fork parent/child sandbox). `None` preserves the previous
+    /// behavior of claiming any job the worker's capabilities allow.
+    ///
+    /// This is advisory, not a security boundary: the guest agent and the worker
+    /// it runs under share one worker-scoped token (see `sandboxwich-agent`'s
+    /// `--sandbox-id`), so a malicious or compromised guest can simply omit this
+    /// filter and claim any job the shared token's capabilities allow. The
+    /// server-side filtering below narrows the *default* blast radius of a
+    /// well-behaved agent claiming the wrong job; it does not stop an
+    /// adversarial one. A real fix needs per-sandbox claim tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_id: Option<SandboxId>,
+    /// Restrict claimable jobs to one of the given kinds. `None` preserves the
+    /// previous behavior of claiming any kind the worker's capabilities allow.
+    /// Same advisory caveat as `sandbox_id` above applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kinds: Option<Vec<JobKind>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

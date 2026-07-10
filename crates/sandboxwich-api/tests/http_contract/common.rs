@@ -258,6 +258,8 @@ pub(crate) async fn run_contract(server: TestServer) {
         ))
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await
@@ -367,6 +369,8 @@ pub(crate) async fn run_contract(server: TestServer) {
         ))
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await
@@ -517,6 +521,8 @@ pub(crate) async fn run_contract(server: TestServer) {
         ))
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await
@@ -550,6 +556,8 @@ pub(crate) async fn run_contract(server: TestServer) {
         ))
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await
@@ -685,6 +693,8 @@ pub(crate) async fn run_contract(server: TestServer) {
         ))
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await

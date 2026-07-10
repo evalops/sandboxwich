@@ -209,6 +209,8 @@ async fn stop_before_first_provision_is_claimable_and_cannot_be_undone() {
         ))
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await
@@ -246,6 +248,8 @@ async fn stop_before_first_provision_is_claimable_and_cannot_be_undone() {
         ))
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await
@@ -546,6 +550,8 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
         ))
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await
@@ -603,6 +609,8 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
         ))
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await
@@ -685,6 +693,8 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
         ))
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await

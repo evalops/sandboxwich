@@ -111,6 +111,8 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
         .header("idempotency-key", claim_operation_id.to_string())
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await
@@ -133,6 +135,8 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
         .header("idempotency-key", claim_operation_id.to_string())
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await
@@ -232,6 +236,8 @@ pub(crate) async fn assert_retryable_failure_requeues_command(
         ))
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await
@@ -308,6 +314,8 @@ pub(crate) async fn assert_retryable_failure_requeues_command(
         ))
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await
@@ -391,6 +399,8 @@ pub(crate) async fn assert_expired_lease_requeues_command(
         ))
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(0),
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await

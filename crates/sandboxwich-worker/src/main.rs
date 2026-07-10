@@ -849,6 +849,13 @@ async fn claim(
         )
         .json(&ClaimLeaseRequest {
             lease_seconds: args.lease_seconds,
+            // The host-side worker legitimately dispatches every job kind and sandbox
+            // its capabilities cover (it's what runs `kubectl exec` etc. on behalf of
+            // whichever sandbox a job targets), so it intentionally claims unfiltered
+            // -- unlike `sandboxwich-agent`'s guest daemon, which scopes claims to its
+            // own sandbox and to `run_command` only.
+            sandbox_id: None,
+            kinds: None,
         })
         .send()
         .await?;
