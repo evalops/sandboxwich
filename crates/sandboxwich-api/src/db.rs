@@ -3,9 +3,12 @@ use anyhow::Context;
 use chrono::Utc;
 use sandboxwich_core::*;
 use sqlx::Row;
-use sqlx::any::AnyPoolOptions;
+use sqlx::any::{AnyArguments, AnyPoolOptions, AnyRow};
+use sqlx::encode::Encode;
 use sqlx::migrate::MigrateDatabase;
-use sqlx::{Any, AnyPool, QueryBuilder, Sqlite};
+use sqlx::types::Type;
+use sqlx::{Any, AnyPool, Arguments, Sqlite};
+use std::fmt::{Display, Write as _};
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -608,10 +611,17 @@ impl SqlDialect {
 
 impl Database {
     /// Starts a database-portable query whose values are bound as SQL is assembled.
-    /// `QueryBuilder<Any>` owns placeholder numbering, so dynamic lists cannot drift
-    /// from a separate hand-built placeholder string.
-    pub(crate) fn query_builder<'args>(&self, sql: &'args str) -> QueryBuilder<'args, Any> {
-        QueryBuilder::new(sql)
+    ///
+    /// Unlike `sqlx::QueryBuilder<Any>`, this formats dialect-correct placeholders
+    /// (`$n` for Postgres, `?` for SQLite). `QueryBuilder<Any>` always emits `?`,
+    /// which Postgres rejects at execution time.
+    pub(crate) fn query_builder<'args>(&self, sql: impl Into<String>) -> PortableQueryBuilder<'args> {
+        PortableQueryBuilder {
+            sql: sql.into(),
+            arguments: AnyArguments::default(),
+            dialect: self.dialect,
+            next_placeholder: 1,
+        }
     }
 
     pub(crate) fn placeholder(&self, index: usize) -> String {
@@ -626,5 +636,129 @@ impl Database {
             .map(|index| self.placeholder(index))
             .collect::<Vec<_>>()
             .join(", ")
+    }
+}
+
+/// Runtime query builder that keeps dynamic bind lists aligned with dialect
+/// placeholder numbering for both Postgres and SQLite via `sqlx::Any`.
+pub(crate) struct PortableQueryBuilder<'args> {
+    sql: String,
+    arguments: AnyArguments<'args>,
+    dialect: SqlDialect,
+    next_placeholder: usize,
+}
+
+impl<'args> PortableQueryBuilder<'args> {
+    pub(crate) fn push(&mut self, sql: impl Display) -> &mut Self {
+        write!(self.sql, "{sql}").expect("query SQL write");
+        self
+    }
+
+    pub(crate) fn push_bind<T>(&mut self, value: T) -> &mut Self
+    where
+        T: 'args + Encode<'args, Any> + Type<Any>,
+    {
+        match self.dialect {
+            SqlDialect::Postgres => {
+                write!(self.sql, "${}", self.next_placeholder).expect("placeholder write");
+            }
+            SqlDialect::Sqlite => {
+                self.sql.push('?');
+            }
+        }
+        self.next_placeholder += 1;
+        self.arguments
+            .add(value)
+            .expect("portable query bind encode");
+        self
+    }
+
+    pub(crate) fn separated(&mut self, separator: &'static str) -> PortableSeparated<'_, 'args> {
+        PortableSeparated {
+            builder: self,
+            separator,
+            push_separator: false,
+        }
+    }
+
+    pub(crate) fn build(self) -> PortableQuery<'args> {
+        PortableQuery {
+            sql: self.sql,
+            arguments: self.arguments,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sql(&self) -> &str {
+        &self.sql
+    }
+}
+
+pub(crate) struct PortableSeparated<'qb, 'args> {
+    builder: &'qb mut PortableQueryBuilder<'args>,
+    separator: &'static str,
+    push_separator: bool,
+}
+
+impl<'qb, 'args> PortableSeparated<'qb, 'args> {
+    pub(crate) fn push_bind<T>(&mut self, value: T) -> &mut Self
+    where
+        T: 'args + Encode<'args, Any> + Type<Any>,
+    {
+        if self.push_separator {
+            self.builder.push(self.separator);
+        } else {
+            self.push_separator = true;
+        }
+        self.builder.push_bind(value);
+        self
+    }
+}
+
+pub(crate) struct PortableQuery<'args> {
+    sql: String,
+    arguments: AnyArguments<'args>,
+}
+
+impl<'args> PortableQuery<'args> {
+    pub(crate) async fn fetch_all<'c, E>(self, executor: E) -> Result<Vec<AnyRow>, sqlx::Error>
+    where
+        E: sqlx::Executor<'c, Database = Any>,
+    {
+        let PortableQuery { sql, arguments } = self;
+        sqlx::query_with(&sql, arguments).fetch_all(executor).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn builder(dialect: SqlDialect, sql: &str) -> PortableQueryBuilder<'static> {
+        PortableQueryBuilder {
+            sql: sql.to_string(),
+            arguments: AnyArguments::default(),
+            dialect,
+            next_placeholder: 1,
+        }
+    }
+
+    #[test]
+    fn portable_query_builder_uses_postgres_placeholders() {
+        let mut query = builder(SqlDialect::Postgres, "select 1 where a = ");
+        query.push_bind("one").push(" and b in (");
+        {
+            let mut values = query.separated(", ");
+            values.push_bind("two").push_bind("three");
+        }
+        query.push(")");
+        assert_eq!(query.sql(), "select 1 where a = $1 and b in ($2, $3)");
+    }
+
+    #[test]
+    fn portable_query_builder_uses_sqlite_placeholders() {
+        let mut query = builder(SqlDialect::Sqlite, "select 1 where a = ");
+        query.push_bind("one").push(" and b = ").push_bind("two");
+        assert_eq!(query.sql(), "select 1 where a = ? and b = ?");
     }
 }
