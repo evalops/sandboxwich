@@ -18,6 +18,8 @@ mod desktop;
 mod idempotency;
 #[path = "http_contract/jobs.rs"]
 mod jobs;
+#[path = "http_contract/limits.rs"]
+mod limits;
 #[path = "http_contract/metrics.rs"]
 mod metrics;
 #[path = "http_contract/public_api.rs"]

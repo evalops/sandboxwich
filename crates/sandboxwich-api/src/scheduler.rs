@@ -4,6 +4,7 @@ use crate::handlers::leases::*;
 use crate::handlers::snapshots::*;
 use crate::handlers::workers::*;
 use crate::idempotency::expire_idempotency_records;
+use crate::limits::expire_tenant_limit_counters;
 use std::time::Duration;
 
 /// Runs the lease/snapshot/desktop-session expiry sweeps on a fixed interval in
@@ -42,6 +43,9 @@ pub(crate) fn spawn_expiry_sweeper(
             }
             if let Err(error) = expire_idempotency_records(&db).await {
                 tracing::warn!(?error, "idempotency retention sweep failed");
+            }
+            if let Err(error) = expire_tenant_limit_counters(&db).await {
+                tracing::warn!(?error, "tenant limit counter retention sweep failed");
             }
         }
     })
