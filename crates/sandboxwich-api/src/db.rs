@@ -65,8 +65,12 @@ pub(crate) async fn connect_database(
         Sqlite::create_database(database_url).await?;
     }
 
+    let pool_max_connections = match dialect {
+        SqlDialect::Sqlite => 1,
+        SqlDialect::Postgres => max_connections,
+    };
     let mut pool_options = AnyPoolOptions::new()
-        .max_connections(max_connections)
+        .max_connections(pool_max_connections)
         .acquire_timeout(Duration::from_secs(10))
         .idle_timeout(Some(Duration::from_secs(5 * 60)));
 
@@ -736,6 +740,7 @@ impl<'args> PortableQuery<'args> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::timeout;
 
     fn builder(dialect: SqlDialect, sql: &str) -> PortableQueryBuilder<'static> {
         PortableQueryBuilder {
@@ -744,6 +749,24 @@ mod tests {
             dialect,
             next_placeholder: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn sqlite_pool_serializes_connections() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}",
+            data_dir.path().join("serialized-pool.db").display()
+        );
+        let db = connect_database(&database_url, 5).await.unwrap();
+        let _connection = db.pool.acquire().await.unwrap();
+
+        assert!(
+            timeout(Duration::from_millis(50), db.pool.acquire())
+                .await
+                .is_err(),
+            "SQLite must expose only one pooled connection so deferred read transactions cannot race writer transactions"
+        );
     }
 
     #[test]
