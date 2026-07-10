@@ -77,54 +77,52 @@ pub(crate) async fn claim_lease(
             lease: None,
         }));
     }
-    let capability_placeholders = (0..capabilities.len())
-        .map(|index| state.db.placeholder(index + 3))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let requested_job_filter = requested_job_id
-        .map(|_| format!(" and id = {}", state.db.placeholder(capabilities.len() + 6)))
-        .unwrap_or_default();
-    let sql = format!(
+    let mut query = state.db.query_builder(
         "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
          from jobs
-         where tenant_id = {} and status = 'queued' and scheduled_at <= {}
-           and required_capability in ({capability_placeholders})
+         where tenant_id = ",
+    );
+    query
+        .push_bind(&worker.tenant_id)
+        .push(" and status = 'queued' and scheduled_at <= ")
+        .push_bind(now.to_rfc3339())
+        .push(" and required_capability in (");
+    {
+        let mut required = query.separated(", ");
+        for capability in capabilities {
+            required.push_bind(capability);
+        }
+    }
+    query
+        .push(
+            ")
            and (
              kind in ('provision_sandbox', 'run_prompt', 'stop_sandbox')
              or exists (
                select 1 from sandbox_placements p
                where p.sandbox_id = coalesce(jobs.sandbox_id, jobs.parent_sandbox_id)
-                 and (p.worker_id = {} or (p.provider = {} and (p.cluster is null or p.cluster = {})))
+                 and (p.worker_id = ",
+        )
+        .push_bind(worker.id.to_string())
+        .push(" or (p.provider = ")
+        .push_bind(&worker.provider)
+        .push(" and (p.cluster is null or p.cluster = ")
+        .push_bind(worker.labels.get("cluster").cloned().unwrap_or_default())
+        .push(
+            ")))
              )
-           )
-         {requested_job_filter}
+           )",
+        );
+    if let Some(job_id) = requested_job_id {
+        query.push(" and id = ").push_bind(job_id.to_string());
+    }
+    query.push(
+        "
          order by priority desc, scheduled_at asc, created_at asc, id asc
          limit 25",
-        state.db.placeholder(1),
-        state.db.placeholder(2),
-        state.db.placeholder(capabilities.len() + 3),
-        state.db.placeholder(capabilities.len() + 4),
-        state.db.placeholder(capabilities.len() + 5)
     );
-    let mut query = sqlx::query(&sql)
-        .bind(&worker.tenant_id)
-        .bind(now.to_rfc3339());
-    for capability in capabilities {
-        query = query.bind(capability);
-    }
-    let rows = query
-        .bind(worker.id.to_string())
-        .bind(&worker.provider)
-        .bind(worker.labels.get("cluster").cloned().unwrap_or_default());
-    let rows = match requested_job_id {
-        Some(job_id) => {
-            rows.bind(job_id.to_string())
-                .fetch_all(&state.db.pool)
-                .await?
-        }
-        None => rows.fetch_all(&state.db.pool).await?,
-    };
+    let rows = query.build().fetch_all(&state.db.pool).await?;
 
     for row in rows {
         let job = row_to_job(row)?;
