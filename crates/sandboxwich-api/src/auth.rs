@@ -382,8 +382,7 @@ pub(crate) fn ensure_operator_authorized_for(
 ) -> Result<(), ApiError> {
     if state.auth.operator_token.is_none() {
         return Err(ApiError::internal(format!(
-            "{operation} is disabled: set SANDBOXWICH_OPERATOR_TOKEN to a dedicated operator \
-             credential (distinct from tenant tokens) to enable {endpoint}"
+            "{operation} is disabled: set SANDBOXWICH_OPERATOR_TOKEN to a dedicated operator              credential (distinct from tenant tokens) to enable {endpoint}"
         )));
     }
     if !is_operator_request(state, headers) {
