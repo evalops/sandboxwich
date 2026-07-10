@@ -15,6 +15,19 @@ use std::time::Duration;
 
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const IDEMPOTENCY_RETENTION_HOURS: i64 = 24;
+// This lease bounds how long a duplicate request will be told
+// `409 idempotency_in_progress` (see `replay_or_wait`) before the sweeper
+// (`expire_idempotency_records`) reclaims an abandoned "processing" row and
+// lets a fresh attempt through. It is *not* a timeout on the handler itself
+// -- nothing here cancels `next.run(request)` -- so it is only safe as long
+// as no handler this middleware wraps can plausibly still be running after
+// five minutes. That holds today: `enforce_idempotency` is only mounted on
+// `tenant_routes` (see `routes.rs`), and every one of those handlers does a
+// bounded number of local DB reads/writes and, for anything long-running
+// (provisioning, commands, snapshots, forks), enqueues a `Job` and returns
+// `202` immediately rather than waiting on worker/provider execution. If a
+// future route under this middleware can legitimately run long, this lease
+// needs to be renewed periodically instead of left as a fixed bound.
 const PROCESSING_LEASE_MINUTES: i64 = 5;
 const MAX_IDEMPOTENT_REQUEST_BYTES: usize = crate::routes::DEFAULT_BODY_LIMIT_BYTES;
 const MAX_STORED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -146,10 +159,48 @@ pub(crate) async fn enforce_idempotency(
         }
         return stored.into_response();
     }
-    if let Err(error) = complete_record(&state.db, &context.tenant_id, &key, &stored).await {
-        tracing::error!(?error, tenant_id = %context.tenant_id, "failed to persist idempotent response");
-    }
+    finalize_completed_record(&state.db, &context.tenant_id, &key, &stored).await;
     stored.into_response()
+}
+
+/// Persists the response for a request that finished executing so a
+/// duplicate can replay it later. If that persist fails, the mutation this
+/// request performed has already committed (we're past `next.run`), but
+/// without a stored response there's nothing valid to replay -- so instead
+/// of leaving the record `processing` (which would make every duplicate
+/// wait out the rest of `PROCESSING_LEASE_MINUTES` behind `409
+/// idempotency_in_progress` only to *still* trigger a second, unreplayed
+/// execution once the sweeper reclaims it), delete the record immediately.
+/// A duplicate that arrives after this will insert a fresh `processing` row
+/// and re-execute right away instead of blocking first. That is still a
+/// second execution -- there is no cached response to fall back to -- but
+/// it is immediate and logged instead of silently delayed, and callers that
+/// care about that risk can already tell from the error rate on this path.
+async fn finalize_completed_record(
+    db: &Database,
+    tenant: &str,
+    key: &str,
+    stored: &StoredResponse,
+) {
+    let Err(error) = complete_record(db, tenant, key, stored).await else {
+        return;
+    };
+    tracing::error!(
+        ?error,
+        tenant_id = %tenant,
+        idempotency_key = %key,
+        "failed to persist idempotent response after the request executed; deleting the \
+         processing record so a retry re-executes immediately instead of waiting out a stale lease"
+    );
+    if let Err(cleanup_error) = abandon_record(db, tenant, key).await {
+        tracing::error!(
+            ?cleanup_error,
+            tenant_id = %tenant,
+            idempotency_key = %key,
+            "failed to delete idempotency record after a completion-persist failure; it will \
+             fall back to expiring naturally via the sweeper"
+        );
+    }
 }
 
 async fn abandon_record(db: &Database, tenant: &str, key: &str) -> Result<(), ApiError> {
@@ -385,4 +436,140 @@ pub(crate) async fn expire_idempotency_records(db: &Database) -> Result<u64, Api
         .execute(&db.pool)
         .await?
         .rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{SqlDialect, ensure_database_constraints};
+    use sqlx::any::AnyPoolOptions;
+
+    async fn test_sqlite_db() -> Database {
+        sqlx::any::install_default_drivers();
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        let db = Database {
+            pool,
+            dialect: SqlDialect::Sqlite,
+        };
+        sqlx::migrate!("./migrations")
+            .run(&db.pool)
+            .await
+            .expect("run migrations");
+        ensure_database_constraints(&db)
+            .await
+            .expect("reconcile enum constraints");
+        db
+    }
+
+    async fn insert_processing_record(db: &Database, tenant: &str, key: &str) {
+        let now = Utc::now();
+        let sql = format!(
+            "insert into idempotency_records
+             (tenant_id, idempotency_key, request_fingerprint, state, created_at, expires_at)
+             values ({})",
+            db.placeholders(6)
+        );
+        sqlx::query(&sql)
+            .bind(tenant)
+            .bind(key)
+            .bind("fingerprint")
+            .bind(RecordState::Processing.as_str())
+            .bind(now.to_rfc3339())
+            .bind((now + ChronoDuration::minutes(PROCESSING_LEASE_MINUTES)).to_rfc3339())
+            .execute(&db.pool)
+            .await
+            .expect("insert processing record");
+    }
+
+    async fn record_exists(db: &Database, tenant: &str, key: &str) -> bool {
+        let sql = format!(
+            "select 1 from idempotency_records where tenant_id = {} and idempotency_key = {}",
+            db.placeholder(1),
+            db.placeholder(2)
+        );
+        sqlx::query(&sql)
+            .bind(tenant)
+            .bind(key)
+            .fetch_optional(&db.pool)
+            .await
+            .expect("query idempotency_records")
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn complete_record_failure_deletes_the_processing_record_instead_of_leaving_it_stuck() {
+        // Regresses the bug this change fixes: if persisting the completed
+        // response fails (here forced with a trigger standing in for any
+        // real database error) after the underlying mutation already
+        // committed, the record must not be left `processing` -- that would
+        // make every duplicate request wait out the rest of
+        // `PROCESSING_LEASE_MINUTES` behind `409 idempotency_in_progress`
+        // and *still* re-execute once the sweeper reclaimed it. Deleting it
+        // immediately instead lets a retry re-execute right away.
+        let db = test_sqlite_db().await;
+        let tenant = "tenant-a";
+        let key = "poison";
+        insert_processing_record(&db, tenant, key).await;
+        assert!(record_exists(&db, tenant, key).await);
+
+        // Force `complete_record`'s UPDATE to fail deterministically, without
+        // reaching into sqlx internals: a trigger that aborts specifically
+        // when this key is updated stands in for a real database error
+        // (lock timeout, connection drop, ...) on that one statement, while
+        // leaving every other statement (including the cleanup delete this
+        // test is asserting on) unaffected.
+        sqlx::query(
+            "create trigger poison_complete before update on idempotency_records
+             when new.idempotency_key = 'poison'
+             begin select raise(abort, 'forced failure for test'); end",
+        )
+        .execute(&db.pool)
+        .await
+        .expect("install poison trigger");
+
+        let stored = StoredResponse {
+            status: StatusCode::OK,
+            content_type: Some("application/json".to_string()),
+            location: None,
+            retry_after: None,
+            body: b"{}".to_vec(),
+        };
+        finalize_completed_record(&db, tenant, key, &stored).await;
+
+        assert!(
+            !record_exists(&db, tenant, key).await,
+            "a completion-persist failure must delete the processing record rather than leave it \
+             stuck, so a retry does not have to wait out a stale lease before re-executing"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_completed_record_persists_the_response_on_the_happy_path() {
+        let db = test_sqlite_db().await;
+        let tenant = "tenant-a";
+        let key = "happy-path";
+        insert_processing_record(&db, tenant, key).await;
+
+        let stored = StoredResponse {
+            status: StatusCode::CREATED,
+            content_type: Some("application/json".to_string()),
+            location: Some("/v1/sandboxes/1".to_string()),
+            retry_after: None,
+            body: b"{\"ok\":true}".to_vec(),
+        };
+        finalize_completed_record(&db, tenant, key, &stored).await;
+
+        let (fingerprint, state, response) = fetch_record(&db, tenant, key)
+            .await
+            .expect("fetch completed record");
+        assert_eq!(fingerprint, "fingerprint");
+        assert_eq!(state, RecordState::Completed);
+        let response = response.expect("completed record must carry a stored response");
+        assert_eq!(response.status, StatusCode::CREATED);
+        assert_eq!(response.body, b"{\"ok\":true}");
+    }
 }
