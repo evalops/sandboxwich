@@ -27,17 +27,34 @@ const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 300;
 
 /// Header name the API's idempotency middleware looks for on mutating `/v1`
 /// requests (see `sandboxwich-api`'s `enforce_idempotency`). Every mutating CLI
-/// command attaches a freshly generated key so a client-side retry of the exact
-/// same request (a dropped connection, a timeout) replays the original response
-/// instead of executing the mutation twice. File uploads deliberately do not get
-/// one: the API buffers idempotent request bodies up to its normal 1 MiB limit,
-/// so attaching a key to a large multipart upload would turn an otherwise-fine
-/// upload into a `413 idempotency_payload_too_large`.
+/// command attaches one.
+///
+/// Honesty note on what the key buys you: by default the key is freshly
+/// generated per CLI invocation, which only makes the single request this
+/// process sends replayable *server-side* -- it cannot protect against the
+/// common retry, a user or script re-running the whole CLI command after a
+/// timeout, because that new process generates a new key. To make a scripted
+/// retry actually replay the original response instead of executing the
+/// mutation twice, pass the same key explicitly via
+/// `--idempotency-key`/`SANDBOXWICH_IDEMPOTENCY_KEY` on every attempt (e.g.
+/// generate one `uuidgen` per logical operation in the script and reuse it
+/// across retries).
+///
+/// File uploads deliberately do not get a key: the API buffers idempotent
+/// request bodies up to its normal 1 MiB limit, so attaching one to a large
+/// multipart upload would turn an otherwise-fine upload into a
+/// `413 idempotency_payload_too_large`.
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 
-/// Generates a fresh `Idempotency-Key` value for one mutating CLI request.
-fn idempotency_key() -> String {
-    Uuid::now_v7().to_string()
+/// Resolves the `Idempotency-Key` value used for this invocation's mutating
+/// request: the explicitly supplied key when given (so retries of the same
+/// logical operation can replay), otherwise a fresh UUIDv7. A blank explicit
+/// value is treated as unset rather than sent as an (invalid) empty key.
+fn resolve_idempotency_key(explicit: Option<String>) -> String {
+    match explicit {
+        Some(key) if !key.trim().is_empty() => key.trim().to_string(),
+        _ => Uuid::now_v7().to_string(),
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -75,6 +92,15 @@ struct Cli {
         default_value_t = DEFAULT_REQUEST_TIMEOUT_SECS
     )]
     request_timeout_secs: u64,
+
+    /// Idempotency-Key sent on this invocation's mutating request. Pass the
+    /// same key when retrying a failed/timed-out invocation of the same
+    /// logical operation and the API replays the original response instead of
+    /// executing the mutation twice. When omitted, a fresh key is generated
+    /// per invocation -- which does NOT protect a re-run of the CLI, only a
+    /// server-side replay of this one request.
+    #[arg(long, env = "SANDBOXWICH_IDEMPOTENCY_KEY")]
+    idempotency_key: Option<String>,
 
     /// Output format for structured responses.
     #[arg(long, short = 'o', value_enum, default_value_t = OutputFormat::Json)]
@@ -424,6 +450,10 @@ async fn main() -> anyhow::Result<()> {
         request_timeout,
     )?;
     let api = cli.api.trim_end_matches('/');
+    // One key per invocation is safe because every subcommand sends at most one
+    // idempotency-keyed mutating request; see IDEMPOTENCY_KEY_HEADER for what an
+    // explicit key buys over the generated default.
+    let idempotency_key = resolve_idempotency_key(cli.idempotency_key.clone());
 
     match cli.command {
         Command::New(args) => {
@@ -432,7 +462,7 @@ async fn main() -> anyhow::Result<()> {
             let wait_timeout = Duration::from_secs(args.wait_timeout_secs);
             let response = client
                 .post(format!("{api}/sandboxes"))
-                .header(IDEMPOTENCY_KEY_HEADER, idempotency_key())
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&CreateSandboxRequest {
                     name: args.name,
                     template: args.template,
@@ -477,7 +507,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Stop { sandbox_id } => {
             let response = client
                 .post(format!("{api}/sandboxes/{sandbox_id}/stop"))
-                .header(IDEMPOTENCY_KEY_HEADER, idempotency_key())
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .send()
                 .await?;
             print_json::<SandboxResponse>(response).await?;
@@ -485,7 +515,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Resume { sandbox_id } => {
             let response = client
                 .post(format!("{api}/sandboxes/{sandbox_id}/resume"))
-                .header(IDEMPOTENCY_KEY_HEADER, idempotency_key())
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .send()
                 .await?;
             print_json::<SandboxResponse>(response).await?;
@@ -493,7 +523,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Fork(args) => {
             let response = client
                 .post(format!("{api}/sandboxes/{}/fork", args.sandbox_id))
-                .header(IDEMPOTENCY_KEY_HEADER, idempotency_key())
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&CreateSandboxRequest {
                     name: args.name,
                     template: None,
@@ -508,7 +538,7 @@ async fn main() -> anyhow::Result<()> {
         Command::CreateSnapshot(args) => {
             let response = client
                 .post(format!("{api}/sandboxes/{}/snapshots", args.sandbox_id))
-                .header(IDEMPOTENCY_KEY_HEADER, idempotency_key())
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&CreateSnapshotRequest {
                     label: args.label,
                     inventory: None,
@@ -536,7 +566,7 @@ async fn main() -> anyhow::Result<()> {
         Command::CleanupSnapshots => {
             let response = client
                 .post(format!("{api}/snapshots/cleanup"))
-                .header(IDEMPOTENCY_KEY_HEADER, idempotency_key())
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .send()
                 .await?;
             print_json::<SnapshotCleanupResponse>(response).await?;
@@ -547,7 +577,7 @@ async fn main() -> anyhow::Result<()> {
                     "{api}/sandboxes/{}/desktop-sessions",
                     args.sandbox_id
                 ))
-                .header(IDEMPOTENCY_KEY_HEADER, idempotency_key())
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&CreateDesktopSessionRequest {
                     broker: args.broker,
                     broker_url: args.broker_url,
@@ -579,7 +609,7 @@ async fn main() -> anyhow::Result<()> {
                     "{api}/desktop-sessions/{}/status",
                     args.desktop_session_id
                 ))
-                .header(IDEMPOTENCY_KEY_HEADER, idempotency_key())
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&UpdateDesktopSessionRequest {
                     status: args.status.into(),
                     broker: args.broker,
@@ -599,7 +629,7 @@ async fn main() -> anyhow::Result<()> {
                     "{api}/desktop-sessions/{}/access",
                     args.desktop_session_id
                 ))
-                .header(IDEMPOTENCY_KEY_HEADER, idempotency_key())
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&DesktopAccessRequest {
                     ttl_seconds: args.ttl_seconds,
                 })
@@ -610,7 +640,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Ssh(args) => {
             let response = client
                 .post(format!("{api}/sandboxes/{}/ssh-access", args.sandbox_id))
-                .header(IDEMPOTENCY_KEY_HEADER, idempotency_key())
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&SshAccessRequest {
                     principal: args.principal.clone(),
                     ttl_seconds: args.ttl_seconds,
@@ -627,7 +657,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Scp(args) => {
             let response = client
                 .post(format!("{api}/sandboxes/{}/ssh-access", args.sandbox_id))
-                .header(IDEMPOTENCY_KEY_HEADER, idempotency_key())
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&SshAccessRequest {
                     principal: args.principal.clone(),
                     ttl_seconds: args.ttl_seconds,
@@ -649,7 +679,7 @@ async fn main() -> anyhow::Result<()> {
             let wait = args.wait || follow;
             let response = client
                 .post(format!("{api}/sandboxes/{}/commands", args.sandbox_id))
-                .header(IDEMPOTENCY_KEY_HEADER, idempotency_key())
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&CommandRequest {
                     argv: args.argv,
                     cwd: args.cwd,
@@ -753,7 +783,7 @@ async fn main() -> anyhow::Result<()> {
         Command::SetGuestHealth(args) => {
             let response = client
                 .post(format!("{api}/sandboxes/{}/guest-health", args.sandbox_id))
-                .header(IDEMPOTENCY_KEY_HEADER, idempotency_key())
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&UpdateGuestHealthRequest {
                     status: args.status.into(),
                     agent_version: args.agent_version,
@@ -774,7 +804,7 @@ async fn main() -> anyhow::Result<()> {
         Command::AddSshKey(args) => {
             let response = client
                 .post(format!("{api}/sandboxes/{}/ssh-keys", args.sandbox_id))
-                .header(IDEMPOTENCY_KEY_HEADER, idempotency_key())
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&RequestSshKeyRequest {
                     public_key: args.public_key,
                     principal: args.principal,
@@ -786,7 +816,7 @@ async fn main() -> anyhow::Result<()> {
         Command::SetSshKeyStatus(args) => {
             let response = client
                 .post(format!("{api}/ssh-keys/{}/status", args.ssh_key_id))
-                .header(IDEMPOTENCY_KEY_HEADER, idempotency_key())
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&UpdateSshKeyStatusRequest {
                     status: args.status.into(),
                     error: args.error,
@@ -1332,6 +1362,36 @@ mod tests {
         assert!(is_terminal(&CommandStatus::Failed));
         assert!(!is_terminal(&CommandStatus::Queued));
         assert!(!is_terminal(&CommandStatus::Running));
+    }
+
+    #[test]
+    fn resolve_idempotency_key_uses_an_explicit_key_verbatim() {
+        // The whole point of --idempotency-key/SANDBOXWICH_IDEMPOTENCY_KEY: a
+        // scripted retry passes the same key on every attempt so the API
+        // replays the first response instead of executing the mutation twice.
+        assert_eq!(
+            resolve_idempotency_key(Some("retry-key-1".to_string())),
+            "retry-key-1"
+        );
+        assert_eq!(
+            resolve_idempotency_key(Some("  padded-key  ".to_string())),
+            "padded-key"
+        );
+    }
+
+    #[test]
+    fn resolve_idempotency_key_generates_a_fresh_key_when_unset_or_blank() {
+        let generated = resolve_idempotency_key(None);
+        assert!(
+            Uuid::parse_str(&generated).is_ok(),
+            "generated key should be a UUID, got: {generated}"
+        );
+        // Fresh per resolution, never a fixed value.
+        assert_ne!(resolve_idempotency_key(None), generated);
+        // A blank explicit value would be rejected by the API as an invalid
+        // (empty) key; treat it as unset instead.
+        let from_blank = resolve_idempotency_key(Some("   ".to_string()));
+        assert!(Uuid::parse_str(&from_blank).is_ok());
     }
 
     fn command_run(status: CommandStatus, exit_code: Option<i32>) -> CommandRun {
