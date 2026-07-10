@@ -11,6 +11,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use sandboxwich_core::ErrorEnvelope;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use utoipa::ToSchema;
 
 #[derive(Clone, Copy)]
 enum CounterKind {
@@ -27,7 +28,7 @@ impl CounterKind {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TenantLimitPolicy {
     pub(crate) tenant_id: String,
@@ -36,7 +37,7 @@ pub(crate) struct TenantLimitPolicy {
     pub(crate) window_seconds: u32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PutTenantLimitPolicy {
     pub(crate) request_limit: u32,
@@ -195,6 +196,7 @@ async fn fetch_policy(db: &Database, tenant: &str) -> Result<Option<TenantLimitP
     }))
 }
 
+#[utoipa::path(get, path = "/v1/operator/tenant-policies/{tenant_id}", tag = "operator", params(("tenant_id" = String, Path)), responses((status = 200, body = TenantLimitPolicy), (status = 404, body = ErrorEnvelope)))]
 pub(crate) async fn get_tenant_limit_policy(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -207,6 +209,7 @@ pub(crate) async fn get_tenant_limit_policy(
         .ok_or_else(|| ApiError::not_found("tenant limit policy not found"))
 }
 
+#[utoipa::path(put, path = "/v1/operator/tenant-policies/{tenant_id}", tag = "operator", params(("tenant_id" = String, Path)), request_body = PutTenantLimitPolicy, responses((status = 200, body = TenantLimitPolicy), (status = 400, body = ErrorEnvelope)))]
 pub(crate) async fn put_tenant_limit_policy(
     State(state): State<AppState>,
     headers: HeaderMap,

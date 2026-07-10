@@ -35,6 +35,18 @@ async fn assert_limit_contract(server: TestServer) {
         .await
         .unwrap();
     assert_eq!(configured.status(), StatusCode::OK);
+    let loaded = operator
+        .get(&policy_url)
+        .bearer_auth(TEST_DEFAULT_TENANT_TOKEN)
+        .header(OPERATOR_TOKEN_HEADER, TEST_OPERATOR_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(loaded.status(), StatusCode::OK);
+    assert_eq!(
+        loaded.json::<serde_json::Value>().await.unwrap()["requestLimit"],
+        1
+    );
 
     let client = server.client();
     let url = format!("{}/v1/sandboxes", server.base_url);
@@ -63,6 +75,17 @@ async fn assert_limit_contract(server: TestServer) {
         }
     }
     assert_eq!((accepted, limited), (1, 7));
+    assert_eq!(
+        reqwest::Client::new()
+            .get(&url)
+            .bearer_auth(TEST_TENANT_B_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK,
+        "a default-tenant policy must not affect another tenant"
+    );
 
     sqlx::any::install_default_drivers();
     let pool = AnyPoolOptions::new()
@@ -101,18 +124,25 @@ async fn assert_limit_contract(server: TestServer) {
         network_egress: None,
         ttl_seconds: Some(120),
     };
+    let first_key = uuid::Uuid::now_v7().to_string();
+    let second_key = uuid::Uuid::now_v7().to_string();
     let first = client
         .post(&url)
-        .header("idempotency-key", uuid::Uuid::now_v7().to_string())
+        .header("idempotency-key", &first_key)
         .json(&body)
         .send();
     let second = client
         .post(&url)
-        .header("idempotency-key", uuid::Uuid::now_v7().to_string())
+        .header("idempotency-key", &second_key)
         .json(&body)
         .send();
     let (first, second) = tokio::join!(first, second);
     let responses = [first, second];
+    let accepted_key = if responses[0].as_ref().unwrap().status() == StatusCode::ACCEPTED {
+        &first_key
+    } else {
+        &second_key
+    };
     let statuses: Vec<_> = responses
         .iter()
         .map(|r| r.as_ref().unwrap().status())
@@ -135,6 +165,18 @@ async fn assert_limit_contract(server: TestServer) {
     assert_eq!(
         limited.json::<ErrorEnvelope>().await.unwrap().code,
         "tenant_mutation_quota_exceeded"
+    );
+    assert_eq!(
+        client
+            .post(&url)
+            .header("idempotency-key", accepted_key)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::ACCEPTED,
+        "an idempotent replay must not consume the mutation quota twice"
     );
 
     sqlx::query("update tenant_limit_counters set window_expires_at = '1970-01-01T00:00:00Z'")

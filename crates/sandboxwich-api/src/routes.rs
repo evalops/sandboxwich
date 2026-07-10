@@ -135,16 +135,30 @@ pub(crate) fn app(state: AppState) -> Router {
         .route_layer(middleware::from_fn(require_worker_principal));
 
     let versioned_routes = Router::new()
-        .merge(tenant_routes.clone().layer(middleware::from_fn_with_state(
+        .merge(
+            tenant_routes
+                .clone()
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    enforce_tenant_limits,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    enforce_idempotency,
+                )),
+        )
+        .merge(worker_routes.clone().layer(middleware::from_fn_with_state(
             state.clone(),
             enforce_tenant_limits,
-        ))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            enforce_idempotency,
         )))
-        .merge(worker_routes.clone())
-        .merge(registration_routes.clone());
+        .merge(
+            registration_routes
+                .clone()
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    enforce_tenant_limits,
+                )),
+        );
 
     let operator_routes = Router::new()
         .route(

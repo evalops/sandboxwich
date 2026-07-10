@@ -95,6 +95,15 @@ Poll `GET /v1/operations/{id}`, reconnect to
 command with `POST /v1/operations/{id}/cancel`. Cancellation is rejected once
 work is leased and for operation kinds that cannot be safely rolled back.
 
+Operators can configure durable fixed-window tenant limits with
+`PUT /v1/operator/tenant-policies/{tenant_id}` using `requestLimit`,
+`mutationLimit`, and `windowSeconds`. The endpoint requires both normal tenant
+authentication and `x-sandboxwich-operator-token`. Limits cover tenant and
+worker `/v1` traffic, use atomic database counters on SQLite and PostgreSQL,
+and survive API restarts. Exhausted request or mutation budgets return `429`
+with `Retry-After` and the stable codes `tenant_rate_limit_exceeded` or
+`tenant_mutation_quota_exceeded`; tenants without a policy remain unlimited.
+
 Sandbox creation and stop are asynchronous and return HTTP `202` with an
 Operation. Resource-only creation endpoints return `201`. Resume is explicitly
 unsupported until a provider can restore durable state. The prompt endpoint
