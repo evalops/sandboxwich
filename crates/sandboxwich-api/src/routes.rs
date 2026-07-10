@@ -91,6 +91,7 @@ pub(crate) fn app(state: AppState) -> Router {
         )
         .route("/snapshots/cleanup", post(cleanup_snapshots))
         .route("/snapshots/{snapshot_id}", get(get_snapshot))
+        .route("/snapshots/{snapshot_id}/fork", post(fork_snapshot))
         .route("/commands/{command_id}", get(get_command))
         .route("/commands/{command_id}/output", get(list_command_output))
         .route("/workers", get(list_workers))

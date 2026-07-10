@@ -246,6 +246,119 @@ async fn platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_cor
     assert_eq!(observed["state"], "planning");
     assert!(observed["observedAt"].is_string());
 
+    let snapshot: SnapshotResponse = client
+        .post(format!(
+            "{}/v1/sandboxes/{}/snapshots",
+            server.base_url, created.sandbox.id
+        ))
+        .header("idempotency-key", uuid::Uuid::now_v7().to_string())
+        .json(&CreateSnapshotRequest {
+            label: Some("platform-restore-source".to_string()),
+            inventory: None,
+            provider_metadata: None,
+            ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let pending_restore = client
+        .post(format!(
+            "{}/v1/snapshots/{}/fork",
+            server.base_url, snapshot.snapshot.id
+        ))
+        .header("idempotency-key", uuid::Uuid::now_v7().to_string())
+        .json(&ForkSnapshotRequest {
+            name: Some("must-not-restore-pending".to_string()),
+            template: "ubuntu-dev".to_string(),
+            memory_limit: MemoryLimit::OneG,
+            network_egress: NetworkEgress::DenyAll,
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pending_restore.status(), StatusCode::CONFLICT);
+    let pending_error: ErrorEnvelope = pending_restore.json().await.unwrap();
+    assert_eq!(pending_error.code, "conflict");
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&server.database_url)
+        .await
+        .unwrap();
+    sqlx::query(
+        "update snapshots set status = 'ready', ready_at = '2026-07-09T00:00:00Z' where id = ?",
+    )
+    .bind(snapshot.snapshot.id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let restore_request = ForkSnapshotRequest {
+        name: Some("platform-restored-child".to_string()),
+        template: "ubuntu-dev".to_string(),
+        memory_limit: MemoryLimit::OneG,
+        network_egress: NetworkEgress::DenyAll,
+        ttl_seconds: Some(120),
+    };
+    let restore_key = uuid::Uuid::now_v7().to_string();
+    let restore_url = format!(
+        "{}/v1/snapshots/{}/fork",
+        server.base_url, snapshot.snapshot.id
+    );
+    let forbidden = reqwest::Client::new()
+        .post(&restore_url)
+        .bearer_auth(TEST_TENANT_B_TOKEN)
+        .header("idempotency-key", uuid::Uuid::now_v7().to_string())
+        .json(&restore_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::NOT_FOUND);
+
+    let restored = client
+        .post(&restore_url)
+        .header("idempotency-key", &restore_key)
+        .header("x-request-id", "platform-snapshot-fork-request")
+        .header("traceparent", traceparent)
+        .json(&restore_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restored.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        restored.headers()["x-request-id"],
+        "platform-snapshot-fork-request"
+    );
+    assert_eq!(restored.headers()["traceparent"], traceparent);
+    let restored_body = restored.bytes().await.unwrap();
+    let restored: SandboxResponse = serde_json::from_slice(&restored_body).unwrap();
+    assert_eq!(
+        restored.sandbox.parent_snapshot_id,
+        Some(snapshot.snapshot.id)
+    );
+    assert_eq!(restored.sandbox.state, SandboxState::Planning);
+    assert_eq!(
+        restored.operation.as_ref().map(|operation| &operation.kind),
+        Some(&OperationKind::ForkSandbox)
+    );
+
+    let restore_replay = client
+        .post(&restore_url)
+        .header("idempotency-key", &restore_key)
+        .json(&restore_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore_replay.status(), StatusCode::ACCEPTED);
+    assert_eq!(restore_replay.bytes().await.unwrap(), restored_body);
+
     let stopped = client
         .post(format!(
             "{}/v1/sandboxes/{}/stop",
@@ -271,6 +384,8 @@ async fn platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_cor
         .unwrap();
     assert!(docs["paths"]["/v1/sandboxes/{sandbox_id}/observed-state"].is_object());
     assert!(docs["components"]["schemas"]["SandboxObservedState"].is_object());
+    assert!(docs["paths"]["/v1/snapshots/{snapshot_id}/fork"].is_object());
+    assert!(docs["components"]["schemas"]["ForkSnapshotRequest"].is_object());
 
     for path in [
         "/v1/sandboxes/{sandbox_id}/commands",

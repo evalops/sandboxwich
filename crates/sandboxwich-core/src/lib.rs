@@ -1109,6 +1109,19 @@ pub struct CreateSnapshotRequest {
     pub ttl_seconds: Option<u64>,
 }
 
+/// Complete child configuration for restoring directly from a durable
+/// snapshot. Fields needed to provision the child are intentionally required
+/// so this request does not depend on the source sandbox still existing.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ForkSnapshotRequest {
+    pub name: Option<String>,
+    pub template: String,
+    pub memory_limit: MemoryLimit,
+    #[serde(default)]
+    pub network_egress: NetworkEgress,
+    pub ttl_seconds: Option<u64>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SnapshotResponse {
     pub ok: bool,
