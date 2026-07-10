@@ -43,6 +43,20 @@ pub(crate) async fn claim_lease(
                 .map_err(|_| ApiError::bad_request("idempotency-key must be a UUID"))
         })
         .transpose()?;
+    let requested_job_id = headers
+        .get("x-sandboxwich-job-id")
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| ApiError::bad_request("invalid x-sandboxwich-job-id"))
+        })
+        .transpose()?
+        .map(|value| {
+            Uuid::parse_str(value)
+                .map(JobId)
+                .map_err(|_| ApiError::bad_request("x-sandboxwich-job-id must be a UUID"))
+        })
+        .transpose()?;
     if let Some(operation_id) = operation_id
         && let Some(lease) = fetch_claim_operation(&state.db, worker_id, operation_id).await?
     {
@@ -63,7 +77,7 @@ pub(crate) async fn claim_lease(
             lease: None,
         }));
     }
-    let mut query = state.db.query_builder(
+let mut query = state.db.query_builder(
         "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
          from jobs
@@ -98,10 +112,16 @@ pub(crate) async fn claim_lease(
         .push(
             ")))
              )
-           )
+           )",
+        );
+    if let Some(job_id) = requested_job_id {
+        query.push(" and id = ").push_bind(job_id.to_string());
+    }
+    query.push(
+        "
          order by priority desc, scheduled_at asc, created_at asc, id asc
          limit 25",
-        );
+    );
     let rows = query.build().fetch_all(&state.db.pool).await?;
 
     for row in rows {
