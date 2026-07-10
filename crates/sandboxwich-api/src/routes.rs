@@ -13,6 +13,7 @@ use crate::handlers::ssh::*;
 use crate::handlers::workers::*;
 use crate::health::*;
 use crate::idempotency::enforce_idempotency;
+use crate::limits::*;
 use crate::reconcile::*;
 use crate::request_id::{attach_request_id, normalize_framework_errors};
 use crate::state::*;
@@ -144,12 +145,37 @@ pub(crate) fn app(state: AppState) -> Router {
         .route_layer(middleware::from_fn(require_worker_principal));
 
     let versioned_routes = Router::new()
-        .merge(tenant_routes.clone().layer(middleware::from_fn_with_state(
+        .merge(
+            tenant_routes
+                .clone()
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    enforce_tenant_limits,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    enforce_idempotency,
+                )),
+        )
+        .merge(worker_routes.clone().layer(middleware::from_fn_with_state(
             state.clone(),
-            enforce_idempotency,
+            enforce_tenant_limits,
         )))
-        .merge(worker_routes.clone())
-        .merge(registration_routes.clone());
+        .merge(
+            registration_routes
+                .clone()
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    enforce_tenant_limits,
+                )),
+        );
+
+    let operator_routes = Router::new()
+        .route(
+            "/tenant-policies/{tenant_id}",
+            get(get_tenant_limit_policy).put(put_tenant_limit_policy),
+        )
+        .route_layer(middleware::from_fn(require_tenant_principal));
 
     Router::new()
         .route("/healthz", get(healthz))
@@ -158,6 +184,7 @@ pub(crate) fn app(state: AppState) -> Router {
         .route("/v1/healthz", get(healthz))
         .route("/v1/readyz", get(readyz))
         .nest("/v1", versioned_routes)
+        .nest("/v1/operator", operator_routes)
         .merge(tenant_routes)
         .merge(worker_routes)
         .merge(registration_routes)

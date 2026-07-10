@@ -140,10 +140,30 @@ pub(crate) async fn enforce_idempotency(
 
     let response = next.run(request).await;
     let stored = capture_response(response).await;
+    if stored.status == StatusCode::TOO_MANY_REQUESTS {
+        if let Err(error) = abandon_record(&state.db, &context.tenant_id, &key).await {
+            tracing::error!(?error, tenant_id = %context.tenant_id, "failed to release throttled idempotency claim");
+        }
+        return stored.into_response();
+    }
     if let Err(error) = complete_record(&state.db, &context.tenant_id, &key, &stored).await {
         tracing::error!(?error, tenant_id = %context.tenant_id, "failed to persist idempotent response");
     }
     stored.into_response()
+}
+
+async fn abandon_record(db: &Database, tenant: &str, key: &str) -> Result<(), ApiError> {
+    let sql = format!(
+        "delete from idempotency_records where tenant_id = {} and idempotency_key = {} and state = 'processing'",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    sqlx::query(&sql)
+        .bind(tenant)
+        .bind(key)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
 }
 
 fn is_mutating(method: &Method) -> bool {
