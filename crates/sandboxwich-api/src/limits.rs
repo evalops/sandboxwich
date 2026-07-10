@@ -108,10 +108,10 @@ async fn consume(
          (tenant_id, kind, used, window_started_at, window_expires_at)
          values ({})
          on conflict (tenant_id, kind) do update set
-           used = case when window_expires_at <= excluded.window_started_at then 1 else used + 1 end,
-           window_started_at = case when window_expires_at <= excluded.window_started_at then excluded.window_started_at else window_started_at end,
-           window_expires_at = case when window_expires_at <= excluded.window_started_at then excluded.window_expires_at else window_expires_at end
-         where window_expires_at <= excluded.window_started_at or used < {}
+           used = case when tenant_limit_counters.window_expires_at <= excluded.window_started_at then 1 else tenant_limit_counters.used + 1 end,
+           window_started_at = case when tenant_limit_counters.window_expires_at <= excluded.window_started_at then excluded.window_started_at else tenant_limit_counters.window_started_at end,
+           window_expires_at = case when tenant_limit_counters.window_expires_at <= excluded.window_started_at then excluded.window_expires_at else tenant_limit_counters.window_expires_at end
+         where tenant_limit_counters.window_expires_at <= excluded.window_started_at or tenant_limit_counters.used < {}
          returning window_expires_at",
         db.placeholders(5),
         db.placeholder(6)
