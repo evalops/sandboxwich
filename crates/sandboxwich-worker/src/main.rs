@@ -1349,16 +1349,19 @@ fn execute_job(
                 agent_request_from_payload(&job.payload)?,
                 cancelled,
             )?;
-            if result.exit_code.unwrap_or(1) == 0 {
-                Ok(WorkerJobOutcome::Complete(WorkerJobResult::RunCommand {
-                    result,
-                }))
-            } else {
-                Ok(WorkerJobOutcome::Fail {
-                    error: result.stderr,
-                    retry: false,
-                })
-            }
+            // A non-zero exit code means the command actually ran to completion inside
+            // the sandbox -- that is a successful *lease* outcome (the worker did what
+            // it was asked), not an infrastructure failure. Previously this branch
+            // reported the lease itself as failed (`FailLeaseRequest { retry: false }`),
+            // which discarded the typed `AgentCommandResult` (dropping stdout entirely,
+            // since only `stderr` was forwarded as the error text) and conflated "the
+            // command exited 1" with "the worker couldn't run it at all". Always
+            // complete the lease with the full result; the API's
+            // `apply_completed_job_on_connection` derives the command's own
+            // Finished/Failed status from `exit_code`.
+            Ok(WorkerJobOutcome::Complete(WorkerJobResult::RunCommand {
+                result,
+            }))
         }
         JobKind::RunPrompt => Ok(WorkerJobOutcome::Complete(WorkerJobResult::RunPrompt {
             output: prompt_output_from_payload(&job.payload)?,
@@ -1699,6 +1702,129 @@ mod tests {
         assert_eq!(result.exit_code, Some(0));
         assert!(result.stdout.contains("\"operation\":\"exec\""));
         assert!(result.stdout.contains("\"memoryLimit\":\"4g\""));
+    }
+
+    /// Test double whose `exec_handoff` always returns a fixed
+    /// `AgentCommandResult`, letting tests exercise a specific exit code without
+    /// a real cluster. Every other `SandboxProvider` method delegates to a real
+    /// dry-run provider.
+    struct FixedExecResultProvider {
+        inner: KubernetesDryRunProvider,
+        result: AgentCommandResult,
+    }
+
+    impl SandboxProvider for FixedExecResultProvider {
+        fn capability_report(&self) -> sandboxwich_core::ProviderCapabilityReport {
+            self.inner.capability_report()
+        }
+
+        fn health_report(&self) -> sandboxwich_core::ProviderHealthReport {
+            self.inner.health_report()
+        }
+
+        fn provision(
+            &self,
+            sandbox_id: sandboxwich_core::SandboxId,
+            spec: &SandboxProvisionSpec,
+            cancelled: &CancelSignal,
+        ) -> anyhow::Result<sandboxwich_core::ProviderSandboxHandle> {
+            self.inner.provision(sandbox_id, spec, cancelled)
+        }
+
+        fn exec_handoff(
+            &self,
+            _sandbox_id: sandboxwich_core::SandboxId,
+            _spec: &SandboxProvisionSpec,
+            _request: AgentCommandRequest,
+            _cancelled: &CancelSignal,
+        ) -> anyhow::Result<AgentCommandResult> {
+            Ok(self.result.clone())
+        }
+
+        fn create_snapshot(
+            &self,
+            sandbox_id: sandboxwich_core::SandboxId,
+            snapshot_id: sandboxwich_core::SnapshotId,
+            cancelled: &CancelSignal,
+        ) -> anyhow::Result<sandboxwich_core::ProviderSnapshotHandle> {
+            self.inner
+                .create_snapshot(sandbox_id, snapshot_id, cancelled)
+        }
+
+        fn fork(
+            &self,
+            parent_sandbox_id: sandboxwich_core::SandboxId,
+            child_sandbox_id: sandboxwich_core::SandboxId,
+            snapshot_id: sandboxwich_core::SnapshotId,
+            spec: &SandboxProvisionSpec,
+            cancelled: &CancelSignal,
+        ) -> anyhow::Result<sandboxwich_core::ProviderForkHandle> {
+            self.inner.fork(
+                parent_sandbox_id,
+                child_sandbox_id,
+                snapshot_id,
+                spec,
+                cancelled,
+            )
+        }
+
+        fn stop(
+            &self,
+            sandbox_id: sandboxwich_core::SandboxId,
+            cancelled: &CancelSignal,
+        ) -> anyhow::Result<()> {
+            self.inner.stop(sandbox_id, cancelled)
+        }
+    }
+
+    #[test]
+    fn run_command_job_completes_the_lease_even_when_the_command_exits_non_zero() {
+        // Regression test: a command that runs to completion but exits non-zero
+        // (e.g. `false`, a failing test suite) used to be reported as a *lease*
+        // failure (`FailLeaseRequest { retry: false }`), which discarded the
+        // command's stdout entirely and conflated "the command ran and failed"
+        // with "the worker could not run it". It must instead complete the
+        // lease with the full typed result; the API derives the command's own
+        // Finished/Failed status from `exit_code`.
+        let sandbox_id = SandboxId::new();
+        let spec = SandboxProvisionSpec {
+            memory_limit: sandboxwich_core::MemoryLimit::FourG,
+            network_egress: Default::default(),
+        };
+        let now = Utc::now();
+        let provider = FixedExecResultProvider {
+            inner: provider(),
+            result: AgentCommandResult {
+                exit_code: Some(1),
+                stdout: "partial output before failure\n".to_string(),
+                stderr: "boom\n".to_string(),
+                started_at: now,
+                finished_at: now,
+            },
+        };
+
+        let outcome = execute_job(
+            &job(
+                JobKind::RunCommand,
+                json!({
+                    "sandboxId": sandbox_id,
+                    "provisionSpec": spec,
+                    "argv": ["false"],
+                    "env": {}
+                }),
+                WorkerCapability::RunCommand,
+            ),
+            &provider,
+            &CancelSignal::never_cancelled(),
+        )
+        .expect("a command that ran and exited non-zero is still a completed lease");
+        let WorkerJobResult::RunCommand { result } = completed_result(outcome) else {
+            panic!("expected run command result");
+        };
+
+        assert_eq!(result.exit_code, Some(1));
+        assert_eq!(result.stdout, "partial output before failure\n");
+        assert_eq!(result.stderr, "boom\n");
     }
 
     #[test]

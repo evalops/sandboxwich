@@ -855,26 +855,19 @@ async fn handle_lease(
     let _ = renew_task.await;
 
     match result {
-        Ok(result) if result.exit_code.unwrap_or(1) == 0 => {
+        // A non-zero exit code means the command actually ran to completion in the
+        // guest -- that is a successful *lease* outcome (the agent did what it was
+        // asked), not an infrastructure failure. This used to report the lease
+        // itself as failed whenever the exit code was non-zero, which discarded the
+        // typed `AgentCommandResult` (stdout, in particular) and conflated "the
+        // command exited 1" with "the agent couldn't run it at all". Always
+        // complete the lease with the full result; the control plane derives the
+        // command's own Finished/Failed status from `exit_code`.
+        Ok(result) => {
             let response = client
                 .post(format!("{api}/leases/{}/complete", lease.id))
                 .json(&CompleteLeaseRequest {
                     result: Some(WorkerJobResult::RunCommand { result }),
-                })
-                .send()
-                .await?;
-            decode_json(response).await.map_err(Into::into)
-        }
-        Ok(result) => {
-            let response = client
-                .post(format!("{api}/leases/{}/fail", lease.id))
-                .json(&FailLeaseRequest {
-                    error: if result.stderr.is_empty() {
-                        format!("command exited with {:?}", result.exit_code)
-                    } else {
-                        result.stderr
-                    },
-                    retry: false,
                 })
                 .send()
                 .await?;

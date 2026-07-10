@@ -356,6 +356,117 @@ pub(crate) async fn assert_retryable_failure_requeues_command(
     assert_eq!(replayed.lease.status, LeaseStatus::Completed);
 }
 
+/// Regression test: a worker that runs a command to completion but the command
+/// itself exits non-zero must still *complete* the lease (the worker did its job),
+/// while the command's own status is derived from the exit code rather than being
+/// unconditionally marked `Finished`. Exercises both a successful (`exit_code: 0`,
+/// `Finished`) and a failing (`exit_code: 7`, `Failed`) completion end-to-end
+/// through `/leases/{id}/complete`.
+pub(crate) async fn assert_command_status_is_derived_from_exit_code(
+    client: &reqwest::Client,
+    server: &TestServer,
+    sandbox: &SandboxResponse,
+    worker: &WorkerResponse,
+) {
+    let worker_client = worker_client(worker);
+
+    async fn queue_and_complete(
+        client: &reqwest::Client,
+        worker_client: &reqwest::Client,
+        server: &TestServer,
+        sandbox: &SandboxResponse,
+        worker: &WorkerResponse,
+        exit_code: i32,
+    ) -> CommandRun {
+        let command: QueueCommandResponse = client
+            .post(format!(
+                "{}/sandboxes/{}/commands",
+                server.base_url, sandbox.sandbox.id
+            ))
+            .json(&CommandRequest {
+                argv: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("exit {exit_code}"),
+                ],
+                cwd: None,
+                env: Default::default(),
+                timeout_secs: None,
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let claimed: ClaimLeaseResponse = worker_client
+            .post(format!(
+                "{}/workers/{}/leases/claim",
+                server.base_url, worker.worker.id
+            ))
+            .json(&ClaimLeaseRequest {
+                lease_seconds: Some(60),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let lease = claimed
+            .lease
+            .expect("expected worker to claim the exit-code test command");
+        assert_eq!(lease.job.id, command.queued_job.id);
+
+        let completed: LeaseResponse = worker_client
+            .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
+            .json(&CompleteLeaseRequest {
+                result: Some(command_result("stdout\n", "stderr\n", exit_code)),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        // Completing the lease always succeeds the *job*: the worker did run the
+        // command, regardless of what it exited with.
+        assert_eq!(completed.lease.job.status, JobStatus::Succeeded);
+
+        let fetched: CommandResponse = client
+            .get(format!(
+                "{}/commands/{}",
+                server.base_url, command.command.id
+            ))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        fetched.command
+    }
+
+    let succeeded = queue_and_complete(client, &worker_client, server, sandbox, worker, 0).await;
+    assert_eq!(succeeded.status, CommandStatus::Finished);
+    assert_eq!(succeeded.exit_code, Some(0));
+
+    let failed = queue_and_complete(client, &worker_client, server, sandbox, worker, 7).await;
+    assert_eq!(failed.status, CommandStatus::Failed);
+    assert_eq!(failed.exit_code, Some(7));
+    assert_eq!(failed.stdout, "stdout\n");
+    assert_eq!(failed.stderr, "stderr\n");
+}
+
 pub(crate) async fn assert_expired_lease_requeues_command(
     client: &reqwest::Client,
     server: &TestServer,
