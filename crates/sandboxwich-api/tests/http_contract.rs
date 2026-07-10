@@ -8,6 +8,8 @@
 //! each one as its own separate integration-test binary.
 #[path = "http_contract/auth.rs"]
 mod auth;
+#[path = "http_contract/cleanup.rs"]
+mod cleanup;
 #[path = "http_contract/commands.rs"]
 mod commands;
 #[path = "http_contract/common.rs"]
