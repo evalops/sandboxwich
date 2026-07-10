@@ -72,8 +72,8 @@ pub(crate) async fn enforce_tenant_limits(
     {
         return response;
     }
-    if is_mutating(request.method()) {
-        if let Err(response) = consume(
+    if is_mutating(request.method())
+        && let Err(response) = consume(
             &state.db,
             &context.tenant_id,
             CounterKind::Mutation,
@@ -81,9 +81,8 @@ pub(crate) async fn enforce_tenant_limits(
             policy.window_seconds,
         )
         .await
-        {
-            return response;
-        }
+    {
+        return response;
     }
     next.run(request).await
 }
