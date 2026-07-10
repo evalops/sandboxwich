@@ -1731,6 +1731,7 @@ fn run_kubectl_documents(
     context: &'static str,
     max_output_bytes: u64,
 ) -> anyhow::Result<KubectlOutput> {
+    let rendered = render_manifest_documents(manifests)?;
     let mut child = Command::new(kubectl)
         .args(args)
         .stdin(Stdio::piped())
@@ -1740,14 +1741,17 @@ fn run_kubectl_documents(
         .with_context(|| format!("failed to spawn kubectl for {context}"))?;
 
     let mut stdin = child.stdin.take().context("failed to open kubectl stdin")?;
-    stdin
-        .write_all(render_manifest_documents(manifests)?.as_bytes())
-        .context("failed to write manifests to kubectl stdin")?;
+    let write_error = stdin.write_all(rendered.as_bytes()).err();
     drop(stdin);
 
     let output = child
         .wait_with_output()
         .with_context(|| format!("failed to wait for kubectl {context}"))?;
+    if output.status.success()
+        && let Some(error) = write_error
+    {
+        return Err(error).context("failed to write manifests to kubectl stdin");
+    }
     let stdout = cap_output_bytes(&output.stdout, max_output_bytes);
     let stderr = cap_output_bytes(&output.stderr, max_output_bytes);
 
@@ -3683,10 +3687,12 @@ mod tests {
     /// - appends every invocation's space-joined argv as one line to `log_path`
     ///   (bracketed with leading/trailing spaces so tests can match whole
     ///   tokens like " delete " without false positives on substrings), and
-    /// - drains stdin for the "apply" verb, mirroring how
+    /// - drains stdin for a successful "apply" verb, mirroring how
     ///   `run_kubectl_documents` actually pipes manifests in via stdin so the
     ///   real caller's `write_all` doesn't block on a full pipe;
-    /// - exits non-zero if `fail_verb` is present in argv, and zero otherwise.
+    /// - exits immediately with a non-zero status if `fail_verb` is present in
+    ///   argv, including before draining stdin. This reproduces kubectl closing
+    ///   its input early after an argument/authentication/validation failure.
     ///
     /// This lets rollback behavior be exercised end-to-end (provision/fork
     /// calling through to a real rollback `kubectl delete`) without requiring
@@ -3705,10 +3711,11 @@ mod tests {
         let script = format!(
             "#!/bin/sh\n\
              printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             {fail_check}\
              case \" $* \" in\n\
              \x20\x20*\" apply \"*) cat >/dev/null 2>&1 || true ;;\n\
              esac\n\
-             {fail_check}exit 0\n",
+             exit 0\n",
             log = log_path.display(),
         );
         let script_path = dir.join("kubectl");
