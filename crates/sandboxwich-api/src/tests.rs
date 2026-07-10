@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use crate::auth::*;
+use crate::cleanup::*;
 use crate::config::*;
 use crate::db::*;
 use crate::handlers::commands::*;
@@ -166,6 +167,49 @@ fn effective_command_timeout_secs_defaults_clamps_and_rejects_unbounded() {
         effective_command_timeout_secs(Some(u64::MAX)),
         MAX_COMMAND_TIMEOUT_SECS
     );
+}
+
+#[test]
+fn effective_lease_seconds_defaults_clamps_and_rejects_unbounded() {
+    // Omitted falls back to the default.
+    assert_eq!(effective_lease_seconds(None), DEFAULT_LEASE_SECONDS);
+    // A reasonable explicit value passes through untouched.
+    assert_eq!(effective_lease_seconds(Some(45)), 45);
+    // `0` is clamped to a floor of 1s rather than granting an
+    // already-expired lease.
+    assert_eq!(effective_lease_seconds(Some(0)), MIN_LEASE_SECONDS);
+    // Values large enough that `as i64` would still be positive are
+    // clamped to the ceiling rather than granting an effectively unbounded
+    // lease.
+    assert_eq!(
+        effective_lease_seconds(Some(u32::MAX as u64)),
+        MAX_LEASE_SECONDS
+    );
+    // The original bug: a `lease_seconds` greater than `i64::MAX` wraps
+    // negative when cast to `i64` (an already-expired lease, causing the
+    // sweeper to requeue a job a worker is still running), and values in
+    // `(i64::MAX / 1000, i64::MAX]` panic `chrono::Duration::seconds`
+    // outright. Both must clamp instead.
+    assert_eq!(
+        effective_lease_seconds(Some(i64::MAX as u64)),
+        MAX_LEASE_SECONDS
+    );
+    assert_eq!(effective_lease_seconds(Some(u64::MAX)), MAX_LEASE_SECONDS);
+
+    // The clamped value must always be safe to feed into
+    // `chrono::Duration::seconds` without panicking, for every input we
+    // exercised above.
+    for input in [
+        None,
+        Some(0),
+        Some(45),
+        Some(u32::MAX as u64),
+        Some(i64::MAX as u64),
+        Some(u64::MAX),
+    ] {
+        let seconds = effective_lease_seconds(input);
+        let _ = chrono::Duration::seconds(seconds as i64);
+    }
 }
 
 async fn test_sqlite_db() -> Database {
@@ -637,4 +681,72 @@ async fn worker_liveness_reconciliation_batch_deletes_only_expired_history() {
         .try_get("count")
         .expect("integer count");
     assert_eq!(remaining, 1);
+}
+
+#[tokio::test]
+async fn cleanup_archived_sandboxes_never_deletes_a_sandbox_with_a_live_restore_reference() {
+    // `cleanup_archived_sandboxes`'s authoritative reference check now runs
+    // on the same connection as the delete, immediately before it, instead
+    // of only once against the pool before the transaction even opens (the
+    // TOCTOU this change closes: a concurrent fork/`create_snapshot` could
+    // previously insert a `snapshot_restore_sources` row referencing the
+    // sandbox in the gap between that pool-level check and the delete
+    // transaction's commit, and the parent got deleted anyway). This test
+    // can't reproduce the original interleaving itself -- the harness has no
+    // seam to pause `cleanup_archived_sandboxes` mid-transaction, and the
+    // real window it closes is a sub-millisecond gap between two statements
+    // in the same DB transaction -- but it does pin the outcome the fix
+    // guarantees: a referenced sandbox is never deleted, regardless of which
+    // of the two checks (the pool pre-check or the in-transaction recheck)
+    // is the one that catches it.
+    let db = test_sqlite_db().await;
+    let now = Utc::now();
+    let sandbox = Sandbox {
+        id: SandboxId::new(),
+        tenant_id: "default".to_string(),
+        name: "referenced-archived".to_string(),
+        state: SandboxState::Archived,
+        template: "default".to_string(),
+        memory_limit: MemoryLimit::default(),
+        network_egress: NetworkEgress::default(),
+        created_at: now,
+        updated_at: now,
+        ttl_seconds: Some(0),
+        parent_snapshot_id: None,
+    };
+    insert_sandbox(&db, &sandbox)
+        .await
+        .expect("insert archived sandbox");
+
+    // The exact row a concurrent `create_snapshot` leaves behind
+    // (`insert_snapshot_on_connection` in `handlers/snapshots.rs`): a live,
+    // unexpired restore source pointing at this sandbox.
+    sqlx::query(
+        "insert into snapshot_restore_sources
+         (snapshot_id, tenant_id, source_sandbox_id, status, expires_at)
+         values (?, ?, ?, 'ready', NULL)",
+    )
+    .bind(SnapshotId::new().to_string())
+    .bind(&sandbox.tenant_id)
+    .bind(sandbox.id.to_string())
+    .execute(&db.pool)
+    .await
+    .expect("seed restore source");
+
+    let result = cleanup_archived_sandboxes(&db)
+        .await
+        .expect("cleanup run must not error on a referenced sandbox");
+    assert!(
+        result.deleted.is_empty(),
+        "a sandbox with a live restore reference must never be deleted"
+    );
+    assert_eq!(result.skipped.len(), 1);
+    assert_eq!(result.skipped[0].sandbox.id, sandbox.id);
+
+    let still_present = fetch_sandbox(&db, sandbox.id).await;
+    assert!(
+        still_present.is_ok(),
+        "the sandbox row must survive when the reference check inside the delete transaction \
+         finds a reference"
+    );
 }

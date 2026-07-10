@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeMap,
-    io::Write,
-    process::{Command, Stdio},
+    process::Stdio,
     str::FromStr,
     sync::{
         Arc,
@@ -160,6 +159,7 @@ pub trait SandboxProvider {
         &self,
         sandbox_id: SandboxId,
         spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
     ) -> anyhow::Result<ProviderSandboxHandle>;
     fn exec_handoff(
         &self,
@@ -172,6 +172,7 @@ pub trait SandboxProvider {
         &self,
         sandbox_id: SandboxId,
         snapshot_id: SnapshotId,
+        cancelled: &CancelSignal,
     ) -> anyhow::Result<ProviderSnapshotHandle>;
     fn fork(
         &self,
@@ -179,10 +180,11 @@ pub trait SandboxProvider {
         child_sandbox_id: SandboxId,
         snapshot_id: SnapshotId,
         spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
     ) -> anyhow::Result<ProviderForkHandle>;
     /// Tear down every resource associated with `sandbox_id`. Must be idempotent:
     /// calling it on an already-stopped (or never-provisioned) sandbox is not an error.
-    fn stop(&self, sandbox_id: SandboxId) -> anyhow::Result<()>;
+    fn stop(&self, sandbox_id: SandboxId, cancelled: &CancelSignal) -> anyhow::Result<()>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1366,11 +1368,16 @@ impl KubernetesApplyProvider {
     ) -> anyhow::Result<KubernetesApplyOutcome> {
         Self::validate_apply_gate(confirm_apply, mutation_enabled)?;
 
+        // `apply_smoke` is a standalone, manually-invoked diagnostic (`provider-smoke`),
+        // not part of the lease-renewal-driven work loop, so there is no `CancelSignal`
+        // to thread through here.
         let apply = run_kubectl_documents(
             &plan.kubectl,
             &plan.apply_args,
             &plan.apply_manifests,
             "apply smoke manifests",
+            self.kubectl_command_timeout,
+            None,
             self.max_captured_output_bytes,
         )?;
         let mut cleanup_status = String::new();
@@ -1384,6 +1391,8 @@ impl KubernetesApplyProvider {
                 &plan.cleanup_args,
                 &plan.cleanup_manifests,
                 "cleanup smoke manifests",
+                self.kubectl_command_timeout,
+                None,
                 self.max_captured_output_bytes,
             )?;
             cleanup_status = cleanup_output.status;
@@ -1498,7 +1507,16 @@ impl KubernetesApplyProvider {
         Ok(manifests)
     }
 
-    fn wait_for_pod_ready(&self, sandbox_id: SandboxId) -> anyhow::Result<KubectlOutput> {
+    /// Waits up to 120s for the sandbox pod to become ready. `cancelled` is polled
+    /// throughout: if the caller's lease renewal is lost while this is in flight, the
+    /// wait is aborted instead of letting a mutating provision/fork run to completion
+    /// against a lease this worker can no longer prove is still its own (see
+    /// `run_kubectl_command_async`'s doc comment).
+    fn wait_for_pod_ready(
+        &self,
+        sandbox_id: SandboxId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<KubectlOutput> {
         let mut args = self.kubectl_base_args();
         args.extend([
             "wait".to_string(),
@@ -1511,7 +1529,7 @@ impl KubernetesApplyProvider {
             &args,
             "wait for sandbox pod readiness",
             self.kubectl_command_timeout,
-            None,
+            Some(cancelled),
             self.max_captured_output_bytes,
         )
     }
@@ -1519,7 +1537,7 @@ impl KubernetesApplyProvider {
     /// Returns true if the sandbox's pod already exists in the cluster. Used so that
     /// `exec_handoff` only provisions when necessary instead of re-applying the full
     /// manifest set (and its immutable Pod fields) before every command.
-    fn pod_exists(&self, sandbox_id: SandboxId) -> anyhow::Result<bool> {
+    fn pod_exists(&self, sandbox_id: SandboxId, cancelled: &CancelSignal) -> anyhow::Result<bool> {
         let mut args = self.kubectl_base_args();
         args.extend([
             "get".to_string(),
@@ -1534,7 +1552,7 @@ impl KubernetesApplyProvider {
             &args,
             "check sandbox pod existence",
             self.kubectl_command_timeout,
-            None,
+            Some(cancelled),
             self.max_captured_output_bytes,
         )?;
         if !output.success {
@@ -1576,6 +1594,17 @@ impl KubernetesApplyProvider {
     /// on the underlying `kubectl delete` also makes this safe to call even when
     /// nothing was actually applied yet (e.g. `provision`'s own `kubectl apply`
     /// failed to spawn at all).
+    ///
+    /// Deliberately does *not* take a `CancelSignal`: unlike the apply/wait steps
+    /// this cleans up after, a `kubectl delete` with `--ignore-not-found` is
+    /// idempotent and only ever removes resources labeled with this exact
+    /// `sandbox_id`, so it carries none of the "might duplicate a mutating side
+    /// effect" risk cancellation exists to prevent. Honoring cancellation here
+    /// would instead race the delete against its own spawn (a cancelled signal is
+    /// typically already true by the time rollback runs, so the `tokio::select!`
+    /// in `run_kubectl_command_async` would very likely kill the process before it
+    /// could delete anything) and turn a best-effort cleanup into a guaranteed
+    /// leak.
     fn rollback_applied_resources(&self, sandbox_id: SandboxId, context: &'static str) {
         let args = self.teardown_args(sandbox_id);
         match run_kubectl_command(
@@ -1724,40 +1753,36 @@ fn cap_output_bytes(bytes: &[u8], max_bytes: u64) -> String {
     text
 }
 
+/// Applies/deletes `manifests` via `kubectl -f -`, piping the rendered documents to
+/// stdin. Routes through [`run_kubectl_command_with_stdin`] (bounded by `timeout`,
+/// killed+reaped on timeout or cancellation, transport failures wrapped as
+/// [`ProviderError::retryable`]) rather than blocking synchronously: previously this
+/// used `std::process::Command::wait_with_output()` directly, which -- unlike every
+/// other kubectl invocation in this module -- had no bound at all, so a wedged API
+/// server hung the calling job-execution thread (and, with it, the sandbox slot the
+/// lease keeps renewing) forever, and any failure surfaced as a plain `anyhow::Error`
+/// that `classify_retry` treats as permanent even though a hung/unreachable API
+/// server is exactly the kind of transient infrastructure failure that should be
+/// retried.
 fn run_kubectl_documents(
     kubectl: &str,
     args: &[String],
     manifests: &[Value],
     context: &'static str,
+    timeout: Duration,
+    cancelled: Option<&CancelSignal>,
     max_output_bytes: u64,
 ) -> anyhow::Result<KubectlOutput> {
-    let mut child = Command::new(kubectl)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to spawn kubectl for {context}"))?;
-
-    let mut stdin = child.stdin.take().context("failed to open kubectl stdin")?;
-    stdin
-        .write_all(render_manifest_documents(manifests)?.as_bytes())
-        .context("failed to write manifests to kubectl stdin")?;
-    drop(stdin);
-
-    let output = child
-        .wait_with_output()
-        .with_context(|| format!("failed to wait for kubectl {context}"))?;
-    let stdout = cap_output_bytes(&output.stdout, max_output_bytes);
-    let stderr = cap_output_bytes(&output.stderr, max_output_bytes);
-
-    Ok(KubectlOutput {
-        success: output.status.success(),
-        code: output.status.code(),
-        status: output.status.to_string(),
-        stdout,
-        stderr,
-    })
+    let payload = render_manifest_documents(manifests)?.into_bytes();
+    run_kubectl_command_with_stdin(
+        kubectl,
+        args,
+        Some(&payload),
+        context,
+        timeout,
+        cancelled,
+        max_output_bytes,
+    )
 }
 
 /// How often a kubectl invocation polls a `CancelSignal` for cancellation
@@ -1877,13 +1902,19 @@ async fn run_kubectl_command_async(
             }
             Ok::<_, std::io::Error>(())
         };
-        tokio::try_join!(
+        let (status, feed_result, stdout_result, stderr_result) = tokio::join!(
             child.wait(),
             feed_stdin,
             stdout_pipe.read_to_end(&mut stdout),
             stderr_pipe.read_to_end(&mut stderr),
-        )
-        .map(|(status, (), _, _)| (status, stdout, stderr))
+        );
+        let status = status?;
+        stdout_result?;
+        stderr_result?;
+        if status.success() {
+            feed_result?;
+        }
+        Ok::<_, std::io::Error>((status, stdout, stderr))
     };
 
     // If the caller's lease renewal is lost while this kubectl invocation is
@@ -2014,6 +2045,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
         &self,
         sandbox_id: SandboxId,
         spec: &SandboxProvisionSpec,
+        _cancelled: &CancelSignal,
     ) -> anyhow::Result<ProviderSandboxHandle> {
         Self::validate_network_policy_egress(&spec.network_egress)?;
         Ok(ProviderSandboxHandle {
@@ -2057,6 +2089,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
         &self,
         sandbox_id: SandboxId,
         snapshot_id: SnapshotId,
+        _cancelled: &CancelSignal,
     ) -> anyhow::Result<ProviderSnapshotHandle> {
         Ok(ProviderSnapshotHandle {
             provider: "kubernetes".to_string(),
@@ -2091,6 +2124,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
         child_sandbox_id: SandboxId,
         snapshot_id: SnapshotId,
         spec: &SandboxProvisionSpec,
+        _cancelled: &CancelSignal,
     ) -> anyhow::Result<ProviderForkHandle> {
         Self::validate_network_policy_egress(&spec.network_egress)?;
         let network_policy =
@@ -2134,7 +2168,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
         })
     }
 
-    fn stop(&self, _sandbox_id: SandboxId) -> anyhow::Result<()> {
+    fn stop(&self, _sandbox_id: SandboxId, _cancelled: &CancelSignal) -> anyhow::Result<()> {
         // Dry-run provider never applies anything to a cluster, so there is nothing
         // to tear down; treat it as a successful (planned) no-op.
         Ok(())
@@ -2181,6 +2215,7 @@ impl SandboxProvider for KubernetesApplyProvider {
         &self,
         sandbox_id: SandboxId,
         spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
     ) -> anyhow::Result<ProviderSandboxHandle> {
         KubernetesDryRunProvider::validate_network_policy_egress(&spec.network_egress)?;
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
@@ -2190,6 +2225,8 @@ impl SandboxProvider for KubernetesApplyProvider {
             &self.kubectl_args("apply"),
             &manifests,
             "apply sandbox manifests",
+            self.kubectl_command_timeout,
+            Some(cancelled),
             self.max_captured_output_bytes,
         )?;
         if !apply.success {
@@ -2203,7 +2240,7 @@ impl SandboxProvider for KubernetesApplyProvider {
                 apply.stderr
             );
         }
-        let wait = match self.wait_for_pod_ready(sandbox_id) {
+        let wait = match self.wait_for_pod_ready(sandbox_id, cancelled) {
             Ok(wait) => wait,
             Err(error) => {
                 self.rollback_applied_resources(sandbox_id, "provision (wait for pod ready)");
@@ -2219,7 +2256,7 @@ impl SandboxProvider for KubernetesApplyProvider {
             );
         }
 
-        let mut handle = self.dry_run.provision(sandbox_id, spec)?;
+        let mut handle = self.dry_run.provision(sandbox_id, spec, cancelled)?;
         mark_resources(
             &mut handle.resources,
             RuntimeResourceStatus::Ready,
@@ -2246,8 +2283,8 @@ impl SandboxProvider for KubernetesApplyProvider {
         // manifest set (and re-waiting up to 120s) before every command is both slow
         // and unsafe: Pod `resources` are immutable, so an exec whose spec drifts from
         // the original provisioning would otherwise hard-fail every subsequent command.
-        if !self.pod_exists(sandbox_id)? {
-            self.provision(sandbox_id, spec)?;
+        if !self.pod_exists(sandbox_id, cancelled)? {
+            self.provision(sandbox_id, spec, cancelled)?;
         }
         let started_at = Utc::now();
         // A per-command `timeout_secs` (see `AgentCommandRequest`) takes
@@ -2282,6 +2319,7 @@ impl SandboxProvider for KubernetesApplyProvider {
         &self,
         sandbox_id: SandboxId,
         snapshot_id: SnapshotId,
+        cancelled: &CancelSignal,
     ) -> anyhow::Result<ProviderSnapshotHandle> {
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
         let snapshot = self
@@ -2292,6 +2330,8 @@ impl SandboxProvider for KubernetesApplyProvider {
             &self.kubectl_args("apply"),
             std::slice::from_ref(&snapshot),
             "apply snapshot manifest",
+            self.kubectl_command_timeout,
+            Some(cancelled),
             self.max_captured_output_bytes,
         )?;
         if !apply.success {
@@ -2301,7 +2341,9 @@ impl SandboxProvider for KubernetesApplyProvider {
                 apply.stderr
             );
         }
-        let mut handle = self.dry_run.create_snapshot(sandbox_id, snapshot_id)?;
+        let mut handle = self
+            .dry_run
+            .create_snapshot(sandbox_id, snapshot_id, cancelled)?;
         mark_resources(
             &mut handle.resources,
             RuntimeResourceStatus::Applied,
@@ -2321,6 +2363,7 @@ impl SandboxProvider for KubernetesApplyProvider {
         child_sandbox_id: SandboxId,
         snapshot_id: SnapshotId,
         spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
     ) -> anyhow::Result<ProviderForkHandle> {
         KubernetesDryRunProvider::validate_network_policy_egress(&spec.network_egress)?;
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
@@ -2330,6 +2373,8 @@ impl SandboxProvider for KubernetesApplyProvider {
             &self.kubectl_args("apply"),
             &manifests,
             "apply fork manifests",
+            self.kubectl_command_timeout,
+            Some(cancelled),
             self.max_captured_output_bytes,
         )?;
         if !apply.success {
@@ -2344,7 +2389,7 @@ impl SandboxProvider for KubernetesApplyProvider {
                 apply.stderr
             );
         }
-        let wait = match self.wait_for_pod_ready(child_sandbox_id) {
+        let wait = match self.wait_for_pod_ready(child_sandbox_id, cancelled) {
             Ok(wait) => wait,
             Err(error) => {
                 self.rollback_applied_resources(child_sandbox_id, "fork (wait for pod ready)");
@@ -2359,9 +2404,13 @@ impl SandboxProvider for KubernetesApplyProvider {
                 wait.stderr
             );
         }
-        let mut handle =
-            self.dry_run
-                .fork(parent_sandbox_id, child_sandbox_id, snapshot_id, spec)?;
+        let mut handle = self.dry_run.fork(
+            parent_sandbox_id,
+            child_sandbox_id,
+            snapshot_id,
+            spec,
+            cancelled,
+        )?;
         mark_resources(
             &mut handle.resources,
             RuntimeResourceStatus::Ready,
@@ -2377,7 +2426,7 @@ impl SandboxProvider for KubernetesApplyProvider {
         Ok(handle)
     }
 
-    fn stop(&self, sandbox_id: SandboxId) -> anyhow::Result<()> {
+    fn stop(&self, sandbox_id: SandboxId, cancelled: &CancelSignal) -> anyhow::Result<()> {
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
         let args = self.teardown_args(sandbox_id);
         let output = run_kubectl_command(
@@ -2385,7 +2434,7 @@ impl SandboxProvider for KubernetesApplyProvider {
             &args,
             "delete sandbox resources",
             self.kubectl_command_timeout,
-            None,
+            Some(cancelled),
             self.max_captured_output_bytes,
         )?;
         if !output.success {
@@ -2542,7 +2591,7 @@ mod tests {
         let spec = SandboxProvisionSpec::default();
 
         let provisioned = provider
-            .provision(sandbox_id, &spec)
+            .provision(sandbox_id, &spec, &CancelSignal::never_cancelled())
             .expect("dry-run provision should succeed");
         assert_eq!(provisioned.metadata["mode"], "dry_run");
         assert_eq!(provisioned.metadata["operation"], "provision");
@@ -2589,7 +2638,7 @@ mod tests {
         assert!(exec.stdout.contains("\"operation\":\"exec\""));
 
         let snapshot = provider
-            .create_snapshot(sandbox_id, snapshot_id)
+            .create_snapshot(sandbox_id, snapshot_id, &CancelSignal::never_cancelled())
             .expect("dry-run snapshot should succeed");
         assert_eq!(snapshot.metadata["operation"], "snapshot");
         assert_eq!(
@@ -2598,7 +2647,13 @@ mod tests {
         );
 
         let fork = provider
-            .fork(sandbox_id, child_sandbox_id, snapshot_id, &spec)
+            .fork(
+                sandbox_id,
+                child_sandbox_id,
+                snapshot_id,
+                &spec,
+                &CancelSignal::never_cancelled(),
+            )
             .expect("dry-run fork should succeed");
         assert_eq!(fork.metadata["operation"], "fork");
         assert_eq!(fork.provider, "kubernetes");
@@ -2627,7 +2682,11 @@ mod tests {
         );
 
         let provisioned = provider
-            .provision(SandboxId::new(), &SandboxProvisionSpec::default())
+            .provision(
+                SandboxId::new(),
+                &SandboxProvisionSpec::default(),
+                &CancelSignal::never_cancelled(),
+            )
             .expect("dry-run provision should succeed");
         assert_eq!(
             provisioned.metadata["runtime"]["image"],
@@ -2682,7 +2741,11 @@ mod tests {
         );
 
         let provisioned = provider
-            .provision(SandboxId::new(), &SandboxProvisionSpec::default())
+            .provision(
+                SandboxId::new(),
+                &SandboxProvisionSpec::default(),
+                &CancelSignal::never_cancelled(),
+            )
             .expect("dry-run provision should succeed");
         assert_eq!(
             provisioned.metadata["manifests"]["pvc"]["spec"]["resources"]["requests"]["storage"],
@@ -2701,7 +2764,7 @@ mod tests {
         };
 
         let provisioned = provider
-            .provision(SandboxId::new(), &spec)
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
             .expect("dry-run provision should succeed");
         assert_eq!(
             provisioned.metadata["manifests"]["pvc"]["spec"]["resources"]["requests"]["storage"],
@@ -2724,7 +2787,7 @@ mod tests {
             },
         };
         let provisioned = provider
-            .provision(SandboxId::new(), &spec)
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
             .expect("dry-run provision should succeed");
         let pod = &provisioned.metadata["manifests"]["pod"];
         let network_policy = &provisioned.metadata["manifests"]["networkPolicy"];
@@ -2773,7 +2836,7 @@ mod tests {
         };
 
         let error = provider
-            .provision(SandboxId::new(), &spec)
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
             .expect_err("host allow rules should not silently render deny-all");
         assert!(error.to_string().contains("cannot enforce host allow rule"));
     }
@@ -2784,7 +2847,11 @@ mod tests {
             KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
                 .with_ssh_authorized_keys_secret(Some("sandboxwich-authorized-keys".to_string()));
         let provisioned = provider
-            .provision(SandboxId::new(), &SandboxProvisionSpec::default())
+            .provision(
+                SandboxId::new(),
+                &SandboxProvisionSpec::default(),
+                &CancelSignal::never_cancelled(),
+            )
             .expect("dry-run provision should succeed");
         let pod = &provisioned.metadata["manifests"]["pod"];
 
@@ -3063,7 +3130,7 @@ mod tests {
         };
 
         let provisioned = provider
-            .provision(SandboxId::new(), &spec)
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
             .expect("dry-run provision should succeed");
         let policy = &provisioned.metadata["manifests"]["networkPolicy"];
 
@@ -3129,7 +3196,7 @@ mod tests {
         };
 
         let provisioned = provider
-            .provision(SandboxId::new(), &spec)
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
             .expect("dry-run provision should succeed");
         let egress = provisioned.metadata["manifests"]["networkPolicy"]["spec"]["egress"]
             .as_array()
@@ -3172,7 +3239,7 @@ mod tests {
         };
 
         let provisioned = provider
-            .provision(SandboxId::new(), &spec)
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
             .expect("dry-run provision should succeed");
         let egress = provisioned.metadata["manifests"]["networkPolicy"]["spec"]["egress"]
             .as_array()
@@ -3203,7 +3270,7 @@ mod tests {
         };
 
         let err = provider
-            .provision(SandboxId::new(), &spec)
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
             .expect_err("allowlisting a range fully covered by an excluded CIDR must be rejected");
         assert!(err.to_string().contains("169.254.0.0/16"));
     }
@@ -3223,7 +3290,7 @@ mod tests {
         };
 
         provider
-            .provision(SandboxId::new(), &spec)
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
             .expect_err("allowlisting a CIDR identical to an excluded range must be rejected");
     }
 
@@ -3242,7 +3309,7 @@ mod tests {
         };
 
         let provisioned = provider
-            .provision(SandboxId::new(), &spec)
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
             .expect("dry-run provision should succeed");
         let egress = provisioned.metadata["manifests"]["networkPolicy"]["spec"]["egress"]
             .as_array()
@@ -3272,7 +3339,7 @@ mod tests {
         };
 
         let provisioned = provider
-            .provision(SandboxId::new(), &spec)
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
             .expect("dry-run provision should succeed");
         let egress = provisioned.metadata["manifests"]["networkPolicy"]["spec"]["egress"]
             .as_array()
@@ -3306,7 +3373,7 @@ mod tests {
         };
 
         let provisioned = provider
-            .provision(SandboxId::new(), &spec)
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
             .expect("dry-run provision should succeed");
         let egress = provisioned.metadata["manifests"]["networkPolicy"]["spec"]["egress"]
             .as_array()
@@ -3327,7 +3394,7 @@ mod tests {
         };
 
         let provisioned = provider
-            .provision(SandboxId::new(), &spec)
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
             .expect("dry-run provision should succeed");
         let except: Vec<&str> = provisioned.metadata["manifests"]["networkPolicy"]["spec"]
             ["egress"][0]["to"][0]["ipBlock"]["except"]
@@ -3357,7 +3424,7 @@ mod tests {
         };
 
         let provisioned = provider
-            .provision(SandboxId::new(), &spec)
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
             .expect("dry-run provision should succeed");
         let except: Vec<&str> = provisioned.metadata["manifests"]["networkPolicy"]["spec"]
             ["egress"][0]["to"][0]["ipBlock"]["except"]
@@ -3380,7 +3447,7 @@ mod tests {
         };
 
         let provisioned = provider
-            .provision(SandboxId::new(), &spec)
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
             .expect("dry-run provision should succeed");
         assert_eq!(
             provisioned.metadata["manifests"]["networkPolicy"]["spec"]["egress"],
@@ -3393,7 +3460,11 @@ mod tests {
         let provider =
             KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
         let provisioned = provider
-            .provision(SandboxId::new(), &SandboxProvisionSpec::default())
+            .provision(
+                SandboxId::new(),
+                &SandboxProvisionSpec::default(),
+                &CancelSignal::never_cancelled(),
+            )
             .expect("dry-run provision should succeed");
         let policy = &provisioned.metadata["manifests"]["networkPolicy"];
 
@@ -3430,7 +3501,11 @@ mod tests {
                     "sandboxwich-proxy".to_string(),
                 )]);
         let provisioned = provider
-            .provision(SandboxId::new(), &SandboxProvisionSpec::default())
+            .provision(
+                SandboxId::new(),
+                &SandboxProvisionSpec::default(),
+                &CancelSignal::never_cancelled(),
+            )
             .expect("dry-run provision should succeed");
         let from =
             &provisioned.metadata["manifests"]["networkPolicy"]["spec"]["ingress"][0]["from"][0];
@@ -3454,7 +3529,7 @@ mod tests {
             network_egress: NetworkEgress::DenyAll,
         };
         let provisioned = provider
-            .provision(SandboxId::new(), &spec)
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
             .expect("dry-run provision should succeed");
         let pod = &provisioned.metadata["manifests"]["pod"];
 
@@ -3480,7 +3555,11 @@ mod tests {
             KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
                 .with_vnc_password_secret(Some("sandboxwich-vnc-password".to_string()));
         let provisioned = provider
-            .provision(SandboxId::new(), &SandboxProvisionSpec::default())
+            .provision(
+                SandboxId::new(),
+                &SandboxProvisionSpec::default(),
+                &CancelSignal::never_cancelled(),
+            )
             .expect("dry-run provision should succeed");
         let pod = &provisioned.metadata["manifests"]["pod"];
         let env = pod["spec"]["containers"][0]["env"]
@@ -3525,10 +3604,14 @@ mod tests {
         let child_id = SandboxId::new();
         let snapshot_id = SnapshotId::new();
         let provisioned = provider
-            .provision(sandbox_id, &SandboxProvisionSpec::default())
+            .provision(
+                sandbox_id,
+                &SandboxProvisionSpec::default(),
+                &CancelSignal::never_cancelled(),
+            )
             .expect("dry-run provision should succeed");
         let snapshot = provider
-            .create_snapshot(sandbox_id, snapshot_id)
+            .create_snapshot(sandbox_id, snapshot_id, &CancelSignal::never_cancelled())
             .expect("dry-run snapshot should succeed");
         let forked = provider
             .fork(
@@ -3536,6 +3619,7 @@ mod tests {
                 child_id,
                 snapshot_id,
                 &SandboxProvisionSpec::default(),
+                &CancelSignal::never_cancelled(),
             )
             .expect("dry-run fork should succeed");
         let apply = KubernetesApplyProvider::new(provider, "kubectl");
@@ -3565,7 +3649,11 @@ mod tests {
             KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich", None, None)
                 .with_sandbox_namespace(Some("sandboxwich-sandboxes".to_string()));
         let provisioned = provider
-            .provision(SandboxId::new(), &SandboxProvisionSpec::default())
+            .provision(
+                SandboxId::new(),
+                &SandboxProvisionSpec::default(),
+                &CancelSignal::never_cancelled(),
+            )
             .expect("dry-run provision should succeed");
 
         assert_eq!(provisioned.metadata["namespace"], "sandboxwich-sandboxes");
@@ -3643,7 +3731,7 @@ mod tests {
         let apply = KubernetesApplyProvider::new(provider, "kubectl");
 
         let error = apply
-            .stop(SandboxId::new())
+            .stop(SandboxId::new(), &CancelSignal::never_cancelled())
             .expect_err("stop without the mutation gate should fail closed");
         assert!(error.to_string().contains("--confirm-apply"));
     }
@@ -3654,7 +3742,7 @@ mod tests {
             KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
 
         provider
-            .stop(SandboxId::new())
+            .stop(SandboxId::new(), &CancelSignal::never_cancelled())
             .expect("dry-run stop should never fail");
     }
 
@@ -3683,10 +3771,12 @@ mod tests {
     /// - appends every invocation's space-joined argv as one line to `log_path`
     ///   (bracketed with leading/trailing spaces so tests can match whole
     ///   tokens like " delete " without false positives on substrings), and
-    /// - drains stdin for the "apply" verb, mirroring how
+    /// - drains stdin for a successful "apply" verb, mirroring how
     ///   `run_kubectl_documents` actually pipes manifests in via stdin so the
     ///   real caller's `write_all` doesn't block on a full pipe;
-    /// - exits non-zero if `fail_verb` is present in argv, and zero otherwise.
+    /// - exits immediately with a non-zero status if `fail_verb` is present in
+    ///   argv, including before draining stdin. This reproduces kubectl closing
+    ///   its input early after an argument/authentication/validation failure.
     ///
     /// This lets rollback behavior be exercised end-to-end (provision/fork
     /// calling through to a real rollback `kubectl delete`) without requiring
@@ -3705,10 +3795,11 @@ mod tests {
         let script = format!(
             "#!/bin/sh\n\
              printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             {fail_check}\
              case \" $* \" in\n\
              \x20\x20*\" apply \"*) cat >/dev/null 2>&1 || true ;;\n\
              esac\n\
-             {fail_check}exit 0\n",
+             exit 0\n",
             log = log_path.display(),
         );
         let script_path = dir.join("kubectl");
@@ -3739,7 +3830,11 @@ mod tests {
         let sandbox_id = SandboxId::new();
 
         let error = provider
-            .provision(sandbox_id, &SandboxProvisionSpec::default())
+            .provision(
+                sandbox_id,
+                &SandboxProvisionSpec::default(),
+                &CancelSignal::never_cancelled(),
+            )
             .expect_err("a pod that never becomes ready should fail provision");
         assert!(error.to_string().contains("did not become ready"));
 
@@ -3773,7 +3868,11 @@ mod tests {
         let sandbox_id = SandboxId::new();
 
         let error = provider
-            .provision(sandbox_id, &SandboxProvisionSpec::default())
+            .provision(
+                sandbox_id,
+                &SandboxProvisionSpec::default(),
+                &CancelSignal::never_cancelled(),
+            )
             .expect_err("a failing kubectl apply should fail provision");
         assert!(error.to_string().contains("kubectl apply"));
 
@@ -3801,6 +3900,7 @@ mod tests {
                 child_sandbox_id,
                 snapshot_id,
                 &SandboxProvisionSpec::default(),
+                &CancelSignal::never_cancelled(),
             )
             .expect_err("a forked pod that never becomes ready should fail fork");
         assert!(error.to_string().contains("did not become ready"));
@@ -3830,7 +3930,11 @@ mod tests {
         let sandbox_id = SandboxId::new();
 
         provider
-            .provision(sandbox_id, &SandboxProvisionSpec::default())
+            .provision(
+                sandbox_id,
+                &SandboxProvisionSpec::default(),
+                &CancelSignal::never_cancelled(),
+            )
             .expect("apply and wait both succeeding should provision successfully");
 
         let log = std::fs::read_to_string(&log_path).expect("read fake kubectl log");
@@ -3839,6 +3943,206 @@ mod tests {
         assert!(
             !log.contains(" delete "),
             "a successful provision must not roll anything back, got: {log}"
+        );
+
+        let _ = std::fs::remove_dir_all(kubectl.parent().expect("kubectl script has a parent dir"));
+    }
+
+    /// Like `write_fake_kubectl`, but instead of failing on `sleep_verb`, the
+    /// script drains stdin and then sleeps for `sleep_secs` before exiting
+    /// zero. Used to exercise the timeout/cancellation bound on a real
+    /// `SandboxProvider` mutating call (`provision`/`fork`/`stop`/
+    /// `create_snapshot`) rather than just `run_kubectl_command_async` in
+    /// isolation.
+    fn write_fake_kubectl_sleeping_on(
+        sleep_verb: &'static str,
+        sleep_secs: u64,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("sandboxwich-fake-kubectl-{}", SandboxId::new()));
+        std::fs::create_dir_all(&dir).expect("create fake kubectl temp dir");
+        let log_path = dir.join("log.txt");
+        let script = format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             cat >/dev/null 2>&1 || true\n\
+             case \" $* \" in\n\
+             \x20\x20*\" {sleep_verb} \"*) sleep {sleep_secs} ;;\n\
+             esac\n\
+             exit 0\n",
+            log = log_path.display(),
+        );
+        let script_path = dir.join("kubectl");
+        std::fs::write(&script_path, script).expect("write fake kubectl script");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)
+                .expect("stat fake kubectl script")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).expect("chmod fake kubectl script");
+        }
+        (script_path, log_path)
+    }
+
+    #[test]
+    fn provision_apply_is_bounded_by_the_kubectl_command_timeout_and_reports_a_retryable_error() {
+        // Regression test for the "run_kubectl_documents is unbounded and blocking"
+        // finding: `provision`'s `kubectl apply` used to run through
+        // `std::process::Command::wait_with_output()` with no bound at all, so a
+        // wedged API server hung the worker's job-execution thread forever, and its
+        // failure (once it did occur) was an untyped `anyhow::Error` that
+        // `classify_retry` treats as permanent. It must instead be bounded by the
+        // provider's configured timeout and reported as a retryable
+        // `ProviderError`.
+        let (kubectl, _log_path) = write_fake_kubectl_sleeping_on("apply", 30);
+        let provider = apply_provider_with_fake_kubectl(&kubectl)
+            .with_kubectl_command_timeout(Duration::from_millis(200));
+        let sandbox_id = SandboxId::new();
+
+        let started = std::time::Instant::now();
+        let error = provider
+            .provision(
+                sandbox_id,
+                &SandboxProvisionSpec::default(),
+                &CancelSignal::never_cancelled(),
+            )
+            .expect_err("a wedged kubectl apply must not hang provision forever");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "provision should have been killed by the ~200ms timeout instead of \
+             waiting anywhere near the fake kubectl's 30s sleep; elapsed = {elapsed:?}"
+        );
+        assert!(
+            error.to_string().contains("timed out"),
+            "expected a timeout error, got: {error}"
+        );
+        let disposition = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ProviderError>())
+            .map(ProviderError::disposition);
+        assert_eq!(
+            disposition,
+            Some(RetryDisposition::Retryable),
+            "a wedged kubectl apply is transient infrastructure trouble and must be \
+             classified retryable, not permanent; got {error:#}"
+        );
+
+        let _ = std::fs::remove_dir_all(kubectl.parent().expect("kubectl script has a parent dir"));
+    }
+
+    #[test]
+    fn provision_apply_is_cancelled_when_lease_renewal_is_lost() {
+        // Regression test for "cancellation only threads through exec_handoff":
+        // before this fix, `provision`'s `kubectl apply` (and its `kubectl wait`)
+        // ran with no `CancelSignal` at all, so a worker that lost its lease mid-
+        // provision kept mutating the cluster indefinitely instead of aborting.
+        let (kubectl, _log_path) = write_fake_kubectl_sleeping_on("apply", 30);
+        let provider = apply_provider_with_fake_kubectl(&kubectl)
+            .with_kubectl_command_timeout(Duration::from_secs(60));
+        let sandbox_id = SandboxId::new();
+
+        let cancelled = CancelSignal::new();
+        let flip_cancelled = cancelled.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            flip_cancelled.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let error = provider
+            .provision(sandbox_id, &SandboxProvisionSpec::default(), &cancelled)
+            .expect_err("a cancelled apply must abort provision instead of completing");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "provision should have been cancelled almost immediately instead of \
+             waiting anywhere near the fake kubectl's 30s sleep or 60s timeout; \
+             elapsed = {elapsed:?}"
+        );
+        assert!(
+            error.to_string().contains("cancelled"),
+            "expected a cancellation error, got: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(kubectl.parent().expect("kubectl script has a parent dir"));
+    }
+
+    #[test]
+    fn provision_wait_for_pod_ready_is_cancelled_when_lease_renewal_is_lost() {
+        // Same regression as above, but targeting `wait_for_pod_ready`
+        // specifically: it used to be called with `cancelled: None` even though
+        // it can block for up to 120s, which was the audit's headline example of
+        // the worker mutating (well, waiting on a mutation of) the cluster past
+        // the point where it could still prove it owned the lease.
+        let (kubectl, log_path) = write_fake_kubectl_sleeping_on("wait", 30);
+        let provider = apply_provider_with_fake_kubectl(&kubectl)
+            .with_kubectl_command_timeout(Duration::from_secs(60));
+        let sandbox_id = SandboxId::new();
+
+        let cancelled = CancelSignal::new();
+        let flip_cancelled = cancelled.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            flip_cancelled.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let error = provider
+            .provision(sandbox_id, &SandboxProvisionSpec::default(), &cancelled)
+            .expect_err("a cancelled wait-for-ready must abort provision instead of completing");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "provision should have been cancelled almost immediately instead of \
+             waiting anywhere near the fake kubectl's 30s sleep or 60s timeout; \
+             elapsed = {elapsed:?}"
+        );
+        assert!(
+            error.to_string().contains("cancelled"),
+            "expected a cancellation error, got: {error}"
+        );
+        let log = std::fs::read_to_string(&log_path).expect("read fake kubectl log");
+        assert!(
+            log.contains(" apply "),
+            "apply should have completed before the wait step began, got: {log}"
+        );
+
+        let _ = std::fs::remove_dir_all(kubectl.parent().expect("kubectl script has a parent dir"));
+    }
+
+    #[test]
+    fn stop_is_cancelled_when_lease_renewal_is_lost() {
+        let (kubectl, _log_path) = write_fake_kubectl_sleeping_on("delete", 30);
+        let provider = apply_provider_with_fake_kubectl(&kubectl)
+            .with_kubectl_command_timeout(Duration::from_secs(60));
+        let sandbox_id = SandboxId::new();
+
+        let cancelled = CancelSignal::new();
+        let flip_cancelled = cancelled.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            flip_cancelled.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let error = provider
+            .stop(sandbox_id, &cancelled)
+            .expect_err("a cancelled stop must abort instead of completing");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "stop should have been cancelled almost immediately instead of waiting \
+             anywhere near the fake kubectl's 30s sleep or 60s timeout; elapsed = {elapsed:?}"
+        );
+        assert!(
+            error.to_string().contains("cancelled"),
+            "expected a cancellation error, got: {error}"
         );
 
         let _ = std::fs::remove_dir_all(kubectl.parent().expect("kubectl script has a parent dir"));
@@ -3893,7 +4197,11 @@ mod tests {
         let sandbox_id = SandboxId::new();
 
         let handle = provider
-            .provision(sandbox_id, &SandboxProvisionSpec::default())
+            .provision(
+                sandbox_id,
+                &SandboxProvisionSpec::default(),
+                &CancelSignal::never_cancelled(),
+            )
             .expect("provision against the fake kubectl should succeed");
 
         let wait_stdout = handle.metadata["waitStdout"]

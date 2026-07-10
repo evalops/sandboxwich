@@ -663,6 +663,7 @@ pub(crate) async fn run_contract(server: TestServer) {
     assert_eq!(fetched_command.command.status, CommandStatus::Finished);
 
     assert_retryable_failure_requeues_command(&client, &server, &created, &worker).await;
+    assert_command_status_is_derived_from_exit_code(&client, &server, &created, &worker).await;
     assert_expired_lease_requeues_command(&client, &server, &created, &worker).await;
     assert_prompt_job_lifecycle(&client, &server, &created).await;
     assert_desktop_session_lifecycle(&client, &server, &created).await;

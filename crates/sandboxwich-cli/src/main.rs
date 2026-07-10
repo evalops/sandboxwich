@@ -25,6 +25,38 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Default ceiling on how long `--wait`/`--follow` (and `logs --follow`) poll for completion.
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 300;
 
+/// Header name the API's idempotency middleware looks for on mutating `/v1`
+/// requests (see `sandboxwich-api`'s `enforce_idempotency`). Every mutating CLI
+/// command attaches one.
+///
+/// Honesty note on what the key buys you: by default the key is freshly
+/// generated per CLI invocation, which only makes the single request this
+/// process sends replayable *server-side* -- it cannot protect against the
+/// common retry, a user or script re-running the whole CLI command after a
+/// timeout, because that new process generates a new key. To make a scripted
+/// retry actually replay the original response instead of executing the
+/// mutation twice, pass the same key explicitly via
+/// `--idempotency-key`/`SANDBOXWICH_IDEMPOTENCY_KEY` on every attempt (e.g.
+/// generate one `uuidgen` per logical operation in the script and reuse it
+/// across retries).
+///
+/// File uploads deliberately do not get a key: the API buffers idempotent
+/// request bodies up to its normal 1 MiB limit, so attaching one to a large
+/// multipart upload would turn an otherwise-fine upload into a
+/// `413 idempotency_payload_too_large`.
+const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+
+/// Resolves the `Idempotency-Key` value used for this invocation's mutating
+/// request: the explicitly supplied key when given (so retries of the same
+/// logical operation can replay), otherwise a fresh UUIDv7. A blank explicit
+/// value is treated as unset rather than sent as an (invalid) empty key.
+fn resolve_idempotency_key(explicit: Option<String>) -> String {
+    match explicit {
+        Some(key) if !key.trim().is_empty() => key.trim().to_string(),
+        _ => Uuid::now_v7().to_string(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum OutputFormat {
     Table,
@@ -60,6 +92,15 @@ struct Cli {
         default_value_t = DEFAULT_REQUEST_TIMEOUT_SECS
     )]
     request_timeout_secs: u64,
+
+    /// Idempotency-Key sent on this invocation's mutating request. Pass the
+    /// same key when retrying a failed/timed-out invocation of the same
+    /// logical operation and the API replays the original response instead of
+    /// executing the mutation twice. When omitted, a fresh key is generated
+    /// per invocation -- which does NOT protect a re-run of the CLI, only a
+    /// server-side replay of this one request.
+    #[arg(long, env = "SANDBOXWICH_IDEMPOTENCY_KEY")]
+    idempotency_key: Option<String>,
 
     /// Output format for structured responses.
     #[arg(long, short = 'o', value_enum, default_value_t = OutputFormat::Json)]
@@ -409,6 +450,10 @@ async fn main() -> anyhow::Result<()> {
         request_timeout,
     )?;
     let api = cli.api.trim_end_matches('/');
+    // One key per invocation is safe because every subcommand sends at most one
+    // idempotency-keyed mutating request; see IDEMPOTENCY_KEY_HEADER for what an
+    // explicit key buys over the generated default.
+    let idempotency_key = resolve_idempotency_key(cli.idempotency_key.clone());
 
     match cli.command {
         Command::New(args) => {
@@ -417,6 +462,7 @@ async fn main() -> anyhow::Result<()> {
             let wait_timeout = Duration::from_secs(args.wait_timeout_secs);
             let response = client
                 .post(format!("{api}/sandboxes"))
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&CreateSandboxRequest {
                     name: args.name,
                     template: args.template,
@@ -461,6 +507,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Stop { sandbox_id } => {
             let response = client
                 .post(format!("{api}/sandboxes/{sandbox_id}/stop"))
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .send()
                 .await?;
             print_json::<SandboxResponse>(response).await?;
@@ -468,6 +515,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Resume { sandbox_id } => {
             let response = client
                 .post(format!("{api}/sandboxes/{sandbox_id}/resume"))
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .send()
                 .await?;
             print_json::<SandboxResponse>(response).await?;
@@ -475,6 +523,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Fork(args) => {
             let response = client
                 .post(format!("{api}/sandboxes/{}/fork", args.sandbox_id))
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&CreateSandboxRequest {
                     name: args.name,
                     template: None,
@@ -489,6 +538,7 @@ async fn main() -> anyhow::Result<()> {
         Command::CreateSnapshot(args) => {
             let response = client
                 .post(format!("{api}/sandboxes/{}/snapshots", args.sandbox_id))
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&CreateSnapshotRequest {
                     label: args.label,
                     inventory: None,
@@ -516,6 +566,7 @@ async fn main() -> anyhow::Result<()> {
         Command::CleanupSnapshots => {
             let response = client
                 .post(format!("{api}/snapshots/cleanup"))
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .send()
                 .await?;
             print_json::<SnapshotCleanupResponse>(response).await?;
@@ -526,6 +577,7 @@ async fn main() -> anyhow::Result<()> {
                     "{api}/sandboxes/{}/desktop-sessions",
                     args.sandbox_id
                 ))
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&CreateDesktopSessionRequest {
                     broker: args.broker,
                     broker_url: args.broker_url,
@@ -557,6 +609,7 @@ async fn main() -> anyhow::Result<()> {
                     "{api}/desktop-sessions/{}/status",
                     args.desktop_session_id
                 ))
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&UpdateDesktopSessionRequest {
                     status: args.status.into(),
                     broker: args.broker,
@@ -576,6 +629,7 @@ async fn main() -> anyhow::Result<()> {
                     "{api}/desktop-sessions/{}/access",
                     args.desktop_session_id
                 ))
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&DesktopAccessRequest {
                     ttl_seconds: args.ttl_seconds,
                 })
@@ -586,6 +640,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Ssh(args) => {
             let response = client
                 .post(format!("{api}/sandboxes/{}/ssh-access", args.sandbox_id))
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&SshAccessRequest {
                     principal: args.principal.clone(),
                     ttl_seconds: args.ttl_seconds,
@@ -602,6 +657,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Scp(args) => {
             let response = client
                 .post(format!("{api}/sandboxes/{}/ssh-access", args.sandbox_id))
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&SshAccessRequest {
                     principal: args.principal.clone(),
                     ttl_seconds: args.ttl_seconds,
@@ -623,6 +679,7 @@ async fn main() -> anyhow::Result<()> {
             let wait = args.wait || follow;
             let response = client
                 .post(format!("{api}/sandboxes/{}/commands", args.sandbox_id))
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&CommandRequest {
                     argv: args.argv,
                     cwd: args.cwd,
@@ -641,7 +698,11 @@ async fn main() -> anyhow::Result<()> {
                     follow,
                 )
                 .await?;
-                print_value(&CommandResponse { ok: true, command })?;
+                print_value(&CommandResponse {
+                    ok: true,
+                    command: command.clone(),
+                })?;
+                exit_with_command_result(&command);
             } else {
                 print_value(&queued)?;
             }
@@ -688,7 +749,17 @@ async fn main() -> anyhow::Result<()> {
                 print_output_chunks(&chunks);
                 initial
             };
-            print_value(&CommandResponse { ok: true, command })?;
+            let follow = args.follow;
+            print_value(&CommandResponse {
+                ok: true,
+                command: command.clone(),
+            })?;
+            // Only `--follow` implies waiting for a terminal state; a plain one-shot
+            // `logs` should keep reflecting whatever status the command happens to be
+            // in right now without forcing a process exit code on it.
+            if follow {
+                exit_with_command_result(&command);
+            }
         }
         Command::Workers => {
             let response = client.get(format!("{api}/workers")).send().await?;
@@ -712,6 +783,7 @@ async fn main() -> anyhow::Result<()> {
         Command::SetGuestHealth(args) => {
             let response = client
                 .post(format!("{api}/sandboxes/{}/guest-health", args.sandbox_id))
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&UpdateGuestHealthRequest {
                     status: args.status.into(),
                     agent_version: args.agent_version,
@@ -732,6 +804,7 @@ async fn main() -> anyhow::Result<()> {
         Command::AddSshKey(args) => {
             let response = client
                 .post(format!("{api}/sandboxes/{}/ssh-keys", args.sandbox_id))
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&RequestSshKeyRequest {
                     public_key: args.public_key,
                     principal: args.principal,
@@ -743,6 +816,7 @@ async fn main() -> anyhow::Result<()> {
         Command::SetSshKeyStatus(args) => {
             let response = client
                 .post(format!("{api}/ssh-keys/{}/status", args.ssh_key_id))
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&UpdateSshKeyStatusRequest {
                     status: args.status.into(),
                     error: args.error,
@@ -1137,6 +1211,34 @@ fn is_terminal(status: &CommandStatus) -> bool {
     matches!(status, CommandStatus::Finished | CommandStatus::Failed)
 }
 
+/// The process exit code that should be reported for a terminal `command`, or
+/// `None` if it hasn't reached a terminal state yet (nothing to report). A
+/// `Failed` command with no exit code at all (e.g. killed by a timeout) maps
+/// to `1`, since "no exit code" is not success.
+fn command_exit_code(command: &CommandRun) -> Option<i32> {
+    if !is_terminal(&command.status) {
+        return None;
+    }
+    Some(match command.status {
+        CommandStatus::Failed => command.exit_code.filter(|&code| code != 0).unwrap_or(1),
+        _ => command.exit_code.unwrap_or(0),
+    })
+}
+
+/// Exits the process with `command`'s own exit code once it has reached a
+/// terminal state, mirroring how `sandboxwich-agent`'s own `exec` reflects a
+/// command's exit code in its process exit code. Without this, `sandboxwich
+/// exec --wait`/`logs --follow` always exited 0 after printing the terminal
+/// `CommandRun` -- even a `Failed` one -- so CI pipelines could not gate on
+/// command failure without parsing the printed JSON themselves.
+fn exit_with_command_result(command: &CommandRun) {
+    if let Some(code) = command_exit_code(command)
+        && code != 0
+    {
+        std::process::exit(code);
+    }
+}
+
 fn print_output_chunks(chunks: &[sandboxwich_core::CommandOutputChunk]) {
     use std::io::Write as _;
 
@@ -1260,6 +1362,92 @@ mod tests {
         assert!(is_terminal(&CommandStatus::Failed));
         assert!(!is_terminal(&CommandStatus::Queued));
         assert!(!is_terminal(&CommandStatus::Running));
+    }
+
+    #[test]
+    fn resolve_idempotency_key_uses_an_explicit_key_verbatim() {
+        // The whole point of --idempotency-key/SANDBOXWICH_IDEMPOTENCY_KEY: a
+        // scripted retry passes the same key on every attempt so the API
+        // replays the first response instead of executing the mutation twice.
+        assert_eq!(
+            resolve_idempotency_key(Some("retry-key-1".to_string())),
+            "retry-key-1"
+        );
+        assert_eq!(
+            resolve_idempotency_key(Some("  padded-key  ".to_string())),
+            "padded-key"
+        );
+    }
+
+    #[test]
+    fn resolve_idempotency_key_generates_a_fresh_key_when_unset_or_blank() {
+        let generated = resolve_idempotency_key(None);
+        assert!(
+            Uuid::parse_str(&generated).is_ok(),
+            "generated key should be a UUID, got: {generated}"
+        );
+        // Fresh per resolution, never a fixed value.
+        assert_ne!(resolve_idempotency_key(None), generated);
+        // A blank explicit value would be rejected by the API as an invalid
+        // (empty) key; treat it as unset instead.
+        let from_blank = resolve_idempotency_key(Some("   ".to_string()));
+        assert!(Uuid::parse_str(&from_blank).is_ok());
+    }
+
+    fn command_run(status: CommandStatus, exit_code: Option<i32>) -> CommandRun {
+        let now = chrono::Utc::now();
+        CommandRun {
+            id: CommandId(Uuid::now_v7()),
+            sandbox_id: sandboxwich_core::SandboxId(Uuid::now_v7()),
+            status,
+            argv: vec!["echo".to_string()],
+            cwd: None,
+            exit_code,
+            stdout: String::new(),
+            stderr: String::new(),
+            created_at: now,
+            finished_at: Some(now),
+        }
+    }
+
+    #[test]
+    fn command_exit_code_is_none_for_non_terminal_commands() {
+        assert_eq!(
+            command_exit_code(&command_run(CommandStatus::Queued, None)),
+            None
+        );
+        assert_eq!(
+            command_exit_code(&command_run(CommandStatus::Running, None)),
+            None
+        );
+    }
+
+    #[test]
+    fn command_exit_code_reflects_a_finished_commands_own_exit_code() {
+        assert_eq!(
+            command_exit_code(&command_run(CommandStatus::Finished, Some(0))),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn command_exit_code_is_non_zero_for_a_failed_command_with_a_non_zero_exit_code() {
+        // Regression test: `sandboxwich exec --wait` used to print a Failed
+        // CommandRun and still exit 0, so CI could not gate on it.
+        assert_eq!(
+            command_exit_code(&command_run(CommandStatus::Failed, Some(7))),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn command_exit_code_falls_back_to_one_for_a_failed_command_with_no_exit_code() {
+        // e.g. a command killed by a timeout never reports its own exit code;
+        // "no exit code" must still not be treated as success.
+        assert_eq!(
+            command_exit_code(&command_run(CommandStatus::Failed, None)),
+            Some(1)
+        );
     }
 
     #[test]

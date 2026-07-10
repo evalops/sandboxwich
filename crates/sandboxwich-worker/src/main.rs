@@ -2,7 +2,7 @@ mod provider;
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use provider::{
     CancelSignal, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES, KUBERNETES_MUTATION_ENV,
@@ -408,10 +408,11 @@ impl SandboxProvider for RuntimeProvider {
         &self,
         sandbox_id: sandboxwich_core::SandboxId,
         spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
     ) -> anyhow::Result<sandboxwich_core::ProviderSandboxHandle> {
         match self {
-            Self::DryRun(provider) => provider.provision(sandbox_id, spec),
-            Self::Apply(provider) => provider.provision(sandbox_id, spec),
+            Self::DryRun(provider) => provider.provision(sandbox_id, spec, cancelled),
+            Self::Apply(provider) => provider.provision(sandbox_id, spec, cancelled),
         }
     }
 
@@ -432,10 +433,11 @@ impl SandboxProvider for RuntimeProvider {
         &self,
         sandbox_id: sandboxwich_core::SandboxId,
         snapshot_id: sandboxwich_core::SnapshotId,
+        cancelled: &CancelSignal,
     ) -> anyhow::Result<sandboxwich_core::ProviderSnapshotHandle> {
         match self {
-            Self::DryRun(provider) => provider.create_snapshot(sandbox_id, snapshot_id),
-            Self::Apply(provider) => provider.create_snapshot(sandbox_id, snapshot_id),
+            Self::DryRun(provider) => provider.create_snapshot(sandbox_id, snapshot_id, cancelled),
+            Self::Apply(provider) => provider.create_snapshot(sandbox_id, snapshot_id, cancelled),
         }
     }
 
@@ -445,21 +447,34 @@ impl SandboxProvider for RuntimeProvider {
         child_sandbox_id: sandboxwich_core::SandboxId,
         snapshot_id: sandboxwich_core::SnapshotId,
         spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
     ) -> anyhow::Result<sandboxwich_core::ProviderForkHandle> {
         match self {
-            Self::DryRun(provider) => {
-                provider.fork(parent_sandbox_id, child_sandbox_id, snapshot_id, spec)
-            }
-            Self::Apply(provider) => {
-                provider.fork(parent_sandbox_id, child_sandbox_id, snapshot_id, spec)
-            }
+            Self::DryRun(provider) => provider.fork(
+                parent_sandbox_id,
+                child_sandbox_id,
+                snapshot_id,
+                spec,
+                cancelled,
+            ),
+            Self::Apply(provider) => provider.fork(
+                parent_sandbox_id,
+                child_sandbox_id,
+                snapshot_id,
+                spec,
+                cancelled,
+            ),
         }
     }
 
-    fn stop(&self, sandbox_id: sandboxwich_core::SandboxId) -> anyhow::Result<()> {
+    fn stop(
+        &self,
+        sandbox_id: sandboxwich_core::SandboxId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<()> {
         match self {
-            Self::DryRun(provider) => provider.stop(sandbox_id),
-            Self::Apply(provider) => provider.stop(sandbox_id),
+            Self::DryRun(provider) => provider.stop(sandbox_id, cancelled),
+            Self::Apply(provider) => provider.stop(sandbox_id, cancelled),
         }
     }
 }
@@ -520,9 +535,20 @@ async fn main() -> anyhow::Result<()> {
                 },
                 &CancelSignal::never_cancelled(),
             )?;
-            let provision = provider.provision(sandbox_id, &spec)?;
-            let snapshot = provider.create_snapshot(sandbox_id, snapshot_id)?;
-            let fork = provider.fork(sandbox_id, child_sandbox_id, snapshot_id, &spec)?;
+            let provision =
+                provider.provision(sandbox_id, &spec, &CancelSignal::never_cancelled())?;
+            let snapshot = provider.create_snapshot(
+                sandbox_id,
+                snapshot_id,
+                &CancelSignal::never_cancelled(),
+            )?;
+            let fork = provider.fork(
+                sandbox_id,
+                child_sandbox_id,
+                snapshot_id,
+                &spec,
+                &CancelSignal::never_cancelled(),
+            )?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -840,7 +866,7 @@ async fn claim(
     client: &reqwest::Client,
     api: &str,
     args: ClaimArgs,
-) -> anyhow::Result<ClaimLeaseResponse> {
+) -> Result<ClaimLeaseResponse, WorkerRequestError> {
     let response = client
         .post(format!("{api}/workers/{}/leases/claim", args.worker_id))
         .header(
@@ -870,7 +896,7 @@ async fn register_worker(
     capabilities: Vec<WorkerCapability>,
     labels: BTreeMap<String, String>,
     max_concurrent_jobs: Option<u32>,
-) -> anyhow::Result<WorkerResponse> {
+) -> Result<WorkerResponse, WorkerRequestError> {
     let response = client
         .post(format!("{api}/workers/register"))
         .json(&RegisterWorkerRequest {
@@ -890,7 +916,7 @@ async fn heartbeat_worker(
     api: &str,
     worker_id: Uuid,
     labels: BTreeMap<String, String>,
-) -> anyhow::Result<WorkerResponse> {
+) -> Result<WorkerResponse, WorkerRequestError> {
     let response = client
         .post(format!("{api}/workers/{worker_id}/heartbeat"))
         .json(&WorkerHeartbeatRequest {
@@ -902,7 +928,11 @@ async fn heartbeat_worker(
     decode_json::<WorkerResponse>(response).await
 }
 
-async fn drain_worker(client: &reqwest::Client, api: &str, worker_id: Uuid) -> anyhow::Result<()> {
+async fn drain_worker(
+    client: &reqwest::Client,
+    api: &str,
+    worker_id: Uuid,
+) -> Result<(), WorkerRequestError> {
     let response = client
         .post(format!("{api}/workers/{worker_id}/drain"))
         .send()
@@ -932,14 +962,87 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// `expires_at`/`leased_at` pair is somehow non-positive.
 const FALLBACK_LEASE_DURATION: Duration = Duration::from_secs(30);
 
+/// Error from a control-plane HTTP call, distinguishing transient/recoverable
+/// failures (connection issues, timeouts, 5xx, 429) from failures that should
+/// not be retried. Mirrors `sandboxwich-agent`'s `AgentRequestError`: before
+/// this type existed, every HTTP failure collapsed into a plain
+/// `anyhow::Error` string in `decode_json`, so `with_retries` could not tell a
+/// dropped connection (worth retrying) apart from a `401`/`404`/`409` (a
+/// permanent rejection -- e.g. `lease_expired`, `idempotency_key_reused` --
+/// that retrying only delays cancel propagation and burns the full retry
+/// budget on). `with_retries` uses `is_recoverable` to stop immediately on the
+/// latter.
+#[derive(Debug)]
+enum WorkerRequestError {
+    Transport(reqwest::Error),
+    Status {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    Decode(serde_json::Error),
+}
+
+impl std::fmt::Display for WorkerRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkerRequestError::Transport(error) => write!(f, "request failed: {error}"),
+            WorkerRequestError::Status { status, body } => {
+                write!(f, "request failed with {status}: {body}")
+            }
+            WorkerRequestError::Decode(error) => {
+                write!(f, "failed to decode response body: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WorkerRequestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            WorkerRequestError::Transport(error) => Some(error),
+            WorkerRequestError::Status { .. } => None,
+            WorkerRequestError::Decode(error) => Some(error),
+        }
+    }
+}
+
+impl From<reqwest::Error> for WorkerRequestError {
+    fn from(error: reqwest::Error) -> Self {
+        WorkerRequestError::Transport(error)
+    }
+}
+
+impl WorkerRequestError {
+    /// Whether this failure looks transient (worth retrying) rather than a
+    /// durable rejection. A decode failure is never recoverable: the server
+    /// answered successfully with a body this worker cannot parse, and
+    /// retrying the identical request will get the identical body.
+    fn is_recoverable(&self) -> bool {
+        match self {
+            WorkerRequestError::Transport(error) => {
+                error.is_timeout() || error.is_connect() || error.is_request()
+            }
+            WorkerRequestError::Status { status, .. } => {
+                status.is_server_error()
+                    || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || *status == reqwest::StatusCode::REQUEST_TIMEOUT
+            }
+            WorkerRequestError::Decode(_) => false,
+        }
+    }
+}
+
 /// Runs `f` up to `attempts` times with exponential backoff between failures.
 /// Transient control-plane hiccups (a dropped connection, a 5xx, a timeout) should
 /// not be fatal to the worker process; this bounds how long we tolerate them before
-/// surfacing the error to the caller.
+/// surfacing the error to the caller. A permanent failure (see
+/// `WorkerRequestError::is_recoverable`) stops the retry loop immediately instead
+/// of burning the full attempt budget and backoff delay on a request that will
+/// never succeed.
 async fn with_retries<T, F, Fut>(operation: &str, attempts: u32, f: F) -> anyhow::Result<T>
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<T>>,
+    Fut: std::future::Future<Output = Result<T, WorkerRequestError>>,
 {
     let mut delay = RETRY_BASE_DELAY;
     let mut last_error = None;
@@ -947,12 +1050,19 @@ where
         match f().await {
             Ok(value) => return Ok(value),
             Err(error) => {
+                if !error.is_recoverable() {
+                    eprintln!(
+                        "warning: {operation} failed with a permanent error, not retrying: {error}"
+                    );
+                    last_error = Some(error);
+                    break;
+                }
                 if attempt == attempts.max(1) {
                     last_error = Some(error);
                     break;
                 }
                 eprintln!(
-                    "warning: {operation} failed (attempt {attempt}/{attempts}), retrying in {delay:?}: {error:#}"
+                    "warning: {operation} failed (attempt {attempt}/{attempts}), retrying in {delay:?}: {error}"
                 );
                 tokio::time::sleep(delay).await;
                 delay = (delay * 2).min(RETRY_MAX_DELAY);
@@ -960,7 +1070,9 @@ where
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("{operation} failed with no error recorded")))
+    Err(last_error
+        .map(anyhow::Error::new)
+        .unwrap_or_else(|| anyhow::anyhow!("{operation} failed with no error recorded")))
 }
 
 /// Uses the provider's typed retry contract. Untyped errors are permanent;
@@ -1312,7 +1424,7 @@ fn execute_job(
         JobKind::ProvisionSandbox => {
             let sandbox_id = sandbox_id_from_payload(&job.payload)?;
             let spec = provision_spec_from_payload(&job.payload)?;
-            let handle = provider.provision(sandbox_id, &spec)?;
+            let handle = provider.provision(sandbox_id, &spec, cancelled)?;
             Ok(WorkerJobOutcome::Complete(
                 WorkerJobResult::ProvisionSandbox { handle },
             ))
@@ -1330,16 +1442,19 @@ fn execute_job(
                 agent_request_from_payload(&job.payload)?,
                 cancelled,
             )?;
-            if result.exit_code.unwrap_or(1) == 0 {
-                Ok(WorkerJobOutcome::Complete(WorkerJobResult::RunCommand {
-                    result,
-                }))
-            } else {
-                Ok(WorkerJobOutcome::Fail {
-                    error: result.stderr,
-                    retry: false,
-                })
-            }
+            // A non-zero exit code means the command actually ran to completion inside
+            // the sandbox -- that is a successful *lease* outcome (the worker did what
+            // it was asked), not an infrastructure failure. Previously this branch
+            // reported the lease itself as failed (`FailLeaseRequest { retry: false }`),
+            // which discarded the typed `AgentCommandResult` (dropping stdout entirely,
+            // since only `stderr` was forwarded as the error text) and conflated "the
+            // command exited 1" with "the worker couldn't run it at all". Always
+            // complete the lease with the full result; the API's
+            // `apply_completed_job_on_connection` derives the command's own
+            // Finished/Failed status from `exit_code`.
+            Ok(WorkerJobOutcome::Complete(WorkerJobResult::RunCommand {
+                result,
+            }))
         }
         JobKind::RunPrompt => Ok(WorkerJobOutcome::Complete(WorkerJobResult::RunPrompt {
             output: prompt_output_from_payload(&job.payload)?,
@@ -1347,7 +1462,7 @@ fn execute_job(
         JobKind::CreateSnapshot => {
             let sandbox_id = sandbox_id_from_payload(&job.payload)?;
             let snapshot_id = snapshot_id_from_payload(&job.payload)?;
-            let handle = provider.create_snapshot(sandbox_id, snapshot_id)?;
+            let handle = provider.create_snapshot(sandbox_id, snapshot_id, cancelled)?;
             Ok(WorkerJobOutcome::Complete(
                 WorkerJobResult::CreateSnapshot { handle },
             ))
@@ -1357,7 +1472,13 @@ fn execute_job(
             let child_sandbox_id = child_sandbox_id_from_payload(&job.payload)?;
             let snapshot_id = snapshot_id_from_payload(&job.payload)?;
             let spec = provision_spec_from_payload(&job.payload)?;
-            let handle = provider.fork(parent_sandbox_id, child_sandbox_id, snapshot_id, &spec)?;
+            let handle = provider.fork(
+                parent_sandbox_id,
+                child_sandbox_id,
+                snapshot_id,
+                &spec,
+                cancelled,
+            )?;
             Ok(WorkerJobOutcome::Complete(WorkerJobResult::ForkSandbox {
                 handle,
             }))
@@ -1367,7 +1488,7 @@ fn execute_job(
             // Actually tear down the sandbox's resources; propagate provider errors so
             // the job is failed (and retried per its classification) instead of the
             // control plane recording a "stopped" sandbox that keeps running.
-            provider.stop(sandbox_id)?;
+            provider.stop(sandbox_id, cancelled)?;
             Ok(WorkerJobOutcome::Complete(WorkerJobResult::StopSandbox {
                 provider: "kubernetes".to_string(),
                 sandbox_id,
@@ -1547,20 +1668,17 @@ where
     Ok(())
 }
 
-async fn decode_json<T>(response: reqwest::Response) -> anyhow::Result<T>
+async fn decode_json<T>(response: reqwest::Response) -> Result<T, WorkerRequestError>
 where
     T: serde::de::DeserializeOwned,
 {
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .context("failed to read response body")?;
+    let body = response.text().await?;
     if !status.is_success() {
-        bail!("request failed with {status}: {body}");
+        return Err(WorkerRequestError::Status { status, body });
     }
 
-    serde_json::from_str(&body).context("failed to decode response body")
+    serde_json::from_str(&body).map_err(WorkerRequestError::Decode)
 }
 
 fn to_capability(value: CapabilityArg) -> WorkerCapability {
@@ -1674,6 +1792,129 @@ mod tests {
         assert_eq!(result.exit_code, Some(0));
         assert!(result.stdout.contains("\"operation\":\"exec\""));
         assert!(result.stdout.contains("\"memoryLimit\":\"4g\""));
+    }
+
+    /// Test double whose `exec_handoff` always returns a fixed
+    /// `AgentCommandResult`, letting tests exercise a specific exit code without
+    /// a real cluster. Every other `SandboxProvider` method delegates to a real
+    /// dry-run provider.
+    struct FixedExecResultProvider {
+        inner: KubernetesDryRunProvider,
+        result: AgentCommandResult,
+    }
+
+    impl SandboxProvider for FixedExecResultProvider {
+        fn capability_report(&self) -> sandboxwich_core::ProviderCapabilityReport {
+            self.inner.capability_report()
+        }
+
+        fn health_report(&self) -> sandboxwich_core::ProviderHealthReport {
+            self.inner.health_report()
+        }
+
+        fn provision(
+            &self,
+            sandbox_id: sandboxwich_core::SandboxId,
+            spec: &SandboxProvisionSpec,
+            cancelled: &CancelSignal,
+        ) -> anyhow::Result<sandboxwich_core::ProviderSandboxHandle> {
+            self.inner.provision(sandbox_id, spec, cancelled)
+        }
+
+        fn exec_handoff(
+            &self,
+            _sandbox_id: sandboxwich_core::SandboxId,
+            _spec: &SandboxProvisionSpec,
+            _request: AgentCommandRequest,
+            _cancelled: &CancelSignal,
+        ) -> anyhow::Result<AgentCommandResult> {
+            Ok(self.result.clone())
+        }
+
+        fn create_snapshot(
+            &self,
+            sandbox_id: sandboxwich_core::SandboxId,
+            snapshot_id: sandboxwich_core::SnapshotId,
+            cancelled: &CancelSignal,
+        ) -> anyhow::Result<sandboxwich_core::ProviderSnapshotHandle> {
+            self.inner
+                .create_snapshot(sandbox_id, snapshot_id, cancelled)
+        }
+
+        fn fork(
+            &self,
+            parent_sandbox_id: sandboxwich_core::SandboxId,
+            child_sandbox_id: sandboxwich_core::SandboxId,
+            snapshot_id: sandboxwich_core::SnapshotId,
+            spec: &SandboxProvisionSpec,
+            cancelled: &CancelSignal,
+        ) -> anyhow::Result<sandboxwich_core::ProviderForkHandle> {
+            self.inner.fork(
+                parent_sandbox_id,
+                child_sandbox_id,
+                snapshot_id,
+                spec,
+                cancelled,
+            )
+        }
+
+        fn stop(
+            &self,
+            sandbox_id: sandboxwich_core::SandboxId,
+            cancelled: &CancelSignal,
+        ) -> anyhow::Result<()> {
+            self.inner.stop(sandbox_id, cancelled)
+        }
+    }
+
+    #[test]
+    fn run_command_job_completes_the_lease_even_when_the_command_exits_non_zero() {
+        // Regression test: a command that runs to completion but exits non-zero
+        // (e.g. `false`, a failing test suite) used to be reported as a *lease*
+        // failure (`FailLeaseRequest { retry: false }`), which discarded the
+        // command's stdout entirely and conflated "the command ran and failed"
+        // with "the worker could not run it". It must instead complete the
+        // lease with the full typed result; the API derives the command's own
+        // Finished/Failed status from `exit_code`.
+        let sandbox_id = SandboxId::new();
+        let spec = SandboxProvisionSpec {
+            memory_limit: sandboxwich_core::MemoryLimit::FourG,
+            network_egress: Default::default(),
+        };
+        let now = Utc::now();
+        let provider = FixedExecResultProvider {
+            inner: provider(),
+            result: AgentCommandResult {
+                exit_code: Some(1),
+                stdout: "partial output before failure\n".to_string(),
+                stderr: "boom\n".to_string(),
+                started_at: now,
+                finished_at: now,
+            },
+        };
+
+        let outcome = execute_job(
+            &job(
+                JobKind::RunCommand,
+                json!({
+                    "sandboxId": sandbox_id,
+                    "provisionSpec": spec,
+                    "argv": ["false"],
+                    "env": {}
+                }),
+                WorkerCapability::RunCommand,
+            ),
+            &provider,
+            &CancelSignal::never_cancelled(),
+        )
+        .expect("a command that ran and exited non-zero is still a completed lease");
+        let WorkerJobResult::RunCommand { result } = completed_result(outcome) else {
+            panic!("expected run command result");
+        };
+
+        assert_eq!(result.exit_code, Some(1));
+        assert_eq!(result.stdout, "partial output before failure\n");
+        assert_eq!(result.stderr, "boom\n");
     }
 
     #[test]
@@ -1860,6 +2101,66 @@ mod tests {
         assert!(!classify_retry(&malformed_payload));
     }
 
+    fn recoverable_status_error() -> WorkerRequestError {
+        WorkerRequestError::Status {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            body: "internal error".to_string(),
+        }
+    }
+
+    fn permanent_status_error() -> WorkerRequestError {
+        WorkerRequestError::Status {
+            status: reqwest::StatusCode::NOT_FOUND,
+            body: "lease_expired".to_string(),
+        }
+    }
+
+    #[test]
+    fn worker_request_error_treats_5xx_429_and_408_as_recoverable() {
+        for status in [
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+        ] {
+            let error = WorkerRequestError::Status {
+                status,
+                body: String::new(),
+            };
+            assert!(error.is_recoverable(), "{status} should be recoverable");
+        }
+    }
+
+    #[test]
+    fn worker_request_error_treats_4xx_rejections_as_permanent() {
+        // These are exactly the durable rejections the audit called out:
+        // 401 (bad/expired credentials), 404 (lease_expired), 409
+        // (idempotency_key_reused). Retrying them delays cancel propagation
+        // and burns the whole retry budget on a request that can never
+        // succeed.
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::CONFLICT,
+            reqwest::StatusCode::BAD_REQUEST,
+        ] {
+            let error = WorkerRequestError::Status {
+                status,
+                body: String::new(),
+            };
+            assert!(!error.is_recoverable(), "{status} should be permanent");
+        }
+    }
+
+    #[test]
+    fn worker_request_error_decode_failures_are_permanent() {
+        let error = WorkerRequestError::Decode(
+            serde_json::from_str::<serde_json::Value>("not json").unwrap_err(),
+        );
+        assert!(!error.is_recoverable());
+    }
+
     #[tokio::test]
     async fn with_retries_recovers_after_transient_failures() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1869,7 +2170,7 @@ mod tests {
             let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
             async move {
                 if attempt < 3 {
-                    Err(anyhow::anyhow!("connection reset by peer"))
+                    Err(recoverable_status_error())
                 } else {
                     Ok(attempt)
                 }
@@ -1888,12 +2189,36 @@ mod tests {
         let attempts = AtomicU32::new(0);
         let result: anyhow::Result<()> = with_retries("test op", 3, || {
             attempts.fetch_add(1, Ordering::SeqCst);
-            async { Err(anyhow::anyhow!("still broken")) }
+            async { Err(recoverable_status_error()) }
         })
         .await;
 
         assert!(result.is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn with_retries_stops_immediately_on_a_permanent_error() {
+        // Regression test for "worker retries permanent 4xx responses": a
+        // 401/404/409 must not be retried at all, so cancel propagation isn't
+        // delayed and the retry budget isn't wasted on a request that can
+        // never succeed.
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let attempts = AtomicU32::new(0);
+        let result: anyhow::Result<()> = with_retries("test op", 5, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async { Err(permanent_status_error()) }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a permanent error must stop the retry loop after the first attempt, not spend the \
+             full 5-attempt budget"
+        );
     }
 
     #[test]

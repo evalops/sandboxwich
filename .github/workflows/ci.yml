@@ -7,6 +7,9 @@ name: ci
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
   rust:
     runs-on: ubuntu-latest
@@ -29,13 +32,71 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - run: cargo fmt --all -- --check
-      - run: cargo check --workspace
-      - run: cargo test --workspace
+      - run: cargo check --workspace --locked
+      - run: cargo test --workspace --locked
         env:
           SANDBOXWICH_TEST_POSTGRES_URL: >-
             postgres://postgres:postgres@localhost:5432/sandboxwich
       - run: |
-          cargo build \
+          cargo build --locked \
+            -p sandboxwich-api \
+            -p sandboxwich-worker \
+            -p sandboxwich-bench
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - uses: taiki-e/install-action@56f527ce5f0c778165d7ba9409086ccf5c910b6d # cargo-audit
+      # RUSTSEC-2023-0071 (rsa timing sidechannel) comes in transitively via
+      # sqlx-mysql, which is part of sqlx's dependency graph even though
+      # this workspace only enables the postgres/sqlite sqlx features.
+      # Upstream has no fixed version yet; re-evaluate when one ships.
+      - run: cargo audit --ignore RUSTSEC-2023-0071
+
+  msrv:
+    name: msrv (1.95)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      # Cargo.toml declares `rust-version = "1.95"`; every other job floats
+      # on `stable`. This job pins the actual MSRV floor instead of trusting
+      # the workspace-lints comment in Cargo.toml to stay true on its own.
+      # dtolnay/rust-toolchain's `stable`/`beta`/`nightly` branches hardcode
+      # their channel and ignore an explicit `toolchain:` override; `master`
+      # is the branch documented to honor an explicit version pin like this.
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - run: cargo check --workspace --all-targets --locked
+
+  benchmark:
+    name: benchmark (non-blocking)
+    runs-on: ubuntu-latest
+    # Shared GitHub-hosted runners have enough CPU/IO variance that p95
+    # latency budgets flake independently of the PR under test. This job
+    # intentionally stays off the required-checks path: do not add
+    # "benchmark (non-blocking)" to branch protection required checks.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - run: |
+          cargo build --locked \
             -p sandboxwich-api \
             -p sandboxwich-worker \
             -p sandboxwich-bench
@@ -58,43 +119,40 @@ jobs:
             function ms(value) { gsub(/ms| /, "", value); return value + 0 }
             /^## / { section = substr($0, 4) }
             /^\| [0-9]+ \|/ {
+              row_seen = 1
               if ($3 + 0 != 0) { print section ": request failures=" $3; failed = 1 }
               p95 = ms($7)
-              limit = (section == "warm startup" ? 2000 :
-                       section == "GET /sandboxes" ? 2000 :
-                       section ~ /^POST \/sandboxes/ ? 2000 : 500)
+              # Deliberately an if/else chain, not a multi-line `? :`
+              # ternary: mawk (Debian/Ubuntus default /usr/bin/awk) does not
+              # continue a statement across a bare line-ending `?` or `:`,
+              # so a ternary split across lines like that is a syntax error
+              # under mawk even though gawk accepts it.
+              if (section == "warm startup") {
+                limit = 2000
+              } else if (section == "GET /sandboxes") {
+                limit = 2000
+              } else if (section ~ /^POST \/sandboxes/) {
+                limit = 2000
+              } else {
+                limit = 500
+              }
               if (p95 > limit) { print section ": p95 " p95 "ms exceeds " limit "ms"; failed = 1 }
             }
             /^\| total TTFT \|/ {
+              ttft_seen = 1
               p95 = ms($6)
               if (p95 > 5000) { print "Sandbox TTFT: p95 " p95 "ms exceeds 5000ms"; failed = 1 }
             }
-            END { exit failed }
+            END {
+              # A report format change that silently stops matching either
+              # pattern above must fail the gate, not exit 0 having checked
+              # nothing (the whole point of this budget gate).
+              if (!row_seen) { print "no per-endpoint benchmark rows found in report; budget gate cannot run"; failed = 1 }
+              if (!ttft_seen) { print "no Sandbox TTFT row found in report; budget gate cannot run"; failed = 1 }
+              exit failed
+            }
           ' sandboxwich-benchmark-report.md
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sandboxwich-benchmark-report
           path: sandboxwich-benchmark-report.md
-
-  clippy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-
-  audit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
-      - uses: taiki-e/install-action@56f527ce5f0c778165d7ba9409086ccf5c910b6d # cargo-audit
-      # RUSTSEC-2023-0071 (rsa timing sidechannel) comes in transitively via
-      # sqlx-mysql, which is part of sqlx's dependency graph even though
-      # this workspace only enables the postgres/sqlite sqlx features.
-      # Upstream has no fixed version yet; re-evaluate when one ships.
-      - run: cargo audit --ignore RUSTSEC-2023-0071
