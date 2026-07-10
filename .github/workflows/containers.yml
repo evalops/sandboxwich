@@ -67,7 +67,10 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          platforms: linux/amd64,linux/arm64
+          # PRs only need to prove the image builds. Native-only validation
+          # avoids QEMU arm64 compiles exhausting this job's 45-minute budget;
+          # pushes to main still publish the supported multi-arch image.
+          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
           push: ${{ github.event_name != 'pull_request' }}
           build-args: |
             BIN=${{ matrix.bin }}

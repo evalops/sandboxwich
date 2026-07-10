@@ -189,7 +189,9 @@ spec:
 # The Kubernetes worker provider already renders this per-sandbox (see
 # provider.rs, and the ingress policy noted in docs/kubernetes.md), but
 # nothing did it for the control plane itself -- this pair of NetworkPolicy
-# objects is that.
+# objects is that. Pods that scrape the authenticated metrics endpoint opt in
+# with the `sandboxwich.dev/metrics-access: "true"` label; the companion allow
+# policy below keeps metrics available without opening port 3217 namespace-wide.
 #
 # Scoped to this repo's own labeled workloads (app.kubernetes.io/part-of:
 # sandboxwich -- the migrate Job above, this Deployment, and the worker
@@ -230,8 +232,9 @@ spec:
 ---
 # Narrow allow carved out of the default-deny above via a second NetworkPolicy
 # (NetworkPolicies selecting the same pod are additive, so this only adds an
-# allowance rather than reopening everything): only the worker Deployment
-# (worker.yaml, same namespace) may reach the api Deployment on port 3217.
+# allowance rather than reopening everything): the worker Deployment
+# (worker.yaml, same namespace) and explicitly labeled metrics scrapers may
+# reach the api Deployment on port 3217.
 # The migrate Job and the worker Deployment itself take no inbound traffic at
 # all, so they are covered by the default-deny policy above and get no
 # corresponding allow rule here.
@@ -268,6 +271,9 @@ spec:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: sandboxwich-worker
+        - podSelector:
+            matchLabels:
+              sandboxwich.dev/metrics-access: "true"
       ports:
         - protocol: TCP
           port: 3217
