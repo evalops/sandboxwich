@@ -615,7 +615,10 @@ impl Database {
     /// Unlike `sqlx::QueryBuilder<Any>`, this formats dialect-correct placeholders
     /// (`$n` for Postgres, `?` for SQLite). `QueryBuilder<Any>` always emits `?`,
     /// which Postgres rejects at execution time.
-    pub(crate) fn query_builder<'args>(&self, sql: impl Into<String>) -> PortableQueryBuilder<'args> {
+    pub(crate) fn query_builder<'args>(
+        &self,
+        sql: impl Into<String>,
+    ) -> PortableQueryBuilder<'args> {
         PortableQueryBuilder {
             sql: sql.into(),
             arguments: AnyArguments::default(),
