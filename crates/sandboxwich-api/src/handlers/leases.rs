@@ -191,7 +191,8 @@ pub(crate) async fn renew_lease(
     // renew it; tenant-wide tokens are rejected.
     ensure_lease_worker_scope(&state.db, lease_id, &ctx).await?;
     let now = Utc::now();
-    let expires_at = now + chrono::Duration::seconds(request.lease_seconds.unwrap_or(60) as i64);
+    let expires_at =
+        now + chrono::Duration::seconds(effective_lease_seconds(request.lease_seconds) as i64);
     let sql = format!(
         "update job_leases
          set expires_at = {}

@@ -168,6 +168,49 @@ fn effective_command_timeout_secs_defaults_clamps_and_rejects_unbounded() {
     );
 }
 
+#[test]
+fn effective_lease_seconds_defaults_clamps_and_rejects_unbounded() {
+    // Omitted falls back to the default.
+    assert_eq!(effective_lease_seconds(None), DEFAULT_LEASE_SECONDS);
+    // A reasonable explicit value passes through untouched.
+    assert_eq!(effective_lease_seconds(Some(45)), 45);
+    // `0` is clamped to a floor of 1s rather than granting an
+    // already-expired lease.
+    assert_eq!(effective_lease_seconds(Some(0)), MIN_LEASE_SECONDS);
+    // Values large enough that `as i64` would still be positive are
+    // clamped to the ceiling rather than granting an effectively unbounded
+    // lease.
+    assert_eq!(
+        effective_lease_seconds(Some(u32::MAX as u64)),
+        MAX_LEASE_SECONDS
+    );
+    // The original bug: a `lease_seconds` greater than `i64::MAX` wraps
+    // negative when cast to `i64` (an already-expired lease, causing the
+    // sweeper to requeue a job a worker is still running), and values in
+    // `(i64::MAX / 1000, i64::MAX]` panic `chrono::Duration::seconds`
+    // outright. Both must clamp instead.
+    assert_eq!(
+        effective_lease_seconds(Some(i64::MAX as u64)),
+        MAX_LEASE_SECONDS
+    );
+    assert_eq!(effective_lease_seconds(Some(u64::MAX)), MAX_LEASE_SECONDS);
+
+    // The clamped value must always be safe to feed into
+    // `chrono::Duration::seconds` without panicking, for every input we
+    // exercised above.
+    for input in [
+        None,
+        Some(0),
+        Some(45),
+        Some(u32::MAX as u64),
+        Some(i64::MAX as u64),
+        Some(u64::MAX),
+    ] {
+        let seconds = effective_lease_seconds(input);
+        let _ = chrono::Duration::seconds(seconds as i64);
+    }
+}
+
 async fn test_sqlite_db() -> Database {
     sqlx::any::install_default_drivers();
     // A single pooled connection: `sqlite::memory:` gives each new
