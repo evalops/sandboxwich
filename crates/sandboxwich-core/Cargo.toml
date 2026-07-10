@@ -14,6 +14,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+utoipa.workspace = true
 
 [lints]
 workspace = true

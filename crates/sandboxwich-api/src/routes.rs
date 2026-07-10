@@ -1,15 +1,18 @@
+use crate::api_contract::openapi;
 use crate::auth::*;
 use crate::handlers::commands::*;
 use crate::handlers::desktop::*;
 use crate::handlers::files::*;
 use crate::handlers::jobs::*;
 use crate::handlers::leases::*;
+use crate::handlers::operations::*;
 use crate::handlers::sandboxes::*;
 use crate::handlers::snapshots::*;
 use crate::handlers::ssh::*;
 use crate::handlers::workers::*;
 use crate::health::*;
 use crate::reconcile::*;
+use crate::request_id::{attach_request_id, normalize_framework_errors};
 use crate::state::*;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
@@ -88,6 +91,9 @@ pub(crate) fn app(state: AppState) -> Router {
         .route("/workers/register", post(register_worker))
         .route("/jobs", get(list_jobs).post(create_job))
         .route("/jobs/{job_id}", get(get_job))
+        .route("/operations/{operation_id}", get(get_operation))
+        .route("/operations/{operation_id}/events", get(operation_events))
+        .route("/operations/{operation_id}/cancel", post(cancel_operation))
         .route(
             "/sandboxes/{sandbox_id}/guest-health",
             get(get_guest_health),
@@ -121,12 +127,22 @@ pub(crate) fn app(state: AppState) -> Router {
         )
         .route_layer(middleware::from_fn(require_worker_principal));
 
+    let versioned_routes = Router::new()
+        .merge(tenant_routes.clone())
+        .merge(worker_routes.clone());
+
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/v1/openapi.json", get(openapi))
+        .route("/v1/healthz", get(healthz))
+        .route("/v1/readyz", get(readyz))
+        .nest("/v1", versioned_routes)
         .merge(tenant_routes)
         .merge(worker_routes)
         .layer(DefaultBodyLimit::max(DEFAULT_BODY_LIMIT_BYTES))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, auth_and_tenant))
+        .layer(middleware::from_fn(normalize_framework_errors))
+        .layer(middleware::from_fn(attach_request_id))
 }
