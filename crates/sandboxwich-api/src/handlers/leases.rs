@@ -77,7 +77,7 @@ pub(crate) async fn claim_lease(
             lease: None,
         }));
     }
-let mut query = state.db.query_builder(
+    let mut query = state.db.query_builder(
         "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
          from jobs
