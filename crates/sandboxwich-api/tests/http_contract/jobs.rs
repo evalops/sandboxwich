@@ -359,9 +359,11 @@ pub(crate) async fn assert_retryable_failure_requeues_command(
 /// Regression test: a worker that runs a command to completion but the command
 /// itself exits non-zero must still *complete* the lease (the worker did its job),
 /// while the command's own status is derived from the exit code rather than being
-/// unconditionally marked `Finished`. Exercises both a successful (`exit_code: 0`,
-/// `Finished`) and a failing (`exit_code: 7`, `Failed`) completion end-to-end
-/// through `/leases/{id}/complete`.
+/// unconditionally marked `Finished`. Exercises a successful (`exit_code: 0`,
+/// `Finished`), a failing (`exit_code: 7`, `Failed`), and a code-less
+/// (`exit_code: null`, e.g. killed by a signal, `Failed` with the null persisted
+/// honestly rather than fabricated as 0) completion end-to-end through
+/// `/leases/{id}/complete`.
 pub(crate) async fn assert_command_status_is_derived_from_exit_code(
     client: &reqwest::Client,
     server: &TestServer,
@@ -376,7 +378,7 @@ pub(crate) async fn assert_command_status_is_derived_from_exit_code(
         server: &TestServer,
         sandbox: &SandboxResponse,
         worker: &WorkerResponse,
-        exit_code: i32,
+        exit_code: Option<i32>,
     ) -> CommandRun {
         let command: QueueCommandResponse = client
             .post(format!(
@@ -387,7 +389,7 @@ pub(crate) async fn assert_command_status_is_derived_from_exit_code(
                 argv: vec![
                     "sh".to_string(),
                     "-c".to_string(),
-                    format!("exit {exit_code}"),
+                    format!("exit {}", exit_code.unwrap_or(0)),
                 ],
                 cwd: None,
                 env: Default::default(),
@@ -423,10 +425,19 @@ pub(crate) async fn assert_command_status_is_derived_from_exit_code(
             .expect("expected worker to claim the exit-code test command");
         assert_eq!(lease.job.id, command.queued_job.id);
 
+        let now = chrono::Utc::now();
         let completed: LeaseResponse = worker_client
             .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
             .json(&CompleteLeaseRequest {
-                result: Some(command_result("stdout\n", "stderr\n", exit_code)),
+                result: Some(WorkerJobResult::RunCommand {
+                    result: AgentCommandResult {
+                        exit_code,
+                        stdout: "stdout\n".to_string(),
+                        stderr: "stderr\n".to_string(),
+                        started_at: now,
+                        finished_at: now,
+                    },
+                }),
             })
             .send()
             .await
@@ -456,15 +467,24 @@ pub(crate) async fn assert_command_status_is_derived_from_exit_code(
         fetched.command
     }
 
-    let succeeded = queue_and_complete(client, &worker_client, server, sandbox, worker, 0).await;
+    let succeeded =
+        queue_and_complete(client, &worker_client, server, sandbox, worker, Some(0)).await;
     assert_eq!(succeeded.status, CommandStatus::Finished);
     assert_eq!(succeeded.exit_code, Some(0));
 
-    let failed = queue_and_complete(client, &worker_client, server, sandbox, worker, 7).await;
+    let failed = queue_and_complete(client, &worker_client, server, sandbox, worker, Some(7)).await;
     assert_eq!(failed.status, CommandStatus::Failed);
     assert_eq!(failed.exit_code, Some(7));
     assert_eq!(failed.stdout, "stdout\n");
     assert_eq!(failed.stderr, "stderr\n");
+
+    // A completion with no exit code at all (a process killed by a signal, or a
+    // runner that couldn't capture the code) must land Failed -- "couldn't say
+    // how it finished" is not success -- and the missing code must stay an
+    // honest null instead of being coerced to a fabricated 0.
+    let codeless = queue_and_complete(client, &worker_client, server, sandbox, worker, None).await;
+    assert_eq!(codeless.status, CommandStatus::Failed);
+    assert_eq!(codeless.exit_code, None);
 }
 
 pub(crate) async fn assert_expired_lease_requeues_command(
