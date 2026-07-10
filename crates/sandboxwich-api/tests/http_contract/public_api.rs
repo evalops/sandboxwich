@@ -298,7 +298,27 @@ async fn platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_cor
     .execute(&pool)
     .await
     .unwrap();
+    sqlx::query("update snapshot_restore_sources set status = 'ready' where snapshot_id = ?")
+        .bind(snapshot.snapshot.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("delete from sandboxes where id = ?")
+        .bind(created.sandbox.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
     pool.close().await;
+
+    let source_is_gone = client
+        .get(format!(
+            "{}/v1/sandboxes/{}",
+            server.base_url, created.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(source_is_gone.status(), StatusCode::NOT_FOUND);
 
     let restore_request = ForkSnapshotRequest {
         name: Some("platform-restored-child".to_string()),
@@ -362,7 +382,7 @@ async fn platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_cor
     let stopped = client
         .post(format!(
             "{}/v1/sandboxes/{}/stop",
-            server.base_url, created.sandbox.id
+            server.base_url, restored.sandbox.id
         ))
         .header("idempotency-key", uuid::Uuid::now_v7().to_string())
         .send()
