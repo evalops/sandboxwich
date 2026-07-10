@@ -321,13 +321,19 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
             if let Some(worker_id) = args.worker_id {
                 let claim_response =
                     with_retry(&mut claim_budget, &mut claim_backoff, "claim_lease", || {
-                        claim_lease(&client, &api, worker_id, args.lease_seconds)
+                        claim_lease(&client, &api, worker_id, sandbox_id, args.lease_seconds)
                     })
                     .await?;
 
                 if let Some(lease) = claim_response.lease
-                    && let Err(error) =
-                        handle_lease(&client, &api, lease, args.max_captured_output_bytes).await
+                    && let Err(error) = handle_lease(
+                        &client,
+                        &api,
+                        sandbox_id,
+                        lease,
+                        args.max_captured_output_bytes,
+                    )
+                    .await
                 {
                     with_retry(
                         &mut claim_budget,
@@ -736,11 +742,25 @@ async fn claim_lease(
     client: &reqwest::Client,
     api: &str,
     worker_id: Uuid,
+    sandbox_id: SandboxId,
     lease_seconds: Option<u64>,
 ) -> Result<ClaimLeaseResponse, AgentRequestError> {
+    // Scope the claim to this daemon's own sandbox and to the only job kind it
+    // knows how to execute. This is advisory server-side filtering, not a
+    // security boundary (see the doc comment on `ClaimLeaseRequest`): the
+    // guest and its worker share one worker-scoped token, so a compromised
+    // guest can strip these fields and claim anything the token's
+    // capabilities allow. `handle_lease` below re-checks the claimed job's
+    // sandbox and kind after the fact as defense in depth against a
+    // well-behaved agent claiming the wrong job (e.g. via a future
+    // server-side filtering bug), not against a malicious one.
     let response = client
         .post(format!("{api}/workers/{worker_id}/leases/claim"))
-        .json(&ClaimLeaseRequest { lease_seconds })
+        .json(&ClaimLeaseRequest {
+            lease_seconds,
+            sandbox_id: Some(sandbox_id),
+            kinds: Some(vec![JobKind::RunCommand]),
+        })
         .send()
         .await?;
     decode_json(response).await
@@ -818,18 +838,78 @@ fn spawn_lease_renewal_task(
     })
 }
 
+/// Why a claimed lease must be handed back rather than executed. Both variants
+/// mean the job merely landed on the wrong executor -- not that it's invalid --
+/// so `handle_lease` always fails these with `retry: true`, never `retry: false`,
+/// so the intended executor still gets a chance to run it.
+#[derive(Debug, Eq, PartialEq)]
+enum LeaseScopeViolation {
+    /// This daemon only executes `run_command` jobs.
+    WrongKind { kind: JobKind },
+    /// The job's payload targets a different sandbox than this daemon's own
+    /// `--sandbox-id`.
+    WrongSandbox { job_sandbox_id: SandboxId },
+}
+
+impl std::fmt::Display for LeaseScopeViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LeaseScopeViolation::WrongKind { kind } => write!(
+                f,
+                "sandboxwich-agent daemon only handles run_command leases, got {kind:?}"
+            ),
+            LeaseScopeViolation::WrongSandbox { job_sandbox_id } => write!(
+                f,
+                "sandboxwich-agent claimed a job for sandbox {job_sandbox_id}"
+            ),
+        }
+    }
+}
+
+/// Pure defense-in-depth check, run *after* a claim succeeds, that a claimed job
+/// actually belongs to this daemon: matches the daemon's `--sandbox-id` and is a
+/// `run_command` job. This is NOT the security boundary -- see the doc comment on
+/// `ClaimLeaseRequest::sandbox_id` -- it catches a well-behaved agent claiming the
+/// wrong job (e.g. a server-side filtering bug, or a claim made against an API
+/// that predates this filtering), not an adversarial one.
+///
+/// A missing or unparseable `sandboxId` in the payload is treated as "could not
+/// verify" rather than a violation, matching the daemon's behavior before this
+/// check existed.
+fn lease_scope_violation(
+    job: &sandboxwich_core::Job,
+    sandbox_id: SandboxId,
+) -> Option<LeaseScopeViolation> {
+    if job.kind != JobKind::RunCommand {
+        return Some(LeaseScopeViolation::WrongKind {
+            kind: job.kind.clone(),
+        });
+    }
+    let job_sandbox_id = job_payload_sandbox_id(&job.payload)?;
+    if job_sandbox_id != sandbox_id {
+        return Some(LeaseScopeViolation::WrongSandbox { job_sandbox_id });
+    }
+    None
+}
+
 async fn handle_lease(
     client: &reqwest::Client,
     api: &str,
+    sandbox_id: SandboxId,
     lease: sandboxwich_core::JobLease,
     max_captured_output_bytes: u64,
 ) -> anyhow::Result<LeaseResponse> {
-    if lease.job.kind != JobKind::RunCommand {
+    if let Some(violation) = lease_scope_violation(&lease.job, sandbox_id) {
+        eprintln!(
+            "sandboxwich-agent: claimed lease {} for job {} out of scope for sandbox {sandbox_id} \
+             ({violation}); failing with retry so the intended executor can claim it instead",
+            lease.id, lease.job.id
+        );
         let response = client
             .post(format!("{api}/leases/{}/fail", lease.id))
             .json(&FailLeaseRequest {
-                error: "sandboxwich-agent daemon only handles run_command leases".to_string(),
-                retry: false,
+                error: violation.to_string(),
+                retry: true,
             })
             .send()
             .await?;
@@ -1189,6 +1269,20 @@ fn resolve_api_token(
         bail!("--api-token-file at {} is empty", path.display());
     }
     Ok(Some(token.to_string()))
+}
+
+/// Reads the `sandboxId` field `sandboxwich-api` stamps onto every `run_command`
+/// job payload (see `queue_command` in `sandboxwich-api`). Returns `None` rather
+/// than erroring if it's absent or malformed so a payload shape the daemon
+/// doesn't recognize doesn't itself become a way to dodge the sandbox check in
+/// `handle_lease`; callers should treat `None` as "could not verify" and the
+/// mismatch check simply becomes a no-op in that case, same as before this
+/// filtering existed.
+fn job_payload_sandbox_id(payload: &serde_json::Value) -> Option<SandboxId> {
+    payload
+        .get("sandboxId")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
 }
 
 fn agent_request_from_payload(payload: &serde_json::Value) -> anyhow::Result<AgentCommandRequest> {
@@ -1669,5 +1763,139 @@ mod tests {
              the caller waiting anywhere near its full 30s sleep or 60s timeout; \
              elapsed = {elapsed:?}"
         );
+    }
+
+    fn test_job(kind: JobKind, payload: serde_json::Value) -> sandboxwich_core::Job {
+        sandboxwich_core::Job {
+            id: sandboxwich_core::JobId::new(),
+            tenant_id: "default".to_string(),
+            kind,
+            status: sandboxwich_core::JobStatus::Leased,
+            payload,
+            required_capability: sandboxwich_core::WorkerCapability::RunCommand,
+            priority: 0,
+            attempts: 1,
+            max_attempts: 3,
+            scheduled_at: Utc::now(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn job_payload_sandbox_id_reads_the_sandbox_id_field() {
+        let sandbox_id = SandboxId(Uuid::now_v7());
+        let payload = serde_json::json!({ "sandboxId": sandbox_id, "argv": ["echo", "hi"] });
+
+        assert_eq!(job_payload_sandbox_id(&payload), Some(sandbox_id));
+    }
+
+    #[test]
+    fn job_payload_sandbox_id_returns_none_when_the_field_is_absent() {
+        let payload = serde_json::json!({ "argv": ["echo", "hi"] });
+
+        assert_eq!(job_payload_sandbox_id(&payload), None);
+    }
+
+    #[test]
+    fn job_payload_sandbox_id_returns_none_when_the_field_is_malformed() {
+        let payload = serde_json::json!({ "sandboxId": "not-a-uuid" });
+
+        assert_eq!(job_payload_sandbox_id(&payload), None);
+    }
+
+    // The following four tests cover consequence (a) and (b) from the lease-scoping
+    // bug this module fixes: an agent that claims a RunCommand job for a *different*
+    // sandbox must never execute it (it would run against the wrong
+    // filesystem/environment and misattribute results), and an agent that claims a
+    // non-RunCommand job (Provision/Snapshot/Fork) must fail it with `retry: true`,
+    // not `retry: false` -- `retry: false` would permanently kill work the real
+    // worker would have handled correctly.
+
+    #[test]
+    fn lease_scope_violation_accepts_a_run_command_job_for_its_own_sandbox() {
+        let sandbox_id = SandboxId(Uuid::now_v7());
+        let job = test_job(
+            JobKind::RunCommand,
+            serde_json::json!({ "sandboxId": sandbox_id, "argv": ["echo", "hi"] }),
+        );
+
+        assert_eq!(lease_scope_violation(&job, sandbox_id), None);
+    }
+
+    #[test]
+    fn lease_scope_violation_accepts_a_run_command_job_when_sandbox_id_cannot_be_verified() {
+        // A payload shape the daemon doesn't recognize (missing/malformed sandboxId)
+        // must not itself become a way to bypass the check -- but it also shouldn't
+        // manufacture a false-positive violation for a legitimately un-annotated
+        // payload, matching behavior from before this check existed.
+        let sandbox_id = SandboxId(Uuid::now_v7());
+        let job = test_job(
+            JobKind::RunCommand,
+            serde_json::json!({ "argv": ["echo", "hi"] }),
+        );
+
+        assert_eq!(lease_scope_violation(&job, sandbox_id), None);
+    }
+
+    #[test]
+    fn lease_scope_violation_rejects_a_run_command_job_for_a_different_sandbox() {
+        let own_sandbox_id = SandboxId(Uuid::now_v7());
+        let other_sandbox_id = SandboxId(Uuid::now_v7());
+        let job = test_job(
+            JobKind::RunCommand,
+            serde_json::json!({ "sandboxId": other_sandbox_id, "argv": ["rm", "-rf", "/"] }),
+        );
+
+        let violation = lease_scope_violation(&job, own_sandbox_id)
+            .expect("a job for a different sandbox must be rejected, never executed");
+        assert_eq!(
+            violation,
+            LeaseScopeViolation::WrongSandbox {
+                job_sandbox_id: other_sandbox_id
+            }
+        );
+    }
+
+    #[test]
+    fn lease_scope_violation_rejects_a_non_run_command_job_with_retryable_kind() {
+        let sandbox_id = SandboxId(Uuid::now_v7());
+        let job = test_job(
+            JobKind::ProvisionSandbox,
+            serde_json::json!({ "sandboxId": sandbox_id }),
+        );
+
+        let violation = lease_scope_violation(&job, sandbox_id)
+            .expect("a non-run_command job must be rejected, not executed");
+        assert_eq!(
+            violation,
+            LeaseScopeViolation::WrongKind {
+                kind: JobKind::ProvisionSandbox
+            }
+        );
+    }
+
+    #[test]
+    fn every_lease_scope_violation_fails_the_lease_with_retry_true() {
+        // Regression guard for consequence (b): it must never be possible to build a
+        // `FailLeaseRequest` from a `LeaseScopeViolation` with `retry: false`, which
+        // would permanently kill a job the intended executor would have handled.
+        let sandbox_id = SandboxId(Uuid::now_v7());
+        let wrong_kind = test_job(JobKind::CreateSnapshot, serde_json::json!({}));
+        let wrong_sandbox = test_job(
+            JobKind::RunCommand,
+            serde_json::json!({ "sandboxId": SandboxId(Uuid::now_v7()) }),
+        );
+
+        for job in [wrong_kind, wrong_sandbox] {
+            let violation = lease_scope_violation(&job, sandbox_id)
+                .expect("both fixtures are constructed to violate lease scope");
+            let request = FailLeaseRequest {
+                error: violation.to_string(),
+                retry: true,
+            };
+            assert!(request.retry, "lease scope violations must always retry");
+        }
     }
 }
