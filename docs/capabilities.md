@@ -12,6 +12,7 @@ until its real provider path is exercised by an end-to-end conformance test.
 | SSH and browser desktop metadata | Experimental | Access records do not provide an ingress tunnel by themselves. |
 | Prompt/model execution | Unsupported | The current worker has no model executor. Dry-run acknowledgements are not model output. |
 | True resume after teardown | Unsupported | Stop destroys resources; create or fork a replacement instead. |
+| Guest-agent lease claim scoping | Advisory only | `sandboxwich-agent`'s daemon passes `sandbox_id`/`kinds` filters on `POST /workers/{id}/leases/claim` so it only claims `run_command` jobs for its own sandbox, and the API enforces those filters server-side. This narrows the default blast radius of a well-behaved agent, but it is **not tenant/sandbox isolation**: the guest and the worker it runs under share one worker-scoped token, so a compromised guest can omit the filters and claim (and forge completions for) any job that token's capabilities allow. Treat every guest-agent deployment as trusting its worker's full capability set until per-sandbox claim tokens exist. |
 | Production secret storage and billing | Unsupported | Explicit non-goals for the current milestone. |
 
 Provider capability reports must distinguish `dry_run` from `apply`; clients
