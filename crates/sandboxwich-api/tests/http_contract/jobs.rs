@@ -707,6 +707,8 @@ pub(crate) async fn assert_command_status_is_derived_from_exit_code(
             ))
             .json(&ClaimLeaseRequest {
                 lease_seconds: Some(60),
+                sandbox_id: None,
+                kinds: None,
             })
             .send()
             .await
