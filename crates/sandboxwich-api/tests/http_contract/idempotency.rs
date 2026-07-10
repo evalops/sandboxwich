@@ -91,6 +91,27 @@ async fn assert_idempotency_contract(server: TestServer) {
         .unwrap();
     assert_eq!(tenant_b.status(), StatusCode::ACCEPTED);
 
+    let registration_key = uuid::Uuid::now_v7().to_string();
+    let registered: WorkerResponse = client
+        .post(format!("{}/v1/workers/register", server.base_url))
+        .header("idempotency-key", &registration_key)
+        .json(&RegisterWorkerRequest {
+            name: "idempotency-secret-boundary".to_string(),
+            provider: "test".to_string(),
+            capabilities: vec![WorkerCapability::ProvisionSandbox],
+            max_concurrent_jobs: Some(1),
+            labels: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(registered.worker_token.is_some());
+
     sqlx::any::install_default_drivers();
     let pool = AnyPoolOptions::new()
         .max_connections(2)
@@ -106,6 +127,24 @@ async fn assert_idempotency_contract(server: TestServer) {
     .try_get("count")
     .unwrap();
     assert_eq!(sandbox_count, 1);
+    let key_placeholder = if server.database_url.starts_with("postgres") {
+        "$1"
+    } else {
+        "?"
+    };
+    let secret_record_count: i64 = sqlx::query(&format!(
+        "select count(*) as count from idempotency_records where idempotency_key = {key_placeholder}"
+    ))
+    .bind(&registration_key)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .try_get("count")
+    .unwrap();
+    assert_eq!(
+        secret_record_count, 0,
+        "raw worker tokens must never enter replay storage"
+    );
 
     sqlx::query("update idempotency_records set expires_at = '1970-01-01T00:00:00Z' where tenant_id = 'default'")
         .execute(&pool)

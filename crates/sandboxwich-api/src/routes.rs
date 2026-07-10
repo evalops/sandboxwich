@@ -90,7 +90,6 @@ pub(crate) fn app(state: AppState) -> Router {
         .route("/commands/{command_id}/output", get(list_command_output))
         .route("/workers", get(list_workers))
         .route("/capacity", get(get_capacity))
-        .route("/workers/register", post(register_worker))
         .route("/jobs", get(list_jobs).post(create_job))
         .route("/jobs/{job_id}", get(get_job))
         .route("/operations/{operation_id}", get(get_operation))
@@ -109,6 +108,12 @@ pub(crate) fn app(state: AppState) -> Router {
             post(create_ssh_access),
         )
         .route("/ssh-keys/{ssh_key_id}/status", post(update_ssh_key_status))
+        .route_layer(middleware::from_fn(require_tenant_principal));
+
+    // Registration returns a one-time raw worker credential. It deliberately does not use the
+    // generic response-replay middleware because raw worker tokens must never be persisted.
+    let registration_routes = Router::new()
+        .route("/workers/register", post(register_worker))
         .route_layer(middleware::from_fn(require_tenant_principal));
 
     let worker_routes = Router::new()
@@ -130,16 +135,16 @@ pub(crate) fn app(state: AppState) -> Router {
         .route_layer(middleware::from_fn(require_worker_principal));
 
     let versioned_routes = Router::new()
-        .merge(tenant_routes.clone())
-        .merge(worker_routes.clone())
-        .layer(middleware::from_fn_with_state(
+        .merge(tenant_routes.clone().layer(middleware::from_fn_with_state(
             state.clone(),
             enforce_tenant_limits,
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             enforce_idempotency,
-        ));
+        )))
+        .merge(worker_routes.clone())
+        .merge(registration_routes.clone());
 
     let operator_routes = Router::new()
         .route(
@@ -158,6 +163,7 @@ pub(crate) fn app(state: AppState) -> Router {
         .nest("/v1/operator", operator_routes)
         .merge(tenant_routes)
         .merge(worker_routes)
+        .merge(registration_routes)
         .layer(DefaultBodyLimit::max(DEFAULT_BODY_LIMIT_BYTES))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, auth_and_tenant))
