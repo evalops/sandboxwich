@@ -191,17 +191,23 @@ SANDBOXWICH_K8S_ENABLE_MUTATION=0 "${ROOT_DIR}/target/debug/sandboxwich-worker" 
   provider-apply-plan --cluster kind-conformance --namespace sandboxwich-sandboxes \
   --storage-class standard --runtime-image "${RUNTIME_IMAGE}" \
   --runtime-class-name sandboxwich-missing-handler >"${TMP_DIR}/runtimeclass-plan.json"
-jq '.apply_manifests[] | select(.kind == "Pod" or .kind == "PersistentVolumeClaim")' \
-  "${TMP_DIR}/runtimeclass-plan.json" | kubectl apply -f -
-runtimeclass_pod="$(jq -r '.apply_manifests[] | select(.kind == "Pod") | .metadata.name' "${TMP_DIR}/runtimeclass-plan.json")"
-[[ "$(kubectl -n sandboxwich-sandboxes get pod "${runtimeclass_pod}" -o jsonpath='{.spec.runtimeClassName}')" == "sandboxwich-missing-handler" ]] \
-  || fail "runtimeClassName was dropped"
-if kubectl -n sandboxwich-sandboxes wait --for=condition=Ready "pod/${runtimeclass_pod}" --timeout=15s; then
-  fail "pod became Ready with a missing RuntimeClass"
+jq '[.apply_manifests[] | select(.kind == "PersistentVolumeClaim")][0]' \
+  "${TMP_DIR}/runtimeclass-plan.json" >"${TMP_DIR}/runtimeclass-pvc.json"
+jq '[.apply_manifests[] | select(.kind == "Pod")][0]' \
+  "${TMP_DIR}/runtimeclass-plan.json" >"${TMP_DIR}/runtimeclass-pod.json"
+runtimeclass_pod="$(jq -r '.metadata.name' "${TMP_DIR}/runtimeclass-pod.json")"
+[[ "$(jq -r '.spec.runtimeClassName' "${TMP_DIR}/runtimeclass-pod.json")" == "sandboxwich-missing-handler" ]] \
+  || fail "runtimeClassName was dropped from the rendered pod"
+kubectl apply -f "${TMP_DIR}/runtimeclass-pvc.json"
+if kubectl apply -f "${TMP_DIR}/runtimeclass-pod.json" 2>"${TMP_DIR}/runtimeclass-error.log"; then
+  fail "pod admission accepted a missing RuntimeClass"
 fi
-kubectl -n sandboxwich-sandboxes delete pod,pvc \
-  -l "sandboxwich.dev/sandbox-id=$(kubectl -n sandboxwich-sandboxes get pod "${runtimeclass_pod}" -o jsonpath='{.metadata.labels.sandboxwich\.dev/sandbox-id}')" \
-  --wait=true
+grep -F 'RuntimeClass "sandboxwich-missing-handler" not found' \
+  "${TMP_DIR}/runtimeclass-error.log" >/dev/null || fail "missing RuntimeClass did not fail closed"
+if kubectl -n sandboxwich-sandboxes get pod "${runtimeclass_pod}" >/dev/null 2>&1; then
+  fail "a pod exists despite missing RuntimeClass admission failure"
+fi
+kubectl delete -f "${TMP_DIR}/runtimeclass-pvc.json" --wait=true
 
 for sandbox_id in "${deny_id}" "${source_id}" "${target_id}"; do
   remaining="$(kubectl -n sandboxwich-sandboxes get pod,pvc,service,networkpolicy \
