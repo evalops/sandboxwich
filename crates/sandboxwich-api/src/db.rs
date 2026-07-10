@@ -5,7 +5,7 @@ use sandboxwich_core::*;
 use sqlx::Row;
 use sqlx::any::AnyPoolOptions;
 use sqlx::migrate::MigrateDatabase;
-use sqlx::{AnyPool, Sqlite};
+use sqlx::{Any, AnyPool, QueryBuilder, Sqlite};
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -607,6 +607,13 @@ impl SqlDialect {
 }
 
 impl Database {
+    /// Starts a database-portable query whose values are bound as SQL is assembled.
+    /// `QueryBuilder<Any>` owns placeholder numbering, so dynamic lists cannot drift
+    /// from a separate hand-built placeholder string.
+    pub(crate) fn query_builder<'args>(&self, sql: &'args str) -> QueryBuilder<'args, Any> {
+        QueryBuilder::new(sql)
+    }
+
     pub(crate) fn placeholder(&self, index: usize) -> String {
         match self.dialect {
             SqlDialect::Postgres => format!("${index}"),
