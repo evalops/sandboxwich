@@ -66,15 +66,19 @@ pub(crate) async fn enforce_idempotency(
     if context.principal == Principal::Operator {
         return next.run(request).await;
     }
-    let Some(key) = request
-        .headers()
-        .get(IDEMPOTENCY_KEY_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-    else {
+    let Some(key_header) = request.headers().get(IDEMPOTENCY_KEY_HEADER) else {
         return next.run(request).await;
+    };
+    let key = match key_header.to_str() {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_owned(),
+        _ => {
+            return coded_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_idempotency_key",
+                "Idempotency-Key must contain valid non-empty text",
+                None,
+            );
+        }
     };
     if key.len() > 128 {
         return coded_error(
@@ -97,7 +101,12 @@ pub(crate) async fn enforce_idempotency(
             );
         }
     };
-    let fingerprint = fingerprint_request(&parts.method, &parts.uri.to_string(), &body);
+    let content_type = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    let fingerprint =
+        fingerprint_request(&parts.method, &parts.uri.to_string(), content_type, &body);
     let request = Request::from_parts(parts, Body::from(body));
     let now = Utc::now();
     let expires_at = now + ChronoDuration::hours(IDEMPOTENCY_RETENTION_HOURS);
@@ -143,11 +152,20 @@ fn is_mutating(method: &Method) -> bool {
     )
 }
 
-fn fingerprint_request(method: &Method, uri: &str, body: &[u8]) -> String {
+fn fingerprint_request(
+    method: &Method,
+    uri: &str,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> String {
     let mut digest = Sha256::new();
     digest.update(method.as_str().as_bytes());
     digest.update([0]);
     digest.update(uri.as_bytes());
+    digest.update([0]);
+    if let Some(content_type) = content_type {
+        digest.update(content_type.as_bytes());
+    }
     digest.update([0]);
     digest.update(body);
     URL_SAFE_NO_PAD.encode(digest.finalize())
