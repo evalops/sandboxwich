@@ -41,6 +41,10 @@ jobs:
           docker build --build-arg BIN=sandboxwich-worker -t sandboxwich-worker:conformance .
           docker build -t sandboxwich-runtime:conformance deploy/runtime/ubuntu-dev
           docker build -f deploy/kubernetes/postgres.Dockerfile -t postgres:conformance .
+          # kind imports the completed images into containerd, temporarily storing a
+          # second copy of every layer. The intermediate BuildKit cache is no longer
+          # needed after these builds and can exhaust the runner during that import.
+          docker builder prune --all --force
       - name: Create disposable cluster
         run: >-
           kind create cluster --name sandboxwich-conformance
