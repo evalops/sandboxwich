@@ -246,24 +246,32 @@ fn fingerprint_request(
 async fn replay_or_wait(db: &Database, tenant: &str, key: &str, fingerprint: &str) -> Response {
     for _ in 0..CONCURRENT_REPLAY_POLLS {
         match fetch_record(db, tenant, key).await {
-            Ok((seen_fingerprint, RecordState::Completed, Some(response))) => {
+            Ok(Some((seen_fingerprint, RecordState::Completed, Some(response)))) => {
                 if seen_fingerprint != fingerprint {
                     return fingerprint_conflict();
                 }
                 return response.into_response();
             }
-            Ok((seen_fingerprint, RecordState::Processing, _)) => {
+            Ok(Some((seen_fingerprint, RecordState::Processing, _))) => {
                 if seen_fingerprint != fingerprint {
                     return fingerprint_conflict();
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            Ok((_, RecordState::Completed, None)) => {
+            Ok(Some((_, RecordState::Completed, None))) => {
                 return coded_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "idempotency_record_incomplete",
                     "stored idempotency response is incomplete",
                     None,
+                );
+            }
+            Ok(None) => {
+                return coded_error(
+                    StatusCode::CONFLICT,
+                    "idempotency_record_released",
+                    "the prior request finished without a replayable response; retry the request",
+                    Some("0"),
                 );
             }
             Err(error) => return error.into_response(),
@@ -281,7 +289,7 @@ async fn fetch_record(
     db: &Database,
     tenant: &str,
     key: &str,
-) -> Result<(String, RecordState, Option<StoredResponse>), ApiError> {
+) -> Result<Option<(String, RecordState, Option<StoredResponse>)>, ApiError> {
     let sql = format!(
         "select request_fingerprint, state, response_status, response_content_type,
                 response_location, response_retry_after, response_body_base64
@@ -292,8 +300,11 @@ async fn fetch_record(
     let row = sqlx::query(&sql)
         .bind(tenant)
         .bind(key)
-        .fetch_one(&db.pool)
+        .fetch_optional(&db.pool)
         .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
     let state = RecordState::parse(&row.try_get::<String, _>("state")?)?;
     let status: Option<i64> = row.try_get("response_status")?;
     let response = match status {
@@ -312,7 +323,7 @@ async fn fetch_record(
         }),
         None => None,
     };
-    Ok((row.try_get("request_fingerprint")?, state, response))
+    Ok(Some((row.try_get("request_fingerprint")?, state, response)))
 }
 
 async fn capture_response(response: Response) -> StoredResponse {
@@ -548,6 +559,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn waiter_gets_a_retryable_conflict_when_the_processing_record_was_released() {
+        let db = test_sqlite_db().await;
+
+        let response = replay_or_wait(&db, "tenant-a", "released", "fingerprint").await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("0"))
+        );
+        let body = to_bytes(response.into_body(), MAX_STORED_RESPONSE_BYTES)
+            .await
+            .expect("read error response");
+        let envelope: ErrorEnvelope =
+            serde_json::from_slice(&body).expect("deserialize error response");
+        assert_eq!(envelope.code, "idempotency_record_released");
+    }
+
+    #[tokio::test]
     async fn finalize_completed_record_persists_the_response_on_the_happy_path() {
         let db = test_sqlite_db().await;
         let tenant = "tenant-a";
@@ -565,7 +595,8 @@ mod tests {
 
         let (fingerprint, state, response) = fetch_record(&db, tenant, key)
             .await
-            .expect("fetch completed record");
+            .expect("fetch completed record")
+            .expect("completed record exists");
         assert_eq!(fingerprint, "fingerprint");
         assert_eq!(state, RecordState::Completed);
         let response = response.expect("completed record must carry a stored response");
