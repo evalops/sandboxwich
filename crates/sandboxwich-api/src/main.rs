@@ -6,6 +6,7 @@ mod db;
 mod error;
 mod handlers;
 mod health;
+mod idempotency;
 mod pagination;
 mod reconcile;
 mod request_id;
