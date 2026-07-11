@@ -138,6 +138,13 @@ pub(crate) fn app(state: AppState) -> Router {
             "/workers/{worker_id}/runtime-resources/reconcile",
             post(reconcile_runtime_resources),
         )
+        .route(
+            "/workers/{worker_id}/sandboxes/{sandbox_id}/guest-token",
+            post(mint_guest_token),
+        )
+        .route_layer(middleware::from_fn(require_worker_principal));
+
+    let guest_routes = Router::new()
         .route("/workers/{worker_id}/leases/claim", post(claim_lease))
         .route("/leases/{lease_id}/renew", post(renew_lease))
         .route("/leases/{lease_id}/output", post(append_lease_output))
@@ -147,7 +154,7 @@ pub(crate) fn app(state: AppState) -> Router {
             "/sandboxes/{sandbox_id}/guest-health",
             post(update_guest_health),
         )
-        .route_layer(middleware::from_fn(require_worker_principal));
+        .route_layer(middleware::from_fn(require_guest_route_principal));
 
     // Tenant limits and idempotency apply to every mutating control-plane
     // path, including the unversioned aliases. Idempotency only activates when
@@ -166,6 +173,10 @@ pub(crate) fn app(state: AppState) -> Router {
         state.clone(),
         enforce_tenant_limits,
     ));
+    let guest_routes = guest_routes.layer(middleware::from_fn_with_state(
+        state.clone(),
+        enforce_tenant_limits,
+    ));
     let registration_routes = registration_routes.layer(middleware::from_fn_with_state(
         state.clone(),
         enforce_tenant_limits,
@@ -174,6 +185,7 @@ pub(crate) fn app(state: AppState) -> Router {
     let versioned_routes = Router::new()
         .merge(tenant_routes.clone())
         .merge(worker_routes.clone())
+        .merge(guest_routes.clone())
         .merge(registration_routes.clone());
 
     let operator_routes = Router::new()
@@ -193,6 +205,7 @@ pub(crate) fn app(state: AppState) -> Router {
         .nest("/v1/operator", operator_routes)
         .merge(tenant_routes)
         .merge(worker_routes)
+        .merge(guest_routes)
         .merge(registration_routes)
         .layer(DefaultBodyLimit::max(DEFAULT_BODY_LIMIT_BYTES))
         .with_state(state.clone())

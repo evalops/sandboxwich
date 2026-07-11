@@ -115,6 +115,10 @@ const PUBLIC_V1_OPERATIONS: &[(&str, &str)] = &[
     ("post", "/v1/workers/{worker_id}/drain"),
     (
         "post",
+        "/v1/workers/{worker_id}/sandboxes/{sandbox_id}/guest-token",
+    ),
+    (
+        "post",
         "/v1/workers/{worker_id}/runtime-resources/reconcile",
     ),
     ("post", "/v1/workers/{worker_id}/leases/claim"),

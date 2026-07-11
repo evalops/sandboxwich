@@ -29,6 +29,14 @@ pub(crate) async fn claim_lease(
     // GH-64: guest-facing route -- only a token scoped to exactly this
     // worker may claim on its behalf; tenant-wide tokens are rejected.
     ensure_worker_scope(&ctx, worker_id)?;
+    if let Some(sandbox_id) = ctx.guest_sandbox_id()
+        && (request.sandbox_id != Some(sandbox_id)
+            || request.kinds.as_deref() != Some(&[JobKind::RunCommand]))
+    {
+        return Err(ApiError::bad_request(
+            "guest lease claims must specify their own sandbox_id and only run_command kind",
+        ));
+    }
     let worker = ensure_worker_tenant(&state.db, worker_id, &ctx).await?;
     let operation_id = headers
         .get("idempotency-key")
