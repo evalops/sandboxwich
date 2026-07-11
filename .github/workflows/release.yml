@@ -20,10 +20,17 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - run: cargo build --locked --release -p sandboxwich-api
       - run: target/release/sandboxwich-api openapi > sandboxwich-openapi.json
+      - name: Record released image digests
+        run: >-
+          grep -h 'image: ghcr.io/evalops/sandboxwich-' deploy/kubernetes/*.yaml |
+          sed 's/^[[:space:]]*image:[[:space:]]*//' |
+          sort -u > sandboxwich-image-digests.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sandboxwich-openapi
-          path: sandboxwich-openapi.json
+          path: |
+            sandboxwich-openapi.json
+            sandboxwich-image-digests.txt
 
   cli:
     name: CLI (${{ matrix.target }})

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.0 - 2026-07-11
+
 - The CLI executable is now named `sandboxwich`. Structured output supports
   `--output json|jsonl|table` while preserving JSON as the compatibility default;
   `--quiet` suppresses successful structured output.

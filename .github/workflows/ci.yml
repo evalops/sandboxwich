@@ -35,6 +35,7 @@ jobs:
       - run: cargo check --workspace --locked
       - run: python3 scripts/test-repository-rules.py
       - run: python3 scripts/test-deployment-images.py
+      - run: python3 scripts/test-release-readiness.py
       - run: cargo test --workspace --locked
         env:
           SANDBOXWICH_TEST_POSTGRES_URL: >-
