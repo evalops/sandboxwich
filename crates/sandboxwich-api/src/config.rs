@@ -24,6 +24,7 @@ pub(crate) enum ApiCommand {
     Serve,
     Migrate,
     CheckSchema,
+    OpenApi,
 }
 
 pub(crate) struct ApiConfig {
@@ -94,12 +95,13 @@ pub(crate) fn parse_api_command(
         None | Some("serve") => ApiCommand::Serve,
         Some("migrate") => ApiCommand::Migrate,
         Some("check-schema") => ApiCommand::CheckSchema,
+        Some("openapi") => ApiCommand::OpenApi,
         Some("--help") | Some("-h") => {
-            println!("usage: sandboxwich-api [serve|migrate|check-schema]");
+            println!("usage: sandboxwich-api [serve|migrate|check-schema|openapi]");
             std::process::exit(0);
         }
         Some(command) => anyhow::bail!(
-            "unknown sandboxwich-api command {command:?}; expected serve, migrate, or check-schema"
+            "unknown sandboxwich-api command {command:?}; expected serve, migrate, check-schema, or openapi"
         ),
     };
     if let Some(extra) = args.next() {

@@ -11,6 +11,20 @@ permissions:
   attestations: write
 
 jobs:
+  openapi:
+    name: OpenAPI contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - run: cargo build --locked --release -p sandboxwich-api
+      - run: target/release/sandboxwich-api openapi > sandboxwich-openapi.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sandboxwich-openapi
+          path: sandboxwich-openapi.json
+
   cli:
     name: CLI (${{ matrix.target }})
     strategy:
@@ -51,7 +65,7 @@ jobs:
             ${{ env.ARCHIVE }}.sha256
 
   publish:
-    needs: cli
+    needs: [cli, openapi]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
