@@ -1,70 +1,62 @@
-# Roadmap
+# Roadmap and support gates
 
-This roadmap is ordered to keep the product honest: durable control-plane contracts first, then worker ownership, then real guest execution, then snapshots, desktop access, and provider backends.
+## Shipped in 0.1
 
-## Milestone 1: Control Plane Foundation
+- Typed `/v1` HTTP control plane with SQLite and PostgreSQL contract tests.
+- Durable worker registration, capacity, leases, renewal, retry, and typed completion.
+- Guest command streaming, file operations, health, SSH metadata, and sandbox-bound tokens.
+- Snapshot, fork, retention, cleanup, desktop-session, and runtime-resource records.
+- Kubernetes dry-run and guarded apply providers with RuntimeClass, ingress, CIDR egress, and optional Cilium FQDN policy.
+- Signed API, worker, and Ubuntu runtime images plus attested CLI archives.
 
-Goal: make the API state model durable, portable, and testable enough for workers to trust it.
+These capabilities remain Experimental until every gate below passes for a named provider and release.
 
-- Prove lifecycle and event contracts with integration tests.
-- Keep SQLite for local development and Postgres for shared deployments.
-- Add command lookup and list APIs beyond the immediate queue response.
-- Add schema constraints for sandbox states, event kinds, and command statuses.
-- Persist runtime resources as typed database rows instead of provider JSON blobs.
+## Promotion gates
 
-## Milestone 2: Worker Leases
+### Authorization
 
-Goal: let workers safely claim, renew, finish, and retry work through durable leases.
+- Tenant, operator, worker, and guest principals have separate credentials and route permissions.
+- Guest credentials are bound to one sandbox, expire, rotate by revocation, and never appear in logs, provider metadata, process arguments, or stored response bodies.
+- SQLite and PostgreSQL tests cover cross-tenant, cross-worker, cross-sandbox, expiry, revocation, and wrong-job-kind requests.
 
-- Add worker registration and heartbeat records.
-- Implement a durable lease queue for sandbox and command work.
-- Add lease timeout, retry, and ownership transitions.
-- Wire `sandboxwich-worker` to claim and report jobs.
-- Use typed worker completion results so job outcomes are matched by contract, not JSON shape.
+### Isolation
 
-## Milestone 3: Guest Agent Execution
+- The supported provider uses gVisor, Kata, a microVM, or an equivalent documented boundary.
+- Sandbox pods cannot reach Kubernetes, cloud metadata, control-plane namespaces, or another sandbox unless an explicit policy permits the destination.
+- FQDN and CIDR allowlists have live allow, deny, DNS failure, redirect, IPv4, and IPv6 tests.
 
-Goal: replace dry-run command responses with real command lifecycle events from guests.
+### Lifecycle recovery
 
-- Define the guest-agent protocol for command start, output, exit, and failure.
-- Stream command output into control-plane events.
-- Add SSH key injection lifecycle.
-- Add failure semantics for unhealthy or unreachable guests.
-- Ship daemon-mode guest agent execution with streaming stdout/stderr chunks.
-- Add guest file upload, download, list, and file-citation annotations.
+- Provision, command, stop, snapshot, fork, cancellation, lease loss, worker restart, API restart, and out-of-band resource deletion have deterministic terminal states.
+- Cleanup and reconciliation are idempotent and retain an operator-readable record of failures.
 
-## Milestone 4: Snapshot And Fork
+### Conformance
 
-Goal: represent snapshot provenance explicitly before provider-specific implementation details leak into the API.
+- The provider passes the disposable-cluster suite from a clean database and empty cluster.
+- SQLite and PostgreSQL contract suites pass on the release commit.
+- Required Rust, Clippy, dependency audit, MSRV, container, and Kubernetes checks pass together on current `main`.
 
-- Add snapshot records and inventory APIs.
-- Replace synthetic fork provenance with real snapshot records.
-- Add fork planning and state transitions.
-- Add retention and TTL cleanup for snapshots and archived sandboxes.
+### Telemetry
 
-## Milestone 5: Desktop Access
+- Metrics expose bounded-label sandbox, worker, job, lease, queue age, heartbeat age, retry, idempotency, cleanup, runtime-resource, and guest-token state.
+- Alerts cover queued-work age, stale workers, repeated lease expiry, cleanup failure, and capacity exhaustion.
+- Tenant credentials cannot read another tenant's metrics; the operator credential can read the global view.
 
-Goal: add a brokered desktop-session contract without exposing long-lived secrets.
+### Documentation
 
-- Define desktop readiness and connection metadata.
-- Add a desktop stream broker service boundary.
-- Emit desktop availability events from workers or providers.
-- Add CLI/API commands for desktop session discovery.
+- Every public `/v1` method and path appears in the released OpenAPI document.
+- The capability matrix names the provider, backend, limitations, and support state.
+- The release contains CLI archives, checksums, provenance attestations, OpenAPI, and image digests.
 
-## Milestone 6: Provider Backends
+## Next work
 
-Goal: make providers pluggable and testable before wiring real infrastructure.
+1. Add live Cilium FQDN conformance on a Cilium-backed disposable cluster.
+2. Add a microVM provider and compare its lifecycle and recovery behavior with RuntimeClass-backed Kubernetes.
+3. Add a brokered desktop transport; current desktop records do not create an ingress tunnel.
+4. Add production secret storage before accepting long-lived user or model credentials.
 
-- Define provider adapter traits and capability reports.
-- Implement the first VM or microVM adapter.
-- Add RuntimeClass-backed isolation for gVisor/Kata-capable Kubernetes clusters.
-- Add resource tiers and network egress policy to provisioning specs.
-- Add provider health and capability reporting.
-- Add an end-to-end provision, exec, snapshot, and fork smoke test.
-
-## Non-Goals For Now
+## Non-goals for 0.1
 
 - Billing.
-- Production secret storage.
-- Direct cloud mutations from tests.
-- User-visible claims of real isolation before a provider backend exists.
+- Long-lived production secret storage.
+- Unsupported isolation claims for the dry-run provider.

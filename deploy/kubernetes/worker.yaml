@@ -173,7 +173,7 @@ spec:
             # explicit guest image so kind/local clusters cannot silently fall
             # back to a private ghcr.io default and ImagePullBackOff.
             - name: SANDBOXWICH_RUNTIME_IMAGE
-              value: ghcr.io/evalops/sandboxwich-ubuntu-dev:latest
+              value: ghcr.io/evalops/sandboxwich-ubuntu-dev@sha256:67beb010add51dd38455dc35b0e5103c73565c529f2efaa3f1ccac9015db79d2
             # SECURITY NOTE (GH-76): this sets both halves of the mutation
             # double opt-in (this env var and --confirm-apply below)
             # permanently ON in this deployment. That is a deliberate,
