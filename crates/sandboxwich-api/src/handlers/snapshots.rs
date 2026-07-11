@@ -152,7 +152,7 @@ pub(crate) async fn fork_snapshot(
                 network_egress: child.network_egress.clone(),
             }
         }),
-        required_capability: WorkerCapability::Snapshot,
+        required_capability: fork_capability(&child.network_egress),
         priority: 0,
         attempts: 0,
         max_attempts: 3,
@@ -757,7 +757,7 @@ pub(crate) async fn queue_forks_waiting_on_snapshot_on_connection(
                         network_egress: child.network_egress.clone(),
                     }
                 }),
-                required_capability: WorkerCapability::Snapshot,
+                required_capability: fork_capability(&child.network_egress),
                 priority: 0,
                 attempts: 0,
                 max_attempts: 3,
