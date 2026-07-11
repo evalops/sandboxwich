@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import pathlib
 import re
+import subprocess
 import unittest
 
 
@@ -42,6 +43,19 @@ class ReleaseReadinessTest(unittest.TestCase):
         self.assertEqual(
             released_images,
             {"sandboxwich-api", "sandboxwich-worker", "sandboxwich-ubuntu-dev"},
+        )
+
+        inventory = subprocess.run(
+            [str(ROOT / "scripts/release-image-digests.sh")],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        self.assertEqual(len(inventory), 3)
+        self.assertEqual(
+            {line.split("/")[-1].split("@")[0] for line in inventory},
+            released_images,
         )
 
 
