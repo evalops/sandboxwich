@@ -82,6 +82,15 @@ jobs:
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
+      - name: Record service image digest
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: printf '%s@%s\n' "${IMAGE}" "${DIGEST}" > "${{ matrix.image }}.image-digest"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.image }}-image-digest
+          path: ${{ matrix.image }}.image-digest
 
   runtime-image:
     name: runtime image (ubuntu-dev)
@@ -135,3 +144,12 @@ jobs:
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/sandboxwich-ubuntu-dev
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
+      - name: Record runtime image digest
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/sandboxwich-ubuntu-dev
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: printf '%s@%s\n' "${IMAGE}" "${DIGEST}" > sandboxwich-ubuntu-dev.image-digest
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sandboxwich-ubuntu-dev-image-digest
+          path: sandboxwich-ubuntu-dev.image-digest

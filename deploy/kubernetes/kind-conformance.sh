@@ -54,7 +54,7 @@ kubectl -n sandboxwich expose deployment postgres --port=5432
 kubectl -n sandboxwich rollout status deployment/postgres --timeout=120s
 
 sed \
-  -e "s#ghcr.io/evalops/sandboxwich-api:latest#${API_IMAGE}#g" \
+  -e "s#ghcr.io/evalops/sandboxwich-api@sha256:[0-9a-f]\{64\}#${API_IMAGE}#g" \
   -e 's/imagePullPolicy: Always/imagePullPolicy: IfNotPresent/g' \
   -e 's/replicas: 2/replicas: 1/' \
   "${ROOT_DIR}/deploy/kubernetes/api.yaml" >"${TMP_DIR}/api.yaml"
@@ -62,7 +62,7 @@ sed \
 # explicit SANDBOXWICH_RUNTIME_IMAGE (required for apply mode); rewrite it so
 # the first worker pod never points at ghcr.io, which kind cannot pull.
 sed \
-  -e "s#ghcr.io/evalops/sandboxwich-worker:latest#${WORKER_IMAGE}#g" \
+  -e "s#ghcr.io/evalops/sandboxwich-worker@sha256:[0-9a-f]\{64\}#${WORKER_IMAGE}#g" \
   -e "s#ghcr.io/evalops/sandboxwich-ubuntu-dev:latest#${RUNTIME_IMAGE}#g" \
   -e 's/imagePullPolicy: Always/imagePullPolicy: IfNotPresent/g' \
   -e 's/value: k3s-dev/value: kind-conformance/' \

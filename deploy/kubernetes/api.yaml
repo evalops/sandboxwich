@@ -33,12 +33,8 @@ spec:
           type: RuntimeDefault
       containers:
         - name: migrate
-          image: ghcr.io/evalops/sandboxwich-api:latest
-          # TODO(follow-up): pin to the sha-<12> tag containers.yml already
-          # publishes instead of floating :latest, so deploys correlate to a
-          # commit. Always at least forces a pull instead of trusting a
-          # node's cached (possibly stale) :latest image.
-          imagePullPolicy: Always
+          image: ghcr.io/evalops/sandboxwich-api@sha256:e722cecbe4072efbef95e6a80bfc687e90491ceeaa97a6b2ca04c88da5066c01
+          imagePullPolicy: IfNotPresent
           args:
             - migrate
           env:
@@ -105,12 +101,8 @@ spec:
           type: RuntimeDefault
       containers:
         - name: api
-          image: ghcr.io/evalops/sandboxwich-api:latest
-          # TODO(follow-up): pin to the sha-<12> tag containers.yml already
-          # publishes instead of floating :latest, so deploys correlate to a
-          # commit. Always at least forces a pull instead of trusting a
-          # node's cached (possibly stale) :latest image.
-          imagePullPolicy: Always
+          image: ghcr.io/evalops/sandboxwich-api@sha256:e722cecbe4072efbef95e6a80bfc687e90491ceeaa97a6b2ca04c88da5066c01
+          imagePullPolicy: IfNotPresent
           env:
             - name: SANDBOXWICH_BIND
               value: 0.0.0.0:3217

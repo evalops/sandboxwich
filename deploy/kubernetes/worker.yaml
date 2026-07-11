@@ -115,12 +115,8 @@ spec:
           type: RuntimeDefault
       containers:
         - name: worker
-          image: ghcr.io/evalops/sandboxwich-worker:latest
-          # TODO(follow-up): pin to the sha-<12> tag containers.yml already
-          # publishes instead of floating :latest, so deploys correlate to a
-          # commit. Always at least forces a pull instead of trusting a
-          # node's cached (possibly stale) :latest image.
-          imagePullPolicy: Always
+          image: ghcr.io/evalops/sandboxwich-worker@sha256:45e661306ead0b59435c1141ab6d120f4dbdbab6ef70cfcdc80ce758cae5d0b9
+          imagePullPolicy: IfNotPresent
           env:
             # kubectl (shelled out to by the apply provider) wants a writable
             # $HOME for its discovery cache. readOnlyRootFilesystem below
