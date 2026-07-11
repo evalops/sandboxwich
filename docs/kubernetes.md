@@ -6,6 +6,12 @@ successful `containers` workflow, download its `*-image-digest` artifacts and
 update both API references together in a reviewed pull request. Run
 `python3 scripts/test-deployment-images.py` before applying the manifests.
 
+Host egress allowlists require Cilium with DNS proxy enforcement. Set
+`SANDBOXWICH_CILIUM_FQDN_EGRESS=true` only on workers whose sandbox namespace
+is managed by Cilium. Those workers advertise `fqdn_egress`; host-bearing
+provision jobs remain queued when no capable worker is online. Workers using
+standard Kubernetes NetworkPolicy continue rejecting host rules.
+
 `sandboxwich` is being shaped to run comfortably on k3s and Kubernetes. The control plane is stateless except for Postgres, and workers register themselves with typed capabilities before they claim any work.
 
 ## Current Shape
