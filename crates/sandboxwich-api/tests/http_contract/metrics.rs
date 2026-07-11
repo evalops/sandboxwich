@@ -160,4 +160,11 @@ pub(crate) async fn assert_metrics_are_exposed(client: &reqwest::Client, server:
     assert!(metrics.contains("# TYPE sandboxwich_sandbox_count gauge"));
     assert!(metrics.contains("sandboxwich_sandbox_count{state=\"planning\"}"));
     assert!(metrics.contains("sandboxwich_worker_capacity_slots"));
+    assert!(metrics.contains("# TYPE sandboxwich_job_lease_count gauge"));
+    assert!(metrics.contains("# TYPE sandboxwich_job_attempts gauge"));
+    assert!(metrics.contains("# TYPE sandboxwich_idempotency_record_count gauge"));
+    assert!(metrics.contains("# TYPE sandboxwich_guest_token_count gauge"));
+    assert!(metrics.contains("# TYPE sandboxwich_cleanup_run_count gauge"));
+    assert!(metrics.contains("# TYPE sandboxwich_job_queue_oldest_seconds gauge"));
+    assert!(metrics.contains("# TYPE sandboxwich_worker_heartbeat_oldest_seconds gauge"));
 }
