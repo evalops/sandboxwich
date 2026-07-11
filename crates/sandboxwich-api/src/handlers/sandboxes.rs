@@ -88,7 +88,7 @@ pub(crate) fn looks_like_dns_name(value: &str) -> bool {
         })
 }
 
-fn provision_capability(network_egress: &NetworkEgress) -> WorkerCapability {
+pub(crate) fn provision_capability(network_egress: &NetworkEgress) -> WorkerCapability {
     if network_egress
         .rules()
         .iter()
@@ -97,6 +97,18 @@ fn provision_capability(network_egress: &NetworkEgress) -> WorkerCapability {
         WorkerCapability::FqdnEgress
     } else {
         WorkerCapability::ProvisionSandbox
+    }
+}
+
+pub(crate) fn fork_capability(network_egress: &NetworkEgress) -> WorkerCapability {
+    if network_egress
+        .rules()
+        .iter()
+        .any(|rule| rule.kind == NetworkAllowRuleKind::Host)
+    {
+        WorkerCapability::FqdnEgress
+    } else {
+        WorkerCapability::Snapshot
     }
 }
 
