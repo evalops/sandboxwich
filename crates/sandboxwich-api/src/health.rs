@@ -1,6 +1,7 @@
 use crate::auth::*;
 use crate::db::*;
 use crate::error::*;
+use crate::rows::parse_timestamp;
 use crate::state::*;
 use axum::Json;
 use axum::extract::{Extension, State};
@@ -129,6 +130,52 @@ pub(crate) async fn collect_prometheus_metrics(
         "Total configured online worker concurrency slots.",
         metrics.scalar("worker_capacity_slots"),
     );
+    append_count_family(
+        &mut body,
+        "sandboxwich_job_lease_count",
+        "Job leases by lifecycle status.",
+        "status",
+        metrics.counts("job_lease"),
+    );
+    append_gauge(
+        &mut body,
+        "sandboxwich_job_attempts",
+        "Total scheduler attempts retained for jobs.",
+        metrics.scalar("job_attempts"),
+    );
+    append_count_family(
+        &mut body,
+        "sandboxwich_idempotency_record_count",
+        "Idempotency records by state.",
+        "state",
+        metrics.counts("idempotency_record"),
+    );
+    append_count_family(
+        &mut body,
+        "sandboxwich_guest_token_count",
+        "Sandbox-bound guest credentials by revocation state.",
+        "state",
+        metrics.counts("guest_token"),
+    );
+    append_count_family(
+        &mut body,
+        "sandboxwich_cleanup_run_count",
+        "Operator cleanup runs by status.",
+        "status",
+        metrics.counts("cleanup_run"),
+    );
+    append_gauge(
+        &mut body,
+        "sandboxwich_job_queue_oldest_seconds",
+        "Age in seconds of the oldest queued job.",
+        metrics.scalar("job_queue_oldest_seconds"),
+    );
+    append_gauge(
+        &mut body,
+        "sandboxwich_worker_heartbeat_oldest_seconds",
+        "Age in seconds of the stalest online worker heartbeat.",
+        metrics.scalar("worker_heartbeat_oldest_seconds"),
+    );
     Ok(body)
 }
 
@@ -184,6 +231,23 @@ pub(crate) async fn fetch_prometheus_metrics(
              select 'worker_capacity_slots' as family, '' as label, coalesce(sum(max_concurrent_jobs), 0) as value
              from workers
              where status = 'online'
+             union all
+             select 'job_lease' as family, status as label, count(*) as value
+             from job_leases group by status
+             union all
+             select 'job_attempts' as family, '' as label, coalesce(sum(attempts), 0) as value
+             from jobs
+             union all
+             select 'idempotency_record' as family, state as label, count(*) as value
+             from idempotency_records group by state
+             union all
+             select 'guest_token' as family,
+                    case when revoked_at is null then 'issued' else 'revoked' end as label,
+                    count(*) as value
+             from guest_tokens group by case when revoked_at is null then 'issued' else 'revoked' end
+             union all
+             select 'cleanup_run' as family, status as label, count(*) as value
+             from cleanup_runs group by status
              order by family asc, label asc"
             .to_string(),
         Some(_) => format!(
@@ -216,6 +280,22 @@ pub(crate) async fn fetch_prometheus_metrics(
              select 'worker_capacity_slots' as family, '' as label, coalesce(sum(max_concurrent_jobs), 0) as value
              from workers
              where status = 'online' and tenant_id = {p6}
+             union all
+             select 'job_lease' as family, job_leases.status as label, count(*) as value
+             from job_leases join jobs on jobs.id = job_leases.job_id
+             where jobs.tenant_id = {p7} group by job_leases.status
+             union all
+             select 'job_attempts' as family, '' as label, coalesce(sum(attempts), 0) as value
+             from jobs where tenant_id = {p8}
+             union all
+             select 'idempotency_record' as family, state as label, count(*) as value
+             from idempotency_records where tenant_id = {p9} group by state
+             union all
+             select 'guest_token' as family,
+                    case when revoked_at is null then 'issued' else 'revoked' end as label,
+                    count(*) as value
+             from guest_tokens where tenant_id = {p10}
+             group by case when revoked_at is null then 'issued' else 'revoked' end
              order by family asc, label asc",
             p1 = db.placeholder(1),
             p2 = db.placeholder(2),
@@ -223,12 +303,16 @@ pub(crate) async fn fetch_prometheus_metrics(
             p4 = db.placeholder(4),
             p5 = db.placeholder(5),
             p6 = db.placeholder(6),
+            p7 = db.placeholder(7),
+            p8 = db.placeholder(8),
+            p9 = db.placeholder(9),
+            p10 = db.placeholder(10),
         ),
     };
 
     let mut query = sqlx::query(&sql);
     if let Some(tenant_id) = tenant_id {
-        for _ in 0..6 {
+        for _ in 0..10 {
             query = query.bind(tenant_id.to_string());
         }
     }
@@ -243,6 +327,41 @@ pub(crate) async fn fetch_prometheus_metrics(
             .entry(family)
             .or_insert_with(Vec::new)
             .push((label, value));
+    }
+    let queued_sql = match tenant_id {
+        None => {
+            "select min(scheduled_at) as observed_at from jobs where status = 'queued'".to_string()
+        }
+        Some(_) => format!(
+            "select min(scheduled_at) as observed_at from jobs where status = 'queued' and tenant_id = {}",
+            db.placeholder(1)
+        ),
+    };
+    let heartbeat_sql = match tenant_id {
+        None => "select min(last_heartbeat_at) as observed_at from workers where status = 'online'"
+            .to_string(),
+        Some(_) => format!(
+            "select min(last_heartbeat_at) as observed_at from workers where status = 'online' and tenant_id = {}",
+            db.placeholder(1)
+        ),
+    };
+    for (family, sql) in [
+        ("job_queue_oldest_seconds", queued_sql),
+        ("worker_heartbeat_oldest_seconds", heartbeat_sql),
+    ] {
+        let mut query = sqlx::query(&sql);
+        if let Some(tenant_id) = tenant_id {
+            query = query.bind(tenant_id);
+        }
+        let row = query.fetch_one(&db.pool).await?;
+        let observed_at: Option<String> = row.try_get("observed_at")?;
+        let age = observed_at
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()?
+            .map(|observed_at| (Utc::now() - observed_at).num_seconds().max(0))
+            .unwrap_or_default();
+        values.insert(family.to_string(), vec![(String::new(), age)]);
     }
     Ok(PrometheusMetrics { values })
 }
