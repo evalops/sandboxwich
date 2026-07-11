@@ -1,6 +1,108 @@
 use crate::common::*;
 use reqwest::StatusCode;
 use sandboxwich_core::*;
+use std::collections::BTreeSet;
+
+#[tokio::test]
+async fn openapi_covers_every_public_v1_operation() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("openapi-coverage.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let docs: serde_json::Value = server
+        .client()
+        .get(format!("{}/v1/openapi.json", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let actual: BTreeSet<(String, String)> = docs["paths"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .flat_map(|(path, item)| {
+            item.as_object()
+                .unwrap()
+                .keys()
+                .filter(|method| {
+                    matches!(method.as_str(), "get" | "post" | "put" | "delete" | "patch")
+                })
+                .map(move |method| (method.to_ascii_uppercase(), path.clone()))
+        })
+        .collect();
+    let expected: BTreeSet<(String, String)> = [
+        ("GET", "/v1/metrics"),
+        ("GET", "/v1/sandboxes"),
+        ("POST", "/v1/sandboxes"),
+        ("GET", "/v1/sandboxes/{sandbox_id}"),
+        ("GET", "/v1/sandboxes/{sandbox_id}/observed-state"),
+        ("GET", "/v1/sandboxes/{sandbox_id}/files"),
+        ("POST", "/v1/sandboxes/{sandbox_id}/files"),
+        ("GET", "/v1/sandboxes/{sandbox_id}/files/{file_id}"),
+        ("GET", "/v1/sandboxes/{sandbox_id}/runtime-resources"),
+        ("POST", "/v1/sandboxes/{sandbox_id}/stop"),
+        ("POST", "/v1/sandboxes/{sandbox_id}/resume"),
+        ("POST", "/v1/sandboxes/{sandbox_id}/fork"),
+        ("GET", "/v1/sandboxes/{sandbox_id}/snapshots"),
+        ("POST", "/v1/sandboxes/{sandbox_id}/snapshots"),
+        ("GET", "/v1/sandboxes/{sandbox_id}/desktop"),
+        ("GET", "/v1/sandboxes/{sandbox_id}/desktop-sessions"),
+        ("POST", "/v1/sandboxes/{sandbox_id}/desktop-sessions"),
+        ("GET", "/v1/sandboxes/{sandbox_id}/commands"),
+        ("POST", "/v1/sandboxes/{sandbox_id}/commands"),
+        ("POST", "/v1/sandboxes/{sandbox_id}/prompt"),
+        ("GET", "/v1/sandboxes/{sandbox_id}/events"),
+        ("GET", "/v1/desktop-sessions/{desktop_session_id}"),
+        ("POST", "/v1/desktop-sessions/{desktop_session_id}/status"),
+        ("POST", "/v1/desktop-sessions/{desktop_session_id}/access"),
+        ("POST", "/v1/snapshots/cleanup"),
+        ("GET", "/v1/snapshots/{snapshot_id}"),
+        ("POST", "/v1/snapshots/{snapshot_id}/fork"),
+        ("GET", "/v1/commands/{command_id}"),
+        ("GET", "/v1/commands/{command_id}/output"),
+        ("GET", "/v1/workers"),
+        ("POST", "/v1/workers/register"),
+        ("GET", "/v1/capacity"),
+        ("GET", "/v1/jobs"),
+        ("POST", "/v1/jobs"),
+        ("GET", "/v1/jobs/{job_id}"),
+        ("POST", "/v1/divergence/reconcile"),
+        ("POST", "/v1/sandboxes/{sandbox_id}/tool-call-ledger"),
+        ("GET", "/v1/sandboxes/{sandbox_id}/divergence-findings"),
+        ("GET", "/v1/operations/{operation_id}"),
+        ("GET", "/v1/operations/{operation_id}/events"),
+        ("POST", "/v1/operations/{operation_id}/cancel"),
+        ("GET", "/v1/sandboxes/{sandbox_id}/guest-health"),
+        ("POST", "/v1/sandboxes/{sandbox_id}/guest-health"),
+        ("GET", "/v1/sandboxes/{sandbox_id}/ssh-keys"),
+        ("POST", "/v1/sandboxes/{sandbox_id}/ssh-keys"),
+        ("POST", "/v1/sandboxes/{sandbox_id}/ssh-access"),
+        ("POST", "/v1/ssh-keys/{ssh_key_id}/status"),
+        ("POST", "/v1/workers/{worker_id}/heartbeat"),
+        ("POST", "/v1/workers/{worker_id}/drain"),
+        (
+            "POST",
+            "/v1/workers/{worker_id}/runtime-resources/reconcile",
+        ),
+        ("POST", "/v1/workers/{worker_id}/leases/claim"),
+        ("POST", "/v1/leases/{lease_id}/renew"),
+        ("POST", "/v1/leases/{lease_id}/output"),
+        ("POST", "/v1/leases/{lease_id}/complete"),
+        ("POST", "/v1/leases/{lease_id}/fail"),
+        ("GET", "/v1/operator/tenant-policies/{tenant_id}"),
+        ("PUT", "/v1/operator/tenant-policies/{tenant_id}"),
+    ]
+    .into_iter()
+    .map(|(method, path)| (method.to_string(), path.to_string()))
+    .collect();
+    assert_eq!(actual, expected);
+}
 
 #[tokio::test]
 async fn v1_contract_exposes_operations_openapi_request_ids_and_honest_prompt_status() {

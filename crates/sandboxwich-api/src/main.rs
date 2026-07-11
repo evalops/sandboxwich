@@ -24,6 +24,7 @@ use std::time::Duration;
 use anyhow::Context;
 use tracing_subscriber::EnvFilter;
 
+use crate::api_contract::openapi_document;
 use crate::config::AuthConfig;
 use crate::config::{ApiCommand, load_api_config};
 use crate::db::connect_database;
@@ -40,6 +41,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = load_api_config()?;
+    if matches!(config.command, ApiCommand::OpenApi) {
+        serde_json::to_writer_pretty(std::io::stdout().lock(), &openapi_document())?;
+        println!();
+        return Ok(());
+    }
     let db = connect_database(&config.database_url, config.database_max_connections).await?;
 
     match config.command {
@@ -60,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
                 verify_database_schema(&db).await?;
             }
         }
+        ApiCommand::OpenApi => unreachable!("OpenAPI exits before database connection"),
     }
 
     if config.allow_insecure_no_auth

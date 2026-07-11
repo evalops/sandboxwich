@@ -109,6 +109,10 @@ fn api_command_parser_accepts_operational_modes() {
         parse_api_command(["check-schema".to_string()]).unwrap(),
         ApiCommand::CheckSchema
     ));
+    assert!(matches!(
+        parse_api_command(["openapi".to_string()]).unwrap(),
+        ApiCommand::OpenApi
+    ));
     assert!(parse_api_command(["migrate".to_string(), "extra".to_string()]).is_err());
     assert!(parse_api_command(["wat".to_string()]).is_err());
 }
