@@ -63,7 +63,7 @@ sed \
 # the first worker pod never points at ghcr.io, which kind cannot pull.
 sed \
   -e "s#ghcr.io/evalops/sandboxwich-worker@sha256:[0-9a-f]\{64\}#${WORKER_IMAGE}#g" \
-  -e "s#ghcr.io/evalops/sandboxwich-ubuntu-dev:latest#${RUNTIME_IMAGE}#g" \
+  -e "s#ghcr.io/evalops/sandboxwich-ubuntu-dev@sha256:[a-f0-9]\{64\}#${RUNTIME_IMAGE}#g" \
   -e 's/imagePullPolicy: Always/imagePullPolicy: IfNotPresent/g' \
   -e 's/value: k3s-dev/value: kind-conformance/' \
   -e 's/value: local-path/value: standard/' \

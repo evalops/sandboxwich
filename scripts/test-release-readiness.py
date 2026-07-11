@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import pathlib
+import re
 import unittest
 
 
@@ -27,6 +28,21 @@ class ReleaseReadinessTest(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
         self.assertIn("sandboxwich-openapi.json", workflow)
         self.assertIn("sandboxwich-image-digests.txt", workflow)
+
+    def test_release_inventory_contains_every_pinned_service_image(self) -> None:
+        manifests = "\n".join(
+            path.read_text() for path in (ROOT / "deploy/kubernetes").glob("*.yaml")
+        )
+        released_images = set(
+            re.findall(
+                r"ghcr\.io/evalops/(sandboxwich-(?:api|worker|ubuntu-dev))@sha256:[0-9a-f]{64}",
+                manifests,
+            )
+        )
+        self.assertEqual(
+            released_images,
+            {"sandboxwich-api", "sandboxwich-worker", "sandboxwich-ubuntu-dev"},
+        )
 
 
 if __name__ == "__main__":
