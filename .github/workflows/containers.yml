@@ -20,7 +20,9 @@ jobs:
   service-images:
     name: service image (${{ matrix.bin }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Main publishes both amd64 and arm64. The emulated arm64 Rust build can
+    # exceed 45 minutes on a cold cache, while PRs remain native amd64 builds.
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
