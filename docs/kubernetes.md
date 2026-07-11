@@ -1,5 +1,11 @@
 # Kubernetes
 
+The checked-in API and worker manifests use OCI image-index digests. The API
+migration job and Deployment intentionally use the same digest. After a
+successful `containers` workflow, download its `*-image-digest` artifacts and
+update both API references together in a reviewed pull request. Run
+`python3 scripts/test-deployment-images.py` before applying the manifests.
+
 `sandboxwich` is being shaped to run comfortably on k3s and Kubernetes. The control plane is stateless except for Postgres, and workers register themselves with typed capabilities before they claim any work.
 
 ## Current Shape
