@@ -89,6 +89,13 @@ Sandbox create accepts typed memory tiers (`1g`, `4g`, `16g`, `64g`) and typed n
 
 Worker completions use typed result variants. Provider-created Pods, PVCs, Services, NetworkPolicies, and VolumeSnapshots are persisted as `runtime_resources` rows with constrained kind, purpose, and status columns; provider metadata is diagnostic compatibility data, not the durable source of runtime state. Runtime resources marked `deleted` were reconciled as missing or removed outside the cleanup path; resources marked `destroyed` were explicitly torn down by archived-sandbox cleanup. Kubernetes providers render deny-by-default egress, pod/container security contexts, resource requests/limits, and optional RuntimeClass isolation such as gVisor or Kata.
 
+Guest agents must use a sandbox-bound token minted by the owning worker through
+`POST /v1/workers/{worker_id}/sandboxes/{sandbox_id}/guest-token`. Do not copy a
+worker token into a guest. Minting a replacement revokes the previous token;
+stopping or deleting the sandbox also revokes it. Guest tokens can claim only
+`run_command` work for their bound sandbox and cannot call worker administration
+routes.
+
 ## Public API contract
 
 The stable HTTP surface is versioned under `/v1`. Unversioned routes remain as

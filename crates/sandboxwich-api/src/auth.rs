@@ -20,6 +20,7 @@ pub(crate) const PROBE_PATHS: &[&str] = &["/healthz", "/readyz"];
 /// incoming bearer token to hash-based worker lookup instead of the static
 /// tenant/shared-token lists without needing to try both on every request.
 pub(crate) const WORKER_TOKEN_PREFIX: &str = "sbw_wtok_";
+pub(crate) const GUEST_TOKEN_PREFIX: &str = "sbw_gtok_";
 
 pub(crate) async fn auth_and_tenant(
     State(state): State<AppState>,
@@ -27,8 +28,25 @@ pub(crate) async fn auth_and_tenant(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    let (tenant_id, worker_id) = if PROBE_PATHS.contains(&path) {
-        (state.default_tenant_id.clone(), None)
+    let (tenant_id, principal) = if PROBE_PATHS.contains(&path) {
+        (state.default_tenant_id.clone(), Principal::Tenant)
+    } else if let Some(token) =
+        bearer_token(&request).filter(|token| token.starts_with(GUEST_TOKEN_PREFIX))
+    {
+        match resolve_guest_token(&state.db, token).await {
+            Ok(Some((tenant_id, worker_id, sandbox_id))) => (
+                tenant_id,
+                Principal::Guest {
+                    worker_id,
+                    sandbox_id,
+                },
+            ),
+            Ok(None) => {
+                return ApiError::unauthorized("valid guest bearer token is required")
+                    .into_response();
+            }
+            Err(error) => return error.into_response(),
+        }
     } else if let Some(token) =
         bearer_token(&request).filter(|token| token.starts_with(WORKER_TOKEN_PREFIX))
     {
@@ -40,7 +58,7 @@ pub(crate) async fn auth_and_tenant(
         // through to the tenant-token checks below, which would let a
         // rejected worker-token attempt be retried as a tenant-wide lookup.
         match resolve_worker_token(&state.db, token).await {
-            Ok(Some((tenant_id, worker_id))) => (tenant_id, Some(worker_id)),
+            Ok(Some((tenant_id, worker_id))) => (tenant_id, Principal::Worker(worker_id)),
             Ok(None) => {
                 return ApiError::unauthorized("valid worker bearer token is required")
                     .into_response();
@@ -59,14 +77,14 @@ pub(crate) async fn auth_and_tenant(
         else {
             return ApiError::unauthorized("valid tenant bearer token is required").into_response();
         };
-        (tenant.tenant_id.clone(), None)
+        (tenant.tenant_id.clone(), Principal::Tenant)
     } else if let Some(expected_token) = &state.auth.shared_token {
         let authorized = bearer_token(&request)
             .is_some_and(|token| constant_time_eq(token.as_bytes(), expected_token.as_bytes()));
         if !authorized {
             return ApiError::unauthorized("valid bearer token is required").into_response();
         }
-        (state.default_tenant_id.clone(), None)
+        (state.default_tenant_id.clone(), Principal::Tenant)
     } else if state.auth.allow_insecure_no_auth {
         // Explicit, off-by-default opt-out (SANDBOXWICH_ALLOW_INSECURE_NO_AUTH) for
         // local development and benchmark harnesses: with no credential configured,
@@ -80,7 +98,7 @@ pub(crate) async fn auth_and_tenant(
             .filter(|tenant| !tenant.is_empty())
             .unwrap_or(&state.default_tenant_id)
             .to_string();
-        (tenant_id, None)
+        (tenant_id, Principal::Tenant)
     } else {
         // Fail closed: with no SANDBOXWICH_API_TOKEN and no SANDBOXWICH_TENANT_TOKENS
         // configured, there is no credential to authenticate against, so we must
@@ -94,10 +112,9 @@ pub(crate) async fn auth_and_tenant(
         )
         .into_response();
     };
-    let principal = match worker_id {
-        Some(worker_id) => Principal::Worker(worker_id),
-        None if is_operator_request(&state, request.headers()) => Principal::Operator,
-        None => Principal::Tenant,
+    let principal = match principal {
+        Principal::Tenant if is_operator_request(&state, request.headers()) => Principal::Operator,
+        principal => principal,
     };
     request.extensions_mut().insert(TenantContext {
         tenant_id,
@@ -105,6 +122,43 @@ pub(crate) async fn auth_and_tenant(
     });
 
     next.run(request).await
+}
+
+pub(crate) async fn resolve_guest_token(
+    db: &Database,
+    token: &str,
+) -> Result<Option<(String, WorkerId, SandboxId)>, ApiError> {
+    let hash = hash_worker_token(token);
+    let sql = format!(
+        "select tenant_id, worker_id, sandbox_id, expires_at
+         from guest_tokens
+         where token_hash = {} and revoked_at is null",
+        db.placeholder(1)
+    );
+    let Some(row) = sqlx::query(&sql)
+        .bind(hash)
+        .fetch_optional(&db.pool)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let expires_at = parse_timestamp(row.try_get("expires_at")?)?;
+    if expires_at <= chrono::Utc::now() {
+        return Ok(None);
+    }
+    Ok(Some((
+        row.try_get("tenant_id")?,
+        WorkerId(parse_uuid(row.try_get("worker_id")?)?),
+        SandboxId(parse_uuid(row.try_get("sandbox_id")?)?),
+    )))
+}
+
+pub(crate) fn generate_guest_token() -> String {
+    format!(
+        "{GUEST_TOKEN_PREFIX}{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    )
 }
 
 /// Resolves a worker-scoped bearer token (see GH-64) to the `(tenant_id,
@@ -252,6 +306,11 @@ pub(crate) async fn ensure_lease_worker_scope(
 ) -> Result<JobLease, ApiError> {
     let lease = ensure_lease_tenant(db, lease_id, ctx).await?;
     ensure_worker_scope(ctx, lease.worker_id)?;
+    if let Some(sandbox_id) = ctx.guest_sandbox_id()
+        && (lease.job.kind != JobKind::RunCommand || sandbox_id_from_job(&lease.job)? != sandbox_id)
+    {
+        return Err(ApiError::not_found("resource not found"));
+    }
     Ok(lease)
 }
 
@@ -268,6 +327,13 @@ pub(crate) async fn ensure_sandbox_worker_scope(
     ctx: &TenantContext,
 ) -> Result<Sandbox, ApiError> {
     let sandbox = ensure_sandbox_tenant(db, sandbox_id, ctx).await?;
+    if let Some(bound_sandbox_id) = ctx.guest_sandbox_id() {
+        return if bound_sandbox_id == sandbox_id {
+            Ok(sandbox)
+        } else {
+            Err(ApiError::not_found("resource not found"))
+        };
+    }
     let Some(worker_id) = ctx.worker_id() else {
         return Err(ApiError::unauthorized(
             "this route requires a worker-scoped token; tenant-wide tokens are not accepted",
@@ -286,7 +352,7 @@ pub(crate) async fn require_tenant_principal(
 ) -> Response {
     match ctx.principal {
         Principal::Tenant | Principal::Operator => next.run(request).await,
-        Principal::Worker(_) => ApiError::unauthorized(
+        Principal::Worker(_) | Principal::Guest { .. } => ApiError::unauthorized(
             "worker-scoped tokens are not accepted on tenant or operator routes",
         )
         .into_response(),
@@ -300,10 +366,26 @@ pub(crate) async fn require_worker_principal(
 ) -> Response {
     match ctx.principal {
         Principal::Worker(_) => next.run(request).await,
-        Principal::Tenant | Principal::Operator => ApiError::unauthorized(
-            "this route requires a worker-scoped token; tenant-wide tokens are not accepted",
-        )
-        .into_response(),
+        Principal::Guest { .. } | Principal::Tenant | Principal::Operator => {
+            ApiError::unauthorized(
+                "this route requires a worker-scoped token; tenant-wide tokens are not accepted",
+            )
+            .into_response()
+        }
+    }
+}
+
+pub(crate) async fn require_guest_route_principal(
+    Extension(ctx): Extension<TenantContext>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match ctx.principal {
+        Principal::Worker(_) | Principal::Guest { .. } => next.run(request).await,
+        Principal::Tenant | Principal::Operator => {
+            ApiError::unauthorized("this route requires a worker or sandbox-scoped guest token")
+                .into_response()
+        }
     }
 }
 

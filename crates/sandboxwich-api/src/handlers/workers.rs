@@ -23,6 +23,68 @@ pub(crate) fn validate_max_concurrent_jobs(max_concurrent_jobs: u32) -> Result<u
     Ok(max_concurrent_jobs)
 }
 
+pub(crate) async fn mint_guest_token(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path((worker_id, sandbox_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<MintGuestTokenRequest>,
+) -> Result<Json<GuestTokenResponse>, ApiError> {
+    let worker_id = WorkerId(worker_id);
+    let sandbox_id = SandboxId(sandbox_id);
+    ensure_worker_scope(&ctx, worker_id)?;
+    ensure_sandbox_worker_scope(&state.db, sandbox_id, &ctx).await?;
+    let ttl_seconds = request.ttl_seconds.unwrap_or(3600);
+    if !(1..=86_400).contains(&ttl_seconds) {
+        return Err(ApiError::bad_request(
+            "guest token ttl_seconds must be between 1 and 86400",
+        ));
+    }
+    let now = Utc::now();
+    let expires_at = now + chrono::Duration::seconds(ttl_seconds as i64);
+    let token = generate_guest_token();
+    let token_hash = hash_worker_token(&token);
+    let mut tx = state.db.pool.begin().await?;
+    let revoke_sql = format!(
+        "update guest_tokens set revoked_at = {}
+         where tenant_id = {} and sandbox_id = {} and revoked_at is null",
+        state.db.placeholder(1),
+        state.db.placeholder(2),
+        state.db.placeholder(3)
+    );
+    sqlx::query(&revoke_sql)
+        .bind(now.to_rfc3339())
+        .bind(&ctx.tenant_id)
+        .bind(sandbox_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    let insert_sql = format!(
+        "insert into guest_tokens
+         (id, tenant_id, worker_id, sandbox_id, token_hash, expires_at, revoked_at, created_at)
+         values ({})",
+        state.db.placeholders(8)
+    );
+    sqlx::query(&insert_sql)
+        .bind(Uuid::now_v7().to_string())
+        .bind(&ctx.tenant_id)
+        .bind(worker_id.to_string())
+        .bind(sandbox_id.to_string())
+        .bind(token_hash)
+        .bind(expires_at.to_rfc3339())
+        .bind(Option::<String>::None)
+        .bind(now.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(GuestTokenResponse {
+        ok: true,
+        token,
+        tenant_id: ctx.tenant_id,
+        worker_id,
+        sandbox_id,
+        expires_at,
+    }))
+}
+
 pub(crate) async fn register_worker(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,

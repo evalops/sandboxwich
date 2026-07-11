@@ -1513,6 +1513,21 @@ pub struct WorkerResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MintGuestTokenRequest {
+    pub ttl_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GuestTokenResponse {
+    pub ok: bool,
+    pub token: String,
+    pub tenant_id: String,
+    pub worker_id: WorkerId,
+    pub sandbox_id: SandboxId,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorkerListResponse {
     pub ok: bool,
     pub workers: Vec<Worker>,

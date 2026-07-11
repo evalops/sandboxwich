@@ -162,6 +162,55 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
     provision(&client, &worker_a_client, &server, &worker_a, &sandbox_a).await;
     provision(&client, &worker_b_client, &server, &worker_b, &sandbox_b).await;
 
+    let guest_token: GuestTokenResponse = worker_a_client
+        .post(format!(
+            "{}/workers/{}/sandboxes/{}/guest-token",
+            server.base_url, worker_a.worker.id, sandbox_a.sandbox.id
+        ))
+        .json(&MintGuestTokenRequest {
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(guest_token.sandbox_id, sandbox_a.sandbox.id);
+    assert!(guest_token.token.starts_with("sbw_gtok_"));
+    let guest_client = build_api_client(Some(&guest_token.token), None).unwrap();
+
+    let guest_heartbeat = guest_client
+        .post(format!(
+            "{}/workers/{}/heartbeat",
+            server.base_url, worker_a.worker.id
+        ))
+        .json(&WorkerHeartbeatRequest {
+            max_concurrent_jobs: None,
+            labels: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(guest_heartbeat.status(), StatusCode::UNAUTHORIZED);
+
+    let cross_sandbox_guest_claim = guest_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker_a.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox_b.sandbox.id),
+            kinds: Some(vec![JobKind::RunCommand]),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_sandbox_guest_claim.status(), StatusCode::BAD_REQUEST);
+
     // Give worker A a real active lease (a RunCommand job for its own
     // sandbox) to attack from worker B and from a tenant-wide token.
     let command: QueueCommandResponse = client
@@ -183,7 +232,7 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
         .json()
         .await
         .unwrap();
-    let claimed: ClaimLeaseResponse = worker_a_client
+    let unscoped_guest_claim = guest_client
         .post(format!(
             "{}/workers/{}/leases/claim",
             server.base_url, worker_a.worker.id
@@ -192,6 +241,21 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unscoped_guest_claim.status(), StatusCode::BAD_REQUEST);
+
+    let claimed: ClaimLeaseResponse = guest_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker_a.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox_a.sandbox.id),
+            kinds: Some(vec![JobKind::RunCommand]),
         })
         .send()
         .await
@@ -376,7 +440,7 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
     // (c) the happy path still works end to end: worker A can append
     // output to, renew, and complete its own lease; worker B can post
     // guest-health for its own sandbox.
-    let output: sandboxwich_core::CommandOutputChunkResponse = worker_a_client
+    let output: sandboxwich_core::CommandOutputChunkResponse = guest_client
         .post(format!("{}/leases/{}/output", server.base_url, lease_a.id))
         .json(&AppendCommandOutputRequest {
             stream: CommandOutputStream::Stdout,
@@ -393,7 +457,7 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
         .unwrap();
     assert_eq!(output.chunk.sequence, 1);
 
-    let renewed: LeaseResponse = worker_a_client
+    let renewed: LeaseResponse = guest_client
         .post(format!("{}/leases/{}/renew", server.base_url, lease_a.id))
         .json(&RenewLeaseRequest {
             lease_seconds: Some(120),
@@ -408,7 +472,7 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
         .unwrap();
     assert_eq!(renewed.lease.id, lease_a.id);
 
-    let completed: LeaseResponse = worker_a_client
+    let completed: LeaseResponse = guest_client
         .post(format!(
             "{}/leases/{}/complete",
             server.base_url, lease_a.id

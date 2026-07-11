@@ -88,6 +88,10 @@ async fn openapi_covers_every_public_v1_operation() {
         ("POST", "/v1/workers/{worker_id}/drain"),
         (
             "POST",
+            "/v1/workers/{worker_id}/sandboxes/{sandbox_id}/guest-token",
+        ),
+        (
+            "POST",
             "/v1/workers/{worker_id}/runtime-resources/reconcile",
         ),
         ("POST", "/v1/workers/{worker_id}/leases/claim"),

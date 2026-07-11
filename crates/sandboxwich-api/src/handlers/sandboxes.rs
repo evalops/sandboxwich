@@ -286,6 +286,19 @@ pub(crate) async fn stop_sandbox(
     )
     .await?;
     insert_job_on_connection(&state.db, &mut tx, &job).await?;
+    let revoke_sql = format!(
+        "update guest_tokens set revoked_at = {}
+         where tenant_id = {} and sandbox_id = {} and revoked_at is null",
+        state.db.placeholder(1),
+        state.db.placeholder(2),
+        state.db.placeholder(3)
+    );
+    sqlx::query(&revoke_sql)
+        .bind(now.to_rfc3339())
+        .bind(&ctx.tenant_id)
+        .bind(sandbox_id.to_string())
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     sandbox.state = SandboxState::Archiving;
     sandbox.updated_at = now;
