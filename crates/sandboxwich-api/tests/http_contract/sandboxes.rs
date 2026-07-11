@@ -355,7 +355,33 @@ pub(crate) async fn assert_resource_tiers_and_file_contracts(
         .send()
         .await
         .unwrap();
-    assert_eq!(host_allowlist.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(host_allowlist.status(), StatusCode::ACCEPTED);
+    let host_allowlist: SandboxResponse = host_allowlist.json().await.unwrap();
+    assert_eq!(
+        host_allowlist.sandbox.network_egress,
+        NetworkEgress::Allowlist {
+            rules: vec![NetworkAllowRule {
+                kind: NetworkAllowRuleKind::Host,
+                value: "api.example.com".to_string(),
+            }]
+        }
+    );
+    let jobs: JobListResponse = client
+        .get(format!("{}/jobs?limit=100", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let host_job = jobs
+        .jobs
+        .iter()
+        .find(|job| job.payload["sandboxId"] == serde_json::json!(host_allowlist.sandbox.id))
+        .expect("host allowlist provisioning job must exist");
+    assert_eq!(host_job.required_capability, WorkerCapability::FqdnEgress);
 
     let fetched: SandboxResponse = client
         .get(format!(

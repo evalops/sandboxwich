@@ -232,6 +232,11 @@ struct ProviderArgs {
     #[arg(long, env = "SANDBOXWICH_RUNTIME_CLASS_NAME")]
     runtime_class_name: Option<String>,
 
+    /// Enable CiliumNetworkPolicy `toFQDNs` rendering for host allow rules.
+    /// The cluster must have Cilium CRDs and DNS proxy enforcement installed.
+    #[arg(long, env = "SANDBOXWICH_CILIUM_FQDN_EGRESS", default_value_t = false)]
+    cilium_fqdn_egress: bool,
+
     /// Dedicated namespace sandbox pods/services/PVCs/NetworkPolicies are
     /// deployed into, separate from the control-plane namespace (GH-76).
     /// Unset falls back to the control-plane `--namespace`, preserving
@@ -750,6 +755,7 @@ fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
     .with_workspace_storage(non_empty(args.workspace_storage))
     .with_ssh_authorized_keys_secret(non_empty(args.ssh_authorized_keys_secret))
     .with_runtime_class_name(non_empty(args.runtime_class_name))
+    .with_cilium_fqdn_egress(args.cilium_fqdn_egress)
     .with_sandbox_namespace(non_empty(args.sandbox_namespace))
     .with_dns_namespace(non_empty(args.dns_namespace));
     let provider = if args.egress_excluded_cidrs_replace {

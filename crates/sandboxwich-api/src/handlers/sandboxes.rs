@@ -61,14 +61,42 @@ pub(crate) fn validate_network_egress(network_egress: &NetworkEgress) -> Result<
                         "cidr network allow rule must use CIDR notation",
                     ));
                 }
-                if rule.kind == NetworkAllowRuleKind::Host {
+                if rule.kind == NetworkAllowRuleKind::Host && !looks_like_dns_name(value) {
                     return Err(ApiError::bad_request(
-                        "host network allow rules require a provider with FQDN egress support; use cidr rules for Kubernetes NetworkPolicy",
+                        "host network allow rule must be a lowercase DNS name without wildcards",
                     ));
                 }
             }
             Ok(())
         }
+    }
+}
+
+pub(crate) fn looks_like_dns_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && !value.ends_with('.')
+        && value.parse::<std::net::IpAddr>().is_err()
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+}
+
+fn provision_capability(network_egress: &NetworkEgress) -> WorkerCapability {
+    if network_egress
+        .rules()
+        .iter()
+        .any(|rule| rule.kind == NetworkAllowRuleKind::Host)
+    {
+        WorkerCapability::FqdnEgress
+    } else {
+        WorkerCapability::ProvisionSandbox
     }
 }
 
@@ -114,7 +142,7 @@ pub(crate) async fn create_sandbox(
         kind: JobKind::ProvisionSandbox,
         status: JobStatus::Queued,
         payload: json!({"sandboxId": sandbox.id, "provisionSpec": provision_spec}),
-        required_capability: WorkerCapability::ProvisionSandbox,
+        required_capability: provision_capability(&sandbox.network_egress),
         priority: 0,
         attempts: 0,
         max_attempts: 3,

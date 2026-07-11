@@ -233,6 +233,7 @@ pub struct KubernetesDryRunProvider {
     /// `ssh_authorized_keys_secret` is mounted as a file rather than an env
     /// var (GH-67).
     vnc_password_secret: Option<String>,
+    fqdn_egress_backend: Option<String>,
 }
 
 impl KubernetesDryRunProvider {
@@ -265,6 +266,7 @@ impl KubernetesDryRunProvider {
                 DEFAULT_INGRESS_SELECTOR_VALUE.to_string(),
             )]),
             vnc_password_secret: None,
+            fqdn_egress_backend: None,
         }
     }
 
@@ -322,6 +324,11 @@ impl KubernetesDryRunProvider {
                 self.dns_namespace = dns_namespace.to_string();
             }
         }
+        self
+    }
+
+    pub fn with_cilium_fqdn_egress(mut self, enabled: bool) -> Self {
+        self.fqdn_egress_backend = enabled.then(|| "cilium".to_string());
         self
     }
 
@@ -509,11 +516,12 @@ impl KubernetesDryRunProvider {
         })
     }
 
-    fn validate_network_policy_egress(network_egress: &NetworkEgress) -> anyhow::Result<()> {
+    fn validate_network_policy_egress(&self, network_egress: &NetworkEgress) -> anyhow::Result<()> {
         if let NetworkEgress::Allowlist { rules } = network_egress
             && let Some(rule) = rules
                 .iter()
                 .find(|rule| rule.kind == NetworkAllowRuleKind::Host)
+            && self.fqdn_egress_backend.as_deref() != Some("cilium")
         {
             bail!(
                 "standard Kubernetes NetworkPolicy cannot enforce host allow rule {}; use cidr allow rules or a provider with FQDN egress support",
@@ -846,7 +854,15 @@ impl KubernetesDryRunProvider {
         sandbox_id: SandboxId,
         network_egress: &NetworkEgress,
     ) -> anyhow::Result<serde_json::Value> {
-        Self::validate_network_policy_egress(network_egress)?;
+        self.validate_network_policy_egress(network_egress)?;
+        if self.fqdn_egress_backend.as_deref() == Some("cilium")
+            && network_egress
+                .rules()
+                .iter()
+                .any(|rule| rule.kind == NetworkAllowRuleKind::Host)
+        {
+            return Ok(self.cilium_fqdn_policy_manifest(sandbox_id, network_egress));
+        }
         let egress = match network_egress {
             NetworkEgress::DenyAll => Vec::new(),
             NetworkEgress::AllowAll => vec![
@@ -883,6 +899,67 @@ impl KubernetesDryRunProvider {
                 "egress": egress
             }
         }))
+    }
+
+    fn cilium_fqdn_policy_manifest(
+        &self,
+        sandbox_id: SandboxId,
+        network_egress: &NetworkEgress,
+    ) -> serde_json::Value {
+        let rules = network_egress.rules();
+        let hosts: Vec<_> = rules
+            .iter()
+            .filter(|rule| rule.kind == NetworkAllowRuleKind::Host)
+            .map(|rule| json!({"matchName": rule.value}))
+            .collect();
+        let cidrs: Vec<_> = rules
+            .iter()
+            .filter(|rule| rule.kind == NetworkAllowRuleKind::Cidr)
+            .map(|rule| {
+                let block = self.ip_block(&rule.value)?;
+                Ok(json!({
+                    "cidr": block["cidr"],
+                    "exceptCIDRs": block.get("except").cloned().unwrap_or_else(|| json!([]))
+                }))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+            .expect("CIDRs were validated before provider dispatch");
+        let mut ingress_labels = serde_json::Map::from_iter([(
+            "k8s:io.kubernetes.pod.namespace".to_string(),
+            json!(self.effective_ingress_namespace()),
+        )]);
+        for (key, value) in &self.ingress_pod_selector {
+            ingress_labels.insert(format!("k8s:{key}"), json!(value));
+        }
+        let denied_cidrs: Vec<_> = self
+            .egress_excluded_cidrs
+            .iter()
+            .map(|cidr| json!({"cidr": cidr}))
+            .collect();
+        let mut egress = vec![json!({"toFQDNs": hosts})];
+        if !cidrs.is_empty() {
+            egress.push(json!({"toCIDRSet": cidrs}));
+        }
+        egress.push(json!({
+            "toEndpoints": [{"matchLabels": {"k8s:io.kubernetes.pod.namespace": self.dns_namespace, "k8s:k8s-app": "kube-dns"}}],
+            "toPorts": [{"ports": [{"port": "53", "protocol": "ANY"}]}]
+        }));
+        json!({
+            "apiVersion": "cilium.io/v2",
+            "kind": "CiliumNetworkPolicy",
+            "metadata": self.object_metadata(format!("sandboxwich-egress-{sandbox_id}"), Some(sandbox_id)),
+            "spec": {
+                "endpointSelector": {"matchLabels": {"sandboxwich.dev/sandbox-id": sandbox_id}},
+                "ingress": [{
+                    "fromEndpoints": [{"matchLabels": ingress_labels}],
+                    "toPorts": [{"ports": [
+                        {"port": "2222", "protocol": "TCP"}, {"port": "6080", "protocol": "TCP"}, {"port": "5900", "protocol": "TCP"}
+                    ]}]
+                }],
+                "egress": egress,
+                "egressDeny": [{"toCIDRSet": denied_cidrs}]
+            }
+        })
     }
 
     fn ssh_service_manifest(&self, sandbox_id: SandboxId) -> serde_json::Value {
@@ -2022,6 +2099,9 @@ impl SandboxProvider for KubernetesDryRunProvider {
         if self.runtime_class_name.is_some() {
             capabilities.push(WorkerCapability::GvisorSandbox);
         }
+        if self.fqdn_egress_backend.is_some() {
+            capabilities.push(WorkerCapability::FqdnEgress);
+        }
         ProviderCapabilityReport {
             provider: "kubernetes".to_string(),
             capabilities,
@@ -2047,7 +2127,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
         spec: &SandboxProvisionSpec,
         _cancelled: &CancelSignal,
     ) -> anyhow::Result<ProviderSandboxHandle> {
-        Self::validate_network_policy_egress(&spec.network_egress)?;
+        self.validate_network_policy_egress(&spec.network_egress)?;
         Ok(ProviderSandboxHandle {
             provider: "kubernetes".to_string(),
             sandbox_id,
@@ -2126,7 +2206,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
         spec: &SandboxProvisionSpec,
         _cancelled: &CancelSignal,
     ) -> anyhow::Result<ProviderForkHandle> {
-        Self::validate_network_policy_egress(&spec.network_egress)?;
+        self.validate_network_policy_egress(&spec.network_egress)?;
         let network_policy =
             self.network_policy_manifest(child_sandbox_id, &spec.network_egress)?;
         Ok(ProviderForkHandle {
@@ -2217,7 +2297,8 @@ impl SandboxProvider for KubernetesApplyProvider {
         spec: &SandboxProvisionSpec,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<ProviderSandboxHandle> {
-        KubernetesDryRunProvider::validate_network_policy_egress(&spec.network_egress)?;
+        self.dry_run
+            .validate_network_policy_egress(&spec.network_egress)?;
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
         let manifests = self.provision_manifests(sandbox_id, spec)?;
         let apply = run_kubectl_documents(
@@ -2365,7 +2446,8 @@ impl SandboxProvider for KubernetesApplyProvider {
         spec: &SandboxProvisionSpec,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<ProviderForkHandle> {
-        KubernetesDryRunProvider::validate_network_policy_egress(&spec.network_egress)?;
+        self.dry_run
+            .validate_network_policy_egress(&spec.network_egress)?;
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
         let manifests = self.fork_manifests(child_sandbox_id, snapshot_id, spec)?;
         let apply = run_kubectl_documents(
@@ -2839,6 +2921,39 @@ mod tests {
             .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
             .expect_err("host allow rules should not silently render deny-all");
         assert!(error.to_string().contains("cannot enforce host allow rule"));
+    }
+
+    #[test]
+    fn cilium_fqdn_backend_renders_host_allow_rules() {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_cilium_fqdn_egress(true);
+        let spec = SandboxProvisionSpec {
+            memory_limit: MemoryLimit::OneG,
+            network_egress: NetworkEgress::Allowlist {
+                rules: vec![sandboxwich_core::NetworkAllowRule {
+                    kind: NetworkAllowRuleKind::Host,
+                    value: "api.example.com".to_string(),
+                }],
+            },
+        };
+
+        let provisioned = provider
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+            .expect("configured Cilium must support host allow rules");
+        let policy = &provisioned.metadata["manifests"]["networkPolicy"];
+        assert_eq!(policy["apiVersion"], "cilium.io/v2");
+        assert_eq!(policy["kind"], "CiliumNetworkPolicy");
+        assert_eq!(
+            policy["spec"]["egress"][0]["toFQDNs"][0]["matchName"],
+            "api.example.com"
+        );
+        assert!(
+            provider
+                .capability_report()
+                .capabilities
+                .contains(&WorkerCapability::FqdnEgress)
+        );
     }
 
     #[test]

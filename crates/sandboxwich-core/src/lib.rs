@@ -1456,6 +1456,7 @@ pub enum WorkerCapability {
     DesktopStream => "desktop_stream",
     K8sPod => "k8s_pod",
     GvisorSandbox => "gvisor_sandbox",
+    FqdnEgress => "fqdn_egress",
 }
 }
 

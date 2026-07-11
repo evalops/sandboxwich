@@ -129,6 +129,30 @@ fn looks_like_cidr_accepts_valid_v4_and_v6_networks() {
 }
 
 #[test]
+fn dns_allow_rules_accept_hosts_and_reject_wildcards_or_ambiguous_names() {
+    for valid in ["api.github.com", "example.com", "a-b.example"] {
+        assert!(
+            looks_like_dns_name(valid),
+            "expected valid DNS name: {valid}"
+        );
+    }
+    for invalid in [
+        "*.example.com",
+        "Example.com",
+        "example.com.",
+        "-edge.example",
+        "edge-.example",
+        "example..com",
+        "127.0.0.1",
+    ] {
+        assert!(
+            !looks_like_dns_name(invalid),
+            "expected invalid DNS name: {invalid}"
+        );
+    }
+}
+
+#[test]
 fn looks_like_cidr_rejects_garbage_and_out_of_range_prefixes() {
     // Not an IP address at all.
     assert!(!looks_like_cidr("notanip/24"));
