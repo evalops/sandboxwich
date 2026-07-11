@@ -19,6 +19,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Install pinned kind
@@ -29,10 +30,22 @@ jobs:
       - name: Build conformance binaries and images
         run: |
           cargo build -p sandboxwich-worker
-          docker build --build-arg BIN=sandboxwich-api -t sandboxwich-api:conformance .
-          docker build --build-arg BIN=sandboxwich-worker -t sandboxwich-worker:conformance .
-          docker build -t sandboxwich-runtime:conformance deploy/runtime/ubuntu-dev
-          docker build -f deploy/kubernetes/postgres.Dockerfile -t postgres:conformance .
+          docker buildx build --load --build-arg BIN=sandboxwich-api \
+            --cache-from type=gha,scope=kind-api \
+            --cache-to type=gha,mode=max,scope=kind-api \
+            -t sandboxwich-api:conformance .
+          docker buildx build --load --build-arg BIN=sandboxwich-worker \
+            --cache-from type=gha,scope=kind-worker \
+            --cache-to type=gha,mode=max,scope=kind-worker \
+            -t sandboxwich-worker:conformance .
+          docker buildx build --load \
+            --cache-from type=gha,scope=kind-runtime \
+            --cache-to type=gha,mode=max,scope=kind-runtime \
+            -t sandboxwich-runtime:conformance deploy/runtime/ubuntu-dev
+          docker buildx build --load -f deploy/kubernetes/postgres.Dockerfile \
+            --cache-from type=gha,scope=kind-postgres \
+            --cache-to type=gha,mode=max,scope=kind-postgres \
+            -t postgres:conformance .
           # kind imports the completed images into containerd, temporarily storing a
           # second copy of every layer. The intermediate BuildKit cache is no longer
           # needed after these builds and can exhaust the runner during that import.
