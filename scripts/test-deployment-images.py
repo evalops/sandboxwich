@@ -29,6 +29,11 @@ class DeploymentImagesTest(unittest.TestCase):
         self.assertEqual(len(api_digests), 2)
         self.assertEqual(len(set(api_digests)), 1)
 
+    def test_kind_conformance_rewrites_pinned_images_to_local_builds(self) -> None:
+        script = (ROOT / "deploy/kubernetes/kind-conformance.sh").read_text()
+        self.assertIn("sandboxwich-api@sha256:[0-9a-f]\\{64\\}", script)
+        self.assertIn("sandboxwich-worker@sha256:[0-9a-f]\\{64\\}", script)
+
 
 if __name__ == "__main__":
     unittest.main()

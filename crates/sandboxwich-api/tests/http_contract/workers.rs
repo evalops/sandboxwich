@@ -211,6 +211,38 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
         .unwrap();
     assert_eq!(cross_sandbox_guest_claim.status(), StatusCode::BAD_REQUEST);
 
+    let replacement_token: GuestTokenResponse = worker_a_client
+        .post(format!(
+            "{}/workers/{}/sandboxes/{}/guest-token",
+            server.base_url, worker_a.worker.id, sandbox_a.sandbox.id
+        ))
+        .json(&MintGuestTokenRequest {
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let revoked_claim = guest_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker_a.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox_a.sandbox.id),
+            kinds: Some(vec![JobKind::RunCommand]),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked_claim.status(), StatusCode::UNAUTHORIZED);
+    let guest_client = build_api_client(Some(&replacement_token.token), None).unwrap();
+
     // Give worker A a real active lease (a RunCommand job for its own
     // sandbox) to attack from worker B and from a tenant-wide token.
     let command: QueueCommandResponse = client
@@ -510,6 +542,40 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
         .await
         .unwrap();
     assert_eq!(health.guest_health.status, GuestStatus::Ready);
+
+    let expiring_token: GuestTokenResponse = worker_a_client
+        .post(format!(
+            "{}/workers/{}/sandboxes/{}/guest-token",
+            server.base_url, worker_a.worker.id, sandbox_a.sandbox.id
+        ))
+        .json(&MintGuestTokenRequest {
+            ttl_seconds: Some(1),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let expired_client = build_api_client(Some(&expiring_token.token), None).unwrap();
+    let expired_health = expired_client
+        .post(format!(
+            "{}/sandboxes/{}/guest-health",
+            server.base_url, sandbox_a.sandbox.id
+        ))
+        .json(&UpdateGuestHealthRequest {
+            status: GuestStatus::Ready,
+            agent_version: None,
+            checks: None,
+            message: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(expired_health.status(), StatusCode::UNAUTHORIZED);
 
     let draining: WorkerResponse = worker_a_client
         .post(format!(
