@@ -46,6 +46,15 @@ start_desktop() {
 
   export DISPLAY="${DISPLAY_NUMBER}"
   Xvfb "${DISPLAY_NUMBER}" -screen 0 "${SANDBOXWICH_DESKTOP_SIZE:-1920x1080x24}" -nolisten tcp &
+
+  # Firefox (and most GTK apps) probe for a D-Bus session bus at startup
+  # for clipboard/notification integration; without one they still run but
+  # log noisy warnings on every launch. Start one per-container-lifetime
+  # here so it's already present for fluxbox and any browser/automation
+  # process spawned later under this DISPLAY.
+  eval "$(dbus-launch --sh-syntax)"
+  export DBUS_SESSION_BUS_ADDRESS
+
   fluxbox >/tmp/sandboxwich-fluxbox.log 2>&1 &
 
   local vnc_password_file="/tmp/sandboxwich-vnc.passwd"
