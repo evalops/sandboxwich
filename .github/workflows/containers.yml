@@ -2,14 +2,6 @@ name: containers
 
 on:
   pull_request:
-    paths:
-      - ".dockerignore"
-      - ".github/workflows/containers.yml"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "Dockerfile"
-      - "crates/**"
-      - "deploy/runtime/ubuntu-dev/**"
   push:
     branches:
       - main

@@ -2,14 +2,6 @@ name: kubernetes-conformance
 
 on:
   pull_request:
-    paths:
-      - ".github/workflows/kubernetes-conformance.yml"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "Dockerfile"
-      - "crates/**"
-      - "deploy/kubernetes/**"
-      - "deploy/runtime/ubuntu-dev/**"
   push:
     branches: [main]
   workflow_dispatch:
