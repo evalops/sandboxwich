@@ -182,9 +182,27 @@ kubectl -n sandboxwich rollout restart deployment/sandboxwich-api
 kubectl -n sandboxwich rollout status deployment/sandboxwich-api --timeout=120s
 start_port_forward
 api "http://127.0.0.1:32170/sandboxes/${source_id}" >/dev/null || fail "API restart lost durable state"
+echo "api-restart-recovered"
+
+# Kill the worker while it owns a long-running command lease. The replacement
+# must reclaim the expired lease and finish the command exactly once.
+lease_response="$(api -X POST "http://127.0.0.1:32170/sandboxes/${source_id}/commands" \
+  --data '{"argv":["sh","-c","sleep 20; printf lease-recovered"]}')"
+lease_command_id="$(jq -r .command.id <<<"${lease_response}")"
+wait_json "http://127.0.0.1:32170/commands/${lease_command_id}" '.command.status' running
 kubectl -n sandboxwich delete pod -l app.kubernetes.io/name=sandboxwich-worker --wait=true
 kubectl -n sandboxwich rollout status deployment/sandboxwich-worker --timeout=120s
-run_command "${source_id}" '["true"]' >/dev/null
+wait_json "http://127.0.0.1:32170/commands/${lease_command_id}" '.command.status' finished
+lease_command="$(api "http://127.0.0.1:32170/commands/${lease_command_id}")"
+[[ "$(jq -r .command.stdout <<<"${lease_command}")" == "lease-recovered" ]] || \
+  fail "reclaimed command output mismatch: ${lease_command}"
+echo "worker-restart-recovered"
+echo "lease-loss-recovered"
+
+# Removing a provider-owned object outside Sandboxwich must not prevent the
+# normal stop path from reaching its terminal state and deleting siblings.
+kubectl -n sandboxwich-sandboxes delete pod "sandboxwich-${target_id}" --wait=true
+echo "out-of-band-pod-deletion"
 
 stop_sandbox "${source_id}"
 stop_sandbox "${target_id}"
@@ -244,6 +262,9 @@ for sandbox_id in "${deny_id}" "${source_id}" "${target_id}"; do
   remaining="$(kubectl -n sandboxwich-sandboxes get pod,pvc,service,networkpolicy \
     -l "sandboxwich.dev/sandbox-id=${sandbox_id}" -o name)"
   [[ -z "${remaining}" ]] || fail "resources leaked for ${sandbox_id}: ${remaining}"
+  kubectl -n sandboxwich-sandboxes delete pod,pvc,service,networkpolicy \
+    -l "sandboxwich.dev/sandbox-id=${sandbox_id}" --ignore-not-found --wait=true >/dev/null
 done
+echo "idempotent-cleanup-recovered"
 
 echo "kind conformance passed"

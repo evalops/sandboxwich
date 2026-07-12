@@ -48,6 +48,18 @@ class RepositoryRulesTest(unittest.TestCase):
         self.assertIn("non_fast_forward", types)
         self.assertIn("deletion", types)
 
+    def test_container_builds_use_native_architecture_runners(self) -> None:
+        workflow = (ROOT / ".github/workflows/containers.yml").read_text()
+        self.assertIn("ubuntu-24.04-arm", workflow)
+        self.assertIn("ubuntu-24.04", workflow)
+        self.assertIn("docker buildx imagetools create", workflow)
+        self.assertIn("linux/amd64", workflow)
+        self.assertIn("linux/arm64", workflow)
+        self.assertNotIn("qemu", workflow.lower())
+        self.assertNotIn("binfmt", workflow.lower())
+        self.assertIn("name: service image (${{ matrix.bin }})", workflow)
+        self.assertIn("name: runtime image (ubuntu-dev)", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()
