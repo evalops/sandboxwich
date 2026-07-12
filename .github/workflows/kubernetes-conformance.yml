@@ -66,3 +66,37 @@ jobs:
       - name: Delete disposable cluster
         if: always()
         run: kind delete cluster --name sandboxwich-conformance
+
+  cilium-fqdn:
+    name: cilium-fqdn
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned kind
+        run: |
+          curl -fsSLo kind https://kind.sigs.k8s.io/dl/v0.29.0/kind-linux-amd64
+          echo c72eda46430f065fb45c5f70e7c957cc9209402ef309294821978677c8fb3284  kind | sha256sum --check
+          sudo install -m 0755 kind /usr/local/bin/kind
+      - name: Create Cilium cluster
+        run: kind create cluster --name sandboxwich-cilium --config deploy/kubernetes/kind-cilium.yaml
+      - name: Install Cilium
+        run: |
+          helm repo add cilium https://helm.cilium.io/
+          helm repo update
+          helm install cilium cilium/cilium --version 1.17.6 --namespace kube-system \
+            --set ipam.mode=kubernetes \
+            --set kubeProxyReplacement=true
+          kubectl -n kube-system rollout status daemonset/cilium --timeout=300s
+          kubectl wait nodes --all --for=condition=Ready --timeout=300s
+      - name: Run Cilium FQDN conformance
+        run: deploy/kubernetes/cilium-fqdn-conformance.sh
+      - name: Collect Cilium diagnostics
+        if: failure()
+        run: |
+          kubectl get nodes,pods -A -o wide
+          kubectl -n kube-system logs daemonset/cilium --tail=200 || true
+          kubectl get ciliumnetworkpolicies -A -o yaml || true
+      - name: Delete Cilium cluster
+        if: always()
+        run: kind delete cluster --name sandboxwich-cilium
