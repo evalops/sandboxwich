@@ -68,7 +68,7 @@ expect_denied() {
 exec_probe curl -fsSI --retry 3 --max-time 20 https://example.com >/dev/null
 echo "allowed-fqdn: pass"
 echo "ipv4-allowed: pass"
-expect_denied denied-fqdn curl -fsSI --max-time 8 https://example.net
+expect_denied denied-fqdn curl -fsSI --max-time 8 https://www.wikipedia.org
 expect_denied dns-failure curl -fsSI --max-time 8 https://does-not-exist.invalid
 exec_probe curl -fsSL --retry 3 --max-time 20 \
   'https://httpbingo.org/redirect-to?url=https://example.com' >/dev/null
