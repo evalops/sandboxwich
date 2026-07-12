@@ -68,6 +68,208 @@ fn dispatches_provision_job_to_provider_manifest() {
 }
 
 #[test]
+fn dispatches_provision_stage_reports_before_returning_the_handle() {
+    let sandbox_id = SandboxId::new();
+    let mut stages = Vec::new();
+    let outcome = execute_job_with_reporter(
+        &job(
+            JobKind::ProvisionSandbox,
+            json!({ "sandboxId": sandbox_id }),
+            WorkerCapability::ProvisionSandbox,
+        ),
+        &provider(),
+        &CancelSignal::never_cancelled(),
+        &mut |report| {
+            stages.push(report.stage);
+            Ok(())
+        },
+    )
+    .expect("provision with reporter succeeds");
+
+    assert!(matches!(outcome, WorkerJobOutcome::Complete(_)));
+    assert_eq!(
+        stages,
+        vec![sandboxwich_core::ProvisioningStage::SandboxReady]
+    );
+}
+
+#[test]
+fn provisioning_report_targets_the_lease_and_uses_its_attempt() {
+    let lease_id = sandboxwich_core::LeaseId::new();
+    let (method, url, request) = provisioning_stage_request(
+        "https://sandboxwich.example/v1/",
+        lease_id,
+        4,
+        ProvisioningStageUpdateRequest {
+            stage: sandboxwich_core::ProvisioningStage::PodReady,
+            resource_kind: Some(RuntimeResourceKind::Pod),
+            resource_namespace: Some("sandboxwich-sandboxes".to_string()),
+            resource_name: Some("sandboxwich-test".to_string()),
+            resource_uid: Some("uid-test".to_string()),
+            observed_generation: Some(1),
+            attempt_count: 1,
+            last_error_class: None,
+            last_error_code: None,
+            last_error: None,
+        },
+    );
+
+    assert_eq!(method, reqwest::Method::PUT);
+    assert_eq!(
+        url,
+        format!("https://sandboxwich.example/v1/leases/{lease_id}/provisioning")
+    );
+    assert_eq!(request.attempt_count, 4);
+}
+
+#[test]
+fn provider_errors_expose_typed_retry_class_and_reason_code() {
+    let error = ProviderError::classified(
+        sandboxwich_core::ProvisioningErrorClass::RetryableCapacity,
+        "workspace_capacity_pending",
+        anyhow::anyhow!("unbound immediate PersistentVolumeClaims"),
+    );
+
+    assert_eq!(
+        error.error_class(),
+        sandboxwich_core::ProvisioningErrorClass::RetryableCapacity
+    );
+    assert_eq!(error.reason_code(), "workspace_capacity_pending");
+    assert_eq!(error.disposition(), RetryDisposition::Retryable);
+}
+
+struct FailingStagedProvider {
+    inner: KubernetesDryRunProvider,
+}
+
+impl SandboxProvider for FailingStagedProvider {
+    fn capability_report(&self) -> sandboxwich_core::ProviderCapabilityReport {
+        self.inner.capability_report()
+    }
+
+    fn health_report(&self) -> sandboxwich_core::ProviderHealthReport {
+        self.inner.health_report()
+    }
+
+    fn provision(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<sandboxwich_core::ProviderSandboxHandle> {
+        self.inner.provision(sandbox_id, spec, cancelled)
+    }
+
+    fn provision_staged(
+        &self,
+        _sandbox_id: SandboxId,
+        _spec: &SandboxProvisionSpec,
+        _cancelled: &CancelSignal,
+        report: &mut dyn FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
+    ) -> anyhow::Result<sandboxwich_core::ProviderSandboxHandle> {
+        report(ProvisioningStageUpdateRequest {
+            stage: sandboxwich_core::ProvisioningStage::WorkspaceReady,
+            resource_kind: Some(RuntimeResourceKind::PersistentVolumeClaim),
+            resource_namespace: Some("sandboxwich-ci".to_string()),
+            resource_name: Some("sandboxwich-pvc-test".to_string()),
+            resource_uid: Some("uid-workspace".to_string()),
+            observed_generation: None,
+            attempt_count: 1,
+            last_error_class: None,
+            last_error_code: None,
+            last_error: None,
+        })?;
+        Err(anyhow::Error::new(ProviderError::classified(
+            sandboxwich_core::ProvisioningErrorClass::RetryableCapacity,
+            "workspace_capacity_pending",
+            anyhow::anyhow!("volume remains unbound"),
+        )))
+    }
+
+    fn exec_handoff(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxProvisionSpec,
+        request: AgentCommandRequest,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<AgentCommandResult> {
+        self.inner
+            .exec_handoff(sandbox_id, spec, request, cancelled)
+    }
+
+    fn create_snapshot(
+        &self,
+        sandbox_id: SandboxId,
+        snapshot_id: SnapshotId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<sandboxwich_core::ProviderSnapshotHandle> {
+        self.inner
+            .create_snapshot(sandbox_id, snapshot_id, cancelled)
+    }
+
+    fn fork(
+        &self,
+        parent_sandbox_id: SandboxId,
+        child_sandbox_id: SandboxId,
+        snapshot_id: SnapshotId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<sandboxwich_core::ProviderForkHandle> {
+        self.inner.fork(
+            parent_sandbox_id,
+            child_sandbox_id,
+            snapshot_id,
+            spec,
+            cancelled,
+        )
+    }
+
+    fn stop(&self, sandbox_id: SandboxId, cancelled: &CancelSignal) -> anyhow::Result<()> {
+        self.inner.stop(sandbox_id, cancelled)
+    }
+}
+
+#[test]
+fn provisioning_failure_reports_typed_error_against_last_durable_stage() {
+    let sandbox_id = SandboxId::new();
+    let mut reports = Vec::new();
+    let result = execute_job_with_reporter(
+        &job(
+            JobKind::ProvisionSandbox,
+            json!({ "sandboxId": sandbox_id }),
+            WorkerCapability::ProvisionSandbox,
+        ),
+        &FailingStagedProvider { inner: provider() },
+        &CancelSignal::never_cancelled(),
+        &mut |report| {
+            reports.push(report);
+            Ok(())
+        },
+    );
+
+    assert!(result.is_err());
+    assert_eq!(reports.len(), 2);
+    assert_eq!(
+        reports[1].stage,
+        sandboxwich_core::ProvisioningStage::WorkspaceReady
+    );
+    assert_eq!(
+        reports[1].last_error_class,
+        Some(sandboxwich_core::ProvisioningErrorClass::RetryableCapacity)
+    );
+    assert_eq!(
+        reports[1].last_error_code.as_deref(),
+        Some("workspace_capacity_pending")
+    );
+    assert!(
+        reports[1]
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("workspace_capacity_pending"))
+    );
+}
+
+#[test]
 fn dispatches_command_job_to_provider_exec_handoff() {
     let sandbox_id = SandboxId::new();
     let spec = SandboxProvisionSpec {

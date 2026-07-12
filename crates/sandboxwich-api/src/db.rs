@@ -396,6 +396,41 @@ pub(crate) const DB_ENUM_COLUMNS: &[DbEnumColumn] = &[
         <CleanupRunStatus as DbVariant>::VALUES,
         "invalid cleanup run status",
     ),
+    DbEnumColumn::new(
+        "provisioning_operations",
+        "stage",
+        "provisioning_operations_stage_check",
+        <ProvisioningStage as DbVariant>::VALUES,
+        "invalid provisioning stage",
+    ),
+    DbEnumColumn::new(
+        "provisioning_operations",
+        "resource_kind",
+        "provisioning_operations_resource_kind_check",
+        <RuntimeResourceKind as DbVariant>::VALUES,
+        "invalid provisioning resource kind",
+    ),
+    DbEnumColumn::new(
+        "provisioning_operations",
+        "last_error_class",
+        "provisioning_operations_error_class_check",
+        <ProvisioningErrorClass as DbVariant>::VALUES,
+        "invalid provisioning error class",
+    ),
+    DbEnumColumn::new(
+        "provisioning_operation_resources",
+        "stage",
+        "provisioning_operation_resources_stage_check",
+        <ProvisioningStage as DbVariant>::VALUES,
+        "invalid provisioning resource stage",
+    ),
+    DbEnumColumn::new(
+        "provisioning_operation_resources",
+        "resource_kind",
+        "provisioning_operation_resources_kind_check",
+        <RuntimeResourceKind as DbVariant>::VALUES,
+        "invalid provisioning resource kind",
+    ),
 ];
 
 pub(crate) fn db_enum_columns() -> &'static [DbEnumColumn] {

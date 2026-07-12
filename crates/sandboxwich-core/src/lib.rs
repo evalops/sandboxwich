@@ -635,6 +635,7 @@ pub enum RuntimeResourceKind {
     Pod => "pod",
     PersistentVolumeClaim => "persistent_volume_claim",
     Service => "service",
+    Secret => "secret",
     VolumeSnapshot => "volume_snapshot",
     NetworkPolicy => "network_policy",
 }
@@ -1585,6 +1586,41 @@ pub enum LeaseStatus {
 }
 }
 
+db_variant_enum! {
+pub enum ProvisioningStage {
+    WorkspacePlanned => "workspace_planned",
+    WorkspaceReady => "workspace_ready",
+    NetworkPolicyReady => "network_policy_ready",
+    CredentialsReady => "credentials_ready",
+    PodReady => "pod_ready",
+    ServiceReady => "service_ready",
+    SandboxReady => "sandbox_ready",
+}
+}
+
+impl ProvisioningStage {
+    pub fn ordinal(&self) -> u8 {
+        match self {
+            Self::WorkspacePlanned => 0,
+            Self::WorkspaceReady => 1,
+            Self::NetworkPolicyReady => 2,
+            Self::CredentialsReady => 3,
+            Self::PodReady => 4,
+            Self::ServiceReady => 5,
+            Self::SandboxReady => 6,
+        }
+    }
+}
+
+db_variant_enum! {
+pub enum ProvisioningErrorClass {
+    RetryableProvider => "retryable_provider",
+    RetryableCapacity => "retryable_capacity",
+    TerminalContract => "terminal_contract",
+    TerminalSecurity => "terminal_security",
+}
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Job {
     pub id: JobId,
@@ -1651,6 +1687,45 @@ pub struct ClaimLeaseRequest {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RenewLeaseRequest {
     pub lease_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProvisioningStageUpdateRequest {
+    pub stage: ProvisioningStage,
+    pub resource_kind: Option<RuntimeResourceKind>,
+    pub resource_namespace: Option<String>,
+    pub resource_name: Option<String>,
+    pub resource_uid: Option<String>,
+    pub observed_generation: Option<i64>,
+    pub attempt_count: i64,
+    pub last_error_class: Option<ProvisioningErrorClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_code: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProvisioningOperation {
+    pub sandbox_id: SandboxId,
+    pub lease_id: LeaseId,
+    pub lease_attempt: i64,
+    pub stage: ProvisioningStage,
+    pub resource_kind: Option<RuntimeResourceKind>,
+    pub resource_namespace: Option<String>,
+    pub resource_name: Option<String>,
+    pub resource_uid: Option<String>,
+    pub observed_generation: Option<i64>,
+    pub attempt_count: i64,
+    pub last_error_class: Option<ProvisioningErrorClass>,
+    pub last_error_code: Option<String>,
+    pub last_error: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProvisioningOperationResponse {
+    pub ok: bool,
+    pub operation: ProvisioningOperation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2016,6 +2091,50 @@ mod tests {
         assert_db_variant_contract::<ProviderHealthStatus>();
         assert_db_variant_contract::<GuestStatus>();
         assert_db_variant_contract::<SshKeyStatus>();
+    }
+
+    #[test]
+    fn provisioning_contract_variants_round_trip_through_db_and_json() {
+        assert_eq!(RuntimeResourceKind::Secret.as_db_str(), "secret");
+        for (stage, value) in [
+            (ProvisioningStage::WorkspacePlanned, "workspace_planned"),
+            (ProvisioningStage::WorkspaceReady, "workspace_ready"),
+            (
+                ProvisioningStage::NetworkPolicyReady,
+                "network_policy_ready",
+            ),
+            (ProvisioningStage::CredentialsReady, "credentials_ready"),
+            (ProvisioningStage::PodReady, "pod_ready"),
+            (ProvisioningStage::ServiceReady, "service_ready"),
+            (ProvisioningStage::SandboxReady, "sandbox_ready"),
+        ] {
+            assert_eq!(stage.as_db_str(), value);
+            assert_eq!(ProvisioningStage::parse_db_str(value).unwrap(), stage);
+            assert_eq!(serde_json::to_value(&stage).unwrap(), value);
+        }
+
+        for (class, value) in [
+            (
+                ProvisioningErrorClass::RetryableProvider,
+                "retryable_provider",
+            ),
+            (
+                ProvisioningErrorClass::RetryableCapacity,
+                "retryable_capacity",
+            ),
+            (
+                ProvisioningErrorClass::TerminalContract,
+                "terminal_contract",
+            ),
+            (
+                ProvisioningErrorClass::TerminalSecurity,
+                "terminal_security",
+            ),
+        ] {
+            assert_eq!(class.as_db_str(), value);
+            assert_eq!(ProvisioningErrorClass::parse_db_str(value).unwrap(), class);
+            assert_eq!(serde_json::to_value(&class).unwrap(), value);
+        }
     }
 
     #[test]

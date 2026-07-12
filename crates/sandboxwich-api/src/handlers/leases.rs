@@ -277,6 +277,444 @@ pub(crate) async fn renew_lease(
     Ok(Json(LeaseResponse { ok: true, lease }))
 }
 
+pub(crate) async fn update_provisioning_stage(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path(lease_id): Path<Uuid>,
+    Json(request): Json<ProvisioningStageUpdateRequest>,
+) -> Result<Json<ProvisioningOperationResponse>, ApiError> {
+    let lease_id = LeaseId(lease_id);
+    ensure_lease_worker_scope(&state.db, lease_id, &ctx).await?;
+    let operation = update_provisioning_stage_in_transaction(&state.db, lease_id, request).await?;
+    Ok(Json(ProvisioningOperationResponse {
+        ok: true,
+        operation,
+    }))
+}
+
+pub(crate) async fn update_provisioning_stage_in_transaction(
+    db: &Database,
+    lease_id: LeaseId,
+    request: ProvisioningStageUpdateRequest,
+) -> Result<ProvisioningOperation, ApiError> {
+    if request.attempt_count < 1 {
+        return Err(ApiError::bad_request("attempt_count must be positive"));
+    }
+    if request
+        .last_error
+        .as_ref()
+        .is_some_and(|error| error.len() > 2048)
+    {
+        return Err(ApiError::bad_request(
+            "last_error must not exceed 2048 bytes",
+        ));
+    }
+    let identity_field_count = [
+        request.resource_kind.is_some(),
+        request.resource_namespace.is_some(),
+        request.resource_name.is_some(),
+        request.resource_uid.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if identity_field_count != 0 && identity_field_count != 4 {
+        return Err(ApiError::bad_request(
+            "resource identity requires kind, namespace, name, and uid",
+        ));
+    }
+
+    let mut tx = db.pool.begin().await?;
+    let updated = async {
+        let lease = fetch_lease_on_connection(db, &mut tx, lease_id).await?;
+        let now = Utc::now();
+        if lease.status != LeaseStatus::Active || lease.expires_at <= now {
+            return Err(ApiError::conflict_code(
+                "lease_not_active",
+                "provisioning progress requires an active lease",
+            ));
+        }
+        if lease.job.kind != JobKind::ProvisionSandbox {
+            return Err(ApiError::bad_request(
+                "provisioning progress requires a provision_sandbox lease",
+            ));
+        }
+        if request.attempt_count != lease.attempt {
+            return Err(ApiError::conflict_code(
+                "provisioning_operation_fenced",
+                "request attempt does not match the active lease attempt",
+            ));
+        }
+        let sandbox_id = sandbox_id_from_job(&lease.job)?;
+
+        let existing_sql = format!(
+            "select lease_id, lease_attempt, stage, stage_index, resource_kind,
+                    resource_namespace, resource_name, resource_uid, observed_generation,
+                    attempt_count, last_error_class, last_error_code, last_error, updated_at
+             from provisioning_operations where sandbox_id = {}",
+            db.placeholder(1)
+        );
+        let existing = sqlx::query(&existing_sql)
+            .bind(sandbox_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+        let mut replace_existing_operation = false;
+        if let Some(row) = existing.as_ref() {
+            let existing_lease_id: String = row.try_get("lease_id")?;
+            let existing_lease_sql = format!(
+                "select job_id, status, expires_at from job_leases where id = {}",
+                db.placeholder(1)
+            );
+            let existing_lease = sqlx::query(&existing_lease_sql)
+                .bind(&existing_lease_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            let existing_job_id: String = existing_lease.try_get("job_id")?;
+            let same_job = existing_job_id == lease.job.id.to_string();
+            let same_lease = existing_lease_id == lease.id.to_string();
+            if !same_lease {
+                let existing_status: String = existing_lease.try_get("status")?;
+                let existing_expires_at: String = existing_lease.try_get("expires_at")?;
+                let existing_is_active = existing_status == "active"
+                    && DateTime::parse_from_rfc3339(&existing_expires_at)
+                        .map_err(|error| ApiError::internal(error.to_string()))?
+                        .with_timezone(&Utc)
+                        > now;
+                if existing_is_active {
+                    return Err(ApiError::conflict_code(
+                        "provisioning_operation_fenced",
+                        "another active lease owns this provisioning operation",
+                    ));
+                }
+                if same_job {
+                    let existing_attempt: i64 = row.try_get("lease_attempt")?;
+                    if lease.attempt <= existing_attempt {
+                        return Err(ApiError::conflict_code(
+                            "provisioning_operation_fenced",
+                            "retry takeover requires a strictly newer lease attempt",
+                        ));
+                    }
+                } else {
+                    replace_existing_operation = true;
+                }
+            }
+
+            let existing_attempt: i64 = row.try_get("lease_attempt")?;
+            let existing_stage_index: i64 = row.try_get("stage_index")?;
+            if !replace_existing_operation && lease.attempt < existing_attempt {
+                return Err(ApiError::conflict_code(
+                    "provisioning_operation_fenced",
+                    "a newer lease attempt owns this provisioning operation",
+                ));
+            }
+            if !replace_existing_operation
+                && lease.attempt == existing_attempt
+                && i64::from(request.stage.ordinal()) < existing_stage_index
+            {
+                return Err(ApiError::conflict_code(
+                    "provisioning_stage_regression",
+                    "provisioning stage cannot move backward",
+                ));
+            }
+
+            if !replace_existing_operation
+                && let (
+                Some(resource_kind),
+                Some(resource_namespace),
+                Some(resource_name),
+                Some(resource_uid),
+            ) = (
+                request.resource_kind.as_ref(),
+                request.resource_namespace.as_deref(),
+                request.resource_name.as_deref(),
+                request.resource_uid.as_deref(),
+            ) {
+                let resource_sql = format!(
+                    "select resource_uid, observed_generation
+                     from provisioning_operation_resources
+                     where sandbox_id = {} and stage = {} and resource_kind = {}
+                       and resource_namespace = {} and resource_name = {}",
+                    db.placeholder(1),
+                    db.placeholder(2),
+                    db.placeholder(3),
+                    db.placeholder(4),
+                    db.placeholder(5),
+                );
+                if let Some(resource) = sqlx::query(&resource_sql)
+                    .bind(sandbox_id.to_string())
+                    .bind(request.stage.as_db_str())
+                    .bind(resource_kind.as_db_str())
+                    .bind(resource_namespace)
+                    .bind(resource_name)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                {
+                    let stored_uid: String = resource.try_get("resource_uid")?;
+                    let stored_generation: Option<i64> =
+                        resource.try_get("observed_generation")?;
+                    if stored_uid != resource_uid
+                        || stored_generation != request.observed_generation
+                    {
+                        return Err(ApiError::conflict_code(
+                            "provisioning_resource_identity_conflict",
+                            "durable resource identity cannot change within a stage",
+                        ));
+                    }
+                    if lease.attempt == existing_attempt
+                        && i64::from(request.stage.ordinal()) == existing_stage_index
+                    {
+                        return provisioning_operation_from_row(sandbox_id, row);
+                    }
+                }
+            } else if !replace_existing_operation
+                && lease.attempt == existing_attempt
+                && i64::from(request.stage.ordinal()) == existing_stage_index
+            {
+                let stored_error_class: Option<String> = row.try_get("last_error_class")?;
+                let requested_error_class = request
+                    .last_error_class
+                    .as_ref()
+                    .map(DbVariant::as_db_str);
+                let stored_error: Option<String> = row.try_get("last_error")?;
+                let stored_error_code: Option<String> = row.try_get("last_error_code")?;
+                if stored_error_class.as_deref() == requested_error_class
+                    && stored_error_code == request.last_error_code
+                    && stored_error == request.last_error
+                {
+                    return provisioning_operation_from_row(sandbox_id, row);
+                }
+            }
+        }
+
+        if replace_existing_operation {
+            let delete_sql = format!(
+                "delete from provisioning_operations
+                 where sandbox_id = {} and not exists (
+                   select 1 from job_leases
+                   where id = provisioning_operations.lease_id
+                     and status = 'active' and expires_at > {}
+                 )",
+                db.placeholder(1),
+                db.placeholder(2),
+            );
+            let deleted = sqlx::query(&delete_sql)
+                .bind(sandbox_id.to_string())
+                .bind(now.to_rfc3339())
+                .execute(&mut *tx)
+                .await?;
+            if deleted.rows_affected() != 1 {
+                return Err(ApiError::conflict_code(
+                    "provisioning_operation_fenced",
+                    "another active lease owns this provisioning operation",
+                ));
+            }
+        }
+
+        let sql = format!(
+            "insert into provisioning_operations
+             (sandbox_id, lease_id, lease_attempt, stage, stage_index, resource_kind,
+              resource_namespace, resource_name, resource_uid, observed_generation,
+              attempt_count, last_error_class, last_error_code, last_error, updated_at)
+             select {}
+             where exists (
+               select 1 from job_leases
+               where id = {} and status = 'active' and attempt = {} and expires_at > {}
+             )
+             on conflict (sandbox_id) do update set
+               lease_id = case when excluded.stage_index >= provisioning_operations.stage_index
+                               then excluded.lease_id else provisioning_operations.lease_id end,
+               lease_attempt = case when excluded.stage_index >= provisioning_operations.stage_index
+                                    then excluded.lease_attempt else provisioning_operations.lease_attempt end,
+               stage = case when excluded.stage_index > provisioning_operations.stage_index
+                            then excluded.stage else provisioning_operations.stage end,
+               stage_index = case when excluded.stage_index > provisioning_operations.stage_index
+                                  then excluded.stage_index else provisioning_operations.stage_index end,
+               resource_kind = case when excluded.stage_index >= provisioning_operations.stage_index
+                                    then excluded.resource_kind else provisioning_operations.resource_kind end,
+               resource_namespace = case when excluded.stage_index >= provisioning_operations.stage_index
+                                         then excluded.resource_namespace else provisioning_operations.resource_namespace end,
+               resource_name = case when excluded.stage_index >= provisioning_operations.stage_index
+                                    then excluded.resource_name else provisioning_operations.resource_name end,
+               resource_uid = case when excluded.stage_index >= provisioning_operations.stage_index
+                                   then excluded.resource_uid else provisioning_operations.resource_uid end,
+               observed_generation = case when excluded.stage_index >= provisioning_operations.stage_index
+                                          then excluded.observed_generation else provisioning_operations.observed_generation end,
+               attempt_count = case when excluded.stage_index >= provisioning_operations.stage_index
+                                    then excluded.attempt_count else provisioning_operations.attempt_count end,
+               last_error_class = case when excluded.stage_index >= provisioning_operations.stage_index
+                                       then excluded.last_error_class else provisioning_operations.last_error_class end,
+               last_error_code = case when excluded.stage_index >= provisioning_operations.stage_index
+                                      then excluded.last_error_code else provisioning_operations.last_error_code end,
+               last_error = case when excluded.stage_index >= provisioning_operations.stage_index
+                                 then excluded.last_error else provisioning_operations.last_error end,
+               updated_at = case when excluded.stage_index >= provisioning_operations.stage_index
+                                 then excluded.updated_at else provisioning_operations.updated_at end
+             where (provisioning_operations.lease_attempt < excluded.lease_attempt
+                or (provisioning_operations.lease_attempt = excluded.lease_attempt
+                    and provisioning_operations.stage_index <= excluded.stage_index))
+               and exists (
+                 select 1 from job_leases
+                 where id = {} and status = 'active' and attempt = {} and expires_at > {}
+               )",
+            (1..=15)
+                .map(|index| db.placeholder(index))
+                .collect::<Vec<_>>()
+                .join(", "),
+            db.placeholder(16),
+            db.placeholder(17),
+            db.placeholder(18),
+            db.placeholder(19),
+            db.placeholder(20),
+            db.placeholder(21),
+        );
+        let result = sqlx::query(&sql)
+            .bind(sandbox_id.to_string())
+            .bind(lease.id.to_string())
+            .bind(lease.attempt)
+            .bind(request.stage.as_db_str())
+            .bind(i64::from(request.stage.ordinal()))
+            .bind(request.resource_kind.as_ref().map(DbVariant::as_db_str))
+            .bind(request.resource_namespace.as_deref())
+            .bind(request.resource_name.as_deref())
+            .bind(request.resource_uid.as_deref())
+            .bind(request.observed_generation)
+            .bind(request.attempt_count)
+            .bind(request.last_error_class.as_ref().map(DbVariant::as_db_str))
+            .bind(request.last_error_code.as_deref())
+            .bind(request.last_error.as_deref())
+            .bind(now.to_rfc3339())
+            .bind(lease.id.to_string())
+            .bind(lease.attempt)
+            .bind(now.to_rfc3339())
+            .bind(lease.id.to_string())
+            .bind(lease.attempt)
+            .bind(now.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() != 1 {
+            return Err(ApiError::conflict_code(
+                "provisioning_operation_fenced",
+                "provisioning operation changed concurrently",
+            ));
+        }
+
+        if let (
+            Some(resource_kind),
+            Some(resource_namespace),
+            Some(resource_name),
+            Some(resource_uid),
+        ) = (
+            request.resource_kind.as_ref(),
+            request.resource_namespace.as_deref(),
+            request.resource_name.as_deref(),
+            request.resource_uid.as_deref(),
+        ) {
+            let resource_sql = format!(
+                "insert into provisioning_operation_resources
+                 (sandbox_id, stage, resource_kind, resource_namespace, resource_name,
+                  resource_uid, observed_generation, updated_at)
+                 values ({}) on conflict do nothing",
+                (1..=8)
+                    .map(|index| db.placeholder(index))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            sqlx::query(&resource_sql)
+                .bind(sandbox_id.to_string())
+                .bind(request.stage.as_db_str())
+                .bind(resource_kind.as_db_str())
+                .bind(resource_namespace)
+                .bind(resource_name)
+                .bind(resource_uid)
+                .bind(request.observed_generation)
+                .bind(now.to_rfc3339())
+                .execute(&mut *tx)
+                .await?;
+            let verify_sql = format!(
+                "select resource_uid, observed_generation
+                 from provisioning_operation_resources
+                 where sandbox_id = {} and stage = {} and resource_kind = {}
+                   and resource_namespace = {} and resource_name = {}",
+                db.placeholder(1),
+                db.placeholder(2),
+                db.placeholder(3),
+                db.placeholder(4),
+                db.placeholder(5),
+            );
+            let stored = sqlx::query(&verify_sql)
+                .bind(sandbox_id.to_string())
+                .bind(request.stage.as_db_str())
+                .bind(resource_kind.as_db_str())
+                .bind(resource_namespace)
+                .bind(resource_name)
+                .fetch_one(&mut *tx)
+                .await?;
+            let stored_uid: String = stored.try_get("resource_uid")?;
+            let stored_generation: Option<i64> = stored.try_get("observed_generation")?;
+            if stored_uid != resource_uid || stored_generation != request.observed_generation {
+                return Err(ApiError::conflict_code(
+                    "provisioning_resource_identity_conflict",
+                    "durable resource identity changed concurrently",
+                ));
+            }
+        }
+
+        let row = sqlx::query(&existing_sql)
+            .bind(sandbox_id.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+        provisioning_operation_from_row(sandbox_id, &row)
+    }
+    .await;
+
+    match updated {
+        Ok(operation) => {
+            tx.commit().await?;
+            Ok(operation)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = tx.rollback().await {
+                tracing::error!(%rollback_error, "failed to roll back provisioning stage update");
+            }
+            Err(error)
+        }
+    }
+}
+
+fn provisioning_operation_from_row(
+    sandbox_id: SandboxId,
+    row: &sqlx::any::AnyRow,
+) -> Result<ProvisioningOperation, ApiError> {
+    let lease_id: String = row.try_get("lease_id")?;
+    let stage: String = row.try_get("stage")?;
+    let resource_kind: Option<String> = row.try_get("resource_kind")?;
+    let last_error_class: Option<String> = row.try_get("last_error_class")?;
+    let updated_at: String = row.try_get("updated_at")?;
+    Ok(ProvisioningOperation {
+        sandbox_id,
+        lease_id: LeaseId(parse_uuid(&lease_id)?),
+        lease_attempt: row.try_get("lease_attempt")?,
+        stage: ProvisioningStage::parse_db_str(&stage)
+            .map_err(|error| ApiError::internal(error.to_string()))?,
+        resource_kind: resource_kind
+            .map(|value| RuntimeResourceKind::parse_db_str(&value))
+            .transpose()
+            .map_err(|error| ApiError::internal(error.to_string()))?,
+        resource_namespace: row.try_get("resource_namespace")?,
+        resource_name: row.try_get("resource_name")?,
+        resource_uid: row.try_get("resource_uid")?,
+        observed_generation: row.try_get("observed_generation")?,
+        attempt_count: row.try_get("attempt_count")?,
+        last_error_class: last_error_class
+            .map(|value| ProvisioningErrorClass::parse_db_str(&value))
+            .transpose()
+            .map_err(|error| ApiError::internal(error.to_string()))?,
+        last_error_code: row.try_get("last_error_code")?,
+        last_error: row.try_get("last_error")?,
+        updated_at: parse_timestamp(&updated_at)?,
+    })
+}
+
 pub(crate) async fn append_lease_output(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,

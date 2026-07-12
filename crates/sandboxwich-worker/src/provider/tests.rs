@@ -1397,6 +1397,314 @@ fn apply_provider_with_fake_kubectl(kubectl: &std::path::Path) -> KubernetesAppl
         .with_mutation_gate(true, true)
 }
 
+fn write_stateful_fake_kubectl() -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir =
+        std::env::temp_dir().join(format!("sandboxwich-stateful-kubectl-{}", SandboxId::new()));
+    std::fs::create_dir_all(&dir).expect("create stateful fake kubectl dir");
+    let log_path = dir.join("log.txt");
+    let script_path = dir.join("kubectl");
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "{log}"
+case " $* " in
+  *" get "*)
+    kind=''
+    name=''
+    previous=''
+    for arg in "$@"; do
+      if [ "$previous" = get ]; then kind="$arg"; previous=kind; continue; fi
+      if [ "$previous" = kind ]; then name="$arg"; break; fi
+      previous="$arg"
+    done
+    kind=$(printf '%s' "$kind" | tr '[:upper:]' '[:lower:]')
+    marker="{dir}/$kind-$name"
+    [ -f "$marker" ] || exit 0
+    python3 - "$marker" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    value = json.load(source)
+metadata = value.setdefault("metadata", {{}})
+metadata["uid"] = "uid-" + metadata["name"]
+metadata["generation"] = 1
+print(json.dumps(value))
+PY
+    ;;
+  *" apply "*)
+    payload=$(cat)
+    kind=$(printf '%s' "$payload" | sed -n 's/.*"kind": "\([^"]*\)".*/\1/p' | head -1 | tr '[:upper:]' '[:lower:]')
+    name=$(printf '%s' "$payload" | sed -n 's/.*"name": "\([^"]*\)".*/\1/p' | head -1)
+    printf '%s' "$payload" > "{dir}/$kind-$name"
+    ;;
+  *" wait "*) ;;
+esac
+"#,
+        log = log_path.display(),
+        dir = dir.display(),
+    );
+    std::fs::write(&script_path, script).expect("write stateful fake kubectl");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("stat stateful fake kubectl")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).expect("chmod stateful fake kubectl");
+    }
+    (script_path, log_path)
+}
+
+#[test]
+fn provision_staged_applies_resources_in_durable_order_and_reports_uids() {
+    let (kubectl, log_path) = write_stateful_fake_kubectl();
+    let provider = apply_provider_with_fake_kubectl(&kubectl);
+    let sandbox_id = SandboxId::new();
+    let mut reports = Vec::new();
+
+    provider
+        .provision_staged(
+            sandbox_id,
+            &SandboxProvisionSpec::default(),
+            &CancelSignal::never_cancelled(),
+            |report| {
+                reports.push(report);
+                Ok(())
+            },
+        )
+        .expect("staged provision succeeds");
+
+    let stages = reports
+        .iter()
+        .map(|report| report.stage.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stages,
+        vec![
+            sandboxwich_core::ProvisioningStage::WorkspacePlanned,
+            sandboxwich_core::ProvisioningStage::WorkspaceReady,
+            sandboxwich_core::ProvisioningStage::NetworkPolicyReady,
+            sandboxwich_core::ProvisioningStage::CredentialsReady,
+            sandboxwich_core::ProvisioningStage::PodReady,
+            sandboxwich_core::ProvisioningStage::ServiceReady,
+            sandboxwich_core::ProvisioningStage::ServiceReady,
+            sandboxwich_core::ProvisioningStage::SandboxReady,
+        ]
+    );
+    assert!(
+        reports
+            .iter()
+            .filter(|report| report.resource_name.is_some())
+            .all(|report| report
+                .resource_uid
+                .as_deref()
+                .is_some_and(|uid| uid.starts_with("uid-")))
+    );
+
+    let log = std::fs::read_to_string(&log_path).expect("read staged kubectl log");
+    assert!(
+        log.matches(" get ").count() >= 10,
+        "expected pre/post reads: {log}"
+    );
+    assert_eq!(
+        log.matches(" apply ").count(),
+        5,
+        "one apply per manifest: {log}"
+    );
+    assert!(log.contains(" wait --for=condition=Ready "));
+
+    let mut replay_reports = Vec::new();
+    provider
+        .provision_staged(
+            sandbox_id,
+            &SandboxProvisionSpec::default(),
+            &CancelSignal::never_cancelled(),
+            |report| {
+                replay_reports.push(report);
+                Ok(())
+            },
+        )
+        .expect("matching resources are adopted on replay");
+    let replay_log = std::fs::read_to_string(&log_path).expect("read replay kubectl log");
+    assert_eq!(
+        replay_log.matches(" apply ").count(),
+        5,
+        "replay must adopt the five existing resources: {replay_log}"
+    );
+    assert_eq!(replay_reports.len(), 8);
+
+    let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+#[test]
+fn provision_staged_stops_before_the_next_resource_when_reporting_fails() {
+    let (kubectl, log_path) = write_stateful_fake_kubectl();
+    let provider = apply_provider_with_fake_kubectl(&kubectl);
+    let error = provider
+        .provision_staged(
+            SandboxId::new(),
+            &SandboxProvisionSpec::default(),
+            &CancelSignal::never_cancelled(),
+            |report| {
+                if report.stage == sandboxwich_core::ProvisioningStage::NetworkPolicyReady {
+                    anyhow::bail!("lost provisioning lease")
+                }
+                Ok(())
+            },
+        )
+        .expect_err("reporting failure stops staged provisioning");
+    assert!(error.to_string().contains("lost provisioning lease"));
+
+    let log = std::fs::read_to_string(&log_path).expect("read failed-report kubectl log");
+    assert_eq!(
+        log.matches(" apply ").count(),
+        2,
+        "workspace and network policy apply before their durable reports: {log}"
+    );
+    assert!(!log.contains(" wait "), "pod stage must not start: {log}");
+    let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+#[test]
+fn adoption_contract_rejects_immutable_or_security_drift_for_every_resource_kind() {
+    let provider = KubernetesDryRunProvider::with_snapshot_class(
+        "k3s-ci",
+        "sandboxwich-ci",
+        Some("local-path".to_string()),
+        None,
+    );
+    let sandbox_id = SandboxId::new();
+    let spec = SandboxProvisionSpec::default();
+    let pvc = provider.pvc_manifest(
+        format!("sandboxwich-pvc-{sandbox_id}"),
+        Some(sandbox_id),
+        &spec.memory_limit,
+    );
+    let network_policy = provider
+        .network_policy_manifest(sandbox_id, &spec.network_egress)
+        .expect("render network policy");
+    let pod = provider.pod_manifest(sandbox_id, &spec);
+    let service = provider.ssh_service_manifest(sandbox_id);
+    let secret = json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": format!("sandboxwich-secret-{sandbox_id}"),
+            "namespace": "sandboxwich-ci",
+            "labels": { "sandboxwich.dev/sandbox-id": sandbox_id.to_string() }
+        },
+        "type": "Opaque",
+        "immutable": true,
+        "data": { "token": "cmVkYWN0ZWQ=" }
+    });
+
+    for desired in [&pvc, &network_policy, &pod, &service, &secret] {
+        validate_adoption_contract(desired, desired).expect("identical resource is adoptable");
+    }
+
+    let mut defaulted_pod = pod.clone();
+    defaulted_pod["spec"]["restartPolicy"] = json!("Always");
+    defaulted_pod["spec"]["dnsPolicy"] = json!("ClusterFirst");
+    defaulted_pod["spec"]["containers"][0]["terminationMessagePath"] =
+        json!("/dev/termination-log");
+    defaulted_pod["spec"]["containers"][0]["terminationMessagePolicy"] = json!("File");
+    validate_adoption_contract(&pod, &defaulted_pod)
+        .expect("Kubernetes API defaults do not change the desired pod contract");
+
+    for field in ["hostNetwork", "hostPID", "hostIPC"] {
+        let mut hostile_pod = pod.clone();
+        hostile_pod["spec"][field] = json!(true);
+        let error = validate_adoption_contract(&pod, &hostile_pod)
+            .expect_err("host namespace escalation must block pod adoption");
+        let provider_error = error
+            .downcast_ref::<ProviderError>()
+            .expect("host namespace conflict is typed");
+        assert_eq!(
+            provider_error.error_class(),
+            sandboxwich_core::ProvisioningErrorClass::TerminalSecurity,
+            "unexpected class for {field}"
+        );
+    }
+
+    let mut defaulted_network_policy = network_policy.clone();
+    if let Some(first_port) = defaulted_network_policy["spec"]["ingress"][0]["ports"]
+        .as_array_mut()
+        .and_then(|ports| ports.first_mut())
+    {
+        first_port["protocol"] = json!("TCP");
+    }
+    validate_adoption_contract(&network_policy, &defaulted_network_policy)
+        .expect("defaulted network policy protocol is semantically equivalent");
+
+    let mut api_normalized_deny_all_policy = network_policy.clone();
+    api_normalized_deny_all_policy["spec"]
+        .as_object_mut()
+        .expect("network policy spec")
+        .remove("egress");
+    validate_adoption_contract(&network_policy, &api_normalized_deny_all_policy)
+        .expect("an omitted empty egress list is the API form of deny-all egress");
+
+    let mut changed_pvc = pvc.clone();
+    changed_pvc["spec"]["storageClassName"] = json!("wrong-storage-class");
+    let mut changed_network_policy = network_policy.clone();
+    changed_network_policy["spec"]["egress"] = json!([{}]);
+    let mut changed_pod = pod.clone();
+    changed_pod["spec"]["containers"][0]["image"] = json!("attacker.invalid/image:latest");
+    let mut changed_service = service.clone();
+    changed_service["spec"]["ports"][0]["targetPort"] = json!(22);
+    let mut changed_secret = secret.clone();
+    changed_secret["data"]["token"] = json!("YXR0YWNrZXI=");
+
+    for (desired, changed) in [
+        (&pvc, &changed_pvc),
+        (&network_policy, &changed_network_policy),
+        (&pod, &changed_pod),
+        (&service, &changed_service),
+        (&secret, &changed_secret),
+    ] {
+        let error = validate_adoption_contract(desired, changed)
+            .expect_err("drifted resource must not be adopted");
+        let provider_error = error
+            .downcast_ref::<ProviderError>()
+            .expect("adoption conflict is typed");
+        assert!(matches!(
+            provider_error.error_class(),
+            sandboxwich_core::ProvisioningErrorClass::TerminalContract
+                | sandboxwich_core::ProvisioningErrorClass::TerminalSecurity
+        ));
+    }
+}
+
+#[test]
+fn kubectl_failures_map_to_typed_provisioning_error_classes() {
+    for (stderr, expected_class, expected_reason) in [
+        (
+            "0/2 nodes are available: pod has unbound immediate PersistentVolumeClaims",
+            sandboxwich_core::ProvisioningErrorClass::RetryableCapacity,
+            "workspace_capacity_pending",
+        ),
+        (
+            "admission webhook denied the request: violates PodSecurity restricted",
+            sandboxwich_core::ProvisioningErrorClass::TerminalSecurity,
+            "kubernetes_policy_denied",
+        ),
+        (
+            "The Pod is invalid: spec.containers: Required value",
+            sandboxwich_core::ProvisioningErrorClass::TerminalContract,
+            "kubernetes_contract_invalid",
+        ),
+        (
+            "Unable to connect to the server: i/o timeout",
+            sandboxwich_core::ProvisioningErrorClass::RetryableProvider,
+            "kubernetes_provider_transient",
+        ),
+    ] {
+        let error = classified_kubectl_failure("provision stage", stderr);
+        assert_eq!(error.error_class(), expected_class);
+        assert_eq!(error.reason_code(), expected_reason);
+    }
+}
+
 #[test]
 fn provision_rolls_back_applied_resources_when_pod_never_becomes_ready() {
     let (kubectl, log_path) = write_fake_kubectl(Some("wait"));
