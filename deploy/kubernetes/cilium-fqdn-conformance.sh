@@ -39,7 +39,24 @@ spec:
               protocol: TCP
 YAML
 
+kubectl -n "${namespace}" wait \
+  --for=condition=Valid ciliumnetworkpolicy/sandboxwich-fqdn-proof --timeout=120s
 exec_probe() { kubectl -n "${namespace}" exec fqdn-probe -- "$@"; }
+policy_ready=false
+for _ in $(seq 1 60); do
+  if exec_probe curl -fsSI --max-time 5 https://example.com >/dev/null 2>&1 &&
+    ! exec_probe curl -fsSI --max-time 3 https://www.wikipedia.org >/dev/null 2>&1; then
+    policy_ready=true
+    break
+  fi
+  sleep 1
+done
+[[ "${policy_ready}" == true ]] || {
+  echo "Cilium policy did not reach the expected allow/deny behavior" >&2
+  kubectl -n "${namespace}" get ciliumendpoints.cilium.io fqdn-probe -o yaml >&2 || true
+  exit 1
+}
+
 expect_denied() {
   marker="$1"
   shift
@@ -53,7 +70,7 @@ expect_denied() {
 exec_probe curl -fsSI --retry 3 --max-time 20 https://example.com >/dev/null
 echo "allowed-fqdn: pass"
 echo "ipv4-allowed: pass"
-expect_denied denied-fqdn curl -fsSI --max-time 8 https://example.net
+expect_denied denied-fqdn curl -fsSI --max-time 8 https://www.wikipedia.org
 expect_denied dns-failure curl -fsSI --max-time 8 https://does-not-exist.invalid
 exec_probe curl -fsSL --retry 3 --max-time 20 \
   'https://httpbingo.org/redirect-to?url=https://example.com' >/dev/null
