@@ -1369,8 +1369,21 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
                 reconciliation_limits.max_scanned,
             )
             .await;
-            match provider.reconcile_orphans(inventory, reconciliation_limits, reconciliation_apply)
-            {
+            let reconciliation_provider = provider.clone();
+            let reconciliation = tokio::task::spawn_blocking(move || {
+                reconciliation_provider.reconcile_orphans(
+                    inventory,
+                    reconciliation_limits,
+                    reconciliation_apply,
+                )
+            })
+            .await
+            .unwrap_or_else(|error| {
+                Err(anyhow::anyhow!(
+                    "orphan reconciliation task panicked or was cancelled: {error}"
+                ))
+            });
+            match reconciliation {
                 Ok(Some((scanned, deleted, apply))) => eprintln!(
                     "worker: orphan reconciliation completed scanned={scanned} deleted={deleted} apply={apply}"
                 ),

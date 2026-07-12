@@ -44,16 +44,41 @@ pub(crate) async fn runtime_resource_inventory(
     };
     let limit = resolve_page_limit(page.limit)?;
     let cursor = resolve_page_cursor(&page)?;
+    let scope_sql = format!(
+        "select id, labels from workers where tenant_id = {} and provider = {}",
+        state.db.placeholder(1),
+        state.db.placeholder(2),
+    );
+    let worker_cluster = worker.labels.get("cluster");
+    let mut scope_worker_ids = Vec::new();
+    for row in sqlx::query(&scope_sql)
+        .bind(&ctx.tenant_id)
+        .bind(&worker.provider)
+        .fetch_all(&state.db.pool)
+        .await?
+    {
+        let labels: String = row.try_get("labels")?;
+        let labels: std::collections::BTreeMap<String, String> = serde_json::from_str(&labels)?;
+        if labels.get("cluster") == worker_cluster {
+            scope_worker_ids.push(row.try_get::<String, _>("id")?);
+        }
+    }
+    if scope_worker_ids.is_empty() {
+        return Err(ApiError::not_found("resource not found"));
+    }
+    let scope_placeholders = (1..=scope_worker_ids.len())
+        .map(|index| state.db.placeholder(index))
+        .collect::<Vec<_>>()
+        .join(", ");
     let sandbox_sql = format!(
-        "select distinct po.sandbox_id
-         from provisioning_operations po
-         join job_leases jl on jl.id = po.lease_id
-         where jl.worker_id = {}
-         order by po.sandbox_id asc limit 201",
+        "select id as sandbox_id
+         from sandboxes
+         where tenant_id = {} and state != 'archived'
+         order by id asc limit 201",
         state.db.placeholder(1),
     );
     let mut sandbox_ids = sqlx::query(&sandbox_sql)
-        .bind(worker_id.to_string())
+        .bind(&ctx.tenant_id)
         .fetch_all(&state.db.pool)
         .await?
         .into_iter()
@@ -75,18 +100,14 @@ pub(crate) async fn runtime_resource_inventory(
          join provisioning_operations po on po.sandbox_id = por.sandbox_id
          join job_leases jl on jl.id = po.lease_id
          join sandboxes s on s.id = por.sandbox_id
-         where jl.worker_id = {} and por.resource_namespace = {}
+         where jl.worker_id in ({scope_placeholders}) and por.resource_namespace = {}
          ) inventory where 1 = 1",
-        state.db.placeholder(1),
-        state.db.placeholder(2),
+        state.db.placeholder(scope_worker_ids.len() + 1),
     );
-    let (resources, next_cursor) = fetch_keyset_page(
-        &state.db,
-        &sql,
-        &[worker_id.to_string(), query.namespace.clone()],
-        limit,
-        &cursor,
-        |row| {
+    let mut fixed_binds = scope_worker_ids;
+    fixed_binds.push(query.namespace.clone());
+    let (resources, next_cursor) =
+        fetch_keyset_page(&state.db, &sql, &fixed_binds, limit, &cursor, |row| {
             let created_at: String = row.try_get("sandbox_created_at")?;
             let updated_at: String = row.try_get("sandbox_updated_at")?;
             let ttl_seconds: Option<i64> = row.try_get("ttl_seconds")?;
@@ -113,9 +134,8 @@ pub(crate) async fn runtime_resource_inventory(
                 expires_at,
                 cleanup_deadline,
             })
-        },
-    )
-    .await?;
+        })
+        .await?;
     Ok(Json(RuntimeResourceInventoryResponse {
         ok: true,
         provider: worker.provider,
