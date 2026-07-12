@@ -53,19 +53,19 @@ pub(crate) async fn runtime_resource_inventory(
     );
     let worker_cluster = worker.labels.get("cluster");
     let mut scope_worker_ids = Vec::new();
-    for row in sqlx::query(&scope_sql)
+    let scope_rows = sqlx::query(&scope_sql)
         .bind(&ctx.tenant_id)
         .bind(&worker.provider)
         .fetch_all(&state.db.pool)
-        .await?
-    {
+        .await?;
+    let scope_complete = scope_rows.len() <= 200;
+    for row in scope_rows {
         let labels: String = row.try_get("labels")?;
         let labels: std::collections::BTreeMap<String, String> = serde_json::from_str(&labels)?;
         if labels.get("cluster") == worker_cluster {
             scope_worker_ids.push(row.try_get::<String, _>("id")?);
         }
     }
-    let scope_complete = scope_worker_ids.len() <= 200;
     scope_worker_ids.truncate(200);
     if scope_worker_ids.is_empty() {
         return Err(ApiError::not_found("resource not found"));
