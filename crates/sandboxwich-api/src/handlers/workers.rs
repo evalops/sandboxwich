@@ -45,7 +45,9 @@ pub(crate) async fn runtime_resource_inventory(
     let limit = resolve_page_limit(page.limit)?;
     let cursor = resolve_page_cursor(&page)?;
     let scope_sql = format!(
-        "select id, labels from workers where tenant_id = {} and provider = {}",
+        "select id, labels from workers
+         where tenant_id = {} and provider = {}
+         order by id asc limit 201",
         state.db.placeholder(1),
         state.db.placeholder(2),
     );
@@ -63,6 +65,8 @@ pub(crate) async fn runtime_resource_inventory(
             scope_worker_ids.push(row.try_get::<String, _>("id")?);
         }
     }
+    let scope_complete = scope_worker_ids.len() <= 200;
+    scope_worker_ids.truncate(200);
     if scope_worker_ids.is_empty() {
         return Err(ApiError::not_found("resource not found"));
     }
@@ -87,7 +91,7 @@ pub(crate) async fn runtime_resource_inventory(
             Ok(SandboxId(parse_uuid(&value)?))
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
-    let complete = sandbox_ids.len() <= 200;
+    let complete = sandbox_ids.len() <= 200 && scope_complete;
     sandbox_ids.truncate(200);
     let sql = format!(
         "select * from (
