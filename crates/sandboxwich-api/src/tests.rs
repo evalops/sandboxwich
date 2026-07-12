@@ -599,6 +599,58 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
         Some("workspace_capacity_pending")
     );
 
+    let competing_job = Job {
+        id: JobId::new(),
+        tenant_id: sandbox.tenant_id.clone(),
+        kind: JobKind::ProvisionSandbox,
+        status: JobStatus::Leased,
+        payload: json!({ "sandboxId": sandbox.id }),
+        required_capability: WorkerCapability::ProvisionSandbox,
+        priority: 0,
+        attempts: 1,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+    };
+    insert_job(&db, &competing_job)
+        .await
+        .expect("insert competing provision job");
+    let competing_lease_id = LeaseId::new();
+    seed_expired_active_lease(
+        &db,
+        competing_lease_id,
+        competing_job.id,
+        worker_id,
+        now + chrono::Duration::minutes(5),
+    )
+    .await;
+    let competing = update_provisioning_stage_in_transaction(
+        &db,
+        competing_lease_id,
+        ProvisioningStageUpdateRequest {
+            stage: ProvisioningStage::WorkspacePlanned,
+            resource_kind: None,
+            resource_namespace: None,
+            resource_name: None,
+            resource_uid: None,
+            observed_generation: None,
+            attempt_count: 1,
+            last_error_class: None,
+            last_error_code: None,
+            last_error: None,
+        },
+    )
+    .await
+    .expect_err("a second active provision lease must not steal the operation");
+    assert_eq!(competing.code, "provisioning_operation_fenced");
+    sqlx::query("update job_leases set status = 'failed' where id = ?")
+        .bind(competing_lease_id.to_string())
+        .execute(&db.pool)
+        .await
+        .expect("retire competing lease");
+
     let stale = update_provisioning_stage_in_transaction(
         &db,
         lease_id,
@@ -618,6 +670,61 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
     .await
     .expect_err("expired lease holder must be fenced");
     assert_eq!(stale.code, "lease_not_active");
+
+    sqlx::query("update job_leases set status = 'completed' where id = ?")
+        .bind(reclaimed_lease_id.to_string())
+        .execute(&db.pool)
+        .await
+        .expect("complete prior provisioning lease");
+    let reprovision_job = Job {
+        id: JobId::new(),
+        tenant_id: sandbox.tenant_id.clone(),
+        kind: JobKind::ProvisionSandbox,
+        status: JobStatus::Leased,
+        payload: json!({ "sandboxId": sandbox.id }),
+        required_capability: WorkerCapability::ProvisionSandbox,
+        priority: 0,
+        attempts: 1,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+    };
+    insert_job(&db, &reprovision_job)
+        .await
+        .expect("insert reprovision job");
+    let reprovision_lease_id = LeaseId::new();
+    seed_expired_active_lease(
+        &db,
+        reprovision_lease_id,
+        reprovision_job.id,
+        worker_id,
+        now + chrono::Duration::minutes(5),
+    )
+    .await;
+
+    let reprovision = update_provisioning_stage_in_transaction(
+        &db,
+        reprovision_lease_id,
+        ProvisioningStageUpdateRequest {
+            stage: ProvisioningStage::WorkspacePlanned,
+            resource_kind: None,
+            resource_namespace: None,
+            resource_name: None,
+            resource_uid: None,
+            observed_generation: None,
+            attempt_count: 1,
+            last_error_class: None,
+            last_error_code: None,
+            last_error: None,
+        },
+    )
+    .await
+    .expect("a fresh reprovision job starts a new staged operation");
+    assert_eq!(reprovision.lease_id, reprovision_lease_id);
+    assert_eq!(reprovision.lease_attempt, 1);
+    assert_eq!(reprovision.stage, ProvisioningStage::WorkspacePlanned);
 }
 
 async fn seed_worker(db: &Database) -> WorkerId {

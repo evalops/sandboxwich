@@ -358,16 +358,46 @@ pub(crate) async fn update_provisioning_stage_in_transaction(
             .bind(sandbox_id.to_string())
             .fetch_optional(&mut *tx)
             .await?;
+        let mut replace_existing_operation = false;
         if let Some(row) = existing.as_ref() {
+            let existing_lease_id: String = row.try_get("lease_id")?;
+            let existing_lease_sql = format!(
+                "select job_id, status, expires_at from job_leases where id = {}",
+                db.placeholder(1)
+            );
+            let existing_lease = sqlx::query(&existing_lease_sql)
+                .bind(&existing_lease_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            let existing_job_id: String = existing_lease.try_get("job_id")?;
+            let same_job = existing_job_id == lease.job.id.to_string();
+            if !same_job {
+                let existing_status: String = existing_lease.try_get("status")?;
+                let existing_expires_at: String = existing_lease.try_get("expires_at")?;
+                let existing_is_active = existing_status == "active"
+                    && DateTime::parse_from_rfc3339(&existing_expires_at)
+                        .map_err(|error| ApiError::internal(error.to_string()))?
+                        .with_timezone(&Utc)
+                        > now;
+                if existing_is_active {
+                    return Err(ApiError::conflict_code(
+                        "provisioning_operation_fenced",
+                        "another active lease owns this provisioning operation",
+                    ));
+                }
+                replace_existing_operation = true;
+            }
+
             let existing_attempt: i64 = row.try_get("lease_attempt")?;
             let existing_stage_index: i64 = row.try_get("stage_index")?;
-            if lease.attempt < existing_attempt {
+            if !replace_existing_operation && lease.attempt < existing_attempt {
                 return Err(ApiError::conflict_code(
                     "provisioning_operation_fenced",
                     "a newer lease attempt owns this provisioning operation",
                 ));
             }
-            if lease.attempt == existing_attempt
+            if !replace_existing_operation
+                && lease.attempt == existing_attempt
                 && i64::from(request.stage.ordinal()) < existing_stage_index
             {
                 return Err(ApiError::conflict_code(
@@ -376,7 +406,8 @@ pub(crate) async fn update_provisioning_stage_in_transaction(
                 ));
             }
 
-            if let (
+            if !replace_existing_operation
+                && let (
                 Some(resource_kind),
                 Some(resource_namespace),
                 Some(resource_name),
@@ -424,7 +455,8 @@ pub(crate) async fn update_provisioning_stage_in_transaction(
                         return provisioning_operation_from_row(sandbox_id, row);
                     }
                 }
-            } else if lease.attempt == existing_attempt
+            } else if !replace_existing_operation
+                && lease.attempt == existing_attempt
                 && i64::from(request.stage.ordinal()) == existing_stage_index
             {
                 let stored_error_class: Option<String> = row.try_get("last_error_class")?;
@@ -440,6 +472,30 @@ pub(crate) async fn update_provisioning_stage_in_transaction(
                 {
                     return provisioning_operation_from_row(sandbox_id, row);
                 }
+            }
+        }
+
+        if replace_existing_operation {
+            let delete_sql = format!(
+                "delete from provisioning_operations
+                 where sandbox_id = {} and not exists (
+                   select 1 from job_leases
+                   where id = provisioning_operations.lease_id
+                     and status = 'active' and expires_at > {}
+                 )",
+                db.placeholder(1),
+                db.placeholder(2),
+            );
+            let deleted = sqlx::query(&delete_sql)
+                .bind(sandbox_id.to_string())
+                .bind(now.to_rfc3339())
+                .execute(&mut *tx)
+                .await?;
+            if deleted.rows_affected() != 1 {
+                return Err(ApiError::conflict_code(
+                    "provisioning_operation_fenced",
+                    "another active lease owns this provisioning operation",
+                ));
             }
         }
 
