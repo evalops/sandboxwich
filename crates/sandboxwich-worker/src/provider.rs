@@ -10,6 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, bail};
+use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use ipnet::IpNet;
 use sandboxwich_core::{
@@ -1363,15 +1364,50 @@ fn adoption_contract(resource: &Value) -> anyhow::Result<Value> {
             "selector": resource["spec"]["selector"],
             "ports": resource["spec"]["ports"],
         }),
-        "Secret" => json!({
-            "type": resource["type"],
-            "immutable": resource["immutable"],
-            "data": resource["data"],
-            "stringData": resource["stringData"],
-        }),
+        "Secret" => {
+            let mut data = resource["data"].as_object().cloned().unwrap_or_default();
+            if let Some(string_data) = resource["stringData"].as_object() {
+                for (key, value) in string_data {
+                    let value = value
+                        .as_str()
+                        .context("Secret stringData values must be strings")?;
+                    data.insert(
+                        key.clone(),
+                        json!(general_purpose::STANDARD.encode(value.as_bytes())),
+                    );
+                }
+            }
+            json!({
+                "type": resource["type"],
+                "immutable": resource["immutable"],
+                "data": data,
+            })
+        }
         other => bail!("unsupported adoption contract for Kubernetes kind {other}"),
     };
     Ok(contract)
+}
+
+fn semantic_contract_matches(desired: &Value, observed: &Value) -> bool {
+    match desired {
+        Value::Null => true,
+        Value::Object(desired_fields) => desired_fields.iter().all(|(key, desired_value)| {
+            desired_value.is_null()
+                || observed.get(key).is_some_and(|observed_value| {
+                    semantic_contract_matches(desired_value, observed_value)
+                })
+        }),
+        Value::Array(desired_items) => observed.as_array().is_some_and(|observed_items| {
+            desired_items.len() == observed_items.len()
+                && desired_items
+                    .iter()
+                    .zip(observed_items)
+                    .all(|(desired_item, observed_item)| {
+                        semantic_contract_matches(desired_item, observed_item)
+                    })
+        }),
+        _ => desired == observed,
+    }
 }
 
 fn validate_adoption_contract(desired: &Value, observed: &Value) -> anyhow::Result<()> {
@@ -1381,7 +1417,7 @@ fn validate_adoption_contract(desired: &Value, observed: &Value) -> anyhow::Resu
     if observed["kind"] != desired["kind"]
         || observed["metadata"]["name"] != desired["metadata"]["name"]
         || observed["metadata"]["namespace"] != desired["metadata"]["namespace"]
-        || adoption_contract(observed)? != adoption_contract(desired)?
+        || !semantic_contract_matches(&adoption_contract(desired)?, &adoption_contract(observed)?)
     {
         let error_class = match kind {
             "Pod" | "NetworkPolicy" | "Secret" => ProvisioningErrorClass::TerminalSecurity,
@@ -1695,9 +1731,13 @@ impl KubernetesApplyProvider {
             )));
         }
         validate_adoption_contract(desired, &observed)?;
-        let uid = observed["metadata"]["uid"]
-            .as_str()
-            .context("observed Kubernetes resource UID is required")?;
+        let uid = observed["metadata"]["uid"].as_str().ok_or_else(|| {
+            anyhow::Error::new(ProviderError::classified(
+                ProvisioningErrorClass::RetryableProvider,
+                "resource_identity_missing",
+                anyhow::anyhow!("observed Kubernetes resource UID is required"),
+            ))
+        })?;
         Ok(Some(KubernetesResourceIdentity {
             resource_kind,
             namespace: namespace.to_string(),

@@ -1567,8 +1567,12 @@ fn provision_staged_stops_before_the_next_resource_when_reporting_fails() {
 
 #[test]
 fn adoption_contract_rejects_immutable_or_security_drift_for_every_resource_kind() {
-    let provider =
-        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+    let provider = KubernetesDryRunProvider::with_snapshot_class(
+        "k3s-ci",
+        "sandboxwich-ci",
+        Some("local-path".to_string()),
+        None,
+    );
     let sandbox_id = SandboxId::new();
     let spec = SandboxProvisionSpec::default();
     let pvc = provider.pvc_manifest(
@@ -1597,6 +1601,25 @@ fn adoption_contract_rejects_immutable_or_security_drift_for_every_resource_kind
     for desired in [&pvc, &network_policy, &pod, &service, &secret] {
         validate_adoption_contract(desired, desired).expect("identical resource is adoptable");
     }
+
+    let mut defaulted_pod = pod.clone();
+    defaulted_pod["spec"]["restartPolicy"] = json!("Always");
+    defaulted_pod["spec"]["dnsPolicy"] = json!("ClusterFirst");
+    defaulted_pod["spec"]["containers"][0]["terminationMessagePath"] =
+        json!("/dev/termination-log");
+    defaulted_pod["spec"]["containers"][0]["terminationMessagePolicy"] = json!("File");
+    validate_adoption_contract(&pod, &defaulted_pod)
+        .expect("Kubernetes API defaults do not change the desired pod contract");
+
+    let mut defaulted_network_policy = network_policy.clone();
+    if let Some(first_port) = defaulted_network_policy["spec"]["ingress"][0]["ports"]
+        .as_array_mut()
+        .and_then(|ports| ports.first_mut())
+    {
+        first_port["protocol"] = json!("TCP");
+    }
+    validate_adoption_contract(&network_policy, &defaulted_network_policy)
+        .expect("defaulted network policy protocol is semantically equivalent");
 
     let mut changed_pvc = pvc.clone();
     changed_pvc["spec"]["storageClassName"] = json!("wrong-storage-class");

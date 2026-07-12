@@ -447,6 +447,26 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
     .expect_err("a provisioning operation must not move backward");
     assert_eq!(regression.code, "provisioning_stage_regression");
 
+    let network_ready = update_provisioning_stage_in_transaction(
+        &db,
+        lease_id,
+        ProvisioningStageUpdateRequest {
+            stage: ProvisioningStage::NetworkPolicyReady,
+            resource_kind: Some(RuntimeResourceKind::NetworkPolicy),
+            resource_namespace: Some("sandboxwich-sandboxes".to_string()),
+            resource_name: Some(format!("sandboxwich-network-{}", sandbox.id)),
+            resource_uid: Some("uid-network-policy".to_string()),
+            observed_generation: Some(1),
+            attempt_count: 1,
+            last_error_class: None,
+            last_error_code: None,
+            last_error: None,
+        },
+    )
+    .await
+    .expect("advance first attempt to network policy ready");
+    assert_eq!(network_ready.stage, ProvisioningStage::NetworkPolicyReady);
+
     sqlx::query("update job_leases set status = 'expired' where id = ?")
         .bind(lease_id.to_string())
         .execute(&db.pool)
@@ -485,8 +505,52 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
     )
     .await
     .expect("new lease attempt resumes without regressing durable stage");
-    assert_eq!(handshake.stage, ProvisioningStage::WorkspaceReady);
-    assert_eq!(handshake.lease_attempt, 2);
+    assert_eq!(handshake.stage, ProvisioningStage::NetworkPolicyReady);
+    assert_eq!(handshake.lease_attempt, 1);
+
+    let replayed_workspace = update_provisioning_stage_in_transaction(
+        &db,
+        reclaimed_lease_id,
+        ProvisioningStageUpdateRequest {
+            stage: ProvisioningStage::WorkspaceReady,
+            resource_kind: Some(RuntimeResourceKind::PersistentVolumeClaim),
+            resource_namespace: Some("sandboxwich-sandboxes".to_string()),
+            resource_name: Some(format!("sandboxwich-pvc-{}", sandbox.id)),
+            resource_uid: Some("uid-workspace".to_string()),
+            observed_generation: None,
+            attempt_count: 2,
+            last_error_class: None,
+            last_error_code: None,
+            last_error: None,
+        },
+    )
+    .await
+    .expect("new attempt replays workspace stage without regression");
+    assert_eq!(
+        replayed_workspace.stage,
+        ProvisioningStage::NetworkPolicyReady
+    );
+    assert_eq!(replayed_workspace.lease_attempt, 1);
+
+    let replayed_network = update_provisioning_stage_in_transaction(
+        &db,
+        reclaimed_lease_id,
+        ProvisioningStageUpdateRequest {
+            stage: ProvisioningStage::NetworkPolicyReady,
+            resource_kind: Some(RuntimeResourceKind::NetworkPolicy),
+            resource_namespace: Some("sandboxwich-sandboxes".to_string()),
+            resource_name: Some(format!("sandboxwich-network-{}", sandbox.id)),
+            resource_uid: Some("uid-network-policy".to_string()),
+            observed_generation: Some(1),
+            attempt_count: 2,
+            last_error_class: None,
+            last_error_code: None,
+            last_error: None,
+        },
+    )
+    .await
+    .expect("new attempt catches up to durable network stage");
+    assert_eq!(replayed_network.lease_attempt, 2);
 
     let reclaimed = update_provisioning_stage_in_transaction(
         &db,

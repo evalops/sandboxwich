@@ -454,8 +454,10 @@ pub(crate) async fn update_provisioning_stage_in_transaction(
                where id = {} and status = 'active' and attempt = {} and expires_at > {}
              )
              on conflict (sandbox_id) do update set
-               lease_id = excluded.lease_id,
-               lease_attempt = excluded.lease_attempt,
+               lease_id = case when excluded.stage_index >= provisioning_operations.stage_index
+                               then excluded.lease_id else provisioning_operations.lease_id end,
+               lease_attempt = case when excluded.stage_index >= provisioning_operations.stage_index
+                                    then excluded.lease_attempt else provisioning_operations.lease_attempt end,
                stage = case when excluded.stage_index > provisioning_operations.stage_index
                             then excluded.stage else provisioning_operations.stage end,
                stage_index = case when excluded.stage_index > provisioning_operations.stage_index
@@ -470,11 +472,16 @@ pub(crate) async fn update_provisioning_stage_in_transaction(
                                    then excluded.resource_uid else provisioning_operations.resource_uid end,
                observed_generation = case when excluded.stage_index >= provisioning_operations.stage_index
                                           then excluded.observed_generation else provisioning_operations.observed_generation end,
-               attempt_count = excluded.attempt_count,
-               last_error_class = excluded.last_error_class,
-               last_error_code = excluded.last_error_code,
-               last_error = excluded.last_error,
-               updated_at = excluded.updated_at
+               attempt_count = case when excluded.stage_index >= provisioning_operations.stage_index
+                                    then excluded.attempt_count else provisioning_operations.attempt_count end,
+               last_error_class = case when excluded.stage_index >= provisioning_operations.stage_index
+                                       then excluded.last_error_class else provisioning_operations.last_error_class end,
+               last_error_code = case when excluded.stage_index >= provisioning_operations.stage_index
+                                      then excluded.last_error_code else provisioning_operations.last_error_code end,
+               last_error = case when excluded.stage_index >= provisioning_operations.stage_index
+                                 then excluded.last_error else provisioning_operations.last_error end,
+               updated_at = case when excluded.stage_index >= provisioning_operations.stage_index
+                                 then excluded.updated_at else provisioning_operations.updated_at end
              where (provisioning_operations.lease_attempt < excluded.lease_attempt
                 or (provisioning_operations.lease_attempt = excluded.lease_attempt
                     and provisioning_operations.stage_index <= excluded.stage_index))
