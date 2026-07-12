@@ -44,8 +44,8 @@ kubectl -n "${namespace}" wait \
 for _ in $(seq 1 60); do
   endpoint="$(kubectl -n "${namespace}" get ciliumendpoints.cilium.io fqdn-probe \
     -o json 2>/dev/null || true)"
-  desired="$(jq -r '.status.policy.spec["policy-revision"] // empty' <<<"${endpoint:-{}}")"
-  realized="$(jq -r '.status.policy.realized["policy-revision"] // empty' <<<"${endpoint:-{}}")"
+  desired="$(jq -r '.status.policy.spec["policy-revision"] // empty' <<<"${endpoint:-null}")"
+  realized="$(jq -r '.status.policy.realized["policy-revision"] // empty' <<<"${endpoint:-null}")"
   [[ -n "${desired}" && "${desired}" == "${realized}" ]] && break
   sleep 1
 done
