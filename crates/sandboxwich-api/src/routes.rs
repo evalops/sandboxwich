@@ -20,7 +20,7 @@ use crate::state::*;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::middleware::{self};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use sandboxwich_core::*;
 
 /// Default request body limit applied to every route. Kept small (1 MiB) because most endpoints
@@ -147,6 +147,10 @@ pub(crate) fn app(state: AppState) -> Router {
     let guest_routes = Router::new()
         .route("/workers/{worker_id}/leases/claim", post(claim_lease))
         .route("/leases/{lease_id}/renew", post(renew_lease))
+        .route(
+            "/leases/{lease_id}/provisioning",
+            put(update_provisioning_stage),
+        )
         .route("/leases/{lease_id}/output", post(append_lease_output))
         .route("/leases/{lease_id}/complete", post(complete_lease))
         .route("/leases/{lease_id}/fail", post(fail_lease))

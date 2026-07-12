@@ -277,6 +277,150 @@ pub(crate) async fn renew_lease(
     Ok(Json(LeaseResponse { ok: true, lease }))
 }
 
+pub(crate) async fn update_provisioning_stage(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path(lease_id): Path<Uuid>,
+    Json(request): Json<ProvisioningStageUpdateRequest>,
+) -> Result<Json<ProvisioningOperationResponse>, ApiError> {
+    let lease_id = LeaseId(lease_id);
+    ensure_lease_worker_scope(&state.db, lease_id, &ctx).await?;
+    let operation = update_provisioning_stage_in_transaction(&state.db, lease_id, request).await?;
+    Ok(Json(ProvisioningOperationResponse {
+        ok: true,
+        operation,
+    }))
+}
+
+pub(crate) async fn update_provisioning_stage_in_transaction(
+    db: &Database,
+    lease_id: LeaseId,
+    request: ProvisioningStageUpdateRequest,
+) -> Result<ProvisioningOperation, ApiError> {
+    if request.attempt_count < 1 {
+        return Err(ApiError::bad_request("attempt_count must be positive"));
+    }
+    if request
+        .last_error
+        .as_ref()
+        .is_some_and(|error| error.len() > 2048)
+    {
+        return Err(ApiError::bad_request(
+            "last_error must not exceed 2048 bytes",
+        ));
+    }
+
+    let mut tx = db.pool.begin().await?;
+    let updated = async {
+        let lease = fetch_lease_on_connection(db, &mut tx, lease_id).await?;
+        if lease.status != LeaseStatus::Active {
+            return Err(ApiError::conflict_code(
+                "lease_not_active",
+                "provisioning progress requires an active lease",
+            ));
+        }
+        if lease.job.kind != JobKind::ProvisionSandbox {
+            return Err(ApiError::bad_request(
+                "provisioning progress requires a provision_sandbox lease",
+            ));
+        }
+        let sandbox_id = sandbox_id_from_job(&lease.job)?;
+
+        let existing_sql = format!(
+            "select stage from provisioning_operations where sandbox_id = {}",
+            db.placeholder(1)
+        );
+        if let Some(row) = sqlx::query(&existing_sql)
+            .bind(sandbox_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            let stage_value: String = row.try_get("stage")?;
+            let stage = ProvisioningStage::parse_db_str(&stage_value)
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            if request.stage.ordinal() < stage.ordinal() {
+                return Err(ApiError::conflict_code(
+                    "provisioning_stage_regression",
+                    "provisioning stage cannot move backward",
+                ));
+            }
+        }
+
+        let now = Utc::now();
+        let sql = format!(
+            "insert into provisioning_operations
+             (sandbox_id, lease_id, lease_attempt, stage, resource_kind,
+              resource_namespace, resource_name, resource_uid, observed_generation,
+              attempt_count, last_error_class, last_error, updated_at)
+             values ({})
+             on conflict (sandbox_id) do update set
+               lease_id = excluded.lease_id,
+               lease_attempt = excluded.lease_attempt,
+               stage = excluded.stage,
+               resource_kind = excluded.resource_kind,
+               resource_namespace = excluded.resource_namespace,
+               resource_name = excluded.resource_name,
+               resource_uid = excluded.resource_uid,
+               observed_generation = excluded.observed_generation,
+               attempt_count = excluded.attempt_count,
+               last_error_class = excluded.last_error_class,
+               last_error = excluded.last_error,
+               updated_at = excluded.updated_at",
+            (1..=13)
+                .map(|index| db.placeholder(index))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let result = sqlx::query(&sql)
+            .bind(sandbox_id.to_string())
+            .bind(lease.id.to_string())
+            .bind(lease.attempt)
+            .bind(request.stage.as_db_str())
+            .bind(request.resource_kind.as_ref().map(DbVariant::as_db_str))
+            .bind(request.resource_namespace.as_deref())
+            .bind(request.resource_name.as_deref())
+            .bind(request.resource_uid.as_deref())
+            .bind(request.observed_generation)
+            .bind(request.attempt_count)
+            .bind(request.last_error_class.as_ref().map(DbVariant::as_db_str))
+            .bind(request.last_error.as_deref())
+            .bind(now.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+        debug_assert_eq!(result.rows_affected(), 1);
+
+        Ok(ProvisioningOperation {
+            sandbox_id,
+            lease_id: lease.id,
+            lease_attempt: lease.attempt,
+            stage: request.stage,
+            resource_kind: request.resource_kind,
+            resource_namespace: request.resource_namespace,
+            resource_name: request.resource_name,
+            resource_uid: request.resource_uid,
+            observed_generation: request.observed_generation,
+            attempt_count: request.attempt_count,
+            last_error_class: request.last_error_class,
+            last_error: request.last_error,
+            updated_at: now,
+        })
+    }
+    .await;
+
+    match updated {
+        Ok(operation) => {
+            tx.commit().await?;
+            Ok(operation)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = tx.rollback().await {
+                tracing::error!(%rollback_error, "failed to roll back provisioning stage update");
+            }
+            Err(error)
+        }
+    }
+}
+
 pub(crate) async fn append_lease_output(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,

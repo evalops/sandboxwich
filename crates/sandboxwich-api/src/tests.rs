@@ -63,6 +63,9 @@ fn db_enum_registry_covers_persisted_variant_columns() {
         ("runtime_resource_tombstones", "purpose"),
         ("runtime_resource_tombstones", "status"),
         ("cleanup_runs", "status"),
+        ("provisioning_operations", "stage"),
+        ("provisioning_operations", "resource_kind"),
+        ("provisioning_operations", "last_error_class"),
     ] {
         assert!(
             seen.contains(&expected),
@@ -263,6 +266,171 @@ async fn test_sqlite_db() -> Database {
         .await
         .expect("reconcile enum constraints");
     db
+}
+
+#[tokio::test]
+async fn provisioning_operation_migration_has_fenced_stage_columns() {
+    let db = test_sqlite_db().await;
+    let columns = sqlx::query("pragma table_info(provisioning_operations)")
+        .fetch_all(&db.pool)
+        .await
+        .expect("inspect provisioning_operations");
+    let names = columns
+        .iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<BTreeSet<_>>();
+
+    for expected in [
+        "sandbox_id",
+        "lease_id",
+        "lease_attempt",
+        "stage",
+        "resource_kind",
+        "resource_namespace",
+        "resource_name",
+        "resource_uid",
+        "observed_generation",
+        "attempt_count",
+        "last_error_class",
+        "last_error",
+        "updated_at",
+    ] {
+        assert!(names.contains(expected), "missing column {expected}");
+    }
+}
+
+#[tokio::test]
+async fn provisioning_stage_update_persists_active_lease_fence() {
+    let db = test_sqlite_db().await;
+    let worker_id = seed_worker(&db).await;
+    let sandbox = seed_sandbox_with_state(&db, SandboxState::Provisioning).await;
+    let now = Utc::now();
+    let job = Job {
+        id: JobId::new(),
+        tenant_id: sandbox.tenant_id.clone(),
+        kind: JobKind::ProvisionSandbox,
+        status: JobStatus::Leased,
+        payload: json!({ "sandboxId": sandbox.id }),
+        required_capability: WorkerCapability::ProvisionSandbox,
+        priority: 0,
+        attempts: 1,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+    };
+    insert_job(&db, &job).await.expect("insert job");
+    let lease_id = LeaseId::new();
+    seed_expired_active_lease(
+        &db,
+        lease_id,
+        job.id,
+        worker_id,
+        now + chrono::Duration::minutes(5),
+    )
+    .await;
+
+    let operation = update_provisioning_stage_in_transaction(
+        &db,
+        lease_id,
+        ProvisioningStageUpdateRequest {
+            stage: ProvisioningStage::WorkspaceReady,
+            resource_kind: Some(RuntimeResourceKind::PersistentVolumeClaim),
+            resource_namespace: Some("sandboxwich-sandboxes".to_string()),
+            resource_name: Some(format!("sandboxwich-pvc-{}", sandbox.id)),
+            resource_uid: Some("uid-workspace".to_string()),
+            observed_generation: None,
+            attempt_count: 1,
+            last_error_class: None,
+            last_error: None,
+        },
+    )
+    .await
+    .expect("persist provisioning stage");
+
+    assert_eq!(operation.sandbox_id, sandbox.id);
+    assert_eq!(operation.lease_id, lease_id);
+    assert_eq!(operation.lease_attempt, 1);
+    assert_eq!(operation.stage, ProvisioningStage::WorkspaceReady);
+    assert_eq!(operation.resource_uid.as_deref(), Some("uid-workspace"));
+
+    let regression = update_provisioning_stage_in_transaction(
+        &db,
+        lease_id,
+        ProvisioningStageUpdateRequest {
+            stage: ProvisioningStage::WorkspacePlanned,
+            resource_kind: None,
+            resource_namespace: None,
+            resource_name: None,
+            resource_uid: None,
+            observed_generation: None,
+            attempt_count: 1,
+            last_error_class: None,
+            last_error: None,
+        },
+    )
+    .await
+    .expect_err("a provisioning operation must not move backward");
+    assert_eq!(regression.code, "provisioning_stage_regression");
+
+    sqlx::query("update job_leases set status = 'expired' where id = ?")
+        .bind(lease_id.to_string())
+        .execute(&db.pool)
+        .await
+        .expect("expire first lease");
+    let reclaimed_lease_id = LeaseId::new();
+    sqlx::query(
+        "insert into job_leases
+         (id, job_id, worker_id, status, attempt, leased_at, expires_at, completed_at, error)
+         values (?, ?, ?, 'active', 2, ?, ?, NULL, NULL)",
+    )
+    .bind(reclaimed_lease_id.to_string())
+    .bind(job.id.to_string())
+    .bind(worker_id.to_string())
+    .bind(now.to_rfc3339())
+    .bind((now + chrono::Duration::minutes(5)).to_rfc3339())
+    .execute(&db.pool)
+    .await
+    .expect("insert reclaimed lease");
+
+    let reclaimed = update_provisioning_stage_in_transaction(
+        &db,
+        reclaimed_lease_id,
+        ProvisioningStageUpdateRequest {
+            stage: ProvisioningStage::PodReady,
+            resource_kind: Some(RuntimeResourceKind::Pod),
+            resource_namespace: Some("sandboxwich-sandboxes".to_string()),
+            resource_name: Some(format!("sandboxwich-{}", sandbox.id)),
+            resource_uid: Some("uid-pod".to_string()),
+            observed_generation: Some(1),
+            attempt_count: 2,
+            last_error_class: None,
+            last_error: None,
+        },
+    )
+    .await
+    .expect("new lease attempt owns operation");
+    assert_eq!(reclaimed.lease_attempt, 2);
+
+    let stale = update_provisioning_stage_in_transaction(
+        &db,
+        lease_id,
+        ProvisioningStageUpdateRequest {
+            stage: ProvisioningStage::SandboxReady,
+            resource_kind: None,
+            resource_namespace: None,
+            resource_name: None,
+            resource_uid: None,
+            observed_generation: None,
+            attempt_count: 2,
+            last_error_class: None,
+            last_error: None,
+        },
+    )
+    .await
+    .expect_err("expired lease holder must be fenced");
+    assert_eq!(stale.code, "lease_not_active");
 }
 
 async fn seed_worker(db: &Database) -> WorkerId {
