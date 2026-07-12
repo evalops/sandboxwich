@@ -467,6 +467,48 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
     .expect("advance first attempt to network policy ready");
     assert_eq!(network_ready.stage, ProvisioningStage::NetworkPolicyReady);
 
+    for competing_attempt in [1_i64, 2_i64] {
+        let competing_lease_id = LeaseId::new();
+        sqlx::query(
+            "insert into job_leases
+             (id, job_id, worker_id, status, attempt, leased_at, expires_at, completed_at, error)
+             values (?, ?, ?, 'active', ?, ?, ?, NULL, NULL)",
+        )
+        .bind(competing_lease_id.to_string())
+        .bind(job.id.to_string())
+        .bind(worker_id.to_string())
+        .bind(competing_attempt)
+        .bind(now.to_rfc3339())
+        .bind((now + chrono::Duration::minutes(5)).to_rfc3339())
+        .execute(&db.pool)
+        .await
+        .expect("insert competing same-job lease");
+        let competing = update_provisioning_stage_in_transaction(
+            &db,
+            competing_lease_id,
+            ProvisioningStageUpdateRequest {
+                stage: ProvisioningStage::NetworkPolicyReady,
+                resource_kind: Some(RuntimeResourceKind::NetworkPolicy),
+                resource_namespace: Some("sandboxwich-sandboxes".to_string()),
+                resource_name: Some(format!("sandboxwich-network-{}", sandbox.id)),
+                resource_uid: Some("uid-network-policy".to_string()),
+                observed_generation: Some(1),
+                attempt_count: competing_attempt,
+                last_error_class: None,
+                last_error_code: None,
+                last_error: None,
+            },
+        )
+        .await
+        .expect_err("a same-job lease cannot take over while its predecessor is active");
+        assert_eq!(competing.code, "provisioning_operation_fenced");
+        sqlx::query("update job_leases set status = 'failed' where id = ?")
+            .bind(competing_lease_id.to_string())
+            .execute(&db.pool)
+            .await
+            .expect("retire competing same-job lease");
+    }
+
     sqlx::query("update job_leases set status = 'expired' where id = ?")
         .bind(lease_id.to_string())
         .execute(&db.pool)

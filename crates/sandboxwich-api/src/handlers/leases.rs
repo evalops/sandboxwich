@@ -371,7 +371,8 @@ pub(crate) async fn update_provisioning_stage_in_transaction(
                 .await?;
             let existing_job_id: String = existing_lease.try_get("job_id")?;
             let same_job = existing_job_id == lease.job.id.to_string();
-            if !same_job {
+            let same_lease = existing_lease_id == lease.id.to_string();
+            if !same_lease {
                 let existing_status: String = existing_lease.try_get("status")?;
                 let existing_expires_at: String = existing_lease.try_get("expires_at")?;
                 let existing_is_active = existing_status == "active"
@@ -385,7 +386,17 @@ pub(crate) async fn update_provisioning_stage_in_transaction(
                         "another active lease owns this provisioning operation",
                     ));
                 }
-                replace_existing_operation = true;
+                if same_job {
+                    let existing_attempt: i64 = row.try_get("lease_attempt")?;
+                    if lease.attempt <= existing_attempt {
+                        return Err(ApiError::conflict_code(
+                            "provisioning_operation_fenced",
+                            "retry takeover requires a strictly newer lease attempt",
+                        ));
+                    }
+                } else {
+                    replace_existing_operation = true;
+                }
             }
 
             let existing_attempt: i64 = row.try_get("lease_attempt")?;
