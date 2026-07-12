@@ -1689,6 +1689,13 @@ fn provision_wait_for_pod_ready_is_cancelled_when_lease_renewal_is_lost() {
 }
 
 #[test]
+fn pod_ready_wait_uses_the_configured_kubectl_timeout() {
+    let provider = apply_provider_with_fake_kubectl(std::path::Path::new("kubectl"))
+        .with_kubectl_command_timeout(Duration::from_secs(600));
+    assert_eq!(provider.pod_ready_timeout_arg(), "--timeout=595s");
+}
+
+#[test]
 fn stop_is_cancelled_when_lease_renewal_is_lost() {
     let (kubectl, _log_path) = write_fake_kubectl_sleeping_on("delete", 30);
     let provider = apply_provider_with_fake_kubectl(&kubectl)
