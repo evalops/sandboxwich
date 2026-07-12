@@ -15,9 +15,9 @@ use ipnet::IpNet;
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, MemoryLimit, NetworkAllowRuleKind, NetworkEgress,
     ProviderCapabilityReport, ProviderForkHandle, ProviderHealthReport, ProviderHealthStatus,
-    ProviderRuntimeResource, ProviderSandboxHandle, ProviderSnapshotHandle, RuntimeResourceKind,
-    RuntimeResourcePurpose, RuntimeResourceStatus, SandboxId, SandboxProvisionSpec, SnapshotId,
-    WorkerCapability,
+    ProviderRuntimeResource, ProviderSandboxHandle, ProviderSnapshotHandle, ProvisioningErrorClass,
+    ProvisioningStage, ProvisioningStageUpdateRequest, RuntimeResourceKind, RuntimeResourcePurpose,
+    RuntimeResourceStatus, SandboxId, SandboxProvisionSpec, SnapshotId, WorkerCapability,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -32,6 +32,8 @@ pub enum RetryDisposition {
 #[derive(Debug)]
 pub struct ProviderError {
     disposition: RetryDisposition,
+    error_class: ProvisioningErrorClass,
+    reason_code: &'static str,
     source: anyhow::Error,
 }
 
@@ -39,6 +41,28 @@ impl ProviderError {
     pub fn retryable(source: impl Into<anyhow::Error>) -> Self {
         Self {
             disposition: RetryDisposition::Retryable,
+            error_class: ProvisioningErrorClass::RetryableProvider,
+            reason_code: "provider_transient",
+            source: source.into(),
+        }
+    }
+
+    pub fn classified(
+        error_class: ProvisioningErrorClass,
+        reason_code: &'static str,
+        source: impl Into<anyhow::Error>,
+    ) -> Self {
+        let disposition = match error_class {
+            ProvisioningErrorClass::RetryableProvider
+            | ProvisioningErrorClass::RetryableCapacity => RetryDisposition::Retryable,
+            ProvisioningErrorClass::TerminalContract | ProvisioningErrorClass::TerminalSecurity => {
+                RetryDisposition::Permanent
+            }
+        };
+        Self {
+            disposition,
+            error_class,
+            reason_code,
             source: source.into(),
         }
     }
@@ -46,11 +70,19 @@ impl ProviderError {
     pub fn disposition(&self) -> RetryDisposition {
         self.disposition
     }
+
+    pub fn error_class(&self) -> ProvisioningErrorClass {
+        self.error_class.clone()
+    }
+
+    pub fn reason_code(&self) -> &'static str {
+        self.reason_code
+    }
 }
 
 impl std::fmt::Display for ProviderError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.source.fmt(formatter)
+        write!(formatter, "{}: {}", self.reason_code(), self.source)
     }
 }
 
@@ -159,6 +191,17 @@ pub trait SandboxProvider {
         spec: &SandboxProvisionSpec,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<ProviderSandboxHandle>;
+    fn provision_staged(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+        report: &mut dyn FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
+    ) -> anyhow::Result<ProviderSandboxHandle> {
+        let handle = self.provision(sandbox_id, spec, cancelled)?;
+        report(stage_update(ProvisioningStage::SandboxReady, None))?;
+        Ok(handle)
+    }
     fn exec_handoff(
         &self,
         sandbox_id: SandboxId,
@@ -1273,6 +1316,43 @@ pub struct KubernetesApplyProvider {
     max_captured_output_bytes: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KubernetesResourceIdentity {
+    resource_kind: RuntimeResourceKind,
+    namespace: String,
+    name: String,
+    uid: String,
+    observed_generation: Option<i64>,
+}
+
+fn runtime_resource_kind_for_kubernetes_kind(kind: &str) -> anyhow::Result<RuntimeResourceKind> {
+    match kind {
+        "PersistentVolumeClaim" => Ok(RuntimeResourceKind::PersistentVolumeClaim),
+        "NetworkPolicy" => Ok(RuntimeResourceKind::NetworkPolicy),
+        "Secret" => Ok(RuntimeResourceKind::Secret),
+        "Pod" => Ok(RuntimeResourceKind::Pod),
+        "Service" => Ok(RuntimeResourceKind::Service),
+        other => bail!("unsupported staged Kubernetes resource kind {other}"),
+    }
+}
+
+fn stage_update(
+    stage: ProvisioningStage,
+    identity: Option<KubernetesResourceIdentity>,
+) -> ProvisioningStageUpdateRequest {
+    ProvisioningStageUpdateRequest {
+        stage,
+        resource_kind: identity.as_ref().map(|value| value.resource_kind.clone()),
+        resource_namespace: identity.as_ref().map(|value| value.namespace.clone()),
+        resource_name: identity.as_ref().map(|value| value.name.clone()),
+        resource_uid: identity.as_ref().map(|value| value.uid.clone()),
+        observed_generation: identity.and_then(|value| value.observed_generation),
+        attempt_count: 1,
+        last_error_class: None,
+        last_error: None,
+    }
+}
+
 impl KubernetesApplyProvider {
     pub fn new(dry_run: KubernetesDryRunProvider, kubectl: impl Into<String>) -> Self {
         let kubectl_context = Some(dry_run.cluster.clone());
@@ -1328,6 +1408,189 @@ impl KubernetesApplyProvider {
     pub fn with_max_captured_output_bytes(mut self, max_captured_output_bytes: u64) -> Self {
         self.max_captured_output_bytes = max_captured_output_bytes;
         self
+    }
+
+    pub fn provision_staged<F>(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+        mut report: F,
+    ) -> anyhow::Result<ProviderSandboxHandle>
+    where
+        F: FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
+    {
+        self.dry_run
+            .validate_network_policy_egress(&spec.network_egress)?;
+        Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
+        report(stage_update(ProvisioningStage::WorkspacePlanned, None))?;
+
+        let workspace = self.dry_run.pvc_manifest(
+            format!("sandboxwich-pvc-{sandbox_id}"),
+            Some(sandbox_id),
+            &spec.memory_limit,
+        );
+        let workspace_identity = self.apply_or_adopt_manifest(&workspace, sandbox_id, cancelled)?;
+        report(stage_update(
+            ProvisioningStage::WorkspaceReady,
+            Some(workspace_identity),
+        ))?;
+
+        let network_policy = self
+            .dry_run
+            .network_policy_manifest(sandbox_id, &spec.network_egress)?;
+        let network_identity =
+            self.apply_or_adopt_manifest(&network_policy, sandbox_id, cancelled)?;
+        report(stage_update(
+            ProvisioningStage::NetworkPolicyReady,
+            Some(network_identity),
+        ))?;
+
+        report(stage_update(ProvisioningStage::CredentialsReady, None))?;
+
+        let pod = self.dry_run.pod_manifest(sandbox_id, spec);
+        let pod_identity = self.apply_or_adopt_manifest(&pod, sandbox_id, cancelled)?;
+        let wait = self.wait_for_pod_ready(sandbox_id, cancelled)?;
+        if !wait.success {
+            bail!(
+                "sandbox pod did not become ready with {}: {}",
+                wait.status,
+                wait.stderr
+            );
+        }
+        report(stage_update(
+            ProvisioningStage::PodReady,
+            Some(pod_identity),
+        ))?;
+
+        let ssh_service = self.dry_run.ssh_service_manifest(sandbox_id);
+        self.apply_or_adopt_manifest(&ssh_service, sandbox_id, cancelled)?;
+        let desktop_service = self.dry_run.desktop_service_manifest(sandbox_id);
+        let service_identity =
+            self.apply_or_adopt_manifest(&desktop_service, sandbox_id, cancelled)?;
+        report(stage_update(
+            ProvisioningStage::ServiceReady,
+            Some(service_identity),
+        ))?;
+        report(stage_update(ProvisioningStage::SandboxReady, None))?;
+
+        let mut handle = self.dry_run.provision(sandbox_id, spec, cancelled)?;
+        mark_resources(
+            &mut handle.resources,
+            RuntimeResourceStatus::Ready,
+            Some(Utc::now()),
+        );
+        if let Some(metadata) = handle.metadata.as_object_mut() {
+            metadata.insert("mode".to_string(), json!("apply"));
+            metadata.insert("provisioningMode".to_string(), json!("staged"));
+        }
+        Ok(handle)
+    }
+
+    fn apply_or_adopt_manifest(
+        &self,
+        manifest: &Value,
+        sandbox_id: SandboxId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<KubernetesResourceIdentity> {
+        let kind = manifest["kind"]
+            .as_str()
+            .context("Kubernetes manifest kind is required")?;
+        let name = manifest["metadata"]["name"]
+            .as_str()
+            .context("Kubernetes manifest metadata.name is required")?;
+        let namespace = manifest["metadata"]["namespace"]
+            .as_str()
+            .context("Kubernetes manifest metadata.namespace is required")?;
+        let resource_kind = runtime_resource_kind_for_kubernetes_kind(kind)?;
+
+        if let Some(identity) = self.read_resource_identity(
+            kind,
+            name,
+            namespace,
+            sandbox_id,
+            resource_kind.clone(),
+            cancelled,
+        )? {
+            return Ok(identity);
+        }
+
+        let apply = run_kubectl_documents(
+            &self.kubectl,
+            &self.kubectl_args("apply"),
+            std::slice::from_ref(manifest),
+            "apply staged sandbox resource",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        if !apply.success {
+            bail!(
+                "kubectl apply staged sandbox resource failed with {}: {}",
+                apply.status,
+                apply.stderr
+            );
+        }
+        self.read_resource_identity(kind, name, namespace, sandbox_id, resource_kind, cancelled)?
+            .context("staged Kubernetes resource was not observable after apply")
+    }
+
+    fn read_resource_identity(
+        &self,
+        kind: &str,
+        name: &str,
+        namespace: &str,
+        sandbox_id: SandboxId,
+        resource_kind: RuntimeResourceKind,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<Option<KubernetesResourceIdentity>> {
+        let mut args = self.kubectl_base_args();
+        args.extend([
+            "get".to_string(),
+            kind.to_string(),
+            name.to_string(),
+            "--ignore-not-found".to_string(),
+            "-o".to_string(),
+            "json".to_string(),
+        ]);
+        let output = run_kubectl_command(
+            &self.kubectl,
+            &args,
+            "read staged sandbox resource",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        if !output.success {
+            bail!(
+                "kubectl get staged sandbox resource failed: {}",
+                output.stderr
+            );
+        }
+        if output.stdout.trim().is_empty() {
+            return Ok(None);
+        }
+        let observed: Value = serde_json::from_str(&output.stdout)
+            .context("kubectl returned invalid resource JSON")?;
+        if observed["metadata"]["labels"]["sandboxwich.dev/sandbox-id"]
+            != json!(sandbox_id.to_string())
+        {
+            return Err(anyhow::Error::new(ProviderError::classified(
+                ProvisioningErrorClass::TerminalContract,
+                "resource_identity_conflict",
+                anyhow::anyhow!("existing Kubernetes resource has a conflicting sandbox identity"),
+            )));
+        }
+        let uid = observed["metadata"]["uid"]
+            .as_str()
+            .context("observed Kubernetes resource UID is required")?;
+        Ok(Some(KubernetesResourceIdentity {
+            resource_kind,
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            uid: uid.to_string(),
+            observed_generation: observed["metadata"]["generation"].as_i64(),
+        }))
     }
 
     /// Renders the smoke-test plan printed by `provider-apply-plan` and
@@ -2359,6 +2622,16 @@ impl SandboxProvider for KubernetesApplyProvider {
             metadata.insert("waitStdout".to_string(), json!(wait.stdout));
         }
         Ok(handle)
+    }
+
+    fn provision_staged(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+        report: &mut dyn FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
+    ) -> anyhow::Result<ProviderSandboxHandle> {
+        KubernetesApplyProvider::provision_staged(self, sandbox_id, spec, cancelled, report)
     }
 
     fn exec_handoff(

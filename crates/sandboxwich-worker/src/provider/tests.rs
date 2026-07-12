@@ -1397,6 +1397,165 @@ fn apply_provider_with_fake_kubectl(kubectl: &std::path::Path) -> KubernetesAppl
         .with_mutation_gate(true, true)
 }
 
+fn write_stateful_fake_kubectl() -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir =
+        std::env::temp_dir().join(format!("sandboxwich-stateful-kubectl-{}", SandboxId::new()));
+    std::fs::create_dir_all(&dir).expect("create stateful fake kubectl dir");
+    let log_path = dir.join("log.txt");
+    let script_path = dir.join("kubectl");
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "{log}"
+case " $* " in
+  *" get "*)
+    kind=''
+    name=''
+    previous=''
+    for arg in "$@"; do
+      if [ "$previous" = get ]; then kind="$arg"; previous=kind; continue; fi
+      if [ "$previous" = kind ]; then name="$arg"; break; fi
+      previous="$arg"
+    done
+    kind=$(printf '%s' "$kind" | tr '[:upper:]' '[:lower:]')
+    marker="{dir}/$kind-$name"
+    [ -f "$marker" ] || exit 0
+    printf '{{"kind":"%s","metadata":{{"name":"%s","namespace":"sandboxwich-ci","uid":"uid-%s","generation":1,"labels":{{"sandboxwich.dev/sandbox-id":"%s"}}}}}}\n' "$kind" "$name" "$name" "$(cat "$marker")"
+    ;;
+  *" apply "*)
+    payload=$(cat)
+    kind=$(printf '%s' "$payload" | sed -n 's/.*"kind": "\([^"]*\)".*/\1/p' | head -1 | tr '[:upper:]' '[:lower:]')
+    name=$(printf '%s' "$payload" | sed -n 's/.*"name": "\([^"]*\)".*/\1/p' | head -1)
+    sandbox=$(printf '%s' "$payload" | sed -n 's/.*"sandboxwich.dev\/sandbox-id": "\([^"]*\)".*/\1/p' | head -1)
+    printf '%s' "$sandbox" > "{dir}/$kind-$name"
+    ;;
+  *" wait "*) ;;
+esac
+"#,
+        log = log_path.display(),
+        dir = dir.display(),
+    );
+    std::fs::write(&script_path, script).expect("write stateful fake kubectl");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("stat stateful fake kubectl")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).expect("chmod stateful fake kubectl");
+    }
+    (script_path, log_path)
+}
+
+#[test]
+fn provision_staged_applies_resources_in_durable_order_and_reports_uids() {
+    let (kubectl, log_path) = write_stateful_fake_kubectl();
+    let provider = apply_provider_with_fake_kubectl(&kubectl);
+    let sandbox_id = SandboxId::new();
+    let mut reports = Vec::new();
+
+    provider
+        .provision_staged(
+            sandbox_id,
+            &SandboxProvisionSpec::default(),
+            &CancelSignal::never_cancelled(),
+            |report| {
+                reports.push(report);
+                Ok(())
+            },
+        )
+        .expect("staged provision succeeds");
+
+    let stages = reports
+        .iter()
+        .map(|report| report.stage.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stages,
+        vec![
+            sandboxwich_core::ProvisioningStage::WorkspacePlanned,
+            sandboxwich_core::ProvisioningStage::WorkspaceReady,
+            sandboxwich_core::ProvisioningStage::NetworkPolicyReady,
+            sandboxwich_core::ProvisioningStage::CredentialsReady,
+            sandboxwich_core::ProvisioningStage::PodReady,
+            sandboxwich_core::ProvisioningStage::ServiceReady,
+            sandboxwich_core::ProvisioningStage::SandboxReady,
+        ]
+    );
+    assert!(
+        reports
+            .iter()
+            .filter(|report| report.resource_name.is_some())
+            .all(|report| report
+                .resource_uid
+                .as_deref()
+                .is_some_and(|uid| uid.starts_with("uid-")))
+    );
+
+    let log = std::fs::read_to_string(&log_path).expect("read staged kubectl log");
+    assert!(
+        log.matches(" get ").count() >= 10,
+        "expected pre/post reads: {log}"
+    );
+    assert_eq!(
+        log.matches(" apply ").count(),
+        5,
+        "one apply per manifest: {log}"
+    );
+    assert!(log.contains(" wait --for=condition=Ready "));
+
+    let mut replay_reports = Vec::new();
+    provider
+        .provision_staged(
+            sandbox_id,
+            &SandboxProvisionSpec::default(),
+            &CancelSignal::never_cancelled(),
+            |report| {
+                replay_reports.push(report);
+                Ok(())
+            },
+        )
+        .expect("matching resources are adopted on replay");
+    let replay_log = std::fs::read_to_string(&log_path).expect("read replay kubectl log");
+    assert_eq!(
+        replay_log.matches(" apply ").count(),
+        5,
+        "replay must adopt the five existing resources: {replay_log}"
+    );
+    assert_eq!(replay_reports.len(), 7);
+
+    let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+#[test]
+fn provision_staged_stops_before_the_next_resource_when_reporting_fails() {
+    let (kubectl, log_path) = write_stateful_fake_kubectl();
+    let provider = apply_provider_with_fake_kubectl(&kubectl);
+    let error = provider
+        .provision_staged(
+            SandboxId::new(),
+            &SandboxProvisionSpec::default(),
+            &CancelSignal::never_cancelled(),
+            |report| {
+                if report.stage == sandboxwich_core::ProvisioningStage::NetworkPolicyReady {
+                    anyhow::bail!("lost provisioning lease")
+                }
+                Ok(())
+            },
+        )
+        .expect_err("reporting failure stops staged provisioning");
+    assert!(error.to_string().contains("lost provisioning lease"));
+
+    let log = std::fs::read_to_string(&log_path).expect("read failed-report kubectl log");
+    assert_eq!(
+        log.matches(" apply ").count(),
+        2,
+        "workspace and network policy apply before their durable reports: {log}"
+    );
+    assert!(!log.contains(" wait "), "pod stage must not start: {log}");
+    let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
 #[test]
 fn provision_rolls_back_applied_resources_when_pod_never_becomes_ready() {
     let (kubectl, log_path) = write_fake_kubectl(Some("wait"));

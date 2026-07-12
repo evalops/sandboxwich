@@ -11,9 +11,9 @@ use provider::{
 };
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse,
-    CompleteLeaseRequest, FailLeaseRequest, JobKind, LeaseResponse, RegisterWorkerRequest,
-    RenewLeaseRequest, SandboxProvisionSpec, WorkerCapability, WorkerHeartbeatRequest,
-    WorkerJobResult, WorkerResponse, build_api_client,
+    CompleteLeaseRequest, FailLeaseRequest, JobKind, LeaseResponse, ProvisioningOperationResponse,
+    ProvisioningStageUpdateRequest, RegisterWorkerRequest, RenewLeaseRequest, SandboxProvisionSpec,
+    WorkerCapability, WorkerHeartbeatRequest, WorkerJobResult, WorkerResponse, build_api_client,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -418,6 +418,21 @@ impl SandboxProvider for RuntimeProvider {
         match self {
             Self::DryRun(provider) => provider.provision(sandbox_id, spec, cancelled),
             Self::Apply(provider) => provider.provision(sandbox_id, spec, cancelled),
+        }
+    }
+
+    fn provision_staged(
+        &self,
+        sandbox_id: sandboxwich_core::SandboxId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+        report: &mut dyn FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
+    ) -> anyhow::Result<sandboxwich_core::ProviderSandboxHandle> {
+        match self {
+            Self::DryRun(provider) => {
+                provider.provision_staged(sandbox_id, spec, cancelled, report)
+            }
+            Self::Apply(provider) => provider.provision_staged(sandbox_id, spec, cancelled, report),
         }
     }
 
@@ -1087,7 +1102,22 @@ fn classify_retry(error: &anyhow::Error) -> bool {
     error
         .chain()
         .find_map(|cause| cause.downcast_ref::<ProviderError>())
-        .map(ProviderError::disposition)
+        .map(|error| {
+            debug_assert_eq!(
+                error.disposition(),
+                match error.error_class() {
+                    sandboxwich_core::ProvisioningErrorClass::RetryableProvider
+                    | sandboxwich_core::ProvisioningErrorClass::RetryableCapacity => {
+                        RetryDisposition::Retryable
+                    }
+                    sandboxwich_core::ProvisioningErrorClass::TerminalContract
+                    | sandboxwich_core::ProvisioningErrorClass::TerminalSecurity => {
+                        RetryDisposition::Permanent
+                    }
+                }
+            );
+            error.disposition()
+        })
         .unwrap_or(RetryDisposition::Permanent)
         == RetryDisposition::Retryable
 }
@@ -1355,10 +1385,27 @@ where
     // blocking-pool thread so it can't stall the async runtime (and the heartbeat/
     // renewal tasks running alongside it).
     let job = lease.job.clone();
+    let lease_attempt = lease.attempt;
     let exec_provider = provider.clone();
     let exec_cancelled = cancelled.clone();
+    let reporter_client = client.clone();
+    let reporter_api = api.to_string();
+    let reporter_runtime = tokio::runtime::Handle::current();
     let outcome = tokio::task::spawn_blocking(move || {
-        execute_job(&job, exec_provider.as_ref(), &exec_cancelled)
+        let mut reporter = |update| {
+            let (url, request) =
+                provisioning_stage_request(&reporter_api, lease_id, lease_attempt, update);
+            reporter_runtime.block_on(with_retries(
+                "report provisioning stage",
+                API_RETRY_ATTEMPTS,
+                || async {
+                    let response = reporter_client.post(&url).json(&request).send().await?;
+                    decode_json::<ProvisioningOperationResponse>(response).await
+                },
+            ))?;
+            Ok(())
+        };
+        execute_job_with_reporter(&job, exec_provider.as_ref(), &exec_cancelled, &mut reporter)
     })
     .await
     .unwrap_or_else(|join_error| {
@@ -1421,16 +1468,42 @@ enum WorkerJobOutcome {
     Fail { error: String, retry: bool },
 }
 
+fn provisioning_stage_request(
+    api: &str,
+    lease_id: sandboxwich_core::LeaseId,
+    lease_attempt: i64,
+    mut request: ProvisioningStageUpdateRequest,
+) -> (String, ProvisioningStageUpdateRequest) {
+    request.attempt_count = lease_attempt;
+    (
+        format!(
+            "{}/leases/{lease_id}/provisioning",
+            api.trim_end_matches('/')
+        ),
+        request,
+    )
+}
+
+#[cfg(test)]
 fn execute_job(
     job: &sandboxwich_core::Job,
     provider: &impl SandboxProvider,
     cancelled: &CancelSignal,
 ) -> anyhow::Result<WorkerJobOutcome> {
+    execute_job_with_reporter(job, provider, cancelled, &mut |_| Ok(()))
+}
+
+fn execute_job_with_reporter(
+    job: &sandboxwich_core::Job,
+    provider: &impl SandboxProvider,
+    cancelled: &CancelSignal,
+    report: &mut dyn FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
+) -> anyhow::Result<WorkerJobOutcome> {
     match job.kind {
         JobKind::ProvisionSandbox => {
             let sandbox_id = sandbox_id_from_payload(&job.payload)?;
             let spec = provision_spec_from_payload(&job.payload)?;
-            let handle = provider.provision(sandbox_id, &spec, cancelled)?;
+            let handle = provider.provision_staged(sandbox_id, &spec, cancelled, report)?;
             Ok(WorkerJobOutcome::Complete(
                 WorkerJobResult::ProvisionSandbox { handle },
             ))
