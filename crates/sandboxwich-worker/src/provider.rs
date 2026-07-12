@@ -89,11 +89,9 @@ pub(crate) fn image_pull_policy_for(image: &str) -> &'static str {
 pub const DEFAULT_MAX_CAPTURED_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Default bound applied to every `kubectl` invocation made by
-/// [`KubernetesApplyProvider`] (see [`run_kubectl_command`]). Deliberately
-/// longer than `wait_for_pod_ready`'s own `--timeout=120s` flag so this is a
-/// backstop against a wedged `kubectl`/API server (a process that hangs
-/// rather than erroring out after its own internal timeout), not something
-/// that routinely races that flag. Configurable via
+/// [`KubernetesApplyProvider`] (see [`run_kubectl_command`]). Pod readiness
+/// uses this bound with a five-second margin so `kubectl wait` reports its own
+/// timeout before the process backstop fires. Configurable via
 /// `with_kubectl_command_timeout`/`--kubectl-command-timeout-secs`/
 /// `SANDBOXWICH_KUBECTL_COMMAND_TIMEOUT_SECS` for environments that need a
 /// longer bound (e.g. slow-running commands executed via `kubectl exec`).
@@ -1316,6 +1314,15 @@ impl KubernetesApplyProvider {
         self
     }
 
+    fn pod_ready_timeout_arg(&self) -> String {
+        let seconds = self
+            .kubectl_command_timeout
+            .as_secs()
+            .saturating_sub(5)
+            .max(1);
+        format!("--timeout={seconds}s")
+    }
+
     /// Caps the stdout/stderr captured from every `kubectl` invocation this
     /// provider makes. See `DEFAULT_MAX_CAPTURED_OUTPUT_BYTES`.
     pub fn with_max_captured_output_bytes(mut self, max_captured_output_bytes: u64) -> Self {
@@ -1584,7 +1591,8 @@ impl KubernetesApplyProvider {
         Ok(manifests)
     }
 
-    /// Waits up to 120s for the sandbox pod to become ready. `cancelled` is polled
+    /// Waits for the sandbox pod to become ready within the configured kubectl
+    /// command bound. `cancelled` is polled
     /// throughout: if the caller's lease renewal is lost while this is in flight, the
     /// wait is aborted instead of letting a mutating provision/fork run to completion
     /// against a lease this worker can no longer prove is still its own (see
@@ -1599,7 +1607,7 @@ impl KubernetesApplyProvider {
             "wait".to_string(),
             "--for=condition=Ready".to_string(),
             format!("pod/{}", self.pod_name(sandbox_id)),
-            "--timeout=120s".to_string(),
+            self.pod_ready_timeout_arg(),
         ]);
         run_kubectl_command(
             &self.kubectl,
