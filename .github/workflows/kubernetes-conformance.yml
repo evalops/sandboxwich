@@ -61,8 +61,9 @@ jobs:
         run: |
           kubectl get all -A -o wide
           kubectl get events -A --sort-by=.lastTimestamp
-          kubectl -n sandboxwich logs deployment/sandboxwich-api --tail=200 || true
-          kubectl -n sandboxwich logs deployment/sandboxwich-worker --tail=200 || true
+          kubectl -n sandboxwich logs deployment/sandboxwich-api --tail=-1 --prefix || true
+          kubectl -n sandboxwich logs deployment/sandboxwich-api --previous --tail=-1 --prefix || true
+          kubectl -n sandboxwich logs deployment/sandboxwich-worker --tail=-1 --prefix || true
       - name: Delete disposable cluster
         if: always()
         run: kind delete cluster --name sandboxwich-conformance

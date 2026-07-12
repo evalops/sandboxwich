@@ -25,7 +25,9 @@ trap cleanup EXIT
 fail() {
   echo "conformance failure: $*" >&2
   kubectl --context "${KUBE_CONTEXT}" get pods -A -o wide >&2 || true
-  kubectl --context "${KUBE_CONTEXT}" -n sandboxwich logs deployment/sandboxwich-worker --tail=100 >&2 || true
+  kubectl --context "${KUBE_CONTEXT}" -n sandboxwich logs deployment/sandboxwich-api --tail=-1 --prefix >&2 || true
+  kubectl --context "${KUBE_CONTEXT}" -n sandboxwich logs deployment/sandboxwich-api --previous --tail=-1 --prefix >&2 || true
+  kubectl --context "${KUBE_CONTEXT}" -n sandboxwich logs deployment/sandboxwich-worker --tail=-1 --prefix >&2 || true
   exit 1
 }
 
