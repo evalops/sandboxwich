@@ -96,7 +96,7 @@ fn dispatches_provision_stage_reports_before_returning_the_handle() {
 #[test]
 fn provisioning_report_targets_the_lease_and_uses_its_attempt() {
     let lease_id = sandboxwich_core::LeaseId::new();
-    let (url, request) = provisioning_stage_request(
+    let (method, url, request) = provisioning_stage_request(
         "https://sandboxwich.example/v1/",
         lease_id,
         4,
@@ -113,6 +113,7 @@ fn provisioning_report_targets_the_lease_and_uses_its_attempt() {
         },
     );
 
+    assert_eq!(method, reqwest::Method::PUT);
     assert_eq!(
         url,
         format!("https://sandboxwich.example/v1/leases/{lease_id}/provisioning")

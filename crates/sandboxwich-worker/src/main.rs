@@ -1393,13 +1393,17 @@ where
     let reporter_runtime = tokio::runtime::Handle::current();
     let outcome = tokio::task::spawn_blocking(move || {
         let mut reporter = |update| {
-            let (url, request) =
+            let (method, url, request) =
                 provisioning_stage_request(&reporter_api, lease_id, lease_attempt, update);
             reporter_runtime.block_on(with_retries(
                 "report provisioning stage",
                 API_RETRY_ATTEMPTS,
                 || async {
-                    let response = reporter_client.post(&url).json(&request).send().await?;
+                    let response = reporter_client
+                        .request(method.clone(), &url)
+                        .json(&request)
+                        .send()
+                        .await?;
                     decode_json::<ProvisioningOperationResponse>(response).await
                 },
             ))?;
@@ -1473,9 +1477,10 @@ fn provisioning_stage_request(
     lease_id: sandboxwich_core::LeaseId,
     lease_attempt: i64,
     mut request: ProvisioningStageUpdateRequest,
-) -> (String, ProvisioningStageUpdateRequest) {
+) -> (reqwest::Method, String, ProvisioningStageUpdateRequest) {
     request.attempt_count = lease_attempt;
     (
+        reqwest::Method::PUT,
         format!(
             "{}/leases/{lease_id}/provisioning",
             api.trim_end_matches('/')
