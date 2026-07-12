@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Provisioning progress is fenced by active lease identity and persists observed
+  Kubernetes resource UIDs, allowing interrupted provisioning to adopt matching
+  resources without duplicating them.
+- Apply-mode workers have a bounded orphan-reconciliation loop. It is dry-run by
+  default; deletion requires a CLI and environment double opt-in and uses UID
+  preconditions while database, discovery, scope, or pagination uncertainty fails
+  closed.
+
 ## 0.1.0 - 2026-07-11
 
 - The CLI executable is now named `sandboxwich`. Structured output supports

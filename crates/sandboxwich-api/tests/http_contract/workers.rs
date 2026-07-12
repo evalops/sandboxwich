@@ -2,6 +2,57 @@ use crate::common::*;
 use reqwest::StatusCode;
 use sandboxwich_core::*;
 
+#[tokio::test]
+pub(crate) async fn runtime_resource_inventory_is_worker_scoped_and_bounded() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("worker-inventory-test.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+    let registered: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "inventory-worker".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![WorkerCapability::ProvisionSandbox],
+            max_concurrent_jobs: Some(1),
+            labels: std::collections::BTreeMap::from([(
+                "cluster".to_string(),
+                "kind-inventory".to_string(),
+            )]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let worker = worker_client(&registered);
+
+    let response = worker
+        .get(format!(
+            "{}/workers/{}/runtime-resource-inventory?namespace=sandboxwich-sandboxes&limit=1",
+            server.base_url, registered.worker.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let inventory: RuntimeResourceInventoryResponse = response.json().await.unwrap();
+    assert!(inventory.ok);
+    assert_eq!(inventory.provider, "kubernetes");
+    assert_eq!(inventory.cluster.as_deref(), Some("kind-inventory"));
+    assert_eq!(inventory.namespace, "sandboxwich-sandboxes");
+    assert!(inventory.sandbox_ids.is_empty());
+    assert!(inventory.complete);
+    assert!(inventory.resources.is_empty());
+    assert!(inventory.next_cursor.is_none());
+}
+
 /// Regression test for issue #64: the guest agent running inside a sandbox
 /// previously authenticated with the same tenant-wide bearer token the CLI
 /// uses for everything, so any compromised sandbox could act as the whole

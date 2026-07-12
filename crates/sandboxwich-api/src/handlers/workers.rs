@@ -2,17 +2,131 @@ use crate::auth::*;
 use crate::db::*;
 use crate::error::*;
 use crate::handlers::commands::*;
+use crate::pagination::*;
 use crate::rows::*;
 use crate::state::*;
 use crate::util::*;
 use axum::Json;
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Path, Query, State};
 use chrono::{DateTime, Utc};
 use sandboxwich_core::*;
 use serde_json::json;
 use sqlx::AnyConnection;
 use sqlx::Row;
 use uuid::Uuid;
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct RuntimeResourceInventoryQuery {
+    namespace: String,
+    limit: Option<u32>,
+    before: Option<String>,
+    after: Option<String>,
+}
+
+pub(crate) async fn runtime_resource_inventory(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path(worker_id): Path<Uuid>,
+    Query(query): Query<RuntimeResourceInventoryQuery>,
+) -> Result<Json<RuntimeResourceInventoryResponse>, ApiError> {
+    let worker_id = WorkerId(worker_id);
+    ensure_worker_scope(&ctx, worker_id)?;
+    let worker = ensure_worker_tenant(&state.db, worker_id, &ctx).await?;
+    if query.namespace.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "runtime resource namespace is required",
+        ));
+    }
+    let page = crate::pagination::PageParams {
+        limit: query.limit,
+        before: query.before,
+        after: query.after,
+    };
+    let limit = resolve_page_limit(page.limit)?;
+    let cursor = resolve_page_cursor(&page)?;
+    let sandbox_sql = format!(
+        "select distinct po.sandbox_id
+         from provisioning_operations po
+         join job_leases jl on jl.id = po.lease_id
+         where jl.worker_id = {}
+         order by po.sandbox_id asc limit 201",
+        state.db.placeholder(1),
+    );
+    let mut sandbox_ids = sqlx::query(&sandbox_sql)
+        .bind(worker_id.to_string())
+        .fetch_all(&state.db.pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            let value: String = row.try_get("sandbox_id")?;
+            Ok(SandboxId(parse_uuid(&value)?))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    let complete = sandbox_ids.len() <= 200;
+    sandbox_ids.truncate(200);
+    let sql = format!(
+        "select * from (
+         select por.updated_at as created_at, por.resource_uid as id,
+                por.sandbox_id, por.resource_kind, por.resource_namespace,
+                por.resource_name, por.resource_uid, s.state,
+                s.created_at as sandbox_created_at, s.updated_at as sandbox_updated_at,
+                s.ttl_seconds
+         from provisioning_operation_resources por
+         join provisioning_operations po on po.sandbox_id = por.sandbox_id
+         join job_leases jl on jl.id = po.lease_id
+         join sandboxes s on s.id = por.sandbox_id
+         where jl.worker_id = {} and por.resource_namespace = {}
+         ) inventory where 1 = 1",
+        state.db.placeholder(1),
+        state.db.placeholder(2),
+    );
+    let (resources, next_cursor) = fetch_keyset_page(
+        &state.db,
+        &sql,
+        &[worker_id.to_string(), query.namespace.clone()],
+        limit,
+        &cursor,
+        |row| {
+            let created_at: String = row.try_get("sandbox_created_at")?;
+            let updated_at: String = row.try_get("sandbox_updated_at")?;
+            let ttl_seconds: Option<i64> = row.try_get("ttl_seconds")?;
+            let expires_at = ttl_seconds
+                .map(|ttl| {
+                    parse_timestamp(&created_at)
+                        .map(|created| created + chrono::Duration::seconds(ttl))
+                })
+                .transpose()?;
+            let state: String = row.try_get("state")?;
+            let cleanup_deadline = if matches!(state.as_str(), "archiving" | "archived") {
+                Some(parse_timestamp(&updated_at)?)
+            } else {
+                expires_at
+            };
+            let resource_kind: String = row.try_get("resource_kind")?;
+            Ok(RuntimeResourceInventoryItem {
+                sandbox_id: SandboxId(parse_uuid(&row.try_get::<String, _>("sandbox_id")?)?),
+                resource_kind: RuntimeResourceKind::parse_db_str(&resource_kind)
+                    .map_err(|_| ApiError::internal("invalid runtime resource kind"))?,
+                namespace: row.try_get("resource_namespace")?,
+                name: row.try_get("resource_name")?,
+                uid: row.try_get("resource_uid")?,
+                expires_at,
+                cleanup_deadline,
+            })
+        },
+    )
+    .await?;
+    Ok(Json(RuntimeResourceInventoryResponse {
+        ok: true,
+        provider: worker.provider,
+        cluster: worker.labels.get("cluster").cloned(),
+        namespace: query.namespace,
+        sandbox_ids,
+        complete,
+        resources,
+        next_cursor,
+    }))
+}
 
 pub(crate) fn validate_max_concurrent_jobs(max_concurrent_jobs: u32) -> Result<u32, ApiError> {
     if max_concurrent_jobs == 0 {
