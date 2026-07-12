@@ -1348,7 +1348,20 @@ fn adoption_contract(resource: &Value) -> anyhow::Result<Value> {
             "volumeMode": resource["spec"]["volumeMode"],
             "dataSource": resource["spec"]["dataSource"],
         }),
-        "NetworkPolicy" => resource["spec"].clone(),
+        "NetworkPolicy" => {
+            let mut spec = resource["spec"].clone();
+            let fields = spec
+                .as_object_mut()
+                .context("NetworkPolicy spec must be an object")?;
+            // The API server omits empty slices when serializing an object
+            // back to JSON. For a policy that includes `Egress` in
+            // policyTypes, an absent `egress` field and `egress: []` both
+            // mean deny all; canonicalize that representation before the
+            // security-sensitive comparison.
+            fields.entry("ingress").or_insert_with(|| json!([]));
+            fields.entry("egress").or_insert_with(|| json!([]));
+            spec
+        }
         "Pod" => json!({
             "runtimeClassName": resource["spec"]["runtimeClassName"],
             "automountServiceAccountToken": resource["spec"]["automountServiceAccountToken"],

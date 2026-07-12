@@ -1636,6 +1636,14 @@ fn adoption_contract_rejects_immutable_or_security_drift_for_every_resource_kind
     validate_adoption_contract(&network_policy, &defaulted_network_policy)
         .expect("defaulted network policy protocol is semantically equivalent");
 
+    let mut api_normalized_deny_all_policy = network_policy.clone();
+    api_normalized_deny_all_policy["spec"]
+        .as_object_mut()
+        .expect("network policy spec")
+        .remove("egress");
+    validate_adoption_contract(&network_policy, &api_normalized_deny_all_policy)
+        .expect("an omitted empty egress list is the API form of deny-all egress");
+
     let mut changed_pvc = pvc.clone();
     changed_pvc["spec"]["storageClassName"] = json!("wrong-storage-class");
     let mut changed_network_policy = network_policy.clone();
