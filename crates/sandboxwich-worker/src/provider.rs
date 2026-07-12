@@ -1352,9 +1352,9 @@ fn adoption_contract(resource: &Value) -> anyhow::Result<Value> {
         "Pod" => json!({
             "runtimeClassName": resource["spec"]["runtimeClassName"],
             "automountServiceAccountToken": resource["spec"]["automountServiceAccountToken"],
-            "hostNetwork": resource["spec"]["hostNetwork"],
-            "hostPID": resource["spec"]["hostPID"],
-            "hostIPC": resource["spec"]["hostIPC"],
+            "hostNetwork": resource["spec"]["hostNetwork"].as_bool().unwrap_or(false),
+            "hostPID": resource["spec"]["hostPID"].as_bool().unwrap_or(false),
+            "hostIPC": resource["spec"]["hostIPC"].as_bool().unwrap_or(false),
             "securityContext": resource["spec"]["securityContext"],
             "containers": resource["spec"]["containers"],
             "volumes": resource["spec"]["volumes"],

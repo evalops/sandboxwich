@@ -1611,6 +1611,21 @@ fn adoption_contract_rejects_immutable_or_security_drift_for_every_resource_kind
     validate_adoption_contract(&pod, &defaulted_pod)
         .expect("Kubernetes API defaults do not change the desired pod contract");
 
+    for field in ["hostNetwork", "hostPID", "hostIPC"] {
+        let mut hostile_pod = pod.clone();
+        hostile_pod["spec"][field] = json!(true);
+        let error = validate_adoption_contract(&pod, &hostile_pod)
+            .expect_err("host namespace escalation must block pod adoption");
+        let provider_error = error
+            .downcast_ref::<ProviderError>()
+            .expect("host namespace conflict is typed");
+        assert_eq!(
+            provider_error.error_class(),
+            sandboxwich_core::ProvisioningErrorClass::TerminalSecurity,
+            "unexpected class for {field}"
+        );
+    }
+
     let mut defaulted_network_policy = network_policy.clone();
     if let Some(first_port) = defaulted_network_policy["spec"]["ingress"][0]["ports"]
         .as_array_mut()
