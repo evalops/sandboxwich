@@ -39,6 +39,21 @@ spec:
               protocol: TCP
 YAML
 
+kubectl -n "${namespace}" wait \
+  --for=condition=Valid ciliumnetworkpolicy/sandboxwich-fqdn-proof --timeout=120s
+for _ in $(seq 1 60); do
+  desired="$(kubectl -n "${namespace}" get ciliumendpoint fqdn-probe \
+    -o jsonpath='{.status.policy.spec.policy-revision}' 2>/dev/null || true)"
+  realized="$(kubectl -n "${namespace}" get ciliumendpoint fqdn-probe \
+    -o jsonpath='{.status.policy.realized.policy-revision}' 2>/dev/null || true)"
+  [[ -n "${desired}" && "${desired}" == "${realized}" ]] && break
+  sleep 1
+done
+[[ -n "${desired:-}" && "${desired}" == "${realized:-}" ]] || {
+  echo "Cilium endpoint policy did not realize: desired=${desired:-} realized=${realized:-}" >&2
+  exit 1
+}
+
 exec_probe() { kubectl -n "${namespace}" exec fqdn-probe -- "$@"; }
 expect_denied() {
   marker="$1"
