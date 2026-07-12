@@ -133,6 +133,88 @@ fn payload_sandbox_id(job: &Job) -> SandboxId {
         .expect("job payload must carry a sandboxId")
 }
 
+#[tokio::test]
+pub(crate) async fn provisioning_stage_route_is_put_only_and_worker_fenced() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("sandboxwich-stage-route.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+    let sandbox = create_sandbox(&client, &server, "stage-route").await;
+    let worker = register_claim_filter_worker(&client, &server).await;
+    let worker_client = worker_client(&worker);
+    let claim: ClaimLeaseResponse = worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox.sandbox.id),
+            kinds: Some(vec![JobKind::ProvisionSandbox]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claim.lease.expect("claim provision lease");
+    let request = ProvisioningStageUpdateRequest {
+        stage: ProvisioningStage::WorkspacePlanned,
+        resource_kind: None,
+        resource_namespace: None,
+        resource_name: None,
+        resource_uid: None,
+        observed_generation: None,
+        attempt_count: lease.attempt,
+        last_error_class: None,
+        last_error_code: None,
+        last_error: None,
+    };
+    let response: ProvisioningOperationResponse = worker_client
+        .put(format!(
+            "{}/leases/{}/provisioning",
+            server.base_url, lease.id
+        ))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(response.operation.lease_id, lease.id);
+
+    let wrong_method = worker_client
+        .post(format!(
+            "{}/leases/{}/provisioning",
+            server.base_url, lease.id
+        ))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+    let tenant_attempt = client
+        .put(format!(
+            "{}/leases/{}/provisioning",
+            server.base_url, lease.id
+        ))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tenant_attempt.status(), StatusCode::UNAUTHORIZED);
+}
+
 /// The guest-side agent daemon claims leases from `POST
 /// /workers/{worker_id}/leases/claim` with an optional `sandbox_id` filter so
 /// it never runs a job destined for a different sandbox inside its own

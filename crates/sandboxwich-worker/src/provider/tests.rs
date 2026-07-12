@@ -1420,14 +1420,22 @@ case " $* " in
     kind=$(printf '%s' "$kind" | tr '[:upper:]' '[:lower:]')
     marker="{dir}/$kind-$name"
     [ -f "$marker" ] || exit 0
-    printf '{{"kind":"%s","metadata":{{"name":"%s","namespace":"sandboxwich-ci","uid":"uid-%s","generation":1,"labels":{{"sandboxwich.dev/sandbox-id":"%s"}}}}}}\n' "$kind" "$name" "$name" "$(cat "$marker")"
+    python3 - "$marker" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    value = json.load(source)
+metadata = value.setdefault("metadata", {{}})
+metadata["uid"] = "uid-" + metadata["name"]
+metadata["generation"] = 1
+print(json.dumps(value))
+PY
     ;;
   *" apply "*)
     payload=$(cat)
     kind=$(printf '%s' "$payload" | sed -n 's/.*"kind": "\([^"]*\)".*/\1/p' | head -1 | tr '[:upper:]' '[:lower:]')
     name=$(printf '%s' "$payload" | sed -n 's/.*"name": "\([^"]*\)".*/\1/p' | head -1)
-    sandbox=$(printf '%s' "$payload" | sed -n 's/.*"sandboxwich.dev\/sandbox-id": "\([^"]*\)".*/\1/p' | head -1)
-    printf '%s' "$sandbox" > "{dir}/$kind-$name"
+    printf '%s' "$payload" > "{dir}/$kind-$name"
     ;;
   *" wait "*) ;;
 esac
@@ -1479,6 +1487,7 @@ fn provision_staged_applies_resources_in_durable_order_and_reports_uids() {
             sandboxwich_core::ProvisioningStage::CredentialsReady,
             sandboxwich_core::ProvisioningStage::PodReady,
             sandboxwich_core::ProvisioningStage::ServiceReady,
+            sandboxwich_core::ProvisioningStage::ServiceReady,
             sandboxwich_core::ProvisioningStage::SandboxReady,
         ]
     );
@@ -1522,7 +1531,7 @@ fn provision_staged_applies_resources_in_durable_order_and_reports_uids() {
         5,
         "replay must adopt the five existing resources: {replay_log}"
     );
-    assert_eq!(replay_reports.len(), 7);
+    assert_eq!(replay_reports.len(), 8);
 
     let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
 }
@@ -1554,6 +1563,100 @@ fn provision_staged_stops_before_the_next_resource_when_reporting_fails() {
     );
     assert!(!log.contains(" wait "), "pod stage must not start: {log}");
     let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+#[test]
+fn adoption_contract_rejects_immutable_or_security_drift_for_every_resource_kind() {
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+    let sandbox_id = SandboxId::new();
+    let spec = SandboxProvisionSpec::default();
+    let pvc = provider.pvc_manifest(
+        format!("sandboxwich-pvc-{sandbox_id}"),
+        Some(sandbox_id),
+        &spec.memory_limit,
+    );
+    let network_policy = provider
+        .network_policy_manifest(sandbox_id, &spec.network_egress)
+        .expect("render network policy");
+    let pod = provider.pod_manifest(sandbox_id, &spec);
+    let service = provider.ssh_service_manifest(sandbox_id);
+    let secret = json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": format!("sandboxwich-secret-{sandbox_id}"),
+            "namespace": "sandboxwich-ci",
+            "labels": { "sandboxwich.dev/sandbox-id": sandbox_id.to_string() }
+        },
+        "type": "Opaque",
+        "immutable": true,
+        "data": { "token": "cmVkYWN0ZWQ=" }
+    });
+
+    for desired in [&pvc, &network_policy, &pod, &service, &secret] {
+        validate_adoption_contract(desired, desired).expect("identical resource is adoptable");
+    }
+
+    let mut changed_pvc = pvc.clone();
+    changed_pvc["spec"]["storageClassName"] = json!("wrong-storage-class");
+    let mut changed_network_policy = network_policy.clone();
+    changed_network_policy["spec"]["egress"] = json!([{}]);
+    let mut changed_pod = pod.clone();
+    changed_pod["spec"]["containers"][0]["image"] = json!("attacker.invalid/image:latest");
+    let mut changed_service = service.clone();
+    changed_service["spec"]["ports"][0]["targetPort"] = json!(22);
+    let mut changed_secret = secret.clone();
+    changed_secret["data"]["token"] = json!("YXR0YWNrZXI=");
+
+    for (desired, changed) in [
+        (&pvc, &changed_pvc),
+        (&network_policy, &changed_network_policy),
+        (&pod, &changed_pod),
+        (&service, &changed_service),
+        (&secret, &changed_secret),
+    ] {
+        let error = validate_adoption_contract(desired, changed)
+            .expect_err("drifted resource must not be adopted");
+        let provider_error = error
+            .downcast_ref::<ProviderError>()
+            .expect("adoption conflict is typed");
+        assert!(matches!(
+            provider_error.error_class(),
+            sandboxwich_core::ProvisioningErrorClass::TerminalContract
+                | sandboxwich_core::ProvisioningErrorClass::TerminalSecurity
+        ));
+    }
+}
+
+#[test]
+fn kubectl_failures_map_to_typed_provisioning_error_classes() {
+    for (stderr, expected_class, expected_reason) in [
+        (
+            "0/2 nodes are available: pod has unbound immediate PersistentVolumeClaims",
+            sandboxwich_core::ProvisioningErrorClass::RetryableCapacity,
+            "workspace_capacity_pending",
+        ),
+        (
+            "admission webhook denied the request: violates PodSecurity restricted",
+            sandboxwich_core::ProvisioningErrorClass::TerminalSecurity,
+            "kubernetes_policy_denied",
+        ),
+        (
+            "The Pod is invalid: spec.containers: Required value",
+            sandboxwich_core::ProvisioningErrorClass::TerminalContract,
+            "kubernetes_contract_invalid",
+        ),
+        (
+            "Unable to connect to the server: i/o timeout",
+            sandboxwich_core::ProvisioningErrorClass::RetryableProvider,
+            "kubernetes_provider_transient",
+        ),
+    ] {
+        let error = classified_kubectl_failure("provision stage", stderr);
+        assert_eq!(error.error_class(), expected_class);
+        assert_eq!(error.reason_code(), expected_reason);
+    }
 }
 
 #[test]

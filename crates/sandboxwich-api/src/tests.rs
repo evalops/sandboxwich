@@ -66,6 +66,8 @@ fn db_enum_registry_covers_persisted_variant_columns() {
         ("provisioning_operations", "stage"),
         ("provisioning_operations", "resource_kind"),
         ("provisioning_operations", "last_error_class"),
+        ("provisioning_operation_resources", "stage"),
+        ("provisioning_operation_resources", "resource_kind"),
     ] {
         assert!(
             seen.contains(&expected),
@@ -285,6 +287,7 @@ async fn provisioning_operation_migration_has_fenced_stage_columns() {
         "lease_id",
         "lease_attempt",
         "stage",
+        "stage_index",
         "resource_kind",
         "resource_namespace",
         "resource_name",
@@ -292,10 +295,35 @@ async fn provisioning_operation_migration_has_fenced_stage_columns() {
         "observed_generation",
         "attempt_count",
         "last_error_class",
+        "last_error_code",
         "last_error",
         "updated_at",
     ] {
         assert!(names.contains(expected), "missing column {expected}");
+    }
+
+    let resource_columns = sqlx::query("pragma table_info(provisioning_operation_resources)")
+        .fetch_all(&db.pool)
+        .await
+        .expect("inspect provisioning_operation_resources");
+    let resource_names = resource_columns
+        .iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<BTreeSet<_>>();
+    for expected in [
+        "sandbox_id",
+        "stage",
+        "resource_kind",
+        "resource_namespace",
+        "resource_name",
+        "resource_uid",
+        "observed_generation",
+        "updated_at",
+    ] {
+        assert!(
+            resource_names.contains(expected),
+            "missing resource column {expected}"
+        );
     }
 }
 
@@ -343,6 +371,7 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
             observed_generation: None,
             attempt_count: 1,
             last_error_class: None,
+            last_error_code: None,
             last_error: None,
         },
     )
@@ -354,6 +383,49 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
     assert_eq!(operation.lease_attempt, 1);
     assert_eq!(operation.stage, ProvisioningStage::WorkspaceReady);
     assert_eq!(operation.resource_uid.as_deref(), Some("uid-workspace"));
+
+    let replayed = update_provisioning_stage_in_transaction(
+        &db,
+        lease_id,
+        ProvisioningStageUpdateRequest {
+            stage: ProvisioningStage::WorkspaceReady,
+            resource_kind: Some(RuntimeResourceKind::PersistentVolumeClaim),
+            resource_namespace: Some("sandboxwich-sandboxes".to_string()),
+            resource_name: Some(format!("sandboxwich-pvc-{}", sandbox.id)),
+            resource_uid: Some("uid-workspace".to_string()),
+            observed_generation: None,
+            attempt_count: 1,
+            last_error_class: None,
+            last_error_code: None,
+            last_error: None,
+        },
+    )
+    .await
+    .expect("identical stage replay succeeds");
+    assert_eq!(replayed.updated_at, operation.updated_at);
+
+    let identity_conflict = update_provisioning_stage_in_transaction(
+        &db,
+        lease_id,
+        ProvisioningStageUpdateRequest {
+            stage: ProvisioningStage::WorkspaceReady,
+            resource_kind: Some(RuntimeResourceKind::PersistentVolumeClaim),
+            resource_namespace: Some("sandboxwich-sandboxes".to_string()),
+            resource_name: Some(format!("sandboxwich-pvc-{}", sandbox.id)),
+            resource_uid: Some("different-workspace-uid".to_string()),
+            observed_generation: None,
+            attempt_count: 1,
+            last_error_class: None,
+            last_error_code: None,
+            last_error: None,
+        },
+    )
+    .await
+    .expect_err("same resource identity cannot change within a stage");
+    assert_eq!(
+        identity_conflict.code,
+        "provisioning_resource_identity_conflict"
+    );
 
     let regression = update_provisioning_stage_in_transaction(
         &db,
@@ -367,6 +439,7 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
             observed_generation: None,
             attempt_count: 1,
             last_error_class: None,
+            last_error_code: None,
             last_error: None,
         },
     )
@@ -394,6 +467,27 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
     .await
     .expect("insert reclaimed lease");
 
+    let handshake = update_provisioning_stage_in_transaction(
+        &db,
+        reclaimed_lease_id,
+        ProvisioningStageUpdateRequest {
+            stage: ProvisioningStage::WorkspacePlanned,
+            resource_kind: None,
+            resource_namespace: None,
+            resource_name: None,
+            resource_uid: None,
+            observed_generation: None,
+            attempt_count: 2,
+            last_error_class: None,
+            last_error_code: None,
+            last_error: None,
+        },
+    )
+    .await
+    .expect("new lease attempt resumes without regressing durable stage");
+    assert_eq!(handshake.stage, ProvisioningStage::WorkspaceReady);
+    assert_eq!(handshake.lease_attempt, 2);
+
     let reclaimed = update_provisioning_stage_in_transaction(
         &db,
         reclaimed_lease_id,
@@ -406,12 +500,40 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
             observed_generation: Some(1),
             attempt_count: 2,
             last_error_class: None,
+            last_error_code: None,
             last_error: None,
         },
     )
     .await
     .expect("new lease attempt owns operation");
     assert_eq!(reclaimed.lease_attempt, 2);
+
+    let failed_stage = update_provisioning_stage_in_transaction(
+        &db,
+        reclaimed_lease_id,
+        ProvisioningStageUpdateRequest {
+            stage: ProvisioningStage::PodReady,
+            resource_kind: None,
+            resource_namespace: None,
+            resource_name: None,
+            resource_uid: None,
+            observed_generation: None,
+            attempt_count: 2,
+            last_error_class: Some(ProvisioningErrorClass::RetryableCapacity),
+            last_error_code: Some("workspace_capacity_pending".to_string()),
+            last_error: Some("workspace_capacity_pending: pod unschedulable".to_string()),
+        },
+    )
+    .await
+    .expect("typed failure updates the current durable stage");
+    assert_eq!(
+        failed_stage.last_error_class,
+        Some(ProvisioningErrorClass::RetryableCapacity)
+    );
+    assert_eq!(
+        failed_stage.last_error_code.as_deref(),
+        Some("workspace_capacity_pending")
+    );
 
     let stale = update_provisioning_stage_in_transaction(
         &db,
@@ -425,6 +547,7 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
             observed_generation: None,
             attempt_count: 2,
             last_error_class: None,
+            last_error_code: None,
             last_error: None,
         },
     )

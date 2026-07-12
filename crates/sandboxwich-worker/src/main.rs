@@ -1508,7 +1508,39 @@ fn execute_job_with_reporter(
         JobKind::ProvisionSandbox => {
             let sandbox_id = sandbox_id_from_payload(&job.payload)?;
             let spec = provision_spec_from_payload(&job.payload)?;
-            let handle = provider.provision_staged(sandbox_id, &spec, cancelled, report)?;
+            let mut last_stage = sandboxwich_core::ProvisioningStage::WorkspacePlanned;
+            let mut tracking_reporter = |update: ProvisioningStageUpdateRequest| {
+                last_stage = update.stage.clone();
+                report(update)
+            };
+            let handle = match provider.provision_staged(
+                sandbox_id,
+                &spec,
+                cancelled,
+                &mut tracking_reporter,
+            ) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    if let Some(provider_error) = error
+                        .chain()
+                        .find_map(|cause| cause.downcast_ref::<ProviderError>())
+                    {
+                        report(ProvisioningStageUpdateRequest {
+                            stage: last_stage,
+                            resource_kind: None,
+                            resource_namespace: None,
+                            resource_name: None,
+                            resource_uid: None,
+                            observed_generation: None,
+                            attempt_count: job.attempts.max(1),
+                            last_error_class: Some(provider_error.error_class()),
+                            last_error_code: Some(provider_error.reason_code().to_string()),
+                            last_error: Some(provider_error.to_string()),
+                        })?;
+                    }
+                    return Err(error);
+                }
+            };
             Ok(WorkerJobOutcome::Complete(
                 WorkerJobResult::ProvisionSandbox { handle },
             ))

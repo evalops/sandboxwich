@@ -1336,6 +1336,108 @@ fn runtime_resource_kind_for_kubernetes_kind(kind: &str) -> anyhow::Result<Runti
     }
 }
 
+fn adoption_contract(resource: &Value) -> anyhow::Result<Value> {
+    let kind = resource["kind"]
+        .as_str()
+        .context("Kubernetes resource kind is required")?;
+    let contract = match kind {
+        "PersistentVolumeClaim" => json!({
+            "storageClassName": resource["spec"]["storageClassName"],
+            "accessModes": resource["spec"]["accessModes"],
+            "volumeMode": resource["spec"]["volumeMode"],
+            "dataSource": resource["spec"]["dataSource"],
+        }),
+        "NetworkPolicy" => resource["spec"].clone(),
+        "Pod" => json!({
+            "runtimeClassName": resource["spec"]["runtimeClassName"],
+            "automountServiceAccountToken": resource["spec"]["automountServiceAccountToken"],
+            "hostNetwork": resource["spec"]["hostNetwork"],
+            "hostPID": resource["spec"]["hostPID"],
+            "hostIPC": resource["spec"]["hostIPC"],
+            "securityContext": resource["spec"]["securityContext"],
+            "containers": resource["spec"]["containers"],
+            "volumes": resource["spec"]["volumes"],
+        }),
+        "Service" => json!({
+            "type": resource["spec"]["type"],
+            "selector": resource["spec"]["selector"],
+            "ports": resource["spec"]["ports"],
+        }),
+        "Secret" => json!({
+            "type": resource["type"],
+            "immutable": resource["immutable"],
+            "data": resource["data"],
+            "stringData": resource["stringData"],
+        }),
+        other => bail!("unsupported adoption contract for Kubernetes kind {other}"),
+    };
+    Ok(contract)
+}
+
+fn validate_adoption_contract(desired: &Value, observed: &Value) -> anyhow::Result<()> {
+    let kind = desired["kind"]
+        .as_str()
+        .context("desired Kubernetes resource kind is required")?;
+    if observed["kind"] != desired["kind"]
+        || observed["metadata"]["name"] != desired["metadata"]["name"]
+        || observed["metadata"]["namespace"] != desired["metadata"]["namespace"]
+        || adoption_contract(observed)? != adoption_contract(desired)?
+    {
+        let error_class = match kind {
+            "Pod" | "NetworkPolicy" | "Secret" => ProvisioningErrorClass::TerminalSecurity,
+            _ => ProvisioningErrorClass::TerminalContract,
+        };
+        return Err(anyhow::Error::new(ProviderError::classified(
+            error_class,
+            "resource_contract_conflict",
+            anyhow::anyhow!("existing Kubernetes {kind} does not match the desired contract"),
+        )));
+    }
+    Ok(())
+}
+
+fn classified_kubectl_failure(context: &str, stderr: &str) -> ProviderError {
+    let message = format!("{context}: {stderr}");
+    let normalized = stderr.to_ascii_lowercase();
+    if normalized.contains("unbound immediate persistentvolumeclaims")
+        || normalized.contains("insufficient cpu")
+        || normalized.contains("insufficient memory")
+        || normalized.contains("unschedulable")
+    {
+        return ProviderError::classified(
+            ProvisioningErrorClass::RetryableCapacity,
+            "workspace_capacity_pending",
+            anyhow::anyhow!(message),
+        );
+    }
+    if normalized.contains("admission")
+        || normalized.contains("forbidden")
+        || normalized.contains("denied")
+        || normalized.contains("unauthorized")
+    {
+        return ProviderError::classified(
+            ProvisioningErrorClass::TerminalSecurity,
+            "kubernetes_policy_denied",
+            anyhow::anyhow!(message),
+        );
+    }
+    if normalized.contains("invalid")
+        || normalized.contains("immutable")
+        || normalized.contains("required value")
+    {
+        return ProviderError::classified(
+            ProvisioningErrorClass::TerminalContract,
+            "kubernetes_contract_invalid",
+            anyhow::anyhow!(message),
+        );
+    }
+    ProviderError::classified(
+        ProvisioningErrorClass::RetryableProvider,
+        "kubernetes_provider_transient",
+        anyhow::anyhow!(message),
+    )
+}
+
 fn stage_update(
     stage: ProvisioningStage,
     identity: Option<KubernetesResourceIdentity>,
@@ -1349,6 +1451,7 @@ fn stage_update(
         observed_generation: identity.and_then(|value| value.observed_generation),
         attempt_count: 1,
         last_error_class: None,
+        last_error_code: None,
         last_error: None,
     }
 }
@@ -1452,11 +1555,10 @@ impl KubernetesApplyProvider {
         let pod_identity = self.apply_or_adopt_manifest(&pod, sandbox_id, cancelled)?;
         let wait = self.wait_for_pod_ready(sandbox_id, cancelled)?;
         if !wait.success {
-            bail!(
-                "sandbox pod did not become ready with {}: {}",
-                wait.status,
-                wait.stderr
-            );
+            return Err(anyhow::Error::new(classified_kubectl_failure(
+                "sandbox pod did not become ready",
+                &wait.stderr,
+            )));
         }
         report(stage_update(
             ProvisioningStage::PodReady,
@@ -1464,7 +1566,12 @@ impl KubernetesApplyProvider {
         ))?;
 
         let ssh_service = self.dry_run.ssh_service_manifest(sandbox_id);
-        self.apply_or_adopt_manifest(&ssh_service, sandbox_id, cancelled)?;
+        let ssh_service_identity =
+            self.apply_or_adopt_manifest(&ssh_service, sandbox_id, cancelled)?;
+        report(stage_update(
+            ProvisioningStage::ServiceReady,
+            Some(ssh_service_identity),
+        ))?;
         let desktop_service = self.dry_run.desktop_service_manifest(sandbox_id);
         let service_identity =
             self.apply_or_adopt_manifest(&desktop_service, sandbox_id, cancelled)?;
@@ -1496,22 +1603,11 @@ impl KubernetesApplyProvider {
         let kind = manifest["kind"]
             .as_str()
             .context("Kubernetes manifest kind is required")?;
-        let name = manifest["metadata"]["name"]
-            .as_str()
-            .context("Kubernetes manifest metadata.name is required")?;
-        let namespace = manifest["metadata"]["namespace"]
-            .as_str()
-            .context("Kubernetes manifest metadata.namespace is required")?;
         let resource_kind = runtime_resource_kind_for_kubernetes_kind(kind)?;
 
-        if let Some(identity) = self.read_resource_identity(
-            kind,
-            name,
-            namespace,
-            sandbox_id,
-            resource_kind.clone(),
-            cancelled,
-        )? {
+        if let Some(identity) =
+            self.read_resource_identity(manifest, sandbox_id, resource_kind.clone(), cancelled)?
+        {
             return Ok(identity);
         }
 
@@ -1525,25 +1621,37 @@ impl KubernetesApplyProvider {
             self.max_captured_output_bytes,
         )?;
         if !apply.success {
-            bail!(
-                "kubectl apply staged sandbox resource failed with {}: {}",
-                apply.status,
-                apply.stderr
-            );
+            return Err(anyhow::Error::new(classified_kubectl_failure(
+                "kubectl apply staged sandbox resource failed",
+                &apply.stderr,
+            )));
         }
-        self.read_resource_identity(kind, name, namespace, sandbox_id, resource_kind, cancelled)?
-            .context("staged Kubernetes resource was not observable after apply")
+        self.read_resource_identity(manifest, sandbox_id, resource_kind, cancelled)?
+            .ok_or_else(|| {
+                anyhow::Error::new(ProviderError::classified(
+                    ProvisioningErrorClass::RetryableProvider,
+                    "resource_observation_missing",
+                    anyhow::anyhow!("staged Kubernetes resource was not observable after apply"),
+                ))
+            })
     }
 
     fn read_resource_identity(
         &self,
-        kind: &str,
-        name: &str,
-        namespace: &str,
+        desired: &Value,
         sandbox_id: SandboxId,
         resource_kind: RuntimeResourceKind,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<Option<KubernetesResourceIdentity>> {
+        let kind = desired["kind"]
+            .as_str()
+            .context("Kubernetes manifest kind is required")?;
+        let name = desired["metadata"]["name"]
+            .as_str()
+            .context("Kubernetes manifest metadata.name is required")?;
+        let namespace = desired["metadata"]["namespace"]
+            .as_str()
+            .context("Kubernetes manifest metadata.namespace is required")?;
         let mut args = self.kubectl_base_args();
         args.extend([
             "get".to_string(),
@@ -1562,16 +1670,21 @@ impl KubernetesApplyProvider {
             self.max_captured_output_bytes,
         )?;
         if !output.success {
-            bail!(
-                "kubectl get staged sandbox resource failed: {}",
-                output.stderr
-            );
+            return Err(anyhow::Error::new(classified_kubectl_failure(
+                "kubectl get staged sandbox resource failed",
+                &output.stderr,
+            )));
         }
         if output.stdout.trim().is_empty() {
             return Ok(None);
         }
-        let observed: Value = serde_json::from_str(&output.stdout)
-            .context("kubectl returned invalid resource JSON")?;
+        let observed: Value = serde_json::from_str(&output.stdout).map_err(|error| {
+            anyhow::Error::new(ProviderError::classified(
+                ProvisioningErrorClass::RetryableProvider,
+                "resource_observation_invalid",
+                anyhow::Error::new(error).context("kubectl returned invalid resource JSON"),
+            ))
+        })?;
         if observed["metadata"]["labels"]["sandboxwich.dev/sandbox-id"]
             != json!(sandbox_id.to_string())
         {
@@ -1581,6 +1694,7 @@ impl KubernetesApplyProvider {
                 anyhow::anyhow!("existing Kubernetes resource has a conflicting sandbox identity"),
             )));
         }
+        validate_adoption_contract(desired, &observed)?;
         let uid = observed["metadata"]["uid"]
             .as_str()
             .context("observed Kubernetes resource UID is required")?;

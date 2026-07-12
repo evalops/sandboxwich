@@ -1699,6 +1699,8 @@ pub struct ProvisioningStageUpdateRequest {
     pub observed_generation: Option<i64>,
     pub attempt_count: i64,
     pub last_error_class: Option<ProvisioningErrorClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_code: Option<String>,
     pub last_error: Option<String>,
 }
 
@@ -1715,6 +1717,7 @@ pub struct ProvisioningOperation {
     pub observed_generation: Option<i64>,
     pub attempt_count: i64,
     pub last_error_class: Option<ProvisioningErrorClass>,
+    pub last_error_code: Option<String>,
     pub last_error: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
