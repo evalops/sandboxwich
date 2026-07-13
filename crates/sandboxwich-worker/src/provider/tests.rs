@@ -574,6 +574,11 @@ fn host_rules_render_a_separate_gateway_and_no_direct_public_egress() {
     let serialized_gateway_policy = serde_json::to_string(gateway_policy).unwrap();
     assert!(serialized_gateway_policy.contains("169.254.0.0/16"));
     assert!(serialized_gateway_policy.contains("10.0.0.0/8"));
+    assert!(!serialized_gateway_policy.contains("::ffff:"));
+    let serialized_runtime_policy = gateway["spec"]["containers"][0]["env"][0]["value"]
+        .as_str()
+        .expect("gateway policy environment is serialized JSON");
+    assert!(serialized_runtime_policy.contains("::ffff:0.0.0.0/96"));
     assert!(
         provider
             .capability_report()

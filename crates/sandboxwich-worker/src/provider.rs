@@ -1304,7 +1304,10 @@ impl KubernetesDryRunProvider {
         let denied_v6 = policy
             .denied_cidrs
             .iter()
-            .filter(|cidr| cidr.addr().is_ipv6())
+            .filter(|cidr| match cidr {
+                IpNet::V6(cidr) => cidr.network().to_ipv4_mapped().is_none(),
+                IpNet::V4(_) => false,
+            })
             .map(ToString::to_string)
             .collect::<Vec<_>>();
         Ok(Some(json!({
