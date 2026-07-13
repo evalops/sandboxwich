@@ -7,7 +7,27 @@ use sqlx::Row;
 use std::collections::BTreeMap;
 
 const LATENCY_BUCKETS: &[f64] = &[1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 900.0];
-const WARM_CLAIM_THRESHOLD_SECONDS: f64 = 30.0;
+const SLO_RETENTION_DAYS: i64 = 35;
+
+pub(crate) async fn expire_slo_observations(db: &Database) -> Result<u64, ApiError> {
+    let cutoff = (Utc::now() - chrono::Duration::days(SLO_RETENTION_DAYS)).to_rfc3339();
+    let mut deleted = 0;
+    for table in [
+        "terminal_slo_observations",
+        "provisioning_stage_observations",
+    ] {
+        let sql = format!(
+            "delete from {table} where observed_at < {}",
+            db.placeholder(1)
+        );
+        deleted += sqlx::query(&sql)
+            .bind(&cutoff)
+            .execute(&db.pool)
+            .await?
+            .rows_affected();
+    }
+    Ok(deleted)
+}
 
 #[derive(Clone)]
 struct Observation {
@@ -71,42 +91,24 @@ async fn fetch_creation_observations(
     tenant_id: Option<&str>,
 ) -> Result<Vec<Observation>, ApiError> {
     let tenant_filter = tenant_id
-        .map(|_| format!(" and j.tenant_id = {}", db.placeholder(1)))
+        .map(|_| format!(" and tenant_id = {}", db.placeholder(1)))
         .unwrap_or_default();
     let sql = format!(
-        "select j.status, s.workspace_mode, j.scheduled_at, j.updated_at,
-                min(l.leased_at) as leased_at
-         from jobs j
-         join sandboxes s on s.id = j.sandbox_id
-         left join job_leases l on l.job_id = j.id
-         where j.kind = 'provision_sandbox'
-           and j.status in ('succeeded', 'failed', 'dead', 'cancelled'){tenant_filter}
-         group by j.id, j.status, s.workspace_mode, j.scheduled_at, j.updated_at"
+        "select outcome, workspace_mode, start_type, duration_ms
+         from terminal_slo_observations
+         where metric_kind = 'sandbox_creation'{tenant_filter}"
     );
     let rows = fetch_rows(db, &sql, tenant_id).await?;
     rows.into_iter()
         .map(|row| {
-            let scheduled = timestamp(&row, "scheduled_at")?;
-            let updated = timestamp(&row, "updated_at")?;
-            let leased: Option<String> = row.try_get("leased_at")?;
-            let claim_seconds = leased
-                .as_deref()
-                .map(parse_timestamp)
-                .transpose()?
-                .map(|value| elapsed_seconds(scheduled, value))
-                .unwrap_or(f64::INFINITY);
-            let status: String = row.try_get("status")?;
+            let duration_ms: i64 = row.try_get("duration_ms")?;
             Ok(Observation {
                 labels: vec![
                     row.try_get("workspace_mode")?,
-                    if claim_seconds <= WARM_CLAIM_THRESHOLD_SECONDS {
-                        "warm".to_string()
-                    } else {
-                        "cold".to_string()
-                    },
-                    terminal_outcome(&status).to_string(),
+                    row.try_get("start_type")?,
+                    row.try_get("outcome")?,
                 ],
-                seconds: elapsed_seconds(scheduled, updated),
+                seconds: duration_ms.max(0) as f64 / 1000.0,
             })
         })
         .collect()
@@ -117,23 +119,16 @@ async fn fetch_simple_terminal_observations(
     tenant_id: Option<&str>,
     family: &str,
 ) -> Result<Vec<Observation>, ApiError> {
-    let (base, tenant_column) = match family {
-        "command" => (
-            "select c.status, c.created_at, c.finished_at
-             from commands c join sandboxes s on s.id = c.sandbox_id
-             where c.status in ('finished', 'failed') and c.finished_at is not null",
-            "s.tenant_id",
-        ),
-        "cleanup" => (
-            "select j.status, j.created_at, j.updated_at as finished_at
-             from jobs j where j.kind = 'stop_sandbox'
-             and j.status in ('succeeded', 'failed', 'dead', 'cancelled')",
-            "j.tenant_id",
-        ),
+    let metric_kind = match family {
+        "command" => "command",
+        "cleanup" => "cleanup",
         _ => unreachable!("bounded metric family"),
     };
+    let base = format!(
+        "select outcome, duration_ms from terminal_slo_observations where metric_kind = '{metric_kind}'"
+    );
     let sql = if tenant_id.is_some() {
-        format!("{base} and {tenant_column} = {}", db.placeholder(1))
+        format!("{base} and tenant_id = {}", db.placeholder(1))
     } else {
         base.to_string()
     };
@@ -141,13 +136,10 @@ async fn fetch_simple_terminal_observations(
         .await?
         .into_iter()
         .map(|row| {
-            let status: String = row.try_get("status")?;
+            let duration_ms: i64 = row.try_get("duration_ms")?;
             Ok(Observation {
-                labels: vec![terminal_outcome(&status).to_string()],
-                seconds: elapsed_seconds(
-                    timestamp(&row, "created_at")?,
-                    timestamp(&row, "finished_at")?,
-                ),
+                labels: vec![row.try_get("outcome")?],
+                seconds: duration_ms.max(0) as f64 / 1000.0,
             })
         })
         .collect()
@@ -185,15 +177,12 @@ async fn fetch_stage_observations(
     tenant_id: Option<&str>,
 ) -> Result<Vec<Observation>, ApiError> {
     let filter = tenant_id
-        .map(|_| format!(" and s.tenant_id = {}", db.placeholder(1)))
+        .map(|_| format!(" and o.tenant_id = {}", db.placeholder(1)))
         .unwrap_or_default();
     let sql = format!(
-        "select o.lease_id, o.stage, o.error_class, o.observed_at,
-                j.scheduled_at as created_at, s.workspace_mode
+        "select o.lease_id, o.stage, o.error_class, o.started_at, o.observed_at,
+                o.workspace_mode
          from provisioning_stage_observations o
-         join sandboxes s on s.id = o.sandbox_id
-         join job_leases l on l.id = o.lease_id
-         join jobs j on j.id = l.job_id
          where 1 = 1{filter}
          order by o.lease_id, o.observed_at, o.stage_index"
     );
@@ -203,8 +192,8 @@ async fn fetch_stage_observations(
     for row in rows {
         let lease_id: String = row.try_get("lease_id")?;
         let observed = timestamp(&row, "observed_at")?;
-        let created = timestamp(&row, "created_at")?;
-        let prior = previous.insert(lease_id, observed).unwrap_or(created);
+        let started = timestamp(&row, "started_at")?;
+        let prior = previous.insert(lease_id, observed).unwrap_or(started);
         let error_class: Option<String> = row.try_get("error_class")?;
         observations.push(Observation {
             labels: vec![
@@ -237,13 +226,6 @@ fn timestamp(row: &sqlx::any::AnyRow, column: &str) -> Result<DateTime<Utc>, Api
 
 fn elapsed_seconds(start: DateTime<Utc>, end: DateTime<Utc>) -> f64 {
     (end - start).num_milliseconds().max(0) as f64 / 1000.0
-}
-
-fn terminal_outcome(status: &str) -> &'static str {
-    match status {
-        "succeeded" | "finished" => "success",
-        _ => "failure",
-    }
 }
 
 fn append_counter_from_observations(

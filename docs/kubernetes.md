@@ -209,7 +209,8 @@ companion NetworkPolicy with both namespace and pod selectors; the shipped
 policy does not grant cross-namespace ingress.
 
 Latency SLO series are derived from durable database timestamps, so API
-restarts do not reset them. `sandboxwich_sandbox_creation_seconds` and
+restarts or archived-sandbox deletion do not reset them. Observations are
+retained for 35 days to cover the 30-day SLO window. `sandboxwich_sandbox_creation_seconds` and
 `sandboxwich_sandbox_creation_total` are labeled by bounded `workspace_mode`,
 `outcome`, and `start_type` values. A start is `warm` when the first worker
 lease is acquired within 30 seconds of scheduling and `cold` otherwise; this

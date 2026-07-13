@@ -253,4 +253,18 @@ async fn archived_sandbox_cleanup_cascades_dependent_rows_on_sqlite() {
         restore_source_count, 1,
         "snapshot_restore_sources rows must survive their source sandbox's deletion"
     );
+
+    let retained_slo_count: i64 = sqlx::query(
+        "select count(*) as count from terminal_slo_observations
+         where tenant_id = 'default' and metric_kind = 'sandbox_creation'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .try_get("count")
+    .unwrap();
+    assert!(
+        retained_slo_count >= 1,
+        "terminal SLO evidence must survive archived sandbox deletion"
+    );
 }
