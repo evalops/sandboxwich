@@ -476,6 +476,30 @@ fn cilium_fqdn_backend_renders_host_allow_rules() {
 }
 
 #[test]
+fn cilium_fqdn_backend_renders_controlled_wildcards_as_patterns() {
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_cilium_fqdn_egress(true);
+    let spec = SandboxProvisionSpec {
+        network_egress: NetworkEgress::Allowlist {
+            rules: vec![sandboxwich_core::NetworkAllowRule {
+                kind: NetworkAllowRuleKind::Host,
+                value: "*.packages.example.com".to_string(),
+            }],
+        },
+        ..SandboxProvisionSpec::default()
+    };
+
+    let provisioned = provider
+        .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+        .expect("configured Cilium must support controlled wildcard rules");
+    assert_eq!(
+        provisioned.metadata["manifests"]["networkPolicy"]["spec"]["egress"][0]["toFQDNs"][0]["matchPattern"],
+        "*.packages.example.com"
+    );
+}
+
+#[test]
 fn host_rules_render_a_separate_gateway_and_no_direct_public_egress() {
     let image = format!(
         "ghcr.io/evalops/sandboxwich-worker@sha256:{}",

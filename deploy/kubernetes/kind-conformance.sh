@@ -168,14 +168,14 @@ gateway_allowed="$(run_command "${gateway_id}" '["sh","-c","curl -fsS --max-time
 for assertion in \
   'curl -fsS --max-time 5 http://example.org/ >/dev/null' \
   'curl -fsS --max-time 5 http://1.1.1.1/ >/dev/null' \
-  'curl -fsS --max-time 5 http://localhost/ >/dev/null'; do
+  'curl --noproxy "" -fsS --max-time 5 http://localhost/ >/dev/null'; do
   response="$(run_command "${gateway_id}" "$(jq -cn --arg command "${assertion}" '["sh","-c",$command]')")"
   [[ "$(jq -r .command.exit_code <<<"${response}")" != "0" ]] || \
     fail "gateway deny assertion unexpectedly succeeded: ${assertion}"
 done
 kubectl -n sandboxwich-sandboxes delete pod \
   "sandboxwich-egress-gateway-${gateway_id}" --wait=true >/dev/null
-outage="$(run_command "${gateway_id}" '["sh","-c","curl -fsS --max-time 5 http://example.com/ >/dev/null"]')"
+outage="$(run_command "${gateway_id}" '["sh","-c","curl --noproxy \"*\" -fsS --max-time 5 http://example.com/ >/dev/null"]')"
 [[ "$(jq -r .command.exit_code <<<"${outage}")" != "0" ]] || \
   fail "gateway outage did not fail closed"
 stop_sandbox "${gateway_id}"

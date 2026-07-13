@@ -1124,7 +1124,13 @@ impl KubernetesDryRunProvider {
         let hosts: Vec<_> = rules
             .iter()
             .filter(|rule| rule.kind == NetworkAllowRuleKind::Host)
-            .map(|rule| json!({"matchName": rule.value}))
+            .map(|rule| {
+                if rule.value.starts_with("*.") {
+                    json!({"matchPattern": rule.value})
+                } else {
+                    json!({"matchName": rule.value})
+                }
+            })
             .collect();
         let cidrs: Vec<_> = rules
             .iter()
