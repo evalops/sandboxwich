@@ -1,4 +1,5 @@
 use super::*;
+use crate::provider::SandboxTeardownSpec;
 use chrono::Utc;
 use sandboxwich_core::{
     Job, JobId, JobStatus, RuntimeResourceKind, RuntimeResourcePurpose, SandboxId, SnapshotId,
@@ -224,8 +225,13 @@ impl SandboxProvider for FailingStagedProvider {
         )
     }
 
-    fn stop(&self, sandbox_id: SandboxId, cancelled: &CancelSignal) -> anyhow::Result<()> {
-        self.inner.stop(sandbox_id, cancelled)
+    fn stop(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxTeardownSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<()> {
+        self.inner.stop(sandbox_id, spec, cancelled)
     }
 }
 
@@ -368,9 +374,10 @@ impl SandboxProvider for FixedExecResultProvider {
     fn stop(
         &self,
         sandbox_id: sandboxwich_core::SandboxId,
+        spec: &SandboxTeardownSpec,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<()> {
-        self.inner.stop(sandbox_id, cancelled)
+        self.inner.stop(sandbox_id, spec, cancelled)
     }
 }
 
@@ -539,6 +546,25 @@ fn stop_sandbox_job_tears_down_resources_via_provider() {
         panic!("expected stop sandbox result");
     };
     assert_eq!(stopped_id, sandbox_id);
+}
+
+#[test]
+fn stop_sandbox_job_rejects_an_invalid_persisted_teardown_hint() {
+    let error = execute_job(
+        &job(
+            JobKind::StopSandbox,
+            json!({
+                "sandboxId": SandboxId::new(),
+                "deleteGkeFqdnPolicy": "yes"
+            }),
+            WorkerCapability::K8sPod,
+        ),
+        &provider(),
+        &CancelSignal::never_cancelled(),
+    )
+    .expect_err("a malformed persisted teardown hint must fail closed");
+
+    assert!(error.to_string().contains("deleteGkeFqdnPolicy"));
 }
 
 #[test]

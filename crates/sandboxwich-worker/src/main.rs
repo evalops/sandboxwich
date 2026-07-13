@@ -546,11 +546,12 @@ impl SandboxProvider for RuntimeProvider {
     fn stop(
         &self,
         sandbox_id: sandboxwich_core::SandboxId,
+        spec: &provider::SandboxTeardownSpec,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<()> {
         match self {
-            Self::DryRun(provider) => provider.stop(sandbox_id, cancelled),
-            Self::Apply(provider) => provider.stop(sandbox_id, cancelled),
+            Self::DryRun(provider) => provider.stop(sandbox_id, spec, cancelled),
+            Self::Apply(provider) => provider.stop(sandbox_id, spec, cancelled),
         }
     }
 }
@@ -1774,10 +1775,11 @@ fn execute_job_with_reporter(
         }
         JobKind::StopSandbox => {
             let sandbox_id = sandbox_id_from_payload(&job.payload)?;
+            let teardown_spec = teardown_spec_from_payload(&job.payload)?;
             // Actually tear down the sandbox's resources; propagate provider errors so
             // the job is failed (and retried per its classification) instead of the
             // control plane recording a "stopped" sandbox that keeps running.
-            provider.stop(sandbox_id, cancelled)?;
+            provider.stop(sandbox_id, &teardown_spec, cancelled)?;
             Ok(WorkerJobOutcome::Complete(WorkerJobResult::StopSandbox {
                 provider: "kubernetes".to_string(),
                 sandbox_id,
@@ -1885,6 +1887,20 @@ fn sandbox_id_from_payload(
         payload,
         "sandboxId",
     )?))
+}
+
+fn teardown_spec_from_payload(
+    payload: &serde_json::Value,
+) -> anyhow::Result<provider::SandboxTeardownSpec> {
+    let delete_gke_fqdn_policy = match payload.get("deleteGkeFqdnPolicy") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| anyhow::anyhow!("job payload deleteGkeFqdnPolicy is invalid"))?,
+    };
+    Ok(provider::SandboxTeardownSpec {
+        delete_gke_fqdn_policy,
+    })
 }
 
 fn parent_sandbox_id_from_payload(

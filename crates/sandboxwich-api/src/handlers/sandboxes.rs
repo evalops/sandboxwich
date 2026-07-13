@@ -6,6 +6,7 @@ use crate::handlers::jobs::*;
 use crate::handlers::operations::operation_from_job;
 use crate::handlers::snapshots::*;
 use crate::pagination::*;
+use crate::reconcile::list_runtime_resources_for_sandbox;
 use crate::rows::*;
 use crate::state::*;
 use axum::Json;
@@ -278,14 +279,25 @@ pub(crate) async fn stop_sandbox(
 ) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
     let mut sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
+    let delete_gke_fqdn_policy = list_runtime_resources_for_sandbox(&state.db, sandbox_id)
+        .await?
+        .iter()
+        .any(|resource| {
+            resource.provider == "kubernetes"
+                && resource.resource_kind == RuntimeResourceKind::NetworkPolicy
+                && resource.resource_name == format!("sandboxwich-fqdn-egress-{sandbox_id}")
+        });
     let now = Utc::now();
     let job = Job {
         id: JobId::new(),
         tenant_id: sandbox.tenant_id.clone(),
         kind: JobKind::StopSandbox,
         status: JobStatus::Queued,
-        payload: json!({"sandboxId": sandbox_id}),
-        required_capability: WorkerCapability::ProvisionSandbox,
+        payload: json!({
+            "sandboxId": sandbox_id,
+            "deleteGkeFqdnPolicy": delete_gke_fqdn_policy,
+        }),
+        required_capability: provision_capability(&sandbox.network_egress),
         priority: 100,
         attempts: 0,
         max_attempts: 3,

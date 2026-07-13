@@ -159,6 +159,11 @@ pub const SANDBOX_RECONCILIATION_RESOURCE_KINDS: &str =
     "pod,persistentvolumeclaim,service,secret,networkpolicy";
 const GKE_FQDN_RESOURCE_KIND: &str = "fqdnnetworkpolicy.networking.gke.io";
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SandboxTeardownSpec {
+    pub(crate) delete_gke_fqdn_policy: bool,
+}
+
 /// Cheaply cloneable signal a job's background lease-renewal task (see
 /// `handle_lease` in `main.rs`) uses to tell an in-flight `exec_handoff` call
 /// that the lease is gone -- renewal failed after retries -- so the
@@ -231,7 +236,12 @@ pub trait SandboxProvider {
     ) -> anyhow::Result<ProviderForkHandle>;
     /// Tear down every resource associated with `sandbox_id`. Must be idempotent:
     /// calling it on an already-stopped (or never-provisioned) sandbox is not an error.
-    fn stop(&self, sandbox_id: SandboxId, cancelled: &CancelSignal) -> anyhow::Result<()>;
+    fn stop(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxTeardownSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<()>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -388,16 +398,23 @@ impl KubernetesDryRunProvider {
         self
     }
 
-    fn teardown_resource_kinds(&self) -> String {
-        self.resource_kinds_with_optional_gke_fqdn(SANDBOX_TEARDOWN_RESOURCE_KINDS)
+    fn teardown_resource_kinds_with_persisted_gke_fqdn(&self, persisted_gke_fqdn: bool) -> String {
+        self.resource_kinds_with_optional_gke_fqdn(
+            SANDBOX_TEARDOWN_RESOURCE_KINDS,
+            persisted_gke_fqdn,
+        )
     }
 
     fn reconciliation_resource_kinds(&self) -> String {
-        self.resource_kinds_with_optional_gke_fqdn(SANDBOX_RECONCILIATION_RESOURCE_KINDS)
+        self.resource_kinds_with_optional_gke_fqdn(SANDBOX_RECONCILIATION_RESOURCE_KINDS, false)
     }
 
-    fn resource_kinds_with_optional_gke_fqdn(&self, base: &str) -> String {
-        if self.fqdn_egress_backend.as_deref() == Some("gke") {
+    fn resource_kinds_with_optional_gke_fqdn(
+        &self,
+        base: &str,
+        persisted_gke_fqdn: bool,
+    ) -> String {
+        if persisted_gke_fqdn || self.fqdn_egress_backend.as_deref() == Some("gke") {
             format!("{base},{GKE_FQDN_RESOURCE_KIND}")
         } else {
             base.to_string()
@@ -2662,10 +2679,19 @@ impl KubernetesApplyProvider {
     /// labeled with this sandbox's id. Split out from `stop` so it can be exercised
     /// in unit tests without invoking a real `kubectl` binary.
     fn teardown_args(&self, sandbox_id: SandboxId) -> Vec<String> {
+        self.teardown_args_with_spec(sandbox_id, &SandboxTeardownSpec::default())
+    }
+
+    fn teardown_args_with_spec(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxTeardownSpec,
+    ) -> Vec<String> {
         let mut args = self.kubectl_base_args();
         args.extend([
             "delete".to_string(),
-            self.dry_run.teardown_resource_kinds(),
+            self.dry_run
+                .teardown_resource_kinds_with_persisted_gke_fqdn(spec.delete_gke_fqdn_policy),
             "-l".to_string(),
             format!("sandboxwich.dev/sandbox-id={sandbox_id}"),
             "--ignore-not-found=true".to_string(),
@@ -3264,7 +3290,12 @@ impl SandboxProvider for KubernetesDryRunProvider {
         })
     }
 
-    fn stop(&self, _sandbox_id: SandboxId, _cancelled: &CancelSignal) -> anyhow::Result<()> {
+    fn stop(
+        &self,
+        _sandbox_id: SandboxId,
+        _spec: &SandboxTeardownSpec,
+        _cancelled: &CancelSignal,
+    ) -> anyhow::Result<()> {
         // Dry-run provider never applies anything to a cluster, so there is nothing
         // to tear down; treat it as a successful (planned) no-op.
         Ok(())
@@ -3534,9 +3565,14 @@ impl SandboxProvider for KubernetesApplyProvider {
         Ok(handle)
     }
 
-    fn stop(&self, sandbox_id: SandboxId, cancelled: &CancelSignal) -> anyhow::Result<()> {
+    fn stop(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxTeardownSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<()> {
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
-        let args = self.teardown_args(sandbox_id);
+        let args = self.teardown_args_with_spec(sandbox_id, spec);
         let output = run_kubectl_command(
             &self.kubectl,
             &args,

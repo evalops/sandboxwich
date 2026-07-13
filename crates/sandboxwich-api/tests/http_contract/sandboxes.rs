@@ -479,6 +479,39 @@ pub(crate) async fn assert_resource_tiers_and_file_contracts(
         .expect("host allowlist provisioning job must exist");
     assert_eq!(host_job.required_capability, WorkerCapability::FqdnEgress);
 
+    client
+        .post(format!(
+            "{}/sandboxes/{}/stop",
+            server.base_url, host_allowlist.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let jobs: JobListResponse = client
+        .get(format!("{}/jobs?limit=100", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let host_stop_job = jobs
+        .jobs
+        .iter()
+        .find(|job| {
+            job.kind == JobKind::StopSandbox
+                && job.payload["sandboxId"] == serde_json::json!(host_allowlist.sandbox.id)
+        })
+        .expect("host allowlist stop job must remain FQDN-worker scoped");
+    assert_eq!(
+        host_stop_job.required_capability,
+        WorkerCapability::FqdnEgress
+    );
+
     let fetched: SandboxResponse = client
         .get(format!(
             "{}/sandboxes/{}",

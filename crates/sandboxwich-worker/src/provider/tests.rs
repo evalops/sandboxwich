@@ -1391,6 +1391,26 @@ fn teardown_args_delete_every_labeled_resource_kind_scoped_to_namespace() {
 }
 
 #[test]
+fn teardown_args_honor_persisted_gke_fqdn_resource_on_an_unconfigured_worker() {
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("gke-ci", "sandboxwich-ci", None, None);
+    let apply = KubernetesApplyProvider::new(provider, "kubectl")
+        .with_kubectl_context(Some("gke-ci".to_string()))
+        .with_mutation_gate(true, true);
+
+    let args = apply.teardown_args_with_spec(
+        SandboxId::new(),
+        &SandboxTeardownSpec {
+            delete_gke_fqdn_policy: true,
+        },
+    );
+
+    assert!(args.contains(&format!(
+        "{SANDBOX_TEARDOWN_RESOURCE_KINDS},{GKE_FQDN_RESOURCE_KIND}"
+    )));
+}
+
+#[test]
 fn teardown_args_omit_context_flag_for_in_cluster_service_account() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
@@ -1412,7 +1432,11 @@ fn stop_refuses_to_mutate_without_confirm_apply_gate() {
     let apply = KubernetesApplyProvider::new(provider, "kubectl");
 
     let error = apply
-        .stop(SandboxId::new(), &CancelSignal::never_cancelled())
+        .stop(
+            SandboxId::new(),
+            &SandboxTeardownSpec::default(),
+            &CancelSignal::never_cancelled(),
+        )
         .expect_err("stop without the mutation gate should fail closed");
     assert!(error.to_string().contains("--confirm-apply"));
 }
@@ -1423,7 +1447,11 @@ fn dry_run_stop_is_a_successful_no_op() {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
 
     provider
-        .stop(SandboxId::new(), &CancelSignal::never_cancelled())
+        .stop(
+            SandboxId::new(),
+            &SandboxTeardownSpec::default(),
+            &CancelSignal::never_cancelled(),
+        )
         .expect("dry-run stop should never fail");
 }
 
@@ -1697,7 +1725,7 @@ fn provision_staged_applies_and_tracks_gke_fqdn_policy_before_pod() {
     assert!(
         provider
             .dry_run
-            .teardown_resource_kinds()
+            .teardown_resource_kinds_with_persisted_gke_fqdn(false)
             .contains("fqdnnetworkpolicy")
     );
     assert!(
@@ -2389,7 +2417,7 @@ fn stop_is_cancelled_when_lease_renewal_is_lost() {
 
     let started = std::time::Instant::now();
     let error = provider
-        .stop(sandbox_id, &cancelled)
+        .stop(sandbox_id, &SandboxTeardownSpec::default(), &cancelled)
         .expect_err("a cancelled stop must abort instead of completing");
     let elapsed = started.elapsed();
 

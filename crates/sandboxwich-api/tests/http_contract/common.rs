@@ -708,6 +708,7 @@ pub(crate) async fn run_contract(server: TestServer) {
         .unwrap();
     let stop_lease = stop_claim.lease.expect("stop must queue provider teardown");
     assert_eq!(stop_lease.job.kind, JobKind::StopSandbox);
+    assert_eq!(stop_lease.job.payload["deleteGkeFqdnPolicy"], true);
     worker_client
         .post(format!(
             "{}/leases/{}/complete",

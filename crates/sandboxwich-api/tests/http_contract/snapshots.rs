@@ -78,7 +78,17 @@ pub(crate) async fn assert_provision_job_persists_runtime_resources(
                 handle: ProviderSandboxHandle {
                     provider: "kubernetes".to_string(),
                     sandbox_id: sandbox.sandbox.id,
-                    resources: provision_resources(sandbox.sandbox.id),
+                    resources: {
+                        let mut resources = provision_resources(sandbox.sandbox.id);
+                        resources.push(provider_resource(
+                            sandbox.sandbox.id,
+                            None,
+                            RuntimeResourceKind::NetworkPolicy,
+                            RuntimeResourcePurpose::Network,
+                            format!("sandboxwich-fqdn-egress-{}", sandbox.sandbox.id),
+                        ));
+                        resources
+                    },
                     metadata: serde_json::json!({
                         "diagnostic": "provider metadata is not the durable runtime source"
                     }),
