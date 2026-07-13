@@ -14,6 +14,8 @@ The name is dumb on purpose. The contracts should not be.
 - `sandboxwich-worker`: host-side worker registration and heartbeat CLI.
 - `sandboxwich-agent`: experimental guest-side daemon/CLI. It is not included
   in the starter Ubuntu runtime image yet.
+- [`sdks/python`](sdks/python): a handwritten, typed Python client (`httpx` +
+  pydantic v2) covering the core sandbox/command/file/snapshot flows.
 
 See the [capability maturity matrix](docs/capabilities.md) before selecting a
 provider or relying on an isolation claim.
