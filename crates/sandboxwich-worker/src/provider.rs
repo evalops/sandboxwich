@@ -792,10 +792,12 @@ impl KubernetesDryRunProvider {
             for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
                 env.push(json!({"name": name, "value": proxy}));
             }
-            env.push(json!({
-                "name": "NO_PROXY",
-                "value": "localhost,127.0.0.1,::1"
-            }));
+            for name in ["NO_PROXY", "no_proxy"] {
+                env.push(json!({
+                    "name": name,
+                    "value": "localhost,127.0.0.1,::1"
+                }));
+            }
         }
 
         if let Some(secret_name) = &self.ssh_authorized_keys_secret {
@@ -1207,6 +1209,18 @@ impl KubernetesDryRunProvider {
                     "imagePullPolicy": image_pull_policy_for(image),
                     "args": ["egress-gateway"],
                     "ports": [{"name": "proxy", "containerPort": 8080}],
+                    "readinessProbe": {
+                        "tcpSocket": {"port": "proxy"},
+                        "periodSeconds": 2,
+                        "timeoutSeconds": 1,
+                        "failureThreshold": 5
+                    },
+                    "livenessProbe": {
+                        "tcpSocket": {"port": "proxy"},
+                        "periodSeconds": 10,
+                        "timeoutSeconds": 1,
+                        "failureThreshold": 3
+                    },
                     "env": [{
                         "name": "SANDBOXWICH_EGRESS_GATEWAY_POLICY",
                         "value": serde_json::to_string(&policy)?
