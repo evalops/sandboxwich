@@ -25,6 +25,7 @@ async fn run_divergence_contract(server: TestServer) {
     let sandbox: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            workspace_mode: None,
             name: Some("divergence-contract".to_string()),
             template: None,
             memory_limit: None,

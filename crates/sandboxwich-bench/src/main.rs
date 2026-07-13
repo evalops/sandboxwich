@@ -706,6 +706,7 @@ async fn run_sandbox_ttft_once(
                 template: Some("ubuntu-dev".to_string()),
                 memory_limit: None,
                 network_egress: None,
+                workspace_mode: Some(sandboxwich_core::WorkspaceMode::GenericEphemeral),
                 ttl_seconds: Some(120),
             }),
     )

@@ -118,6 +118,7 @@ async fn assert_limit_contract(server: TestServer) {
         .await
         .unwrap();
     let body = CreateSandboxRequest {
+        workspace_mode: None,
         name: Some("quota-race".into()),
         template: None,
         memory_limit: None,

@@ -145,6 +145,7 @@ async fn v1_contract_exposes_operations_openapi_request_ids_and_honest_prompt_st
     let created = client
         .post(format!("{}/v1/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            workspace_mode: None,
             name: Some("v1-contract".to_string()),
             template: None,
             memory_limit: None,
@@ -285,6 +286,7 @@ async fn platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_cor
     let unauthorized = reqwest::Client::new()
         .post(&create_url)
         .json(&CreateSandboxRequest {
+            workspace_mode: None,
             name: Some("missing-tenant-identity".to_string()),
             template: None,
             memory_limit: None,
@@ -299,6 +301,7 @@ async fn platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_cor
     let idempotency_key = uuid::Uuid::now_v7().to_string();
     let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
     let request = CreateSandboxRequest {
+        workspace_mode: None,
         name: Some("platform-provider-contract".to_string()),
         template: None,
         memory_limit: None,

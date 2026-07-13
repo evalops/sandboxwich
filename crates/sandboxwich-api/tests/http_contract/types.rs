@@ -42,6 +42,7 @@ pub(crate) async fn assert_database_rejects_invalid_typed_values(
         .bind("ubuntu-dev")
         .bind("1g")
         .bind("deny_all")
+        .bind("persistent")
         .bind(now)
         .bind(now)
         .bind(120_i64)
@@ -60,6 +61,7 @@ pub(crate) async fn assert_database_rejects_invalid_typed_values(
         .bind("ubuntu-dev")
         .bind("2g")
         .bind("deny_all")
+        .bind("persistent")
         .bind(now)
         .bind(now)
         .bind(120_i64)
@@ -78,6 +80,7 @@ pub(crate) async fn assert_database_rejects_invalid_typed_values(
         .bind("ubuntu-dev")
         .bind("1g")
         .bind("sometimes")
+        .bind("persistent")
         .bind(now)
         .bind(now)
         .bind(120_i64)
@@ -87,6 +90,25 @@ pub(crate) async fn assert_database_rejects_invalid_typed_values(
     assert!(
         invalid_network_result.is_err(),
         "invalid sandbox network egress mode was accepted"
+    );
+
+    let invalid_workspace_mode_result = sqlx::query(&insert_sandbox_sql(database_url))
+        .bind(Uuid::now_v7().to_string())
+        .bind("invalid-workspace-mode")
+        .bind("ready")
+        .bind("ubuntu-dev")
+        .bind("1g")
+        .bind("deny_all")
+        .bind("forever")
+        .bind(now)
+        .bind(now)
+        .bind(120_i64)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await;
+    assert!(
+        invalid_workspace_mode_result.is_err(),
+        "invalid sandbox workspace mode was accepted"
     );
 
     let invalid_network_rule_result = sqlx::query(&insert_network_allow_rule_sql(database_url))
@@ -526,10 +548,10 @@ pub(crate) async fn assert_database_rejects_invalid_typed_values(
 pub(crate) fn insert_sandbox_sql(database_url: &str) -> String {
     format!(
         "insert into sandboxes
-         (id, name, state, template, memory_limit, network_egress_mode,
+         (id, name, state, template, memory_limit, network_egress_mode, workspace_mode,
           created_at, updated_at, ttl_seconds, parent_snapshot_id)
          values ({})",
-        placeholders(database_url, 10)
+        placeholders(database_url, 11)
     )
 }
 

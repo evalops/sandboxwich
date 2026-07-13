@@ -15,7 +15,7 @@ use sandboxwich_core::{
     SandboxState, SnapshotCleanupResponse, SnapshotListResponse, SnapshotResponse,
     SshAccessRequest, SshAccessResponse, SshKeyListResponse, SshKeyResponse, SshKeyStatus,
     UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest,
-    WorkerListResponse,
+    WorkerListResponse, WorkspaceMode,
 };
 use uuid::Uuid;
 
@@ -164,6 +164,9 @@ struct NewArgs {
 
     #[arg(long, value_enum)]
     memory_limit: Option<MemoryLimitArg>,
+
+    #[arg(long, value_enum, default_value_t = WorkspaceModeArg::Persistent)]
+    workspace_mode: WorkspaceModeArg,
 
     #[arg(long)]
     ttl_seconds: Option<u64>,
@@ -426,6 +429,13 @@ enum MemoryLimitArg {
 }
 
 #[derive(Clone, Debug, ValueEnum)]
+enum WorkspaceModeArg {
+    Ephemeral,
+    GenericEphemeral,
+    Persistent,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
 enum NetworkEgressArg {
     DenyAll,
     Allowlist,
@@ -468,6 +478,7 @@ async fn main() -> anyhow::Result<()> {
                     template: args.template,
                     memory_limit: args.memory_limit.map(Into::into),
                     network_egress: Some(network_egress),
+                    workspace_mode: Some(args.workspace_mode.into()),
                     ttl_seconds: args.ttl_seconds,
                 })
                 .send()
@@ -529,6 +540,7 @@ async fn main() -> anyhow::Result<()> {
                     template: None,
                     memory_limit: None,
                     network_egress: None,
+                    workspace_mode: None,
                     ttl_seconds: args.ttl_seconds,
                 })
                 .send()
@@ -889,6 +901,16 @@ impl From<MemoryLimitArg> for MemoryLimit {
             MemoryLimitArg::FourG => Self::FourG,
             MemoryLimitArg::SixteenG => Self::SixteenG,
             MemoryLimitArg::SixtyFourG => Self::SixtyFourG,
+        }
+    }
+}
+
+impl From<WorkspaceModeArg> for WorkspaceMode {
+    fn from(value: WorkspaceModeArg) -> Self {
+        match value {
+            WorkspaceModeArg::Ephemeral => Self::Ephemeral,
+            WorkspaceModeArg::GenericEphemeral => Self::GenericEphemeral,
+            WorkspaceModeArg::Persistent => Self::Persistent,
         }
     }
 }
@@ -1489,6 +1511,7 @@ mod tests {
     #[test]
     fn allowlist_requires_explicit_cidrs() {
         let args = NewArgs {
+            workspace_mode: WorkspaceModeArg::Persistent,
             name: None,
             template: None,
             memory_limit: None,

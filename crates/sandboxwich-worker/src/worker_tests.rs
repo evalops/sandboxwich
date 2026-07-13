@@ -273,6 +273,7 @@ fn provisioning_failure_reports_typed_error_against_last_durable_stage() {
 fn dispatches_command_job_to_provider_exec_handoff() {
     let sandbox_id = SandboxId::new();
     let spec = SandboxProvisionSpec {
+        workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         memory_limit: sandboxwich_core::MemoryLimit::FourG,
         network_egress: Default::default(),
     };
@@ -384,6 +385,7 @@ fn run_command_job_completes_the_lease_even_when_the_command_exits_non_zero() {
     // Finished/Failed status from `exit_code`.
     let sandbox_id = SandboxId::new();
     let spec = SandboxProvisionSpec {
+        workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         memory_limit: sandboxwich_core::MemoryLimit::FourG,
         network_egress: Default::default(),
     };

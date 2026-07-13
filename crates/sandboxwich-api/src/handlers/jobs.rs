@@ -89,6 +89,7 @@ pub(crate) fn add_provision_spec_to_payload(
         serde_json::to_value(SandboxProvisionSpec {
             memory_limit: sandbox.memory_limit.clone(),
             network_egress: sandbox.network_egress.clone(),
+            workspace_mode: sandbox.workspace_mode.clone(),
         })?,
     );
     Ok(())

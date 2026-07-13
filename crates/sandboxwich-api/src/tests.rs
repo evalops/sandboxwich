@@ -178,7 +178,7 @@ fn looks_like_cidr_rejects_garbage_and_out_of_range_prefixes() {
 #[test]
 fn db_enum_fingerprint_is_versioned_and_stable_for_current_registry() {
     let fingerprint = db_enum_schema_fingerprint();
-    assert!(fingerprint.starts_with("db-enum-v2:"));
+    assert!(fingerprint.starts_with("db-enum-v3:"));
     assert_eq!(fingerprint, db_enum_schema_fingerprint());
 }
 
@@ -957,6 +957,7 @@ async fn expire_due_leases_does_not_double_process_concurrent_sweeps() {
     let worker_id = seed_worker(&db).await;
     let now = Utc::now();
     let sandbox = Sandbox {
+        workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         id: SandboxId::new(),
         tenant_id: "default".to_string(),
         name: "test-sandbox".to_string(),
@@ -1017,6 +1018,7 @@ async fn expire_due_leases_does_not_double_process_concurrent_sweeps() {
 async fn seed_sandbox_with_state(db: &Database, state: SandboxState) -> Sandbox {
     let now = Utc::now();
     let sandbox = Sandbox {
+        workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         id: SandboxId::new(),
         tenant_id: "default".to_string(),
         name: "test-sandbox".to_string(),
@@ -1234,6 +1236,7 @@ async fn cleanup_archived_sandboxes_never_deletes_a_sandbox_with_a_live_restore_
     let db = test_sqlite_db().await;
     let now = Utc::now();
     let sandbox = Sandbox {
+        workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         id: SandboxId::new(),
         tenant_id: "default".to_string(),
         name: "referenced-archived".to_string(),

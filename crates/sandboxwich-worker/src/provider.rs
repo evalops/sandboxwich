@@ -19,7 +19,7 @@ use sandboxwich_core::{
     ProviderRuntimeResource, ProviderSandboxHandle, ProviderSnapshotHandle, ProvisioningErrorClass,
     ProvisioningStage, ProvisioningStageUpdateRequest, RuntimeResourceInventoryResponse,
     RuntimeResourceKind, RuntimeResourcePurpose, RuntimeResourceStatus, SandboxId,
-    SandboxProvisionSpec, SnapshotId, WorkerCapability,
+    SandboxProvisionSpec, SnapshotId, WorkerCapability, WorkspaceMode,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -510,6 +510,13 @@ impl KubernetesDryRunProvider {
         spec: &SandboxProvisionSpec,
     ) -> anyhow::Result<serde_json::Value> {
         let network_policy = self.network_policy_manifest(sandbox_id, &spec.network_egress)?;
+        let pvc = (spec.workspace_mode == WorkspaceMode::Persistent).then(|| {
+            self.pvc_manifest(
+                format!("sandboxwich-pvc-{sandbox_id}"),
+                Some(sandbox_id),
+                &spec.memory_limit,
+            )
+        });
         Ok(json!({
             "provider": "kubernetes",
             "mode": "dry_run",
@@ -521,14 +528,15 @@ impl KubernetesDryRunProvider {
             "podName": format!("sandboxwich-{}", sandbox_id),
             "storageClass": self.storage_class,
             "snapshotClass": self.snapshot_class,
-            "workspaceStorage": self.effective_workspace_storage(&spec.memory_limit),
+            "workspaceStorage": self.effective_workspace_storage_for_spec(spec),
+            "workspaceMode": spec.workspace_mode,
             "runtime": self.runtime_metadata(),
             "resources": self.resource_metadata(&spec.memory_limit),
             "networkEgress": spec.network_egress,
             "isolation": self.isolation_metadata(),
             "manifests": {
                 "pod": self.pod_manifest(sandbox_id, spec),
-                "pvc": self.pvc_manifest(format!("sandboxwich-pvc-{sandbox_id}"), Some(sandbox_id), &spec.memory_limit),
+                "pvc": pvc,
                 "sshService": self.ssh_service_manifest(sandbox_id),
                 "desktopService": self.desktop_service_manifest(sandbox_id),
                 "networkPolicy": network_policy,
@@ -585,6 +593,17 @@ impl KubernetesDryRunProvider {
         }
     }
 
+    fn effective_workspace_storage_for_spec(&self, spec: &SandboxProvisionSpec) -> String {
+        if spec.workspace_mode == WorkspaceMode::Ephemeral {
+            // emptyDir usage counts against the container's aggregate
+            // ephemeral-storage limit. Never advertise or render a workspace
+            // ceiling above the limit that Kubernetes actually enforces.
+            Self::ephemeral_storage_limit(&spec.memory_limit).to_string()
+        } else {
+            self.effective_workspace_storage(&spec.memory_limit)
+        }
+    }
+
     fn object_metadata(&self, name: String, sandbox_id: Option<SandboxId>) -> serde_json::Value {
         let mut labels = serde_json::Map::from_iter([
             (
@@ -629,12 +648,32 @@ impl KubernetesDryRunProvider {
             "name": "workspace",
             "mountPath": "/workspace"
         })];
-        let mut volumes = vec![json!({
-            "name": "workspace",
-            "persistentVolumeClaim": {
-                "claimName": format!("sandboxwich-pvc-{sandbox_id}")
-            }
-        })];
+        let workspace_volume = match &spec.workspace_mode {
+            WorkspaceMode::Ephemeral => json!({
+                "name": "workspace",
+                "emptyDir": { "sizeLimit": self.effective_workspace_storage_for_spec(spec) }
+            }),
+            WorkspaceMode::GenericEphemeral => json!({
+                "name": "workspace",
+                "ephemeral": {
+                    "volumeClaimTemplate": {
+                        "metadata": { "labels": { "sandboxwich.dev/sandbox-id": sandbox_id } },
+                        "spec": {
+                            "accessModes": ["ReadWriteOnce"],
+                            "storageClassName": self.storage_class,
+                            "resources": { "requests": {
+                                "storage": self.effective_workspace_storage(&spec.memory_limit)
+                            }}
+                        }
+                    }
+                }
+            }),
+            WorkspaceMode::Persistent => json!({
+                "name": "workspace",
+                "persistentVolumeClaim": { "claimName": format!("sandboxwich-pvc-{sandbox_id}") }
+            }),
+        };
+        let mut volumes = vec![workspace_volume];
         let mut env = vec![
             json!({
                 "name": "SANDBOXWICH_WORKSPACE",
@@ -1112,13 +1151,22 @@ impl KubernetesDryRunProvider {
         spec: &SandboxProvisionSpec,
         status: RuntimeResourceStatus,
     ) -> Vec<ProviderRuntimeResource> {
-        vec![
-            self.workspace_pvc_resource(sandbox_id, &spec.memory_limit, status.clone(), None),
+        let mut resources = Vec::new();
+        if spec.workspace_mode == WorkspaceMode::Persistent {
+            resources.push(self.workspace_pvc_resource(
+                sandbox_id,
+                &spec.memory_limit,
+                status.clone(),
+                None,
+            ));
+        }
+        resources.extend([
             self.runtime_pod_resource(sandbox_id, status.clone()),
             self.ssh_service_resource(sandbox_id, status.clone()),
             self.desktop_service_resource(sandbox_id, status.clone()),
             self.network_policy_resource(sandbox_id, status),
-        ]
+        ]);
+        resources
     }
 
     fn fork_resources(
@@ -1751,16 +1799,21 @@ impl KubernetesApplyProvider {
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
         report(stage_update(ProvisioningStage::WorkspacePlanned, None))?;
 
-        let workspace = self.dry_run.pvc_manifest(
-            format!("sandboxwich-pvc-{sandbox_id}"),
-            Some(sandbox_id),
-            &spec.memory_limit,
-        );
-        let workspace_identity = self.apply_or_adopt_manifest(&workspace, sandbox_id, cancelled)?;
-        report(stage_update(
-            ProvisioningStage::WorkspaceReady,
-            Some(workspace_identity),
-        ))?;
+        if spec.workspace_mode == WorkspaceMode::Persistent {
+            let workspace = self.dry_run.pvc_manifest(
+                format!("sandboxwich-pvc-{sandbox_id}"),
+                Some(sandbox_id),
+                &spec.memory_limit,
+            );
+            let workspace_identity =
+                self.apply_or_adopt_manifest(&workspace, sandbox_id, cancelled)?;
+            report(stage_update(
+                ProvisioningStage::WorkspaceReady,
+                Some(workspace_identity),
+            ))?;
+        } else {
+            report(stage_update(ProvisioningStage::WorkspaceReady, None))?;
+        }
 
         let network_policy = self
             .dry_run
@@ -2382,11 +2435,14 @@ impl KubernetesApplyProvider {
         sandbox_id: SandboxId,
         spec: &SandboxProvisionSpec,
     ) -> anyhow::Result<Vec<Value>> {
-        let mut manifests = vec![self.dry_run.pvc_manifest(
-            format!("sandboxwich-pvc-{sandbox_id}"),
-            Some(sandbox_id),
-            &spec.memory_limit,
-        )];
+        let mut manifests = Vec::new();
+        if spec.workspace_mode == WorkspaceMode::Persistent {
+            manifests.push(self.dry_run.pvc_manifest(
+                format!("sandboxwich-pvc-{sandbox_id}"),
+                Some(sandbox_id),
+                &spec.memory_limit,
+            ));
+        }
         manifests.push(self.dry_run.pod_manifest(sandbox_id, spec));
         manifests.push(
             self.dry_run

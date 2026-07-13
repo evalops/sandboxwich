@@ -13,6 +13,7 @@ pub(crate) fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
     let state: String = row.try_get("state")?;
     let memory_limit: String = row.try_get("memory_limit")?;
     let network_egress_mode: String = row.try_get("network_egress_mode")?;
+    let workspace_mode: String = row.try_get("workspace_mode")?;
     let created_at: String = row.try_get("created_at")?;
     let updated_at: String = row.try_get("updated_at")?;
     let ttl_seconds: Option<i64> = row.try_get("ttl_seconds")?;
@@ -31,6 +32,8 @@ pub(crate) fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
         template: row.try_get("template")?,
         memory_limit: parse_memory_limit(&memory_limit)?,
         network_egress,
+        workspace_mode: WorkspaceMode::parse_db_str(&workspace_mode)
+            .map_err(|_| ApiError::internal("database contains invalid workspace mode"))?,
         created_at: parse_timestamp(&created_at)?,
         updated_at: parse_timestamp(&updated_at)?,
         ttl_seconds: ttl_seconds.map(|ttl| ttl as u64),
