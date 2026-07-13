@@ -687,8 +687,8 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
         ))
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
-            sandbox_id: None,
-            kinds: None,
+            sandbox_id: Some(sandbox.sandbox.id),
+            kinds: Some(vec![JobKind::CreateSnapshot]),
         })
         .send()
         .await
@@ -746,8 +746,8 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
         ))
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
-            sandbox_id: None,
-            kinds: None,
+            sandbox_id: Some(forked.sandbox.id),
+            kinds: Some(vec![JobKind::ForkSandbox]),
         })
         .send()
         .await
