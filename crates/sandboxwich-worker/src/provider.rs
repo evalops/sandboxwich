@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    net::IpAddr,
     process::Stdio,
     str::FromStr,
     sync::{
@@ -280,6 +281,11 @@ pub struct KubernetesDryRunProvider {
     /// Namespace running cluster DNS, used to scope the always-on DNS
     /// egress rule (GH-66).
     dns_namespace: String,
+    /// Additional DNS endpoints that cannot be selected as ordinary pods,
+    /// such as GKE NodeLocal DNSCache's link-local host-network address.
+    /// Access is restricted to TCP/UDP port 53 and does not weaken the
+    /// protected-CIDR carve-outs for any other traffic.
+    dns_service_ips: Vec<IpAddr>,
     /// CIDRs carved out (via NetworkPolicy `except`) of every egress allow
     /// rule that overlaps them, so sandboxes can never reach the control
     /// plane / metadata endpoints regardless of egress mode -- not just
@@ -327,6 +333,7 @@ impl KubernetesDryRunProvider {
             isolation_backend: "kubernetes".to_string(),
             sandbox_namespace: None,
             dns_namespace: DEFAULT_DNS_NAMESPACE.to_string(),
+            dns_service_ips: Vec::new(),
             egress_excluded_cidrs: DEFAULT_EGRESS_EXCLUDED_CIDRS
                 .iter()
                 .map(|cidr| cidr.to_string())
@@ -403,6 +410,16 @@ impl KubernetesDryRunProvider {
                 self.dns_namespace = dns_namespace.to_string();
             }
         }
+        self
+    }
+
+    pub fn with_dns_service_ips(mut self, dns_service_ips: Vec<IpAddr>) -> Self {
+        dns_service_ips.into_iter().for_each(|address| {
+            if !self.dns_service_ips.contains(&address) {
+                self.dns_service_ips.push(address);
+            }
+        });
+        self.dns_service_ips.sort();
         self
     }
 
@@ -1016,8 +1033,8 @@ impl KubernetesDryRunProvider {
     /// Egress rule always appended so sandboxes can resolve DNS even under
     /// a restrictive allowlist (GH-66). Scoped to the cluster DNS
     /// namespace/pods rather than left open.
-    fn dns_egress_rule(&self) -> serde_json::Value {
-        json!({
+    fn dns_egress_rules(&self) -> Vec<serde_json::Value> {
+        let mut rules = vec![json!({
             "to": [{
                 "namespaceSelector": {
                     "matchLabels": {
@@ -1034,7 +1051,21 @@ impl KubernetesDryRunProvider {
                 {"protocol": "UDP", "port": 53},
                 {"protocol": "TCP", "port": 53}
             ]
-        })
+        })];
+        rules.extend(self.dns_service_ips.iter().map(|address| {
+            let cidr = match address {
+                IpAddr::V4(address) => format!("{address}/32"),
+                IpAddr::V6(address) => format!("{address}/128"),
+            };
+            json!({
+                "to": [{"ipBlock": {"cidr": cidr}}],
+                "ports": [
+                    {"protocol": "UDP", "port": 53},
+                    {"protocol": "TCP", "port": 53}
+                ]
+            })
+        }));
+        rules
     }
 
     /// Ingress rule restricting the sandbox's ssh/desktop/vnc ports to
@@ -1075,12 +1106,11 @@ impl KubernetesDryRunProvider {
         {
             return Ok(self.cilium_fqdn_policy_manifest(sandbox_id, network_egress));
         }
-        let egress = match network_egress {
+        let mut egress = match network_egress {
             NetworkEgress::DenyAll => Vec::new(),
-            NetworkEgress::AllowAll => vec![
-                json!({ "to": [{ "ipBlock": self.ip_block("0.0.0.0/0")? }] }),
-                self.dns_egress_rule(),
-            ],
+            NetworkEgress::AllowAll => {
+                vec![json!({ "to": [{ "ipBlock": self.ip_block("0.0.0.0/0")? }] })]
+            }
             NetworkEgress::Allowlist { rules } => {
                 let mut egress: Vec<serde_json::Value> = rules
                     .iter()
@@ -1102,10 +1132,12 @@ impl KubernetesDryRunProvider {
                         "ports": [{"protocol": "TCP", "port": 8080}]
                     }));
                 }
-                egress.push(self.dns_egress_rule());
                 egress
             }
         };
+        if !matches!(network_egress, NetworkEgress::DenyAll) {
+            egress.extend(self.dns_egress_rules());
+        }
 
         Ok(json!({
             "apiVersion": "networking.k8s.io/v1",
@@ -1173,6 +1205,16 @@ impl KubernetesDryRunProvider {
         egress.push(json!({
             "toEndpoints": [{"matchLabels": {"k8s:io.kubernetes.pod.namespace": self.dns_namespace, "k8s:k8s-app": "kube-dns"}}],
             "toPorts": [{"ports": [{"port": "53", "protocol": "ANY"}]}]
+        }));
+        egress.extend(self.dns_service_ips.iter().map(|address| {
+            let cidr = match address {
+                IpAddr::V4(address) => format!("{address}/32"),
+                IpAddr::V6(address) => format!("{address}/128"),
+            };
+            json!({
+                "toCIDRSet": [{"cidr": cidr}],
+                "toPorts": [{"ports": [{"port": "53", "protocol": "ANY"}]}]
+            })
         }));
         json!({
             "apiVersion": "cilium.io/v2",
@@ -1316,6 +1358,23 @@ impl KubernetesDryRunProvider {
             })
             .map(ToString::to_string)
             .collect::<Vec<_>>();
+        let mut egress = self.dns_egress_rules();
+        egress.extend([
+            json!({
+                "to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": denied_v4}}],
+                "ports": [
+                    {"protocol": "TCP", "port": 80},
+                    {"protocol": "TCP", "port": 443}
+                ]
+            }),
+            json!({
+                "to": [{"ipBlock": {"cidr": "::/0", "except": denied_v6}}],
+                "ports": [
+                    {"protocol": "TCP", "port": 80},
+                    {"protocol": "TCP", "port": 443}
+                ]
+            }),
+        ]);
         Ok(Some(json!({
             "apiVersion": "networking.k8s.io/v1",
             "kind": "NetworkPolicy",
@@ -1336,23 +1395,7 @@ impl KubernetesDryRunProvider {
                     }}}],
                     "ports": [{"protocol": "TCP", "port": 8080}]
                 }],
-                "egress": [
-                    self.dns_egress_rule(),
-                    {
-                        "to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": denied_v4}}],
-                        "ports": [
-                            {"protocol": "TCP", "port": 80},
-                            {"protocol": "TCP", "port": 443}
-                        ]
-                    },
-                    {
-                        "to": [{"ipBlock": {"cidr": "::/0", "except": denied_v6}}],
-                        "ports": [
-                            {"protocol": "TCP", "port": 80},
-                            {"protocol": "TCP", "port": 443}
-                        ]
-                    }
-                ]
+                "egress": egress
             }
         })))
     }

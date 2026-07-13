@@ -591,6 +591,62 @@ fn host_rules_render_a_separate_gateway_and_no_direct_public_egress() {
 }
 
 #[test]
+fn node_local_dns_is_allowed_only_on_dns_ports_for_runtime_and_gateway() {
+    let image = format!(
+        "ghcr.io/evalops/sandboxwich-worker@sha256:{}",
+        "a".repeat(64)
+    );
+    let node_local_dns = "169.254.20.10".parse().unwrap();
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("gke-ci", "sandboxwich-ci", None, None)
+            .with_egress_gateway_image(Some(image))
+            .with_dns_service_ips(vec![node_local_dns]);
+    let spec = SandboxProvisionSpec {
+        network_egress: NetworkEgress::Allowlist {
+            rules: vec![sandboxwich_core::NetworkAllowRule {
+                kind: NetworkAllowRuleKind::Host,
+                value: "example.com".to_string(),
+            }],
+        },
+        ..SandboxProvisionSpec::default()
+    };
+
+    let provisioned = provider
+        .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+        .expect("node-local DNS must compose with the protected link-local carve-out");
+
+    for policy_name in ["networkPolicy", "egressGatewayNetworkPolicy"] {
+        let egress = provisioned.metadata["manifests"][policy_name]["spec"]["egress"]
+            .as_array()
+            .expect("egress rules should be rendered");
+        let dns_rule = egress
+            .iter()
+            .find(|rule| rule["to"][0]["ipBlock"]["cidr"] == "169.254.20.10/32")
+            .expect("the configured NodeLocal DNS endpoint must be explicit");
+        assert_eq!(
+            dns_rule["ports"],
+            json!([
+                {"protocol": "UDP", "port": 53},
+                {"protocol": "TCP", "port": 53}
+            ])
+        );
+    }
+
+    let gateway_egress =
+        provisioned.metadata["manifests"]["egressGatewayNetworkPolicy"]["spec"]["egress"]
+            .as_array()
+            .unwrap();
+    assert!(!gateway_egress.iter().any(|rule| {
+        rule["to"][0]["ipBlock"]["cidr"] == "169.254.20.10/32"
+            && rule["ports"].as_array().is_some_and(|ports| {
+                ports
+                    .iter()
+                    .any(|port| port["port"] == 80 || port["port"] == 443)
+            })
+    }));
+}
+
+#[test]
 fn host_rules_reject_an_unpinned_gateway_image() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("gke-ci", "sandboxwich-ci", None, None)
