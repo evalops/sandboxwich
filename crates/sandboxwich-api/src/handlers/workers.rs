@@ -125,7 +125,7 @@ pub(crate) async fn runtime_resource_inventory(
             let cleanup_deadline = if matches!(state.as_str(), "archiving" | "archived") {
                 Some(parse_timestamp(&updated_at)?)
             } else {
-                expires_at
+                None
             };
             let resource_kind: String = row.try_get("resource_kind")?;
             Ok(RuntimeResourceInventoryItem {

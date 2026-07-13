@@ -185,6 +185,12 @@ pub(crate) async fn runtime_resource_inventory_is_worker_scoped_and_bounded() {
         replacement_inventory.resources[0].uid,
         "uid-inventory-workspace"
     );
+    assert!(replacement_inventory.resources[0].expires_at.is_some());
+    assert!(
+        replacement_inventory.resources[0]
+            .cleanup_deadline
+            .is_none()
+    );
 }
 
 /// Regression test for issue #64: the guest agent running inside a sandbox

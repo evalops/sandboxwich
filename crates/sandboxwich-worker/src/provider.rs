@@ -1886,6 +1886,7 @@ impl KubernetesApplyProvider {
     fn delete_reconciled_resource(
         &self,
         resource: &ObservedKubernetesResource,
+        timeout: Duration,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<()> {
         if self.kubectl_context.is_some() {
@@ -1912,7 +1913,7 @@ impl KubernetesApplyProvider {
             host
         };
         let url = format!("https://{host}:{port}{path}");
-        let timeout = self.kubectl_command_timeout;
+        let timeout = self.kubectl_command_timeout.min(timeout);
         let request = async move {
             let client = reqwest::Client::builder()
                 .add_root_certificate(certificate)
@@ -1996,7 +1997,7 @@ impl KubernetesApplyProvider {
                         namespace: resource.namespace,
                         name: resource.name,
                         uid: resource.uid,
-                        expires_at: resource.cleanup_deadline.or(resource.expires_at),
+                        expires_at: resource.cleanup_deadline,
                     })
                     .collect(),
             })
@@ -2023,7 +2024,11 @@ impl KubernetesApplyProvider {
                 if decision.delete_allowed
                     && let Some(resource) = decision.resource.as_ref()
                 {
-                    self.delete_reconciled_resource(resource, cancelled)?;
+                    let remaining = limits.max_elapsed.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    self.delete_reconciled_resource(resource, remaining, cancelled)?;
                     deleted += 1;
                 }
             }
