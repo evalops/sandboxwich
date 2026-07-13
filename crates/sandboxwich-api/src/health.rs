@@ -2,6 +2,7 @@ use crate::auth::*;
 use crate::db::*;
 use crate::error::*;
 use crate::rows::parse_timestamp;
+use crate::slo_metrics::append_slo_metrics;
 use crate::state::*;
 use axum::Json;
 use axum::extract::{Extension, State};
@@ -130,6 +131,12 @@ pub(crate) async fn collect_prometheus_metrics(
         "Total configured online worker concurrency slots.",
         metrics.scalar("worker_capacity_slots"),
     );
+    append_gauge(
+        &mut body,
+        "sandboxwich_worker_available_slots",
+        "Online worker concurrency slots not currently leased.",
+        metrics.scalar("worker_available_slots").max(0),
+    );
     append_count_family(
         &mut body,
         "sandboxwich_job_lease_count",
@@ -176,6 +183,7 @@ pub(crate) async fn collect_prometheus_metrics(
         "Age in seconds of the stalest online worker heartbeat.",
         metrics.scalar("worker_heartbeat_oldest_seconds"),
     );
+    append_slo_metrics(&mut body, db, tenant_id).await?;
     Ok(body)
 }
 
@@ -232,6 +240,10 @@ pub(crate) async fn fetch_prometheus_metrics(
              from workers
              where status = 'online'
              union all
+             select 'worker_available_slots' as family, '' as label,
+                    coalesce((select sum(max_concurrent_jobs) from workers where status = 'online'), 0)
+                      - (select count(*) from job_leases where status = 'active') as value
+             union all
              select 'job_lease' as family, status as label, count(*) as value
              from job_leases group by status
              union all
@@ -281,6 +293,11 @@ pub(crate) async fn fetch_prometheus_metrics(
              from workers
              where status = 'online' and tenant_id = {p6}
              union all
+             select 'worker_available_slots' as family, '' as label,
+                    coalesce((select sum(max_concurrent_jobs) from workers where status = 'online' and tenant_id = {p11}), 0)
+                      - (select count(*) from job_leases join jobs on jobs.id = job_leases.job_id
+                         where job_leases.status = 'active' and jobs.tenant_id = {p12}) as value
+             union all
              select 'job_lease' as family, job_leases.status as label, count(*) as value
              from job_leases join jobs on jobs.id = job_leases.job_id
              where jobs.tenant_id = {p7} group by job_leases.status
@@ -307,12 +324,14 @@ pub(crate) async fn fetch_prometheus_metrics(
             p8 = db.placeholder(8),
             p9 = db.placeholder(9),
             p10 = db.placeholder(10),
+            p11 = db.placeholder(11),
+            p12 = db.placeholder(12),
         ),
     };
 
     let mut query = sqlx::query(&sql);
     if let Some(tenant_id) = tenant_id {
-        for _ in 0..10 {
+        for _ in 0..12 {
             query = query.bind(tenant_id.to_string());
         }
     }

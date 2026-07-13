@@ -14,6 +14,7 @@ mod request_id;
 mod routes;
 mod rows;
 mod scheduler;
+mod slo_metrics;
 mod state;
 #[cfg(test)]
 mod tests;

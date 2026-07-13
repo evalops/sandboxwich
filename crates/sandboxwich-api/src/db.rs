@@ -131,9 +131,9 @@ pub(crate) async fn ensure_database_constraints(db: &Database) -> anyhow::Result
 }
 
 pub(crate) const DB_ENUM_SCHEMA_METADATA_KEY: &str = "db_enum_constraints_fingerprint";
-// v3 adds workspace mode to the reconciled enum constraints. Bumping the
-// version forces existing installations to install the new guard on upgrade.
-pub(crate) const DB_ENUM_SCHEMA_FINGERPRINT_VERSION: &str = "db-enum-v3";
+// v4 adds durable provisioning-stage observation constraints. Bumping the
+// version forces existing installations to install the new guards on upgrade.
+pub(crate) const DB_ENUM_SCHEMA_FINGERPRINT_VERSION: &str = "db-enum-v4";
 pub(crate) const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 pub(crate) const FNV_PRIME: u64 = 0x00000100000001b3;
 
@@ -437,6 +437,20 @@ pub(crate) const DB_ENUM_COLUMNS: &[DbEnumColumn] = &[
         "provisioning_operation_resources_kind_check",
         <RuntimeResourceKind as DbVariant>::VALUES,
         "invalid provisioning resource kind",
+    ),
+    DbEnumColumn::new(
+        "provisioning_stage_observations",
+        "stage",
+        "provisioning_stage_observations_stage_check",
+        <ProvisioningStage as DbVariant>::VALUES,
+        "invalid provisioning observation stage",
+    ),
+    DbEnumColumn::new(
+        "provisioning_stage_observations",
+        "error_class",
+        "provisioning_stage_observations_error_class_check",
+        <ProvisioningErrorClass as DbVariant>::VALUES,
+        "invalid provisioning observation error class",
     ),
 ];
 

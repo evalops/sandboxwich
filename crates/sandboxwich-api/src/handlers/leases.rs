@@ -598,6 +598,32 @@ pub(crate) async fn update_provisioning_stage_in_transaction(
             ));
         }
 
+        let observation_sql = format!(
+            "insert into provisioning_stage_observations
+             (sandbox_id, lease_id, tenant_id, workspace_mode, stage, stage_index, lease_attempt, error_class, started_at, observed_at)
+             values ({}) on conflict (lease_id, stage) do update set
+               error_class = excluded.error_class
+             where excluded.error_class is not null",
+            db.placeholders(10)
+        );
+        sqlx::query(&observation_sql)
+            .bind(sandbox_id.to_string())
+            .bind(lease.id.to_string())
+            .bind(&lease.job.tenant_id)
+            .bind(
+                lease.job.payload["provisionSpec"]["workspace_mode"]
+                    .as_str()
+                    .unwrap_or("persistent"),
+            )
+            .bind(request.stage.as_db_str())
+            .bind(i64::from(request.stage.ordinal()))
+            .bind(lease.attempt)
+            .bind(request.last_error_class.as_ref().map(DbVariant::as_db_str))
+            .bind(lease.job.scheduled_at.to_rfc3339())
+            .bind(now.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+
         if let (
             Some(resource_kind),
             Some(resource_namespace),
@@ -803,9 +829,14 @@ pub(crate) async fn complete_lease_in_transaction(
 
         let now = Utc::now();
         complete_active_lease_on_connection(db, &mut tx, lease_id, now).await?;
+        let successful = match &result {
+            WorkerJobResult::RunCommand { result } => result.exit_code == Some(0),
+            _ => true,
+        };
         apply_completed_job_on_connection(db, &mut tx, &lease.job, result).await?;
         update_job_status_on_connection(db, &mut tx, lease.job_id, JobStatus::Succeeded, None, now)
             .await?;
+        record_terminal_slo_observation(db, &mut tx, &lease, successful, now).await?;
 
         fetch_lease_on_connection(db, &mut tx, lease_id).await
     }
@@ -887,6 +918,7 @@ pub(crate) async fn fail_lease_in_transaction(
             )
             .await?;
             apply_failed_job_on_connection(db, &mut tx, &lease.job, error).await?;
+            record_terminal_slo_observation(db, &mut tx, &lease, false, now).await?;
         }
 
         fetch_lease_on_connection(db, &mut tx, lease_id).await
@@ -983,7 +1015,7 @@ pub(crate) async fn expire_lease_if_still_active(
         }
 
         let lease = fetch_lease_on_connection(db, &mut tx, lease_id).await?;
-        let job = lease.job;
+        let job = lease.job.clone();
         let next_status = if job.attempts >= job.max_attempts {
             JobStatus::Dead
         } else {
@@ -1000,6 +1032,7 @@ pub(crate) async fn expire_lease_if_still_active(
         .await?;
         if job.attempts >= job.max_attempts {
             apply_failed_job_on_connection(db, &mut tx, &job, "lease expired").await?;
+            record_terminal_slo_observation(db, &mut tx, &lease, false, now).await?;
         } else {
             apply_retryable_job_on_connection(db, &mut tx, &job, "lease expired").await?;
         }
@@ -1019,6 +1052,56 @@ pub(crate) async fn expire_lease_if_still_active(
             Err(error)
         }
     }
+}
+
+async fn record_terminal_slo_observation(
+    db: &Database,
+    connection: &mut AnyConnection,
+    lease: &JobLease,
+    successful: bool,
+    observed_at: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    let metric_kind = match lease.job.kind {
+        JobKind::ProvisionSandbox => "sandbox_creation",
+        JobKind::RunCommand => "command",
+        JobKind::StopSandbox => "cleanup",
+        _ => return Ok(()),
+    };
+    let workspace_mode = (metric_kind == "sandbox_creation").then(|| {
+        lease.job.payload["provisionSpec"]["workspace_mode"]
+            .as_str()
+            .unwrap_or("persistent")
+            .to_string()
+    });
+    let start_type = (metric_kind == "sandbox_creation").then(|| {
+        if (lease.leased_at - lease.job.scheduled_at).num_seconds() <= 30 {
+            "warm"
+        } else {
+            "cold"
+        }
+    });
+    let sql = format!(
+        "insert into terminal_slo_observations
+         (source_id, tenant_id, metric_kind, outcome, workspace_mode, start_type, duration_ms, observed_at)
+         values ({}) on conflict do nothing",
+        db.placeholders(8)
+    );
+    sqlx::query(&sql)
+        .bind(lease.job.id.to_string())
+        .bind(&lease.job.tenant_id)
+        .bind(metric_kind)
+        .bind(if successful { "success" } else { "failure" })
+        .bind(workspace_mode)
+        .bind(start_type)
+        .bind(
+            (observed_at - lease.job.scheduled_at)
+                .num_milliseconds()
+                .max(0),
+        )
+        .bind(observed_at.to_rfc3339())
+        .execute(&mut *connection)
+        .await?;
+    Ok(())
 }
 
 /// Guarded, atomic `active` -> `expired` transition. Returns `true` only if this
