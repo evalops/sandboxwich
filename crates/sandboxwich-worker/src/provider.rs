@@ -620,8 +620,19 @@ impl KubernetesDryRunProvider {
             && let Some(rule) = rules
                 .iter()
                 .find(|rule| rule.kind == NetworkAllowRuleKind::Host)
-            && !matches!(self.fqdn_egress_backend.as_deref(), Some("cilium" | "gke"))
         {
+            if self.fqdn_egress_backend.as_deref() == Some("gke") {
+                if !self.egress_excluded_cidrs.is_empty() {
+                    bail!(
+                        "GKE FQDNNetworkPolicy is additive with Kubernetes NetworkPolicy and cannot preserve excluded CIDR denies for host allow rule {}; refusing to provision an unsafe sandbox",
+                        rule.value
+                    );
+                }
+                return Ok(());
+            }
+            if self.fqdn_egress_backend.as_deref() == Some("cilium") {
+                return Ok(());
+            }
             bail!(
                 "standard Kubernetes NetworkPolicy cannot enforce host allow rule {}; use cidr allow rules or a provider with FQDN egress support",
                 rule.value

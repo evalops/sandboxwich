@@ -476,7 +476,7 @@ fn cilium_fqdn_backend_renders_host_allow_rules() {
 }
 
 #[test]
-fn gke_fqdn_backend_renders_additive_ingress_and_host_egress_policies() {
+fn gke_fqdn_manifest_limits_host_egress_to_web_ports() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("gke-ci", "sandboxwich-ci", None, None)
             .with_gke_fqdn_egress(true);
@@ -491,13 +491,9 @@ fn gke_fqdn_backend_renders_additive_ingress_and_host_egress_policies() {
         },
     };
 
-    let provisioned = provider
-        .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
-        .expect("configured GKE FQDN policy must support host allow rules");
-    let standard = &provisioned.metadata["manifests"]["networkPolicy"];
-    let fqdn = &provisioned.metadata["manifests"]["fqdnNetworkPolicy"];
-    assert_eq!(standard["apiVersion"], "networking.k8s.io/v1");
-    assert_eq!(standard["kind"], "NetworkPolicy");
+    let fqdn = provider
+        .gke_fqdn_policy_manifest(SandboxId::new(), &spec.network_egress)
+        .expect("configured GKE backend renders its policy document");
     assert_eq!(fqdn["apiVersion"], "networking.gke.io/v1alpha1");
     assert_eq!(fqdn["kind"], "FQDNNetworkPolicy");
     assert_eq!(
@@ -512,6 +508,30 @@ fn gke_fqdn_backend_renders_additive_ingress_and_host_egress_policies() {
             .capabilities
             .contains(&WorkerCapability::FqdnEgress)
     );
+}
+
+#[test]
+fn gke_fqdn_backend_rejects_hosts_when_excluded_cidr_denies_are_required() {
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("gke-ci", "sandboxwich-ci", None, None)
+            .with_gke_fqdn_egress(true);
+    let spec = SandboxProvisionSpec {
+        workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        memory_limit: MemoryLimit::OneG,
+        network_egress: NetworkEgress::Allowlist {
+            rules: vec![sandboxwich_core::NetworkAllowRule {
+                kind: NetworkAllowRuleKind::Host,
+                value: "metadata.google.internal".to_string(),
+            }],
+        },
+    };
+
+    let error = provider
+        .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+        .expect_err("GKE FQDN policy must not bypass excluded metadata CIDRs");
+
+    assert!(error.to_string().contains("additive"));
+    assert!(error.to_string().contains("excluded CIDR denies"));
 }
 
 #[test]
@@ -1669,7 +1689,7 @@ fn provision_staged_applies_resources_in_durable_order_and_reports_uids() {
 }
 
 #[test]
-fn provision_staged_applies_and_tracks_gke_fqdn_policy_before_pod() {
+fn provision_staged_rejects_gke_fqdn_before_any_cluster_mutation() {
     let (kubectl, log_path) = write_stateful_fake_kubectl();
     let dry_run =
         KubernetesDryRunProvider::with_snapshot_class("gke-ci", "sandboxwich-ci", None, None)
@@ -1686,42 +1706,14 @@ fn provision_staged_applies_and_tracks_gke_fqdn_policy_before_pod() {
         },
         ..SandboxProvisionSpec::default()
     };
-    let mut reports = Vec::new();
+    let error = provider
+        .provision_staged(sandbox_id, &spec, &CancelSignal::never_cancelled(), |_| {
+            Ok(())
+        })
+        .expect_err("additive GKE policy must fail before applying cluster resources");
 
-    let handle = provider
-        .provision_staged(
-            sandbox_id,
-            &spec,
-            &CancelSignal::never_cancelled(),
-            |report| {
-                reports.push(report);
-                Ok(())
-            },
-        )
-        .expect("GKE FQDN staged provision succeeds");
-
-    let log = std::fs::read_to_string(&log_path).expect("read staged kubectl log");
-    assert!(log.contains("FQDNNetworkPolicy"));
-    assert!(
-        log.find("FQDNNetworkPolicy").expect("FQDN apply") < log.find(" wait ").expect("pod wait"),
-        "the enforceable egress policy must be durable before pod readiness: {log}"
-    );
-    assert_eq!(
-        reports
-            .iter()
-            .filter(|report| report.stage == sandboxwich_core::ProvisioningStage::NetworkPolicyReady)
-            .count(),
-        2
-    );
-    assert_eq!(
-        handle
-            .resources
-            .iter()
-            .filter(|resource| resource.resource_kind
-                == sandboxwich_core::RuntimeResourceKind::NetworkPolicy)
-            .count(),
-        2
-    );
+    assert!(error.to_string().contains("excluded CIDR denies"));
+    assert!(!log_path.exists(), "kubectl must not run before rejection");
     assert!(
         provider
             .dry_run

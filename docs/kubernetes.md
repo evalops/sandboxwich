@@ -11,11 +11,14 @@ Host egress allowlists require an enforceable FQDN backend. Set
 is managed by Cilium with DNS proxy enforcement, or set
 `SANDBOXWICH_GKE_FQDN_EGRESS=true` on GKE Dataplane V2 clusters with FQDN
 Network Policy enabled. The two options are mutually exclusive. GKE workers
-render an additive `networking.gke.io/v1alpha1` `FQDNNetworkPolicy` limited to
-TCP ports 80 and 443 while retaining the standard NetworkPolicy for ingress,
-DNS, and CIDR rules. Those workers advertise `fqdn_egress`; host-bearing
-provision jobs remain queued when no capable worker is online. Workers using
-standard Kubernetes NetworkPolicy continue rejecting host rules.
+can render an additive `networking.gke.io/v1alpha1` `FQDNNetworkPolicy` limited
+to TCP ports 80 and 443. Because GKE combines that allow with standard
+NetworkPolicy allows, the worker rejects host-bearing provisions while any
+excluded metadata/control-plane CIDRs are configured: the standard policy's
+CIDR carve-outs cannot veto an FQDN allow. This fail-closed behavior prevents a
+hostname that resolves into an excluded range from bypassing the carve-out.
+Use Cilium when host allowlisting and excluded-CIDR denies are both required.
+Workers using standard Kubernetes NetworkPolicy continue rejecting host rules.
 
 `sandboxwich` is being shaped to run comfortably on k3s and Kubernetes. The control plane is stateless except for Postgres, and workers register themselves with typed capabilities before they claim any work.
 
