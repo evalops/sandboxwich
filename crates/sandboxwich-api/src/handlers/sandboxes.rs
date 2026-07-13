@@ -304,7 +304,7 @@ pub(crate) async fn stop_sandbox(
             "sandboxId": sandbox_id,
             "deleteGkeFqdnPolicy": delete_gke_fqdn_policy,
         }),
-        required_capability: provision_capability(&sandbox.network_egress),
+        required_capability: WorkerCapability::ProvisionSandbox,
         priority: 100,
         attempts: 0,
         max_attempts: 3,

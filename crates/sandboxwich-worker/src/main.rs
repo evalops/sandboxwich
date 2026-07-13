@@ -8,7 +8,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use provider::{
     CancelSignal, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES, KUBERNETES_MUTATION_ENV,
     KubernetesApplyProvider, KubernetesDryRunProvider, ProviderError, ReconciliationLimits,
-    RetryDisposition, SandboxProvider,
+    RetryDisposition, SandboxProvider, image_is_digest_pinned,
 };
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse,
@@ -753,7 +753,12 @@ async fn main() -> anyhow::Result<()> {
         Command::Run(args) => {
             let runtime_class_name = args.provider.provider.runtime_class_name.as_deref();
             let fqdn_egress_backend = args.provider.provider.cilium_fqdn_egress
-                || non_empty(args.provider.provider.egress_gateway_image.clone()).is_some();
+                || args
+                    .provider
+                    .provider
+                    .egress_gateway_image
+                    .as_deref()
+                    .is_some_and(image_is_digest_pinned);
             let capabilities =
                 capabilities_from_args(args.capability, runtime_class_name, fqdn_egress_backend);
             let labels: BTreeMap<_, _> = args.label.into_iter().collect();

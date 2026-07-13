@@ -274,6 +274,22 @@ fn image_pull_policy_tracks_tag_mutability() {
 }
 
 #[test]
+fn digest_pin_validation_requires_an_exact_lowercase_sha256() {
+    assert!(image_is_digest_pinned(&format!(
+        "ghcr.io/evalops/sandboxwich-worker@sha256:{}",
+        "a".repeat(64)
+    )));
+    for image in [
+        "ghcr.io/evalops/sandboxwich-worker:latest",
+        "ghcr.io/evalops/sandboxwich-worker@sha256:abc",
+        "ghcr.io/evalops/sandboxwich-worker@sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+        assert!(!image_is_digest_pinned(image), "accepted {image}");
+    }
+}
+
+#[test]
 fn kubernetes_dry_run_uses_configured_workspace_storage() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)

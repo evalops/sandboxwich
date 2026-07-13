@@ -118,6 +118,16 @@ pub(crate) fn image_pull_policy_for(image: &str) -> &'static str {
     }
 }
 
+pub(crate) fn image_is_digest_pinned(image: &str) -> bool {
+    image.split_once("@sha256:").is_some_and(|(name, digest)| {
+        !name.is_empty()
+            && digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
 /// Default cap on the stdout/stderr captured from a single `kubectl` invocation
 /// before it's stored in a `KubectlOutput` (and, from there, in job results and
 /// provider metadata sent back to the control plane). Mirrors
@@ -637,7 +647,7 @@ impl KubernetesDryRunProvider {
                 return Ok(());
             }
             if let Some(image) = &self.egress_gateway_image {
-                if image.contains("@sha256:") {
+                if image_is_digest_pinned(image) {
                     return Ok(());
                 }
                 bail!(

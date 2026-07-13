@@ -509,7 +509,7 @@ pub(crate) async fn assert_resource_tiers_and_file_contracts(
         .expect("host allowlist stop job must remain FQDN-worker scoped");
     assert_eq!(
         host_stop_job.required_capability,
-        WorkerCapability::FqdnEgress
+        WorkerCapability::ProvisionSandbox
     );
 
     let fetched: SandboxResponse = client
