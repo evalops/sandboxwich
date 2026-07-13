@@ -34,6 +34,20 @@ class DeploymentImagesTest(unittest.TestCase):
         self.assertIn("sandboxwich-api@sha256:[0-9a-f]\\{64\\}", script)
         self.assertIn("sandboxwich-worker@sha256:[0-9a-f]\\{64\\}", script)
 
+    def test_private_dns_probe_cannot_bypass_the_gateway_via_no_proxy(self) -> None:
+        script = (ROOT / "deploy/kubernetes/kind-conformance.sh").read_text()
+        self.assertIn(
+            'curl --noproxy "" -fsS --max-time 5 http://localhost/',
+            script,
+        )
+
+    def test_gateway_outage_probe_bypasses_the_proxy(self) -> None:
+        script = (ROOT / "deploy/kubernetes/kind-conformance.sh").read_text()
+        self.assertIn(
+            'curl --noproxy \\"*\\" -fsS --max-time 5 http://example.com/',
+            script,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
