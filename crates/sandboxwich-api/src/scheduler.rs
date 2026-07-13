@@ -5,7 +5,6 @@ use crate::handlers::snapshots::*;
 use crate::handlers::workers::*;
 use crate::idempotency::expire_idempotency_records;
 use crate::limits::expire_tenant_limit_counters;
-use crate::slo_metrics::expire_slo_observations;
 use std::time::Duration;
 
 /// Runs the lease/snapshot/desktop-session expiry sweeps on a fixed interval in
@@ -47,9 +46,6 @@ pub(crate) fn spawn_expiry_sweeper(
             }
             if let Err(error) = expire_tenant_limit_counters(&db).await {
                 tracing::warn!(?error, "tenant limit counter retention sweep failed");
-            }
-            if let Err(error) = expire_slo_observations(&db).await {
-                tracing::warn!(?error, "SLO observation retention sweep failed");
             }
         }
     })

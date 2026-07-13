@@ -7,28 +7,6 @@ use sqlx::Row;
 use std::collections::BTreeMap;
 
 const LATENCY_BUCKETS: &[f64] = &[1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 900.0];
-const SLO_RETENTION_DAYS: i64 = 35;
-
-pub(crate) async fn expire_slo_observations(db: &Database) -> Result<u64, ApiError> {
-    let cutoff = (Utc::now() - chrono::Duration::days(SLO_RETENTION_DAYS)).to_rfc3339();
-    let mut deleted = 0;
-    for table in [
-        "terminal_slo_observations",
-        "provisioning_stage_observations",
-    ] {
-        let sql = format!(
-            "delete from {table} where observed_at < {}",
-            db.placeholder(1)
-        );
-        deleted += sqlx::query(&sql)
-            .bind(&cutoff)
-            .execute(&db.pool)
-            .await?
-            .rows_affected();
-    }
-    Ok(deleted)
-}
-
 #[derive(Clone)]
 struct Observation {
     labels: Vec<String>,
