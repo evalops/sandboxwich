@@ -29,6 +29,13 @@ pub(crate) async fn claim_lease(
     // GH-64: guest-facing route -- only a token scoped to exactly this
     // worker may claim on its behalf; tenant-wide tokens are rejected.
     ensure_worker_scope(&ctx, worker_id)?;
+    // Real enforcement (not advisory) for a per-sandbox guest token (see the
+    // doc comment on `ClaimLeaseRequest::sandbox_id`): the caller authenticated
+    // as exactly one sandbox, so it must ask for that sandbox and nothing but
+    // `run_command` jobs, or the request is rejected outright. A worker-scoped
+    // token has no `guest_sandbox_id` and skips this block entirely -- the
+    // `sandbox_id`/`kinds` filtering it gets is the advisory SQL narrowing
+    // below, which it can freely omit or widen.
     if let Some(sandbox_id) = ctx.guest_sandbox_id()
         && (request.sandbox_id != Some(sandbox_id)
             || request.kinds.as_deref() != Some(&[JobKind::RunCommand]))
@@ -125,13 +132,17 @@ pub(crate) async fn claim_lease(
     if let Some(job_id) = requested_job_id {
         query.push(" and id = ").push_bind(job_id.to_string());
     }
-    // Guest-facing scoping (advisory, see the doc comment on
-    // `ClaimLeaseRequest::sandbox_id`): a caller such as `sandboxwich-agent`'s
-    // daemon loop can narrow claims to the sandbox and job kinds it actually
-    // handles, so a job destined for a different sandbox -- or a job kind the
-    // caller isn't equipped to execute -- is never handed to it in the first
-    // place. Matches any of the job's own sandbox, fork parent, or fork child
-    // columns so the filter also makes sense for provision/fork jobs.
+    // Sandbox/kind scoping (see the doc comment on `ClaimLeaseRequest::sandbox_id`):
+    // a caller such as `sandboxwich-agent`'s daemon loop can narrow claims to the
+    // sandbox and job kinds it actually handles, so a job destined for a
+    // different sandbox -- or a job kind the caller isn't equipped to execute --
+    // is never handed to it in the first place. Matches any of the job's own
+    // sandbox, fork parent, or fork child columns so the filter also makes sense
+    // for provision/fork jobs. For a worker-scoped token this is advisory only
+    // (nothing stops the caller from omitting or widening it); for a per-sandbox
+    // guest token it is real enforcement, because the guest-scope check above
+    // already forced `request.sandbox_id`/`request.kinds` to match the token's
+    // own bound sandbox before we ever get here.
     if let Some(sandbox_id) = request.sandbox_id {
         query
             .push(" and (jobs.sandbox_id = ")
@@ -211,8 +222,11 @@ pub(crate) async fn claim_lease(
 
 /// True if `job` references `sandbox_id` as its own sandbox, its fork parent, or its
 /// fork child. Used to re-check a claim request's `sandbox_id` filter against the
-/// typed job, mirroring the SQL `where` clause built in `claim_lease`.
-fn job_matches_sandbox(job: &Job, sandbox_id: SandboxId) -> bool {
+/// typed job, mirroring the SQL `where` clause built in `claim_lease` -- and, via
+/// `pub(crate)`, reused by `ensure_lease_worker_scope` in `auth.rs` so a per-sandbox
+/// guest token's enforcement checks the same set of sandbox linkages a well-behaved
+/// caller's advisory filter does.
+pub(crate) fn job_matches_sandbox(job: &Job, sandbox_id: SandboxId) -> bool {
     sandbox_id_from_job(job).ok() == Some(sandbox_id)
         || parent_sandbox_id_from_job(job).ok() == Some(sandbox_id)
         || child_sandbox_id_from_job(job).ok() == Some(sandbox_id)
