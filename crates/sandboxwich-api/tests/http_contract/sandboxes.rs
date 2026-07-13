@@ -718,6 +718,7 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
             "{}/workers/{}/leases/claim",
             server.base_url, race_worker.worker.id
         ))
+        .header("x-sandboxwich-job-id", snapshot_job.id.to_string())
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox.sandbox.id),
@@ -777,6 +778,7 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
             "{}/workers/{}/leases/claim",
             server.base_url, race_worker.worker.id
         ))
+        .header("x-sandboxwich-job-id", fork_job.id.to_string())
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
             sandbox_id: Some(forked.sandbox.id),
