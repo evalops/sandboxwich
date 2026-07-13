@@ -653,6 +653,17 @@ fn egress_gateway_image_is_an_explicit_provider_contract() {
 }
 
 #[test]
+fn egress_gateway_health_is_an_explicit_local_probe_command() {
+    let health = Cli::try_parse_from(["sandboxwich-worker", "egress-gateway-health"])
+        .expect("gateway health is a supported worker command");
+    assert!(matches!(
+        health.command,
+        Command::EgressGatewayHealth(EgressGatewayHealthArgs { address })
+            if address == "127.0.0.1:8080".parse::<SocketAddr>().unwrap()
+    ));
+}
+
+#[test]
 fn classify_retry_flags_transient_infrastructure_errors_as_retryable() {
     let timeout = anyhow::Error::new(ProviderError::retryable(anyhow::anyhow!("timeout")));
     assert!(classify_retry(&timeout));

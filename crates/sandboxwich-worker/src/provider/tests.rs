@@ -549,10 +549,13 @@ fn host_rules_render_a_separate_gateway_and_no_direct_public_egress() {
         gateway["spec"]["containers"][0]["args"][0],
         "egress-gateway"
     );
-    assert_eq!(
-        gateway["spec"]["containers"][0]["readinessProbe"]["tcpSocket"]["port"],
-        "proxy"
-    );
+    for probe in ["readinessProbe", "livenessProbe"] {
+        assert_eq!(
+            gateway["spec"]["containers"][0][probe]["exec"]["command"],
+            json!(["/usr/local/bin/sandboxwich", "egress-gateway-health"])
+        );
+        assert!(gateway["spec"]["containers"][0][probe]["tcpSocket"].is_null());
+    }
     assert_eq!(service["kind"], "Service");
     assert_eq!(
         sandbox_policy["spec"]["podSelector"]["matchLabels"]["sandboxwich.dev/component"],
