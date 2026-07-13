@@ -32,6 +32,12 @@ pub(crate) async fn create_snapshot(
 ) -> Result<(StatusCode, Json<SnapshotResponse>), ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
     let sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
+    if sandbox.workspace_mode != WorkspaceMode::Persistent {
+        return Err(ApiError::conflict_code(
+            "workspace_mode_snapshot_unsupported",
+            "snapshots require workspace_mode=persistent",
+        ));
+    }
     let snapshot = pending_snapshot_from_request(sandbox_id, request)?;
     let scheduled_at = snapshot.created_at;
     insert_snapshot(&state.db, &snapshot).await?;
@@ -133,6 +139,7 @@ pub(crate) async fn fork_snapshot(
         template: request.template,
         memory_limit: request.memory_limit,
         network_egress: request.network_egress,
+        workspace_mode: WorkspaceMode::Persistent,
         created_at: now,
         updated_at: now,
         ttl_seconds: request.ttl_seconds,
@@ -150,6 +157,7 @@ pub(crate) async fn fork_snapshot(
             "provisionSpec": SandboxProvisionSpec {
                 memory_limit: child.memory_limit.clone(),
                 network_egress: child.network_egress.clone(),
+                workspace_mode: child.workspace_mode.clone(),
             }
         }),
         required_capability: fork_capability(&child.network_egress),
@@ -724,7 +732,7 @@ pub(crate) async fn queue_forks_waiting_on_snapshot_on_connection(
     parent_sandbox_id: SandboxId,
 ) -> Result<(), ApiError> {
     let sql = format!(
-        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode,
+        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode,
                 created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where parent_snapshot_id = {} and state = 'planning'
@@ -755,6 +763,7 @@ pub(crate) async fn queue_forks_waiting_on_snapshot_on_connection(
                     "provisionSpec": SandboxProvisionSpec {
                         memory_limit: child.memory_limit.clone(),
                         network_egress: child.network_egress.clone(),
+                        workspace_mode: child.workspace_mode.clone(),
                     }
                 }),
                 required_capability: fork_capability(&child.network_egress),
@@ -794,7 +803,7 @@ pub(crate) async fn fail_sandboxes_waiting_on_snapshot_on_connection(
     error: &str,
 ) -> Result<(), ApiError> {
     let sql = format!(
-        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode,
+        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode,
                 created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where parent_snapshot_id = {} and state = 'planning'

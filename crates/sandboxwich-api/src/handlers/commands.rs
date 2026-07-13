@@ -101,6 +101,7 @@ pub(crate) async fn queue_command(
             "provisionSpec": SandboxProvisionSpec {
                 memory_limit: sandbox.memory_limit.clone(),
                 network_egress: sandbox.network_egress.clone(),
+                workspace_mode: sandbox.workspace_mode.clone(),
             }
         }),
         required_capability: WorkerCapability::RunCommand,

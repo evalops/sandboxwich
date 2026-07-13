@@ -131,9 +131,9 @@ pub(crate) async fn ensure_database_constraints(db: &Database) -> anyhow::Result
 }
 
 pub(crate) const DB_ENUM_SCHEMA_METADATA_KEY: &str = "db_enum_constraints_fingerprint";
-// v2 adds the sandbox state transition guard (trigger backstop); bumping the
-// version forces `ensure_database_constraints` to reconcile it on upgrade.
-pub(crate) const DB_ENUM_SCHEMA_FINGERPRINT_VERSION: &str = "db-enum-v2";
+// v3 adds workspace mode to the reconciled enum constraints. Bumping the
+// version forces existing installations to install the new guard on upgrade.
+pub(crate) const DB_ENUM_SCHEMA_FINGERPRINT_VERSION: &str = "db-enum-v3";
 pub(crate) const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 pub(crate) const FNV_PRIME: u64 = 0x00000100000001b3;
 
@@ -248,6 +248,13 @@ pub(crate) const DB_ENUM_COLUMNS: &[DbEnumColumn] = &[
         "sandboxes_network_egress_mode_check",
         <NetworkEgressMode as DbVariant>::VALUES,
         "invalid sandbox network egress mode",
+    ),
+    DbEnumColumn::new(
+        "sandboxes",
+        "workspace_mode",
+        "sandboxes_workspace_mode_check",
+        <WorkspaceMode as DbVariant>::VALUES,
+        "invalid sandbox workspace mode",
     ),
     DbEnumColumn::new(
         "sandbox_network_egress_rules",

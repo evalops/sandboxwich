@@ -473,6 +473,23 @@ pub enum SandboxState {
 }
 }
 
+db_variant_enum! {
+pub enum WorkspaceMode {
+    Ephemeral => "ephemeral",
+    GenericEphemeral => "generic_ephemeral",
+    Persistent => "persistent",
+}
+}
+
+// The shared database-enum macro owns the derive list and does not expose a
+// per-variant `#[default]` hook, so this default must remain explicit.
+#[allow(clippy::derivable_impls)]
+impl Default for WorkspaceMode {
+    fn default() -> Self {
+        Self::Persistent
+    }
+}
+
 impl SandboxState {
     /// Every declared sandbox lifecycle state.
     pub const ALL: [SandboxState; 8] = [
@@ -816,6 +833,8 @@ pub struct SandboxProvisionSpec {
     pub memory_limit: MemoryLimit,
     #[serde(default)]
     pub network_egress: NetworkEgress,
+    #[serde(default)]
+    pub workspace_mode: WorkspaceMode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -878,6 +897,8 @@ pub struct Sandbox {
     pub memory_limit: MemoryLimit,
     #[serde(default)]
     pub network_egress: NetworkEgress,
+    #[serde(default)]
+    pub workspace_mode: WorkspaceMode,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub ttl_seconds: Option<u64>,
@@ -890,6 +911,7 @@ pub struct CreateSandboxRequest {
     pub template: Option<String>,
     pub memory_limit: Option<MemoryLimit>,
     pub network_egress: Option<NetworkEgress>,
+    pub workspace_mode: Option<WorkspaceMode>,
     pub ttl_seconds: Option<u64>,
 }
 
