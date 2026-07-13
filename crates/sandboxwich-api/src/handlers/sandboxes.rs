@@ -6,6 +6,7 @@ use crate::handlers::jobs::*;
 use crate::handlers::operations::operation_from_job;
 use crate::handlers::snapshots::*;
 use crate::pagination::*;
+use crate::reconcile::list_runtime_resources_for_sandbox;
 use crate::rows::*;
 use crate::state::*;
 use axum::Json;
@@ -67,15 +68,22 @@ pub(crate) fn validate_network_egress(network_egress: &NetworkEgress) -> Result<
                         "cidr network allow rule must use CIDR notation",
                     ));
                 }
-                if rule.kind == NetworkAllowRuleKind::Host && !looks_like_dns_name(value) {
+                if rule.kind == NetworkAllowRuleKind::Host && !looks_like_host_rule(value) {
                     return Err(ApiError::bad_request(
-                        "host network allow rule must be a lowercase DNS name without wildcards",
+                        "host network allow rule must be a lowercase DNS name or one leading-label wildcard",
                     ));
                 }
             }
             Ok(())
         }
     }
+}
+
+pub(crate) fn looks_like_host_rule(value: &str) -> bool {
+    if let Some(base) = value.strip_prefix("*.") {
+        return base.contains('.') && !base.contains('*') && looks_like_dns_name(base);
+    }
+    !value.contains('*') && looks_like_dns_name(value)
 }
 
 pub(crate) fn looks_like_dns_name(value: &str) -> bool {
@@ -278,13 +286,24 @@ pub(crate) async fn stop_sandbox(
 ) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
     let mut sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
+    let delete_gke_fqdn_policy = list_runtime_resources_for_sandbox(&state.db, sandbox_id)
+        .await?
+        .iter()
+        .any(|resource| {
+            resource.provider == "kubernetes"
+                && resource.resource_kind == RuntimeResourceKind::NetworkPolicy
+                && resource.resource_name == format!("sandboxwich-fqdn-egress-{sandbox_id}")
+        });
     let now = Utc::now();
     let job = Job {
         id: JobId::new(),
         tenant_id: sandbox.tenant_id.clone(),
         kind: JobKind::StopSandbox,
         status: JobStatus::Queued,
-        payload: json!({"sandboxId": sandbox_id}),
+        payload: json!({
+            "sandboxId": sandbox_id,
+            "deleteGkeFqdnPolicy": delete_gke_fqdn_policy,
+        }),
         required_capability: WorkerCapability::ProvisionSandbox,
         priority: 100,
         attempts: 0,

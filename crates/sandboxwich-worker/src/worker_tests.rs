@@ -1,4 +1,5 @@
 use super::*;
+use crate::provider::SandboxTeardownSpec;
 use chrono::Utc;
 use sandboxwich_core::{
     Job, JobId, JobStatus, RuntimeResourceKind, RuntimeResourcePurpose, SandboxId, SnapshotId,
@@ -224,8 +225,13 @@ impl SandboxProvider for FailingStagedProvider {
         )
     }
 
-    fn stop(&self, sandbox_id: SandboxId, cancelled: &CancelSignal) -> anyhow::Result<()> {
-        self.inner.stop(sandbox_id, cancelled)
+    fn stop(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxTeardownSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<()> {
+        self.inner.stop(sandbox_id, spec, cancelled)
     }
 }
 
@@ -368,9 +374,10 @@ impl SandboxProvider for FixedExecResultProvider {
     fn stop(
         &self,
         sandbox_id: sandboxwich_core::SandboxId,
+        spec: &SandboxTeardownSpec,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<()> {
-        self.inner.stop(sandbox_id, cancelled)
+        self.inner.stop(sandbox_id, spec, cancelled)
     }
 }
 
@@ -542,6 +549,25 @@ fn stop_sandbox_job_tears_down_resources_via_provider() {
 }
 
 #[test]
+fn stop_sandbox_job_rejects_an_invalid_persisted_teardown_hint() {
+    let error = execute_job(
+        &job(
+            JobKind::StopSandbox,
+            json!({
+                "sandboxId": SandboxId::new(),
+                "deleteGkeFqdnPolicy": "yes"
+            }),
+            WorkerCapability::K8sPod,
+        ),
+        &provider(),
+        &CancelSignal::never_cancelled(),
+    )
+    .expect_err("a malformed persisted teardown hint must fail closed");
+
+    assert!(error.to_string().contains("deleteGkeFqdnPolicy"));
+}
+
+#[test]
 fn resume_sandbox_job_fails_instead_of_silently_succeeding() {
     let sandbox_id = SandboxId::new();
     let outcome = execute_job(
@@ -567,7 +593,7 @@ fn resume_sandbox_job_fails_instead_of_silently_succeeding() {
 
 #[test]
 fn default_registration_capabilities_cover_supported_worker_jobs() {
-    let capabilities = capabilities_from_args(Vec::new(), None);
+    let capabilities = capabilities_from_args(Vec::new(), None, false);
 
     assert!(capabilities.contains(&WorkerCapability::ProvisionSandbox));
     assert!(capabilities.contains(&WorkerCapability::RunCommand));
@@ -579,9 +605,23 @@ fn default_registration_capabilities_cover_supported_worker_jobs() {
 
 #[test]
 fn default_registration_capabilities_include_gvisor_when_runtime_class_is_configured() {
-    let capabilities = capabilities_from_args(Vec::new(), Some("gvisor"));
+    let capabilities = capabilities_from_args(Vec::new(), Some("gvisor"), false);
 
     assert!(capabilities.contains(&WorkerCapability::GvisorSandbox));
+}
+
+#[test]
+fn default_registration_capabilities_include_fqdn_when_a_backend_is_enabled() {
+    let capabilities = capabilities_from_args(Vec::new(), None, true);
+
+    assert!(capabilities.contains(&WorkerCapability::FqdnEgress));
+}
+
+#[test]
+fn explicit_registration_capabilities_can_select_fqdn_egress() {
+    let capabilities = capabilities_from_args(vec![CapabilityArg::FqdnEgress], None, false);
+
+    assert_eq!(capabilities, vec![WorkerCapability::FqdnEgress]);
 }
 
 #[test]
@@ -592,6 +632,24 @@ fn empty_provider_options_are_normalized_to_absent() {
         non_empty(Some("local-path".to_string())),
         Some("local-path".to_string())
     );
+}
+
+#[test]
+fn egress_gateway_image_is_an_explicit_provider_contract() {
+    let gateway = Cli::try_parse_from([
+        "sandboxwich-worker",
+        "provider-capabilities",
+        "--egress-gateway-image",
+        "ghcr.io/evalops/sandboxwich-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ])
+    .expect("gateway image is a supported provider option");
+    assert!(matches!(
+        gateway.command,
+        Command::ProviderCapabilities(ProviderArgs {
+            egress_gateway_image: Some(_),
+            ..
+        })
+    ));
 }
 
 #[test]

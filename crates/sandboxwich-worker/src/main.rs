@@ -1,13 +1,14 @@
+mod egress_gateway;
 mod provider;
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use provider::{
     CancelSignal, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES, KUBERNETES_MUTATION_ENV,
     KubernetesApplyProvider, KubernetesDryRunProvider, ProviderError, ReconciliationLimits,
-    RetryDisposition, SandboxProvider,
+    RetryDisposition, SandboxProvider, image_is_digest_pinned,
 };
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse,
@@ -46,6 +47,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    EgressGateway(EgressGatewayArgs),
     Capabilities,
     ProviderCapabilities(ProviderArgs),
     ProviderHealth(ProviderArgs),
@@ -61,6 +63,19 @@ enum Command {
     Run(RunArgs),
     WorkOnce(WorkOnceArgs),
     WorkLoop(WorkLoopArgs),
+}
+
+#[derive(Debug, Args)]
+struct EgressGatewayArgs {
+    #[arg(
+        long,
+        env = "SANDBOXWICH_EGRESS_GATEWAY_BIND",
+        default_value = "0.0.0.0:8080"
+    )]
+    bind: SocketAddr,
+
+    #[arg(long, env = "SANDBOXWICH_EGRESS_GATEWAY_POLICY")]
+    policy: String,
 }
 
 #[derive(Debug, Args)]
@@ -223,6 +238,9 @@ struct ProviderArgs {
 
     #[arg(long, env = "SANDBOXWICH_RUNTIME_IMAGE")]
     runtime_image: Option<String>,
+
+    #[arg(long, env = "SANDBOXWICH_EGRESS_GATEWAY_IMAGE")]
+    egress_gateway_image: Option<String>,
 
     #[arg(long, env = "SANDBOXWICH_WORKSPACE_STORAGE")]
     workspace_storage: Option<String>,
@@ -399,6 +417,7 @@ enum CapabilityArg {
     RunCommand,
     Snapshot,
     DesktopStream,
+    FqdnEgress,
     K8sPod,
     GvisorSandbox,
 }
@@ -536,11 +555,12 @@ impl SandboxProvider for RuntimeProvider {
     fn stop(
         &self,
         sandbox_id: sandboxwich_core::SandboxId,
+        spec: &provider::SandboxTeardownSpec,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<()> {
         match self {
-            Self::DryRun(provider) => provider.stop(sandbox_id, cancelled),
-            Self::Apply(provider) => provider.stop(sandbox_id, cancelled),
+            Self::DryRun(provider) => provider.stop(sandbox_id, spec, cancelled),
+            Self::Apply(provider) => provider.stop(sandbox_id, spec, cancelled),
         }
     }
 }
@@ -552,6 +572,11 @@ async fn main() -> anyhow::Result<()> {
     let client = build_api_client(cli.api_token.as_deref(), cli.tenant.as_deref())?;
 
     match cli.command {
+        Command::EgressGateway(args) => {
+            let policy = serde_json::from_str(&args.policy)
+                .context("parse SANDBOXWICH_EGRESS_GATEWAY_POLICY")?;
+            egress_gateway::run_egress_gateway(args.bind, policy).await?;
+        }
         Command::Capabilities => {
             println!(
                 "{}",
@@ -660,7 +685,7 @@ async fn main() -> anyhow::Result<()> {
                 &api,
                 args.name,
                 args.provider,
-                capabilities_from_args(args.capability, None),
+                capabilities_from_args(args.capability, None, false),
                 args.label.into_iter().collect(),
                 // Standalone registration may be consumed by multiple
                 // work-once/work-loop processes, so preserve the operator's
@@ -727,7 +752,15 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Run(args) => {
             let runtime_class_name = args.provider.provider.runtime_class_name.as_deref();
-            let capabilities = capabilities_from_args(args.capability, runtime_class_name);
+            let fqdn_egress_backend = args.provider.provider.cilium_fqdn_egress
+                || args
+                    .provider
+                    .provider
+                    .egress_gateway_image
+                    .as_deref()
+                    .is_some_and(image_is_digest_pinned);
+            let capabilities =
+                capabilities_from_args(args.capability, runtime_class_name, fqdn_egress_backend);
             let labels: BTreeMap<_, _> = args.label.into_iter().collect();
             let response = register_worker(
                 &client,
@@ -813,6 +846,7 @@ fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
         non_empty(args.snapshot_class),
     )
     .with_runtime_image(non_empty(args.runtime_image))
+    .with_egress_gateway_image(non_empty(args.egress_gateway_image))
     .with_workspace_storage(non_empty(args.workspace_storage))
     .with_ssh_authorized_keys_secret(non_empty(args.ssh_authorized_keys_secret))
     .with_runtime_class_name(non_empty(args.runtime_class_name))
@@ -1763,10 +1797,11 @@ fn execute_job_with_reporter(
         }
         JobKind::StopSandbox => {
             let sandbox_id = sandbox_id_from_payload(&job.payload)?;
+            let teardown_spec = teardown_spec_from_payload(&job.payload)?;
             // Actually tear down the sandbox's resources; propagate provider errors so
             // the job is failed (and retried per its classification) instead of the
             // control plane recording a "stopped" sandbox that keeps running.
-            provider.stop(sandbox_id, cancelled)?;
+            provider.stop(sandbox_id, &teardown_spec, cancelled)?;
             Ok(WorkerJobOutcome::Complete(WorkerJobResult::StopSandbox {
                 provider: "kubernetes".to_string(),
                 sandbox_id,
@@ -1876,6 +1911,20 @@ fn sandbox_id_from_payload(
     )?))
 }
 
+fn teardown_spec_from_payload(
+    payload: &serde_json::Value,
+) -> anyhow::Result<provider::SandboxTeardownSpec> {
+    let delete_gke_fqdn_policy = match payload.get("deleteGkeFqdnPolicy") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| anyhow::anyhow!("job payload deleteGkeFqdnPolicy is invalid"))?,
+    };
+    Ok(provider::SandboxTeardownSpec {
+        delete_gke_fqdn_policy,
+    })
+}
+
 fn parent_sandbox_id_from_payload(
     payload: &serde_json::Value,
 ) -> anyhow::Result<sandboxwich_core::SandboxId> {
@@ -1915,6 +1964,7 @@ fn uuid_from_payload(payload: &serde_json::Value, field: &'static str) -> anyhow
 fn capabilities_from_args(
     capabilities: Vec<CapabilityArg>,
     runtime_class_name: Option<&str>,
+    fqdn_egress_backend: bool,
 ) -> Vec<WorkerCapability> {
     if capabilities.is_empty() {
         let mut defaults = vec![
@@ -1926,6 +1976,9 @@ fn capabilities_from_args(
         ];
         if runtime_class_name.is_some_and(|value| !value.trim().is_empty()) {
             defaults.push(WorkerCapability::GvisorSandbox);
+        }
+        if fqdn_egress_backend {
+            defaults.push(WorkerCapability::FqdnEgress);
         }
         defaults
     } else {
@@ -1965,6 +2018,7 @@ fn to_capability(value: CapabilityArg) -> WorkerCapability {
         CapabilityArg::RunCommand => WorkerCapability::RunCommand,
         CapabilityArg::Snapshot => WorkerCapability::Snapshot,
         CapabilityArg::DesktopStream => WorkerCapability::DesktopStream,
+        CapabilityArg::FqdnEgress => WorkerCapability::FqdnEgress,
         CapabilityArg::K8sPod => WorkerCapability::K8sPod,
         CapabilityArg::GvisorSandbox => WorkerCapability::GvisorSandbox,
     }

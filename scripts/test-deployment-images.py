@@ -34,6 +34,48 @@ class DeploymentImagesTest(unittest.TestCase):
         self.assertIn("sandboxwich-api@sha256:[0-9a-f]\\{64\\}", script)
         self.assertIn("sandboxwich-worker@sha256:[0-9a-f]\\{64\\}", script)
 
+    def test_kind_enables_containerd_registry_host_rewrites(self) -> None:
+        config = (ROOT / "deploy/kubernetes/kind-conformance.yaml").read_text()
+        workflow = (ROOT / ".github/workflows/kubernetes-conformance.yml").read_text()
+        self.assertIn("containerdConfigPatches:", config)
+        self.assertIn('config_path = "/etc/containerd/certs.d"', config)
+        self.assertIn(
+            'docker exec "${node}" crictl pull "${gateway_image}"', workflow
+        )
+
+    def test_private_dns_probe_cannot_bypass_the_gateway_via_no_proxy(self) -> None:
+        script = (ROOT / "deploy/kubernetes/kind-conformance.sh").read_text()
+        self.assertIn(
+            'curl --noproxy "" -fsS --max-time 5 http://localhost/',
+            script,
+        )
+
+    def test_gateway_outage_probe_bypasses_the_proxy(self) -> None:
+        script = (ROOT / "deploy/kubernetes/kind-conformance.sh").read_text()
+        self.assertIn(
+            'curl --noproxy \\"*\\" -fsS --max-time 5 http://example.com/',
+            script,
+        )
+
+    def test_negative_probes_accept_failed_command_status(self) -> None:
+        script = (ROOT / "deploy/kubernetes/kind-conformance.sh").read_text()
+        self.assertIn(
+            '[[ "${status}" == "finished" || "${status}" == "failed" ]] && return 0',
+            script,
+        )
+        self.assertIn(
+            'wait_command_terminal "http://127.0.0.1:32170/commands/${command_id}"',
+            script,
+        )
+        self.assertIn("assert_command_failed_with_exit", script)
+        self.assertIn(".command.exit_code != null", script)
+
+    def test_gateway_registry_is_enabled_and_preflighted_on_every_kind_node(self) -> None:
+        cluster = (ROOT / "deploy/kubernetes/kind-conformance.yaml").read_text()
+        workflow = (ROOT / ".github/workflows/kubernetes-conformance.yml").read_text()
+        self.assertIn('config_path = "/etc/containerd/certs.d"', cluster)
+        self.assertIn('crictl pull "${gateway_image}"', workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

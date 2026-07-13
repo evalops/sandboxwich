@@ -54,6 +54,30 @@ jobs:
         run: >-
           kind create cluster --name sandboxwich-conformance
           --config deploy/kubernetes/kind-conformance.yaml --wait 120s
+      - name: Publish digest-pinned gateway image to the disposable registry
+        run: |
+          docker run -d --restart=always -p 127.0.0.1:5001:5000 \
+            --name sandboxwich-kind-registry registry:2
+          docker network connect kind sandboxwich-kind-registry
+          for node in $(kind get nodes --name sandboxwich-conformance); do
+            docker exec "${node}" mkdir -p /etc/containerd/certs.d/localhost:5001
+            printf '%s\n' \
+              'server = "http://sandboxwich-kind-registry:5000"' \
+              '[host."http://sandboxwich-kind-registry:5000"]' \
+              '  capabilities = ["pull", "resolve"]' | \
+              docker exec -i "${node}" tee \
+                /etc/containerd/certs.d/localhost:5001/hosts.toml >/dev/null
+          done
+          docker tag sandboxwich-worker:conformance \
+            localhost:5001/sandboxwich-worker:conformance
+          docker push localhost:5001/sandboxwich-worker:conformance
+          gateway_image="$(docker image inspect localhost:5001/sandboxwich-worker:conformance \
+            --format '{{range .RepoDigests}}{{println .}}{{end}}' | head -n1)"
+          [[ "${gateway_image}" == *@sha256:* ]]
+          for node in $(kind get nodes --name sandboxwich-conformance); do
+            docker exec "${node}" crictl pull "${gateway_image}"
+          done
+          echo "SANDBOXWICH_GATEWAY_IMAGE=${gateway_image}" >>"${GITHUB_ENV}"
       - name: Run live conformance and chaos checks
         run: deploy/kubernetes/kind-conformance.sh
       - name: Collect cluster diagnostics
@@ -66,7 +90,9 @@ jobs:
           kubectl -n sandboxwich logs deployment/sandboxwich-worker --tail=-1 --prefix || true
       - name: Delete disposable cluster
         if: always()
-        run: kind delete cluster --name sandboxwich-conformance
+        run: |
+          kind delete cluster --name sandboxwich-conformance
+          docker rm -f sandboxwich-kind-registry >/dev/null 2>&1 || true
 
   cilium-fqdn:
     name: cilium-fqdn

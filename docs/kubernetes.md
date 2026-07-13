@@ -6,11 +6,20 @@ successful `containers` workflow, download its `*-image-digest` artifacts and
 update both API references together in a reviewed pull request. Run
 `python3 scripts/test-deployment-images.py` before applying the manifests.
 
-Host egress allowlists require Cilium with DNS proxy enforcement. Set
-`SANDBOXWICH_CILIUM_FQDN_EGRESS=true` only on workers whose sandbox namespace
-is managed by Cilium. Those workers advertise `fqdn_egress`; host-bearing
-provision jobs remain queued when no capable worker is online. Workers using
-standard Kubernetes NetworkPolicy continue rejecting host rules.
+Host egress allowlists require an enforceable FQDN boundary. Set
+`SANDBOXWICH_EGRESS_GATEWAY_IMAGE` to a digest-pinned `sandboxwich-worker`
+image. Each host-bearing Sandbox then gets a dedicated HTTP proxy, Service,
+and NetworkPolicy. The Sandbox can reach cluster DNS and its gateway but cannot
+connect directly to public IP addresses. The gateway resolves a requested host
+once, rejects every result set containing a private, link-local, metadata,
+cluster, or operator-excluded address, and connects to the validated address
+without resolving again. Gateway loss therefore fails closed. Workers reject
+host rules when the gateway image is absent or mutable.
+
+`SANDBOXWICH_CILIUM_FQDN_EGRESS=true` remains available on namespaces managed
+by Cilium DNS proxy enforcement. Native GKE `FQDNNetworkPolicy` is not used:
+its allows are additive with Kubernetes NetworkPolicy and cannot preserve CIDR
+denies when an allowed hostname resolves to a protected address.
 
 `sandboxwich` is being shaped to run comfortably on k3s and Kubernetes. The control plane is stateless except for Postgres, and workers register themselves with typed capabilities before they claim any work.
 
@@ -155,7 +164,7 @@ Pass `--vnc-password-secret sandboxwich-vnc-password` (or set `SANDBOXWICH_VNC_P
 
 ## Sandbox Namespace Isolation
 
-Sandbox Pods, Services, PVCs, and NetworkPolicies render into a dedicated namespace, separate from the control-plane namespace running `sandboxwich-api` and the `sandboxwich-secrets` Secret (`SANDBOXWICH_DATABASE_URL`, `api-token`). Configure it with `--sandbox-namespace` / `SANDBOXWICH_SANDBOX_NAMESPACE`; unset falls back to `--namespace` (the control-plane namespace), preserving older single-namespace deployments. `deploy/kubernetes/worker.yaml` creates a `sandboxwich-sandboxes` Namespace and scopes the worker's Role/RoleBinding to it exclusively, so a compromised worker cannot reach control-plane pods or the database credential.
+Sandbox Pods, Services, PVCs, NetworkPolicies, and optional GKE FQDNNetworkPolicies render into a dedicated namespace, separate from the control-plane namespace running `sandboxwich-api` and the `sandboxwich-secrets` Secret (`SANDBOXWICH_DATABASE_URL`, `api-token`). Configure it with `--sandbox-namespace` / `SANDBOXWICH_SANDBOX_NAMESPACE`; unset falls back to `--namespace` (the control-plane namespace), preserving older single-namespace deployments. `deploy/kubernetes/worker.yaml` creates a `sandboxwich-sandboxes` Namespace and scopes the worker's Role/RoleBinding to it exclusively, so a compromised worker cannot reach control-plane pods or the database credential.
 
 The rendered per-sandbox NetworkPolicy also:
 

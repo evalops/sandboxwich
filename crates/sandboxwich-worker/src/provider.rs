@@ -26,6 +26,8 @@ use serde_json::{Map, Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
+use crate::egress_gateway::EgressGatewayPolicy;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetryDisposition {
     Retryable,
@@ -116,6 +118,16 @@ pub(crate) fn image_pull_policy_for(image: &str) -> &'static str {
     }
 }
 
+pub(crate) fn image_is_digest_pinned(image: &str) -> bool {
+    image.split_once("@sha256:").is_some_and(|(name, digest)| {
+        !name.is_empty()
+            && digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
 /// Default cap on the stdout/stderr captured from a single `kubectl` invocation
 /// before it's stored in a `KubectlOutput` (and, from there, in job results and
 /// provider metadata sent back to the control plane). Mirrors
@@ -157,6 +169,12 @@ pub const DEFAULT_INGRESS_SELECTOR_VALUE: &str = "sandboxwich";
 pub const SANDBOX_TEARDOWN_RESOURCE_KINDS: &str = "pod,persistentvolumeclaim,service,networkpolicy";
 pub const SANDBOX_RECONCILIATION_RESOURCE_KINDS: &str =
     "pod,persistentvolumeclaim,service,secret,networkpolicy";
+const GKE_FQDN_RESOURCE_KIND: &str = "fqdnnetworkpolicy.networking.gke.io";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SandboxTeardownSpec {
+    pub(crate) delete_gke_fqdn_policy: bool,
+}
 
 /// Cheaply cloneable signal a job's background lease-renewal task (see
 /// `handle_lease` in `main.rs`) uses to tell an in-flight `exec_handoff` call
@@ -230,7 +248,12 @@ pub trait SandboxProvider {
     ) -> anyhow::Result<ProviderForkHandle>;
     /// Tear down every resource associated with `sandbox_id`. Must be idempotent:
     /// calling it on an already-stopped (or never-provisioned) sandbox is not an error.
-    fn stop(&self, sandbox_id: SandboxId, cancelled: &CancelSignal) -> anyhow::Result<()>;
+    fn stop(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxTeardownSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<()>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -240,6 +263,7 @@ pub struct KubernetesDryRunProvider {
     storage_class: Option<String>,
     snapshot_class: Option<String>,
     runtime_image: String,
+    egress_gateway_image: Option<String>,
     workspace_storage: String,
     workspace_storage_override: bool,
     ssh_authorized_keys_secret: Option<String>,
@@ -295,6 +319,7 @@ impl KubernetesDryRunProvider {
             storage_class,
             snapshot_class,
             runtime_image: DEFAULT_SANDBOX_GUEST_IMAGE.to_string(),
+            egress_gateway_image: None,
             workspace_storage: "2Gi".to_string(),
             workspace_storage_override: false,
             ssh_authorized_keys_secret: None,
@@ -320,6 +345,14 @@ impl KubernetesDryRunProvider {
         if let Some(image) = image {
             self.runtime_image = image;
         }
+        self
+    }
+
+    pub fn with_egress_gateway_image(mut self, image: Option<String>) -> Self {
+        self.egress_gateway_image = image.and_then(|image| {
+            let image = image.trim();
+            (!image.is_empty()).then(|| image.to_string())
+        });
         self
     }
 
@@ -374,8 +407,33 @@ impl KubernetesDryRunProvider {
     }
 
     pub fn with_cilium_fqdn_egress(mut self, enabled: bool) -> Self {
-        self.fqdn_egress_backend = enabled.then(|| "cilium".to_string());
+        if enabled {
+            self.fqdn_egress_backend = Some("cilium".to_string());
+        }
         self
+    }
+
+    fn teardown_resource_kinds_with_persisted_gke_fqdn(&self, persisted_gke_fqdn: bool) -> String {
+        self.resource_kinds_with_optional_gke_fqdn(
+            SANDBOX_TEARDOWN_RESOURCE_KINDS,
+            persisted_gke_fqdn,
+        )
+    }
+
+    fn reconciliation_resource_kinds(&self) -> String {
+        self.resource_kinds_with_optional_gke_fqdn(SANDBOX_RECONCILIATION_RESOURCE_KINDS, false)
+    }
+
+    fn resource_kinds_with_optional_gke_fqdn(
+        &self,
+        base: &str,
+        persisted_gke_fqdn: bool,
+    ) -> String {
+        if persisted_gke_fqdn {
+            format!("{base},{GKE_FQDN_RESOURCE_KIND}")
+        } else {
+            base.to_string()
+        }
     }
 
     /// Merges operator-supplied CIDRs into the excluded set (deduped
@@ -510,6 +568,12 @@ impl KubernetesDryRunProvider {
         spec: &SandboxProvisionSpec,
     ) -> anyhow::Result<serde_json::Value> {
         let network_policy = self.network_policy_manifest(sandbox_id, &spec.network_egress)?;
+        let egress_gateway_pod =
+            self.egress_gateway_pod_manifest(sandbox_id, &spec.network_egress)?;
+        let egress_gateway_service =
+            self.egress_gateway_service_manifest(sandbox_id, &spec.network_egress);
+        let egress_gateway_network_policy =
+            self.egress_gateway_network_policy_manifest(sandbox_id, &spec.network_egress)?;
         let pvc = (spec.workspace_mode == WorkspaceMode::Persistent).then(|| {
             self.pvc_manifest(
                 format!("sandboxwich-pvc-{sandbox_id}"),
@@ -540,6 +604,9 @@ impl KubernetesDryRunProvider {
                 "sshService": self.ssh_service_manifest(sandbox_id),
                 "desktopService": self.desktop_service_manifest(sandbox_id),
                 "networkPolicy": network_policy,
+                "egressGatewayPod": egress_gateway_pod,
+                "egressGatewayService": egress_gateway_service,
+                "egressGatewayNetworkPolicy": egress_gateway_network_policy,
             }
         }))
     }
@@ -575,14 +642,59 @@ impl KubernetesDryRunProvider {
             && let Some(rule) = rules
                 .iter()
                 .find(|rule| rule.kind == NetworkAllowRuleKind::Host)
-            && self.fqdn_egress_backend.as_deref() != Some("cilium")
         {
+            if self.fqdn_egress_backend.as_deref() == Some("cilium") {
+                return Ok(());
+            }
+            if let Some(image) = &self.egress_gateway_image {
+                if image_is_digest_pinned(image) {
+                    return Ok(());
+                }
+                bail!(
+                    "egress_gateway_image_unpinned: host allow rule {} requires a digest-pinned gateway image",
+                    rule.value
+                );
+            }
             bail!(
-                "standard Kubernetes NetworkPolicy cannot enforce host allow rule {}; use cidr allow rules or a provider with FQDN egress support",
+                "egress_gateway_image_required: host allow rule {} requires SANDBOXWICH_EGRESS_GATEWAY_IMAGE",
                 rule.value
             );
         }
         Ok(())
+    }
+
+    fn host_rules<'a>(&self, network_egress: &'a NetworkEgress) -> impl Iterator<Item = &'a str> {
+        network_egress
+            .rules()
+            .iter()
+            .filter(|rule| rule.kind == NetworkAllowRuleKind::Host)
+            .map(|rule| rule.value.as_str())
+    }
+
+    fn uses_egress_gateway(&self, network_egress: &NetworkEgress) -> bool {
+        self.fqdn_egress_backend.as_deref() != Some("cilium")
+            && self.host_rules(network_egress).next().is_some()
+    }
+
+    fn egress_gateway_policy(
+        &self,
+        network_egress: &NetworkEgress,
+    ) -> anyhow::Result<Option<EgressGatewayPolicy>> {
+        if !self.uses_egress_gateway(network_egress) {
+            return Ok(None);
+        }
+        let denied_cidrs = self
+            .egress_excluded_cidrs
+            .iter()
+            .map(|cidr| IpNet::from_str(cidr))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(EgressGatewayPolicy::new(
+            self.host_rules(network_egress)
+                .map(ToString::to_string)
+                .collect(),
+            vec![80, 443],
+            denied_cidrs,
+        )?))
     }
 
     fn effective_workspace_storage(&self, memory_limit: &MemoryLimit) -> String {
@@ -684,6 +796,19 @@ impl KubernetesDryRunProvider {
                 "value": "2222"
             }),
         ];
+
+        if self.uses_egress_gateway(&spec.network_egress) {
+            let proxy = format!("http://sandboxwich-egress-gateway-{sandbox_id}:8080");
+            for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+                env.push(json!({"name": name, "value": proxy}));
+            }
+            for name in ["NO_PROXY", "no_proxy"] {
+                env.push(json!({
+                    "name": name,
+                    "value": "localhost,127.0.0.1,::1"
+                }));
+            }
+        }
 
         if let Some(secret_name) = &self.ssh_authorized_keys_secret {
             volume_mounts.push(json!({
@@ -797,12 +922,14 @@ impl KubernetesDryRunProvider {
             pod_spec.insert("runtimeClassName".to_string(), json!(runtime_class_name));
         }
 
-        json!({
+        let mut manifest = json!({
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": self.object_metadata(format!("sandboxwich-{sandbox_id}"), Some(sandbox_id)),
             "spec": pod_spec
-        })
+        });
+        manifest["metadata"]["labels"]["sandboxwich.dev/component"] = json!("runtime");
+        manifest
     }
 
     fn pvc_manifest(
@@ -964,6 +1091,17 @@ impl KubernetesDryRunProvider {
                         }))
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?;
+                if self.uses_egress_gateway(network_egress) {
+                    egress.push(json!({
+                        "to": [{
+                            "podSelector": {"matchLabels": {
+                                "sandboxwich.dev/sandbox-id": sandbox_id,
+                                "sandboxwich.dev/component": "egress-gateway"
+                            }}
+                        }],
+                        "ports": [{"protocol": "TCP", "port": 8080}]
+                    }));
+                }
                 egress.push(self.dns_egress_rule());
                 egress
             }
@@ -976,7 +1114,8 @@ impl KubernetesDryRunProvider {
             "spec": {
                 "podSelector": {
                     "matchLabels": {
-                        "sandboxwich.dev/sandbox-id": sandbox_id
+                        "sandboxwich.dev/sandbox-id": sandbox_id,
+                        "sandboxwich.dev/component": "runtime"
                     }
                 },
                 "policyTypes": ["Ingress", "Egress"],
@@ -995,7 +1134,13 @@ impl KubernetesDryRunProvider {
         let hosts: Vec<_> = rules
             .iter()
             .filter(|rule| rule.kind == NetworkAllowRuleKind::Host)
-            .map(|rule| json!({"matchName": rule.value}))
+            .map(|rule| {
+                if rule.value.starts_with("*.") {
+                    json!({"matchPattern": rule.value})
+                } else {
+                    json!({"matchName": rule.value})
+                }
+            })
             .collect();
         let cidrs: Vec<_> = rules
             .iter()
@@ -1047,6 +1192,165 @@ impl KubernetesDryRunProvider {
         })
     }
 
+    fn egress_gateway_pod_manifest(
+        &self,
+        sandbox_id: SandboxId,
+        network_egress: &NetworkEgress,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        let Some(policy) = self.egress_gateway_policy(network_egress)? else {
+            return Ok(None);
+        };
+        let image = self
+            .egress_gateway_image
+            .as_deref()
+            .context("egress_gateway_image_required")?;
+        let mut manifest = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": self.object_metadata(
+                format!("sandboxwich-egress-gateway-{sandbox_id}"),
+                Some(sandbox_id),
+            ),
+            "spec": {
+                "automountServiceAccountToken": false,
+                "securityContext": {
+                    "runAsNonRoot": true,
+                    "runAsUser": 10001,
+                    "runAsGroup": 10001,
+                    "seccompProfile": {"type": "RuntimeDefault"}
+                },
+                "containers": [{
+                    "name": "gateway",
+                    "image": image,
+                    "imagePullPolicy": image_pull_policy_for(image),
+                    "args": ["egress-gateway"],
+                    "ports": [{"name": "proxy", "containerPort": 8080}],
+                    "readinessProbe": {
+                        "tcpSocket": {"port": "proxy"},
+                        "periodSeconds": 2,
+                        "timeoutSeconds": 1,
+                        "failureThreshold": 5
+                    },
+                    "livenessProbe": {
+                        "tcpSocket": {"port": "proxy"},
+                        "periodSeconds": 10,
+                        "timeoutSeconds": 1,
+                        "failureThreshold": 3
+                    },
+                    "env": [{
+                        "name": "SANDBOXWICH_EGRESS_GATEWAY_POLICY",
+                        "value": serde_json::to_string(&policy)?
+                    }],
+                    "resources": {
+                        "requests": {"cpu": "25m", "memory": "32Mi", "ephemeral-storage": "32Mi"},
+                        "limits": {"cpu": "250m", "memory": "128Mi", "ephemeral-storage": "128Mi"}
+                    },
+                    "securityContext": {
+                        "allowPrivilegeEscalation": false,
+                        "readOnlyRootFilesystem": true,
+                        "runAsNonRoot": true,
+                        "capabilities": {"drop": ["ALL"]},
+                        "seccompProfile": {"type": "RuntimeDefault"}
+                    }
+                }]
+            }
+        });
+        manifest["metadata"]["labels"]["sandboxwich.dev/component"] = json!("egress-gateway");
+        manifest["metadata"]["annotations"] = json!({
+            "sandboxwich.dev/egress-policy-id": policy.policy_id
+        });
+        Ok(Some(manifest))
+    }
+
+    fn egress_gateway_service_manifest(
+        &self,
+        sandbox_id: SandboxId,
+        network_egress: &NetworkEgress,
+    ) -> Option<serde_json::Value> {
+        self.uses_egress_gateway(network_egress).then(|| {
+            json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": self.object_metadata(
+                    format!("sandboxwich-egress-gateway-{sandbox_id}"),
+                    Some(sandbox_id),
+                ),
+                "spec": {
+                    "type": "ClusterIP",
+                    "selector": {
+                        "sandboxwich.dev/sandbox-id": sandbox_id,
+                        "sandboxwich.dev/component": "egress-gateway"
+                    },
+                    "ports": [{"name": "proxy", "port": 8080, "targetPort": "proxy"}]
+                }
+            })
+        })
+    }
+
+    fn egress_gateway_network_policy_manifest(
+        &self,
+        sandbox_id: SandboxId,
+        network_egress: &NetworkEgress,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        let Some(policy) = self.egress_gateway_policy(network_egress)? else {
+            return Ok(None);
+        };
+        let denied_v4 = policy
+            .denied_cidrs
+            .iter()
+            .filter(|cidr| cidr.addr().is_ipv4())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let denied_v6 = policy
+            .denied_cidrs
+            .iter()
+            .filter(|cidr| match cidr {
+                IpNet::V6(cidr) => cidr.network().to_ipv4_mapped().is_none(),
+                IpNet::V4(_) => false,
+            })
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        Ok(Some(json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": self.object_metadata(
+                format!("sandboxwich-egress-gateway-{sandbox_id}"),
+                Some(sandbox_id),
+            ),
+            "spec": {
+                "podSelector": {"matchLabels": {
+                    "sandboxwich.dev/sandbox-id": sandbox_id,
+                    "sandboxwich.dev/component": "egress-gateway"
+                }},
+                "policyTypes": ["Ingress", "Egress"],
+                "ingress": [{
+                    "from": [{"podSelector": {"matchLabels": {
+                        "sandboxwich.dev/sandbox-id": sandbox_id,
+                        "sandboxwich.dev/component": "runtime"
+                    }}}],
+                    "ports": [{"protocol": "TCP", "port": 8080}]
+                }],
+                "egress": [
+                    self.dns_egress_rule(),
+                    {
+                        "to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": denied_v4}}],
+                        "ports": [
+                            {"protocol": "TCP", "port": 80},
+                            {"protocol": "TCP", "port": 443}
+                        ]
+                    },
+                    {
+                        "to": [{"ipBlock": {"cidr": "::/0", "except": denied_v6}}],
+                        "ports": [
+                            {"protocol": "TCP", "port": 80},
+                            {"protocol": "TCP", "port": 443}
+                        ]
+                    }
+                ]
+            }
+        })))
+    }
+
     fn ssh_service_manifest(&self, sandbox_id: SandboxId) -> serde_json::Value {
         json!({
             "apiVersion": "v1",
@@ -1055,7 +1359,8 @@ impl KubernetesDryRunProvider {
             "spec": {
                 "type": "ClusterIP",
                 "selector": {
-                    "sandboxwich.dev/sandbox-id": sandbox_id
+                    "sandboxwich.dev/sandbox-id": sandbox_id,
+                    "sandboxwich.dev/component": "runtime"
                 },
                 "ports": [{
                     "name": "ssh",
@@ -1111,7 +1416,8 @@ impl KubernetesDryRunProvider {
             "spec": {
                 "type": "ClusterIP",
                 "selector": {
-                    "sandboxwich.dev/sandbox-id": sandbox_id
+                    "sandboxwich.dev/sandbox-id": sandbox_id,
+                    "sandboxwich.dev/component": "runtime"
                 },
                 "ports": [{
                     "name": "desktop",
@@ -1164,8 +1470,13 @@ impl KubernetesDryRunProvider {
             self.runtime_pod_resource(sandbox_id, status.clone()),
             self.ssh_service_resource(sandbox_id, status.clone()),
             self.desktop_service_resource(sandbox_id, status.clone()),
-            self.network_policy_resource(sandbox_id, status),
+            self.network_policy_resource(sandbox_id, status.clone()),
         ]);
+        resources.extend(self.egress_gateway_resources(
+            sandbox_id,
+            &spec.network_egress,
+            status.clone(),
+        ));
         resources
     }
 
@@ -1176,7 +1487,7 @@ impl KubernetesDryRunProvider {
         spec: &SandboxProvisionSpec,
         status: RuntimeResourceStatus,
     ) -> Vec<ProviderRuntimeResource> {
-        vec![
+        let mut resources = vec![
             self.workspace_pvc_resource(
                 child_sandbox_id,
                 &spec.memory_limit,
@@ -1186,8 +1497,14 @@ impl KubernetesDryRunProvider {
             self.runtime_pod_resource(child_sandbox_id, status.clone()),
             self.ssh_service_resource(child_sandbox_id, status.clone()),
             self.desktop_service_resource(child_sandbox_id, status.clone()),
-            self.network_policy_resource(child_sandbox_id, status),
-        ]
+            self.network_policy_resource(child_sandbox_id, status.clone()),
+        ];
+        resources.extend(self.egress_gateway_resources(
+            child_sandbox_id,
+            &spec.network_egress,
+            status.clone(),
+        ));
+        resources
     }
 
     fn snapshot_resources(
@@ -1277,6 +1594,46 @@ impl KubernetesDryRunProvider {
             format!("sandboxwich-egress-{sandbox_id}"),
             status,
         )
+    }
+
+    fn egress_gateway_resources(
+        &self,
+        sandbox_id: SandboxId,
+        network_egress: &NetworkEgress,
+        status: RuntimeResourceStatus,
+    ) -> Vec<ProviderRuntimeResource> {
+        if !self.uses_egress_gateway(network_egress) {
+            return Vec::new();
+        }
+        let name = format!("sandboxwich-egress-gateway-{sandbox_id}");
+        let mut pod = self.base_resource(
+            sandbox_id,
+            None,
+            RuntimeResourceKind::Pod,
+            RuntimeResourcePurpose::Network,
+            name.clone(),
+            status.clone(),
+        );
+        pod.runtime_image = self.egress_gateway_image.clone();
+        let mut service = self.base_resource(
+            sandbox_id,
+            None,
+            RuntimeResourceKind::Service,
+            RuntimeResourcePurpose::Network,
+            name.clone(),
+            status.clone(),
+        );
+        service.service_port = Some(8080);
+        service.target_port = Some("proxy".to_string());
+        let policy = self.base_resource(
+            sandbox_id,
+            None,
+            RuntimeResourceKind::NetworkPolicy,
+            RuntimeResourcePurpose::Network,
+            name,
+            status,
+        );
+        vec![pod, service, policy]
     }
 
     fn desktop_service_resource(
@@ -1524,6 +1881,12 @@ fn kubernetes_delete_path(resource: &ObservedKubernetesResource) -> anyhow::Resu
         RuntimeResourceKind::Service => "services",
         RuntimeResourceKind::Secret => "secrets",
         RuntimeResourceKind::NetworkPolicy => {
+            if resource.name.starts_with("sandboxwich-fqdn-egress-") {
+                return Ok(format!(
+                    "/apis/networking.gke.io/v1alpha1/namespaces/{}/fqdnnetworkpolicies/{}",
+                    resource.namespace, resource.name
+                ));
+            }
             return Ok(format!(
                 "/apis/networking.k8s.io/v1/namespaces/{}/networkpolicies/{}",
                 resource.namespace, resource.name
@@ -1551,7 +1914,7 @@ fn kubernetes_delete_options(resource: &ObservedKubernetesResource) -> Value {
 fn runtime_resource_kind_for_kubernetes_kind(kind: &str) -> anyhow::Result<RuntimeResourceKind> {
     match kind {
         "PersistentVolumeClaim" => Ok(RuntimeResourceKind::PersistentVolumeClaim),
-        "NetworkPolicy" => Ok(RuntimeResourceKind::NetworkPolicy),
+        "NetworkPolicy" | "FQDNNetworkPolicy" => Ok(RuntimeResourceKind::NetworkPolicy),
         "Secret" => Ok(RuntimeResourceKind::Secret),
         "Pod" => Ok(RuntimeResourceKind::Pod),
         "Service" => Ok(RuntimeResourceKind::Service),
@@ -1584,6 +1947,7 @@ fn adoption_contract(resource: &Value) -> anyhow::Result<Value> {
             fields.entry("egress").or_insert_with(|| json!([]));
             spec
         }
+        "FQDNNetworkPolicy" => resource["spec"].clone(),
         "Pod" => json!({
             "runtimeClassName": resource["spec"]["runtimeClassName"],
             "automountServiceAccountToken": resource["spec"]["automountServiceAccountToken"],
@@ -1815,6 +2179,36 @@ impl KubernetesApplyProvider {
             report(stage_update(ProvisioningStage::WorkspaceReady, None))?;
         }
 
+        if let Some(gateway_policy) = self
+            .dry_run
+            .egress_gateway_network_policy_manifest(sandbox_id, &spec.network_egress)?
+        {
+            let policy_identity =
+                self.apply_or_adopt_manifest(&gateway_policy, sandbox_id, cancelled)?;
+            report(stage_update(
+                ProvisioningStage::NetworkPolicyReady,
+                Some(policy_identity),
+            ))?;
+            let gateway_service = self
+                .dry_run
+                .egress_gateway_service_manifest(sandbox_id, &spec.network_egress)
+                .context("gateway service missing for host policy")?;
+            self.apply_or_adopt_manifest(&gateway_service, sandbox_id, cancelled)?;
+            let gateway_pod = self
+                .dry_run
+                .egress_gateway_pod_manifest(sandbox_id, &spec.network_egress)?
+                .context("gateway pod missing for host policy")?;
+            self.apply_or_adopt_manifest(&gateway_pod, sandbox_id, cancelled)?;
+            let gateway_name = format!("sandboxwich-egress-gateway-{sandbox_id}");
+            let wait = self.wait_for_named_pod_ready(&gateway_name, cancelled)?;
+            if !wait.success {
+                return Err(anyhow::Error::new(classified_kubectl_failure(
+                    "egress gateway pod did not become ready",
+                    &wait.stderr,
+                )));
+            }
+        }
+
         let network_policy = self
             .dry_run
             .network_policy_manifest(sandbox_id, &spec.network_egress)?;
@@ -1824,7 +2218,6 @@ impl KubernetesApplyProvider {
             ProvisioningStage::NetworkPolicyReady,
             Some(network_identity),
         ))?;
-
         report(stage_update(ProvisioningStage::CredentialsReady, None))?;
 
         let pod = self.dry_run.pod_manifest(sandbox_id, spec);
@@ -1879,7 +2272,7 @@ impl KubernetesApplyProvider {
         let mut args = self.kubectl_base_args();
         args.extend([
             "get".to_string(),
-            SANDBOX_RECONCILIATION_RESOURCE_KINDS.to_string(),
+            self.dry_run.reconciliation_resource_kinds(),
             "--selector".to_string(),
             "sandboxwich.dev/sandbox-id".to_string(),
             "--output".to_string(),
@@ -2443,11 +2836,29 @@ impl KubernetesApplyProvider {
                 &spec.memory_limit,
             ));
         }
-        manifests.push(self.dry_run.pod_manifest(sandbox_id, spec));
+        if let Some(gateway) = self
+            .dry_run
+            .egress_gateway_pod_manifest(sandbox_id, &spec.network_egress)?
+        {
+            manifests.push(gateway);
+        }
+        if let Some(service) = self
+            .dry_run
+            .egress_gateway_service_manifest(sandbox_id, &spec.network_egress)
+        {
+            manifests.push(service);
+        }
+        if let Some(policy) = self
+            .dry_run
+            .egress_gateway_network_policy_manifest(sandbox_id, &spec.network_egress)?
+        {
+            manifests.push(policy);
+        }
         manifests.push(
             self.dry_run
                 .network_policy_manifest(sandbox_id, &spec.network_egress)?,
         );
+        manifests.push(self.dry_run.pod_manifest(sandbox_id, spec));
         manifests.push(self.dry_run.ssh_service_manifest(sandbox_id));
         manifests.push(self.dry_run.desktop_service_manifest(sandbox_id));
         Ok(manifests)
@@ -2464,11 +2875,29 @@ impl KubernetesApplyProvider {
                 self.dry_run
                     .fork_pvc_manifest(child_sandbox_id, snapshot_id, &spec.memory_limit),
             ];
-        manifests.push(self.dry_run.pod_manifest(child_sandbox_id, spec));
+        if let Some(gateway) = self
+            .dry_run
+            .egress_gateway_pod_manifest(child_sandbox_id, &spec.network_egress)?
+        {
+            manifests.push(gateway);
+        }
+        if let Some(service) = self
+            .dry_run
+            .egress_gateway_service_manifest(child_sandbox_id, &spec.network_egress)
+        {
+            manifests.push(service);
+        }
+        if let Some(policy) = self
+            .dry_run
+            .egress_gateway_network_policy_manifest(child_sandbox_id, &spec.network_egress)?
+        {
+            manifests.push(policy);
+        }
         manifests.push(
             self.dry_run
                 .network_policy_manifest(child_sandbox_id, &spec.network_egress)?,
         );
+        manifests.push(self.dry_run.pod_manifest(child_sandbox_id, spec));
         manifests.push(self.dry_run.ssh_service_manifest(child_sandbox_id));
         manifests.push(self.dry_run.desktop_service_manifest(child_sandbox_id));
         Ok(manifests)
@@ -2485,11 +2914,19 @@ impl KubernetesApplyProvider {
         sandbox_id: SandboxId,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<KubectlOutput> {
+        self.wait_for_named_pod_ready(&self.pod_name(sandbox_id), cancelled)
+    }
+
+    fn wait_for_named_pod_ready(
+        &self,
+        pod_name: &str,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<KubectlOutput> {
         let mut args = self.kubectl_base_args();
         args.extend([
             "wait".to_string(),
             "--for=condition=Ready".to_string(),
-            format!("pod/{}", self.pod_name(sandbox_id)),
+            format!("pod/{pod_name}"),
             self.pod_ready_timeout_arg(),
         ]);
         run_kubectl_command(
@@ -2500,6 +2937,27 @@ impl KubernetesApplyProvider {
             Some(cancelled),
             self.max_captured_output_bytes,
         )
+    }
+
+    fn wait_for_gateway_ready_if_needed(
+        &self,
+        sandbox_id: SandboxId,
+        network_egress: &NetworkEgress,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<Option<KubectlOutput>> {
+        if !self.dry_run.uses_egress_gateway(network_egress) {
+            return Ok(None);
+        }
+        let name = format!("sandboxwich-egress-gateway-{sandbox_id}");
+        let wait = self.wait_for_named_pod_ready(&name, cancelled)?;
+        if !wait.success {
+            bail!(
+                "egress gateway pod did not become ready with {}: {}",
+                wait.status,
+                wait.stderr
+            );
+        }
+        Ok(Some(wait))
     }
 
     /// Returns true if the sandbox's pod already exists in the cluster. Used so that
@@ -2537,10 +2995,19 @@ impl KubernetesApplyProvider {
     /// labeled with this sandbox's id. Split out from `stop` so it can be exercised
     /// in unit tests without invoking a real `kubectl` binary.
     fn teardown_args(&self, sandbox_id: SandboxId) -> Vec<String> {
+        self.teardown_args_with_spec(sandbox_id, &SandboxTeardownSpec::default())
+    }
+
+    fn teardown_args_with_spec(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxTeardownSpec,
+    ) -> Vec<String> {
         let mut args = self.kubectl_base_args();
         args.extend([
             "delete".to_string(),
-            SANDBOX_TEARDOWN_RESOURCE_KINDS.to_string(),
+            self.dry_run
+                .teardown_resource_kinds_with_persisted_gke_fqdn(spec.delete_gke_fqdn_policy),
             "-l".to_string(),
             format!("sandboxwich.dev/sandbox-id={sandbox_id}"),
             "--ignore-not-found=true".to_string(),
@@ -2990,7 +3457,12 @@ impl SandboxProvider for KubernetesDryRunProvider {
         if self.runtime_class_name.is_some() {
             capabilities.push(WorkerCapability::GvisorSandbox);
         }
-        if self.fqdn_egress_backend.is_some() {
+        if self.fqdn_egress_backend.as_deref() == Some("cilium")
+            || self
+                .egress_gateway_image
+                .as_deref()
+                .is_some_and(image_is_digest_pinned)
+        {
             capabilities.push(WorkerCapability::FqdnEgress);
         }
         ProviderCapabilityReport {
@@ -3139,7 +3611,12 @@ impl SandboxProvider for KubernetesDryRunProvider {
         })
     }
 
-    fn stop(&self, _sandbox_id: SandboxId, _cancelled: &CancelSignal) -> anyhow::Result<()> {
+    fn stop(
+        &self,
+        _sandbox_id: SandboxId,
+        _spec: &SandboxTeardownSpec,
+        _cancelled: &CancelSignal,
+    ) -> anyhow::Result<()> {
         // Dry-run provider never applies anything to a cluster, so there is nothing
         // to tear down; treat it as a successful (planned) no-op.
         Ok(())
@@ -3211,6 +3688,12 @@ impl SandboxProvider for KubernetesApplyProvider {
                 apply.status,
                 apply.stderr
             );
+        }
+        if let Err(error) =
+            self.wait_for_gateway_ready_if_needed(sandbox_id, &spec.network_egress, cancelled)
+        {
+            self.rollback_applied_resources(sandbox_id, "provision (wait for gateway ready)");
+            return Err(error);
         }
         let wait = match self.wait_for_pod_ready(sandbox_id, cancelled) {
             Ok(wait) => wait,
@@ -3372,6 +3855,12 @@ impl SandboxProvider for KubernetesApplyProvider {
                 apply.stderr
             );
         }
+        if let Err(error) =
+            self.wait_for_gateway_ready_if_needed(child_sandbox_id, &spec.network_egress, cancelled)
+        {
+            self.rollback_applied_resources(child_sandbox_id, "fork (wait for gateway ready)");
+            return Err(error);
+        }
         let wait = match self.wait_for_pod_ready(child_sandbox_id, cancelled) {
             Ok(wait) => wait,
             Err(error) => {
@@ -3409,9 +3898,14 @@ impl SandboxProvider for KubernetesApplyProvider {
         Ok(handle)
     }
 
-    fn stop(&self, sandbox_id: SandboxId, cancelled: &CancelSignal) -> anyhow::Result<()> {
+    fn stop(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxTeardownSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<()> {
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
-        let args = self.teardown_args(sandbox_id);
+        let args = self.teardown_args_with_spec(sandbox_id, spec);
         let output = run_kubectl_command(
             &self.kubectl,
             &args,
