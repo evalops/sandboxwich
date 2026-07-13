@@ -189,7 +189,7 @@ fn looks_like_cidr_rejects_garbage_and_out_of_range_prefixes() {
 #[test]
 fn db_enum_fingerprint_is_versioned_and_stable_for_current_registry() {
     let fingerprint = db_enum_schema_fingerprint();
-    assert!(fingerprint.starts_with("db-enum-v4:"));
+    assert!(fingerprint.starts_with("db-enum-v5:"));
     assert_eq!(fingerprint, db_enum_schema_fingerprint());
 }
 
