@@ -78,7 +78,7 @@ jobs:
             dev.sandboxwich.build.dependency-lock-digest=${{ steps.build-definition.outputs.dependency_lock_digest }}
           cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.arch }}
-          provenance: mode=max
+          provenance: mode=max,version=v1
           sbom: true
 
   service-images:
@@ -218,7 +218,7 @@ jobs:
             dev.sandboxwich.build.dependency-lock-digest=${{ steps.build-definition.outputs.dependency_lock_digest }}
           cache-from: type=gha,scope=sandboxwich-ubuntu-dev-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=sandboxwich-ubuntu-dev-${{ matrix.arch }}
-          provenance: mode=max
+          provenance: mode=max,version=v1
           sbom: true
 
   runtime-image:

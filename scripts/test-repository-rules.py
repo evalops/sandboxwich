@@ -73,6 +73,7 @@ class RepositoryRulesTest(unittest.TestCase):
             "provenance-summary.json",
         ):
             self.assertIn(marker, workflow)
+        self.assertEqual(workflow.count("provenance: mode=max,version=v1"), 2)
         for marker in (
             "{{json .Provenance}}",
             "{{json .SBOM}}",

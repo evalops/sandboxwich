@@ -36,8 +36,9 @@ for platform in linux/amd64 linux/arm64; do
     --arg revision "${source_revision}" \
     --arg dockerfile "${dockerfile_digest}" \
     --arg lock "${dependency_lock_digest}" \
-    '.[$platform].SLSA.buildDefinition.externalParameters as $definition |
-      $definition.configSource.request.args["vcs:revision"] == $revision and
+    '.[$platform].SLSA as $slsa |
+      $slsa.buildDefinition.externalParameters as $definition |
+      $slsa.runDetails.metadata.buildkit_metadata.vcs.revision == $revision and
       $definition.request.args["label:org.opencontainers.image.revision"] == $revision and
       $definition.request.args["label:dev.sandboxwich.build.runner-architecture"] == $arch and
       $definition.request.args["label:dev.sandboxwich.build.dockerfile-digest"] == $dockerfile and
