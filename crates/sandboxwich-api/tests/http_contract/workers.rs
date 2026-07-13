@@ -786,6 +786,352 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
     assert_eq!(draining.worker.status, WorkerStatus::Draining);
 }
 
+/// Regression test for the "real fix" for per-sandbox claim scoping: two
+/// sandboxes provisioned by the *same* worker each get their own guest token
+/// (`sbw_gtok_...`), and the API must reject one sandbox's guest token acting
+/// on the other's leases even though both share a worker id -- the scenario
+/// `worker_scoped_tokens_enforce_guest_route_boundaries` above doesn't cover,
+/// since its cross-worker attacks use a full worker-scoped token rather than
+/// a sandbox-scoped guest token from a sibling sandbox under the same worker.
+#[tokio::test]
+pub(crate) async fn guest_tokens_are_scoped_to_their_own_sandbox_within_one_worker() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("sandboxwich-guest-token-sandbox-scope-test.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+
+    let registered: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "guest-token-scope-worker".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![
+                WorkerCapability::ProvisionSandbox,
+                WorkerCapability::RunCommand,
+            ],
+            max_concurrent_jobs: Some(4),
+            labels: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let worker_client = worker_client(&registered);
+
+    async fn create_sandbox(
+        client: &reqwest::Client,
+        server: &TestServer,
+        name: &str,
+    ) -> SandboxResponse {
+        client
+            .post(format!("{}/sandboxes", server.base_url))
+            .json(&CreateSandboxRequest {
+                workspace_mode: None,
+                name: Some(name.to_string()),
+                template: None,
+                memory_limit: None,
+                network_egress: None,
+                ttl_seconds: Some(120),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    let sandbox_1 = create_sandbox(&client, &server, "guest-scope-sandbox-1").await;
+    let sandbox_2 = create_sandbox(&client, &server, "guest-scope-sandbox-2").await;
+
+    // One worker provisions both sandboxes, so `worker_owns_sandbox` is true
+    // for either one -- the interesting boundary here is sandbox, not worker.
+    async fn provision(
+        client: &reqwest::Client,
+        worker_client: &reqwest::Client,
+        server: &TestServer,
+        worker: &WorkerResponse,
+        sandbox: &SandboxResponse,
+    ) {
+        let jobs: JobListResponse = client
+            .get(format!("{}/jobs", server.base_url))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let queued = jobs
+            .jobs
+            .into_iter()
+            .find(|job| {
+                job.kind == JobKind::ProvisionSandbox
+                    && job.payload["sandboxId"] == serde_json::json!(sandbox.sandbox.id)
+            })
+            .unwrap();
+        let claimed: ClaimLeaseResponse = worker_client
+            .post(format!(
+                "{}/workers/{}/leases/claim",
+                server.base_url, worker.worker.id
+            ))
+            .json(&ClaimLeaseRequest {
+                lease_seconds: Some(60),
+                sandbox_id: None,
+                kinds: None,
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let lease = claimed
+            .lease
+            .expect("worker should claim its own provision job");
+        assert_eq!(lease.job.id, queued.id);
+        let completed: LeaseResponse = worker_client
+            .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
+            .json(&CompleteLeaseRequest {
+                result: Some(WorkerJobResult::ProvisionSandbox {
+                    handle: ProviderSandboxHandle {
+                        provider: "kubernetes".to_string(),
+                        sandbox_id: sandbox.sandbox.id,
+                        resources: provision_resources(sandbox.sandbox.id),
+                        metadata: serde_json::json!({}),
+                    },
+                }),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(completed.lease.job.status, JobStatus::Succeeded);
+    }
+
+    provision(&client, &worker_client, &server, &registered, &sandbox_1).await;
+    provision(&client, &worker_client, &server, &registered, &sandbox_2).await;
+
+    async fn mint_guest_token(
+        worker_client: &reqwest::Client,
+        server: &TestServer,
+        worker: &WorkerResponse,
+        sandbox: &SandboxResponse,
+    ) -> reqwest::Client {
+        let minted: GuestTokenResponse = worker_client
+            .post(format!(
+                "{}/workers/{}/sandboxes/{}/guest-token",
+                server.base_url, worker.worker.id, sandbox.sandbox.id
+            ))
+            .json(&MintGuestTokenRequest {
+                ttl_seconds: Some(120),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(minted.sandbox_id, sandbox.sandbox.id);
+        assert!(minted.token.starts_with("sbw_gtok_"));
+        build_api_client(Some(&minted.token), None).unwrap()
+    }
+
+    let guest_1 = mint_guest_token(&worker_client, &server, &registered, &sandbox_1).await;
+    let guest_2 = mint_guest_token(&worker_client, &server, &registered, &sandbox_2).await;
+
+    // Queue and claim a run_command job for sandbox 1 with its own guest
+    // token -- the correct-sandbox claim must succeed.
+    let command: QueueCommandResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/commands",
+            server.base_url, sandbox_1.sandbox.id
+        ))
+        .json(&CommandRequest {
+            argv: vec!["true".to_string()],
+            cwd: None,
+            env: Default::default(),
+            timeout_secs: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Sandbox 2's guest token cannot claim sandbox 1's job even when it asks
+    // for its own sandbox_id (there simply is no matching job for it), and
+    // the daemon would see an empty claim -- prove that explicitly before
+    // proving the cross-sandbox *lease* attacks below.
+    let empty_claim: ClaimLeaseResponse = guest_2
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, registered.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox_2.sandbox.id),
+            kinds: Some(vec![JobKind::RunCommand]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(empty_claim.lease.is_none());
+
+    let claimed: ClaimLeaseResponse = guest_1
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, registered.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox_1.sandbox.id),
+            kinds: Some(vec![JobKind::RunCommand]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease_1 = claimed
+        .lease
+        .expect("sandbox 1's guest token should claim its own command job");
+    assert_eq!(lease_1.job.id, command.queued_job.id);
+
+    // Sandbox 2's guest token -- a *valid* credential, just for the wrong
+    // sandbox -- must not be able to renew, append output to, complete, or
+    // fail sandbox 1's lease, even though both sandboxes share a worker id.
+    let cross_renew = guest_2
+        .post(format!("{}/leases/{}/renew", server.base_url, lease_1.id))
+        .json(&RenewLeaseRequest {
+            lease_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_renew.status(), StatusCode::NOT_FOUND);
+
+    let cross_output = guest_2
+        .post(format!("{}/leases/{}/output", server.base_url, lease_1.id))
+        .json(&AppendCommandOutputRequest {
+            stream: CommandOutputStream::Stdout,
+            chunk: "attack".to_string(),
+            annotations: Vec::new(),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_output.status(), StatusCode::NOT_FOUND);
+
+    let cross_fail = guest_2
+        .post(format!("{}/leases/{}/fail", server.base_url, lease_1.id))
+        .json(&FailLeaseRequest {
+            error: "attack".to_string(),
+            retry: false,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_fail.status(), StatusCode::NOT_FOUND);
+
+    let cross_complete = guest_2
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, lease_1.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(command_result("owned\n", "", 0)),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_complete.status(), StatusCode::NOT_FOUND);
+
+    // The happy path still works: sandbox 1's own guest token can renew,
+    // append output to, and complete its own lease.
+    let renewed: LeaseResponse = guest_1
+        .post(format!("{}/leases/{}/renew", server.base_url, lease_1.id))
+        .json(&RenewLeaseRequest {
+            lease_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(renewed.lease.id, lease_1.id);
+
+    let output: sandboxwich_core::CommandOutputChunkResponse = guest_1
+        .post(format!("{}/leases/{}/output", server.base_url, lease_1.id))
+        .json(&AppendCommandOutputRequest {
+            stream: CommandOutputStream::Stdout,
+            chunk: "ok".to_string(),
+            annotations: Vec::new(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(output.chunk.sequence, 1);
+
+    let completed: LeaseResponse = guest_1
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, lease_1.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(command_result("ok\n", "", 0)),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(completed.lease.job.status, JobStatus::Succeeded);
+}
+
 pub(crate) async fn assert_guest_health_and_ssh_key_lifecycle(
     client: &reqwest::Client,
     server: &TestServer,
