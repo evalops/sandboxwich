@@ -47,6 +47,12 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Record service build definition
+        id: build-definition
+        shell: bash
+        run: |
+          echo "dockerfile_digest=sha256:$(sha256sum Dockerfile | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
+          echo "dependency_lock_digest=sha256:$(sha256sum Cargo.lock | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
@@ -67,9 +73,12 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/evalops/sandboxwich
             org.opencontainers.image.revision=${{ github.sha }}
+            dev.sandboxwich.build.runner-architecture=${{ matrix.arch }}
+            dev.sandboxwich.build.dockerfile-digest=${{ steps.build-definition.outputs.dockerfile_digest }}
+            dev.sandboxwich.build.dependency-lock-digest=${{ steps.build-definition.outputs.dependency_lock_digest }}
           cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.arch }}
-          provenance: mode=max
+          provenance: mode=max,version=v1
           sbom: true
 
   service-images:
@@ -90,6 +99,7 @@ jobs:
         env:
           BUILD_RESULT: ${{ needs.service-build.result }}
         run: test "${BUILD_RESULT}" = success
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         if: github.event_name != 'pull_request'
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -118,17 +128,50 @@ jobs:
           printf '%s@%s\n' "${IMAGE}" "${digest}" > "${{ matrix.image }}.image-digest"
       - uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9 # v3
         if: github.event_name != 'pull_request'
+      - name: Verify service platform SBOM and provenance
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
+          DIGEST: ${{ steps.index.outputs.digest }}
+        run: |
+          dockerfile_digest="sha256:$(sha256sum Dockerfile | cut -d' ' -f1)"
+          dependency_lock_digest="sha256:$(sha256sum Cargo.lock | cut -d' ' -f1)"
+          scripts/verify-image-provenance.sh \
+            "${IMAGE}@${DIGEST}" "${GITHUB_SHA}" "${dockerfile_digest}" "${dependency_lock_digest}" \
+            "${{ matrix.image }}.provenance-summary.json"
+      - name: Sign service platform manifests
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
+        run: |
+          jq -r '.platforms[].digest' "${{ matrix.image }}.provenance-summary.json" | while read -r digest; do
+            cosign sign --yes "${IMAGE}@${digest}"
+          done
       - name: Sign service image index
         if: github.event_name != 'pull_request'
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
           DIGEST: ${{ steps.index.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
+      - name: Verify service signatures and provenance closure
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
+          DIGEST: ${{ steps.index.outputs.digest }}
+          VERIFY_SIGNATURES: "true"
+        run: |
+          dockerfile_digest="sha256:$(sha256sum Dockerfile | cut -d' ' -f1)"
+          dependency_lock_digest="sha256:$(sha256sum Cargo.lock | cut -d' ' -f1)"
+          scripts/verify-image-provenance.sh \
+            "${IMAGE}@${DIGEST}" "${GITHUB_SHA}" "${dockerfile_digest}" "${dependency_lock_digest}" \
+            "${{ matrix.image }}.provenance-summary.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: github.event_name != 'pull_request'
         with:
           name: ${{ matrix.image }}-image-digest
-          path: ${{ matrix.image }}.image-digest
+          path: |
+            ${{ matrix.image }}.image-digest
+            ${{ matrix.image }}.provenance-summary.json
 
   runtime-build:
     name: runtime build (ubuntu-dev, ${{ matrix.arch }})
@@ -146,6 +189,12 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Record runtime build definition
+        id: build-definition
+        shell: bash
+        run: |
+          echo "dockerfile_digest=sha256:$(sha256sum deploy/runtime/ubuntu-dev/Dockerfile | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
+          echo "dependency_lock_digest=sha256:$(sha256sum Cargo.lock | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         if: github.event_name != 'pull_request'
@@ -164,9 +213,12 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/evalops/sandboxwich
             org.opencontainers.image.revision=${{ github.sha }}
+            dev.sandboxwich.build.runner-architecture=${{ matrix.arch }}
+            dev.sandboxwich.build.dockerfile-digest=${{ steps.build-definition.outputs.dockerfile_digest }}
+            dev.sandboxwich.build.dependency-lock-digest=${{ steps.build-definition.outputs.dependency_lock_digest }}
           cache-from: type=gha,scope=sandboxwich-ubuntu-dev-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=sandboxwich-ubuntu-dev-${{ matrix.arch }}
-          provenance: mode=max
+          provenance: mode=max,version=v1
           sbom: true
 
   runtime-image:
@@ -179,6 +231,7 @@ jobs:
         env:
           BUILD_RESULT: ${{ needs.runtime-build.result }}
         run: test "${BUILD_RESULT}" = success
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         if: github.event_name != 'pull_request'
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -207,14 +260,47 @@ jobs:
           printf '%s@%s\n' "${IMAGE}" "${digest}" > sandboxwich-ubuntu-dev.image-digest
       - uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9 # v3
         if: github.event_name != 'pull_request'
+      - name: Verify runtime platform SBOM and provenance
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/sandboxwich-ubuntu-dev
+          DIGEST: ${{ steps.index.outputs.digest }}
+        run: |
+          dockerfile_digest="sha256:$(sha256sum deploy/runtime/ubuntu-dev/Dockerfile | cut -d' ' -f1)"
+          dependency_lock_digest="sha256:$(sha256sum Cargo.lock | cut -d' ' -f1)"
+          scripts/verify-image-provenance.sh \
+            "${IMAGE}@${DIGEST}" "${GITHUB_SHA}" "${dockerfile_digest}" "${dependency_lock_digest}" \
+            sandboxwich-ubuntu-dev.provenance-summary.json
+      - name: Sign runtime platform manifests
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/sandboxwich-ubuntu-dev
+        run: |
+          jq -r '.platforms[].digest' sandboxwich-ubuntu-dev.provenance-summary.json | while read -r digest; do
+            cosign sign --yes "${IMAGE}@${digest}"
+          done
       - name: Sign runtime image index
         if: github.event_name != 'pull_request'
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/sandboxwich-ubuntu-dev
           DIGEST: ${{ steps.index.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
+      - name: Verify runtime signatures and provenance closure
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/sandboxwich-ubuntu-dev
+          DIGEST: ${{ steps.index.outputs.digest }}
+          VERIFY_SIGNATURES: "true"
+        run: |
+          dockerfile_digest="sha256:$(sha256sum deploy/runtime/ubuntu-dev/Dockerfile | cut -d' ' -f1)"
+          dependency_lock_digest="sha256:$(sha256sum Cargo.lock | cut -d' ' -f1)"
+          scripts/verify-image-provenance.sh \
+            "${IMAGE}@${DIGEST}" "${GITHUB_SHA}" "${dockerfile_digest}" "${dependency_lock_digest}" \
+            sandboxwich-ubuntu-dev.provenance-summary.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: github.event_name != 'pull_request'
         with:
           name: sandboxwich-ubuntu-dev-image-digest
-          path: sandboxwich-ubuntu-dev.image-digest
+          path: |
+            sandboxwich-ubuntu-dev.image-digest
+            sandboxwich-ubuntu-dev.provenance-summary.json
