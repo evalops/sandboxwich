@@ -48,6 +48,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     EgressGateway(EgressGatewayArgs),
+    EgressGatewayHealth(EgressGatewayHealthArgs),
     Capabilities,
     ProviderCapabilities(ProviderArgs),
     ProviderHealth(ProviderArgs),
@@ -76,6 +77,12 @@ struct EgressGatewayArgs {
 
     #[arg(long, env = "SANDBOXWICH_EGRESS_GATEWAY_POLICY")]
     policy: String,
+}
+
+#[derive(Debug, Args)]
+struct EgressGatewayHealthArgs {
+    #[arg(long, default_value = "127.0.0.1:8080")]
+    address: SocketAddr,
 }
 
 #[derive(Debug, Args)]
@@ -576,6 +583,9 @@ async fn main() -> anyhow::Result<()> {
             let policy = serde_json::from_str(&args.policy)
                 .context("parse SANDBOXWICH_EGRESS_GATEWAY_POLICY")?;
             egress_gateway::run_egress_gateway(args.bind, policy).await?;
+        }
+        Command::EgressGatewayHealth(args) => {
+            egress_gateway::check_egress_gateway_health(args.address).await?;
         }
         Command::Capabilities => {
             println!(

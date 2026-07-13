@@ -38,6 +38,7 @@ pub(crate) const DEFAULT_GATEWAY_DENY_CIDRS: &[&str] = &[
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -224,6 +225,14 @@ pub(crate) async fn run_egress_gateway(
             }
         });
     }
+}
+
+pub(crate) async fn check_egress_gateway_health(address: SocketAddr) -> anyhow::Result<()> {
+    timeout(HEALTH_CHECK_TIMEOUT, TcpStream::connect(address))
+        .await
+        .context("egress gateway health check timed out")?
+        .context("connect to egress gateway health socket")?;
+    Ok(())
 }
 
 async fn handle_client(mut client: TcpStream, policy: &EgressGatewayPolicy) -> anyhow::Result<()> {
@@ -586,5 +595,24 @@ mod tests {
 
         upstream_task.await.unwrap();
         proxy_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_health_check_requires_a_listening_gateway_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+
+        check_egress_gateway_health(address).await.unwrap();
+        accept.await.unwrap();
+
+        let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_address = unavailable.local_addr().unwrap();
+        drop(unavailable);
+        assert!(
+            check_egress_gateway_health(unavailable_address)
+                .await
+                .is_err()
+        );
     }
 }

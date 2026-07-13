@@ -1226,13 +1226,19 @@ impl KubernetesDryRunProvider {
                     "args": ["egress-gateway"],
                     "ports": [{"name": "proxy", "containerPort": 8080}],
                     "readinessProbe": {
-                        "tcpSocket": {"port": "proxy"},
+                        "exec": {"command": [
+                            "/usr/local/bin/sandboxwich",
+                            "egress-gateway-health"
+                        ]},
                         "periodSeconds": 2,
                         "timeoutSeconds": 1,
                         "failureThreshold": 5
                     },
                     "livenessProbe": {
-                        "tcpSocket": {"port": "proxy"},
+                        "exec": {"command": [
+                            "/usr/local/bin/sandboxwich",
+                            "egress-gateway-health"
+                        ]},
                         "periodSeconds": 10,
                         "timeoutSeconds": 1,
                         "failureThreshold": 3
