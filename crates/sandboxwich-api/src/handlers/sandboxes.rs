@@ -68,15 +68,22 @@ pub(crate) fn validate_network_egress(network_egress: &NetworkEgress) -> Result<
                         "cidr network allow rule must use CIDR notation",
                     ));
                 }
-                if rule.kind == NetworkAllowRuleKind::Host && !looks_like_dns_name(value) {
+                if rule.kind == NetworkAllowRuleKind::Host && !looks_like_host_rule(value) {
                     return Err(ApiError::bad_request(
-                        "host network allow rule must be a lowercase DNS name without wildcards",
+                        "host network allow rule must be a lowercase DNS name or one leading-label wildcard",
                     ));
                 }
             }
             Ok(())
         }
     }
+}
+
+pub(crate) fn looks_like_host_rule(value: &str) -> bool {
+    if let Some(base) = value.strip_prefix("*.") {
+        return base.contains('.') && !base.contains('*') && looks_like_dns_name(base);
+    }
+    !value.contains('*') && looks_like_dns_name(value)
 }
 
 pub(crate) fn looks_like_dns_name(value: &str) -> bool {

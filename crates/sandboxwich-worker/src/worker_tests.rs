@@ -635,31 +635,21 @@ fn empty_provider_options_are_normalized_to_absent() {
 }
 
 #[test]
-fn fqdn_backends_are_explicit_and_mutually_exclusive() {
-    let gke = Cli::try_parse_from([
+fn egress_gateway_image_is_an_explicit_provider_contract() {
+    let gateway = Cli::try_parse_from([
         "sandboxwich-worker",
         "provider-capabilities",
-        "--gke-fqdn-egress",
+        "--egress-gateway-image",
+        "ghcr.io/evalops/sandboxwich-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     ])
-    .expect("GKE FQDN backend is a supported provider option");
+    .expect("gateway image is a supported provider option");
     assert!(matches!(
-        gke.command,
+        gateway.command,
         Command::ProviderCapabilities(ProviderArgs {
-            gke_fqdn_egress: true,
-            cilium_fqdn_egress: false,
+            egress_gateway_image: Some(_),
             ..
         })
     ));
-
-    assert!(
-        Cli::try_parse_from([
-            "sandboxwich-worker",
-            "provider-capabilities",
-            "--gke-fqdn-egress",
-            "--cilium-fqdn-egress",
-        ])
-        .is_err()
-    );
 }
 
 #[test]

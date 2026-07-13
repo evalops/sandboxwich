@@ -1,6 +1,7 @@
+mod egress_gateway;
 mod provider;
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -46,6 +47,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    EgressGateway(EgressGatewayArgs),
     Capabilities,
     ProviderCapabilities(ProviderArgs),
     ProviderHealth(ProviderArgs),
@@ -61,6 +63,19 @@ enum Command {
     Run(RunArgs),
     WorkOnce(WorkOnceArgs),
     WorkLoop(WorkLoopArgs),
+}
+
+#[derive(Debug, Args)]
+struct EgressGatewayArgs {
+    #[arg(
+        long,
+        env = "SANDBOXWICH_EGRESS_GATEWAY_BIND",
+        default_value = "0.0.0.0:8080"
+    )]
+    bind: SocketAddr,
+
+    #[arg(long, env = "SANDBOXWICH_EGRESS_GATEWAY_POLICY")]
+    policy: String,
 }
 
 #[derive(Debug, Args)]
@@ -224,6 +239,9 @@ struct ProviderArgs {
     #[arg(long, env = "SANDBOXWICH_RUNTIME_IMAGE")]
     runtime_image: Option<String>,
 
+    #[arg(long, env = "SANDBOXWICH_EGRESS_GATEWAY_IMAGE")]
+    egress_gateway_image: Option<String>,
+
     #[arg(long, env = "SANDBOXWICH_WORKSPACE_STORAGE")]
     workspace_storage: Option<String>,
 
@@ -237,16 +255,6 @@ struct ProviderArgs {
     /// The cluster must have Cilium CRDs and DNS proxy enforcement installed.
     #[arg(long, env = "SANDBOXWICH_CILIUM_FQDN_EGRESS", default_value_t = false)]
     cilium_fqdn_egress: bool,
-
-    /// Enable GKE Dataplane V2 FQDNNetworkPolicy rendering for host allow
-    /// rules. The cluster must have GKE FQDN Network Policy enabled.
-    #[arg(
-        long,
-        env = "SANDBOXWICH_GKE_FQDN_EGRESS",
-        default_value_t = false,
-        conflicts_with = "cilium_fqdn_egress"
-    )]
-    gke_fqdn_egress: bool,
 
     /// Dedicated namespace sandbox pods/services/PVCs/NetworkPolicies are
     /// deployed into, separate from the control-plane namespace (GH-76).
@@ -564,6 +572,11 @@ async fn main() -> anyhow::Result<()> {
     let client = build_api_client(cli.api_token.as_deref(), cli.tenant.as_deref())?;
 
     match cli.command {
+        Command::EgressGateway(args) => {
+            let policy = serde_json::from_str(&args.policy)
+                .context("parse SANDBOXWICH_EGRESS_GATEWAY_POLICY")?;
+            egress_gateway::run_egress_gateway(args.bind, policy).await?;
+        }
         Command::Capabilities => {
             println!(
                 "{}",
@@ -739,8 +752,8 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Run(args) => {
             let runtime_class_name = args.provider.provider.runtime_class_name.as_deref();
-            let fqdn_egress_backend =
-                args.provider.provider.cilium_fqdn_egress || args.provider.provider.gke_fqdn_egress;
+            let fqdn_egress_backend = args.provider.provider.cilium_fqdn_egress
+                || non_empty(args.provider.provider.egress_gateway_image.clone()).is_some();
             let capabilities =
                 capabilities_from_args(args.capability, runtime_class_name, fqdn_egress_backend);
             let labels: BTreeMap<_, _> = args.label.into_iter().collect();
@@ -828,11 +841,11 @@ fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
         non_empty(args.snapshot_class),
     )
     .with_runtime_image(non_empty(args.runtime_image))
+    .with_egress_gateway_image(non_empty(args.egress_gateway_image))
     .with_workspace_storage(non_empty(args.workspace_storage))
     .with_ssh_authorized_keys_secret(non_empty(args.ssh_authorized_keys_secret))
     .with_runtime_class_name(non_empty(args.runtime_class_name))
     .with_cilium_fqdn_egress(args.cilium_fqdn_egress)
-    .with_gke_fqdn_egress(args.gke_fqdn_egress)
     .with_sandbox_namespace(non_empty(args.sandbox_namespace))
     .with_dns_namespace(non_empty(args.dns_namespace));
     let provider = if args.egress_excluded_cidrs_replace {

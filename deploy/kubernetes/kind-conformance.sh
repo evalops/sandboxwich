@@ -5,6 +5,7 @@ set -euo pipefail
 CLUSTER_NAME="${SANDBOXWICH_KIND_CLUSTER:-sandboxwich-conformance}"
 API_IMAGE="${SANDBOXWICH_API_IMAGE:-sandboxwich-api:conformance}"
 WORKER_IMAGE="${SANDBOXWICH_WORKER_IMAGE:-sandboxwich-worker:conformance}"
+GATEWAY_IMAGE="${SANDBOXWICH_GATEWAY_IMAGE:-}"
 RUNTIME_IMAGE="${SANDBOXWICH_RUNTIME_IMAGE:-sandboxwich-runtime:conformance}"
 POSTGRES_IMAGE="${SANDBOXWICH_POSTGRES_IMAGE:-postgres:conformance}"
 API_TOKEN="sandboxwich-kind-conformance-token"
@@ -34,6 +35,7 @@ fail() {
 for command in kind kubectl curl jq sed; do
   command -v "${command}" >/dev/null || fail "${command} is required"
 done
+[[ "${GATEWAY_IMAGE}" == *@sha256:* ]] || fail "SANDBOXWICH_GATEWAY_IMAGE must be digest-pinned"
 kind get clusters | grep -Fxq "${CLUSTER_NAME}" || fail "kind cluster ${CLUSTER_NAME} does not exist"
 kubectl --context "${KUBE_CONTEXT}" -n kube-system rollout status deployment/coredns --timeout=120s
 
@@ -70,8 +72,12 @@ sed \
   -e 's/value: k3s-dev/value: kind-conformance/' \
   -e 's/value: local-path/value: standard/' \
   "${ROOT_DIR}/deploy/kubernetes/worker.yaml" >"${TMP_DIR}/worker.yaml"
+sed -i "/name: SANDBOXWICH_EGRESS_GATEWAY_IMAGE/{n;s#value: .*#value: ${GATEWAY_IMAGE}#;}" \
+  "${TMP_DIR}/worker.yaml"
 grep -Fq "value: ${RUNTIME_IMAGE}" "${TMP_DIR}/worker.yaml" || \
   fail "worker manifest missing runtime image value ${RUNTIME_IMAGE}"
+grep -Fq "value: ${GATEWAY_IMAGE}" "${TMP_DIR}/worker.yaml" || \
+  fail "worker manifest missing gateway image value ${GATEWAY_IMAGE}"
 
 kubectl apply -f "${TMP_DIR}/api.yaml"
 kubectl -n sandboxwich wait --for=condition=complete job/sandboxwich-api-migrate --timeout=120s
@@ -127,6 +133,19 @@ create_sandbox() {
   printf '%s' "${sandbox_id}"
 }
 
+create_host_sandbox() {
+  local response sandbox_id
+  response="$(api -X POST http://127.0.0.1:32170/sandboxes \
+    --data '{"name":"conformance-egress-gateway","network_egress":{"mode":"allowlist","rules":[{"kind":"host","value":"example.com"},{"kind":"host","value":"localhost"}]},"ttl_seconds":600}')"
+  sandbox_id="$(jq -r .sandbox.id <<<"${response}")"
+  wait_json "http://127.0.0.1:32170/sandboxes/${sandbox_id}" '.sandbox.state' ready
+  kubectl -n sandboxwich-sandboxes wait --for=condition=Ready \
+    "pod/sandboxwich-egress-gateway-${sandbox_id}" --timeout=120s >/dev/null
+  kubectl -n sandboxwich-sandboxes wait --for=condition=Ready \
+    "pod/sandboxwich-${sandbox_id}" --timeout=120s >/dev/null
+  printf '%s' "${sandbox_id}"
+}
+
 run_command() {
   local sandbox_id="$1" argv_json="$2" response command_id
   response="$(api -X POST "http://127.0.0.1:32170/sandboxes/${sandbox_id}/commands" \
@@ -141,6 +160,26 @@ stop_sandbox() {
   api -X POST "http://127.0.0.1:32170/sandboxes/${sandbox_id}/stop" --data '{}' >/dev/null
   wait_json "http://127.0.0.1:32170/sandboxes/${sandbox_id}" '.sandbox.state' archived
 }
+
+gateway_id="$(create_host_sandbox)"
+gateway_allowed="$(run_command "${gateway_id}" '["sh","-c","curl -fsS --max-time 15 http://example.com/ >/dev/null"]')"
+[[ "$(jq -r .command.exit_code <<<"${gateway_allowed}")" == "0" ]] || \
+  fail "gateway rejected allowed host: ${gateway_allowed}"
+for assertion in \
+  'curl -fsS --max-time 5 http://example.org/ >/dev/null' \
+  'curl -fsS --max-time 5 http://1.1.1.1/ >/dev/null' \
+  'curl -fsS --max-time 5 http://localhost/ >/dev/null'; do
+  response="$(run_command "${gateway_id}" "$(jq -cn --arg command "${assertion}" '["sh","-c",$command]')")"
+  [[ "$(jq -r .command.exit_code <<<"${response}")" != "0" ]] || \
+    fail "gateway deny assertion unexpectedly succeeded: ${assertion}"
+done
+kubectl -n sandboxwich-sandboxes delete pod \
+  "sandboxwich-egress-gateway-${gateway_id}" --wait=true >/dev/null
+outage="$(run_command "${gateway_id}" '["sh","-c","curl -fsS --max-time 5 http://example.com/ >/dev/null"]')"
+[[ "$(jq -r .command.exit_code <<<"${outage}")" != "0" ]] || \
+  fail "gateway outage did not fail closed"
+stop_sandbox "${gateway_id}"
+echo "egress-gateway-enforced"
 
 deny_id="$(create_sandbox conformance-deny deny_all)"
 command_response="$(run_command "${deny_id}" '["sh","-c","printf sandboxwich-live-exec"]')"
@@ -293,7 +332,7 @@ kubectl -n sandboxwich-sandboxes get secret sandboxwich-foreign-secret >/dev/nul
 kubectl -n sandboxwich-sandboxes delete secret sandboxwich-foreign-secret --wait=true >/dev/null
 echo "orphan-reconciliation-recovered"
 
-for sandbox_id in "${deny_id}" "${source_id}" "${target_id}"; do
+for sandbox_id in "${gateway_id}" "${deny_id}" "${source_id}" "${target_id}"; do
   remaining="$(kubectl -n sandboxwich-sandboxes get pod,pvc,service,networkpolicy \
     -l "sandboxwich.dev/sandbox-id=${sandbox_id}" -o name)"
   [[ -z "${remaining}" ]] || fail "resources leaked for ${sandbox_id}: ${remaining}"

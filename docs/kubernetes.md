@@ -6,19 +6,20 @@ successful `containers` workflow, download its `*-image-digest` artifacts and
 update both API references together in a reviewed pull request. Run
 `python3 scripts/test-deployment-images.py` before applying the manifests.
 
-Host egress allowlists require an enforceable FQDN backend. Set
-`SANDBOXWICH_CILIUM_FQDN_EGRESS=true` only on workers whose sandbox namespace
-is managed by Cilium with DNS proxy enforcement, or set
-`SANDBOXWICH_GKE_FQDN_EGRESS=true` on GKE Dataplane V2 clusters with FQDN
-Network Policy enabled. The two options are mutually exclusive. GKE workers
-can render an additive `networking.gke.io/v1alpha1` `FQDNNetworkPolicy` limited
-to TCP ports 80 and 443. Because GKE combines that allow with standard
-NetworkPolicy allows, the worker rejects host-bearing provisions while any
-excluded metadata/control-plane CIDRs are configured: the standard policy's
-CIDR carve-outs cannot veto an FQDN allow. This fail-closed behavior prevents a
-hostname that resolves into an excluded range from bypassing the carve-out.
-Use Cilium when host allowlisting and excluded-CIDR denies are both required.
-Workers using standard Kubernetes NetworkPolicy continue rejecting host rules.
+Host egress allowlists require an enforceable FQDN boundary. Set
+`SANDBOXWICH_EGRESS_GATEWAY_IMAGE` to a digest-pinned `sandboxwich-worker`
+image. Each host-bearing Sandbox then gets a dedicated HTTP proxy, Service,
+and NetworkPolicy. The Sandbox can reach cluster DNS and its gateway but cannot
+connect directly to public IP addresses. The gateway resolves a requested host
+once, rejects every result set containing a private, link-local, metadata,
+cluster, or operator-excluded address, and connects to the validated address
+without resolving again. Gateway loss therefore fails closed. Workers reject
+host rules when the gateway image is absent or mutable.
+
+`SANDBOXWICH_CILIUM_FQDN_EGRESS=true` remains available on namespaces managed
+by Cilium DNS proxy enforcement. Native GKE `FQDNNetworkPolicy` is not used:
+its allows are additive with Kubernetes NetworkPolicy and cannot preserve CIDR
+denies when an allowed hostname resolves to a protected address.
 
 `sandboxwich` is being shaped to run comfortably on k3s and Kubernetes. The control plane is stateless except for Postgres, and workers register themselves with typed capabilities before they claim any work.
 

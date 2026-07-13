@@ -438,7 +438,7 @@ fn kubernetes_dry_run_rejects_host_allow_rules_for_standard_network_policy() {
     let error = provider
         .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
         .expect_err("host allow rules should not silently render deny-all");
-    assert!(error.to_string().contains("cannot enforce host allow rule"));
+    assert!(error.to_string().contains("egress_gateway_image_required"));
 }
 
 #[test]
@@ -476,10 +476,15 @@ fn cilium_fqdn_backend_renders_host_allow_rules() {
 }
 
 #[test]
-fn gke_fqdn_manifest_limits_host_egress_to_web_ports() {
+fn host_rules_render_a_separate_gateway_and_no_direct_public_egress() {
+    let image = format!(
+        "ghcr.io/evalops/sandboxwich-worker@sha256:{}",
+        "a".repeat(64)
+    );
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("gke-ci", "sandboxwich-ci", None, None)
-            .with_gke_fqdn_egress(true);
+            .with_egress_gateway_image(Some(image.clone()));
+    let sandbox_id = SandboxId::new();
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         memory_limit: MemoryLimit::OneG,
@@ -491,17 +496,40 @@ fn gke_fqdn_manifest_limits_host_egress_to_web_ports() {
         },
     };
 
-    let fqdn = provider
-        .gke_fqdn_policy_manifest(SandboxId::new(), &spec.network_egress)
-        .expect("configured GKE backend renders its policy document");
-    assert_eq!(fqdn["apiVersion"], "networking.gke.io/v1alpha1");
-    assert_eq!(fqdn["kind"], "FQDNNetworkPolicy");
+    let provisioned = provider
+        .provision(sandbox_id, &spec, &CancelSignal::never_cancelled())
+        .expect("digest-pinned gateway must support host rules");
+    let gateway = &provisioned.metadata["manifests"]["egressGatewayPod"];
+    let service = &provisioned.metadata["manifests"]["egressGatewayService"];
+    let sandbox_policy = &provisioned.metadata["manifests"]["networkPolicy"];
+    let gateway_policy = &provisioned.metadata["manifests"]["egressGatewayNetworkPolicy"];
+    assert_eq!(gateway["kind"], "Pod");
+    assert_eq!(gateway["spec"]["containers"][0]["image"], image);
     assert_eq!(
-        fqdn["spec"]["egress"][0]["matches"][0]["name"],
-        "api.example.com"
+        gateway["spec"]["containers"][0]["args"][0],
+        "egress-gateway"
     );
-    assert_eq!(fqdn["spec"]["egress"][0]["ports"][0]["port"], 80);
-    assert_eq!(fqdn["spec"]["egress"][0]["ports"][1]["port"], 443);
+    assert_eq!(service["kind"], "Service");
+    assert_eq!(
+        sandbox_policy["spec"]["podSelector"]["matchLabels"]["sandboxwich.dev/component"],
+        "runtime"
+    );
+    let sandbox_egress = sandbox_policy["spec"]["egress"].as_array().unwrap();
+    assert!(
+        sandbox_egress
+            .iter()
+            .any(|rule| rule["ports"][0]["port"] == 8080)
+    );
+    assert!(!sandbox_egress.iter().any(|rule| {
+        rule["to"].as_array().is_some_and(|peers| {
+            peers
+                .iter()
+                .any(|peer| peer["ipBlock"]["cidr"] == "0.0.0.0/0")
+        })
+    }));
+    let serialized_gateway_policy = serde_json::to_string(gateway_policy).unwrap();
+    assert!(serialized_gateway_policy.contains("169.254.0.0/16"));
+    assert!(serialized_gateway_policy.contains("10.0.0.0/8"));
     assert!(
         provider
             .capability_report()
@@ -511,27 +539,27 @@ fn gke_fqdn_manifest_limits_host_egress_to_web_ports() {
 }
 
 #[test]
-fn gke_fqdn_backend_rejects_hosts_when_excluded_cidr_denies_are_required() {
+fn host_rules_reject_an_unpinned_gateway_image() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("gke-ci", "sandboxwich-ci", None, None)
-            .with_gke_fqdn_egress(true);
+            .with_egress_gateway_image(Some(
+                "ghcr.io/evalops/sandboxwich-worker:latest".to_string(),
+            ));
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
                 kind: NetworkAllowRuleKind::Host,
-                value: "metadata.google.internal".to_string(),
+                value: "api.example.com".to_string(),
             }],
         },
     };
 
     let error = provider
         .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
-        .expect_err("GKE FQDN policy must not bypass excluded metadata CIDRs");
-
-    assert!(error.to_string().contains("additive"));
-    assert!(error.to_string().contains("excluded CIDR denies"));
+        .expect_err("host rules must reject a mutable gateway image");
+    assert!(error.to_string().contains("egress_gateway_image_unpinned"));
 }
 
 #[test]
@@ -1689,11 +1717,14 @@ fn provision_staged_applies_resources_in_durable_order_and_reports_uids() {
 }
 
 #[test]
-fn provision_staged_rejects_gke_fqdn_before_any_cluster_mutation() {
+fn provision_staged_applies_gateway_policy_and_waits_for_gateway_before_runtime() {
     let (kubectl, log_path) = write_stateful_fake_kubectl();
     let dry_run =
         KubernetesDryRunProvider::with_snapshot_class("gke-ci", "sandboxwich-ci", None, None)
-            .with_gke_fqdn_egress(true);
+            .with_egress_gateway_image(Some(format!(
+                "ghcr.io/evalops/sandboxwich-worker@sha256:{}",
+                "a".repeat(64)
+            )));
     let provider = KubernetesApplyProvider::new(dry_run, kubectl.to_string_lossy().into_owned())
         .with_mutation_gate(true, true);
     let sandbox_id = SandboxId::new();
@@ -1706,26 +1737,29 @@ fn provision_staged_rejects_gke_fqdn_before_any_cluster_mutation() {
         },
         ..SandboxProvisionSpec::default()
     };
-    let error = provider
+    let handle = provider
         .provision_staged(sandbox_id, &spec, &CancelSignal::never_cancelled(), |_| {
             Ok(())
         })
-        .expect_err("additive GKE policy must fail before applying cluster resources");
+        .expect("gateway provision succeeds");
+    let log = std::fs::read_to_string(&log_path).expect("read staged kubectl log");
+    let gateway_wait = log
+        .find(&format!("pod/sandboxwich-egress-gateway-{sandbox_id}"))
+        .expect("gateway readiness wait");
+    let runtime_apply = log
+        .rfind(&format!("sandboxwich-{sandbox_id}"))
+        .expect("runtime apply");
+    assert!(
+        gateway_wait < runtime_apply,
+        "gateway must be ready first: {log}"
+    );
+    assert!(handle.resources.iter().any(|resource| {
+        resource.resource_kind == sandboxwich_core::RuntimeResourceKind::Pod
+            && resource.resource_name == format!("sandboxwich-egress-gateway-{sandbox_id}")
+    }));
 
-    assert!(error.to_string().contains("excluded CIDR denies"));
-    assert!(!log_path.exists(), "kubectl must not run before rejection");
-    assert!(
-        provider
-            .dry_run
-            .teardown_resource_kinds_with_persisted_gke_fqdn(false)
-            .contains("fqdnnetworkpolicy")
-    );
-    assert!(
-        provider
-            .dry_run
-            .reconciliation_resource_kinds()
-            .contains("fqdnnetworkpolicy")
-    );
+    // Historical GKE resources remain discoverable for cleanup after the
+    // backend is removed from new provisions.
     let fqdn_observed = ObservedKubernetesResource {
         sandbox_id: Some(sandbox_id),
         resource_kind: sandboxwich_core::RuntimeResourceKind::NetworkPolicy,
