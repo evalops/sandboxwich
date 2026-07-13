@@ -653,6 +653,37 @@ fn egress_gateway_image_is_an_explicit_provider_contract() {
 }
 
 #[test]
+fn node_local_dns_addresses_are_typed_provider_options() {
+    let cli = Cli::try_parse_from([
+        "sandboxwich-worker",
+        "provider-capabilities",
+        "--dns-service-ip",
+        "169.254.20.10",
+        "--dns-service-ip",
+        "fd00::53",
+    ])
+    .expect("typed IPv4 and IPv6 DNS endpoints should parse");
+    assert!(matches!(
+        cli.command,
+        Command::ProviderCapabilities(ProviderArgs { dns_service_ips, .. })
+            if dns_service_ips == vec![
+                "169.254.20.10".parse::<IpAddr>().unwrap(),
+                "fd00::53".parse::<IpAddr>().unwrap()
+            ]
+    ));
+
+    assert!(
+        Cli::try_parse_from([
+            "sandboxwich-worker",
+            "provider-capabilities",
+            "--dns-service-ip",
+            "not-an-ip",
+        ])
+        .is_err()
+    );
+}
+
+#[test]
 fn egress_gateway_health_is_an_explicit_local_probe_command() {
     let health = Cli::try_parse_from(["sandboxwich-worker", "egress-gateway-health"])
         .expect("gateway health is a supported worker command");

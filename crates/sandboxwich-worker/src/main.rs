@@ -1,7 +1,12 @@
 mod egress_gateway;
 mod provider;
 
-use std::{collections::BTreeMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -276,6 +281,16 @@ struct ProviderArgs {
     /// egress rule (GH-66).
     #[arg(long, env = "SANDBOXWICH_DNS_NAMESPACE")]
     dns_namespace: Option<String>,
+
+    /// DNS resolver endpoints that are not selectable as ordinary pods,
+    /// such as GKE NodeLocal DNSCache. Each address receives only TCP/UDP
+    /// port 53 egress; protected CIDRs remain denied for all other traffic.
+    #[arg(
+        long = "dns-service-ip",
+        env = "SANDBOXWICH_DNS_SERVICE_IPS",
+        value_delimiter = ','
+    )]
+    dns_service_ips: Vec<IpAddr>,
 
     /// Additional CIDRs excluded from every egress allow rule that
     /// overlaps them, via NetworkPolicy `except`, so sandboxes can never
@@ -862,7 +877,8 @@ fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
     .with_runtime_class_name(non_empty(args.runtime_class_name))
     .with_cilium_fqdn_egress(args.cilium_fqdn_egress)
     .with_sandbox_namespace(non_empty(args.sandbox_namespace))
-    .with_dns_namespace(non_empty(args.dns_namespace));
+    .with_dns_namespace(non_empty(args.dns_namespace))
+    .with_dns_service_ips(args.dns_service_ips);
     let provider = if args.egress_excluded_cidrs_replace {
         provider.with_egress_excluded_cidrs_replace(args.egress_excluded_cidrs)
     } else {
