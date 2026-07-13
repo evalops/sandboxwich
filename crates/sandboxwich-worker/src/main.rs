@@ -25,6 +25,8 @@ use sandboxwich_core::{
 use serde_json::json;
 use uuid::Uuid;
 
+const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
+
 #[derive(Debug, Parser)]
 #[command(name = "sandboxwich-worker")]
 #[command(about = "Host-side worker for sandbox orchestration")]
@@ -282,9 +284,11 @@ struct ProviderArgs {
     #[arg(long, env = "SANDBOXWICH_DNS_NAMESPACE")]
     dns_namespace: Option<String>,
 
-    /// DNS resolver endpoints that are not selectable as ordinary pods,
-    /// such as GKE NodeLocal DNSCache. Each address receives only TCP/UDP
-    /// port 53 egress; protected CIDRs remain denied for all other traffic.
+    /// Additional DNS resolver endpoints that are not selectable as ordinary
+    /// pods, such as GKE NodeLocal DNSCache. In-cluster workers also merge the
+    /// nameservers from `/etc/resolv.conf`, so the policy follows the cluster's
+    /// actual DNS provider. Each address receives only TCP/UDP port 53 egress;
+    /// protected CIDRs remain denied for all other traffic.
     #[arg(
         long = "dns-service-ip",
         env = "SANDBOXWICH_DNS_SERVICE_IPS",
@@ -864,6 +868,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
+    let dns_service_ips = runtime_dns_service_ips(args.dns_service_ips);
     let provider = KubernetesDryRunProvider::with_snapshot_class(
         args.cluster,
         args.namespace,
@@ -878,7 +883,7 @@ fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
     .with_cilium_fqdn_egress(args.cilium_fqdn_egress)
     .with_sandbox_namespace(non_empty(args.sandbox_namespace))
     .with_dns_namespace(non_empty(args.dns_namespace))
-    .with_dns_service_ips(args.dns_service_ips);
+    .with_dns_service_ips(dns_service_ips);
     let provider = if args.egress_excluded_cidrs_replace {
         provider.with_egress_excluded_cidrs_replace(args.egress_excluded_cidrs)
     } else {
@@ -888,6 +893,56 @@ fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
         .with_ingress_namespace(non_empty(args.ingress_namespace))
         .with_ingress_pod_selector(args.ingress_selector_label)
         .with_vnc_password_secret(non_empty(args.vnc_password_secret))
+}
+
+fn resolver_ips_from_resolv_conf(contents: &str) -> Vec<IpAddr> {
+    let mut resolvers = contents
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next() == Some("nameserver"))
+                .then(|| fields.next())
+                .flatten()
+                .and_then(|value| value.parse().ok())
+        })
+        .collect::<Vec<_>>();
+    resolvers.sort();
+    resolvers.dedup();
+    resolvers
+}
+
+fn merge_dns_service_ips(mut configured: Vec<IpAddr>, discovered: Vec<IpAddr>) -> Vec<IpAddr> {
+    configured.extend(discovered);
+    configured.sort();
+    configured.dedup();
+    configured
+}
+
+fn runtime_dns_service_ips(configured: Vec<IpAddr>) -> Vec<IpAddr> {
+    if std::env::var_os("KUBERNETES_SERVICE_HOST").is_none() {
+        return merge_dns_service_ips(configured, Vec::new());
+    }
+    match std::fs::read_to_string(RESOLV_CONF_PATH) {
+        Ok(contents) => {
+            let discovered = resolver_ips_from_resolv_conf(&contents);
+            if discovered.is_empty() {
+                eprintln!(
+                    "warning: {RESOLV_CONF_PATH} contained no usable DNS nameservers; using only configured resolver endpoints"
+                );
+            } else {
+                eprintln!(
+                    "worker: discovered in-cluster DNS resolver endpoints from {RESOLV_CONF_PATH}: {discovered:?}"
+                );
+            }
+            merge_dns_service_ips(configured, discovered)
+        }
+        Err(error) => {
+            eprintln!(
+                "warning: failed to read in-cluster DNS nameservers from {RESOLV_CONF_PATH}: {error}; using only configured resolver endpoints"
+            );
+            merge_dns_service_ips(configured, Vec::new())
+        }
+    }
 }
 
 /// GH-76: `--confirm-apply` and `SANDBOXWICH_K8S_ENABLE_MUTATION=1` are a
