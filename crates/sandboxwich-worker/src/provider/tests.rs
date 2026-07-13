@@ -334,7 +334,12 @@ fn kubernetes_workspace_modes_render_distinct_bounded_storage_contracts() {
         assert_eq!(manifests["pvc"].is_null(), !standalone_pvc);
 
         if mode == WorkspaceMode::Ephemeral {
-            assert_eq!(volume["emptyDir"]["sizeLimit"], "3Gi");
+            assert_eq!(volume["emptyDir"]["sizeLimit"], "1Gi");
+            assert_eq!(provisioned.metadata["workspaceStorage"], "1Gi");
+            assert_eq!(
+                manifests["pod"]["spec"]["containers"][0]["resources"]["limits"]["ephemeral-storage"],
+                "1Gi"
+            );
         }
         if mode == WorkspaceMode::GenericEphemeral {
             assert_eq!(

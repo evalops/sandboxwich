@@ -528,7 +528,7 @@ impl KubernetesDryRunProvider {
             "podName": format!("sandboxwich-{}", sandbox_id),
             "storageClass": self.storage_class,
             "snapshotClass": self.snapshot_class,
-            "workspaceStorage": self.effective_workspace_storage(&spec.memory_limit),
+            "workspaceStorage": self.effective_workspace_storage_for_spec(spec),
             "workspaceMode": spec.workspace_mode,
             "runtime": self.runtime_metadata(),
             "resources": self.resource_metadata(&spec.memory_limit),
@@ -593,6 +593,17 @@ impl KubernetesDryRunProvider {
         }
     }
 
+    fn effective_workspace_storage_for_spec(&self, spec: &SandboxProvisionSpec) -> String {
+        if spec.workspace_mode == WorkspaceMode::Ephemeral {
+            // emptyDir usage counts against the container's aggregate
+            // ephemeral-storage limit. Never advertise or render a workspace
+            // ceiling above the limit that Kubernetes actually enforces.
+            Self::ephemeral_storage_limit(&spec.memory_limit).to_string()
+        } else {
+            self.effective_workspace_storage(&spec.memory_limit)
+        }
+    }
+
     fn object_metadata(&self, name: String, sandbox_id: Option<SandboxId>) -> serde_json::Value {
         let mut labels = serde_json::Map::from_iter([
             (
@@ -640,7 +651,7 @@ impl KubernetesDryRunProvider {
         let workspace_volume = match &spec.workspace_mode {
             WorkspaceMode::Ephemeral => json!({
                 "name": "workspace",
-                "emptyDir": { "sizeLimit": self.effective_workspace_storage(&spec.memory_limit) }
+                "emptyDir": { "sizeLimit": self.effective_workspace_storage_for_spec(spec) }
             }),
             WorkspaceMode::GenericEphemeral => json!({
                 "name": "workspace",
