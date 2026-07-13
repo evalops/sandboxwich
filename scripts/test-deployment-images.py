@@ -59,6 +59,12 @@ class DeploymentImagesTest(unittest.TestCase):
             script,
         )
 
+    def test_gateway_registry_is_enabled_and_preflighted_on_every_kind_node(self) -> None:
+        cluster = (ROOT / "deploy/kubernetes/kind-conformance.yaml").read_text()
+        workflow = (ROOT / ".github/workflows/kubernetes-conformance.yml").read_text()
+        self.assertIn('config_path = "/etc/containerd/certs.d"', cluster)
+        self.assertIn('crictl pull "${gateway_image}"', workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

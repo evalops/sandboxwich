@@ -74,6 +74,9 @@ jobs:
           gateway_image="$(docker image inspect localhost:5001/sandboxwich-worker:conformance \
             --format '{{range .RepoDigests}}{{println .}}{{end}}' | head -n1)"
           [[ "${gateway_image}" == *@sha256:* ]]
+          for node in $(kind get nodes --name sandboxwich-conformance); do
+            docker exec "${node}" crictl pull "${gateway_image}"
+          done
           echo "SANDBOXWICH_GATEWAY_IMAGE=${gateway_image}" >>"${GITHUB_ENV}"
       - name: Run live conformance and chaos checks
         run: deploy/kubernetes/kind-conformance.sh
