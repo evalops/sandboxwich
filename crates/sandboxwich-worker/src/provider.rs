@@ -157,6 +157,7 @@ pub const DEFAULT_INGRESS_SELECTOR_VALUE: &str = "sandboxwich";
 pub const SANDBOX_TEARDOWN_RESOURCE_KINDS: &str = "pod,persistentvolumeclaim,service,networkpolicy";
 pub const SANDBOX_RECONCILIATION_RESOURCE_KINDS: &str =
     "pod,persistentvolumeclaim,service,secret,networkpolicy";
+const GKE_FQDN_RESOURCE_KIND: &str = "fqdnnetworkpolicy.networking.gke.io";
 
 /// Cheaply cloneable signal a job's background lease-renewal task (see
 /// `handle_lease` in `main.rs`) uses to tell an in-flight `exec_handoff` call
@@ -374,8 +375,33 @@ impl KubernetesDryRunProvider {
     }
 
     pub fn with_cilium_fqdn_egress(mut self, enabled: bool) -> Self {
-        self.fqdn_egress_backend = enabled.then(|| "cilium".to_string());
+        if enabled {
+            self.fqdn_egress_backend = Some("cilium".to_string());
+        }
         self
+    }
+
+    pub fn with_gke_fqdn_egress(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.fqdn_egress_backend = Some("gke".to_string());
+        }
+        self
+    }
+
+    fn teardown_resource_kinds(&self) -> String {
+        self.resource_kinds_with_optional_gke_fqdn(SANDBOX_TEARDOWN_RESOURCE_KINDS)
+    }
+
+    fn reconciliation_resource_kinds(&self) -> String {
+        self.resource_kinds_with_optional_gke_fqdn(SANDBOX_RECONCILIATION_RESOURCE_KINDS)
+    }
+
+    fn resource_kinds_with_optional_gke_fqdn(&self, base: &str) -> String {
+        if self.fqdn_egress_backend.as_deref() == Some("gke") {
+            format!("{base},{GKE_FQDN_RESOURCE_KIND}")
+        } else {
+            base.to_string()
+        }
     }
 
     /// Merges operator-supplied CIDRs into the excluded set (deduped
@@ -510,6 +536,7 @@ impl KubernetesDryRunProvider {
         spec: &SandboxProvisionSpec,
     ) -> anyhow::Result<serde_json::Value> {
         let network_policy = self.network_policy_manifest(sandbox_id, &spec.network_egress)?;
+        let fqdn_network_policy = self.gke_fqdn_policy_manifest(sandbox_id, &spec.network_egress);
         let pvc = (spec.workspace_mode == WorkspaceMode::Persistent).then(|| {
             self.pvc_manifest(
                 format!("sandboxwich-pvc-{sandbox_id}"),
@@ -540,6 +567,7 @@ impl KubernetesDryRunProvider {
                 "sshService": self.ssh_service_manifest(sandbox_id),
                 "desktopService": self.desktop_service_manifest(sandbox_id),
                 "networkPolicy": network_policy,
+                "fqdnNetworkPolicy": fqdn_network_policy,
             }
         }))
     }
@@ -575,7 +603,7 @@ impl KubernetesDryRunProvider {
             && let Some(rule) = rules
                 .iter()
                 .find(|rule| rule.kind == NetworkAllowRuleKind::Host)
-            && self.fqdn_egress_backend.as_deref() != Some("cilium")
+            && !matches!(self.fqdn_egress_backend.as_deref(), Some("cilium" | "gke"))
         {
             bail!(
                 "standard Kubernetes NetworkPolicy cannot enforce host allow rule {}; use cidr allow rules or a provider with FQDN egress support",
@@ -1047,6 +1075,45 @@ impl KubernetesDryRunProvider {
         })
     }
 
+    fn gke_fqdn_policy_manifest(
+        &self,
+        sandbox_id: SandboxId,
+        network_egress: &NetworkEgress,
+    ) -> Option<serde_json::Value> {
+        if self.fqdn_egress_backend.as_deref() != Some("gke") {
+            return None;
+        }
+        let matches: Vec<_> = network_egress
+            .rules()
+            .iter()
+            .filter(|rule| rule.kind == NetworkAllowRuleKind::Host)
+            .map(|rule| json!({"name": rule.value}))
+            .collect();
+        if matches.is_empty() {
+            return None;
+        }
+        Some(json!({
+            "apiVersion": "networking.gke.io/v1alpha1",
+            "kind": "FQDNNetworkPolicy",
+            "metadata": self.object_metadata(
+                format!("sandboxwich-fqdn-egress-{sandbox_id}"),
+                Some(sandbox_id),
+            ),
+            "spec": {
+                "podSelector": {
+                    "matchLabels": {"sandboxwich.dev/sandbox-id": sandbox_id}
+                },
+                "egress": [{
+                    "matches": matches,
+                    "ports": [
+                        {"protocol": "TCP", "port": 80},
+                        {"protocol": "TCP", "port": 443}
+                    ]
+                }]
+            }
+        }))
+    }
+
     fn ssh_service_manifest(&self, sandbox_id: SandboxId) -> serde_json::Value {
         json!({
             "apiVersion": "v1",
@@ -1164,8 +1231,14 @@ impl KubernetesDryRunProvider {
             self.runtime_pod_resource(sandbox_id, status.clone()),
             self.ssh_service_resource(sandbox_id, status.clone()),
             self.desktop_service_resource(sandbox_id, status.clone()),
-            self.network_policy_resource(sandbox_id, status),
+            self.network_policy_resource(sandbox_id, status.clone()),
         ]);
+        if self
+            .gke_fqdn_policy_manifest(sandbox_id, &spec.network_egress)
+            .is_some()
+        {
+            resources.push(self.fqdn_network_policy_resource(sandbox_id, status));
+        }
         resources
     }
 
@@ -1176,7 +1249,7 @@ impl KubernetesDryRunProvider {
         spec: &SandboxProvisionSpec,
         status: RuntimeResourceStatus,
     ) -> Vec<ProviderRuntimeResource> {
-        vec![
+        let mut resources = vec![
             self.workspace_pvc_resource(
                 child_sandbox_id,
                 &spec.memory_limit,
@@ -1186,8 +1259,15 @@ impl KubernetesDryRunProvider {
             self.runtime_pod_resource(child_sandbox_id, status.clone()),
             self.ssh_service_resource(child_sandbox_id, status.clone()),
             self.desktop_service_resource(child_sandbox_id, status.clone()),
-            self.network_policy_resource(child_sandbox_id, status),
-        ]
+            self.network_policy_resource(child_sandbox_id, status.clone()),
+        ];
+        if self
+            .gke_fqdn_policy_manifest(child_sandbox_id, &spec.network_egress)
+            .is_some()
+        {
+            resources.push(self.fqdn_network_policy_resource(child_sandbox_id, status));
+        }
+        resources
     }
 
     fn snapshot_resources(
@@ -1275,6 +1355,21 @@ impl KubernetesDryRunProvider {
             RuntimeResourceKind::NetworkPolicy,
             RuntimeResourcePurpose::Network,
             format!("sandboxwich-egress-{sandbox_id}"),
+            status,
+        )
+    }
+
+    fn fqdn_network_policy_resource(
+        &self,
+        sandbox_id: SandboxId,
+        status: RuntimeResourceStatus,
+    ) -> ProviderRuntimeResource {
+        self.base_resource(
+            sandbox_id,
+            None,
+            RuntimeResourceKind::NetworkPolicy,
+            RuntimeResourcePurpose::Network,
+            format!("sandboxwich-fqdn-egress-{sandbox_id}"),
             status,
         )
     }
@@ -1524,6 +1619,12 @@ fn kubernetes_delete_path(resource: &ObservedKubernetesResource) -> anyhow::Resu
         RuntimeResourceKind::Service => "services",
         RuntimeResourceKind::Secret => "secrets",
         RuntimeResourceKind::NetworkPolicy => {
+            if resource.name.starts_with("sandboxwich-fqdn-egress-") {
+                return Ok(format!(
+                    "/apis/networking.gke.io/v1alpha1/namespaces/{}/fqdnnetworkpolicies/{}",
+                    resource.namespace, resource.name
+                ));
+            }
             return Ok(format!(
                 "/apis/networking.k8s.io/v1/namespaces/{}/networkpolicies/{}",
                 resource.namespace, resource.name
@@ -1551,7 +1652,7 @@ fn kubernetes_delete_options(resource: &ObservedKubernetesResource) -> Value {
 fn runtime_resource_kind_for_kubernetes_kind(kind: &str) -> anyhow::Result<RuntimeResourceKind> {
     match kind {
         "PersistentVolumeClaim" => Ok(RuntimeResourceKind::PersistentVolumeClaim),
-        "NetworkPolicy" => Ok(RuntimeResourceKind::NetworkPolicy),
+        "NetworkPolicy" | "FQDNNetworkPolicy" => Ok(RuntimeResourceKind::NetworkPolicy),
         "Secret" => Ok(RuntimeResourceKind::Secret),
         "Pod" => Ok(RuntimeResourceKind::Pod),
         "Service" => Ok(RuntimeResourceKind::Service),
@@ -1584,6 +1685,7 @@ fn adoption_contract(resource: &Value) -> anyhow::Result<Value> {
             fields.entry("egress").or_insert_with(|| json!([]));
             spec
         }
+        "FQDNNetworkPolicy" => resource["spec"].clone(),
         "Pod" => json!({
             "runtimeClassName": resource["spec"]["runtimeClassName"],
             "automountServiceAccountToken": resource["spec"]["automountServiceAccountToken"],
@@ -1824,6 +1926,17 @@ impl KubernetesApplyProvider {
             ProvisioningStage::NetworkPolicyReady,
             Some(network_identity),
         ))?;
+        if let Some(fqdn_policy) = self
+            .dry_run
+            .gke_fqdn_policy_manifest(sandbox_id, &spec.network_egress)
+        {
+            let fqdn_identity =
+                self.apply_or_adopt_manifest(&fqdn_policy, sandbox_id, cancelled)?;
+            report(stage_update(
+                ProvisioningStage::NetworkPolicyReady,
+                Some(fqdn_identity),
+            ))?;
+        }
 
         report(stage_update(ProvisioningStage::CredentialsReady, None))?;
 
@@ -1879,7 +1992,7 @@ impl KubernetesApplyProvider {
         let mut args = self.kubectl_base_args();
         args.extend([
             "get".to_string(),
-            SANDBOX_RECONCILIATION_RESOURCE_KINDS.to_string(),
+            self.dry_run.reconciliation_resource_kinds(),
             "--selector".to_string(),
             "sandboxwich.dev/sandbox-id".to_string(),
             "--output".to_string(),
@@ -2448,6 +2561,12 @@ impl KubernetesApplyProvider {
             self.dry_run
                 .network_policy_manifest(sandbox_id, &spec.network_egress)?,
         );
+        if let Some(policy) = self
+            .dry_run
+            .gke_fqdn_policy_manifest(sandbox_id, &spec.network_egress)
+        {
+            manifests.push(policy);
+        }
         manifests.push(self.dry_run.ssh_service_manifest(sandbox_id));
         manifests.push(self.dry_run.desktop_service_manifest(sandbox_id));
         Ok(manifests)
@@ -2469,6 +2588,12 @@ impl KubernetesApplyProvider {
             self.dry_run
                 .network_policy_manifest(child_sandbox_id, &spec.network_egress)?,
         );
+        if let Some(policy) = self
+            .dry_run
+            .gke_fqdn_policy_manifest(child_sandbox_id, &spec.network_egress)
+        {
+            manifests.push(policy);
+        }
         manifests.push(self.dry_run.ssh_service_manifest(child_sandbox_id));
         manifests.push(self.dry_run.desktop_service_manifest(child_sandbox_id));
         Ok(manifests)
@@ -2540,7 +2665,7 @@ impl KubernetesApplyProvider {
         let mut args = self.kubectl_base_args();
         args.extend([
             "delete".to_string(),
-            SANDBOX_TEARDOWN_RESOURCE_KINDS.to_string(),
+            self.dry_run.teardown_resource_kinds(),
             "-l".to_string(),
             format!("sandboxwich.dev/sandbox-id={sandbox_id}"),
             "--ignore-not-found=true".to_string(),

@@ -7,7 +7,7 @@ until its real provider path is exercised by an end-to-end conformance test.
 |---|---|---|
 | Typed HTTP control plane | Experimental | SQLite for local development; Postgres for shared deployments. |
 | Kubernetes pod provisioning | Experimental | Apply mode mutates a configured sandbox namespace. Require gVisor or Kata for hostile multi-tenant workloads. |
-| FQDN egress allowlists | Experimental | Workers configured with `SANDBOXWICH_CILIUM_FQDN_EGRESS=true` render Cilium `toFQDNs` policy and advertise `fqdn_egress`. Standard Kubernetes NetworkPolicy workers reject host rules. |
+| FQDN egress allowlists | Experimental | Workers configured with `SANDBOXWICH_CILIUM_FQDN_EGRESS=true` render Cilium `toFQDNs`; GKE Dataplane V2 workers configured with `SANDBOXWICH_GKE_FQDN_EGRESS=true` render additive `FQDNNetworkPolicy` resources. Both advertise `fqdn_egress`; standard Kubernetes NetworkPolicy workers reject host rules. |
 | Command execution | Experimental | Kubernetes apply mode uses `kubectl exec`; dry-run mode is simulation only. |
 | Snapshots and forks | Experimental | Requires a working CSI `VolumeSnapshotClass`; not all clusters support it. |
 | SSH and browser desktop metadata | Experimental | Access records do not provide an ingress tunnel by themselves. |

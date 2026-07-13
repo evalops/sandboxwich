@@ -595,6 +595,34 @@ fn empty_provider_options_are_normalized_to_absent() {
 }
 
 #[test]
+fn fqdn_backends_are_explicit_and_mutually_exclusive() {
+    let gke = Cli::try_parse_from([
+        "sandboxwich-worker",
+        "provider-capabilities",
+        "--gke-fqdn-egress",
+    ])
+    .expect("GKE FQDN backend is a supported provider option");
+    assert!(matches!(
+        gke.command,
+        Command::ProviderCapabilities(ProviderArgs {
+            gke_fqdn_egress: true,
+            cilium_fqdn_egress: false,
+            ..
+        })
+    ));
+
+    assert!(
+        Cli::try_parse_from([
+            "sandboxwich-worker",
+            "provider-capabilities",
+            "--gke-fqdn-egress",
+            "--cilium-fqdn-egress",
+        ])
+        .is_err()
+    );
+}
+
+#[test]
 fn classify_retry_flags_transient_infrastructure_errors_as_retryable() {
     let timeout = anyhow::Error::new(ProviderError::retryable(anyhow::anyhow!("timeout")));
     assert!(classify_retry(&timeout));

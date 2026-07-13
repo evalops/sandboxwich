@@ -476,6 +476,45 @@ fn cilium_fqdn_backend_renders_host_allow_rules() {
 }
 
 #[test]
+fn gke_fqdn_backend_renders_additive_ingress_and_host_egress_policies() {
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("gke-ci", "sandboxwich-ci", None, None)
+            .with_gke_fqdn_egress(true);
+    let spec = SandboxProvisionSpec {
+        workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        memory_limit: MemoryLimit::OneG,
+        network_egress: NetworkEgress::Allowlist {
+            rules: vec![sandboxwich_core::NetworkAllowRule {
+                kind: NetworkAllowRuleKind::Host,
+                value: "api.example.com".to_string(),
+            }],
+        },
+    };
+
+    let provisioned = provider
+        .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+        .expect("configured GKE FQDN policy must support host allow rules");
+    let standard = &provisioned.metadata["manifests"]["networkPolicy"];
+    let fqdn = &provisioned.metadata["manifests"]["fqdnNetworkPolicy"];
+    assert_eq!(standard["apiVersion"], "networking.k8s.io/v1");
+    assert_eq!(standard["kind"], "NetworkPolicy");
+    assert_eq!(fqdn["apiVersion"], "networking.gke.io/v1alpha1");
+    assert_eq!(fqdn["kind"], "FQDNNetworkPolicy");
+    assert_eq!(
+        fqdn["spec"]["egress"][0]["matches"][0]["name"],
+        "api.example.com"
+    );
+    assert_eq!(fqdn["spec"]["egress"][0]["ports"][0]["port"], 80);
+    assert_eq!(fqdn["spec"]["egress"][0]["ports"][1]["port"], 443);
+    assert!(
+        provider
+            .capability_report()
+            .capabilities
+            .contains(&WorkerCapability::FqdnEgress)
+    );
+}
+
+#[test]
 fn kubernetes_pod_mounts_authorized_keys_secret_by_reference() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
@@ -1597,6 +1636,89 @@ fn provision_staged_applies_resources_in_durable_order_and_reports_uids() {
         "replay must adopt the five existing resources: {replay_log}"
     );
     assert_eq!(replay_reports.len(), 8);
+
+    let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+#[test]
+fn provision_staged_applies_and_tracks_gke_fqdn_policy_before_pod() {
+    let (kubectl, log_path) = write_stateful_fake_kubectl();
+    let dry_run =
+        KubernetesDryRunProvider::with_snapshot_class("gke-ci", "sandboxwich-ci", None, None)
+            .with_gke_fqdn_egress(true);
+    let provider = KubernetesApplyProvider::new(dry_run, kubectl.to_string_lossy().into_owned())
+        .with_mutation_gate(true, true);
+    let sandbox_id = SandboxId::new();
+    let spec = SandboxProvisionSpec {
+        network_egress: NetworkEgress::Allowlist {
+            rules: vec![sandboxwich_core::NetworkAllowRule {
+                kind: NetworkAllowRuleKind::Host,
+                value: "api.example.com".to_string(),
+            }],
+        },
+        ..SandboxProvisionSpec::default()
+    };
+    let mut reports = Vec::new();
+
+    let handle = provider
+        .provision_staged(
+            sandbox_id,
+            &spec,
+            &CancelSignal::never_cancelled(),
+            |report| {
+                reports.push(report);
+                Ok(())
+            },
+        )
+        .expect("GKE FQDN staged provision succeeds");
+
+    let log = std::fs::read_to_string(&log_path).expect("read staged kubectl log");
+    assert!(log.contains("FQDNNetworkPolicy"));
+    assert!(
+        log.find("FQDNNetworkPolicy").expect("FQDN apply") < log.find(" wait ").expect("pod wait"),
+        "the enforceable egress policy must be durable before pod readiness: {log}"
+    );
+    assert_eq!(
+        reports
+            .iter()
+            .filter(|report| report.stage == sandboxwich_core::ProvisioningStage::NetworkPolicyReady)
+            .count(),
+        2
+    );
+    assert_eq!(
+        handle
+            .resources
+            .iter()
+            .filter(|resource| resource.resource_kind
+                == sandboxwich_core::RuntimeResourceKind::NetworkPolicy)
+            .count(),
+        2
+    );
+    assert!(
+        provider
+            .dry_run
+            .teardown_resource_kinds()
+            .contains("fqdnnetworkpolicy")
+    );
+    assert!(
+        provider
+            .dry_run
+            .reconciliation_resource_kinds()
+            .contains("fqdnnetworkpolicy")
+    );
+    let fqdn_observed = ObservedKubernetesResource {
+        sandbox_id: Some(sandbox_id),
+        resource_kind: sandboxwich_core::RuntimeResourceKind::NetworkPolicy,
+        namespace: "sandboxwich-ci".to_string(),
+        name: format!("sandboxwich-fqdn-egress-{sandbox_id}"),
+        uid: "uid-fqdn".to_string(),
+    };
+    assert_eq!(
+        kubernetes_delete_path(&fqdn_observed).expect("GKE FQDN delete path"),
+        format!(
+            "/apis/networking.gke.io/v1alpha1/namespaces/sandboxwich-ci/fqdnnetworkpolicies/sandboxwich-fqdn-egress-{sandbox_id}"
+        )
+    );
 
     let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
 }

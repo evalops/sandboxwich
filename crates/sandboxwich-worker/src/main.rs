@@ -238,6 +238,16 @@ struct ProviderArgs {
     #[arg(long, env = "SANDBOXWICH_CILIUM_FQDN_EGRESS", default_value_t = false)]
     cilium_fqdn_egress: bool,
 
+    /// Enable GKE Dataplane V2 FQDNNetworkPolicy rendering for host allow
+    /// rules. The cluster must have GKE FQDN Network Policy enabled.
+    #[arg(
+        long,
+        env = "SANDBOXWICH_GKE_FQDN_EGRESS",
+        default_value_t = false,
+        conflicts_with = "cilium_fqdn_egress"
+    )]
+    gke_fqdn_egress: bool,
+
     /// Dedicated namespace sandbox pods/services/PVCs/NetworkPolicies are
     /// deployed into, separate from the control-plane namespace (GH-76).
     /// Unset falls back to the control-plane `--namespace`, preserving
@@ -817,6 +827,7 @@ fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
     .with_ssh_authorized_keys_secret(non_empty(args.ssh_authorized_keys_secret))
     .with_runtime_class_name(non_empty(args.runtime_class_name))
     .with_cilium_fqdn_egress(args.cilium_fqdn_egress)
+    .with_gke_fqdn_egress(args.gke_fqdn_egress)
     .with_sandbox_namespace(non_empty(args.sandbox_namespace))
     .with_dns_namespace(non_empty(args.dns_namespace));
     let provider = if args.egress_excluded_cidrs_replace {
