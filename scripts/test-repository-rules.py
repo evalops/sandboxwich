@@ -60,6 +60,31 @@ class RepositoryRulesTest(unittest.TestCase):
         self.assertIn("name: service image (${{ matrix.bin }})", workflow)
         self.assertIn("name: runtime image (ubuntu-dev)", workflow)
 
+    def test_container_workflow_verifies_and_signs_platform_provenance(self) -> None:
+        workflow = (ROOT / ".github/workflows/containers.yml").read_text()
+        verifier = (ROOT / "scripts/verify-image-provenance.sh").read_text()
+        for marker in (
+            "dev.sandboxwich.build.runner-architecture",
+            "dev.sandboxwich.build.dockerfile-digest",
+            "dev.sandboxwich.build.dependency-lock-digest",
+            "verify-image-provenance.sh",
+            "Sign service platform manifests",
+            "Sign runtime platform manifests",
+            "provenance-summary.json",
+        ):
+            self.assertIn(marker, workflow)
+        for marker in (
+            "{{json .Provenance}}",
+            "{{json .SBOM}}",
+            "linux/amd64",
+            "linux/arm64",
+            "attestation-manifest",
+            "cosign verify",
+        ):
+            self.assertIn(marker, verifier)
+        self.assertNotIn("qemu", workflow.lower())
+        self.assertNotIn("binfmt", workflow.lower())
+
 
 if __name__ == "__main__":
     unittest.main()
