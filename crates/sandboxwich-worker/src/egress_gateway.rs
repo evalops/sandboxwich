@@ -376,12 +376,26 @@ impl ProxyRequest {
         });
         let (host, port) = parse_authority(authority, 80)?;
         let forward_first = format!("{method} {path} {version}");
-        let remainder = text.split_once("\r\n").map_or("\r\n", |(_, value)| value);
+        let mut forward_header = format!("{forward_first}\r\nHost: {authority}\r\n");
+        for line in text.split("\r\n").skip(1) {
+            if line.is_empty() {
+                break;
+            }
+            let (name, _) = line
+                .split_once(':')
+                .ok_or_else(|| GatewayDeny::new("invalid_header"))?;
+            if name.eq_ignore_ascii_case("host") {
+                continue;
+            }
+            forward_header.push_str(line);
+            forward_header.push_str("\r\n");
+        }
+        forward_header.push_str("\r\n");
         Ok(Self {
             host,
             port,
             connect: false,
-            forward_header: format!("{forward_first}\r\n{remainder}").into_bytes(),
+            forward_header: forward_header.into_bytes(),
         })
     }
 }
@@ -505,6 +519,18 @@ mod tests {
                 .reason_code(),
             "unsupported_proxy_request"
         );
+    }
+
+    #[test]
+    fn parser_replaces_a_mismatched_host_header_with_the_validated_authority() {
+        let request = ProxyRequest::parse(
+            b"GET http://allowed.example:8080/v1 HTTP/1.1\r\nHost: other.example\r\nX-Test: retained\r\n\r\n",
+        )
+        .unwrap();
+        let forward_header = String::from_utf8(request.forward_header).unwrap();
+        assert!(forward_header.contains("\r\nHost: allowed.example:8080\r\n"));
+        assert!(!forward_header.contains("other.example"));
+        assert!(forward_header.contains("\r\nX-Test: retained\r\n"));
     }
 
     #[test]

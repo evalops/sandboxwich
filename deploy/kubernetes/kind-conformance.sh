@@ -168,6 +168,14 @@ run_command() {
   api "http://127.0.0.1:32170/commands/${command_id}"
 }
 
+assert_command_failed_with_exit() {
+  local response="$1" context="$2"
+  jq -e '.command.exit_code != null and
+    (.command.exit_code | type == "number") and
+    .command.exit_code != 0' <<<"${response}" >/dev/null ||
+    fail "${context} did not return a concrete nonzero exit: ${response}"
+}
+
 stop_sandbox() {
   local sandbox_id="$1"
   api -X POST "http://127.0.0.1:32170/sandboxes/${sandbox_id}/stop" --data '{}' >/dev/null
@@ -183,14 +191,12 @@ for assertion in \
   'curl -fsS --max-time 5 http://1.1.1.1/ >/dev/null' \
   'curl --noproxy "" -fsS --max-time 5 http://localhost/ >/dev/null'; do
   response="$(run_command "${gateway_id}" "$(jq -cn --arg command "${assertion}" '["sh","-c",$command]')")"
-  [[ "$(jq -r .command.exit_code <<<"${response}")" != "0" ]] || \
-    fail "gateway deny assertion unexpectedly succeeded: ${assertion}"
+  assert_command_failed_with_exit "${response}" "gateway deny assertion ${assertion}"
 done
 kubectl -n sandboxwich-sandboxes delete pod \
   "sandboxwich-egress-gateway-${gateway_id}" --wait=true >/dev/null
 outage="$(run_command "${gateway_id}" '["sh","-c","curl --noproxy \"*\" -fsS --max-time 5 http://example.com/ >/dev/null"]')"
-[[ "$(jq -r .command.exit_code <<<"${outage}")" != "0" ]] || \
-  fail "gateway outage did not fail closed"
+assert_command_failed_with_exit "${outage}" "gateway outage"
 stop_sandbox "${gateway_id}"
 echo "egress-gateway-enforced"
 
