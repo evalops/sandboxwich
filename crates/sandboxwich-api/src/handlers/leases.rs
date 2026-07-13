@@ -601,7 +601,9 @@ pub(crate) async fn update_provisioning_stage_in_transaction(
         let observation_sql = format!(
             "insert into provisioning_stage_observations
              (sandbox_id, lease_id, tenant_id, workspace_mode, stage, stage_index, lease_attempt, error_class, started_at, observed_at)
-             values ({}) on conflict do nothing",
+             values ({}) on conflict (lease_id, stage) do update set
+               error_class = excluded.error_class
+             where excluded.error_class is not null",
             db.placeholders(10)
         );
         sqlx::query(&observation_sql)

@@ -194,6 +194,24 @@ pub(crate) async fn provisioning_stage_route_is_put_only_and_worker_fenced() {
         .unwrap();
     assert_eq!(response.operation.lease_id, lease.id);
 
+    let failed_stage = ProvisioningStageUpdateRequest {
+        last_error_class: Some(ProvisioningErrorClass::RetryableProvider),
+        last_error_code: Some("pod_ready_timeout".to_string()),
+        last_error: Some("pod readiness timed out".to_string()),
+        ..request.clone()
+    };
+    worker_client
+        .put(format!(
+            "{}/leases/{}/provisioning",
+            server.base_url, lease.id
+        ))
+        .json(&failed_stage)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
     let wrong_method = worker_client
         .post(format!(
             "{}/leases/{}/provisioning",
@@ -228,7 +246,7 @@ pub(crate) async fn provisioning_stage_route_is_put_only_and_worker_fenced() {
         .unwrap();
     assert!(metrics.contains("sandboxwich_provisioning_stage_seconds_bucket{"));
     assert!(metrics.contains("stage=\"workspace_planned\""));
-    assert!(metrics.contains("error_class=\"none\""));
+    assert!(metrics.contains("error_class=\"retryable_provider\""));
 }
 
 /// The guest-side agent daemon claims leases from `POST
