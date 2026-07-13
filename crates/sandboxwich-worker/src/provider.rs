@@ -3458,7 +3458,10 @@ impl SandboxProvider for KubernetesDryRunProvider {
             capabilities.push(WorkerCapability::GvisorSandbox);
         }
         if self.fqdn_egress_backend.as_deref() == Some("cilium")
-            || self.egress_gateway_image.is_some()
+            || self
+                .egress_gateway_image
+                .as_deref()
+                .is_some_and(image_is_digest_pinned)
         {
             capabilities.push(WorkerCapability::FqdnEgress);
         }

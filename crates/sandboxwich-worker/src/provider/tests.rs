@@ -609,6 +609,13 @@ fn host_rules_reject_an_unpinned_gateway_image() {
         .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
         .expect_err("host rules must reject a mutable gateway image");
     assert!(error.to_string().contains("egress_gateway_image_unpinned"));
+    assert!(
+        !provider
+            .capability_report()
+            .capabilities
+            .contains(&WorkerCapability::FqdnEgress),
+        "provider-capabilities must not advertise work that provisioning rejects"
+    );
 }
 
 #[test]

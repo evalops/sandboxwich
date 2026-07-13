@@ -121,6 +121,19 @@ wait_json() {
   fail "timed out waiting for ${expression}=${expected} from ${url}"
 }
 
+wait_command_terminal() {
+  local url="$1"
+  for _ in $(seq 1 90); do
+    local response status
+    response="$(api "${url}")" || true
+    status="$(jq -r '.command.status' <<<"${response:-{}}" 2>/dev/null || true)"
+    [[ "${status}" == "finished" || "${status}" == "failed" ]] && return 0
+    [[ "${status}" == "dead" ]] && fail "terminal failure from ${url}: ${response}"
+    sleep 1
+  done
+  fail "timed out waiting for a terminal command status from ${url}"
+}
+
 create_sandbox() {
   local name="$1" network_egress="$2" response sandbox_id
   response="$(api -X POST http://127.0.0.1:32170/sandboxes \
@@ -151,7 +164,7 @@ run_command() {
   response="$(api -X POST "http://127.0.0.1:32170/sandboxes/${sandbox_id}/commands" \
     --data "$(jq -cn --argjson argv "${argv_json}" '{argv:$argv}')")"
   command_id="$(jq -r .command.id <<<"${response}")"
-  wait_json "http://127.0.0.1:32170/commands/${command_id}" '.command.status' finished
+  wait_command_terminal "http://127.0.0.1:32170/commands/${command_id}"
   api "http://127.0.0.1:32170/commands/${command_id}"
 }
 

@@ -48,6 +48,17 @@ class DeploymentImagesTest(unittest.TestCase):
             script,
         )
 
+    def test_negative_probes_accept_failed_command_status(self) -> None:
+        script = (ROOT / "deploy/kubernetes/kind-conformance.sh").read_text()
+        self.assertIn(
+            '[[ "${status}" == "finished" || "${status}" == "failed" ]] && return 0',
+            script,
+        )
+        self.assertIn(
+            'wait_command_terminal "http://127.0.0.1:32170/commands/${command_id}"',
+            script,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
