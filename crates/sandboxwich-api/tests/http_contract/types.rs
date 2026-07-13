@@ -111,6 +111,31 @@ pub(crate) async fn assert_database_rejects_invalid_typed_values(
         "invalid sandbox workspace mode was accepted"
     );
 
+    // `sandboxes.parent_snapshot_id` now carries a real foreign key to
+    // `snapshot_restore_sources(snapshot_id)` (see
+    // `postgres_sandbox_parent_snapshot_fk_statements` /
+    // `sqlite_rebuild_sandboxes_with_parent_snapshot_fk` in `db.rs`): a
+    // sandbox can never be inserted pointing at a snapshot id that never
+    // existed, on either backend.
+    let invalid_parent_snapshot_result = sqlx::query(&insert_sandbox_sql(database_url))
+        .bind(Uuid::now_v7().to_string())
+        .bind("invalid-parent-snapshot")
+        .bind("ready")
+        .bind("ubuntu-dev")
+        .bind("1g")
+        .bind("deny_all")
+        .bind("persistent")
+        .bind(now)
+        .bind(now)
+        .bind(120_i64)
+        .bind(invalid_snapshot_id.clone())
+        .execute(&pool)
+        .await;
+    assert!(
+        invalid_parent_snapshot_result.is_err(),
+        "sandbox with a parent_snapshot_id pointing at a nonexistent snapshot was accepted"
+    );
+
     let invalid_network_rule_result = sqlx::query(&insert_network_allow_rule_sql(database_url))
         .bind(Uuid::now_v7().to_string())
         .bind(sandbox_id)
