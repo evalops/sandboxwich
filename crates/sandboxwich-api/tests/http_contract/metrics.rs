@@ -162,6 +162,7 @@ pub(crate) async fn assert_metrics_are_exposed(client: &reqwest::Client, server:
     assert!(metrics.contains("# TYPE sandboxwich_sandbox_count gauge"));
     assert!(metrics.contains("sandboxwich_sandbox_count{state=\"planning\"}"));
     assert!(metrics.contains("sandboxwich_worker_capacity_slots"));
+    assert!(metrics.contains("sandboxwich_worker_available_slots"));
     assert!(metrics.contains("# TYPE sandboxwich_job_lease_count gauge"));
     assert!(metrics.contains("# TYPE sandboxwich_job_attempts gauge"));
     assert!(metrics.contains("# TYPE sandboxwich_idempotency_record_count gauge"));
@@ -169,4 +170,35 @@ pub(crate) async fn assert_metrics_are_exposed(client: &reqwest::Client, server:
     assert!(metrics.contains("# TYPE sandboxwich_cleanup_run_count gauge"));
     assert!(metrics.contains("# TYPE sandboxwich_job_queue_oldest_seconds gauge"));
     assert!(metrics.contains("# TYPE sandboxwich_worker_heartbeat_oldest_seconds gauge"));
+    assert!(metrics.contains("# TYPE sandboxwich_sandbox_creation_seconds histogram"));
+    assert!(metrics.contains("# TYPE sandboxwich_sandbox_creation_total counter"));
+    assert!(metrics.contains("# TYPE sandboxwich_command_duration_seconds histogram"));
+    assert!(metrics.contains("# TYPE sandboxwich_cleanup_duration_seconds histogram"));
+    assert!(metrics.contains("# TYPE sandboxwich_worker_claim_seconds histogram"));
+    assert!(metrics.contains("# TYPE sandboxwich_provisioning_stage_seconds histogram"));
+}
+
+pub(crate) async fn assert_slo_metrics_have_bounded_observations(
+    client: &reqwest::Client,
+    server: &TestServer,
+) {
+    let metrics = client
+        .get(format!("{}/metrics", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics.contains("sandboxwich_sandbox_creation_seconds_bucket{"));
+    assert!(metrics.contains("workspace_mode=\"persistent\""));
+    assert!(metrics.contains("start_type=\"warm\"") || metrics.contains("start_type=\"cold\""));
+    assert!(metrics.contains("sandboxwich_command_duration_seconds_bucket{"));
+    assert!(metrics.contains("sandboxwich_cleanup_duration_seconds_bucket{"));
+    assert!(metrics.contains("sandboxwich_worker_claim_seconds_bucket{"));
+    for forbidden in ["tenant_id=", "sandbox_id=", "command_id=", "hostname="] {
+        assert!(!metrics.contains(forbidden), "forbidden label {forbidden}");
+    }
 }

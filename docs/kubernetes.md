@@ -208,6 +208,23 @@ token there. Scrapers in another namespace require a deployment-specific
 companion NetworkPolicy with both namespace and pod selectors; the shipped
 policy does not grant cross-namespace ingress.
 
+Latency SLO series are derived from durable database timestamps, so API
+restarts do not reset them. `sandboxwich_sandbox_creation_seconds` and
+`sandboxwich_sandbox_creation_total` are labeled by bounded `workspace_mode`,
+`outcome`, and `start_type` values. A start is `warm` when the first worker
+lease is acquired within 30 seconds of scheduling and `cold` otherwise; this
+definition measures whether ready capacity was available without exposing node
+or tenant identity. Command, cleanup, worker-claim, and provisioning-stage
+histograms likewise use only bounded status, job-kind, stage, storage-mode, and
+error-class labels. Tenant, sandbox, job, command, hostname, and arbitrary
+provider values are never metric labels.
+
+`sandboxwich_worker_capacity_slots` reports configured online concurrency;
+`sandboxwich_worker_available_slots` subtracts active leases and clamps the
+result at zero. The initial production rollout should keep SLO alerting in
+measurement mode until at least 14 days of cardinality and traffic evidence is
+available.
+
 Run the read-only homelab smoke through a port-forward after GitOps applies the manifests:
 
 ```sh

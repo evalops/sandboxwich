@@ -68,6 +68,8 @@ fn db_enum_registry_covers_persisted_variant_columns() {
         ("provisioning_operations", "last_error_class"),
         ("provisioning_operation_resources", "stage"),
         ("provisioning_operation_resources", "resource_kind"),
+        ("provisioning_stage_observations", "stage"),
+        ("provisioning_stage_observations", "error_class"),
     ] {
         assert!(
             seen.contains(&expected),
@@ -178,7 +180,7 @@ fn looks_like_cidr_rejects_garbage_and_out_of_range_prefixes() {
 #[test]
 fn db_enum_fingerprint_is_versioned_and_stable_for_current_registry() {
     let fingerprint = db_enum_schema_fingerprint();
-    assert!(fingerprint.starts_with("db-enum-v3:"));
+    assert!(fingerprint.starts_with("db-enum-v4:"));
     assert_eq!(fingerprint, db_enum_schema_fingerprint());
 }
 

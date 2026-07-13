@@ -215,6 +215,20 @@ pub(crate) async fn provisioning_stage_route_is_put_only_and_worker_fenced() {
         .await
         .unwrap();
     assert_eq!(tenant_attempt.status(), StatusCode::UNAUTHORIZED);
+
+    let metrics = client
+        .get(format!("{}/metrics", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics.contains("sandboxwich_provisioning_stage_seconds_bucket{"));
+    assert!(metrics.contains("stage=\"workspace_planned\""));
+    assert!(metrics.contains("error_class=\"none\""));
 }
 
 /// The guest-side agent daemon claims leases from `POST

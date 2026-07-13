@@ -598,6 +598,23 @@ pub(crate) async fn update_provisioning_stage_in_transaction(
             ));
         }
 
+        let observation_sql = format!(
+            "insert into provisioning_stage_observations
+             (sandbox_id, lease_id, stage, stage_index, lease_attempt, error_class, observed_at)
+             values ({}) on conflict do nothing",
+            db.placeholders(7)
+        );
+        sqlx::query(&observation_sql)
+            .bind(sandbox_id.to_string())
+            .bind(lease.id.to_string())
+            .bind(request.stage.as_db_str())
+            .bind(i64::from(request.stage.ordinal()))
+            .bind(lease.attempt)
+            .bind(request.last_error_class.as_ref().map(DbVariant::as_db_str))
+            .bind(now.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+
         if let (
             Some(resource_kind),
             Some(resource_namespace),

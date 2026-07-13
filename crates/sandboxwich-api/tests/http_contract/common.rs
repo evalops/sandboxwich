@@ -784,6 +784,7 @@ pub(crate) async fn run_contract(server: TestServer) {
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert_slo_metrics_have_bounded_observations(&client, &server).await;
 }
 
 /// Polls `check` until it returns `Some`, or panics after a bounded wait. Used
