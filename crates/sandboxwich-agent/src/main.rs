@@ -21,8 +21,8 @@ use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, AgentFileReadResponse, AgentFileWriteRequest,
     AgentHealthResponse, AppendCommandOutputRequest, ClaimLeaseRequest, ClaimLeaseResponse,
     CommandOutputStream, CompleteLeaseRequest, DEFAULT_COMMAND_TIMEOUT_SECS, FailLeaseRequest,
-    GuestStatus, JobKind, LeaseId, LeaseResponse, RenewLeaseRequest, SandboxId,
-    UpdateGuestHealthRequest, WorkerJobResult, build_api_client,
+    GuestStatus, GuestTokenResponse, JobKind, LeaseId, LeaseResponse, MintGuestTokenRequest,
+    RenewLeaseRequest, SandboxId, UpdateGuestHealthRequest, WorkerJobResult, build_api_client,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -59,6 +59,11 @@ const RENEW_ATTEMPTS: u32 = 3;
 const RENEW_RETRY_DELAY: Duration = Duration::from_millis(250);
 /// How often a command's execution polls for a lease-cancellation signal.
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Default TTL requested when the daemon self-mints its own sandbox-scoped
+/// guest token (see `resolve_guest_client`). Matches the API's own default
+/// (`mint_guest_token`'s `ttl_seconds.unwrap_or(3600)`) so leaving both sides
+/// at their defaults produces one consistent lifetime.
+const DEFAULT_GUEST_TOKEN_TTL_SECS: u64 = 3600;
 
 #[derive(Debug, Parser)]
 #[command(name = "sandboxwich-agent")]
@@ -122,6 +127,33 @@ struct DaemonArgs {
 
     #[arg(long, env = "SANDBOXWICH_WORKER_ID")]
     worker_id: Option<Uuid>,
+
+    /// Pre-provisioned sandbox-scoped guest credential (`sbw_gtok_...`, see
+    /// GH-64's guest-token endpoint) to use for guest-facing calls
+    /// (claim/renew/complete/fail/output, guest-health) instead of the
+    /// worker-wide `--api-token`. Takes precedence over
+    /// `--guest-token-file`/`SANDBOXWICH_GUEST_TOKEN_FILE` below when both
+    /// somehow resolve (mirrors `--api-token`'s own file-over-literal
+    /// precedence via `resolve_api_token`).
+    #[arg(long, env = "SANDBOXWICH_GUEST_TOKEN")]
+    guest_token: Option<String>,
+
+    /// Path to a file containing the guest token, mirroring
+    /// `--api-token-file`'s mounted read-only Secret delivery; takes
+    /// precedence over `--guest-token`/`SANDBOXWICH_GUEST_TOKEN` when set.
+    #[arg(long, env = "SANDBOXWICH_GUEST_TOKEN_FILE")]
+    guest_token_file: Option<PathBuf>,
+
+    /// TTL requested when this daemon self-mints its own sandbox-scoped
+    /// guest token. Only used when neither `--guest-token` nor
+    /// `--guest-token-file` resolves to a token and `--worker-id` is set;
+    /// ignored otherwise.
+    #[arg(
+        long,
+        env = "SANDBOXWICH_GUEST_TOKEN_TTL_SECONDS",
+        default_value_t = DEFAULT_GUEST_TOKEN_TTL_SECS
+    )]
+    guest_token_ttl_seconds: u64,
 
     #[arg(long)]
     lease_seconds: Option<u64>,
@@ -288,11 +320,34 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
     let api_token = resolve_api_token(args.api_token_file, args.api_token)?;
     let client = build_api_client(api_token.as_deref(), args.tenant.as_deref())?;
     let sandbox_id = SandboxId(args.sandbox_id);
+
+    // The real fix for the advisory sandbox/kind filter on `ClaimLeaseRequest`
+    // (see its doc comment): rather than reusing the worker-wide `client` for
+    // every guest-facing call, prefer a credential the API itself has bound to
+    // exactly this `(worker_id, sandbox_id)`, so a compromised guest process
+    // cannot claim, renew, complete, or fail a lease outside its own sandbox
+    // regardless of what it puts in the request body. Falls back to `client`
+    // (the pre-fix behavior) when no worker id is configured or minting/using a
+    // guest token doesn't pan out.
+    let guest_client = resolve_guest_client(
+        &client,
+        &api,
+        GuestCredentialConfig {
+            tenant: args.tenant,
+            worker_id: args.worker_id,
+            sandbox_id,
+            guest_token_file: args.guest_token_file,
+            guest_token: args.guest_token,
+            guest_token_ttl_seconds: args.guest_token_ttl_seconds,
+        },
+    )
+    .await;
+
     let mut iterations = 0_u64;
     let heartbeat_interval = Duration::from_millis(args.heartbeat_interval_ms.max(1));
-    post_guest_health(&client, &api, sandbox_id, GuestStatus::Ready, None).await?;
+    post_guest_health(&guest_client, &api, sandbox_id, GuestStatus::Ready, None).await?;
     let heartbeat_task = tokio::spawn(heartbeat_loop(
-        client.clone(),
+        guest_client.clone(),
         api.clone(),
         sandbox_id,
         heartbeat_interval,
@@ -321,13 +376,19 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
             if let Some(worker_id) = args.worker_id {
                 let claim_response =
                     with_retry(&mut claim_budget, &mut claim_backoff, "claim_lease", || {
-                        claim_lease(&client, &api, worker_id, sandbox_id, args.lease_seconds)
+                        claim_lease(
+                            &guest_client,
+                            &api,
+                            worker_id,
+                            sandbox_id,
+                            args.lease_seconds,
+                        )
                     })
                     .await?;
 
                 if let Some(lease) = claim_response.lease
                     && let Err(error) = handle_lease(
-                        &client,
+                        &guest_client,
                         &api,
                         sandbox_id,
                         lease,
@@ -341,7 +402,7 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
                         "post_guest_health",
                         || {
                             post_guest_health(
-                                &client,
+                                &guest_client,
                                 &api,
                                 sandbox_id,
                                 GuestStatus::Unhealthy,
@@ -738,6 +799,156 @@ fn open_workspace(
     Ok((workspace, relative, display_path))
 }
 
+/// Which sandbox-scoped guest credential (if any) `resolve_guest_client` should
+/// use, decided purely from already-resolved inputs (no I/O), so the
+/// precedence rule itself is unit-testable without a live server or
+/// filesystem.
+#[derive(Debug, Eq, PartialEq)]
+enum GuestCredentialSource {
+    /// A guest token was supplied directly (via `--guest-token[-file]`); use it
+    /// as-is and never call the mint endpoint.
+    Provided(String),
+    /// No guest token was supplied, but a worker id is configured: self-mint
+    /// one bound to `(worker_id, sandbox_id)` via the worker-scoped client.
+    SelfMint { worker_id: Uuid, ttl_seconds: u64 },
+    /// Neither a guest token nor a worker id is available; there is nothing to
+    /// mint or use, so the caller falls back to the worker-wide client.
+    None,
+}
+
+fn guest_credential_source(
+    resolved_guest_token: Option<String>,
+    worker_id: Option<Uuid>,
+    ttl_seconds: u64,
+) -> GuestCredentialSource {
+    if let Some(token) = resolved_guest_token {
+        GuestCredentialSource::Provided(token)
+    } else if let Some(worker_id) = worker_id {
+        GuestCredentialSource::SelfMint {
+            worker_id,
+            ttl_seconds,
+        }
+    } else {
+        GuestCredentialSource::None
+    }
+}
+
+/// Inputs `resolve_guest_client` needs beyond the worker-scoped client and API
+/// base URL, grouped into one struct so the function stays under clippy's
+/// argument-count lint.
+struct GuestCredentialConfig {
+    tenant: Option<String>,
+    worker_id: Option<Uuid>,
+    sandbox_id: SandboxId,
+    guest_token_file: Option<PathBuf>,
+    guest_token: Option<String>,
+    guest_token_ttl_seconds: u64,
+}
+
+/// Resolves the credential this daemon uses for every guest-facing call
+/// (claim/renew/complete/fail/output, guest-health): a pre-provisioned,
+/// sandbox-scoped guest token if one was supplied (`--guest-token`/
+/// `--guest-token-file`, following the same file-over-literal precedence as
+/// `resolve_api_token`), otherwise one freshly self-minted -- via
+/// `worker_client`, the worker-scoped credential also used for
+/// `--api-token`/`--api-token-file` -- and bound to exactly this
+/// `(worker_id, sandbox_id)`.
+///
+/// Falls back to `worker_client` itself, unchanged, whenever there's nothing
+/// better to use: no worker id configured (nothing to mint against, and
+/// nothing to claim leases with either), or minting fails (e.g. an older API
+/// without the guest-token endpoint, or a deployment that hasn't wired
+/// guest-token delivery into this sandbox yet). That fallback is the pre-fix
+/// behavior -- the guest and its worker sharing one worker-scoped token (see
+/// the doc comment on `ClaimLeaseRequest`) -- so this function only ever
+/// narrows an existing deployment's blast radius; it never makes the daemon
+/// fail to start.
+async fn resolve_guest_client(
+    worker_client: &reqwest::Client,
+    api: &str,
+    config: GuestCredentialConfig,
+) -> reqwest::Client {
+    let resolved_guest_token = match resolve_api_token(config.guest_token_file, config.guest_token)
+    {
+        Ok(token) => token,
+        Err(error) => {
+            eprintln!(
+                "warning: sandboxwich-agent could not read --guest-token-file ({error}); \
+                     falling back to the worker-scoped credential for guest-facing calls"
+            );
+            None
+        }
+    };
+
+    let token = match guest_credential_source(
+        resolved_guest_token,
+        config.worker_id,
+        config.guest_token_ttl_seconds,
+    ) {
+        GuestCredentialSource::Provided(token) => Some(token),
+        GuestCredentialSource::SelfMint {
+            worker_id,
+            ttl_seconds,
+        } => match mint_guest_token(
+            worker_client,
+            api,
+            worker_id,
+            config.sandbox_id,
+            ttl_seconds,
+        )
+        .await
+        {
+            Ok(minted) => Some(minted.token),
+            Err(error) => {
+                eprintln!(
+                    "warning: sandboxwich-agent could not mint a sandbox-scoped guest token \
+                     ({error}); falling back to the worker-scoped credential for guest-facing \
+                     calls"
+                );
+                None
+            }
+        },
+        GuestCredentialSource::None => None,
+    };
+
+    let Some(token) = token else {
+        return worker_client.clone();
+    };
+
+    match build_api_client(Some(&token), config.tenant.as_deref()) {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!(
+                "warning: sandboxwich-agent could not build a client from its guest token \
+                 ({error}); falling back to the worker-scoped credential for guest-facing calls"
+            );
+            worker_client.clone()
+        }
+    }
+}
+
+/// Mints a sandbox-scoped guest token (`sbw_gtok_...`) bound to exactly
+/// `(worker_id, sandbox_id)`, using `client` (the worker-scoped credential)
+/// to authenticate the mint call itself. See `resolve_guest_client`.
+async fn mint_guest_token(
+    client: &reqwest::Client,
+    api: &str,
+    worker_id: Uuid,
+    sandbox_id: SandboxId,
+    ttl_seconds: u64,
+) -> Result<GuestTokenResponse, AgentRequestError> {
+    let response = client
+        .post(format!(
+            "{api}/workers/{worker_id}/sandboxes/{sandbox_id}/guest-token"
+        ))
+        .json(&MintGuestTokenRequest {
+            ttl_seconds: Some(ttl_seconds),
+        })
+        .send()
+        .await?;
+    decode_json(response).await
+}
+
 async fn claim_lease(
     client: &reqwest::Client,
     api: &str,
@@ -746,14 +957,16 @@ async fn claim_lease(
     lease_seconds: Option<u64>,
 ) -> Result<ClaimLeaseResponse, AgentRequestError> {
     // Scope the claim to this daemon's own sandbox and to the only job kind it
-    // knows how to execute. This is advisory server-side filtering, not a
-    // security boundary (see the doc comment on `ClaimLeaseRequest`): the
-    // guest and its worker share one worker-scoped token, so a compromised
-    // guest can strip these fields and claim anything the token's
-    // capabilities allow. `handle_lease` below re-checks the claimed job's
-    // sandbox and kind after the fact as defense in depth against a
-    // well-behaved agent claiming the wrong job (e.g. via a future
-    // server-side filtering bug), not against a malicious one.
+    // knows how to execute. `client` here should be the sandbox-scoped guest
+    // credential `resolve_guest_client` prefers (see its doc comment) -- when
+    // it is, the API enforces this filter as a real security boundary (see
+    // the doc comment on `ClaimLeaseRequest`), and a compromised guest process
+    // cannot claim anything outside its own sandbox no matter what it puts in
+    // this request. If `resolve_guest_client` fell back to the worker-wide
+    // token instead, this filtering is advisory only. `handle_lease` below
+    // re-checks the claimed job's sandbox and kind after the fact as further
+    // defense in depth (e.g. against a future server-side filtering bug),
+    // regardless of which credential was used to claim it.
     let response = client
         .post(format!("{api}/workers/{worker_id}/leases/claim"))
         .json(&ClaimLeaseRequest {
@@ -1395,6 +1608,39 @@ mod tests {
                 .to_string()
                 .contains("failed to read --api-token-file")
         );
+    }
+
+    #[test]
+    fn guest_credential_source_prefers_a_provided_token_over_self_minting() {
+        let worker_id = Uuid::now_v7();
+        let source =
+            guest_credential_source(Some("sbw_gtok_provided".to_string()), Some(worker_id), 3600);
+        assert_eq!(
+            source,
+            GuestCredentialSource::Provided("sbw_gtok_provided".to_string())
+        );
+    }
+
+    #[test]
+    fn guest_credential_source_self_mints_when_no_token_is_provided_but_a_worker_id_is() {
+        let worker_id = Uuid::now_v7();
+        let source = guest_credential_source(None, Some(worker_id), 1800);
+        assert_eq!(
+            source,
+            GuestCredentialSource::SelfMint {
+                worker_id,
+                ttl_seconds: 1800
+            }
+        );
+    }
+
+    #[test]
+    fn guest_credential_source_is_none_without_a_token_or_a_worker_id() {
+        // Mirrors `heartbeat`/`exec`, which never have a worker id (there is no
+        // lease-claiming loop to scope): nothing to mint against, so the caller
+        // falls back to the worker-wide client unchanged.
+        let source = guest_credential_source(None, None, 3600);
+        assert_eq!(source, GuestCredentialSource::None);
     }
 
     #[test]
