@@ -740,3 +740,12 @@ fn mutation_gate_warning_fires_only_when_both_halves_are_set() {
     assert!(warning.contains("sandboxwich-sandboxes"));
     assert!(warning.contains("GH-76"));
 }
+
+#[test]
+fn orphan_reconciliation_apply_requires_both_opt_ins() {
+    assert!(!orphan_reconciliation_apply_enabled(false, None));
+    assert!(!orphan_reconciliation_apply_enabled(true, None));
+    assert!(!orphan_reconciliation_apply_enabled(false, Some("1")));
+    assert!(!orphan_reconciliation_apply_enabled(true, Some("true")));
+    assert!(orphan_reconciliation_apply_enabled(true, Some("1")));
+}

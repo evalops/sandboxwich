@@ -1706,6 +1706,189 @@ fn kubectl_failures_map_to_typed_provisioning_error_classes() {
 }
 
 #[test]
+fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate() {
+    let now = Utc::now();
+    let live_sandbox = SandboxId::new();
+    let expired_sandbox = SandboxId::new();
+    let orphan_sandbox = SandboxId::new();
+    let inventory = ReconciliationInventory {
+        sandbox_ids: std::collections::HashSet::from([live_sandbox, expired_sandbox]),
+        resources: vec![ExpectedKubernetesResource {
+            sandbox_id: live_sandbox,
+            resource_kind: RuntimeResourceKind::Pod,
+            namespace: "sandboxwich-ci".to_string(),
+            name: format!("sandboxwich-{live_sandbox}"),
+            uid: "uid-live".to_string(),
+            expires_at: Some(now + chrono::Duration::minutes(5)),
+        }],
+    };
+    let observed = vec![
+        ObservedKubernetesResource {
+            sandbox_id: Some(live_sandbox),
+            resource_kind: RuntimeResourceKind::Pod,
+            namespace: "sandboxwich-ci".to_string(),
+            name: format!("sandboxwich-{live_sandbox}"),
+            uid: "uid-live".to_string(),
+        },
+        ObservedKubernetesResource {
+            sandbox_id: Some(orphan_sandbox),
+            resource_kind: RuntimeResourceKind::Service,
+            namespace: "sandboxwich-ci".to_string(),
+            name: format!("sandboxwich-{orphan_sandbox}"),
+            uid: "uid-orphan".to_string(),
+        },
+        ObservedKubernetesResource {
+            sandbox_id: Some(expired_sandbox),
+            resource_kind: RuntimeResourceKind::PersistentVolumeClaim,
+            namespace: "sandboxwich-ci".to_string(),
+            name: format!("sandboxwich-pvc-{expired_sandbox}"),
+            uid: "uid-expired".to_string(),
+        },
+        ObservedKubernetesResource {
+            sandbox_id: None,
+            resource_kind: RuntimeResourceKind::Pod,
+            namespace: "sandboxwich-ci".to_string(),
+            name: "foreign-pod".to_string(),
+            uid: "uid-foreign".to_string(),
+        },
+        ObservedKubernetesResource {
+            sandbox_id: Some(live_sandbox),
+            resource_kind: RuntimeResourceKind::Pod,
+            namespace: "sandboxwich-ci".to_string(),
+            name: format!("sandboxwich-{live_sandbox}"),
+            uid: "replacement-uid".to_string(),
+        },
+    ];
+    let expired =
+        std::collections::HashMap::from([(expired_sandbox, now - chrono::Duration::seconds(1))]);
+
+    let decisions = classify_reconciliation(&inventory, &observed, &expired, now);
+    assert_eq!(
+        decisions[0].classification,
+        ReconciliationClassification::Expected
+    );
+    assert_eq!(
+        decisions[1].classification,
+        ReconciliationClassification::Orphaned
+    );
+    assert_eq!(
+        decisions[2].classification,
+        ReconciliationClassification::Expired
+    );
+    assert_eq!(
+        decisions[3].classification,
+        ReconciliationClassification::Indeterminate
+    );
+    assert!(!decisions[3].delete_allowed);
+    assert_eq!(
+        decisions[4].classification,
+        ReconciliationClassification::Indeterminate
+    );
+    assert!(!decisions[4].delete_allowed);
+
+    let unavailable = plan_orphan_reconciliation(
+        Err(anyhow::anyhow!("database unavailable")),
+        &observed,
+        &expired,
+        now,
+    );
+    assert!(unavailable.iter().all(|decision| {
+        decision.classification == ReconciliationClassification::Indeterminate
+            && !decision.delete_allowed
+    }));
+}
+
+#[test]
+fn orphan_reconciliation_deletes_with_uid_precondition_and_fails_closed() {
+    let dir = std::env::temp_dir().join(format!("sandboxwich-reconcile-{}", SandboxId::new()));
+    std::fs::create_dir_all(&dir).expect("create reconciliation fake dir");
+    let log_path = dir.join("log.txt");
+    let script_path = dir.join("kubectl");
+    let orphan = SandboxId::new();
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "{log}"
+case " $* " in
+  *" get "*)
+    printf '%s\n' '{{"items":[{{"kind":"Pod","metadata":{{"namespace":"sandboxwich-ci","name":"sandboxwich-{orphan}","uid":"uid-orphan","labels":{{"sandboxwich.dev/sandbox-id":"{orphan}"}}}}}}]}}'
+    ;;
+  *" delete "*)
+    cat >> "{log}"
+    ;;
+esac
+"#,
+        log = log_path.display(),
+    );
+    std::fs::write(&script_path, script).expect("write reconciliation fake kubectl");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("stat reconciliation fake kubectl")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).expect("chmod fake kubectl");
+    }
+    let provider = apply_provider_with_fake_kubectl(&script_path);
+    let inventory = RuntimeResourceInventoryResponse {
+        ok: true,
+        provider: "kubernetes".to_string(),
+        cluster: Some("k3s-ci".to_string()),
+        namespace: "sandboxwich-ci".to_string(),
+        sandbox_ids: Vec::new(),
+        complete: true,
+        resources: Vec::new(),
+        next_cursor: None,
+    };
+    let limits = ReconciliationLimits {
+        max_scanned: 10,
+        max_deleted: 1,
+        max_elapsed: Duration::from_secs(5),
+    };
+    let observed = ObservedKubernetesResource {
+        sandbox_id: Some(orphan),
+        resource_kind: RuntimeResourceKind::Pod,
+        namespace: "sandboxwich-ci".to_string(),
+        name: format!("sandboxwich-{orphan}"),
+        uid: "uid-orphan".to_string(),
+    };
+    assert_eq!(
+        kubernetes_delete_path(&observed).expect("delete path"),
+        format!("/api/v1/namespaces/sandboxwich-ci/pods/sandboxwich-{orphan}")
+    );
+    assert_eq!(
+        kubernetes_delete_options(&observed)["preconditions"]["uid"],
+        "uid-orphan"
+    );
+
+    let dry_run = provider
+        .reconcile_orphans(
+            Ok(inventory),
+            limits,
+            false,
+            &CancelSignal::never_cancelled(),
+        )
+        .expect("dry-run reconciliation");
+    assert_eq!(dry_run.deleted, 0);
+
+    let unavailable = provider
+        .reconcile_orphans(
+            Err(anyhow::anyhow!("inventory unavailable")),
+            limits,
+            true,
+            &CancelSignal::never_cancelled(),
+        )
+        .expect("inventory failure is fail-closed");
+    assert_eq!(unavailable.deleted, 0);
+    assert!(
+        unavailable
+            .decisions
+            .iter()
+            .all(|decision| !decision.delete_allowed)
+    );
+}
+
+#[test]
 fn provision_rolls_back_applied_resources_when_pod_never_becomes_ready() {
     let (kubectl, log_path) = write_fake_kubectl(Some("wait"));
     let provider = apply_provider_with_fake_kubectl(&kubectl);

@@ -6,14 +6,15 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use provider::{
     CancelSignal, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES, KUBERNETES_MUTATION_ENV,
-    KubernetesApplyProvider, KubernetesDryRunProvider, ProviderError, RetryDisposition,
-    SandboxProvider,
+    KubernetesApplyProvider, KubernetesDryRunProvider, ProviderError, ReconciliationLimits,
+    RetryDisposition, SandboxProvider,
 };
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse,
     CompleteLeaseRequest, FailLeaseRequest, JobKind, LeaseResponse, ProvisioningOperationResponse,
-    ProvisioningStageUpdateRequest, RegisterWorkerRequest, RenewLeaseRequest, SandboxProvisionSpec,
-    WorkerCapability, WorkerHeartbeatRequest, WorkerJobResult, WorkerResponse, build_api_client,
+    ProvisioningStageUpdateRequest, RegisterWorkerRequest, RenewLeaseRequest,
+    RuntimeResourceInventoryResponse, SandboxProvisionSpec, WorkerCapability,
+    WorkerHeartbeatRequest, WorkerJobResult, WorkerResponse, build_api_client,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -332,6 +333,25 @@ struct RuntimeProviderArgs {
         default_value_t = DEFAULT_MAX_CAPTURED_OUTPUT_BYTES
     )]
     max_captured_output_bytes: u64,
+
+    #[arg(
+        long,
+        env = "SANDBOXWICH_ORPHAN_RECONCILIATION_INTERVAL_SECS",
+        default_value_t = 60
+    )]
+    orphan_reconciliation_interval_secs: u64,
+
+    #[arg(long, default_value_t = 200)]
+    orphan_reconciliation_max_scanned: usize,
+
+    #[arg(long, default_value_t = 20)]
+    orphan_reconciliation_max_deleted: usize,
+
+    #[arg(long, default_value_t = 10)]
+    orphan_reconciliation_max_elapsed_secs: u64,
+
+    #[arg(long, default_value_t = false)]
+    orphan_reconciliation_apply: bool,
 }
 
 #[derive(Debug, Args)]
@@ -392,6 +412,32 @@ enum ProviderModeArg {
 enum RuntimeProvider {
     DryRun(KubernetesDryRunProvider),
     Apply(KubernetesApplyProvider),
+}
+
+impl RuntimeProvider {
+    fn reconcile_orphans(
+        &self,
+        inventory: anyhow::Result<RuntimeResourceInventoryResponse>,
+        limits: ReconciliationLimits,
+        apply: bool,
+    ) -> anyhow::Result<Option<(usize, usize, bool)>> {
+        match self {
+            Self::DryRun(_) => Ok(None),
+            Self::Apply(provider) => {
+                let outcome = provider.reconcile_orphans(
+                    inventory,
+                    limits,
+                    apply,
+                    &CancelSignal::never_cancelled(),
+                )?;
+                Ok(Some((
+                    outcome.decisions.len(),
+                    outcome.deleted,
+                    outcome.apply,
+                )))
+            }
+        }
+    }
 }
 
 impl SandboxProvider for RuntimeProvider {
@@ -814,6 +860,10 @@ fn mutation_gate_force_enabled_warning(
     }
 }
 
+fn orphan_reconciliation_apply_enabled(flag: bool, environment: Option<&str>) -> bool {
+    flag && environment == Some("1")
+}
+
 /// `0` is documented as "fall back to the default" rather than "disable the
 /// bound": an unbounded `kubectl` wait is exactly the hang this timeout
 /// exists to prevent, so silently accepting `0` as infinite would defeat it.
@@ -1196,12 +1246,89 @@ async fn drain_watchdog(shutdown: Arc<std::sync::atomic::AtomicBool>, drain_time
     tokio::time::sleep(drain_timeout).await;
 }
 
+async fn fetch_runtime_resource_inventory(
+    client: &reqwest::Client,
+    api: &str,
+    worker_id: Uuid,
+    namespace: &str,
+    max_scanned: usize,
+) -> anyhow::Result<RuntimeResourceInventoryResponse> {
+    let mut resources = Vec::new();
+    let mut cursor = None;
+    let mut scope = None;
+    let mut sandbox_ids = std::collections::HashSet::new();
+    let mut complete = true;
+    while resources.len() < max_scanned {
+        let page_limit = (max_scanned - resources.len()).min(200);
+        let mut url = format!(
+            "{api}/workers/{worker_id}/runtime-resource-inventory?namespace={namespace}&limit={page_limit}"
+        );
+        if let Some(after) = cursor.as_deref() {
+            url.push_str("&after=");
+            url.push_str(after);
+        }
+        let response = client.get(url).send().await?;
+        let page = decode_json::<RuntimeResourceInventoryResponse>(response).await?;
+        scope.get_or_insert_with(|| {
+            (
+                page.provider.clone(),
+                page.cluster.clone(),
+                page.namespace.clone(),
+            )
+        });
+        sandbox_ids.extend(page.sandbox_ids);
+        complete &= page.complete;
+        resources.extend(page.resources);
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    let (provider, cluster, namespace) =
+        scope.unwrap_or_else(|| ("kubernetes".to_string(), None, namespace.to_string()));
+    if cursor.is_some() {
+        anyhow::bail!("runtime resource inventory exceeded max_scanned={max_scanned}");
+    }
+    Ok(RuntimeResourceInventoryResponse {
+        ok: true,
+        provider,
+        cluster,
+        namespace,
+        sandbox_ids: sandbox_ids.into_iter().collect(),
+        complete,
+        resources,
+        next_cursor: cursor,
+    })
+}
+
 async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> anyhow::Result<()> {
+    let reconciliation_namespace = args
+        .provider
+        .provider
+        .sandbox_namespace
+        .clone()
+        .unwrap_or_else(|| args.provider.provider.namespace.clone());
+    let reconciliation_interval =
+        Duration::from_secs(args.provider.orphan_reconciliation_interval_secs.max(1));
+    let reconciliation_limits = ReconciliationLimits {
+        max_scanned: args.provider.orphan_reconciliation_max_scanned.max(1),
+        max_deleted: args.provider.orphan_reconciliation_max_deleted,
+        max_elapsed: Duration::from_secs(
+            args.provider.orphan_reconciliation_max_elapsed_secs.max(1),
+        ),
+    };
+    let reconciliation_apply = orphan_reconciliation_apply_enabled(
+        args.provider.orphan_reconciliation_apply,
+        std::env::var("SANDBOXWICH_ORPHAN_RECONCILIATION_APPLY")
+            .ok()
+            .as_deref(),
+    );
     let provider = Arc::new(runtime_provider_from_args(args.provider)?);
     let labels: BTreeMap<_, _> = args.label.into_iter().collect();
     let drain_timeout = Duration::from_secs(args.drain_timeout_secs);
     let shutdown = spawn_shutdown_listener();
     let mut iterations = 0_u64;
+    let mut last_reconciliation = None;
 
     loop {
         if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1229,6 +1356,41 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
             );
             sleep_or_shutdown(Duration::from_millis(args.idle_sleep_ms), &shutdown).await;
             continue;
+        }
+
+        if last_reconciliation
+            .is_none_or(|last: std::time::Instant| last.elapsed() >= reconciliation_interval)
+        {
+            let inventory = fetch_runtime_resource_inventory(
+                client,
+                api,
+                args.worker_id,
+                &reconciliation_namespace,
+                reconciliation_limits.max_scanned,
+            )
+            .await;
+            let reconciliation_provider = provider.clone();
+            let reconciliation = tokio::task::spawn_blocking(move || {
+                reconciliation_provider.reconcile_orphans(
+                    inventory,
+                    reconciliation_limits,
+                    reconciliation_apply,
+                )
+            })
+            .await
+            .unwrap_or_else(|error| {
+                Err(anyhow::anyhow!(
+                    "orphan reconciliation task panicked or was cancelled: {error}"
+                ))
+            });
+            match reconciliation {
+                Ok(Some((scanned, deleted, apply))) => eprintln!(
+                    "worker: orphan reconciliation completed scanned={scanned} deleted={deleted} apply={apply}"
+                ),
+                Ok(None) => {}
+                Err(error) => eprintln!("error: orphan reconciliation failed closed: {error:#}"),
+            }
+            last_reconciliation = Some(std::time::Instant::now());
         }
 
         // Re-check right before claiming: a signal received during the heartbeat

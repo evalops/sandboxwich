@@ -17,12 +17,14 @@ use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, MemoryLimit, NetworkAllowRuleKind, NetworkEgress,
     ProviderCapabilityReport, ProviderForkHandle, ProviderHealthReport, ProviderHealthStatus,
     ProviderRuntimeResource, ProviderSandboxHandle, ProviderSnapshotHandle, ProvisioningErrorClass,
-    ProvisioningStage, ProvisioningStageUpdateRequest, RuntimeResourceKind, RuntimeResourcePurpose,
-    RuntimeResourceStatus, SandboxId, SandboxProvisionSpec, SnapshotId, WorkerCapability,
+    ProvisioningStage, ProvisioningStageUpdateRequest, RuntimeResourceInventoryResponse,
+    RuntimeResourceKind, RuntimeResourcePurpose, RuntimeResourceStatus, SandboxId,
+    SandboxProvisionSpec, SnapshotId, WorkerCapability,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetryDisposition {
@@ -153,6 +155,8 @@ pub const DEFAULT_INGRESS_SELECTOR_VALUE: &str = "sandboxwich";
 /// Kubernetes resource kinds (as a `kubectl get/delete` type list) that carry the
 /// `sandboxwich.dev/sandbox-id` label and must be torn down when a sandbox is stopped.
 pub const SANDBOX_TEARDOWN_RESOURCE_KINDS: &str = "pod,persistentvolumeclaim,service,networkpolicy";
+pub const SANDBOX_RECONCILIATION_RESOURCE_KINDS: &str =
+    "pod,persistentvolumeclaim,service,secret,networkpolicy";
 
 /// Cheaply cloneable signal a job's background lease-renewal task (see
 /// `handle_lease` in `main.rs`) uses to tell an in-flight `exec_handoff` call
@@ -1326,6 +1330,176 @@ struct KubernetesResourceIdentity {
     observed_generation: Option<i64>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExpectedKubernetesResource {
+    sandbox_id: SandboxId,
+    resource_kind: RuntimeResourceKind,
+    namespace: String,
+    name: String,
+    uid: String,
+    expires_at: Option<chrono::DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ObservedKubernetesResource {
+    sandbox_id: Option<SandboxId>,
+    resource_kind: RuntimeResourceKind,
+    namespace: String,
+    name: String,
+    uid: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ReconciliationInventory {
+    sandbox_ids: std::collections::HashSet<SandboxId>,
+    resources: Vec<ExpectedKubernetesResource>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconciliationClassification {
+    Expected,
+    Missing,
+    Orphaned,
+    Expired,
+    Indeterminate,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReconciliationDecision {
+    classification: ReconciliationClassification,
+    resource: Option<ObservedKubernetesResource>,
+    delete_allowed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReconciliationLimits {
+    pub max_scanned: usize,
+    pub max_deleted: usize,
+    pub max_elapsed: Duration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconciliationOutcome {
+    pub(crate) decisions: Vec<ReconciliationDecision>,
+    pub(crate) deleted: usize,
+    pub(crate) apply: bool,
+}
+
+fn classify_reconciliation(
+    inventory: &ReconciliationInventory,
+    observed: &[ObservedKubernetesResource],
+    expired_sandboxes: &std::collections::HashMap<SandboxId, chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+) -> Vec<ReconciliationDecision> {
+    let mut decisions = observed
+        .iter()
+        .map(|resource| {
+            let coordinate_match = inventory.resources.iter().find(|expected| {
+                Some(expected.sandbox_id) == resource.sandbox_id
+                    && expected.resource_kind == resource.resource_kind
+                    && expected.namespace == resource.namespace
+                    && expected.name == resource.name
+            });
+            let classification = match resource.sandbox_id {
+                None => ReconciliationClassification::Indeterminate,
+                Some(_)
+                    if coordinate_match.is_some_and(|expected| expected.uid != resource.uid) =>
+                {
+                    ReconciliationClassification::Indeterminate
+                }
+                Some(sandbox_id)
+                    if expired_sandboxes
+                        .get(&sandbox_id)
+                        .is_some_and(|expires_at| *expires_at <= now) =>
+                {
+                    ReconciliationClassification::Expired
+                }
+                Some(_) if coordinate_match.is_some() => ReconciliationClassification::Expected,
+                Some(sandbox_id) if inventory.sandbox_ids.contains(&sandbox_id) => {
+                    ReconciliationClassification::Indeterminate
+                }
+                Some(_) => ReconciliationClassification::Orphaned,
+            };
+            ReconciliationDecision {
+                delete_allowed: matches!(
+                    classification,
+                    ReconciliationClassification::Orphaned | ReconciliationClassification::Expired
+                ),
+                classification,
+                resource: Some(resource.clone()),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for expected in &inventory.resources {
+        if !observed.iter().any(|resource| {
+            resource.sandbox_id == Some(expected.sandbox_id)
+                && resource.resource_kind == expected.resource_kind
+                && resource.namespace == expected.namespace
+                && resource.name == expected.name
+                && resource.uid == expected.uid
+        }) {
+            decisions.push(ReconciliationDecision {
+                classification: ReconciliationClassification::Missing,
+                resource: None,
+                delete_allowed: false,
+            });
+        }
+    }
+    decisions
+}
+
+fn plan_orphan_reconciliation(
+    inventory: anyhow::Result<ReconciliationInventory>,
+    observed: &[ObservedKubernetesResource],
+    expired_sandboxes: &std::collections::HashMap<SandboxId, chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+) -> Vec<ReconciliationDecision> {
+    match inventory {
+        Ok(inventory) => classify_reconciliation(&inventory, observed, expired_sandboxes, now),
+        Err(_) => observed
+            .iter()
+            .cloned()
+            .map(|resource| ReconciliationDecision {
+                classification: ReconciliationClassification::Indeterminate,
+                resource: Some(resource),
+                delete_allowed: false,
+            })
+            .collect(),
+    }
+}
+
+fn kubernetes_delete_path(resource: &ObservedKubernetesResource) -> anyhow::Result<String> {
+    let plural = match resource.resource_kind {
+        RuntimeResourceKind::Pod => "pods",
+        RuntimeResourceKind::PersistentVolumeClaim => "persistentvolumeclaims",
+        RuntimeResourceKind::Service => "services",
+        RuntimeResourceKind::Secret => "secrets",
+        RuntimeResourceKind::NetworkPolicy => {
+            return Ok(format!(
+                "/apis/networking.k8s.io/v1/namespaces/{}/networkpolicies/{}",
+                resource.namespace, resource.name
+            ));
+        }
+        RuntimeResourceKind::VolumeSnapshot => {
+            bail!("volume snapshots are outside orphan reconciliation scope")
+        }
+    };
+    Ok(format!(
+        "/api/v1/namespaces/{}/{plural}/{}",
+        resource.namespace, resource.name
+    ))
+}
+
+fn kubernetes_delete_options(resource: &ObservedKubernetesResource) -> Value {
+    json!({
+        "apiVersion": "v1",
+        "kind": "DeleteOptions",
+        "preconditions": { "uid": resource.uid },
+        "propagationPolicy": "Background"
+    })
+}
+
 fn runtime_resource_kind_for_kubernetes_kind(kind: &str) -> anyhow::Result<RuntimeResourceKind> {
     match kind {
         "PersistentVolumeClaim" => Ok(RuntimeResourceKind::PersistentVolumeClaim),
@@ -1641,6 +1815,229 @@ impl KubernetesApplyProvider {
             metadata.insert("provisioningMode".to_string(), json!("staged"));
         }
         Ok(handle)
+    }
+
+    fn discover_reconciliation_resources(
+        &self,
+        max_scanned: usize,
+        max_elapsed: Duration,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<Vec<ObservedKubernetesResource>> {
+        let mut args = self.kubectl_base_args();
+        args.extend([
+            "get".to_string(),
+            SANDBOX_RECONCILIATION_RESOURCE_KINDS.to_string(),
+            "--selector".to_string(),
+            "sandboxwich.dev/sandbox-id".to_string(),
+            "--output".to_string(),
+            "json".to_string(),
+        ]);
+        let output = run_kubectl_command(
+            &self.kubectl,
+            &args,
+            "discover sandbox resources for reconciliation",
+            self.kubectl_command_timeout.min(max_elapsed),
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        if !output.success {
+            return Err(anyhow::Error::new(classified_kubectl_failure(
+                "sandbox resource discovery failed",
+                &output.stderr,
+            )));
+        }
+        let list: Value = serde_json::from_str(&output.stdout)
+            .context("kubectl reconciliation inventory was not valid JSON")?;
+        let items = list["items"]
+            .as_array()
+            .context("kubectl reconciliation inventory omitted items")?;
+        if items.len() > max_scanned {
+            bail!("Kubernetes inventory exceeded max_scanned={max_scanned}");
+        }
+        items
+            .iter()
+            .map(|item| {
+                let kind = item["kind"]
+                    .as_str()
+                    .context("observed Kubernetes resource omitted kind")?;
+                let label = item["metadata"]["labels"]["sandboxwich.dev/sandbox-id"].as_str();
+                Ok(ObservedKubernetesResource {
+                    sandbox_id: label
+                        .and_then(|value| Uuid::parse_str(value).ok())
+                        .map(SandboxId),
+                    resource_kind: runtime_resource_kind_for_kubernetes_kind(kind)?,
+                    namespace: item["metadata"]["namespace"]
+                        .as_str()
+                        .context("observed Kubernetes resource omitted namespace")?
+                        .to_string(),
+                    name: item["metadata"]["name"]
+                        .as_str()
+                        .context("observed Kubernetes resource omitted name")?
+                        .to_string(),
+                    uid: item["metadata"]["uid"]
+                        .as_str()
+                        .context("observed Kubernetes resource omitted uid")?
+                        .to_string(),
+                })
+            })
+            .collect()
+    }
+
+    fn delete_reconciled_resource(
+        &self,
+        resource: &ObservedKubernetesResource,
+        timeout: Duration,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<()> {
+        if self.kubectl_context.is_some() {
+            bail!("UID-fenced orphan deletion is supported only with in-cluster credentials");
+        }
+        if cancelled.is_cancelled() {
+            bail!("orphan reconciliation was cancelled before delete");
+        }
+        let path = kubernetes_delete_path(resource)?;
+        let token = std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/token")
+            .context("read in-cluster service account token")?;
+        let certificate = std::fs::read("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+            .context("read in-cluster Kubernetes CA")?;
+        let certificate = reqwest::Certificate::from_pem(&certificate)
+            .context("parse in-cluster Kubernetes CA")?;
+        let host = std::env::var("KUBERNETES_SERVICE_HOST")
+            .context("KUBERNETES_SERVICE_HOST is not set")?;
+        let port = std::env::var("KUBERNETES_SERVICE_PORT_HTTPS")
+            .or_else(|_| std::env::var("KUBERNETES_SERVICE_PORT"))
+            .context("KUBERNETES_SERVICE_PORT is not set")?;
+        let host = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host
+        };
+        let url = format!("https://{host}:{port}{path}");
+        let timeout = self.kubectl_command_timeout.min(timeout);
+        let request = async move {
+            let client = reqwest::Client::builder()
+                .add_root_certificate(certificate)
+                .timeout(timeout)
+                .build()?;
+            client
+                .delete(url)
+                .bearer_auth(token.trim())
+                .json(&kubernetes_delete_options(resource))
+                .send()
+                .await
+                .map_err(anyhow::Error::new)
+        };
+        let response = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => handle.block_on(request)?,
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("build runtime for Kubernetes UID-fenced delete")?
+                .block_on(request)?,
+        };
+        if !response.status().is_success() && response.status() != reqwest::StatusCode::NOT_FOUND {
+            bail!(
+                "Kubernetes UID-fenced delete failed with {}",
+                response.status()
+            );
+        }
+        Ok(())
+    }
+
+    pub fn reconcile_orphans(
+        &self,
+        inventory: anyhow::Result<RuntimeResourceInventoryResponse>,
+        limits: ReconciliationLimits,
+        apply: bool,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<ReconciliationOutcome> {
+        let started = std::time::Instant::now();
+        let observed = match self.discover_reconciliation_resources(
+            limits.max_scanned,
+            limits.max_elapsed,
+            cancelled,
+        ) {
+            Ok(resources) => resources,
+            Err(_error) => {
+                let decisions = inventory
+                    .ok()
+                    .map(|inventory| inventory.resources)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|_| ReconciliationDecision {
+                        classification: ReconciliationClassification::Indeterminate,
+                        resource: None,
+                        delete_allowed: false,
+                    })
+                    .collect();
+                return Ok(ReconciliationOutcome {
+                    decisions,
+                    deleted: 0,
+                    apply,
+                });
+            }
+        };
+        let inventory = inventory.and_then(|response| {
+            if response.provider != "kubernetes"
+                || response.namespace != self.dry_run.effective_sandbox_namespace()
+                || response.cluster.as_deref() != Some(self.dry_run.cluster.as_str())
+                || !response.complete
+                || response.next_cursor.is_some()
+            {
+                bail!("runtime resource inventory scope did not match this worker");
+            }
+            Ok(ReconciliationInventory {
+                sandbox_ids: response.sandbox_ids.into_iter().collect(),
+                resources: response
+                    .resources
+                    .into_iter()
+                    .map(|resource| ExpectedKubernetesResource {
+                        sandbox_id: resource.sandbox_id,
+                        resource_kind: resource.resource_kind,
+                        namespace: resource.namespace,
+                        name: resource.name,
+                        uid: resource.uid,
+                        expires_at: resource.cleanup_deadline,
+                    })
+                    .collect(),
+            })
+        });
+        let expired = inventory
+            .as_ref()
+            .ok()
+            .map(|inventory| {
+                inventory
+                    .resources
+                    .iter()
+                    .filter_map(|resource| resource.expires_at.map(|at| (resource.sandbox_id, at)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut decisions = plan_orphan_reconciliation(inventory, &observed, &expired, Utc::now());
+        decisions.truncate(limits.max_scanned);
+        let mut deleted = 0;
+        if apply {
+            for decision in &decisions {
+                if deleted >= limits.max_deleted || started.elapsed() >= limits.max_elapsed {
+                    break;
+                }
+                if decision.delete_allowed
+                    && let Some(resource) = decision.resource.as_ref()
+                {
+                    let remaining = limits.max_elapsed.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    self.delete_reconciled_resource(resource, remaining, cancelled)?;
+                    deleted += 1;
+                }
+            }
+        }
+        Ok(ReconciliationOutcome {
+            decisions,
+            deleted,
+            apply,
+        })
     }
 
     fn apply_or_adopt_manifest(

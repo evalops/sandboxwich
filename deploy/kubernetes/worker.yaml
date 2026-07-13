@@ -236,6 +236,14 @@ spec:
             # the process in the common case.
             - --drain-timeout-secs
             - "300"
+            - --orphan-reconciliation-interval-secs
+            - "60"
+            - --orphan-reconciliation-max-scanned
+            - "200"
+            - --orphan-reconciliation-max-deleted
+            - "20"
+            - --orphan-reconciliation-max-elapsed-secs
+            - "10"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

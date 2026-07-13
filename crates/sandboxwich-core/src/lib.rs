@@ -927,6 +927,30 @@ pub struct RuntimeResourceListResponse {
     pub resources: Vec<RuntimeResource>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeResourceInventoryItem {
+    pub sandbox_id: SandboxId,
+    pub resource_kind: RuntimeResourceKind,
+    pub namespace: String,
+    pub name: String,
+    pub uid: String,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub cleanup_deadline: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeResourceInventoryResponse {
+    pub ok: bool,
+    pub provider: String,
+    pub cluster: Option<String>,
+    pub namespace: String,
+    pub sandbox_ids: Vec<SandboxId>,
+    pub complete: bool,
+    pub resources: Vec<RuntimeResourceInventoryItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
 /// Maximum size of a file that can be uploaded into a sandbox and stored (base64-encoded) in the
 /// primary database. Kept well below the historical 512 MiB cap: base64 inflates storage by ~33%,
 /// every stored byte lives in the primary DB (not object storage), and the whole file is buffered

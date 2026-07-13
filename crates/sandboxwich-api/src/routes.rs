@@ -135,6 +135,10 @@ pub(crate) fn app(state: AppState) -> Router {
         .route("/workers/{worker_id}/heartbeat", post(heartbeat_worker))
         .route("/workers/{worker_id}/drain", post(drain_worker))
         .route(
+            "/workers/{worker_id}/runtime-resource-inventory",
+            get(runtime_resource_inventory),
+        )
+        .route(
             "/workers/{worker_id}/runtime-resources/reconcile",
             post(reconcile_runtime_resources),
         )

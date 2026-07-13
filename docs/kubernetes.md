@@ -80,6 +80,12 @@ Apply mode uses the pod ServiceAccount and `kubectl` to create the sandbox PVC, 
 
 The double opt-in (`--confirm-apply` plus `SANDBOXWICH_K8S_ENABLE_MUTATION=1`) exists so a worker cannot mutate Kubernetes resources by accident in local runs, CI, and smoke tests. Be aware of its limits in production: the checked-in worker Deployment sets both halves unconditionally, because an apply-mode worker with the gate closed cannot process any work. In that deployment the gate is documentation, not a control — the Role scoping to the sandbox namespace is what bounds a compromised worker's blast radius. The worker logs a startup warning whenever both halves are force-enabled so the state is visible in pod logs.
 
+### Orphan reconciliation
+
+Apply-mode workers compare labeled Pods, PVCs, Services, Secrets, and NetworkPolicies with `GET /workers/{worker_id}/runtime-resource-inventory`. The loop runs every 60 seconds in the checked-in Deployment, scans at most 200 resources, spends at most 10 seconds, and permits at most 20 deletes per pass. Inventory, discovery, scope, UID, pagination, or deadline uncertainty produces no deletes. Resources for a live sandbox that have not yet been acknowledged are also indeterminate and survive the pass.
+
+Reconciliation is dry-run unless both `--orphan-reconciliation-apply` and `SANDBOXWICH_ORPHAN_RECONCILIATION_APPLY=1` are set. Apply mode sends a Kubernetes `DeleteOptions` request with the observed UID as a precondition. Roll back immediately by removing either opt-in; use `--orphan-reconciliation-interval-secs`, `--orphan-reconciliation-max-scanned`, `--orphan-reconciliation-max-deleted`, and `--orphan-reconciliation-max-elapsed-secs` to tune the bounded loop.
+
 Sandbox creation carries a typed provision spec: memory tier (`1g`, `4g`, `16g`, `64g`) and network egress (`deny_all`, `allow_all`, or `allowlist`). The Kubernetes provider maps tiers to CPU/memory requests and PVC size, renders deny-by-default egress with explicit CIDR allow rules, sets `runAsNonRoot`, drops all container capabilities, and uses `RuntimeDefault` seccomp. `--runtime-class-name gvisor` or `--runtime-class-name kata` enables a RuntimeClass-backed isolation backend when the cluster supports it.
 
 Inspect the persisted runtime view with:

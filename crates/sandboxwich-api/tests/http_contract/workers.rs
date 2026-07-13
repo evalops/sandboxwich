@@ -2,6 +2,197 @@ use crate::common::*;
 use reqwest::StatusCode;
 use sandboxwich_core::*;
 
+#[tokio::test]
+pub(crate) async fn runtime_resource_inventory_is_worker_scoped_and_bounded() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("worker-inventory-test.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+    let registered: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "inventory-worker".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![WorkerCapability::ProvisionSandbox],
+            max_concurrent_jobs: Some(1),
+            labels: std::collections::BTreeMap::from([(
+                "cluster".to_string(),
+                "kind-inventory".to_string(),
+            )]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let worker = worker_client(&registered);
+
+    let response = worker
+        .get(format!(
+            "{}/workers/{}/runtime-resource-inventory?namespace=sandboxwich-sandboxes&limit=1",
+            server.base_url, registered.worker.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let inventory: RuntimeResourceInventoryResponse = response.json().await.unwrap();
+    assert!(inventory.ok);
+    assert_eq!(inventory.provider, "kubernetes");
+    assert_eq!(inventory.cluster.as_deref(), Some("kind-inventory"));
+    assert_eq!(inventory.namespace, "sandboxwich-sandboxes");
+    assert!(inventory.sandbox_ids.is_empty());
+    assert!(inventory.complete);
+    assert!(inventory.resources.is_empty());
+    assert!(inventory.next_cursor.is_none());
+
+    let sandbox: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("inventory-sandbox".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let pre_ack_inventory: RuntimeResourceInventoryResponse = worker
+        .get(format!(
+            "{}/workers/{}/runtime-resource-inventory?namespace=sandboxwich-sandboxes",
+            server.base_url, registered.worker.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(pre_ack_inventory.sandbox_ids.contains(&sandbox.sandbox.id));
+    assert!(pre_ack_inventory.resources.is_empty());
+    let claimed: ClaimLeaseResponse = worker
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, registered.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox.sandbox.id),
+            kinds: Some(vec![JobKind::ProvisionSandbox]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claimed.lease.expect("claim provisioning lease");
+    for request in [
+        ProvisioningStageUpdateRequest {
+            stage: ProvisioningStage::WorkspacePlanned,
+            resource_kind: None,
+            resource_namespace: None,
+            resource_name: None,
+            resource_uid: None,
+            observed_generation: None,
+            attempt_count: lease.attempt,
+            last_error_class: None,
+            last_error_code: None,
+            last_error: None,
+        },
+        ProvisioningStageUpdateRequest {
+            stage: ProvisioningStage::WorkspaceReady,
+            resource_kind: Some(RuntimeResourceKind::PersistentVolumeClaim),
+            resource_namespace: Some("sandboxwich-sandboxes".to_string()),
+            resource_name: Some(format!("sandboxwich-pvc-{}", sandbox.sandbox.id)),
+            resource_uid: Some("uid-inventory-workspace".to_string()),
+            observed_generation: None,
+            attempt_count: lease.attempt,
+            last_error_class: None,
+            last_error_code: None,
+            last_error: None,
+        },
+    ] {
+        worker
+            .put(format!(
+                "{}/leases/{}/provisioning",
+                server.base_url, lease.id
+            ))
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+
+    let replacement: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "inventory-worker-replacement".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![WorkerCapability::ProvisionSandbox],
+            max_concurrent_jobs: Some(1),
+            labels: std::collections::BTreeMap::from([(
+                "cluster".to_string(),
+                "kind-inventory".to_string(),
+            )]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let replacement_inventory: RuntimeResourceInventoryResponse = worker_client(&replacement)
+        .get(format!(
+            "{}/workers/{}/runtime-resource-inventory?namespace=sandboxwich-sandboxes",
+            server.base_url, replacement.worker.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        replacement_inventory
+            .sandbox_ids
+            .contains(&sandbox.sandbox.id)
+    );
+    assert_eq!(replacement_inventory.resources.len(), 1);
+    assert_eq!(
+        replacement_inventory.resources[0].uid,
+        "uid-inventory-workspace"
+    );
+    assert!(replacement_inventory.resources[0].expires_at.is_some());
+    assert!(
+        replacement_inventory.resources[0]
+            .cleanup_deadline
+            .is_none()
+    );
+}
+
 /// Regression test for issue #64: the guest agent running inside a sandbox
 /// previously authenticated with the same tenant-wide bearer token the CLI
 /// uses for everything, so any compromised sandbox could act as the whole
