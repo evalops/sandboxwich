@@ -409,6 +409,7 @@ enum CapabilityArg {
     RunCommand,
     Snapshot,
     DesktopStream,
+    FqdnEgress,
     K8sPod,
     GvisorSandbox,
 }
@@ -671,7 +672,7 @@ async fn main() -> anyhow::Result<()> {
                 &api,
                 args.name,
                 args.provider,
-                capabilities_from_args(args.capability, None),
+                capabilities_from_args(args.capability, None, false),
                 args.label.into_iter().collect(),
                 // Standalone registration may be consumed by multiple
                 // work-once/work-loop processes, so preserve the operator's
@@ -738,7 +739,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Run(args) => {
             let runtime_class_name = args.provider.provider.runtime_class_name.as_deref();
-            let capabilities = capabilities_from_args(args.capability, runtime_class_name);
+            let fqdn_egress_backend =
+                args.provider.provider.cilium_fqdn_egress || args.provider.provider.gke_fqdn_egress;
+            let capabilities =
+                capabilities_from_args(args.capability, runtime_class_name, fqdn_egress_backend);
             let labels: BTreeMap<_, _> = args.label.into_iter().collect();
             let response = register_worker(
                 &client,
@@ -1942,6 +1946,7 @@ fn uuid_from_payload(payload: &serde_json::Value, field: &'static str) -> anyhow
 fn capabilities_from_args(
     capabilities: Vec<CapabilityArg>,
     runtime_class_name: Option<&str>,
+    fqdn_egress_backend: bool,
 ) -> Vec<WorkerCapability> {
     if capabilities.is_empty() {
         let mut defaults = vec![
@@ -1953,6 +1958,9 @@ fn capabilities_from_args(
         ];
         if runtime_class_name.is_some_and(|value| !value.trim().is_empty()) {
             defaults.push(WorkerCapability::GvisorSandbox);
+        }
+        if fqdn_egress_backend {
+            defaults.push(WorkerCapability::FqdnEgress);
         }
         defaults
     } else {
@@ -1992,6 +2000,7 @@ fn to_capability(value: CapabilityArg) -> WorkerCapability {
         CapabilityArg::RunCommand => WorkerCapability::RunCommand,
         CapabilityArg::Snapshot => WorkerCapability::Snapshot,
         CapabilityArg::DesktopStream => WorkerCapability::DesktopStream,
+        CapabilityArg::FqdnEgress => WorkerCapability::FqdnEgress,
         CapabilityArg::K8sPod => WorkerCapability::K8sPod,
         CapabilityArg::GvisorSandbox => WorkerCapability::GvisorSandbox,
     }

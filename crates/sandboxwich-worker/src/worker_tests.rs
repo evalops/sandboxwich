@@ -593,7 +593,7 @@ fn resume_sandbox_job_fails_instead_of_silently_succeeding() {
 
 #[test]
 fn default_registration_capabilities_cover_supported_worker_jobs() {
-    let capabilities = capabilities_from_args(Vec::new(), None);
+    let capabilities = capabilities_from_args(Vec::new(), None, false);
 
     assert!(capabilities.contains(&WorkerCapability::ProvisionSandbox));
     assert!(capabilities.contains(&WorkerCapability::RunCommand));
@@ -605,9 +605,23 @@ fn default_registration_capabilities_cover_supported_worker_jobs() {
 
 #[test]
 fn default_registration_capabilities_include_gvisor_when_runtime_class_is_configured() {
-    let capabilities = capabilities_from_args(Vec::new(), Some("gvisor"));
+    let capabilities = capabilities_from_args(Vec::new(), Some("gvisor"), false);
 
     assert!(capabilities.contains(&WorkerCapability::GvisorSandbox));
+}
+
+#[test]
+fn default_registration_capabilities_include_fqdn_when_a_backend_is_enabled() {
+    let capabilities = capabilities_from_args(Vec::new(), None, true);
+
+    assert!(capabilities.contains(&WorkerCapability::FqdnEgress));
+}
+
+#[test]
+fn explicit_registration_capabilities_can_select_fqdn_egress() {
+    let capabilities = capabilities_from_args(vec![CapabilityArg::FqdnEgress], None, false);
+
+    assert_eq!(capabilities, vec![WorkerCapability::FqdnEgress]);
 }
 
 #[test]
