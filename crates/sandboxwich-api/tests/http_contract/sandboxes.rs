@@ -17,6 +17,7 @@ async fn disposable_workspace_mode_round_trips_and_rejects_durable_operations() 
     let created: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: Some(WorkspaceMode::Ephemeral),
             name: Some("disposable-contract".to_string()),
             template: None,
@@ -75,6 +76,7 @@ async fn disposable_workspace_mode_round_trips_and_rejects_durable_operations() 
             server.base_url, created.sandbox.id
         ))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some("unsupported-child".to_string()),
             template: None,
@@ -112,6 +114,7 @@ pub(crate) async fn list_sandboxes_hydrates_each_allowlist_sandboxes_own_rules()
     let single_rule: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some("egress-batch-single-rule".to_string()),
             template: None,
@@ -136,6 +139,7 @@ pub(crate) async fn list_sandboxes_hydrates_each_allowlist_sandboxes_own_rules()
     let multi_rule: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some("egress-batch-multi-rule".to_string()),
             template: None,
@@ -166,6 +170,7 @@ pub(crate) async fn list_sandboxes_hydrates_each_allowlist_sandboxes_own_rules()
     let no_rules: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some("egress-batch-deny-all".to_string()),
             template: None,
@@ -246,6 +251,7 @@ async fn stop_before_first_provision_is_claimable_and_cannot_be_undone() {
     let created: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some("stop-before-provision".to_string()),
             template: None,
@@ -402,6 +408,7 @@ pub(crate) async fn assert_resource_tiers_and_file_contracts(
     let sized: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some("sized-contract".to_string()),
             template: None,
@@ -436,6 +443,7 @@ pub(crate) async fn assert_resource_tiers_and_file_contracts(
     let host_allowlist = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some("host-egress-contract".to_string()),
             template: None,
@@ -680,6 +688,7 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
             server.base_url, sandbox.sandbox.id
         ))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some("race-child".to_string()),
             template: None,

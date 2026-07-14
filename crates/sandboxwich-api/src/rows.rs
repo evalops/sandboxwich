@@ -25,6 +25,7 @@ pub(crate) fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
     };
 
     Ok(Sandbox {
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         id: SandboxId(parse_uuid(&id)?),
         tenant_id: row.try_get("tenant_id")?,
         name: row.try_get("name")?,

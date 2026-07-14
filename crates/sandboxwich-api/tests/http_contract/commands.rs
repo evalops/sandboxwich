@@ -17,6 +17,7 @@ pub(crate) async fn small_body_route_rejects_oversized_json_but_upload_route_acc
     let created: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some("body-limit-test".to_string()),
             template: None,
@@ -106,6 +107,7 @@ pub(crate) async fn list_commands_respect_limit_and_paginate_with_cursor() {
     let created: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some("pagination-test".to_string()),
             template: None,

@@ -968,6 +968,7 @@ async fn expire_due_leases_does_not_double_process_concurrent_sweeps() {
     let worker_id = seed_worker(&db).await;
     let now = Utc::now();
     let sandbox = Sandbox {
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         id: SandboxId::new(),
         tenant_id: "default".to_string(),
@@ -1029,6 +1030,7 @@ async fn expire_due_leases_does_not_double_process_concurrent_sweeps() {
 async fn seed_sandbox_with_state(db: &Database, state: SandboxState) -> Sandbox {
     let now = Utc::now();
     let sandbox = Sandbox {
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         id: SandboxId::new(),
         tenant_id: "default".to_string(),
@@ -1247,6 +1249,7 @@ async fn cleanup_archived_sandboxes_never_deletes_a_sandbox_with_a_live_restore_
     let db = test_sqlite_db().await;
     let now = Utc::now();
     let sandbox = Sandbox {
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         id: SandboxId::new(),
         tenant_id: "default".to_string(),

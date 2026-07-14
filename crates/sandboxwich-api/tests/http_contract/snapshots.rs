@@ -459,6 +459,7 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
     let archived: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some("cleanup-me".to_string()),
             template: None,
@@ -559,6 +560,7 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
             server.base_url, sandbox.sandbox.id
         ))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some("contract-child".to_string()),
             template: None,
@@ -812,6 +814,7 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
             server.base_url, sandbox.sandbox.id
         ))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some("failed-child".to_string()),
             template: None,

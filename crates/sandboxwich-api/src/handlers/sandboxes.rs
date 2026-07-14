@@ -41,6 +41,7 @@ pub(crate) fn provision_spec_from_request(
         .unwrap_or_default();
     validate_network_egress(&network_egress)?;
     Ok(SandboxProvisionSpec {
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit,
         network_egress,
         workspace_mode,
@@ -149,6 +150,7 @@ pub(crate) async fn create_sandbox(
     let now = Utc::now();
     let provision_spec = provision_spec_from_request(&request, None)?;
     let sandbox = Sandbox {
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         id: SandboxId::new(),
         tenant_id: ctx.tenant_id.clone(),
         name: request.name.unwrap_or_else(|| "fresh-sandwich".to_string()),
@@ -397,6 +399,7 @@ pub(crate) async fn fork_sandbox(
         error: None,
     };
     let child = Sandbox {
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         id: SandboxId::new(),
         tenant_id: parent.tenant_id.clone(),
         name: request
@@ -419,8 +422,13 @@ pub(crate) async fn fork_sandbox(
         kind: JobKind::CreateSnapshot,
         status: JobStatus::Queued,
         payload: json!({"sandboxId": parent.id, "snapshotId": snapshot.id,
-            "operation": { "kind": OperationKind::ForkSandbox, "resourceId": child.id },
-            "provisionSpec": SandboxProvisionSpec { memory_limit: parent.memory_limit.clone(), network_egress: parent.network_egress.clone(), workspace_mode: parent.workspace_mode.clone() }}),
+        "operation": { "kind": OperationKind::ForkSandbox, "resourceId": child.id },
+        "provisionSpec": SandboxProvisionSpec {
+            execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
+            memory_limit: parent.memory_limit.clone(),
+            network_egress: parent.network_egress.clone(),
+            workspace_mode: parent.workspace_mode.clone(),
+        }}),
         required_capability: WorkerCapability::Snapshot,
         priority: 0,
         attempts: 0,

@@ -99,6 +99,7 @@ pub(crate) async fn queue_command(
             "env": env,
             "timeoutSecs": timeout_secs,
             "provisionSpec": SandboxProvisionSpec {
+                execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
                 memory_limit: sandbox.memory_limit.clone(),
                 network_egress: sandbox.network_egress.clone(),
                 workspace_mode: sandbox.workspace_mode.clone(),

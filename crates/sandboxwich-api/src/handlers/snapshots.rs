@@ -130,6 +130,7 @@ pub(crate) async fn fork_snapshot(
         claim_snapshot_restore_source_on_connection(&state.db, &mut tx, snapshot_id, &ctx, now)
             .await?;
     let child = Sandbox {
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         id: SandboxId::new(),
         tenant_id: ctx.tenant_id.clone(),
         name: request
@@ -155,6 +156,7 @@ pub(crate) async fn fork_snapshot(
             "childSandboxId": child.id,
             "snapshotId": snapshot_id,
             "provisionSpec": SandboxProvisionSpec {
+                execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
                 memory_limit: child.memory_limit.clone(),
                 network_egress: child.network_egress.clone(),
                 workspace_mode: child.workspace_mode.clone(),
@@ -761,6 +763,7 @@ pub(crate) async fn queue_forks_waiting_on_snapshot_on_connection(
                     "childSandboxId": child.id,
                     "snapshotId": snapshot_id,
                     "provisionSpec": SandboxProvisionSpec {
+                        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
                         memory_limit: child.memory_limit.clone(),
                         network_egress: child.network_egress.clone(),
                         workspace_mode: child.workspace_mode.clone(),

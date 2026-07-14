@@ -15,6 +15,7 @@ pub(crate) async fn job_can_be_fetched_by_id_with_tenant_isolation() {
     let sandbox: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some("job-fetch".to_string()),
             template: None,
@@ -113,6 +114,7 @@ async fn create_sandbox(
     client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some(name.to_string()),
             template: None,

@@ -702,6 +702,7 @@ async fn run_sandbox_ttft_once(
         client
             .post(format!("{}/sandboxes", base_url.trim_end_matches('/')))
             .json(&CreateSandboxRequest {
+                execution_class: None,
                 name: Some(format!("ttft-bench-{index}")),
                 template: Some("ubuntu-dev".to_string()),
                 memory_limit: None,
