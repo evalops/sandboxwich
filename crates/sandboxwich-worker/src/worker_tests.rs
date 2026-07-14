@@ -1,5 +1,6 @@
 use super::*;
 use crate::provider::SandboxTeardownSpec;
+use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use sandboxwich_core::{
     Job, JobId, JobStatus, MAX_COMMAND_STDIN_BYTES, RuntimeResourceKind, RuntimeResourcePurpose,
@@ -286,6 +287,7 @@ fn dispatches_command_job_to_provider_exec_handoff() {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         memory_limit: sandboxwich_core::MemoryLimit::FourG,
         network_egress: Default::default(),
+        runtime_profile: Default::default(),
     };
     let outcome = execute_job(
         &job(
@@ -495,6 +497,7 @@ fn run_command_job_completes_the_lease_even_when_the_command_exits_non_zero() {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         memory_limit: sandboxwich_core::MemoryLimit::FourG,
         network_egress: Default::default(),
+        runtime_profile: Default::default(),
     };
     let now = Utc::now();
     let provider = FixedExecResultProvider {
@@ -693,7 +696,7 @@ fn resume_sandbox_job_fails_instead_of_silently_succeeding() {
 
 #[test]
 fn default_registration_capabilities_cover_supported_worker_jobs() {
-    let capabilities = capabilities_from_args(Vec::new(), None, false);
+    let capabilities = capabilities_from_args(Vec::new(), None, false, false);
 
     assert!(capabilities.contains(&WorkerCapability::ProvisionSandbox));
     assert!(capabilities.contains(&WorkerCapability::RunCommand));
@@ -705,21 +708,21 @@ fn default_registration_capabilities_cover_supported_worker_jobs() {
 
 #[test]
 fn default_registration_capabilities_include_gvisor_when_runtime_class_is_configured() {
-    let capabilities = capabilities_from_args(Vec::new(), Some("gvisor"), false);
+    let capabilities = capabilities_from_args(Vec::new(), Some("gvisor"), false, false);
 
     assert!(capabilities.contains(&WorkerCapability::GvisorSandbox));
 }
 
 #[test]
 fn default_registration_capabilities_include_fqdn_when_a_backend_is_enabled() {
-    let capabilities = capabilities_from_args(Vec::new(), None, true);
+    let capabilities = capabilities_from_args(Vec::new(), None, true, false);
 
     assert!(capabilities.contains(&WorkerCapability::FqdnEgress));
 }
 
 #[test]
 fn explicit_registration_capabilities_can_select_fqdn_egress() {
-    let capabilities = capabilities_from_args(vec![CapabilityArg::FqdnEgress], None, false);
+    let capabilities = capabilities_from_args(vec![CapabilityArg::FqdnEgress], None, false, false);
 
     assert_eq!(capabilities, vec![WorkerCapability::FqdnEgress]);
 }

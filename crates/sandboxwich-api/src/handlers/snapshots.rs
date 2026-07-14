@@ -123,6 +123,11 @@ pub(crate) async fn fork_snapshot(
     Path(snapshot_id): Path<Uuid>,
     Json(request): Json<ForkSnapshotRequest>,
 ) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
+    validate_runtime_profile(
+        &request.runtime_profile,
+        &request.network_egress,
+        Some(&request.template),
+    )?;
     let snapshot_id = SnapshotId(snapshot_id);
     let now = Utc::now();
     let mut tx = state.db.pool.begin().await?;
@@ -140,6 +145,7 @@ pub(crate) async fn fork_snapshot(
         memory_limit: request.memory_limit,
         network_egress: request.network_egress,
         workspace_mode: WorkspaceMode::Persistent,
+        runtime_profile: request.runtime_profile,
         created_at: now,
         updated_at: now,
         ttl_seconds: request.ttl_seconds,
@@ -154,13 +160,15 @@ pub(crate) async fn fork_snapshot(
             "parentSandboxId": restore_source.source_sandbox_id,
             "childSandboxId": child.id,
             "snapshotId": snapshot_id,
+            "runtimeImage": child.template,
             "provisionSpec": SandboxProvisionSpec {
                 memory_limit: child.memory_limit.clone(),
                 network_egress: child.network_egress.clone(),
                 workspace_mode: child.workspace_mode.clone(),
+                runtime_profile: child.runtime_profile.clone(),
             }
         }),
-        required_capability: fork_capability(&child.network_egress),
+        required_capability: fork_capability(&child.runtime_profile, &child.network_egress),
         priority: 0,
         attempts: 0,
         max_attempts: 3,
@@ -733,7 +741,7 @@ pub(crate) async fn queue_forks_waiting_on_snapshot_on_connection(
     parent_sandbox_id: SandboxId,
 ) -> Result<(), ApiError> {
     let sql = format!(
-        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode,
+        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile,
                 created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where parent_snapshot_id = {} and state = 'planning'
@@ -761,13 +769,15 @@ pub(crate) async fn queue_forks_waiting_on_snapshot_on_connection(
                     "parentSandboxId": parent_sandbox_id,
                     "childSandboxId": child.id,
                     "snapshotId": snapshot_id,
+                    "runtimeImage": child.template,
                     "provisionSpec": SandboxProvisionSpec {
                         memory_limit: child.memory_limit.clone(),
                         network_egress: child.network_egress.clone(),
                         workspace_mode: child.workspace_mode.clone(),
+                        runtime_profile: child.runtime_profile.clone(),
                     }
                 }),
-                required_capability: fork_capability(&child.network_egress),
+                required_capability: fork_capability(&child.runtime_profile, &child.network_egress),
                 priority: 0,
                 attempts: 0,
                 max_attempts: 3,
@@ -804,7 +814,7 @@ pub(crate) async fn fail_sandboxes_waiting_on_snapshot_on_connection(
     error: &str,
 ) -> Result<(), ApiError> {
     let sql = format!(
-        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode,
+        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile,
                 created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where parent_snapshot_id = {} and state = 'planning'

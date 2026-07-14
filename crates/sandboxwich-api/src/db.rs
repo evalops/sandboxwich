@@ -257,6 +257,13 @@ pub(crate) const DB_ENUM_COLUMNS: &[DbEnumColumn] = &[
         "invalid sandbox workspace mode",
     ),
     DbEnumColumn::new(
+        "sandboxes",
+        "runtime_profile",
+        "sandboxes_runtime_profile_check",
+        <SandboxRuntimeProfile as DbVariant>::VALUES,
+        "invalid sandbox runtime profile",
+    ),
+    DbEnumColumn::new(
         "sandbox_network_egress_rules",
         "kind",
         "sandbox_network_egress_rules_kind_check",

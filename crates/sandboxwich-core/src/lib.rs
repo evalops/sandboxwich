@@ -490,6 +490,23 @@ impl Default for WorkspaceMode {
     }
 }
 
+db_variant_enum! {
+/// Closed runtime trust profiles. The APEX profile permits only the trusted
+/// image supervisor to start as uid 0; it is not a tenant-controlled root
+/// toggle and guest mission processes still run as uid 10001.
+pub enum SandboxRuntimeProfile {
+    Unprivileged => "unprivileged",
+    ApexTrustedSupervisorV1 => "apex_trusted_supervisor_v1",
+}
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for SandboxRuntimeProfile {
+    fn default() -> Self {
+        Self::Unprivileged
+    }
+}
+
 impl SandboxState {
     /// Every declared sandbox lifecycle state.
     pub const ALL: [SandboxState; 8] = [
@@ -835,6 +852,8 @@ pub struct SandboxProvisionSpec {
     pub network_egress: NetworkEgress,
     #[serde(default)]
     pub workspace_mode: WorkspaceMode,
+    #[serde(default)]
+    pub runtime_profile: SandboxRuntimeProfile,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -899,6 +918,8 @@ pub struct Sandbox {
     pub network_egress: NetworkEgress,
     #[serde(default)]
     pub workspace_mode: WorkspaceMode,
+    #[serde(default)]
+    pub runtime_profile: SandboxRuntimeProfile,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub ttl_seconds: Option<u64>,
@@ -912,6 +933,7 @@ pub struct CreateSandboxRequest {
     pub memory_limit: Option<MemoryLimit>,
     pub network_egress: Option<NetworkEgress>,
     pub workspace_mode: Option<WorkspaceMode>,
+    pub runtime_profile: Option<SandboxRuntimeProfile>,
     pub ttl_seconds: Option<u64>,
 }
 
@@ -1176,6 +1198,8 @@ pub struct ForkSnapshotRequest {
     pub memory_limit: MemoryLimit,
     #[serde(default)]
     pub network_egress: NetworkEgress,
+    #[serde(default)]
+    pub runtime_profile: SandboxRuntimeProfile,
     pub ttl_seconds: Option<u64>,
 }
 
@@ -1576,6 +1600,7 @@ pub enum WorkerCapability {
     K8sPod => "k8s_pod",
     GvisorSandbox => "gvisor_sandbox",
     FqdnEgress => "fqdn_egress",
+    ApexTrustedSupervisorV1 => "apex_trusted_supervisor_v1",
 }
 }
 

@@ -56,6 +56,7 @@ pub(crate) async fn runtime_resource_inventory_is_worker_scoped_and_bounded() {
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("inventory-sandbox".to_string()),
             template: None,
             memory_limit: None,
@@ -260,6 +261,7 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
             .post(format!("{}/sandboxes", server.base_url))
             .json(&CreateSandboxRequest {
                 workspace_mode: None,
+                runtime_profile: None,
                 name: Some(name.to_string()),
                 template: None,
                 memory_limit: None,

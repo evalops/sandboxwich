@@ -24,6 +24,7 @@ async fn sandbox_read_reports_actual_worker_placement_proof() {
             memory_limit: None,
             network_egress: None,
             workspace_mode: None,
+            runtime_profile: None,
             ttl_seconds: Some(120),
         })
         .send()
@@ -115,6 +116,7 @@ async fn sandbox_read_reports_actual_worker_placement_proof() {
             memory_limit: None,
             network_egress: None,
             workspace_mode: None,
+            runtime_profile: None,
             ttl_seconds: Some(120),
         })
         .send()
@@ -171,6 +173,7 @@ async fn disposable_workspace_mode_round_trips_and_rejects_durable_operations() 
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
             workspace_mode: Some(WorkspaceMode::Ephemeral),
+            runtime_profile: None,
             name: Some("disposable-contract".to_string()),
             template: None,
             memory_limit: None,
@@ -229,6 +232,7 @@ async fn disposable_workspace_mode_round_trips_and_rejects_durable_operations() 
         ))
         .json(&CreateSandboxRequest {
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("unsupported-child".to_string()),
             template: None,
             memory_limit: None,
@@ -266,6 +270,7 @@ pub(crate) async fn list_sandboxes_hydrates_each_allowlist_sandboxes_own_rules()
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("egress-batch-single-rule".to_string()),
             template: None,
             memory_limit: None,
@@ -290,6 +295,7 @@ pub(crate) async fn list_sandboxes_hydrates_each_allowlist_sandboxes_own_rules()
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("egress-batch-multi-rule".to_string()),
             template: None,
             memory_limit: None,
@@ -320,6 +326,7 @@ pub(crate) async fn list_sandboxes_hydrates_each_allowlist_sandboxes_own_rules()
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("egress-batch-deny-all".to_string()),
             template: None,
             memory_limit: None,
@@ -400,6 +407,7 @@ async fn stop_before_first_provision_is_claimable_and_cannot_be_undone() {
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("stop-before-provision".to_string()),
             template: None,
             memory_limit: None,
@@ -564,6 +572,7 @@ pub(crate) async fn assert_resource_tiers_and_file_contracts(
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("sized-contract".to_string()),
             template: None,
             memory_limit: Some(MemoryLimit::FourG),
@@ -598,6 +607,7 @@ pub(crate) async fn assert_resource_tiers_and_file_contracts(
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("host-egress-contract".to_string()),
             template: None,
             memory_limit: Some(MemoryLimit::OneG),
@@ -823,7 +833,16 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
                 WorkerCapability::ProvisionSandbox,
             ],
             max_concurrent_jobs: Some(1),
-            labels: [("cluster".to_string(), "k3s-dev".to_string())].into(),
+            labels: [
+                ("cluster".to_string(), "k3s-dev".to_string()),
+                ("provider_mode".to_string(), "apply".to_string()),
+                (
+                    "runtime_image".to_string(),
+                    "image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                ),
+            ]
+            .into(),
         })
         .send()
         .await
@@ -842,6 +861,7 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
         ))
         .json(&CreateSandboxRequest {
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("race-child".to_string()),
             template: None,
             memory_limit: None,
@@ -958,20 +978,24 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
         .expect("expected race worker to claim the fork job");
     assert_eq!(fork_lease.job.id, fork_job.id);
 
-    let provisioning_child: SandboxResponse = client
-        .get(format!(
-            "{}/sandboxes/{}",
-            server.base_url, forked.sandbox.id
-        ))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
+    // A claimed fork is provisioning before a placement proof exists, so the
+    // public GET intentionally fails closed. Verify the fenced state directly.
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&server.database_url)
         .await
         .unwrap();
-    assert_eq!(provisioning_child.sandbox.state, SandboxState::Provisioning);
+    let state: String = sqlx::query_scalar(&format!(
+        "select state from sandboxes where id = {}",
+        crate::types::placeholders(&server.database_url, 1)
+    ))
+    .bind(forked.sandbox.id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, SandboxState::Provisioning.as_db_str());
+    pool.close().await;
 
     // Race: archive the child while its ForkSandbox job is still in flight,
     // *before* the lease is completed below.

@@ -147,6 +147,7 @@ pub(crate) async fn run_contract(server: TestServer) {
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("contract-test".to_string()),
             template: None,
             memory_limit: None,
@@ -218,7 +219,16 @@ pub(crate) async fn run_contract(server: TestServer) {
         ))
         .json(&WorkerHeartbeatRequest {
             max_concurrent_jobs: None,
-            labels: [("node".to_string(), "k3s-node-1".to_string())].into(),
+            labels: [
+                ("node".to_string(), "k3s-node-1".to_string()),
+                ("provider_mode".to_string(), "apply".to_string()),
+                (
+                    "runtime_image".to_string(),
+                    "image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                ),
+            ]
+            .into(),
         })
         .send()
         .await

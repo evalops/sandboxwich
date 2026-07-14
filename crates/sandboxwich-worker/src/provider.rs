@@ -15,13 +15,14 @@ use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use ipnet::IpNet;
 use sandboxwich_core::{
-    AgentCommandRequest, AgentCommandResult, MAX_SANDBOX_FILE_BYTES, MaterializeFileDestination,
-    MemoryLimit, NetworkAllowRuleKind, NetworkEgress, ProviderCapabilityReport, ProviderForkHandle,
-    ProviderHealthReport, ProviderHealthStatus, ProviderRuntimeResource, ProviderSandboxHandle,
-    ProviderSnapshotHandle, ProvisioningErrorClass, ProvisioningStage,
-    ProvisioningStageUpdateRequest, RuntimeResourceInventoryResponse, RuntimeResourceKind,
-    RuntimeResourcePurpose, RuntimeResourceStatus, SandboxId, SandboxProvisionSpec, SnapshotId,
-    WorkerCapability, WorkspaceMode, validate_agent_command_request,
+    AgentCommandRequest, AgentCommandResult, DbVariant, MAX_SANDBOX_FILE_BYTES,
+    MaterializeFileDestination, MemoryLimit, NetworkAllowRuleKind, NetworkEgress,
+    ProviderCapabilityReport, ProviderForkHandle, ProviderHealthReport, ProviderHealthStatus,
+    ProviderRuntimeResource, ProviderSandboxHandle, ProviderSnapshotHandle, ProvisioningErrorClass,
+    ProvisioningStage, ProvisioningStageUpdateRequest, RuntimeResourceInventoryResponse,
+    RuntimeResourceKind, RuntimeResourcePurpose, RuntimeResourceStatus, SandboxId,
+    SandboxProvisionSpec, SandboxRuntimeProfile, SnapshotId, WorkerCapability, WorkspaceMode,
+    validate_agent_command_request,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -281,6 +282,7 @@ pub struct KubernetesDryRunProvider {
     storage_class: Option<String>,
     snapshot_class: Option<String>,
     runtime_image: String,
+    apex_trusted_supervisor_v1: bool,
     egress_gateway_image: Option<String>,
     workspace_storage: String,
     workspace_storage_override: bool,
@@ -342,6 +344,7 @@ impl KubernetesDryRunProvider {
             storage_class,
             snapshot_class,
             runtime_image: DEFAULT_SANDBOX_GUEST_IMAGE.to_string(),
+            apex_trusted_supervisor_v1: false,
             egress_gateway_image: None,
             workspace_storage: "2Gi".to_string(),
             workspace_storage_override: false,
@@ -370,6 +373,21 @@ impl KubernetesDryRunProvider {
             self.runtime_image = image;
         }
         self
+    }
+
+    pub fn with_apex_trusted_supervisor_v1(mut self, enabled: bool) -> Self {
+        self.apex_trusted_supervisor_v1 = enabled;
+        self
+    }
+
+    fn validate_runtime_profile(&self, spec: &SandboxProvisionSpec) -> anyhow::Result<()> {
+        if spec.runtime_profile == SandboxRuntimeProfile::ApexTrustedSupervisorV1 {
+            anyhow::ensure!(
+                self.apex_trusted_supervisor_v1 && image_is_digest_pinned(&self.runtime_image),
+                "apex_trusted_supervisor_v1 is not configured for this digest-pinned runtime"
+            );
+        }
+        Ok(())
     }
 
     pub fn with_egress_gateway_image(mut self, image: Option<String>) -> Self {
@@ -578,6 +596,14 @@ impl KubernetesDryRunProvider {
             labels.insert("snapshot_class".to_string(), snapshot_class.clone());
         }
         labels.insert("runtime_image".to_string(), self.runtime_image.clone());
+        if self.apex_trusted_supervisor_v1 {
+            labels.insert(
+                "runtime_profile".to_string(),
+                SandboxRuntimeProfile::ApexTrustedSupervisorV1
+                    .as_db_str()
+                    .to_string(),
+            );
+        }
         labels.insert(
             "workspace_storage".to_string(),
             self.workspace_storage.clone(),
@@ -601,6 +627,7 @@ impl KubernetesDryRunProvider {
         operation: &'static str,
         spec: &SandboxProvisionSpec,
     ) -> anyhow::Result<serde_json::Value> {
+        self.validate_runtime_profile(spec)?;
         let network_policy = self.network_policy_manifest(sandbox_id, &spec.network_egress)?;
         let egress_gateway_pod =
             self.egress_gateway_pod_manifest(sandbox_id, &spec.network_egress)?;
@@ -897,20 +924,50 @@ impl KubernetesDryRunProvider {
         }
 
         let ephemeral_storage = Self::ephemeral_storage_limit(&spec.memory_limit);
+        let apex_supervisor =
+            spec.runtime_profile == SandboxRuntimeProfile::ApexTrustedSupervisorV1;
+        let pod_security_context = if apex_supervisor {
+            json!({
+                "runAsNonRoot": false,
+                "runAsUser": 0,
+                "runAsGroup": 0,
+                "fsGroup": 10001,
+                "seccompProfile": { "type": "RuntimeDefault" }
+            })
+        } else {
+            json!({
+                "runAsNonRoot": true,
+                "runAsUser": 10001,
+                "runAsGroup": 10001,
+                "fsGroup": 10001,
+                "seccompProfile": { "type": "RuntimeDefault" }
+            })
+        };
+        let container_security_context = if apex_supervisor {
+            json!({
+                "allowPrivilegeEscalation": false,
+                "readOnlyRootFilesystem": false,
+                "runAsNonRoot": false,
+                "runAsUser": 0,
+                "runAsGroup": 0,
+                "capabilities": {
+                    "drop": ["ALL"],
+                    "add": ["CHOWN", "SETGID", "SETUID", "KILL", "DAC_READ_SEARCH"]
+                },
+                "seccompProfile": { "type": "RuntimeDefault" }
+            })
+        } else {
+            json!({
+                "allowPrivilegeEscalation": false,
+                "readOnlyRootFilesystem": false,
+                "runAsNonRoot": true,
+                "capabilities": { "drop": ["ALL"] },
+                "seccompProfile": { "type": "RuntimeDefault" }
+            })
+        };
         let mut pod_spec = Map::from_iter([
             ("automountServiceAccountToken".to_string(), json!(false)),
-            (
-                "securityContext".to_string(),
-                json!({
-                    "runAsNonRoot": true,
-                    "runAsUser": 10001,
-                    "runAsGroup": 10001,
-                    "fsGroup": 10001,
-                    "seccompProfile": {
-                        "type": "RuntimeDefault"
-                    }
-                }),
-            ),
+            ("securityContext".to_string(), pod_security_context),
             (
                 "containers".to_string(),
                 json!([{
@@ -936,17 +993,7 @@ impl KubernetesDryRunProvider {
                             "ephemeral-storage": ephemeral_storage
                         }
                     },
-                    "securityContext": {
-                        "allowPrivilegeEscalation": false,
-                        "readOnlyRootFilesystem": false,
-                        "runAsNonRoot": true,
-                        "capabilities": {
-                            "drop": ["ALL"]
-                        },
-                        "seccompProfile": {
-                            "type": "RuntimeDefault"
-                        }
-                    },
+                    "securityContext": container_security_context,
                     "volumeMounts": volume_mounts
                 }]),
             ),
@@ -2895,6 +2942,7 @@ impl KubernetesApplyProvider {
         sandbox_id: SandboxId,
         spec: &SandboxProvisionSpec,
     ) -> anyhow::Result<Vec<Value>> {
+        self.dry_run.validate_runtime_profile(spec)?;
         let mut manifests = Vec::new();
         if spec.workspace_mode == WorkspaceMode::Persistent {
             manifests.push(self.dry_run.pvc_manifest(
@@ -2937,6 +2985,7 @@ impl KubernetesApplyProvider {
         snapshot_id: SnapshotId,
         spec: &SandboxProvisionSpec,
     ) -> anyhow::Result<Vec<Value>> {
+        self.dry_run.validate_runtime_profile(spec)?;
         let mut manifests =
             vec![
                 self.dry_run
@@ -3529,6 +3578,9 @@ impl SandboxProvider for KubernetesDryRunProvider {
             WorkerCapability::Snapshot,
             WorkerCapability::DesktopStream,
         ];
+        if self.apex_trusted_supervisor_v1 && image_is_digest_pinned(&self.runtime_image) {
+            capabilities.push(WorkerCapability::ApexTrustedSupervisorV1);
+        }
         if self.runtime_class_name.is_some() {
             capabilities.push(WorkerCapability::GvisorSandbox);
         }
@@ -3660,6 +3712,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
         spec: &SandboxProvisionSpec,
         _cancelled: &CancelSignal,
     ) -> anyhow::Result<ProviderForkHandle> {
+        self.validate_runtime_profile(spec)?;
         self.validate_network_policy_egress(&spec.network_egress)?;
         let network_policy =
             self.network_policy_manifest(child_sandbox_id, &spec.network_egress)?;

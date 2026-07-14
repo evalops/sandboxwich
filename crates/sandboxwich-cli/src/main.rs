@@ -479,6 +479,7 @@ async fn main() -> anyhow::Result<()> {
                     memory_limit: args.memory_limit.map(Into::into),
                     network_egress: Some(network_egress),
                     workspace_mode: Some(args.workspace_mode.into()),
+                    runtime_profile: None,
                     ttl_seconds: args.ttl_seconds,
                 })
                 .send()
@@ -541,6 +542,7 @@ async fn main() -> anyhow::Result<()> {
                     memory_limit: None,
                     network_egress: None,
                     workspace_mode: None,
+                    runtime_profile: None,
                     ttl_seconds: args.ttl_seconds,
                 })
                 .send()

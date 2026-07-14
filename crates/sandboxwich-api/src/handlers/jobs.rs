@@ -14,6 +14,7 @@ use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
 use chrono::Utc;
 use sandboxwich_core::*;
+use serde_json::json;
 use sha2::Digest;
 use sqlx::AnyConnection;
 use uuid::Uuid;
@@ -159,7 +160,7 @@ pub(crate) async fn enrich_job_payload_with_provision_spec(
     job: &mut Job,
 ) -> Result<(), ApiError> {
     match job.kind {
-        JobKind::ProvisionSandbox | JobKind::RunCommand => {
+        JobKind::ProvisionSandbox | JobKind::RunCommand | JobKind::MaterializeFile => {
             let sandbox = fetch_sandbox(db, sandbox_id_from_job(job)?).await?;
             add_provision_spec_to_payload(job, &sandbox)?;
         }
@@ -170,8 +171,7 @@ pub(crate) async fn enrich_job_payload_with_provision_spec(
         JobKind::RunPrompt
         | JobKind::CreateSnapshot
         | JobKind::StopSandbox
-        | JobKind::ResumeSandbox
-        | JobKind::MaterializeFile => {}
+        | JobKind::ResumeSandbox => {}
     }
     Ok(())
 }
@@ -180,20 +180,24 @@ pub(crate) fn add_provision_spec_to_payload(
     job: &mut Job,
     sandbox: &Sandbox,
 ) -> Result<(), ApiError> {
-    if job.payload.get("provisionSpec").is_some() {
-        return Ok(());
-    }
     let Some(payload) = job.payload.as_object_mut() else {
         return Err(ApiError::bad_request("job payload must be an object"));
     };
-    payload.insert(
-        "provisionSpec".to_string(),
-        serde_json::to_value(SandboxProvisionSpec {
-            memory_limit: sandbox.memory_limit.clone(),
-            network_egress: sandbox.network_egress.clone(),
-            workspace_mode: sandbox.workspace_mode.clone(),
-        })?,
-    );
+    // This is authoritative control-plane enrichment, not a caller-provided
+    // image selector. Profile-bound jobs must stay on the exact worker image
+    // that owns the sandbox placement.
+    payload.insert("runtimeImage".to_string(), json!(sandbox.template));
+    if !payload.contains_key("provisionSpec") {
+        payload.insert(
+            "provisionSpec".to_string(),
+            serde_json::to_value(SandboxProvisionSpec {
+                memory_limit: sandbox.memory_limit.clone(),
+                network_egress: sandbox.network_egress.clone(),
+                workspace_mode: sandbox.workspace_mode.clone(),
+                runtime_profile: sandbox.runtime_profile.clone(),
+            })?,
+        );
+    }
     Ok(())
 }
 
@@ -213,6 +217,11 @@ pub(crate) async fn validate_job_payload_tenant(
         }
         JobKind::MaterializeFile => {
             let sandbox = ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
+            if sandbox.runtime_profile != SandboxRuntimeProfile::ApexTrustedSupervisorV1 {
+                return Err(ApiError::bad_request(
+                    "materialize_file requires apex_trusted_supervisor_v1",
+                ));
+            }
             let file_id = file_id_from_job(job)?;
             let stored = fetch_sandbox_file(db, sandbox.id, file_id).await?;
             let expected = materialization_digest_from_job(job)?;

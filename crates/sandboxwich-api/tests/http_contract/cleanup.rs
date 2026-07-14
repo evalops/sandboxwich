@@ -56,6 +56,7 @@ async fn archived_sandbox_cleanup_cascades_dependent_rows_on_sqlite() {
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("cascade-cleanup-me".to_string()),
             template: None,
             memory_limit: None,

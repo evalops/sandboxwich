@@ -48,6 +48,134 @@ fn materialization_job_input_is_ref_only_and_exact() {
     }
 }
 
+#[test]
+fn apex_runtime_profile_requires_pinned_image_and_deny_by_default_egress() {
+    let pinned = format!("ghcr.io/evalops/apex@sha256:{}", "a".repeat(64));
+    let request = |template: &str, network_egress| CreateSandboxRequest {
+        name: None,
+        template: Some(template.to_string()),
+        memory_limit: None,
+        network_egress: Some(network_egress),
+        workspace_mode: None,
+        runtime_profile: Some(SandboxRuntimeProfile::ApexTrustedSupervisorV1),
+        ttl_seconds: None,
+    };
+    assert!(provision_spec_from_request(&request(&pinned, NetworkEgress::DenyAll), None).is_ok());
+    assert!(
+        provision_spec_from_request(
+            &request(
+                &pinned,
+                NetworkEgress::Allowlist {
+                    rules: vec![NetworkAllowRule {
+                        kind: NetworkAllowRuleKind::Host,
+                        value: "model-gateway.example.com".to_string(),
+                    }],
+                },
+            ),
+            None,
+        )
+        .is_ok()
+    );
+    assert!(
+        provision_spec_from_request(
+            &request("ghcr.io/evalops/apex:latest", NetworkEgress::DenyAll),
+            None
+        )
+        .is_err()
+    );
+    assert!(provision_spec_from_request(&request(&pinned, NetworkEgress::AllowAll), None).is_err());
+}
+
+#[test]
+fn apex_profile_bound_jobs_only_match_the_exact_profile_worker_image() {
+    let now = Utc::now();
+    let requested_image = format!("ghcr.io/evalops/apex@sha256:{}", "a".repeat(64));
+    let job = Job {
+        id: JobId::new(),
+        tenant_id: "tenant-a".to_string(),
+        kind: JobKind::MaterializeFile,
+        status: JobStatus::Queued,
+        payload: json!({
+            "sandboxId": SandboxId::new(),
+            "runtimeImage": requested_image,
+            "provisionSpec": { "runtime_profile": "apex_trusted_supervisor_v1" }
+        }),
+        required_capability: WorkerCapability::MaterializeFile,
+        priority: 0,
+        attempts: 0,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+    };
+    let worker = |capabilities, image: &str| Worker {
+        id: WorkerId::new(),
+        tenant_id: "tenant-a".to_string(),
+        name: "worker".to_string(),
+        status: WorkerStatus::Online,
+        provider: "kubernetes".to_string(),
+        capabilities,
+        max_concurrent_jobs: 1,
+        labels: std::collections::BTreeMap::from([(
+            "runtime_image".to_string(),
+            image.to_string(),
+        )]),
+        registered_at: now,
+        last_heartbeat_at: Some(now),
+    };
+    assert!(worker_supports_runtime_profile(
+        &worker(
+            vec![
+                WorkerCapability::MaterializeFile,
+                WorkerCapability::ApexTrustedSupervisorV1,
+            ],
+            job.payload["runtimeImage"].as_str().unwrap(),
+        ),
+        &job,
+    ));
+    assert!(!worker_supports_runtime_profile(
+        &worker(
+            vec![WorkerCapability::ProvisionSandbox],
+            job.payload["runtimeImage"].as_str().unwrap()
+        ),
+        &job,
+    ));
+    assert!(!worker_supports_runtime_profile(
+        &worker(
+            vec![
+                WorkerCapability::MaterializeFile,
+                WorkerCapability::ApexTrustedSupervisorV1,
+            ],
+            &format!("ghcr.io/evalops/apex@sha256:{}", "b".repeat(64)),
+        ),
+        &job,
+    ));
+
+    let run_command = Job {
+        kind: JobKind::RunCommand,
+        required_capability: WorkerCapability::RunCommand,
+        ..job.clone()
+    };
+    assert!(worker_supports_runtime_profile(
+        &worker(
+            vec![
+                WorkerCapability::RunCommand,
+                WorkerCapability::ApexTrustedSupervisorV1,
+            ],
+            run_command.payload["runtimeImage"].as_str().unwrap(),
+        ),
+        &run_command,
+    ));
+    assert!(!worker_supports_runtime_profile(
+        &worker(
+            vec![WorkerCapability::RunCommand],
+            run_command.payload["runtimeImage"].as_str().unwrap(),
+        ),
+        &run_command,
+    ));
+}
+
 #[tokio::test]
 async fn materialization_rejects_a_file_from_another_sandbox() {
     let db = test_sqlite_db().await;
@@ -61,6 +189,7 @@ async fn materialization_rejects_a_file_from_another_sandbox() {
         memory_limit: MemoryLimit::FourG,
         network_egress: NetworkEgress::default(),
         workspace_mode: WorkspaceMode::Persistent,
+        runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
         created_at: now,
         updated_at: now,
         ttl_seconds: Some(600),
@@ -104,6 +233,16 @@ async fn materialization_rejects_a_file_from_another_sandbox() {
         .await
         .unwrap_err();
     assert_eq!(error.status, StatusCode::NOT_FOUND);
+
+    let mut generic = make("generic");
+    generic.runtime_profile = SandboxRuntimeProfile::Unprivileged;
+    insert_sandbox(&db, &generic).await.unwrap();
+    let mut generic_job = job;
+    generic_job.payload["sandboxId"] = json!(generic.id);
+    let error = validate_job_payload_tenant(&db, &generic_job, &ctx)
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
 }
 
 #[test]
@@ -1055,6 +1194,7 @@ async fn expire_due_leases_does_not_double_process_concurrent_sweeps() {
     let now = Utc::now();
     let sandbox = Sandbox {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        runtime_profile: SandboxRuntimeProfile::Unprivileged,
         id: SandboxId::new(),
         tenant_id: "default".to_string(),
         name: "test-sandbox".to_string(),
@@ -1116,6 +1256,7 @@ async fn seed_sandbox_with_state(db: &Database, state: SandboxState) -> Sandbox 
     let now = Utc::now();
     let sandbox = Sandbox {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        runtime_profile: SandboxRuntimeProfile::Unprivileged,
         id: SandboxId::new(),
         tenant_id: "default".to_string(),
         name: "test-sandbox".to_string(),
@@ -1334,6 +1475,7 @@ async fn cleanup_archived_sandboxes_never_deletes_a_sandbox_with_a_live_restore_
     let now = Utc::now();
     let sandbox = Sandbox {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        runtime_profile: SandboxRuntimeProfile::Unprivileged,
         id: SandboxId::new(),
         tenant_id: "default".to_string(),
         name: "referenced-archived".to_string(),

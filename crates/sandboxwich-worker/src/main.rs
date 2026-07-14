@@ -254,6 +254,15 @@ struct ProviderArgs {
     #[arg(long, env = "SANDBOXWICH_RUNTIME_IMAGE")]
     runtime_image: Option<String>,
 
+    /// Enables the one closed uid-0 trusted-supervisor profile. This is only
+    /// advertised when the configured runtime image is digest-pinned.
+    #[arg(
+        long,
+        env = "SANDBOXWICH_APEX_TRUSTED_SUPERVISOR_V1",
+        default_value_t = false
+    )]
+    apex_trusted_supervisor_v1: bool,
+
     #[arg(long, env = "SANDBOXWICH_EGRESS_GATEWAY_IMAGE")]
     egress_gateway_image: Option<String>,
 
@@ -744,7 +753,7 @@ async fn main() -> anyhow::Result<()> {
                 &api,
                 args.name,
                 args.provider,
-                capabilities_from_args(args.capability, None, false),
+                capabilities_from_args(args.capability, None, false, false),
                 args.label.into_iter().collect(),
                 // Standalone registration may be consumed by multiple
                 // work-once/work-loop processes, so preserve the operator's
@@ -818,9 +827,28 @@ async fn main() -> anyhow::Result<()> {
                     .egress_gateway_image
                     .as_deref()
                     .is_some_and(image_is_digest_pinned);
-            let capabilities =
-                capabilities_from_args(args.capability, runtime_class_name, fqdn_egress_backend);
-            let labels: BTreeMap<_, _> = args.label.into_iter().collect();
+            validate_apex_trusted_supervisor_config(&args.provider.provider)?;
+            let capabilities = capabilities_from_args(
+                args.capability,
+                runtime_class_name,
+                fqdn_egress_backend,
+                args.provider.provider.apex_trusted_supervisor_v1,
+            );
+            let mut labels: BTreeMap<_, _> = args.label.into_iter().collect();
+            if args.provider.provider.apex_trusted_supervisor_v1 {
+                labels.insert(
+                    "runtime_profile".to_string(),
+                    "apex_trusted_supervisor_v1".to_string(),
+                );
+                labels.insert(
+                    "runtime_image".to_string(),
+                    args.provider
+                        .provider
+                        .runtime_image
+                        .clone()
+                        .expect("validated digest-pinned runtime image"),
+                );
+            }
             let response = register_worker(
                 &client,
                 &api,
@@ -906,6 +934,7 @@ fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
         non_empty(args.snapshot_class),
     )
     .with_runtime_image(non_empty(args.runtime_image))
+    .with_apex_trusted_supervisor_v1(args.apex_trusted_supervisor_v1)
     .with_egress_gateway_image(non_empty(args.egress_gateway_image))
     .with_workspace_storage(non_empty(args.workspace_storage))
     .with_ssh_authorized_keys_secret(non_empty(args.ssh_authorized_keys_secret))
@@ -1050,6 +1079,7 @@ fn apply_provider_from_args(args: ProviderApplyArgs) -> anyhow::Result<Kubernete
 }
 
 fn runtime_provider_from_args(args: RuntimeProviderArgs) -> anyhow::Result<RuntimeProvider> {
+    validate_apex_trusted_supervisor_config(&args.provider)?;
     if matches!(args.provider_mode, ProviderModeArg::Apply) {
         require_explicit_runtime_image_for_apply(&args.provider)?;
     }
@@ -1076,6 +1106,18 @@ fn runtime_provider_from_args(args: RuntimeProviderArgs) -> anyhow::Result<Runti
             )
         }
     })
+}
+
+fn validate_apex_trusted_supervisor_config(args: &ProviderArgs) -> anyhow::Result<()> {
+    if args.apex_trusted_supervisor_v1 {
+        anyhow::ensure!(
+            args.runtime_image
+                .as_deref()
+                .is_some_and(image_is_digest_pinned),
+            "apex_trusted_supervisor_v1 requires SANDBOXWICH_RUNTIME_IMAGE pinned by sha256 digest"
+        );
+    }
+    Ok(())
 }
 
 async fn claim(
@@ -2212,6 +2254,7 @@ fn capabilities_from_args(
     capabilities: Vec<CapabilityArg>,
     runtime_class_name: Option<&str>,
     fqdn_egress_backend: bool,
+    apex_trusted_supervisor_v1: bool,
 ) -> Vec<WorkerCapability> {
     if capabilities.is_empty() {
         let mut defaults = vec![
@@ -2228,9 +2271,21 @@ fn capabilities_from_args(
         if fqdn_egress_backend {
             defaults.push(WorkerCapability::FqdnEgress);
         }
+        if apex_trusted_supervisor_v1 {
+            defaults.push(WorkerCapability::ApexTrustedSupervisorV1);
+        }
         defaults
     } else {
-        capabilities.into_iter().map(to_capability).collect()
+        let mut capabilities = capabilities
+            .into_iter()
+            .map(to_capability)
+            .collect::<Vec<_>>();
+        if apex_trusted_supervisor_v1
+            && !capabilities.contains(&WorkerCapability::ApexTrustedSupervisorV1)
+        {
+            capabilities.push(WorkerCapability::ApexTrustedSupervisorV1);
+        }
+        capabilities
     }
 }
 

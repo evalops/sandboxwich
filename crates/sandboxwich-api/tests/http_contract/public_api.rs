@@ -148,6 +148,7 @@ async fn v1_contract_exposes_operations_openapi_request_ids_and_honest_prompt_st
         .post(format!("{}/v1/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("v1-contract".to_string()),
             template: None,
             memory_limit: None,
@@ -290,6 +291,7 @@ async fn platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_cor
         .post(&create_url)
         .json(&CreateSandboxRequest {
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("missing-tenant-identity".to_string()),
             template: None,
             memory_limit: None,
@@ -305,6 +307,7 @@ async fn platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_cor
     let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
     let request = CreateSandboxRequest {
         workspace_mode: None,
+        runtime_profile: None,
         name: Some("platform-provider-contract".to_string()),
         template: None,
         memory_limit: None,
@@ -389,6 +392,7 @@ async fn platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_cor
             template: "ubuntu-dev".to_string(),
             memory_limit: MemoryLimit::OneG,
             network_egress: NetworkEgress::DenyAll,
+            runtime_profile: SandboxRuntimeProfile::Unprivileged,
             ttl_seconds: Some(120),
         })
         .send()
@@ -437,6 +441,7 @@ async fn platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_cor
         template: "ubuntu-dev".to_string(),
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::DenyAll,
+        runtime_profile: SandboxRuntimeProfile::Unprivileged,
         ttl_seconds: Some(120),
     };
     let restore_key = uuid::Uuid::now_v7().to_string();

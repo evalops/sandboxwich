@@ -178,6 +178,9 @@ pub(crate) async fn claim_lease(
         if !worker.capabilities.contains(&job.required_capability) {
             continue;
         }
+        if !worker_supports_runtime_profile(&worker, &job) {
+            continue;
+        }
         // Defense in depth: re-check the caller's sandbox/kind filters (if any) against
         // the typed job for the same reason as the capability check above.
         if let Some(sandbox_id) = request.sandbox_id
@@ -210,6 +213,19 @@ pub(crate) async fn claim_lease(
         ok: true,
         lease: None,
     }))
+}
+
+pub(crate) fn worker_supports_runtime_profile(worker: &Worker, job: &Job) -> bool {
+    let profile = job.payload["provisionSpec"]["runtime_profile"].as_str();
+    if profile != Some(SandboxRuntimeProfile::ApexTrustedSupervisorV1.as_db_str()) {
+        return true;
+    }
+    let requested_image = job.payload["runtimeImage"].as_str();
+    worker
+        .capabilities
+        .contains(&WorkerCapability::ApexTrustedSupervisorV1)
+        && requested_image.is_some()
+        && worker.labels.get("runtime_image").map(String::as_str) == requested_image
 }
 
 pub(crate) async fn fetch_lease_materialization(

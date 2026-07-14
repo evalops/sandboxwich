@@ -17,6 +17,7 @@ pub(crate) async fn command_stdin_is_redacted_from_tenant_jobs_but_preserved_for
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("stdin-redaction-test".to_string()),
             template: None,
             memory_limit: None,
@@ -235,6 +236,7 @@ pub(crate) async fn command_stdin_over_one_mib_is_rejected_before_job_dispatch()
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("stdin-limit-test".to_string()),
             template: None,
             memory_limit: None,
@@ -341,6 +343,7 @@ pub(crate) async fn small_body_route_rejects_oversized_json_but_upload_route_acc
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("body-limit-test".to_string()),
             template: None,
             memory_limit: None,
@@ -430,6 +433,7 @@ pub(crate) async fn list_commands_respect_limit_and_paginate_with_cursor() {
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("pagination-test".to_string()),
             template: None,
             memory_limit: None,

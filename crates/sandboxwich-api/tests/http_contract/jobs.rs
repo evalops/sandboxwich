@@ -12,7 +12,26 @@ async fn materialization_bytes_are_worker_fenced_ref_only_and_consumed_only_when
     );
     let server = TestServer::start(database_url, Some(data_dir)).await;
     let client = server.client();
-    let sandbox = create_sandbox(&client, &server, "materialization").await;
+    let runtime_image = format!("image@sha256:{}", "a".repeat(64));
+    let sandbox: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("materialization".to_string()),
+            template: Some(runtime_image.clone()),
+            memory_limit: None,
+            network_egress: Some(NetworkEgress::DenyAll),
+            workspace_mode: None,
+            runtime_profile: Some(SandboxRuntimeProfile::ApexTrustedSupervisorV1),
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let worker: WorkerResponse = client
         .post(format!("{}/workers/register", server.base_url))
         .json(&RegisterWorkerRequest {
@@ -21,15 +40,12 @@ async fn materialization_bytes_are_worker_fenced_ref_only_and_consumed_only_when
             capabilities: vec![
                 WorkerCapability::ProvisionSandbox,
                 WorkerCapability::MaterializeFile,
+                WorkerCapability::ApexTrustedSupervisorV1,
             ],
             max_concurrent_jobs: Some(1),
             labels: [
                 ("provider_mode".into(), "apply".into()),
-                (
-                    "runtime_image".into(),
-                    "image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                        .into(),
-                ),
+                ("runtime_image".into(), runtime_image),
             ]
             .into(),
         })
@@ -309,6 +325,7 @@ pub(crate) async fn job_can_be_fetched_by_id_with_tenant_isolation() {
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("job-fetch".to_string()),
             template: None,
             memory_limit: None,
@@ -407,6 +424,7 @@ async fn create_sandbox(
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
             workspace_mode: None,
+            runtime_profile: None,
             name: Some(name.to_string()),
             template: None,
             memory_limit: None,

@@ -253,6 +253,62 @@ fn kubernetes_dry_run_uses_configured_runtime_image() {
 }
 
 #[test]
+fn apex_trusted_supervisor_profile_is_closed_and_minimally_privileged() {
+    let runtime_image = format!("ghcr.io/evalops/apex@sha256:{}", "a".repeat(64));
+    let configured =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_runtime_image(Some(runtime_image.clone()))
+            .with_apex_trusted_supervisor_v1(true);
+    let spec = SandboxProvisionSpec {
+        runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
+        network_egress: NetworkEgress::DenyAll,
+        ..SandboxProvisionSpec::default()
+    };
+
+    let report = configured.capability_report();
+    assert!(
+        report
+            .capabilities
+            .contains(&WorkerCapability::ApexTrustedSupervisorV1)
+    );
+    assert_eq!(
+        report.labels.get("runtime_profile").map(String::as_str),
+        Some("apex_trusted_supervisor_v1")
+    );
+    assert_eq!(report.labels.get("runtime_image"), Some(&runtime_image));
+
+    let provisioned = configured
+        .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+        .expect("configured APEX supervisor profile should render");
+    let pod = &provisioned.metadata["manifests"]["pod"]["spec"];
+    assert_eq!(pod["automountServiceAccountToken"], false);
+    assert_eq!(pod["securityContext"]["runAsUser"], 0);
+    assert_eq!(pod["securityContext"]["runAsGroup"], 0);
+    assert_eq!(pod["securityContext"]["fsGroup"], 10001);
+    assert_eq!(
+        pod["securityContext"]["seccompProfile"]["type"],
+        "RuntimeDefault"
+    );
+    let container = &pod["containers"][0]["securityContext"];
+    assert_eq!(container["allowPrivilegeEscalation"], false);
+    assert_eq!(container["runAsUser"], 0);
+    assert_eq!(container["capabilities"]["drop"], json!(["ALL"]));
+    assert_eq!(
+        container["capabilities"]["add"],
+        json!(["CHOWN", "SETGID", "SETUID", "KILL", "DAC_READ_SEARCH"])
+    );
+
+    let unconfigured =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_runtime_image(Some(runtime_image));
+    assert!(
+        unconfigured
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+            .is_err()
+    );
+}
+
+#[test]
 fn image_pull_policy_tracks_tag_mutability() {
     assert_eq!(
         image_pull_policy_for("ghcr.io/evalops/sandboxwich-ubuntu-dev:latest"),
@@ -334,6 +390,7 @@ fn kubernetes_workspace_modes_render_distinct_bounded_storage_contracts() {
             workspace_mode: mode.clone(),
             memory_limit: MemoryLimit::OneG,
             network_egress: NetworkEgress::DenyAll,
+            runtime_profile: Default::default(),
         };
         let provisioned = provider
             .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
@@ -377,6 +434,7 @@ fn configured_workspace_storage_overrides_non_default_tier_disk_size() {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         memory_limit: MemoryLimit::FourG,
         network_egress: NetworkEgress::DenyAll,
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -402,6 +460,7 @@ fn kubernetes_dry_run_renders_resource_network_and_runtime_class_controls() {
                 value: "10.0.0.0/8".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
     let provisioned = provider
         .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
@@ -451,6 +510,7 @@ fn kubernetes_dry_run_rejects_host_allow_rules_for_standard_network_policy() {
                 value: "api.example.com".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
 
     let error = provider
@@ -473,6 +533,7 @@ fn cilium_fqdn_backend_renders_host_allow_rules() {
                 value: "api.example.com".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -536,6 +597,7 @@ fn host_rules_render_a_separate_gateway_and_no_direct_public_egress() {
                 value: "api.example.com".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -664,6 +726,7 @@ fn host_rules_reject_an_unpinned_gateway_image() {
                 value: "api.example.com".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
 
     let error = provider
@@ -1176,6 +1239,7 @@ fn allow_all_egress_carves_out_control_plane_and_dns_ranges() {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::AllowAll,
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -1243,6 +1307,7 @@ fn allowlist_egress_carves_out_control_plane_ranges_contained_within_allowed_cid
                 value: "10.0.0.0/8".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -1287,6 +1352,7 @@ fn allowlist_egress_leaves_disjoint_narrow_cidrs_untouched() {
                 value: "192.168.1.0/24".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -1319,6 +1385,7 @@ fn allowlist_egress_rejects_cidr_fully_covered_by_an_excluded_range() {
                 value: "169.254.169.0/24".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
 
     let err = provider
@@ -1340,6 +1407,7 @@ fn allowlist_egress_rejects_cidr_exactly_equal_to_an_excluded_range() {
                 value: "10.42.0.0/16".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
 
     provider
@@ -1360,6 +1428,7 @@ fn allowlist_egress_carves_out_control_plane_ranges_when_wide_open_cidr_is_allow
                 value: "0.0.0.0/0".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -1391,6 +1460,7 @@ fn ipv6_allowlist_cidr_containing_an_ipv6_excluded_range_carves_it_out() {
                 value: "fd00::/8".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -1426,6 +1496,7 @@ fn ipv6_allow_rule_is_unaffected_by_default_ipv4_excluded_cidrs() {
                 value: "2001:db8::/32".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -1448,6 +1519,7 @@ fn operator_supplied_egress_excluded_cidrs_merge_with_defaults() {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::AllowAll,
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -1479,6 +1551,7 @@ fn with_egress_excluded_cidrs_replace_drops_the_defaults() {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::AllowAll,
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -1503,6 +1576,7 @@ fn deny_all_egress_still_renders_no_egress_rules() {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::DenyAll,
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -1583,6 +1657,7 @@ fn pod_disables_service_account_token_automount_and_sets_ephemeral_storage_limit
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         memory_limit: MemoryLimit::FourG,
         network_egress: NetworkEgress::DenyAll,
+        runtime_profile: Default::default(),
     };
     let provisioned = provider
         .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())

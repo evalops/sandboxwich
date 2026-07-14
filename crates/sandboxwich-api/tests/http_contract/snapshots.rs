@@ -1,6 +1,7 @@
 use crate::common::*;
 use reqwest::StatusCode;
 use sandboxwich_core::*;
+use sqlx::Row;
 
 pub(crate) async fn assert_provision_job_persists_runtime_resources(
     client: &reqwest::Client,
@@ -469,6 +470,7 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("cleanup-me".to_string()),
             template: None,
             memory_limit: None,
@@ -569,6 +571,7 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
         ))
         .json(&CreateSandboxRequest {
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("contract-child".to_string()),
             template: None,
             memory_limit: None,
@@ -822,6 +825,7 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
         ))
         .json(&CreateSandboxRequest {
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("failed-child".to_string()),
             template: None,
             memory_limit: None,
@@ -893,18 +897,24 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .await
         .unwrap();
     assert_eq!(failed.lease.job.status, JobStatus::Failed);
-    let failed_child: SandboxResponse = client
-        .get(format!(
-            "{}/sandboxes/{}",
-            server.base_url, failed_fork.sandbox.id
-        ))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
+    // A permanently failed fork has no placement proof, so the public GET
+    // intentionally fails closed. Verify the durable lifecycle transition
+    // directly instead of weakening the placement-proof contract.
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&server.database_url)
         .await
         .unwrap();
-    assert_eq!(failed_child.sandbox.state, SandboxState::Error);
+    let row = sqlx::query(&format!(
+        "select state from sandboxes where id = {}",
+        crate::types::placeholders(&server.database_url, 1)
+    ))
+    .bind(failed_fork.sandbox.id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let state: String = row.try_get("state").unwrap();
+    assert_eq!(state, SandboxState::Error.as_db_str());
+    pool.close().await;
 }
