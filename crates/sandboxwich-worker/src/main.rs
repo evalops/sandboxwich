@@ -2084,7 +2084,8 @@ fn capabilities_from_args(
         );
     }
 
-    let mut resolved = if capabilities.is_empty() {
+    let uses_default_capabilities = capabilities.is_empty();
+    let mut resolved = if uses_default_capabilities {
         vec![
             WorkerCapability::K8sPod,
             WorkerCapability::ProvisionSandbox,
@@ -2100,7 +2101,10 @@ fn capabilities_from_args(
         IsolationProfile::Gvisor => resolved.push(WorkerCapability::SandboxedContainer),
         IsolationProfile::Kata => resolved.push(WorkerCapability::VirtualMachine),
     }
-    if fqdn_egress_backend && !resolved.contains(&WorkerCapability::FqdnEgress) {
+    if uses_default_capabilities
+        && fqdn_egress_backend
+        && !resolved.contains(&WorkerCapability::FqdnEgress)
+    {
         resolved.push(WorkerCapability::FqdnEgress);
     }
     Ok(resolved)

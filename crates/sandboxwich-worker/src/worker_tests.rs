@@ -741,6 +741,67 @@ fn explicit_registration_capabilities_can_select_fqdn_egress() {
 }
 
 #[test]
+fn capability_derivation_preserves_explicit_fqdn_semantics_across_isolation_profiles() {
+    for (profile, runtime_class_name, isolation_capability) in [
+        (IsolationProfile::Development, None, None),
+        (
+            IsolationProfile::Gvisor,
+            Some("gvisor"),
+            Some(WorkerCapability::SandboxedContainer),
+        ),
+        (
+            IsolationProfile::Kata,
+            Some("kata-qemu"),
+            Some(WorkerCapability::VirtualMachine),
+        ),
+    ] {
+        for fqdn_egress_backend in [false, true] {
+            let defaults = capabilities_from_args(
+                Vec::new(),
+                profile,
+                runtime_class_name,
+                fqdn_egress_backend,
+            )
+            .expect("default capability derivation is valid");
+            assert_eq!(
+                defaults.contains(&WorkerCapability::FqdnEgress),
+                fqdn_egress_backend,
+                "default FQDN capability must track backend availability for {profile:?}"
+            );
+            assert_eq!(
+                defaults
+                    .iter()
+                    .find(|capability| {
+                        matches!(
+                            capability,
+                            WorkerCapability::SandboxedContainer | WorkerCapability::VirtualMachine
+                        )
+                    })
+                    .cloned(),
+                isolation_capability.clone(),
+                "default isolation capability must track the typed profile"
+            );
+
+            let explicit = capabilities_from_args(
+                vec![CapabilityArg::RunCommand],
+                profile,
+                runtime_class_name,
+                fqdn_egress_backend,
+            )
+            .expect("explicit capability derivation is valid");
+            let mut expected = vec![WorkerCapability::RunCommand];
+            if let Some(isolation_capability) = isolation_capability.as_ref() {
+                expected.push(isolation_capability.clone());
+            }
+            assert_eq!(
+                explicit, expected,
+                "an FQDN backend must not broaden an explicit capability list"
+            );
+        }
+    }
+}
+
+#[test]
 fn empty_provider_options_are_normalized_to_absent() {
     assert_eq!(non_empty(None), None);
     assert_eq!(non_empty(Some("   ".to_string())), None);
