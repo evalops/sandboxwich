@@ -1,8 +1,11 @@
 use crate::auth::*;
 use crate::error::*;
 use crate::handlers::commands::insert_event_on_connection;
-use crate::handlers::jobs::insert_job_on_connection;
-use crate::handlers::sandboxes::{fetch_sandbox, set_sandbox_state_on_connection};
+use crate::handlers::jobs::{add_provision_spec_to_payload, insert_job_on_connection};
+use crate::handlers::sandboxes::{
+    fetch_sandbox, fetch_sandbox_on_connection, hydrate_sandbox_network_egress_on_connection,
+    set_sandbox_state_on_connection,
+};
 use crate::state::*;
 use axum::Json;
 use axum::extract::{Extension, Path, State};
@@ -353,7 +356,10 @@ async fn request_divergence_stop_on_connection(
     finding: &DivergenceFinding,
 ) -> Result<(), ApiError> {
     let now = Utc::now();
-    let job = Job {
+    let mut sandbox =
+        fetch_sandbox_on_connection(&state.db, connection, finding.sandbox_id).await?;
+    hydrate_sandbox_network_egress_on_connection(&state.db, connection, &mut sandbox).await?;
+    let mut job = Job {
         id: JobId::new(),
         tenant_id: ctx.tenant_id.clone(),
         kind: JobKind::StopSandbox,
@@ -368,6 +374,7 @@ async fn request_divergence_stop_on_connection(
         updated_at: now,
         last_error: None,
     };
+    add_provision_spec_to_payload(&mut job, &sandbox)?;
     set_sandbox_state_on_connection(
         &state.db,
         connection,

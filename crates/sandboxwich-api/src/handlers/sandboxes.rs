@@ -45,11 +45,11 @@ pub(crate) fn provision_spec_from_request(
         .or_else(|| parent.map(|sandbox| sandbox.runtime_profile.clone()))
         .unwrap_or_default();
     validate_network_egress(&network_egress)?;
-    validate_runtime_profile(
-        &runtime_profile,
-        &network_egress,
-        request.template.as_deref(),
-    )?;
+    let effective_template = request
+        .template
+        .as_deref()
+        .or_else(|| parent.map(|sandbox| sandbox.template.as_str()));
+    validate_runtime_profile(&runtime_profile, &network_egress, effective_template)?;
     Ok(SandboxProvisionSpec {
         memory_limit,
         network_egress,
@@ -208,7 +208,7 @@ pub(crate) async fn create_sandbox(
         parent_snapshot_id: None,
     };
 
-    let job = Job {
+    let mut job = Job {
         id: JobId::new(),
         tenant_id: sandbox.tenant_id.clone(),
         kind: JobKind::ProvisionSandbox,
@@ -226,6 +226,7 @@ pub(crate) async fn create_sandbox(
         updated_at: now,
         last_error: None,
     };
+    add_provision_spec_to_payload(&mut job, &sandbox)?;
     let mut tx = state.db.pool.begin().await?;
     insert_sandbox_on_connection(&state.db, &mut tx, &sandbox).await?;
     replace_sandbox_network_rules_on_connection(
@@ -407,7 +408,7 @@ pub(crate) async fn stop_sandbox(
                 && resource.resource_name == format!("sandboxwich-fqdn-egress-{sandbox_id}")
         });
     let now = Utc::now();
-    let job = Job {
+    let mut job = Job {
         id: JobId::new(),
         tenant_id: sandbox.tenant_id.clone(),
         kind: JobKind::StopSandbox,
@@ -425,6 +426,7 @@ pub(crate) async fn stop_sandbox(
         updated_at: now,
         last_error: None,
     };
+    add_provision_spec_to_payload(&mut job, &sandbox)?;
     let mut tx = state.db.pool.begin().await?;
     set_sandbox_state_on_connection(
         &state.db,
@@ -504,6 +506,13 @@ pub(crate) async fn fork_sandbox(
         provider_metadata: json!({
             "source": "fork_request"
         }),
+        runtime_image: parent.template.clone(),
+        provision_spec: SandboxProvisionSpec {
+            memory_limit: parent.memory_limit.clone(),
+            network_egress: parent.network_egress.clone(),
+            workspace_mode: parent.workspace_mode.clone(),
+            runtime_profile: parent.runtime_profile.clone(),
+        },
         created_at: now,
         ready_at: None,
         expires_at: None,

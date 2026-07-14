@@ -493,6 +493,7 @@ async fn main() -> anyhow::Result<()> {
                     ok: true,
                     sandbox,
                     operation: None,
+                    placement: None,
                 })?;
             } else {
                 print_value(&created)?;

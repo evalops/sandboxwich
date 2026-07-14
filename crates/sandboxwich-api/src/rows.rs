@@ -153,6 +153,13 @@ pub(crate) fn row_to_snapshot(row: AnyRow) -> Result<Snapshot, ApiError> {
         label: row.try_get("label")?,
         inventory: serde_json::from_str(&inventory)?,
         provider_metadata: serde_json::from_str(&provider_metadata)?,
+        runtime_image: row
+            .try_get::<Option<String>, _>("runtime_image")?
+            .ok_or_else(|| ApiError::internal("snapshot placement metadata is missing"))?,
+        provision_spec: serde_json::from_str(
+            &row.try_get::<Option<String>, _>("provision_spec")?
+                .ok_or_else(|| ApiError::internal("snapshot placement metadata is missing"))?,
+        )?,
         created_at: parse_timestamp(&created_at)?,
         ready_at: ready_at.map(|time| parse_timestamp(&time)).transpose()?,
         expires_at: expires_at.map(|time| parse_timestamp(&time)).transpose()?,

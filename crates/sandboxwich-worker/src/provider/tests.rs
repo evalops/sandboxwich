@@ -1,5 +1,5 @@
 use super::*;
-use sandboxwich_core::MAX_COMMAND_STDIN_BYTES;
+use sandboxwich_core::{MAX_COMMAND_STDIN_BYTES, NetworkAllowRule};
 
 #[tokio::test]
 async fn run_kubectl_command_async_succeeds_within_timeout() {
@@ -306,6 +306,32 @@ fn apex_trusted_supervisor_profile_is_closed_and_minimally_privileged() {
             .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
             .is_err()
     );
+
+    for network_egress in [
+        NetworkEgress::AllowAll,
+        NetworkEgress::Allowlist {
+            rules: vec![NetworkAllowRule {
+                kind: NetworkAllowRuleKind::Cidr,
+                value: "not-a-cidr".to_string(),
+            }],
+        },
+    ] {
+        let rejected = SandboxProvisionSpec {
+            runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
+            network_egress,
+            ..SandboxProvisionSpec::default()
+        };
+        assert!(
+            configured
+                .provision(
+                    SandboxId::new(),
+                    &rejected,
+                    &CancelSignal::never_cancelled()
+                )
+                .is_err(),
+            "provider must independently reject unsafe APEX egress"
+        );
+    }
 }
 
 #[test]

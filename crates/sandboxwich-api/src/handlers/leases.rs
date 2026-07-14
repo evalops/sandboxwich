@@ -216,16 +216,47 @@ pub(crate) async fn claim_lease(
 }
 
 pub(crate) fn worker_supports_runtime_profile(worker: &Worker, job: &Job) -> bool {
-    let profile = job.payload["provisionSpec"]["runtime_profile"].as_str();
-    if profile != Some(SandboxRuntimeProfile::ApexTrustedSupervisorV1.as_db_str()) {
+    let Some(spec_object) = job
+        .payload
+        .get("provisionSpec")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    if [
+        "memory_limit",
+        "network_egress",
+        "workspace_mode",
+        "runtime_profile",
+    ]
+    .iter()
+    .any(|field| !spec_object.contains_key(*field))
+    {
+        return false;
+    }
+    let Ok(spec) = serde_json::from_value::<SandboxProvisionSpec>(
+        job.payload
+            .get("provisionSpec")
+            .cloned()
+            .unwrap_or_default(),
+    ) else {
+        return false;
+    };
+    let Some(requested_image) = job
+        .payload
+        .get("runtimeImage")
+        .and_then(serde_json::Value::as_str)
+        .filter(|image| !image.is_empty())
+    else {
+        return false;
+    };
+    if spec.runtime_profile != SandboxRuntimeProfile::ApexTrustedSupervisorV1 {
         return true;
     }
-    let requested_image = job.payload["runtimeImage"].as_str();
     worker
         .capabilities
         .contains(&WorkerCapability::ApexTrustedSupervisorV1)
-        && requested_image.is_some()
-        && worker.labels.get("runtime_image").map(String::as_str) == requested_image
+        && worker.labels.get("runtime_image").map(String::as_str) == Some(requested_image)
 }
 
 pub(crate) async fn fetch_lease_materialization(

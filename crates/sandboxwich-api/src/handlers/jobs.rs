@@ -160,7 +160,13 @@ pub(crate) async fn enrich_job_payload_with_provision_spec(
     job: &mut Job,
 ) -> Result<(), ApiError> {
     match job.kind {
-        JobKind::ProvisionSandbox | JobKind::RunCommand | JobKind::MaterializeFile => {
+        JobKind::ProvisionSandbox
+        | JobKind::RunCommand
+        | JobKind::RunPrompt
+        | JobKind::CreateSnapshot
+        | JobKind::StopSandbox
+        | JobKind::ResumeSandbox
+        | JobKind::MaterializeFile => {
             let sandbox = fetch_sandbox(db, sandbox_id_from_job(job)?).await?;
             add_provision_spec_to_payload(job, &sandbox)?;
         }
@@ -168,10 +174,6 @@ pub(crate) async fn enrich_job_payload_with_provision_spec(
             let child = fetch_sandbox(db, child_sandbox_id_from_job(job)?).await?;
             add_provision_spec_to_payload(job, &child)?;
         }
-        JobKind::RunPrompt
-        | JobKind::CreateSnapshot
-        | JobKind::StopSandbox
-        | JobKind::ResumeSandbox => {}
     }
     Ok(())
 }
@@ -187,17 +189,15 @@ pub(crate) fn add_provision_spec_to_payload(
     // image selector. Profile-bound jobs must stay on the exact worker image
     // that owns the sandbox placement.
     payload.insert("runtimeImage".to_string(), json!(sandbox.template));
-    if !payload.contains_key("provisionSpec") {
-        payload.insert(
-            "provisionSpec".to_string(),
-            serde_json::to_value(SandboxProvisionSpec {
-                memory_limit: sandbox.memory_limit.clone(),
-                network_egress: sandbox.network_egress.clone(),
-                workspace_mode: sandbox.workspace_mode.clone(),
-                runtime_profile: sandbox.runtime_profile.clone(),
-            })?,
-        );
-    }
+    payload.insert(
+        "provisionSpec".to_string(),
+        serde_json::to_value(SandboxProvisionSpec {
+            memory_limit: sandbox.memory_limit.clone(),
+            network_egress: sandbox.network_egress.clone(),
+            workspace_mode: sandbox.workspace_mode.clone(),
+            runtime_profile: sandbox.runtime_profile.clone(),
+        })?,
+    );
     Ok(())
 }
 

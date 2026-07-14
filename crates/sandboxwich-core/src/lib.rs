@@ -844,7 +844,7 @@ impl NetworkEgress {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default, utoipa::ToSchema)]
 pub struct SandboxProvisionSpec {
     #[serde(default)]
     pub memory_limit: MemoryLimit,
@@ -1174,6 +1174,8 @@ pub struct Snapshot {
     pub label: String,
     pub inventory: serde_json::Value,
     pub provider_metadata: serde_json::Value,
+    pub runtime_image: String,
+    pub provision_spec: SandboxProvisionSpec,
     pub created_at: DateTime<Utc>,
     pub ready_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,

@@ -49,6 +49,59 @@ fn materialization_job_input_is_ref_only_and_exact() {
 }
 
 #[test]
+fn authoritative_job_enrichment_overwrites_caller_placement_metadata() {
+    let now = Utc::now();
+    let sandbox = Sandbox {
+        id: SandboxId::new(),
+        tenant_id: "tenant".to_string(),
+        name: "apex".to_string(),
+        state: SandboxState::Ready,
+        template: format!("ghcr.io/evalops/apex@sha256:{}", "a".repeat(64)),
+        memory_limit: MemoryLimit::FourG,
+        network_egress: NetworkEgress::DenyAll,
+        workspace_mode: WorkspaceMode::Persistent,
+        runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
+        created_at: now,
+        updated_at: now,
+        ttl_seconds: None,
+        parent_snapshot_id: None,
+    };
+    let mut job = Job {
+        id: JobId::new(),
+        tenant_id: sandbox.tenant_id.clone(),
+        kind: JobKind::RunCommand,
+        status: JobStatus::Queued,
+        payload: json!({
+            "sandboxId": sandbox.id,
+            "runtimeImage": "attacker:latest",
+            "provisionSpec": SandboxProvisionSpec::default()
+        }),
+        required_capability: WorkerCapability::RunCommand,
+        priority: 0,
+        attempts: 0,
+        max_attempts: 1,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+    };
+
+    add_provision_spec_to_payload(&mut job, &sandbox).expect("enrich job");
+
+    assert_eq!(job.payload["runtimeImage"], json!(sandbox.template));
+    assert_eq!(
+        serde_json::from_value::<SandboxProvisionSpec>(job.payload["provisionSpec"].clone())
+            .expect("provision spec"),
+        SandboxProvisionSpec {
+            memory_limit: sandbox.memory_limit,
+            network_egress: sandbox.network_egress,
+            workspace_mode: sandbox.workspace_mode,
+            runtime_profile: sandbox.runtime_profile,
+        }
+    );
+}
+
+#[test]
 fn apex_runtime_profile_requires_pinned_image_and_deny_by_default_egress() {
     let pinned = format!("ghcr.io/evalops/apex@sha256:{}", "a".repeat(64));
     let request = |template: &str, network_egress| CreateSandboxRequest {
@@ -84,6 +137,32 @@ fn apex_runtime_profile_requires_pinned_image_and_deny_by_default_egress() {
         .is_err()
     );
     assert!(provision_spec_from_request(&request(&pinned, NetworkEgress::AllowAll), None).is_err());
+    let now = Utc::now();
+    let parent = Sandbox {
+        id: SandboxId::new(),
+        tenant_id: "tenant".to_string(),
+        name: "parent".to_string(),
+        state: SandboxState::Ready,
+        template: pinned,
+        memory_limit: MemoryLimit::FourG,
+        network_egress: NetworkEgress::DenyAll,
+        workspace_mode: WorkspaceMode::Persistent,
+        runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
+        created_at: now,
+        updated_at: now,
+        ttl_seconds: None,
+        parent_snapshot_id: None,
+    };
+    let inherited = CreateSandboxRequest {
+        name: None,
+        template: None,
+        memory_limit: None,
+        network_egress: None,
+        workspace_mode: None,
+        runtime_profile: None,
+        ttl_seconds: None,
+    };
+    assert!(provision_spec_from_request(&inherited, Some(&parent)).is_ok());
 }
 
 #[test]
@@ -98,7 +177,12 @@ fn apex_profile_bound_jobs_only_match_the_exact_profile_worker_image() {
         payload: json!({
             "sandboxId": SandboxId::new(),
             "runtimeImage": requested_image,
-            "provisionSpec": { "runtime_profile": "apex_trusted_supervisor_v1" }
+            "provisionSpec": SandboxProvisionSpec {
+                memory_limit: MemoryLimit::FourG,
+                network_egress: NetworkEgress::DenyAll,
+                workspace_mode: WorkspaceMode::Persistent,
+                runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
+            }
         }),
         required_capability: WorkerCapability::MaterializeFile,
         priority: 0,
@@ -174,6 +258,26 @@ fn apex_profile_bound_jobs_only_match_the_exact_profile_worker_image() {
         ),
         &run_command,
     ));
+    for payload in [
+        json!({"sandboxId": SandboxId::new()}),
+        json!({"sandboxId": SandboxId::new(), "runtimeImage": requested_image, "provisionSpec": {"runtime_profile": "apex_trusted_supervisor_v1"}}),
+        json!({"sandboxId": SandboxId::new(), "runtimeImage": requested_image, "provisionSpec": {"runtime_profile": "unknown"}}),
+    ] {
+        let malformed = Job {
+            payload,
+            ..run_command.clone()
+        };
+        assert!(!worker_supports_runtime_profile(
+            &worker(
+                vec![
+                    WorkerCapability::RunCommand,
+                    WorkerCapability::ApexTrustedSupervisorV1,
+                ],
+                run_command.payload["runtimeImage"].as_str().unwrap(),
+            ),
+            &malformed,
+        ));
+    }
 }
 
 #[tokio::test]
@@ -1303,6 +1407,13 @@ async fn snapshot_restore_claim_rejects_expired_ready_source() {
         label: "expired-restore-source".to_string(),
         inventory: json!({}),
         provider_metadata: json!({}),
+        runtime_image: sandbox.template.clone(),
+        provision_spec: SandboxProvisionSpec {
+            memory_limit: sandbox.memory_limit.clone(),
+            network_egress: sandbox.network_egress.clone(),
+            workspace_mode: sandbox.workspace_mode.clone(),
+            runtime_profile: sandbox.runtime_profile.clone(),
+        },
         created_at: now,
         ready_at: Some(now),
         expires_at: Some(now - chrono::Duration::seconds(1)),
@@ -1327,6 +1438,83 @@ async fn snapshot_restore_claim_rejects_expired_ready_source() {
     .expect_err("expired ready snapshot must not be restorable");
 
     assert_eq!(error.status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn snapshot_restore_claim_retains_authoritative_placement_after_source_deletion() {
+    let db = test_sqlite_db().await;
+    let mut sandbox = seed_sandbox_with_state(&db, SandboxState::Ready).await;
+    sandbox.template = format!("ghcr.io/evalops/apex@sha256:{}", "b".repeat(64));
+    sandbox.memory_limit = MemoryLimit::FourG;
+    sandbox.network_egress = NetworkEgress::DenyAll;
+    sandbox.workspace_mode = WorkspaceMode::Persistent;
+    sandbox.runtime_profile = SandboxRuntimeProfile::ApexTrustedSupervisorV1;
+    let sql = format!(
+        "update sandboxes set template = {}, memory_limit = {}, runtime_profile = {} where id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4)
+    );
+    sqlx::query(&sql)
+        .bind(&sandbox.template)
+        .bind("4g")
+        .bind("apex_trusted_supervisor_v1")
+        .bind(sandbox.id.to_string())
+        .execute(&db.pool)
+        .await
+        .expect("persist source placement");
+    let now = Utc::now();
+    let expected_spec = SandboxProvisionSpec {
+        memory_limit: sandbox.memory_limit.clone(),
+        network_egress: sandbox.network_egress.clone(),
+        workspace_mode: sandbox.workspace_mode.clone(),
+        runtime_profile: sandbox.runtime_profile.clone(),
+    };
+    let snapshot = Snapshot {
+        id: SnapshotId::new(),
+        sandbox_id: sandbox.id,
+        status: SnapshotStatus::Ready,
+        label: "durable-placement".to_string(),
+        inventory: json!({}),
+        provider_metadata: json!({}),
+        runtime_image: sandbox.template.clone(),
+        provision_spec: expected_spec.clone(),
+        created_at: now,
+        ready_at: Some(now),
+        expires_at: None,
+        error: None,
+    };
+    let mut connection = db.pool.acquire().await.expect("acquire connection");
+    insert_snapshot_on_connection(&db, &mut connection, &snapshot)
+        .await
+        .expect("insert snapshot");
+    sqlx::query("delete from snapshots where id = ?")
+        .bind(snapshot.id.to_string())
+        .execute(&mut *connection)
+        .await
+        .expect("delete tenant-facing snapshot row");
+    sqlx::query("delete from sandboxes where id = ?")
+        .bind(sandbox.id.to_string())
+        .execute(&mut *connection)
+        .await
+        .expect("delete source sandbox");
+
+    let restored = claim_snapshot_restore_source_on_connection(
+        &db,
+        &mut connection,
+        snapshot.id,
+        &TenantContext {
+            tenant_id: sandbox.tenant_id,
+            principal: Principal::Tenant,
+        },
+        now,
+    )
+    .await
+    .expect("retained restore source");
+
+    assert_eq!(restored.runtime_image, snapshot.runtime_image);
+    assert_eq!(restored.provision_spec, expected_spec);
 }
 
 #[tokio::test]

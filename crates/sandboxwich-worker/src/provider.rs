@@ -381,10 +381,15 @@ impl KubernetesDryRunProvider {
     }
 
     fn validate_runtime_profile(&self, spec: &SandboxProvisionSpec) -> anyhow::Result<()> {
+        self.validate_network_policy_egress(&spec.network_egress)?;
         if spec.runtime_profile == SandboxRuntimeProfile::ApexTrustedSupervisorV1 {
             anyhow::ensure!(
                 self.apex_trusted_supervisor_v1 && image_is_digest_pinned(&self.runtime_image),
                 "apex_trusted_supervisor_v1 is not configured for this digest-pinned runtime"
+            );
+            anyhow::ensure!(
+                !matches!(spec.network_egress, NetworkEgress::AllowAll),
+                "apex_trusted_supervisor_v1 requires deny-by-default egress"
             );
         }
         Ok(())

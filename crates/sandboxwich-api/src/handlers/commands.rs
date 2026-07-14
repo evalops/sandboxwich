@@ -98,9 +98,9 @@ pub(crate) async fn queue_command(
         finished_at: None,
     };
 
-    let job = Job {
+    let mut job = Job {
         id: JobId::new(),
-        tenant_id: sandbox.tenant_id,
+        tenant_id: sandbox.tenant_id.clone(),
         kind: JobKind::RunCommand,
         status: JobStatus::Queued,
         payload: json!({
@@ -127,6 +127,7 @@ pub(crate) async fn queue_command(
         updated_at: now,
         last_error: None,
     };
+    add_provision_spec_to_payload(&mut job, &sandbox)?;
 
     let mut tx = state.db.pool.begin().await?;
     insert_command_on_connection(&state.db, &mut tx, &command).await?;

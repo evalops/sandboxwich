@@ -2,6 +2,218 @@ use crate::common::*;
 use sandboxwich_core::*;
 
 #[tokio::test]
+pub(crate) async fn apex_command_claim_requires_exact_profile_and_runtime_image() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("apex-command-claim.db").display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let client = server.client();
+    let runtime_image = format!("ghcr.io/evalops/apex@sha256:{}", "a".repeat(64));
+    let created: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("apex-command".to_string()),
+            template: Some(runtime_image.clone()),
+            memory_limit: Some(MemoryLimit::FourG),
+            network_egress: Some(NetworkEgress::DenyAll),
+            workspace_mode: Some(WorkspaceMode::Persistent),
+            runtime_profile: Some(SandboxRuntimeProfile::ApexTrustedSupervisorV1),
+            ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let exact: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "exact-apex-command".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![
+                WorkerCapability::ProvisionSandbox,
+                WorkerCapability::RunCommand,
+                WorkerCapability::ApexTrustedSupervisorV1,
+            ],
+            max_concurrent_jobs: Some(1),
+            labels: [("runtime_image".to_string(), runtime_image.clone())].into(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let provision: ClaimLeaseResponse = worker_client(&exact)
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, exact.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(created.sandbox.id),
+            kinds: Some(vec![JobKind::ProvisionSandbox]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let provision = provision.lease.expect("exact APEX worker claims provision");
+    let mut resources = provision_resources(created.sandbox.id);
+    for resource in &mut resources {
+        resource.runtime_image = Some(runtime_image.clone());
+    }
+    worker_client(&exact)
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, provision.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::ProvisionSandbox {
+                handle: ProviderSandboxHandle {
+                    provider: "kubernetes".to_string(),
+                    sandbox_id: created.sandbox.id,
+                    resources,
+                    metadata: serde_json::json!({}),
+                },
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    client
+        .post(format!(
+            "{}/sandboxes/{}/commands",
+            server.base_url, created.sandbox.id
+        ))
+        .json(&CommandRequest {
+            argv: vec!["true".to_string()],
+            cwd: None,
+            env: Default::default(),
+            stdin: None,
+            timeout_secs: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let wrong: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "wrong-apex-command".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![
+                WorkerCapability::RunCommand,
+                WorkerCapability::ApexTrustedSupervisorV1,
+            ],
+            max_concurrent_jobs: Some(1),
+            labels: [(
+                "runtime_image".to_string(),
+                format!("wrong@sha256:{}", "c".repeat(64)),
+            )]
+            .into(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let wrong_claim: ClaimLeaseResponse = worker_client(&wrong)
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, wrong.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(created.sandbox.id),
+            kinds: Some(vec![JobKind::RunCommand]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(wrong_claim.lease.is_none());
+
+    assert!(
+        exact
+            .worker
+            .capabilities
+            .contains(&WorkerCapability::ApexTrustedSupervisorV1)
+    );
+    let jobs: JobListResponse = client
+        .get(format!("{}/jobs", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let command_job = jobs
+        .jobs
+        .iter()
+        .find(|job| job.kind == JobKind::RunCommand)
+        .unwrap();
+    assert_eq!(
+        command_job.payload["provisionSpec"]["runtime_profile"],
+        serde_json::json!("apex_trusted_supervisor_v1")
+    );
+    assert_eq!(
+        command_job.payload["runtimeImage"],
+        serde_json::json!(runtime_image)
+    );
+    let exact_claim: ClaimLeaseResponse = worker_client(&exact)
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, exact.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(created.sandbox.id),
+            kinds: Some(vec![JobKind::RunCommand]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = exact_claim.lease.expect("exact APEX worker claims command");
+    assert_eq!(
+        lease.job.payload["runtimeImage"],
+        serde_json::json!(runtime_image)
+    );
+}
+
+#[tokio::test]
 pub(crate) async fn command_stdin_is_redacted_from_tenant_jobs_but_preserved_for_worker_dispatch() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!(
@@ -206,6 +418,14 @@ pub(crate) async fn command_stdin_is_redacted_from_tenant_jobs_but_preserved_for
     let lease = claim
         .lease
         .expect("worker should receive a command dispatch");
+    assert_eq!(
+        lease.job.payload["runtimeImage"],
+        serde_json::json!(created.sandbox.template)
+    );
+    assert_eq!(
+        lease.job.payload["provisionSpec"]["runtime_profile"],
+        serde_json::json!(created.sandbox.runtime_profile)
+    );
     assert_eq!(lease.job.payload["stdin"], encoded);
     let dispatched: AgentCommandRequest = serde_json::from_value(serde_json::json!({
         "argv": lease.job.payload["argv"],

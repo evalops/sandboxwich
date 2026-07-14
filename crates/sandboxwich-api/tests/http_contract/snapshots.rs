@@ -1,6 +1,183 @@
 use crate::common::*;
 use reqwest::StatusCode;
 use sandboxwich_core::*;
+
+#[tokio::test]
+pub(crate) async fn apex_snapshot_claim_requires_exact_profile_and_runtime_image() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("apex-snapshot-claim.db").display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let client = server.client();
+    let runtime_image = format!("ghcr.io/evalops/apex@sha256:{}", "d".repeat(64));
+    let created: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("apex-snapshot".to_string()),
+            template: Some(runtime_image.clone()),
+            memory_limit: Some(MemoryLimit::FourG),
+            network_egress: Some(NetworkEgress::DenyAll),
+            workspace_mode: Some(WorkspaceMode::Persistent),
+            runtime_profile: Some(SandboxRuntimeProfile::ApexTrustedSupervisorV1),
+            ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let exact: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "exact-apex-snapshot".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![
+                WorkerCapability::ProvisionSandbox,
+                WorkerCapability::Snapshot,
+                WorkerCapability::ApexTrustedSupervisorV1,
+            ],
+            max_concurrent_jobs: Some(1),
+            labels: [("runtime_image".to_string(), runtime_image.clone())].into(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let provision: ClaimLeaseResponse = worker_client(&exact)
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, exact.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(created.sandbox.id),
+            kinds: Some(vec![JobKind::ProvisionSandbox]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let provision = provision.lease.expect("exact APEX worker claims provision");
+    let mut resources = provision_resources(created.sandbox.id);
+    for resource in &mut resources {
+        resource.runtime_image = Some(runtime_image.clone());
+    }
+    worker_client(&exact)
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, provision.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::ProvisionSandbox {
+                handle: ProviderSandboxHandle {
+                    provider: "kubernetes".to_string(),
+                    sandbox_id: created.sandbox.id,
+                    resources,
+                    metadata: serde_json::json!({}),
+                },
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    client
+        .post(format!(
+            "{}/sandboxes/{}/snapshots",
+            server.base_url, created.sandbox.id
+        ))
+        .json(&CreateSnapshotRequest {
+            label: Some("apex".to_string()),
+            inventory: None,
+            provider_metadata: None,
+            ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let wrong: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "generic-snapshot".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![WorkerCapability::Snapshot],
+            max_concurrent_jobs: Some(1),
+            labels: [("runtime_image".to_string(), runtime_image.clone())].into(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let wrong_claim: ClaimLeaseResponse = worker_client(&wrong)
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, wrong.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(created.sandbox.id),
+            kinds: Some(vec![JobKind::CreateSnapshot]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(wrong_claim.lease.is_none());
+
+    let exact_claim: ClaimLeaseResponse = worker_client(&exact)
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, exact.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(created.sandbox.id),
+            kinds: Some(vec![JobKind::CreateSnapshot]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = exact_claim
+        .lease
+        .expect("exact APEX worker claims snapshot");
+    assert_eq!(
+        lease.job.payload["runtimeImage"],
+        serde_json::json!(runtime_image)
+    );
+}
 use sqlx::Row;
 
 pub(crate) async fn assert_provision_job_persists_runtime_resources(
@@ -336,6 +513,14 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .lease
         .expect("expected snapshot worker to claim manual snapshot job");
     assert_eq!(snapshot_lease.job.kind, JobKind::CreateSnapshot);
+    assert_eq!(
+        snapshot_lease.job.payload["runtimeImage"],
+        serde_json::json!(sandbox.sandbox.template)
+    );
+    assert_eq!(
+        snapshot_lease.job.payload["provisionSpec"]["runtime_profile"],
+        serde_json::json!(sandbox.sandbox.runtime_profile)
+    );
     let snapshot_id = snapshot.snapshot.id.to_string();
     assert_eq!(
         snapshot_lease
