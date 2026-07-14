@@ -118,6 +118,20 @@ async fn workers_claim_only_jobs_matching_functional_and_execution_requirements(
         ],
     )
     .await;
+    let sandboxed_only = register_execution_worker(
+        &client,
+        &server,
+        "execution-sandboxed-only",
+        vec![WorkerCapability::SandboxedContainer],
+    )
+    .await;
+    let vm_only = register_execution_worker(
+        &client,
+        &server,
+        "execution-vm-only",
+        vec![WorkerCapability::VirtualMachine],
+    )
+    .await;
 
     let development_sandbox = create_execution_sandbox(
         &client,
@@ -127,6 +141,18 @@ async fn workers_claim_only_jobs_matching_functional_and_execution_requirements(
         None,
     )
     .await;
+    assert!(
+        claim_execution_job(&server, &sandboxed_only, development_sandbox.sandbox.id)
+            .await
+            .is_none(),
+        "sandboxed execution support must not replace the ProvisionSandbox functional capability"
+    );
+    assert!(
+        claim_execution_job(&server, &vm_only, development_sandbox.sandbox.id)
+            .await
+            .is_none(),
+        "VM execution support must not replace the ProvisionSandbox functional capability"
+    );
     assert!(
         claim_execution_job(&server, &development, development_sandbox.sandbox.id)
             .await
@@ -175,13 +201,6 @@ async fn workers_claim_only_jobs_matching_functional_and_execution_requirements(
         ExecutionClass::VirtualMachine
     );
 
-    let vm_only = register_execution_worker(
-        &client,
-        &server,
-        "execution-vm-only",
-        vec![WorkerCapability::VirtualMachine],
-    )
-    .await;
     let fqdn_only = register_execution_worker(
         &client,
         &server,
