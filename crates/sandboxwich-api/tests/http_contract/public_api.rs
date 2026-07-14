@@ -96,6 +96,7 @@ async fn openapi_covers_every_public_v1_operation() {
         ),
         ("POST", "/v1/workers/{worker_id}/leases/claim"),
         ("POST", "/v1/leases/{lease_id}/renew"),
+        ("GET", "/v1/leases/{lease_id}/materialization"),
         ("POST", "/v1/leases/{lease_id}/output"),
         ("POST", "/v1/leases/{lease_id}/complete"),
         ("POST", "/v1/leases/{lease_id}/fail"),
@@ -129,6 +130,7 @@ async fn v1_contract_exposes_operations_openapi_request_ids_and_honest_prompt_st
     let docs: serde_json::Value = docs.json().await.unwrap();
     assert_eq!(docs["info"]["version"], "1.0.0");
     assert!(docs["paths"]["/v1/operations/{operation_id}"].is_object());
+    assert!(docs["paths"]["/v1/leases/{lease_id}/materialization"]["get"].is_object());
     assert!(docs["components"]["schemas"]["Operation"].is_object());
 
     let malformed = client
