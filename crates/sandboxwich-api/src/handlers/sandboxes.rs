@@ -506,13 +506,13 @@ pub(crate) async fn fork_sandbox(
         provider_metadata: json!({
             "source": "fork_request"
         }),
-        runtime_image: parent.template.clone(),
-        provision_spec: SandboxProvisionSpec {
+        runtime_image: Some(parent.template.clone()),
+        provision_spec: Some(SandboxProvisionSpec {
             memory_limit: parent.memory_limit.clone(),
             network_egress: parent.network_egress.clone(),
             workspace_mode: parent.workspace_mode.clone(),
             runtime_profile: parent.runtime_profile.clone(),
-        },
+        }),
         created_at: now,
         ready_at: None,
         expires_at: None,

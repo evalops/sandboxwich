@@ -3,6 +3,167 @@ use reqwest::StatusCode;
 use sandboxwich_core::*;
 
 #[tokio::test]
+pub(crate) async fn legacy_snapshot_reads_and_expiry_survive_missing_placement_but_restore_fails_closed()
+ {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir
+                .path()
+                .join("legacy-snapshot-placement.db")
+                .display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let client = server.client();
+    let created: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("legacy-snapshot".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            workspace_mode: Some(WorkspaceMode::Persistent),
+            runtime_profile: None,
+            ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let snapshot: SnapshotResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/snapshots",
+            server.base_url, created.sandbox.id
+        ))
+        .json(&CreateSnapshotRequest {
+            label: Some("legacy".to_string()),
+            inventory: None,
+            provider_metadata: None,
+            ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .connect(&server.database_url)
+        .await
+        .unwrap();
+    sqlx::query(
+        "update snapshots
+         set status = 'ready', runtime_image = null, provision_spec = null
+         where id = ?",
+    )
+    .bind(snapshot.snapshot.id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "update snapshot_restore_sources
+         set status = 'ready', runtime_image = null, provision_spec = null
+         where snapshot_id = ?",
+    )
+    .bind(snapshot.snapshot.id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let fetched: SnapshotResponse = client
+        .get(format!(
+            "{}/snapshots/{}",
+            server.base_url, snapshot.snapshot.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(fetched.snapshot.runtime_image.is_none());
+    assert!(fetched.snapshot.provision_spec.is_none());
+    let listed: SnapshotListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/snapshots",
+            server.base_url, created.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed.snapshots.len(), 1);
+    assert!(listed.snapshots[0].runtime_image.is_none());
+
+    let restore = client
+        .post(format!(
+            "{}/snapshots/{}/fork",
+            server.base_url, snapshot.snapshot.id
+        ))
+        .json(&ForkSnapshotRequest {
+            name: Some("must-not-restore".to_string()),
+            template: created.sandbox.template.clone(),
+            memory_limit: created.sandbox.memory_limit.clone(),
+            network_egress: created.sandbox.network_egress.clone(),
+            runtime_profile: created.sandbox.runtime_profile.clone(),
+            ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        restore.json::<ErrorEnvelope>().await.unwrap().code,
+        "snapshot_placement_unavailable"
+    );
+
+    sqlx::query("update snapshots set expires_at = ? where id = ?")
+        .bind((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339())
+        .bind(snapshot.snapshot.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    client
+        .post(format!("{}/snapshots/cleanup", server.base_url))
+        .header(OPERATOR_TOKEN_HEADER, TEST_OPERATOR_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let expired: SnapshotResponse = client
+        .get(format!(
+            "{}/snapshots/{}",
+            server.base_url, snapshot.snapshot.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(expired.snapshot.status, SnapshotStatus::Expired);
+}
+
+#[tokio::test]
 pub(crate) async fn apex_snapshot_claim_requires_exact_profile_and_runtime_image() {
     let data_dir = tempfile::tempdir().unwrap();
     let server = TestServer::start(

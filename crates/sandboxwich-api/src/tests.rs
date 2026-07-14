@@ -166,6 +166,42 @@ fn apex_runtime_profile_requires_pinned_image_and_deny_by_default_egress() {
 }
 
 #[test]
+fn snapshot_fork_request_rejects_placement_mismatches() {
+    let image = format!("ghcr.io/evalops/apex@sha256:{}", "e".repeat(64));
+    let source = SnapshotRestoreSource {
+        source_sandbox_id: SandboxId::new(),
+        runtime_image: image.clone(),
+        provision_spec: SandboxProvisionSpec {
+            memory_limit: MemoryLimit::FourG,
+            network_egress: NetworkEgress::DenyAll,
+            workspace_mode: WorkspaceMode::Persistent,
+            runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
+        },
+    };
+    let matching = ForkSnapshotRequest {
+        name: None,
+        template: image,
+        memory_limit: MemoryLimit::FourG,
+        network_egress: NetworkEgress::DenyAll,
+        runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
+        ttl_seconds: None,
+    };
+    validate_snapshot_fork_request(&matching, &source).expect("matching placement");
+    let mut mismatch = matching.clone();
+    mismatch.template = "attacker:latest".to_string();
+    assert!(validate_snapshot_fork_request(&mismatch, &source).is_err());
+    let mut mismatch = matching.clone();
+    mismatch.memory_limit = MemoryLimit::OneG;
+    assert!(validate_snapshot_fork_request(&mismatch, &source).is_err());
+    let mut mismatch = matching.clone();
+    mismatch.network_egress = NetworkEgress::AllowAll;
+    assert!(validate_snapshot_fork_request(&mismatch, &source).is_err());
+    let mut mismatch = matching;
+    mismatch.runtime_profile = SandboxRuntimeProfile::Unprivileged;
+    assert!(validate_snapshot_fork_request(&mismatch, &source).is_err());
+}
+
+#[test]
 fn apex_profile_bound_jobs_only_match_the_exact_profile_worker_image() {
     let now = Utc::now();
     let requested_image = format!("ghcr.io/evalops/apex@sha256:{}", "a".repeat(64));
@@ -1407,13 +1443,13 @@ async fn snapshot_restore_claim_rejects_expired_ready_source() {
         label: "expired-restore-source".to_string(),
         inventory: json!({}),
         provider_metadata: json!({}),
-        runtime_image: sandbox.template.clone(),
-        provision_spec: SandboxProvisionSpec {
+        runtime_image: Some(sandbox.template.clone()),
+        provision_spec: Some(SandboxProvisionSpec {
             memory_limit: sandbox.memory_limit.clone(),
             network_egress: sandbox.network_egress.clone(),
             workspace_mode: sandbox.workspace_mode.clone(),
             runtime_profile: sandbox.runtime_profile.clone(),
-        },
+        }),
         created_at: now,
         ready_at: Some(now),
         expires_at: Some(now - chrono::Duration::seconds(1)),
@@ -1478,8 +1514,8 @@ async fn snapshot_restore_claim_retains_authoritative_placement_after_source_del
         label: "durable-placement".to_string(),
         inventory: json!({}),
         provider_metadata: json!({}),
-        runtime_image: sandbox.template.clone(),
-        provision_spec: expected_spec.clone(),
+        runtime_image: Some(sandbox.template.clone()),
+        provision_spec: Some(expected_spec.clone()),
         created_at: now,
         ready_at: Some(now),
         expires_at: None,
@@ -1513,7 +1549,7 @@ async fn snapshot_restore_claim_retains_authoritative_placement_after_source_del
     .await
     .expect("retained restore source");
 
-    assert_eq!(restored.runtime_image, snapshot.runtime_image);
+    assert_eq!(Some(restored.runtime_image), snapshot.runtime_image);
     assert_eq!(restored.provision_spec, expected_spec);
 }
 

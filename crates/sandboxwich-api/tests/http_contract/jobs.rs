@@ -3,6 +3,156 @@ use reqwest::StatusCode;
 use sandboxwich_core::*;
 use sha2::{Digest, Sha256};
 
+async fn legacy_provision_fixture(name: &str) -> (TestServer, SandboxResponse, WorkerResponse) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join(format!("{name}.db")).display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let client = server.client();
+    let sandbox: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some(name.to_string()),
+            template: None,
+            memory_limit: Some(MemoryLimit::FourG),
+            network_egress: Some(NetworkEgress::DenyAll),
+            workspace_mode: Some(WorkspaceMode::Persistent),
+            runtime_profile: None,
+            ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let worker: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: format!("{name}-worker"),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![WorkerCapability::ProvisionSandbox],
+            max_concurrent_jobs: Some(1),
+            labels: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    (server, sandbox, worker)
+}
+
+#[tokio::test]
+async fn legacy_queued_job_is_authoritatively_repaired_and_claimed() {
+    let (server, sandbox, worker) = legacy_provision_fixture("legacy-repair").await;
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .connect(&server.database_url)
+        .await
+        .unwrap();
+    sqlx::query("update jobs set payload = ? where kind = 'provision_sandbox'")
+        .bind(serde_json::json!({"sandboxId": sandbox.sandbox.id}).to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let claimed: ClaimLeaseResponse = worker_client(&worker)
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox.sandbox.id),
+            kinds: Some(vec![JobKind::ProvisionSandbox]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claimed
+        .lease
+        .expect("legacy job should be repaired and claimed");
+    assert_eq!(
+        lease.job.payload["runtimeImage"],
+        serde_json::json!(sandbox.sandbox.template)
+    );
+    assert_eq!(
+        lease.job.payload["provisionSpec"]["memory_limit"],
+        serde_json::json!("4g")
+    );
+}
+
+#[tokio::test]
+async fn irreparable_legacy_queued_job_becomes_observably_dead() {
+    let (server, _sandbox, worker) = legacy_provision_fixture("legacy-dead").await;
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .connect(&server.database_url)
+        .await
+        .unwrap();
+    sqlx::query("update jobs set payload = '{}' where kind = 'provision_sandbox'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let claimed: ClaimLeaseResponse = worker_client(&worker)
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: Some(vec![JobKind::ProvisionSandbox]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(claimed.lease.is_none());
+    let jobs: JobListResponse = server
+        .client()
+        .get(format!("{}/jobs", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let job = jobs
+        .jobs
+        .iter()
+        .find(|job| job.kind == JobKind::ProvisionSandbox)
+        .unwrap();
+    assert_eq!(job.status, JobStatus::Dead);
+    assert_eq!(
+        job.last_error.as_deref(),
+        Some("authoritative_placement_unavailable")
+    );
+}
+
 #[tokio::test]
 async fn materialization_bytes_are_worker_fenced_ref_only_and_consumed_only_when_terminal() {
     let data_dir = tempfile::tempdir().unwrap();

@@ -171,11 +171,14 @@ pub(crate) async fn claim_lease(
     let rows = query.build().fetch_all(&state.db.pool).await?;
 
     for row in rows {
-        let job = row_to_job(row)?;
+        let mut job = row_to_job(row)?;
         // Defense in depth: SQL is the efficient scheduling filter, but keep the typed
         // capability check at the claim boundary so a future query refactor cannot lease
         // work to an incompatible worker.
         if !worker.capabilities.contains(&job.required_capability) {
+            continue;
+        }
+        if !repair_legacy_job_placement(&state.db, &mut job).await? {
             continue;
         }
         if !worker_supports_runtime_profile(&worker, &job) {
@@ -215,14 +218,11 @@ pub(crate) async fn claim_lease(
     }))
 }
 
-pub(crate) fn worker_supports_runtime_profile(worker: &Worker, job: &Job) -> bool {
-    let Some(spec_object) = job
+fn authoritative_placement(job: &Job) -> Option<(SandboxProvisionSpec, &str)> {
+    let spec_object = job
         .payload
         .get("provisionSpec")
-        .and_then(serde_json::Value::as_object)
-    else {
-        return false;
-    };
+        .and_then(serde_json::Value::as_object)?;
     if [
         "memory_limit",
         "network_egress",
@@ -232,7 +232,7 @@ pub(crate) fn worker_supports_runtime_profile(worker: &Worker, job: &Job) -> boo
     .iter()
     .any(|field| !spec_object.contains_key(*field))
     {
-        return false;
+        return None;
     }
     let Ok(spec) = serde_json::from_value::<SandboxProvisionSpec>(
         job.payload
@@ -240,14 +240,58 @@ pub(crate) fn worker_supports_runtime_profile(worker: &Worker, job: &Job) -> boo
             .cloned()
             .unwrap_or_default(),
     ) else {
-        return false;
+        return None;
     };
-    let Some(requested_image) = job
+    let requested_image = job
         .payload
         .get("runtimeImage")
         .and_then(serde_json::Value::as_str)
-        .filter(|image| !image.is_empty())
-    else {
+        .filter(|image| !image.is_empty())?;
+    Some((spec, requested_image))
+}
+
+async fn repair_legacy_job_placement(db: &Database, job: &mut Job) -> Result<bool, ApiError> {
+    if authoritative_placement(job).is_some() {
+        return Ok(true);
+    }
+    if enrich_job_payload_with_provision_spec(db, job)
+        .await
+        .is_err()
+    {
+        let sql = format!(
+            "update jobs
+             set status = 'dead', last_error = {}, updated_at = {}
+             where id = {} and status = 'queued'",
+            db.placeholder(1),
+            db.placeholder(2),
+            db.placeholder(3)
+        );
+        sqlx::query(&sql)
+            .bind("authoritative_placement_unavailable")
+            .bind(Utc::now().to_rfc3339())
+            .bind(job.id.to_string())
+            .execute(&db.pool)
+            .await?;
+        return Ok(false);
+    }
+    let sql = format!(
+        "update jobs set payload = {}, updated_at = {}
+         where id = {} and status = 'queued'",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3)
+    );
+    let updated = sqlx::query(&sql)
+        .bind(serde_json::to_string(&job.payload)?)
+        .bind(Utc::now().to_rfc3339())
+        .bind(job.id.to_string())
+        .execute(&db.pool)
+        .await?;
+    Ok(updated.rows_affected() == 1)
+}
+
+pub(crate) fn worker_supports_runtime_profile(worker: &Worker, job: &Job) -> bool {
+    let Some((spec, requested_image)) = authoritative_placement(job) else {
         return false;
     };
     if spec.runtime_profile != SandboxRuntimeProfile::ApexTrustedSupervisorV1 {

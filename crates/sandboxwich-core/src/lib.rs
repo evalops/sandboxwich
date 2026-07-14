@@ -1174,8 +1174,10 @@ pub struct Snapshot {
     pub label: String,
     pub inventory: serde_json::Value,
     pub provider_metadata: serde_json::Value,
-    pub runtime_image: String,
-    pub provision_spec: SandboxProvisionSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provision_spec: Option<SandboxProvisionSpec>,
     pub created_at: DateTime<Utc>,
     pub ready_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,

@@ -130,6 +130,7 @@ pub(crate) async fn fork_snapshot(
     let restore_source =
         claim_snapshot_restore_source_on_connection(&state.db, &mut tx, snapshot_id, &ctx, now)
             .await?;
+    validate_snapshot_fork_request(&request, &restore_source)?;
     validate_network_egress(&restore_source.provision_spec.network_egress)?;
     validate_runtime_profile(
         &restore_source.provision_spec.runtime_profile,
@@ -222,6 +223,22 @@ pub(crate) struct SnapshotRestoreSource {
     pub(crate) provision_spec: SandboxProvisionSpec,
 }
 
+pub(crate) fn validate_snapshot_fork_request(
+    request: &ForkSnapshotRequest,
+    source: &SnapshotRestoreSource,
+) -> Result<(), ApiError> {
+    if request.template != source.runtime_image
+        || request.memory_limit != source.provision_spec.memory_limit
+        || request.network_egress != source.provision_spec.network_egress
+        || request.runtime_profile != source.provision_spec.runtime_profile
+    {
+        return Err(ApiError::bad_request(
+            "snapshot fork placement fields must match the authoritative snapshot",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn claim_snapshot_restore_source_on_connection(
     db: &Database,
     connection: &mut AnyConnection,
@@ -262,14 +279,21 @@ pub(crate) async fn claim_snapshot_restore_source_on_connection(
     let source_sandbox_id: String = row.try_get("source_sandbox_id")?;
     let runtime_image: Option<String> = row.try_get("runtime_image")?;
     let provision_spec: Option<String> = row.try_get("provision_spec")?;
+    let (Some(runtime_image), Some(provision_spec)) = (runtime_image, provision_spec) else {
+        return Err(ApiError::conflict_code(
+            "snapshot_placement_unavailable",
+            "snapshot placement metadata is unavailable",
+        ));
+    };
     Ok(SnapshotRestoreSource {
         source_sandbox_id: SandboxId(parse_uuid(&source_sandbox_id)?),
-        runtime_image: runtime_image
-            .ok_or_else(|| ApiError::internal("snapshot placement metadata is missing"))?,
-        provision_spec: serde_json::from_str(
-            &provision_spec
-                .ok_or_else(|| ApiError::internal("snapshot placement metadata is missing"))?,
-        )?,
+        runtime_image,
+        provision_spec: serde_json::from_str(&provision_spec).map_err(|_| {
+            ApiError::conflict_code(
+                "snapshot_placement_unavailable",
+                "snapshot placement metadata is invalid",
+            )
+        })?,
     })
 }
 
@@ -332,13 +356,13 @@ pub(crate) fn pending_snapshot_from_request(
         label,
         inventory: request.inventory.unwrap_or_else(|| json!({})),
         provider_metadata: request.provider_metadata.unwrap_or_else(|| json!({})),
-        runtime_image: sandbox.template.clone(),
-        provision_spec: SandboxProvisionSpec {
+        runtime_image: Some(sandbox.template.clone()),
+        provision_spec: Some(SandboxProvisionSpec {
             memory_limit: sandbox.memory_limit.clone(),
             network_egress: sandbox.network_egress.clone(),
             workspace_mode: sandbox.workspace_mode.clone(),
             runtime_profile: sandbox.runtime_profile.clone(),
-        },
+        }),
         created_at: now,
         ready_at: None,
         expires_at: expires_at_from_ttl(now, request.ttl_seconds)?,
@@ -378,7 +402,13 @@ pub(crate) async fn insert_snapshot_on_connection(
         .bind(serde_json::to_string(&snapshot.inventory)?)
         .bind(serde_json::to_string(&snapshot.provider_metadata)?)
         .bind(&snapshot.runtime_image)
-        .bind(serde_json::to_string(&snapshot.provision_spec)?)
+        .bind(
+            snapshot
+                .provision_spec
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+        )
         .bind(snapshot.created_at.to_rfc3339())
         .bind(snapshot.ready_at.map(|time| time.to_rfc3339()))
         .bind(snapshot.expires_at.map(|time| time.to_rfc3339()))
@@ -403,7 +433,13 @@ pub(crate) async fn insert_snapshot_on_connection(
         .bind(snapshot_status_to_str(&snapshot.status))
         .bind(snapshot.expires_at.map(|time| time.to_rfc3339()))
         .bind(&snapshot.runtime_image)
-        .bind(serde_json::to_string(&snapshot.provision_spec)?)
+        .bind(
+            snapshot
+                .provision_spec
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+        )
         .bind(snapshot.sandbox_id.to_string())
         .execute(&mut *connection)
         .await?;
