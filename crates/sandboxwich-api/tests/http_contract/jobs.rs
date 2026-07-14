@@ -15,7 +15,7 @@ pub(crate) async fn job_can_be_fetched_by_id_with_tenant_isolation() {
     let sandbox: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
-            execution_class: None,
+            execution_class: Some(ExecutionClass::VirtualMachine),
             workspace_mode: None,
             name: Some("job-fetch".to_string()),
             template: None,
@@ -64,6 +64,18 @@ pub(crate) async fn job_can_be_fetched_by_id_with_tenant_isolation() {
         .unwrap();
     assert_eq!(fetched.job.id, job.job.id);
     assert_eq!(fetched.job.status, JobStatus::Queued);
+    assert_eq!(
+        job.job.required_execution_class,
+        ExecutionClass::VirtualMachine
+    );
+    assert_eq!(
+        fetched.job.required_execution_class,
+        ExecutionClass::VirtualMachine
+    );
+    assert_eq!(
+        fetched.job.required_capability,
+        WorkerCapability::ProvisionSandbox
+    );
 
     // Tenant identity now comes only from which bearer token authenticated
     // the request, never from a client-supplied header: authenticate as

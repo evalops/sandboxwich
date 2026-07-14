@@ -62,6 +62,7 @@ pub(crate) async fn create_snapshot(
             "snapshotId": snapshot.id
         }),
         required_capability: WorkerCapability::Snapshot,
+        required_execution_class: sandbox.execution_class,
         priority: 0,
         attempts: 0,
         max_attempts: 3,
@@ -163,6 +164,7 @@ pub(crate) async fn fork_snapshot(
             }
         }),
         required_capability: fork_capability(&child.network_egress),
+        required_execution_class: child.execution_class.clone(),
         priority: 0,
         attempts: 0,
         max_attempts: 3,
@@ -770,6 +772,7 @@ pub(crate) async fn queue_forks_waiting_on_snapshot_on_connection(
                     }
                 }),
                 required_capability: fork_capability(&child.network_egress),
+                required_execution_class: child.execution_class.clone(),
                 priority: 0,
                 attempts: 0,
                 max_attempts: 3,

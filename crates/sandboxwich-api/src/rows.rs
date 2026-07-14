@@ -292,6 +292,7 @@ pub(crate) fn row_to_job(row: AnyRow) -> Result<Job, ApiError> {
     let status: String = row.try_get("status")?;
     let payload: String = row.try_get("payload")?;
     let required_capability: String = row.try_get("required_capability")?;
+    let required_execution_class: String = row.try_get("required_execution_class")?;
     let scheduled_at: String = row.try_get("scheduled_at")?;
     let created_at: String = row.try_get("created_at")?;
     let updated_at: String = row.try_get("updated_at")?;
@@ -303,6 +304,9 @@ pub(crate) fn row_to_job(row: AnyRow) -> Result<Job, ApiError> {
         status: parse_job_status(&status)?,
         payload: serde_json::from_str(&payload)?,
         required_capability: parse_worker_capability(&required_capability)?,
+        required_execution_class: ExecutionClass::parse_db_str(&required_execution_class).map_err(
+            |_| ApiError::internal("database contains invalid required execution class"),
+        )?,
         priority: row.try_get("priority")?,
         attempts: row.try_get("attempts")?,
         max_attempts: row.try_get("max_attempts")?,
@@ -355,6 +359,7 @@ pub(crate) fn row_to_lease_without_job(row: AnyRow) -> Result<JobLease, ApiError
             .map(|time| parse_timestamp(&time))
             .transpose()?,
         error: row.try_get("error")?,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
         job: Job {
             id: JobId::new(),
             tenant_id: "default".to_string(),
@@ -362,6 +367,7 @@ pub(crate) fn row_to_lease_without_job(row: AnyRow) -> Result<JobLease, ApiError
             status: JobStatus::Queued,
             payload: json!({}),
             required_capability: WorkerCapability::RunCommand,
+            required_execution_class: ExecutionClass::DevelopmentContainer,
             priority: 0,
             attempts: 0,
             max_attempts: 1,

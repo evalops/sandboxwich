@@ -106,6 +106,7 @@ pub(crate) async fn queue_command(
             }
         }),
         required_capability: WorkerCapability::RunCommand,
+        required_execution_class: sandbox.execution_class,
         priority: 0,
         attempts: 0,
         max_attempts: 3,

@@ -120,6 +120,14 @@ pub(crate) fn provision_capability(network_egress: &NetworkEgress) -> WorkerCapa
     }
 }
 
+pub(crate) fn execution_capability(execution_class: &ExecutionClass) -> WorkerCapability {
+    match execution_class {
+        ExecutionClass::DevelopmentContainer => WorkerCapability::ProvisionSandbox,
+        ExecutionClass::SandboxedContainer => WorkerCapability::SandboxedContainer,
+        ExecutionClass::VirtualMachine => WorkerCapability::VirtualMachine,
+    }
+}
+
 pub(crate) fn fork_capability(network_egress: &NetworkEgress) -> WorkerCapability {
     if network_egress
         .rules()
@@ -177,6 +185,7 @@ pub(crate) async fn create_sandbox(
         status: JobStatus::Queued,
         payload: json!({"sandboxId": sandbox.id, "provisionSpec": provision_spec}),
         required_capability: provision_capability(&sandbox.network_egress),
+        required_execution_class: sandbox.execution_class.clone(),
         priority: 0,
         attempts: 0,
         max_attempts: 3,
@@ -312,6 +321,7 @@ pub(crate) async fn stop_sandbox(
             "deleteGkeFqdnPolicy": delete_gke_fqdn_policy,
         }),
         required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: sandbox.execution_class.clone(),
         priority: 100,
         attempts: 0,
         max_attempts: 3,
@@ -435,6 +445,7 @@ pub(crate) async fn fork_sandbox(
             workspace_mode: parent.workspace_mode.clone(),
         }}),
         required_capability: WorkerCapability::Snapshot,
+        required_execution_class: parent.execution_class.clone(),
         priority: 0,
         attempts: 0,
         max_attempts: 3,

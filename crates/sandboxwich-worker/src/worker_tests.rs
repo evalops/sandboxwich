@@ -2,7 +2,8 @@ use super::*;
 use crate::provider::SandboxTeardownSpec;
 use chrono::Utc;
 use sandboxwich_core::{
-    Job, JobId, JobStatus, RuntimeResourceKind, RuntimeResourcePurpose, SandboxId, SnapshotId,
+    ExecutionClass, Job, JobId, JobStatus, RuntimeResourceKind, RuntimeResourcePurpose, SandboxId,
+    SnapshotId,
 };
 
 fn provider() -> KubernetesDryRunProvider {
@@ -23,6 +24,7 @@ fn job(kind: JobKind, payload: serde_json::Value, capability: WorkerCapability) 
         status: JobStatus::Leased,
         payload,
         required_capability: capability,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
         priority: 0,
         attempts: 1,
         max_attempts: 3,

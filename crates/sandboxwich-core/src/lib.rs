@@ -1517,6 +1517,8 @@ pub enum WorkerStatus {
 db_variant_enum! {
 pub enum WorkerCapability {
     ProvisionSandbox => "provision_sandbox",
+    SandboxedContainer => "sandboxed_container",
+    VirtualMachine => "virtual_machine",
     RunCommand => "run_command",
     AgentPrompt => "agent_prompt",
     Snapshot => "snapshot",
@@ -1695,6 +1697,8 @@ pub struct Job {
     pub status: JobStatus,
     pub payload: serde_json::Value,
     pub required_capability: WorkerCapability,
+    #[serde(default)]
+    pub required_execution_class: ExecutionClass,
     pub priority: i64,
     pub attempts: i64,
     pub max_attempts: i64,
@@ -1715,6 +1719,8 @@ pub struct JobLease {
     pub expires_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub required_execution_class: ExecutionClass,
     pub job: Job,
 }
 
