@@ -12,7 +12,7 @@ use crate::state::*;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, State};
-use axum::http::{HeaderMap, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use sandboxwich_core::*;
@@ -178,7 +178,7 @@ pub(crate) async fn claim_lease(
         if !worker.capabilities.contains(&job.required_capability) {
             continue;
         }
-        if !repair_legacy_job_placement(&state.db, &mut job).await? {
+        if !authoritatively_refresh_job_placement(&state.db, &mut job).await? {
             continue;
         }
         if !worker_supports_runtime_profile(&worker, &job) {
@@ -250,14 +250,22 @@ fn authoritative_placement(job: &Job) -> Option<(SandboxProvisionSpec, &str)> {
     Some((spec, requested_image))
 }
 
-async fn repair_legacy_job_placement(db: &Database, job: &mut Job) -> Result<bool, ApiError> {
-    if authoritative_placement(job).is_some() {
-        return Ok(true);
-    }
-    if enrich_job_payload_with_provision_spec(db, job)
-        .await
-        .is_err()
-    {
+pub(crate) async fn authoritatively_refresh_job_placement(
+    db: &Database,
+    job: &mut Job,
+) -> Result<bool, ApiError> {
+    let reference_error = validate_authoritative_placement_reference(job).err();
+    let enrichment_error = match reference_error {
+        Some(error) => Some(error),
+        None => enrich_job_payload_with_provision_spec(db, job).await.err(),
+    };
+    if let Some(error) = enrichment_error {
+        if !matches!(
+            error.status,
+            StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND
+        ) {
+            return Err(error);
+        }
         let sql = format!(
             "update jobs
              set status = 'dead', last_error = {}, updated_at = {}
@@ -288,6 +296,21 @@ async fn repair_legacy_job_placement(db: &Database, job: &mut Job) -> Result<boo
         .execute(&db.pool)
         .await?;
     Ok(updated.rows_affected() == 1)
+}
+
+fn validate_authoritative_placement_reference(job: &Job) -> Result<(), ApiError> {
+    let key = match job.kind {
+        JobKind::ForkSandbox => "childSandboxId",
+        _ => "sandboxId",
+    };
+    let value = job
+        .payload
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ApiError::bad_request(format!("job payload is missing {key}")))?;
+    Uuid::parse_str(value)
+        .map(|_| ())
+        .map_err(|_| ApiError::bad_request(format!("job payload contains invalid {key}")))
 }
 
 pub(crate) fn worker_supports_runtime_profile(worker: &Worker, job: &Job) -> bool {

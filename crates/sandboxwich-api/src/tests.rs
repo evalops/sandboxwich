@@ -201,6 +201,46 @@ fn snapshot_fork_request_rejects_placement_mismatches() {
     assert!(validate_snapshot_fork_request(&mismatch, &source).is_err());
 }
 
+#[tokio::test]
+async fn transient_authority_refresh_error_leaves_queued_job_retryable() {
+    let db = test_sqlite_db().await;
+    let sandbox = seed_sandbox_with_state(&db, SandboxState::Ready).await;
+    let now = Utc::now();
+    let mut job = Job {
+        id: JobId::new(),
+        tenant_id: sandbox.tenant_id.clone(),
+        kind: JobKind::ProvisionSandbox,
+        status: JobStatus::Queued,
+        payload: json!({"sandboxId": sandbox.id}),
+        required_capability: WorkerCapability::ProvisionSandbox,
+        priority: 0,
+        attempts: 0,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+    };
+    insert_job(&db, &job).await.expect("insert queued job");
+    sqlx::query("alter table sandboxes rename to unavailable_sandboxes")
+        .execute(&db.pool)
+        .await
+        .expect("make authoritative store unavailable");
+
+    let error = authoritatively_refresh_job_placement(&db, &mut job)
+        .await
+        .expect_err("internal authority read must propagate");
+    assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    let status: String = sqlx::query("select status from jobs where id = ?")
+        .bind(job.id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read job")
+        .try_get("status")
+        .expect("status");
+    assert_eq!(status, "queued");
+}
+
 #[test]
 fn apex_profile_bound_jobs_only_match_the_exact_profile_worker_image() {
     let now = Utc::now();

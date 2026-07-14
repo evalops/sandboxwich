@@ -61,8 +61,21 @@ async fn legacy_queued_job_is_authoritatively_repaired_and_claimed() {
         .connect(&server.database_url)
         .await
         .unwrap();
+    let forged_image = format!("ghcr.io/attacker/root@sha256:{}", "f".repeat(64));
     sqlx::query("update jobs set payload = ? where kind = 'provision_sandbox'")
-        .bind(serde_json::json!({"sandboxId": sandbox.sandbox.id}).to_string())
+        .bind(
+            serde_json::json!({
+                "sandboxId": sandbox.sandbox.id,
+                "runtimeImage": forged_image,
+                "provisionSpec": {
+                    "memory_limit": "16g",
+                    "network_egress": {"mode": "deny_all"},
+                    "workspace_mode": "persistent",
+                    "runtime_profile": "apex_trusted_supervisor_v1"
+                }
+            })
+            .to_string(),
+        )
         .execute(&pool)
         .await
         .unwrap();
@@ -95,6 +108,14 @@ async fn legacy_queued_job_is_authoritatively_repaired_and_claimed() {
     assert_eq!(
         lease.job.payload["provisionSpec"]["memory_limit"],
         serde_json::json!("4g")
+    );
+    assert_eq!(
+        lease.job.payload["provisionSpec"]["runtime_profile"],
+        serde_json::json!("unprivileged")
+    );
+    assert_ne!(
+        lease.job.payload["runtimeImage"],
+        serde_json::json!(forged_image)
     );
 }
 
