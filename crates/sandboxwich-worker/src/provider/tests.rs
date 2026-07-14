@@ -1,4 +1,5 @@
 use super::*;
+use sandboxwich_core::MAX_COMMAND_STDIN_BYTES;
 
 #[tokio::test]
 async fn run_kubectl_command_async_succeeds_within_timeout() {
@@ -1018,6 +1019,139 @@ fn provider_mode_distinguishes_apply_execution_from_dry_run_simulation() {
         apply.capability_report().labels.get("provider_mode"),
         Some(&"apply".to_string())
     );
+}
+
+#[test]
+fn dry_run_provider_rejects_oversized_stdin_at_its_entrypoint() {
+    let provider = KubernetesDryRunProvider::with_snapshot_class(
+        "k3s-ci",
+        "sandboxwich-ci",
+        Some("local-path".to_string()),
+        None,
+    );
+    let request = AgentCommandRequest {
+        argv: vec!["true".to_string()],
+        cwd: None,
+        env: BTreeMap::new(),
+        stdin: Some(vec![b'x'; MAX_COMMAND_STDIN_BYTES + 1]),
+        timeout_secs: None,
+    };
+
+    let error = provider
+        .exec_handoff(
+            SandboxId::new(),
+            &SandboxProvisionSpec::default(),
+            request,
+            &CancelSignal::never_cancelled(),
+        )
+        .expect_err("dry-run provider boundary must reject oversized stdin");
+
+    assert!(error.to_string().contains("command_stdin_too_large"));
+}
+
+#[test]
+fn apply_provider_rejects_oversized_stdin_before_kubectl_lookup_or_provisioning() {
+    let (kubectl, log_path) = write_fake_kubectl(None);
+    let provider = apply_provider_with_fake_kubectl(&kubectl);
+    let request = AgentCommandRequest {
+        argv: vec!["true".to_string()],
+        cwd: None,
+        env: BTreeMap::new(),
+        stdin: Some(vec![b'x'; MAX_COMMAND_STDIN_BYTES + 1]),
+        timeout_secs: None,
+    };
+
+    let error = provider
+        .exec_handoff(
+            SandboxId::new(),
+            &SandboxProvisionSpec::default(),
+            request,
+            &CancelSignal::never_cancelled(),
+        )
+        .expect_err("apply provider boundary must reject before kubectl side effects");
+
+    assert!(error.to_string().contains("command_stdin_too_large"));
+    assert!(
+        !log_path.exists(),
+        "validation must run before kubectl lookup"
+    );
+    let _ = std::fs::remove_dir_all(kubectl.parent().unwrap());
+}
+
+#[test]
+fn providers_reject_nul_environment_before_guest_or_kubectl_and_preserve_binary_stdin_boundary() {
+    let mut env = BTreeMap::new();
+    env.insert("VALID_KEY".to_string(), "prefix\0shifted".to_string());
+    let binary_stdin = vec![0, 255, b'j', b's', b'o', b'n', b'\n'];
+    let request = AgentCommandRequest {
+        argv: vec!["cat".to_string()],
+        cwd: None,
+        env,
+        stdin: Some(binary_stdin),
+        timeout_secs: None,
+    };
+    let dry_run = KubernetesDryRunProvider::with_snapshot_class(
+        "k3s-ci",
+        "sandboxwich-ci",
+        Some("local-path".to_string()),
+        None,
+    );
+    let dry_error = dry_run
+        .exec_handoff(
+            SandboxId::new(),
+            &SandboxProvisionSpec::default(),
+            request.clone(),
+            &CancelSignal::never_cancelled(),
+        )
+        .expect_err("NUL environment value must fail at dry-run provider boundary");
+    assert!(
+        dry_error
+            .to_string()
+            .contains("command_environment_contains_nul")
+    );
+
+    let mut nul_key_env = BTreeMap::new();
+    nul_key_env.insert("BAD\0KEY".to_string(), "value".to_string());
+    let nul_key_error = dry_run
+        .exec_handoff(
+            SandboxId::new(),
+            &SandboxProvisionSpec::default(),
+            AgentCommandRequest {
+                argv: vec!["cat".to_string()],
+                cwd: None,
+                env: nul_key_env,
+                stdin: Some(vec![0, 255, b'x']),
+                timeout_secs: None,
+            },
+            &CancelSignal::never_cancelled(),
+        )
+        .expect_err("NUL environment key must fail at provider boundary");
+    assert!(
+        nul_key_error
+            .to_string()
+            .contains("command_environment_contains_nul")
+    );
+
+    let (kubectl, log_path) = write_fake_kubectl(None);
+    let apply = apply_provider_with_fake_kubectl(&kubectl);
+    let apply_error = apply
+        .exec_handoff(
+            SandboxId::new(),
+            &SandboxProvisionSpec::default(),
+            request,
+            &CancelSignal::never_cancelled(),
+        )
+        .expect_err("NUL environment value must fail before kubectl or guest start");
+    assert!(
+        apply_error
+            .to_string()
+            .contains("command_environment_contains_nul")
+    );
+    assert!(
+        !log_path.exists(),
+        "validation must run before kubectl lookup"
+    );
+    let _ = std::fs::remove_dir_all(kubectl.parent().unwrap());
 }
 
 #[test]

@@ -21,6 +21,9 @@ pub(crate) async fn create_job(
     Extension(ctx): Extension<TenantContext>,
     Json(request): Json<CreateJobRequest>,
 ) -> Result<Json<JobResponse>, ApiError> {
+    if request.kind == JobKind::RunCommand {
+        validate_run_command_job_input(&request.payload)?;
+    }
     let now = Utc::now();
     let mut job = Job {
         id: JobId::new(),
@@ -40,7 +43,54 @@ pub(crate) async fn create_job(
     validate_job_payload_tenant(&state.db, &job, &ctx).await?;
     enrich_job_payload_with_provision_spec(&state.db, &mut job).await?;
     insert_job(&state.db, &job).await?;
-    Ok(Json(JobResponse { ok: true, job }))
+    Ok(Json(JobResponse {
+        ok: true,
+        job: job.into(),
+    }))
+}
+
+fn validate_run_command_job_input(payload: &serde_json::Value) -> Result<(), ApiError> {
+    let env = payload
+        .get("env")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| ApiError::bad_request("job payload env is invalid"))?
+        .unwrap_or_default();
+    let stdin = payload
+        .get("stdin")
+        .cloned()
+        .map(|value| {
+            serde_json::from_value(serde_json::json!({
+                "argv": [],
+                "cwd": null,
+                "env": {},
+                "stdin": value,
+                "timeout_secs": null
+            }))
+            .map(|request: AgentCommandRequest| request.stdin)
+        })
+        .transpose()
+        .map_err(|error| {
+            if error.to_string().contains("command_stdin_too_large") {
+                ApiError::payload_too_large(
+                    "command_stdin_too_large",
+                    "command stdin exceeds 1048576 bytes",
+                )
+            } else {
+                ApiError::bad_request("job payload stdin is invalid")
+            }
+        })?
+        .flatten();
+    validate_command_input(&stdin, &env).map_err(|error| match error {
+        CommandExecutionRequestError::StdinTooLarge => ApiError::payload_too_large(
+            "command_stdin_too_large",
+            "command stdin exceeds 1048576 bytes",
+        ),
+        CommandExecutionRequestError::EnvironmentContainsNul => {
+            ApiError::bad_request(error.to_string())
+        }
+    })
 }
 
 pub(crate) async fn get_job(
@@ -50,7 +100,10 @@ pub(crate) async fn get_job(
 ) -> Result<Json<JobResponse>, ApiError> {
     let job = fetch_job(&state.db, JobId(job_id)).await?;
     ensure_job_tenant(&job, &ctx)?;
-    Ok(Json(JobResponse { ok: true, job }))
+    Ok(Json(JobResponse {
+        ok: true,
+        job: job.into(),
+    }))
 }
 
 pub(crate) async fn enrich_job_payload_with_provision_spec(
@@ -157,7 +210,7 @@ pub(crate) async fn list_jobs(
 
     Ok(Json(JobListResponse {
         ok: true,
-        jobs,
+        jobs: jobs.into_iter().map(PublicJob::from).collect(),
         next_cursor,
     }))
 }

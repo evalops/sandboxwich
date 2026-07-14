@@ -21,6 +21,7 @@ use sandboxwich_core::{
     ProvisioningStage, ProvisioningStageUpdateRequest, RuntimeResourceInventoryResponse,
     RuntimeResourceKind, RuntimeResourcePurpose, RuntimeResourceStatus, SandboxId,
     SandboxProvisionSpec, SnapshotId, WorkerCapability, WorkspaceMode,
+    validate_agent_command_request,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -3563,6 +3564,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
         request: AgentCommandRequest,
         _cancelled: &CancelSignal,
     ) -> anyhow::Result<AgentCommandResult> {
+        validate_agent_command_request(&request)?;
         let started_at = Utc::now();
         let finished_at = Utc::now();
         Ok(AgentCommandResult {
@@ -3801,6 +3803,7 @@ impl SandboxProvider for KubernetesApplyProvider {
         request: AgentCommandRequest,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<AgentCommandResult> {
+        validate_agent_command_request(&request)?;
         // Only provision when the pod is actually missing. Re-applying the full
         // manifest set (and re-waiting up to 120s) before every command is both slow
         // and unsafe: Pod `resources` are immutable, so an exec whose spec drifts from

@@ -1311,6 +1311,46 @@ pub const MAX_COMMAND_TIMEOUT_SECS: u64 = 3600;
 
 /// Maximum decoded byte length accepted for one command's non-secret stdin.
 pub const MAX_COMMAND_STDIN_BYTES: usize = 1024 * 1024;
+const MAX_COMMAND_STDIN_BASE64_BYTES: usize = MAX_COMMAND_STDIN_BYTES.div_ceil(3) * 4;
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum CommandExecutionRequestError {
+    #[error("command_stdin_too_large: command stdin exceeds 1048576 bytes")]
+    StdinTooLarge,
+    #[error(
+        "command_environment_contains_nul: command environment keys and values cannot contain NUL"
+    )]
+    EnvironmentContainsNul,
+}
+
+pub fn validate_command_input(
+    stdin: &Option<Vec<u8>>,
+    env: &BTreeMap<String, String>,
+) -> Result<(), CommandExecutionRequestError> {
+    if stdin
+        .as_ref()
+        .is_some_and(|stdin| stdin.len() > MAX_COMMAND_STDIN_BYTES)
+    {
+        return Err(CommandExecutionRequestError::StdinTooLarge);
+    }
+    if env
+        .iter()
+        .any(|(key, value)| key.contains('\0') || value.contains('\0'))
+    {
+        return Err(CommandExecutionRequestError::EnvironmentContainsNul);
+    }
+    Ok(())
+}
+
+pub fn validate_agent_command_request(
+    request: &AgentCommandRequest,
+) -> Result<(), CommandExecutionRequestError> {
+    validate_command_input(&request.stdin, &request.env)
+}
+
+pub fn encode_command_stdin_base64(stdin: &[u8]) -> String {
+    general_purpose::STANDARD.encode(stdin)
+}
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CommandRequest {
@@ -1687,7 +1727,7 @@ pub enum ProvisioningErrorClass {
 }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Job {
     pub id: JobId,
     pub tenant_id: String,
@@ -1704,7 +1744,46 @@ pub struct Job {
     pub last_error: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+fn redacted_job_payload(payload: &serde_json::Value) -> serde_json::Value {
+    let mut redacted = payload.clone();
+    if let Some(object) = redacted.as_object_mut() {
+        object.remove("stdin");
+    }
+    redacted
+}
+
+fn serialize_redacted_job_payload<S>(
+    payload: &serde_json::Value,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    redacted_job_payload(payload).serialize(serializer)
+}
+
+impl fmt::Debug for Job {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Job")
+            .field("id", &self.id)
+            .field("tenant_id", &self.tenant_id)
+            .field("kind", &self.kind)
+            .field("status", &self.status)
+            .field("payload", &redacted_job_payload(&self.payload))
+            .field("required_capability", &self.required_capability)
+            .field("priority", &self.priority)
+            .field("attempts", &self.attempts)
+            .field("max_attempts", &self.max_attempts)
+            .field("scheduled_at", &self.scheduled_at)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("last_error", &self.last_error)
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JobLease {
     pub id: LeaseId,
     pub job_id: JobId,
@@ -1718,13 +1797,103 @@ pub struct JobLease {
     pub job: Job,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+impl fmt::Debug for JobLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JobLease")
+            .field("id", &self.id)
+            .field("job_id", &self.job_id)
+            .field("worker_id", &self.worker_id)
+            .field("status", &self.status)
+            .field("attempt", &self.attempt)
+            .field("leased_at", &self.leased_at)
+            .field("expires_at", &self.expires_at)
+            .field("completed_at", &self.completed_at)
+            .field("error", &self.error)
+            .field("job", &self.job)
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CreateJobRequest {
     pub kind: JobKind,
     pub payload: serde_json::Value,
     pub required_capability: WorkerCapability,
     pub priority: Option<i64>,
     pub max_attempts: Option<i64>,
+}
+
+impl fmt::Debug for CreateJobRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CreateJobRequest")
+            .field("kind", &self.kind)
+            .field("payload", &redacted_job_payload(&self.payload))
+            .field("required_capability", &self.required_capability)
+            .field("priority", &self.priority)
+            .field("max_attempts", &self.max_attempts)
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PublicJob {
+    pub id: JobId,
+    pub tenant_id: String,
+    pub kind: JobKind,
+    pub status: JobStatus,
+    #[serde(serialize_with = "serialize_redacted_job_payload")]
+    pub payload: serde_json::Value,
+    pub required_capability: WorkerCapability,
+    pub priority: i64,
+    pub attempts: i64,
+    pub max_attempts: i64,
+    pub scheduled_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub last_error: Option<String>,
+}
+
+impl From<Job> for PublicJob {
+    fn from(job: Job) -> Self {
+        Self {
+            id: job.id,
+            tenant_id: job.tenant_id,
+            kind: job.kind,
+            status: job.status,
+            payload: redacted_job_payload(&job.payload),
+            required_capability: job.required_capability,
+            priority: job.priority,
+            attempts: job.attempts,
+            max_attempts: job.max_attempts,
+            scheduled_at: job.scheduled_at,
+            created_at: job.created_at,
+            updated_at: job.updated_at,
+            last_error: job.last_error,
+        }
+    }
+}
+
+impl fmt::Debug for PublicJob {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicJob")
+            .field("id", &self.id)
+            .field("tenant_id", &self.tenant_id)
+            .field("kind", &self.kind)
+            .field("status", &self.status)
+            .field("payload", &redacted_job_payload(&self.payload))
+            .field("required_capability", &self.required_capability)
+            .field("priority", &self.priority)
+            .field("attempts", &self.attempts)
+            .field("max_attempts", &self.max_attempts)
+            .field("scheduled_at", &self.scheduled_at)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("last_error", &self.last_error)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1808,13 +1977,13 @@ pub struct FailLeaseRequest {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JobResponse {
     pub ok: bool,
-    pub job: Job,
+    pub job: PublicJob,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JobListResponse {
     pub ok: bool,
-    pub jobs: Vec<Job>,
+    pub jobs: Vec<PublicJob>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
 }
@@ -1877,7 +2046,7 @@ pub struct AgentCommandRequest {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     /// Bounded, non-secret bytes delivered to the child process's stdin.
-    #[serde(default, with = "serde_optional_base64_bytes")]
+    #[serde(default, with = "serde_bounded_optional_base64_bytes")]
     pub stdin: Option<Vec<u8>>,
     /// Bound applied by `execute_streaming` around `child.wait()`; the child
     /// is killed and a distinct timeout failure reported if it runs longer
@@ -1980,6 +2149,37 @@ pub mod serde_optional_base64_bytes {
                     .map_err(serde::de::Error::custom)
             })
             .transpose()
+    }
+}
+
+mod serde_bounded_optional_base64_bytes {
+    use super::*;
+
+    pub fn serialize<S>(content: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serde_optional_base64_bytes::serialize(content, serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let encoded = Option::<String>::deserialize(deserializer)?;
+        let Some(encoded) = encoded else {
+            return Ok(None);
+        };
+        if encoded.len() > MAX_COMMAND_STDIN_BASE64_BYTES {
+            return Err(serde::de::Error::custom("command_stdin_too_large"));
+        }
+        let decoded = general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(serde::de::Error::custom)?;
+        if decoded.len() > MAX_COMMAND_STDIN_BYTES {
+            return Err(serde::de::Error::custom("command_stdin_too_large"));
+        }
+        Ok(Some(decoded))
     }
 }
 
@@ -2175,6 +2375,38 @@ mod tests {
             assert_eq!(decoded, parsed);
         }
         assert!(T::parse_db_str("__not_a_variant__").is_err());
+    }
+
+    #[test]
+    fn oversized_agent_command_stdin_is_rejected_during_deserialization() {
+        let encoded = general_purpose::STANDARD.encode(vec![b'x'; MAX_COMMAND_STDIN_BYTES + 1]);
+        let value = serde_json::json!({
+            "argv": ["true"],
+            "cwd": null,
+            "env": {},
+            "stdin": encoded,
+            "timeout_secs": null
+        });
+
+        let error = serde_json::from_value::<AgentCommandRequest>(value)
+            .expect_err("deserialization must reject stdin over the decoded limit");
+
+        assert!(error.to_string().contains("command_stdin_too_large"));
+
+        let precheck_value = serde_json::json!({
+            "argv": ["true"],
+            "cwd": null,
+            "env": {},
+            "stdin": "A".repeat(MAX_COMMAND_STDIN_BASE64_BYTES + 1),
+            "timeout_secs": null
+        });
+        let precheck_error = serde_json::from_value::<AgentCommandRequest>(precheck_value)
+            .expect_err("encoded-length precheck must reject oversized input");
+        assert!(
+            precheck_error
+                .to_string()
+                .contains("command_stdin_too_large")
+        );
     }
 
     #[test]

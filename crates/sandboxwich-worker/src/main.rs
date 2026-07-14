@@ -17,10 +17,11 @@ use provider::{
 };
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse,
-    CompleteLeaseRequest, FailLeaseRequest, JobKind, LeaseResponse, MAX_COMMAND_STDIN_BYTES,
-    ProvisioningOperationResponse, ProvisioningStageUpdateRequest, RegisterWorkerRequest,
-    RenewLeaseRequest, RuntimeResourceInventoryResponse, SandboxProvisionSpec, WorkerCapability,
+    CompleteLeaseRequest, FailLeaseRequest, JobKind, LeaseResponse, ProvisioningOperationResponse,
+    ProvisioningStageUpdateRequest, RegisterWorkerRequest, RenewLeaseRequest,
+    RuntimeResourceInventoryResponse, SandboxProvisionSpec, WorkerCapability,
     WorkerHeartbeatRequest, WorkerJobResult, WorkerResponse, build_api_client,
+    validate_agent_command_request,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -534,6 +535,7 @@ impl SandboxProvider for RuntimeProvider {
         request: AgentCommandRequest,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<sandboxwich_core::AgentCommandResult> {
+        validate_agent_command_request(&request)?;
         match self {
             Self::DryRun(provider) => provider.exec_handoff(sandbox_id, spec, request, cancelled),
             Self::Apply(provider) => provider.exec_handoff(sandbox_id, spec, request, cancelled),
@@ -1951,23 +1953,24 @@ fn agent_request_from_payload(payload: &serde_json::Value) -> anyhow::Result<Age
             .map(|request: AgentCommandRequest| request.stdin)
         })
         .transpose()
-        .context("job payload stdin is invalid")?
+        .map_err(|error| {
+            if error.to_string().contains("command_stdin_too_large") {
+                anyhow::anyhow!("command_stdin_too_large: command stdin exceeds 1048576 bytes")
+            } else {
+                anyhow::Error::new(error).context("job payload stdin is invalid")
+            }
+        })?
         .flatten();
-    if stdin
-        .as_ref()
-        .is_some_and(|stdin| stdin.len() > MAX_COMMAND_STDIN_BYTES)
-    {
-        anyhow::bail!("command_stdin_too_large: command stdin exceeds 1048576 bytes");
-    }
     let timeout_secs = payload.get("timeoutSecs").and_then(|value| value.as_u64());
-
-    Ok(AgentCommandRequest {
+    let request = AgentCommandRequest {
         argv,
         cwd,
         env,
         stdin,
         timeout_secs,
-    })
+    };
+    validate_agent_command_request(&request)?;
+    Ok(request)
 }
 
 fn prompt_output_from_payload(payload: &serde_json::Value) -> anyhow::Result<String> {

@@ -21,8 +21,8 @@ use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, AgentFileReadResponse, AgentFileWriteRequest,
     AgentHealthResponse, AppendCommandOutputRequest, ClaimLeaseRequest, ClaimLeaseResponse,
     CommandOutputStream, CompleteLeaseRequest, DEFAULT_COMMAND_TIMEOUT_SECS, FailLeaseRequest,
-    GuestStatus, JobKind, LeaseId, LeaseResponse, MAX_COMMAND_STDIN_BYTES, RenewLeaseRequest,
-    SandboxId, UpdateGuestHealthRequest, WorkerJobResult, build_api_client,
+    GuestStatus, JobKind, LeaseId, LeaseResponse, RenewLeaseRequest, SandboxId,
+    UpdateGuestHealthRequest, WorkerJobResult, build_api_client, validate_agent_command_request,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -976,6 +976,7 @@ async fn execute_streaming(
     max_captured_output_bytes: u64,
     cancelled: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<AgentCommandResult> {
+    validate_agent_command_request(&request)?;
     let AgentCommandRequest {
         argv,
         cwd,
@@ -1341,22 +1342,24 @@ fn agent_request_from_payload(payload: &serde_json::Value) -> anyhow::Result<Age
             .map(|request: AgentCommandRequest| request.stdin)
         })
         .transpose()
-        .context("job payload stdin is invalid")?
+        .map_err(|error| {
+            if error.to_string().contains("command_stdin_too_large") {
+                anyhow::anyhow!("command_stdin_too_large: command stdin exceeds 1048576 bytes")
+            } else {
+                anyhow::Error::new(error).context("job payload stdin is invalid")
+            }
+        })?
         .flatten();
-    if stdin
-        .as_ref()
-        .is_some_and(|stdin| stdin.len() > MAX_COMMAND_STDIN_BYTES)
-    {
-        bail!("command_stdin_too_large: command stdin exceeds 1048576 bytes");
-    }
     let timeout_secs = payload.get("timeoutSecs").and_then(|value| value.as_u64());
-    Ok(AgentCommandRequest {
+    let request = AgentCommandRequest {
         argv,
         cwd,
         env,
         stdin,
         timeout_secs,
-    })
+    };
+    validate_agent_command_request(&request)?;
+    Ok(request)
 }
 
 async fn decode_json<T>(response: reqwest::Response) -> Result<T, AgentRequestError>

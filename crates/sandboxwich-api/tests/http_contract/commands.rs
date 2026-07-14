@@ -2,6 +2,224 @@ use crate::common::*;
 use sandboxwich_core::*;
 
 #[tokio::test]
+pub(crate) async fn command_stdin_is_redacted_from_tenant_jobs_but_preserved_for_worker_dispatch() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("sandboxwich-command-stdin-redaction.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+    let created: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            workspace_mode: None,
+            name: Some("stdin-redaction-test".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let worker: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "stdin-dispatch-worker".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![
+                WorkerCapability::K8sPod,
+                WorkerCapability::ProvisionSandbox,
+                WorkerCapability::RunCommand,
+            ],
+            max_concurrent_jobs: Some(1),
+            labels: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let worker_client = worker_client(&worker);
+    let provision: ClaimLeaseResponse = worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(created.sandbox.id),
+            kinds: Some(vec![JobKind::ProvisionSandbox]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let provision = provision.lease.expect("claim provision lease first");
+    worker_client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, provision.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::ProvisionSandbox {
+                handle: ProviderSandboxHandle {
+                    provider: "kubernetes".to_string(),
+                    sandbox_id: created.sandbox.id,
+                    resources: provision_resources(created.sandbox.id),
+                    metadata: serde_json::json!({}),
+                },
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let marker = b"apex-public-redaction-\0\xff".to_vec();
+    let encoded = serde_json::to_value(AgentCommandRequest {
+        argv: vec!["sha256sum".to_string()],
+        cwd: None,
+        env: Default::default(),
+        stdin: Some(marker.clone()),
+        timeout_secs: None,
+    })
+    .unwrap()["stdin"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let command_response = client
+        .post(format!(
+            "{}/sandboxes/{}/commands",
+            server.base_url, created.sandbox.id
+        ))
+        .json(&CommandRequest {
+            argv: vec!["sha256sum".to_string()],
+            cwd: None,
+            env: Default::default(),
+            stdin: Some(marker.clone()),
+            timeout_secs: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let command_json = command_response.text().await.unwrap();
+    assert!(!command_json.contains("apex-public-redaction"));
+    assert!(!command_json.contains(&encoded));
+    let command: QueueCommandResponse = serde_json::from_str(&command_json).unwrap();
+
+    let created_job_response = client
+        .post(format!("{}/jobs", server.base_url))
+        .json(&CreateJobRequest {
+            kind: JobKind::RunCommand,
+            payload: serde_json::json!({
+                "sandboxId": created.sandbox.id,
+                "commandId": command.command.id,
+                "argv": ["sha256sum"],
+                "cwd": null,
+                "env": {},
+                "stdin": encoded,
+                "timeoutSecs": DEFAULT_COMMAND_TIMEOUT_SECS
+            }),
+            required_capability: WorkerCapability::RunCommand,
+            priority: None,
+            max_attempts: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let create_job_json = created_job_response.text().await.unwrap();
+    assert!(!create_job_json.contains("apex-public-redaction"));
+    assert!(!create_job_json.contains(&encoded));
+    let created_job: JobResponse = serde_json::from_str(&create_job_json).unwrap();
+
+    let get_job_json = client
+        .get(format!("{}/jobs/{}", server.base_url, created_job.job.id))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!get_job_json.contains("apex-public-redaction"));
+    assert!(!get_job_json.contains(&encoded));
+    let fetched: JobResponse = serde_json::from_str(&get_job_json).unwrap();
+    assert!(!format!("{fetched:?}").contains(&encoded));
+
+    let list_job_json = client
+        .get(format!("{}/jobs", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!list_job_json.contains("apex-public-redaction"));
+    assert!(!list_job_json.contains(&encoded));
+    let listed: JobListResponse = serde_json::from_str(&list_job_json).unwrap();
+    assert!(!format!("{listed:?}").contains(&encoded));
+
+    let claim: ClaimLeaseResponse = worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(created.sandbox.id),
+            kinds: Some(vec![JobKind::RunCommand]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claim
+        .lease
+        .expect("worker should receive a command dispatch");
+    assert_eq!(lease.job.payload["stdin"], encoded);
+    let dispatched: AgentCommandRequest = serde_json::from_value(serde_json::json!({
+        "argv": lease.job.payload["argv"],
+        "cwd": lease.job.payload["cwd"],
+        "env": lease.job.payload["env"],
+        "stdin": lease.job.payload["stdin"],
+        "timeout_secs": lease.job.payload["timeoutSecs"]
+    }))
+    .unwrap();
+    assert_eq!(dispatched.stdin, Some(marker));
+    assert!(!format!("{lease:?}").contains("apex-public-redaction"));
+    assert!(!format!("{lease:?}").contains(&encoded));
+}
+
+#[tokio::test]
 pub(crate) async fn command_stdin_over_one_mib_is_rejected_before_job_dispatch() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!(

@@ -66,15 +66,16 @@ pub(crate) async fn queue_command(
     if request.argv.is_empty() {
         return Err(ApiError::bad_request("argv must contain at least one item"));
     }
-    if request
-        .stdin
-        .as_ref()
-        .is_some_and(|stdin| stdin.len() > MAX_COMMAND_STDIN_BYTES)
-    {
-        return Err(ApiError::payload_too_large(
-            "command_stdin_too_large",
-            "command stdin exceeds 1048576 bytes",
-        ));
+    if let Err(error) = validate_command_input(&request.stdin, &request.env) {
+        return match error {
+            CommandExecutionRequestError::StdinTooLarge => Err(ApiError::payload_too_large(
+                "command_stdin_too_large",
+                "command stdin exceeds 1048576 bytes",
+            )),
+            CommandExecutionRequestError::EnvironmentContainsNul => {
+                Err(ApiError::bad_request(error.to_string()))
+            }
+        };
     }
 
     let sandbox_id = SandboxId(sandbox_id);
@@ -82,7 +83,7 @@ pub(crate) async fn queue_command(
 
     let now = Utc::now();
     let env = request.env;
-    let stdin = request.stdin;
+    let stdin = request.stdin.as_deref().map(encode_command_stdin_base64);
     let timeout_secs = effective_command_timeout_secs(request.timeout_secs);
     let command = CommandRun {
         id: CommandId::new(),

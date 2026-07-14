@@ -807,7 +807,7 @@ where
     None
 }
 
-pub(crate) fn job_for_command(jobs: &[Job], command_id: CommandId) -> Job {
+pub(crate) fn job_for_command(jobs: &[PublicJob], command_id: CommandId) -> PublicJob {
     jobs.iter()
         .find(|job| {
             job.kind == JobKind::RunCommand
@@ -822,7 +822,7 @@ pub(crate) fn job_for_command(jobs: &[Job], command_id: CommandId) -> Job {
         .expect("expected command job")
 }
 
-pub(crate) fn job_for_child_sandbox(jobs: &[Job], child_sandbox_id: &str) -> Job {
+pub(crate) fn job_for_child_sandbox(jobs: &[PublicJob], child_sandbox_id: &str) -> PublicJob {
     jobs.iter()
         .find(|job| {
             job.payload
@@ -834,7 +834,7 @@ pub(crate) fn job_for_child_sandbox(jobs: &[Job], child_sandbox_id: &str) -> Job
         .expect("expected fork job")
 }
 
-pub(crate) fn job_for_snapshot(jobs: &[Job], snapshot_id: &str) -> Job {
+pub(crate) fn job_for_snapshot(jobs: &[PublicJob], snapshot_id: &str) -> PublicJob {
     jobs.iter()
         .find(|job| {
             job.payload
