@@ -22,7 +22,7 @@ must not treat a simulated result as evidence that runtime work occurred.
 
 ## Execution class ownership
 
-Callers select the workload requirement through the typed `executionClass`
+Callers select the workload requirement through the typed `execution_class`
 field. Omitting it preserves the compatibility default of
 `development_container`. The selected class is durable, is inherited by forks,
 and constrains worker claim routing. It does not name a Kubernetes

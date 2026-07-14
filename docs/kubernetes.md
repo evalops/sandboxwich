@@ -100,8 +100,8 @@ Sandbox creation carries a typed provision spec: memory tier (`1g`, `4g`, `16g`,
 
 ### Execution class and isolation ownership
 
-The caller's `executionClass` is a provider-neutral workload requirement. The
-operator decides how a worker satisfies it with
+The caller's `execution_class` HTTP field is a provider-neutral workload
+requirement. The operator decides how a worker satisfies it with
 `--isolation-profile development|gvisor|kata` (or
 `SANDBOXWICH_ISOLATION_PROFILE`) and the independently supplied
 `--runtime-class-name`. The mapping is exact: `development` advertises no

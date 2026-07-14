@@ -307,7 +307,9 @@ git commit -m "fix(worker): report exact isolation capabilities"
 
 - [ ] **Step 1: Document caller versus operator responsibility**
 
-State that callers request `executionClass`; operators configure profile, RuntimeClass, nodes, CNI, storage, and conformance. Mark VM-class execution experimental until SW-3 live conformance passes.
+State that callers request the `execution_class` HTTP field; operators configure
+profile, RuntimeClass, nodes, CNI, storage, and conformance. Mark VM-class
+execution experimental until SW-3 live conformance passes.
 
 - [ ] **Step 2: Run formatting and lint**
 
