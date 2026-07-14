@@ -9,7 +9,6 @@ use std::{
 };
 
 use anyhow::Context;
-use base64::{Engine as _, engine::general_purpose};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use provider::{
     CancelSignal, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES, KUBERNETES_MUTATION_ENV,
@@ -1688,6 +1687,30 @@ where
             }
         }
     });
+    let materialization = if lease.job.kind == JobKind::MaterializeFile {
+        match fetch_materialization(client, api, lease_id).await {
+            Ok(content) if !cancelled.is_cancelled() => Some(content),
+            Ok(_) | Err(_) => {
+                renew_task.abort();
+                let _ = renew_task.await;
+                let payload = FailLeaseRequest {
+                    error: "materialization fetch failed".to_string(),
+                    retry: true,
+                };
+                return with_retries("fail lease", API_RETRY_ATTEMPTS, || async {
+                    let response = client
+                        .post(format!("{api}/leases/{lease_id}/fail"))
+                        .json(&payload)
+                        .send()
+                        .await?;
+                    decode_json::<LeaseResponse>(response).await
+                })
+                .await;
+            }
+        }
+    } else {
+        None
+    };
 
     // Job execution shells out to `kubectl` and blocks synchronously; run it on a
     // blocking-pool thread so it can't stall the async runtime (and the heartbeat/
@@ -1717,7 +1740,13 @@ where
             ))?;
             Ok(())
         };
-        execute_job_with_reporter(&job, exec_provider.as_ref(), &exec_cancelled, &mut reporter)
+        execute_job_with_reporter(
+            &job,
+            materialization.as_deref(),
+            exec_provider.as_ref(),
+            &exec_cancelled,
+            &mut reporter,
+        )
     })
     .await
     .unwrap_or_else(|join_error| {
@@ -1774,6 +1803,38 @@ where
     }
 }
 
+async fn fetch_materialization(
+    client: &reqwest::Client,
+    api: &str,
+    lease_id: sandboxwich_core::LeaseId,
+) -> anyhow::Result<Vec<u8>> {
+    let mut response = client
+        .get(format!("{api}/leases/{lease_id}/materialization"))
+        .send()
+        .await?
+        .error_for_status()?;
+    let declared = response
+        .content_length()
+        .context("materialization response has no content-length")?;
+    anyhow::ensure!(
+        declared <= sandboxwich_core::MAX_SANDBOX_FILE_BYTES,
+        "materialization response exceeds 64 MiB"
+    );
+    let mut content = Vec::with_capacity(declared as usize);
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(
+            content.len() + chunk.len() <= sandboxwich_core::MAX_SANDBOX_FILE_BYTES as usize,
+            "materialization response exceeds 64 MiB"
+        );
+        content.extend_from_slice(&chunk);
+    }
+    anyhow::ensure!(
+        content.len() as u64 == declared,
+        "materialization response length mismatch"
+    );
+    Ok(content)
+}
+
 #[derive(Debug)]
 enum WorkerJobOutcome {
     Complete(WorkerJobResult),
@@ -1803,11 +1864,22 @@ fn execute_job(
     provider: &impl SandboxProvider,
     cancelled: &CancelSignal,
 ) -> anyhow::Result<WorkerJobOutcome> {
-    execute_job_with_reporter(job, provider, cancelled, &mut |_| Ok(()))
+    execute_job_with_reporter(job, None, provider, cancelled, &mut |_| Ok(()))
+}
+
+#[cfg(test)]
+fn execute_materialization_job(
+    job: &sandboxwich_core::Job,
+    content: &[u8],
+    provider: &impl SandboxProvider,
+    cancelled: &CancelSignal,
+) -> anyhow::Result<WorkerJobOutcome> {
+    execute_job_with_reporter(job, Some(content), provider, cancelled, &mut |_| Ok(()))
 }
 
 fn execute_job_with_reporter(
     job: &sandboxwich_core::Job,
+    materialization: Option<&[u8]>,
     provider: &impl SandboxProvider,
     cancelled: &CancelSignal,
     report: &mut dyn FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
@@ -1895,14 +1967,7 @@ fn execute_job_with_reporter(
                 .get("expectedSha256")
                 .and_then(serde_json::Value::as_str)
                 .context("materialization digest is missing")?;
-            let content = job
-                .payload
-                .get("transientContentBase64")
-                .and_then(serde_json::Value::as_str)
-                .context("materialization content was not supplied by the API")?;
-            let content = general_purpose::STANDARD
-                .decode(content)
-                .context("materialization content is invalid")?;
+            let content = materialization.context("materialization content was not fetched")?;
             anyhow::ensure!(
                 content.len() as u64 <= sandboxwich_core::MAX_SANDBOX_FILE_BYTES,
                 "materialization exceeds 64 MiB"
@@ -1911,7 +1976,7 @@ fn execute_job_with_reporter(
                 sandbox_id,
                 destination.clone(),
                 expected_sha256,
-                &content,
+                content,
                 cancelled,
             )?;
             Ok(WorkerJobOutcome::Complete(

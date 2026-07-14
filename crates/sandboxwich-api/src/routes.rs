@@ -155,6 +155,10 @@ pub(crate) fn app(state: AppState) -> Router {
         .route("/workers/{worker_id}/leases/claim", post(claim_lease))
         .route("/leases/{lease_id}/renew", post(renew_lease))
         .route(
+            "/leases/{lease_id}/materialization",
+            get(fetch_lease_materialization),
+        )
+        .route(
             "/leases/{lease_id}/provisioning",
             put(update_provisioning_stage),
         )

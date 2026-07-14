@@ -10,9 +10,10 @@ use crate::reconcile::*;
 use crate::rows::*;
 use crate::state::*;
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::{Extension, Path, State};
-use axum::http::HeaderMap;
-use base64::{Engine as _, engine::general_purpose};
+use axum::http::{HeaderMap, header};
+use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use sandboxwich_core::*;
 use serde_json::json;
@@ -70,7 +71,6 @@ pub(crate) async fn claim_lease(
     if let Some(operation_id) = operation_id
         && let Some(lease) = fetch_claim_operation(&state.db, worker_id, operation_id).await?
     {
-        let lease = enrich_materialization_lease(&state.db, lease).await?;
         return Ok(Json(ClaimLeaseResponse {
             ok: true,
             lease: Some(lease),
@@ -199,7 +199,6 @@ pub(crate) async fn claim_lease(
         )
         .await?
         {
-            let lease = enrich_materialization_lease(&state.db, lease).await?;
             return Ok(Json(ClaimLeaseResponse {
                 ok: true,
                 lease: Some(lease),
@@ -213,25 +212,36 @@ pub(crate) async fn claim_lease(
     }))
 }
 
-async fn enrich_materialization_lease(
-    db: &Database,
-    mut lease: JobLease,
-) -> Result<JobLease, ApiError> {
+pub(crate) async fn fetch_lease_materialization(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path(lease_id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let lease = ensure_lease_worker_scope(&state.db, LeaseId(lease_id), &ctx).await?;
+    if lease.status != LeaseStatus::Active || lease.expires_at <= Utc::now() {
+        return Err(ApiError::bad_request("materialization lease is not active"));
+    }
     if lease.job.kind != JobKind::MaterializeFile {
-        return Ok(lease);
+        return Err(ApiError::not_found("materialization not found"));
     }
     let sandbox_id = sandbox_id_from_job(&lease.job)?;
-    let stored = fetch_sandbox_file(db, sandbox_id, file_id_from_job(&lease.job)?).await?;
-    let payload = lease
-        .job
-        .payload
-        .as_object_mut()
-        .ok_or_else(|| ApiError::internal("materialization payload is not an object"))?;
-    payload.insert(
-        "transientContentBase64".to_string(),
-        json!(general_purpose::STANDARD.encode(stored.content)),
-    );
-    Ok(lease)
+    let stored = fetch_sandbox_file(&state.db, sandbox_id, file_id_from_job(&lease.job)?).await?;
+    validate_file_size(stored.content.len() as u64)?;
+    if stored.file.size_bytes != stored.content.len() as u64 {
+        return Err(ApiError::internal(
+            "materialization file size is inconsistent",
+        ));
+    }
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_LENGTH, stored.content.len().to_string()),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+        ],
+        Bytes::from(stored.content),
+    )
+        .into_response())
 }
 
 /// True if `job` references `sandbox_id` as its own sandbox, its fork parent, or its
@@ -1897,10 +1907,16 @@ pub(crate) async fn apply_failed_job_on_connection(
             )
             .await?;
         }
-        JobKind::ProvisionSandbox
-        | JobKind::StopSandbox
-        | JobKind::ResumeSandbox
-        | JobKind::MaterializeFile => {}
+        JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {}
+        JobKind::MaterializeFile => {
+            delete_sandbox_file_if_present_on_connection(
+                db,
+                connection,
+                sandbox_id_from_job(job)?,
+                file_id_from_job(job)?,
+            )
+            .await?;
+        }
     }
     Ok(())
 }

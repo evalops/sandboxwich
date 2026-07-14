@@ -91,6 +91,68 @@ async fn sandbox_read_reports_actual_worker_placement_proof() {
         .await
         .unwrap();
     assert_eq!(forbidden.status(), StatusCode::NOT_FOUND);
+
+    sqlx::query("update workers set labels = '{}' where id = ?")
+        .bind(&worker_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let corrupt_placed = client
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, created.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(corrupt_placed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let unplaced: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("unplaced-proof".into()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            workspace_mode: None,
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let planning: SandboxResponse = client
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, unplaced.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(planning.placement.is_none());
+    sqlx::query("update sandboxes set state = 'ready' where id = ?")
+        .bind(unplaced.sandbox.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let missing_ready = client
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, unplaced.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_ready.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[tokio::test]
@@ -376,7 +438,15 @@ async fn stop_before_first_provision_is_claimable_and_cannot_be_undone() {
             provider: "kubernetes".to_string(),
             capabilities: vec![WorkerCapability::ProvisionSandbox],
             max_concurrent_jobs: Some(1),
-            labels: Default::default(),
+            labels: [
+                ("provider_mode".to_string(), "apply".to_string()),
+                (
+                    "runtime_image".to_string(),
+                    "image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                ),
+            ]
+            .into(),
         })
         .send()
         .await

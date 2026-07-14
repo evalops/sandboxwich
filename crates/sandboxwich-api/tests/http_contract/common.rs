@@ -185,7 +185,16 @@ pub(crate) async fn run_contract(server: TestServer) {
                 WorkerCapability::RunCommand,
             ],
             max_concurrent_jobs: Some(1),
-            labels: [("cluster".to_string(), "k3s-dev".to_string())].into(),
+            labels: [
+                ("cluster".to_string(), "k3s-dev".to_string()),
+                ("provider_mode".to_string(), "apply".to_string()),
+                (
+                    "runtime_image".to_string(),
+                    "image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                ),
+            ]
+            .into(),
         })
         .send()
         .await

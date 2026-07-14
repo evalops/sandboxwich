@@ -253,7 +253,7 @@ pub(crate) async fn get_sandbox(
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<SandboxResponse>, ApiError> {
     let sandbox = ensure_sandbox_tenant(&state.db, SandboxId(sandbox_id), &ctx).await?;
-    let placement = fetch_sandbox_placement_proof(&state.db, sandbox.id).await?;
+    let placement = fetch_sandbox_placement_proof(&state.db, sandbox.id, &sandbox.state).await?;
     Ok(Json(SandboxResponse {
         ok: true,
         sandbox,
@@ -265,6 +265,7 @@ pub(crate) async fn get_sandbox(
 async fn fetch_sandbox_placement_proof(
     db: &Database,
     sandbox_id: SandboxId,
+    sandbox_state: &SandboxState,
 ) -> Result<Option<SandboxPlacementProof>, ApiError> {
     let sql = format!(
         "select p.worker_id, p.provider, w.labels
@@ -278,36 +279,36 @@ async fn fetch_sandbox_placement_proof(
         .fetch_optional(&db.pool)
         .await?
     else {
-        return Ok(None);
+        return if matches!(
+            sandbox_state,
+            SandboxState::Planning | SandboxState::Archiving | SandboxState::Archived
+        ) {
+            Ok(None)
+        } else {
+            Err(ApiError::internal("sandbox placement proof is missing"))
+        };
     };
     let worker_id: String = row.try_get("worker_id")?;
     let provider: String = row.try_get("provider")?;
     if provider.is_empty() {
-        return Ok(None);
+        return Err(ApiError::internal("worker placement provider is missing"));
     }
     let labels: String = row.try_get("labels")?;
-    let Ok(labels) = serde_json::from_str::<HashMap<String, String>>(&labels) else {
-        return Ok(None);
-    };
-    let Some(provider_mode) = labels
+    let labels: HashMap<String, String> = serde_json::from_str(&labels)
+        .map_err(|_| ApiError::internal("worker placement labels are invalid"))?;
+    let provider_mode = labels
         .get("provider_mode")
         .filter(|value| !value.is_empty())
         .cloned()
-    else {
-        return Ok(None);
-    };
-    let Some(runtime_image) = labels
+        .ok_or_else(|| ApiError::internal("worker placement provider mode is missing"))?;
+    let runtime_image = labels
         .get("runtime_image")
         .filter(|value| immutable_sha256_image(value))
         .cloned()
-    else {
-        return Ok(None);
-    };
-    let Ok(worker_id) = Uuid::parse_str(&worker_id) else {
-        return Ok(None);
-    };
+        .ok_or_else(|| ApiError::internal("worker placement runtime image is not digest-pinned"))?;
     Ok(Some(SandboxPlacementProof {
-        worker_id,
+        worker_id: Uuid::parse_str(&worker_id)
+            .map_err(|_| ApiError::internal("worker placement id is invalid"))?,
         provider,
         provider_mode,
         runtime_image,

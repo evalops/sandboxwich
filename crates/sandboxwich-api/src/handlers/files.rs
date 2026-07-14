@@ -375,6 +375,25 @@ pub(crate) async fn delete_sandbox_file_on_connection(
     Ok(())
 }
 
+pub(crate) async fn delete_sandbox_file_if_present_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    sandbox_id: SandboxId,
+    file_id: FileId,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "delete from sandbox_files where sandbox_id = {} and id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+    );
+    sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .bind(file_id.to_string())
+        .execute(connection)
+        .await?;
+    Ok(())
+}
+
 pub(crate) async fn fetch_sandbox_file_metadata_on_connection(
     db: &Database,
     connection: &mut AnyConnection,

@@ -1,6 +1,299 @@
 use crate::common::*;
 use reqwest::StatusCode;
 use sandboxwich_core::*;
+use sha2::{Digest, Sha256};
+
+#[tokio::test]
+async fn materialization_bytes_are_worker_fenced_ref_only_and_consumed_only_when_terminal() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("materialization.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+    let sandbox = create_sandbox(&client, &server, "materialization").await;
+    let worker: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "materialization-worker".into(),
+            provider: "kubernetes".into(),
+            capabilities: vec![
+                WorkerCapability::ProvisionSandbox,
+                WorkerCapability::MaterializeFile,
+            ],
+            max_concurrent_jobs: Some(1),
+            labels: [
+                ("provider_mode".into(), "apply".into()),
+                (
+                    "runtime_image".into(),
+                    "image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .into(),
+                ),
+            ]
+            .into(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let worker_client = worker_client(&worker);
+    let provision: ClaimLeaseResponse = worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox.sandbox.id),
+            kinds: Some(vec![JobKind::ProvisionSandbox]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let provision = provision.lease.unwrap();
+    worker_client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, provision.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::ProvisionSandbox {
+                handle: ProviderSandboxHandle {
+                    provider: "kubernetes".into(),
+                    sandbox_id: sandbox.sandbox.id,
+                    resources: provision_resources(sandbox.sandbox.id),
+                    metadata: serde_json::json!({}),
+                },
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let secret = b"private-apex-task".to_vec();
+    let uploaded: FileResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/files",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .multipart(
+            reqwest::multipart::Form::new()
+                .text("path", "task.zip")
+                .part("file", reqwest::multipart::Part::bytes(secret.clone())),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let digest = format!("{:x}", Sha256::digest(&secret));
+    let queued: JobResponse = client
+        .post(format!("{}/jobs", server.base_url))
+        .json(&CreateJobRequest {
+            kind: JobKind::MaterializeFile,
+            payload: serde_json::json!({
+                "sandboxId": sandbox.sandbox.id,
+                "fileId": uploaded.file.id,
+                "destination": "apex_task",
+                "expectedSha256": digest,
+            }),
+            required_capability: WorkerCapability::MaterializeFile,
+            priority: None,
+            max_attempts: Some(2),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    async fn claim_materialization(
+        client: &reqwest::Client,
+        server: &TestServer,
+        worker: &WorkerResponse,
+        sandbox: SandboxId,
+    ) -> JobLease {
+        let claimed: ClaimLeaseResponse = client
+            .post(format!(
+                "{}/workers/{}/leases/claim",
+                server.base_url, worker.worker.id
+            ))
+            .json(&ClaimLeaseRequest {
+                lease_seconds: Some(60),
+                sandbox_id: Some(sandbox),
+                kinds: Some(vec![JobKind::MaterializeFile]),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        claimed.lease.unwrap()
+    }
+
+    let first = claim_materialization(&worker_client, &server, &worker, sandbox.sandbox.id).await;
+    assert_eq!(first.job.id, queued.job.id);
+    assert!(first.job.payload.get("transientContentBase64").is_none());
+    let tenant_fetch = client
+        .get(format!(
+            "{}/leases/{}/materialization",
+            server.base_url, first.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tenant_fetch.status(), StatusCode::UNAUTHORIZED);
+    let fetched = worker_client
+        .get(format!(
+            "{}/leases/{}/materialization",
+            server.base_url, first.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(fetched.content_length(), Some(secret.len() as u64));
+    assert_eq!(fetched.bytes().await.unwrap().as_ref(), secret.as_slice());
+    worker_client
+        .post(format!("{}/leases/{}/fail", server.base_url, first.id))
+        .json(&FailLeaseRequest {
+            error: "retry".into(),
+            retry: true,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let retained: ListFilesResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/files",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(retained.files.len(), 1);
+
+    let second = claim_materialization(&worker_client, &server, &worker, sandbox.sandbox.id).await;
+    worker_client
+        .post(format!("{}/leases/{}/fail", server.base_url, second.id))
+        .json(&FailLeaseRequest {
+            error: "terminal".into(),
+            retry: false,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let consumed: ListFilesResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/files",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(consumed.files.is_empty());
+
+    let cancelled_file: FileResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/files",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .multipart(
+            reqwest::multipart::Form::new()
+                .text("path", "cancelled-task.zip")
+                .part("file", reqwest::multipart::Part::bytes(secret.clone())),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let cancelled_job: JobResponse = client
+        .post(format!("{}/jobs", server.base_url))
+        .json(&CreateJobRequest {
+            kind: JobKind::MaterializeFile,
+            payload: serde_json::json!({
+                "sandboxId": sandbox.sandbox.id,
+                "fileId": cancelled_file.file.id,
+                "destination": "apex_task",
+                "expectedSha256": format!("{:x}", Sha256::digest(&secret)),
+            }),
+            required_capability: WorkerCapability::MaterializeFile,
+            priority: None,
+            max_attempts: Some(1),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    client
+        .post(format!(
+            "{}/operations/{}/cancel",
+            server.base_url, cancelled_job.job.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let cancelled_consumed: ListFilesResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/files",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(cancelled_consumed.files.is_empty());
+}
 
 #[tokio::test]
 pub(crate) async fn job_can_be_fetched_by_id_with_tenant_isolation() {

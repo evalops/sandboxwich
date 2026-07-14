@@ -1,6 +1,5 @@
 use super::*;
 use crate::provider::SandboxTeardownSpec;
-use base64::engine::general_purpose;
 use chrono::Utc;
 use sandboxwich_core::{
     Job, JobId, JobStatus, MAX_COMMAND_STDIN_BYTES, RuntimeResourceKind, RuntimeResourcePurpose,
@@ -81,6 +80,7 @@ fn dispatches_provision_stage_reports_before_returning_the_handle() {
             json!({ "sandboxId": sandbox_id }),
             WorkerCapability::ProvisionSandbox,
         ),
+        None,
         &provider(),
         &CancelSignal::never_cancelled(),
         &mut |report| {
@@ -248,6 +248,7 @@ fn provisioning_failure_reports_typed_error_against_last_durable_stage() {
             json!({ "sandboxId": sandbox_id }),
             WorkerCapability::ProvisionSandbox,
         ),
+        None,
         &FailingStagedProvider { inner: provider() },
         &CancelSignal::never_cancelled(),
         &mut |report| {
@@ -374,12 +375,12 @@ fn oversized_command_stdin_is_rejected_before_provider_dispatch() {
 }
 
 #[test]
-fn materialization_dispatches_transient_bytes_and_returns_only_safe_receipt() {
+fn materialization_dispatches_fetched_bytes_and_returns_only_safe_receipt() {
     let sandbox_id = SandboxId::new();
     let file_id = sandboxwich_core::FileId::new();
     let content = b"private-apex-archive";
     let digest = format!("{:x}", sha2::Sha256::digest(content));
-    let outcome = execute_job(
+    let outcome = execute_materialization_job(
         &job(
             JobKind::MaterializeFile,
             json!({
@@ -387,10 +388,10 @@ fn materialization_dispatches_transient_bytes_and_returns_only_safe_receipt() {
                 "fileId": file_id,
                 "destination": "apex_task",
                 "expectedSha256": digest,
-                "transientContentBase64": general_purpose::STANDARD.encode(content),
             }),
             WorkerCapability::MaterializeFile,
         ),
+        content,
         &provider(),
         &CancelSignal::never_cancelled(),
     )
