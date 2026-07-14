@@ -209,6 +209,7 @@ pub(crate) async fn create_sandbox(
             ok: true,
             sandbox,
             operation: Some(operation_from_job(&job)?),
+            placement: None,
         }),
     ))
 }
@@ -252,11 +253,66 @@ pub(crate) async fn get_sandbox(
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<SandboxResponse>, ApiError> {
     let sandbox = ensure_sandbox_tenant(&state.db, SandboxId(sandbox_id), &ctx).await?;
+    let placement = fetch_sandbox_placement_proof(&state.db, sandbox.id).await?;
     Ok(Json(SandboxResponse {
         ok: true,
         sandbox,
         operation: None,
+        placement,
     }))
+}
+
+async fn fetch_sandbox_placement_proof(
+    db: &Database,
+    sandbox_id: SandboxId,
+) -> Result<Option<SandboxPlacementProof>, ApiError> {
+    let sql = format!(
+        "select p.worker_id, p.provider, w.labels
+           from sandbox_placements p
+           join workers w on w.id = p.worker_id
+          where p.sandbox_id = {}",
+        db.placeholder(1)
+    );
+    let Some(row) = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .fetch_optional(&db.pool)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let worker_id: String = row.try_get("worker_id")?;
+    let provider: String = row.try_get("provider")?;
+    if provider.is_empty() {
+        return Err(ApiError::internal("worker placement provider is missing"));
+    }
+    let labels: String = row.try_get("labels")?;
+    let labels: HashMap<String, String> = serde_json::from_str(&labels)
+        .map_err(|_| ApiError::internal("worker placement labels are invalid"))?;
+    let provider_mode = labels
+        .get("provider_mode")
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| ApiError::internal("worker placement provider mode is missing"))?;
+    let runtime_image = labels
+        .get("runtime_image")
+        .filter(|value| immutable_sha256_image(value))
+        .cloned()
+        .ok_or_else(|| ApiError::internal("worker placement runtime image is not digest-pinned"))?;
+    Ok(Some(SandboxPlacementProof {
+        worker_id: Uuid::parse_str(&worker_id)
+            .map_err(|_| ApiError::internal("worker placement id is invalid"))?,
+        provider,
+        provider_mode,
+        runtime_image,
+    }))
+}
+
+fn immutable_sha256_image(image: &str) -> bool {
+    image.rsplit_once('@').is_some_and(|(_, digest)| {
+        digest.len() == 71
+            && digest.starts_with("sha256:")
+            && digest[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
 }
 
 #[utoipa::path(
@@ -346,6 +402,7 @@ pub(crate) async fn stop_sandbox(
             ok: true,
             sandbox,
             operation: Some(operation_from_job(&job)?),
+            placement: None,
         }),
     ))
 }
@@ -464,6 +521,7 @@ pub(crate) async fn fork_sandbox(
             ok: true,
             sandbox: child,
             operation: Some(operation_from_job(&job)?),
+            placement: None,
         }),
     ))
 }
@@ -506,6 +564,7 @@ pub(crate) async fn transition_sandbox(
         ok: true,
         sandbox,
         operation: None,
+        placement: None,
     }))
 }
 

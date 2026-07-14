@@ -1,6 +1,97 @@
 use crate::common::*;
 use reqwest::StatusCode;
 use sandboxwich_core::*;
+use sqlx::any::AnyPoolOptions;
+use uuid::Uuid;
+
+#[tokio::test]
+async fn sandbox_read_reports_actual_worker_placement_proof() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("sandbox-placement-proof.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+    let created: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("placement-proof".into()),
+            template: Some(
+                "image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .into(),
+            ),
+            memory_limit: None,
+            network_egress: None,
+            workspace_mode: None,
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new()
+        .connect(&server.database_url)
+        .await
+        .unwrap();
+    let worker_id = Uuid::now_v7().to_string();
+    sqlx::query("insert into workers (id,tenant_id,name,status,provider,capabilities,labels,registered_at,last_heartbeat_at) values (?,?,?,?,?,?,?,?,?)")
+        .bind(&worker_id).bind("default").bind("actual-worker").bind("online")
+        .bind("kubernetes").bind("[\"provision_sandbox\"]")
+        .bind("{\"provider_mode\":\"apply\",\"runtime_image\":\"image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}")
+        .bind("2026-07-14T00:00:00Z").bind("2026-07-14T00:00:00Z")
+        .execute(&pool).await.unwrap();
+    sqlx::query("insert into sandbox_placements (sandbox_id,worker_id,provider,cluster,generation,created_at,updated_at) values (?,?,?,?,?,?,?)")
+        .bind(created.sandbox.id.to_string()).bind(&worker_id).bind("kubernetes")
+        .bind("cluster-a").bind(1_i64).bind("2026-07-14T00:00:00Z").bind("2026-07-14T00:00:00Z")
+        .execute(&pool).await.unwrap();
+    let fetched: SandboxResponse = client
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, created.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let proof = fetched.placement.expect("actual placement proof");
+    assert_eq!(proof.worker_id.to_string(), worker_id);
+    assert_eq!(proof.provider, "kubernetes");
+    assert_eq!(proof.provider_mode, "apply");
+    assert_eq!(
+        proof.runtime_image,
+        "image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    let tenant_b = reqwest::Client::builder()
+        .default_headers(
+            [(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {TEST_TENANT_B_TOKEN}").parse().unwrap(),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .build()
+        .unwrap();
+    let forbidden = tenant_b
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, created.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::NOT_FOUND);
+}
 
 #[tokio::test]
 async fn disposable_workspace_mode_round_trips_and_rejects_durable_operations() {

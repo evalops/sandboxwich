@@ -921,6 +921,16 @@ pub struct SandboxResponse {
     pub sandbox: Sandbox,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation: Option<Operation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<SandboxPlacementProof>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SandboxPlacementProof {
+    pub worker_id: Uuid,
+    pub provider: String,
+    pub provider_mode: String,
+    pub runtime_image: String,
 }
 
 /// Provider-facing projection used by external control planes to reconcile a
