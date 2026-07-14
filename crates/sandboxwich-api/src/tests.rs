@@ -42,6 +42,7 @@ fn db_enum_registry_covers_persisted_variant_columns() {
         ("sandboxes", "state"),
         ("sandboxes", "memory_limit"),
         ("sandboxes", "network_egress_mode"),
+        ("sandboxes", "execution_class"),
         ("sandbox_network_egress_rules", "kind"),
         ("commands", "status"),
         ("command_output_chunks", "stream"),
@@ -50,6 +51,7 @@ fn db_enum_registry_covers_persisted_variant_columns() {
         ("jobs", "kind"),
         ("jobs", "status"),
         ("jobs", "required_capability"),
+        ("jobs", "required_execution_class"),
         ("job_leases", "status"),
         ("guest_health", "status"),
         ("snapshots", "status"),
@@ -189,7 +191,7 @@ fn looks_like_cidr_rejects_garbage_and_out_of_range_prefixes() {
 #[test]
 fn db_enum_fingerprint_is_versioned_and_stable_for_current_registry() {
     let fingerprint = db_enum_schema_fingerprint();
-    assert!(fingerprint.starts_with("db-enum-v4:"));
+    assert!(fingerprint.starts_with("db-enum-v5:"));
     assert_eq!(fingerprint, db_enum_schema_fingerprint());
 }
 
@@ -351,6 +353,7 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
         status: JobStatus::Leased,
         payload: json!({ "sandboxId": sandbox.id }),
         required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
         priority: 0,
         attempts: 1,
         max_attempts: 3,
@@ -659,6 +662,7 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
         status: JobStatus::Leased,
         payload: json!({ "sandboxId": sandbox.id }),
         required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
         priority: 0,
         attempts: 1,
         max_attempts: 3,
@@ -736,6 +740,7 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
         status: JobStatus::Leased,
         payload: json!({ "sandboxId": sandbox.id }),
         required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
         priority: 0,
         attempts: 1,
         max_attempts: 3,
@@ -810,6 +815,7 @@ async fn seed_provision_job(db: &Database) -> Job {
         status: JobStatus::Leased,
         payload: json!({ "sandboxId": Uuid::now_v7().to_string() }),
         required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
         priority: 0,
         attempts: 0,
         max_attempts: 3,
@@ -968,6 +974,7 @@ async fn expire_due_leases_does_not_double_process_concurrent_sweeps() {
     let worker_id = seed_worker(&db).await;
     let now = Utc::now();
     let sandbox = Sandbox {
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         id: SandboxId::new(),
         tenant_id: "default".to_string(),
@@ -993,6 +1000,7 @@ async fn expire_due_leases_does_not_double_process_concurrent_sweeps() {
             "promptEventId": prompt_event_id.to_string(),
         }),
         required_capability: WorkerCapability::AgentPrompt,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
         priority: 0,
         attempts: 0,
         max_attempts: 3,
@@ -1029,6 +1037,7 @@ async fn expire_due_leases_does_not_double_process_concurrent_sweeps() {
 async fn seed_sandbox_with_state(db: &Database, state: SandboxState) -> Sandbox {
     let now = Utc::now();
     let sandbox = Sandbox {
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         id: SandboxId::new(),
         tenant_id: "default".to_string(),
@@ -1247,6 +1256,7 @@ async fn cleanup_archived_sandboxes_never_deletes_a_sandbox_with_a_live_restore_
     let db = test_sqlite_db().await;
     let now = Utc::now();
     let sandbox = Sandbox {
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         id: SandboxId::new(),
         tenant_id: "default".to_string(),

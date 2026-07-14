@@ -3,6 +3,104 @@ use reqwest::StatusCode;
 use sandboxwich_core::*;
 
 #[tokio::test]
+async fn execution_class_defaults_persists_and_inherits_through_fork() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("execution-class.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+
+    let defaulted: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            execution_class: None,
+            workspace_mode: None,
+            name: Some("execution-default".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        defaulted.sandbox.execution_class,
+        ExecutionClass::DevelopmentContainer
+    );
+
+    let vm: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            execution_class: Some(ExecutionClass::VirtualMachine),
+            workspace_mode: None,
+            name: Some("execution-vm".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(vm.sandbox.execution_class, ExecutionClass::VirtualMachine);
+
+    let fetched: SandboxResponse = client
+        .get(format!("{}/sandboxes/{}", server.base_url, vm.sandbox.id))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        fetched.sandbox.execution_class,
+        ExecutionClass::VirtualMachine
+    );
+
+    let child: SandboxResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/fork",
+            server.base_url, vm.sandbox.id
+        ))
+        .json(&CreateSandboxRequest {
+            execution_class: None,
+            workspace_mode: None,
+            name: Some("execution-vm-child".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        child.sandbox.execution_class,
+        ExecutionClass::VirtualMachine
+    );
+}
+
+#[tokio::test]
 async fn disposable_workspace_mode_round_trips_and_rejects_durable_operations() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!(
@@ -17,6 +115,7 @@ async fn disposable_workspace_mode_round_trips_and_rejects_durable_operations() 
     let created: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: Some(WorkspaceMode::Ephemeral),
             name: Some("disposable-contract".to_string()),
             template: None,
@@ -75,6 +174,7 @@ async fn disposable_workspace_mode_round_trips_and_rejects_durable_operations() 
             server.base_url, created.sandbox.id
         ))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some("unsupported-child".to_string()),
             template: None,
@@ -112,6 +212,7 @@ pub(crate) async fn list_sandboxes_hydrates_each_allowlist_sandboxes_own_rules()
     let single_rule: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some("egress-batch-single-rule".to_string()),
             template: None,
@@ -136,6 +237,7 @@ pub(crate) async fn list_sandboxes_hydrates_each_allowlist_sandboxes_own_rules()
     let multi_rule: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some("egress-batch-multi-rule".to_string()),
             template: None,
@@ -166,6 +268,7 @@ pub(crate) async fn list_sandboxes_hydrates_each_allowlist_sandboxes_own_rules()
     let no_rules: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some("egress-batch-deny-all".to_string()),
             template: None,
@@ -246,6 +349,7 @@ async fn stop_before_first_provision_is_claimable_and_cannot_be_undone() {
     let created: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some("stop-before-provision".to_string()),
             template: None,
@@ -402,6 +506,7 @@ pub(crate) async fn assert_resource_tiers_and_file_contracts(
     let sized: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some("sized-contract".to_string()),
             template: None,
@@ -436,6 +541,7 @@ pub(crate) async fn assert_resource_tiers_and_file_contracts(
     let host_allowlist = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some("host-egress-contract".to_string()),
             template: None,
@@ -680,6 +786,7 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
             server.base_url, sandbox.sandbox.id
         ))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             name: Some("race-child".to_string()),
             template: None,

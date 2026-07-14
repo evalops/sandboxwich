@@ -217,7 +217,7 @@ pub(crate) async fn cleanup_archived_sandboxes(
     db: &Database,
 ) -> Result<ArchivedSandboxCleanupResult, ApiError> {
     let rows = sqlx::query(
-        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode,
+        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, execution_class,
                 created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where state = 'archived' and ttl_seconds is not null

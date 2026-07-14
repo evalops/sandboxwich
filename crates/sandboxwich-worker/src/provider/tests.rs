@@ -330,6 +330,7 @@ fn kubernetes_workspace_modes_render_distinct_bounded_storage_contracts() {
     ] {
         let spec = SandboxProvisionSpec {
             workspace_mode: mode.clone(),
+            execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
             memory_limit: MemoryLimit::OneG,
             network_egress: NetworkEgress::DenyAll,
         };
@@ -373,6 +374,7 @@ fn configured_workspace_storage_overrides_non_default_tier_disk_size() {
             .with_workspace_storage(Some("20Gi".to_string()));
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::FourG,
         network_egress: NetworkEgress::DenyAll,
     };
@@ -390,9 +392,11 @@ fn configured_workspace_storage_overrides_non_default_tier_disk_size() {
 fn kubernetes_dry_run_renders_resource_network_and_runtime_class_controls() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Gvisor)
             .with_runtime_class_name(Some("gvisor".to_string()));
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::FourG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -432,7 +436,52 @@ fn kubernetes_dry_run_renders_resource_network_and_runtime_class_controls() {
         provider
             .capability_report()
             .capabilities
+            .contains(&WorkerCapability::SandboxedContainer)
+    );
+    assert!(
+        !provider
+            .capability_report()
+            .capabilities
+            .contains(&WorkerCapability::VirtualMachine)
+    );
+    assert!(
+        !provider
+            .capability_report()
+            .capabilities
             .contains(&WorkerCapability::GvisorSandbox)
+    );
+}
+
+#[test]
+fn kubernetes_dry_run_reports_exact_typed_isolation_capability() {
+    let development =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_runtime_class_name(Some("arbitrary-runtime".to_string()));
+    assert!(
+        !development
+            .capability_report()
+            .capabilities
+            .iter()
+            .any(|capability| matches!(
+                capability,
+                WorkerCapability::SandboxedContainer | WorkerCapability::VirtualMachine
+            ))
+    );
+
+    let kata =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Kata)
+            .with_runtime_class_name(Some("kata-qemu".to_string()));
+    assert!(
+        kata.capability_report()
+            .capabilities
+            .contains(&WorkerCapability::VirtualMachine)
+    );
+    assert!(
+        !kata
+            .capability_report()
+            .capabilities
+            .contains(&WorkerCapability::SandboxedContainer)
     );
 }
 
@@ -442,6 +491,7 @@ fn kubernetes_dry_run_rejects_host_allow_rules_for_standard_network_policy() {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -464,6 +514,7 @@ fn cilium_fqdn_backend_renders_host_allow_rules() {
             .with_cilium_fqdn_egress(true);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -527,6 +578,7 @@ fn host_rules_render_a_separate_gateway_and_no_direct_public_egress() {
     let sandbox_id = SandboxId::new();
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -655,6 +707,7 @@ fn host_rules_reject_an_unpinned_gateway_image() {
             ));
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -962,6 +1015,7 @@ fn allow_all_egress_carves_out_control_plane_and_dns_ranges() {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::AllowAll,
     };
@@ -1024,6 +1078,7 @@ fn allowlist_egress_carves_out_control_plane_ranges_contained_within_allowed_cid
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -1068,6 +1123,7 @@ fn allowlist_egress_leaves_disjoint_narrow_cidrs_untouched() {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -1100,6 +1156,7 @@ fn allowlist_egress_rejects_cidr_fully_covered_by_an_excluded_range() {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -1121,6 +1178,7 @@ fn allowlist_egress_rejects_cidr_exactly_equal_to_an_excluded_range() {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -1141,6 +1199,7 @@ fn allowlist_egress_carves_out_control_plane_ranges_when_wide_open_cidr_is_allow
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -1172,6 +1231,7 @@ fn ipv6_allowlist_cidr_containing_an_ipv6_excluded_range_carves_it_out() {
             .with_egress_excluded_cidrs(vec!["fd00:ec2::254/128".to_string()]);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -1207,6 +1267,7 @@ fn ipv6_allow_rule_is_unaffected_by_default_ipv4_excluded_cidrs() {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -1234,6 +1295,7 @@ fn operator_supplied_egress_excluded_cidrs_merge_with_defaults() {
             .with_egress_excluded_cidrs(vec!["172.16.0.0/12".to_string()]);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::AllowAll,
     };
@@ -1265,6 +1327,7 @@ fn with_egress_excluded_cidrs_replace_drops_the_defaults() {
             .with_egress_excluded_cidrs_replace(vec!["172.16.0.0/12".to_string()]);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::AllowAll,
     };
@@ -1289,6 +1352,7 @@ fn deny_all_egress_still_renders_no_egress_rules() {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::DenyAll,
     };
@@ -1369,6 +1433,7 @@ fn pod_disables_service_account_token_automount_and_sets_ephemeral_storage_limit
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::FourG,
         network_egress: NetworkEgress::DenyAll,
     };

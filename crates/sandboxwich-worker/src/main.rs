@@ -11,7 +11,7 @@ use std::{
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use provider::{
-    CancelSignal, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES, KUBERNETES_MUTATION_ENV,
+    CancelSignal, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES, IsolationProfile, KUBERNETES_MUTATION_ENV,
     KubernetesApplyProvider, KubernetesDryRunProvider, ProviderError, ReconciliationLimits,
     RetryDisposition, SandboxProvider, image_is_digest_pinned,
 };
@@ -265,6 +265,14 @@ struct ProviderArgs {
     #[arg(long, env = "SANDBOXWICH_RUNTIME_CLASS_NAME")]
     runtime_class_name: Option<String>,
 
+    #[arg(
+        long,
+        env = "SANDBOXWICH_ISOLATION_PROFILE",
+        value_enum,
+        default_value_t = IsolationProfile::Development
+    )]
+    isolation_profile: IsolationProfile,
+
     /// Enable CiliumNetworkPolicy `toFQDNs` rendering for host allow rules.
     /// The cluster must have Cilium CRDs and DNS proxy enforcement installed.
     #[arg(long, env = "SANDBOXWICH_CILIUM_FQDN_EGRESS", default_value_t = false)]
@@ -445,6 +453,8 @@ enum CapabilityArg {
     DesktopStream,
     FqdnEgress,
     K8sPod,
+    SandboxedContainer,
+    VirtualMachine,
     GvisorSandbox,
 }
 
@@ -618,28 +628,27 @@ async fn main() -> anyhow::Result<()> {
                         "agent_prompt",
                         "snapshot",
                         "desktop_stream",
-                        "k8s_pod",
-                        "gvisor_sandbox"
+                        "k8s_pod"
                     ]
                 }))?
             );
         }
         Command::ProviderCapabilities(args) => {
-            let provider = provider_from_args(args);
+            let provider = provider_from_args(args)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&provider.capability_report())?
             );
         }
         Command::ProviderHealth(args) => {
-            let provider = provider_from_args(args);
+            let provider = provider_from_args(args)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&provider.health_report())?
             );
         }
         Command::ProviderSmoke(args) => {
-            let provider = provider_from_args(args);
+            let provider = provider_from_args(args)?;
             let sandbox_id = sandboxwich_core::SandboxId::new();
             let child_sandbox_id = sandboxwich_core::SandboxId::new();
             let snapshot_id = sandboxwich_core::SnapshotId::new();
@@ -714,7 +723,12 @@ async fn main() -> anyhow::Result<()> {
                 &api,
                 args.name,
                 args.provider,
-                capabilities_from_args(args.capability, None, false),
+                capabilities_from_args(
+                    args.capability,
+                    IsolationProfile::Development,
+                    None,
+                    false,
+                )?,
                 args.label.into_iter().collect(),
                 // Standalone registration may be consumed by multiple
                 // work-once/work-loop processes, so preserve the operator's
@@ -780,6 +794,7 @@ async fn main() -> anyhow::Result<()> {
             print_json::<LeaseResponse>(response).await?;
         }
         Command::Run(args) => {
+            let isolation_profile = args.provider.provider.isolation_profile;
             let runtime_class_name = args.provider.provider.runtime_class_name.as_deref();
             let fqdn_egress_backend = args.provider.provider.cilium_fqdn_egress
                 || args
@@ -788,8 +803,12 @@ async fn main() -> anyhow::Result<()> {
                     .egress_gateway_image
                     .as_deref()
                     .is_some_and(image_is_digest_pinned);
-            let capabilities =
-                capabilities_from_args(args.capability, runtime_class_name, fqdn_egress_backend);
+            let capabilities = capabilities_from_args(
+                args.capability,
+                isolation_profile,
+                runtime_class_name,
+                fqdn_egress_backend,
+            )?;
             let labels: BTreeMap<_, _> = args.label.into_iter().collect();
             let response = register_worker(
                 &client,
@@ -867,7 +886,9 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
+fn provider_from_args(args: ProviderArgs) -> anyhow::Result<KubernetesDryRunProvider> {
+    let runtime_class_name = non_empty(args.runtime_class_name);
+    validate_isolation_configuration(args.isolation_profile, runtime_class_name.as_deref())?;
     let dns_service_ips = runtime_dns_service_ips(args.dns_service_ips);
     let provider = KubernetesDryRunProvider::with_snapshot_class(
         args.cluster,
@@ -879,7 +900,8 @@ fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
     .with_egress_gateway_image(non_empty(args.egress_gateway_image))
     .with_workspace_storage(non_empty(args.workspace_storage))
     .with_ssh_authorized_keys_secret(non_empty(args.ssh_authorized_keys_secret))
-    .with_runtime_class_name(non_empty(args.runtime_class_name))
+    .with_isolation_profile(args.isolation_profile)
+    .with_runtime_class_name(runtime_class_name)
     .with_cilium_fqdn_egress(args.cilium_fqdn_egress)
     .with_sandbox_namespace(non_empty(args.sandbox_namespace))
     .with_dns_namespace(non_empty(args.dns_namespace))
@@ -889,10 +911,10 @@ fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
     } else {
         provider.with_egress_excluded_cidrs(args.egress_excluded_cidrs)
     };
-    provider
+    Ok(provider
         .with_ingress_namespace(non_empty(args.ingress_namespace))
         .with_ingress_pod_selector(args.ingress_selector_label)
-        .with_vnc_password_secret(non_empty(args.vnc_password_secret))
+        .with_vnc_password_secret(non_empty(args.vnc_password_secret)))
 }
 
 fn resolver_ips_from_resolv_conf(contents: &str) -> Vec<IpAddr> {
@@ -1003,7 +1025,7 @@ fn require_explicit_runtime_image_for_apply(args: &ProviderArgs) -> anyhow::Resu
 
 fn apply_provider_from_args(args: ProviderApplyArgs) -> anyhow::Result<KubernetesApplyProvider> {
     require_explicit_runtime_image_for_apply(&args.provider)?;
-    let provider = provider_from_args(args.provider);
+    let provider = provider_from_args(args.provider)?;
     let mutation_enabled = KubernetesApplyProvider::mutation_enabled_from_env();
     if let Some(warning) = mutation_gate_force_enabled_warning(
         args.confirm_apply,
@@ -1023,7 +1045,7 @@ fn runtime_provider_from_args(args: RuntimeProviderArgs) -> anyhow::Result<Runti
     if matches!(args.provider_mode, ProviderModeArg::Apply) {
         require_explicit_runtime_image_for_apply(&args.provider)?;
     }
-    let provider = provider_from_args(args.provider);
+    let provider = provider_from_args(args.provider)?;
     Ok(match args.provider_mode {
         ProviderModeArg::DryRun => RuntimeProvider::DryRun(provider),
         ProviderModeArg::Apply => {
@@ -2044,27 +2066,65 @@ fn uuid_from_payload(payload: &serde_json::Value, field: &'static str) -> anyhow
 
 fn capabilities_from_args(
     capabilities: Vec<CapabilityArg>,
+    isolation_profile: IsolationProfile,
     runtime_class_name: Option<&str>,
     fqdn_egress_backend: bool,
-) -> Vec<WorkerCapability> {
-    if capabilities.is_empty() {
-        let mut defaults = vec![
+) -> anyhow::Result<Vec<WorkerCapability>> {
+    validate_isolation_configuration(isolation_profile, runtime_class_name)?;
+    if capabilities.iter().any(|capability| {
+        matches!(
+            capability,
+            CapabilityArg::SandboxedContainer
+                | CapabilityArg::VirtualMachine
+                | CapabilityArg::GvisorSandbox
+        )
+    }) {
+        anyhow::bail!(
+            "hostile-workload capabilities are derived from --isolation-profile and cannot be overridden with --capability"
+        );
+    }
+
+    let uses_default_capabilities = capabilities.is_empty();
+    let mut resolved = if uses_default_capabilities {
+        vec![
             WorkerCapability::K8sPod,
             WorkerCapability::ProvisionSandbox,
             WorkerCapability::RunCommand,
             WorkerCapability::Snapshot,
             WorkerCapability::DesktopStream,
-        ];
-        if runtime_class_name.is_some_and(|value| !value.trim().is_empty()) {
-            defaults.push(WorkerCapability::GvisorSandbox);
-        }
-        if fqdn_egress_backend {
-            defaults.push(WorkerCapability::FqdnEgress);
-        }
-        defaults
+        ]
     } else {
         capabilities.into_iter().map(to_capability).collect()
+    };
+    match isolation_profile {
+        IsolationProfile::Development => {}
+        IsolationProfile::Gvisor => resolved.push(WorkerCapability::SandboxedContainer),
+        IsolationProfile::Kata => resolved.push(WorkerCapability::VirtualMachine),
     }
+    if uses_default_capabilities
+        && fqdn_egress_backend
+        && !resolved.contains(&WorkerCapability::FqdnEgress)
+    {
+        resolved.push(WorkerCapability::FqdnEgress);
+    }
+    Ok(resolved)
+}
+
+fn validate_isolation_configuration(
+    isolation_profile: IsolationProfile,
+    runtime_class_name: Option<&str>,
+) -> anyhow::Result<()> {
+    if matches!(
+        isolation_profile,
+        IsolationProfile::Gvisor | IsolationProfile::Kata
+    ) && runtime_class_name.is_none_or(|value| value.trim().is_empty())
+    {
+        anyhow::bail!(
+            "--isolation-profile {} requires a non-empty --runtime-class-name",
+            isolation_profile.as_str()
+        );
+    }
+    Ok(())
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -2101,6 +2161,8 @@ fn to_capability(value: CapabilityArg) -> WorkerCapability {
         CapabilityArg::DesktopStream => WorkerCapability::DesktopStream,
         CapabilityArg::FqdnEgress => WorkerCapability::FqdnEgress,
         CapabilityArg::K8sPod => WorkerCapability::K8sPod,
+        CapabilityArg::SandboxedContainer => WorkerCapability::SandboxedContainer,
+        CapabilityArg::VirtualMachine => WorkerCapability::VirtualMachine,
         CapabilityArg::GvisorSandbox => WorkerCapability::GvisorSandbox,
     }
 }

@@ -99,12 +99,14 @@ pub(crate) async fn queue_command(
             "env": env,
             "timeoutSecs": timeout_secs,
             "provisionSpec": SandboxProvisionSpec {
+                execution_class: sandbox.execution_class.clone(),
                 memory_limit: sandbox.memory_limit.clone(),
                 network_egress: sandbox.network_egress.clone(),
                 workspace_mode: sandbox.workspace_mode.clone(),
             }
         }),
         required_capability: WorkerCapability::RunCommand,
+        required_execution_class: sandbox.execution_class,
         priority: 0,
         attempts: 0,
         max_attempts: 3,

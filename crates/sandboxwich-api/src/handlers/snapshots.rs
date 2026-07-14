@@ -62,6 +62,7 @@ pub(crate) async fn create_snapshot(
             "snapshotId": snapshot.id
         }),
         required_capability: WorkerCapability::Snapshot,
+        required_execution_class: sandbox.execution_class,
         priority: 0,
         attempts: 0,
         max_attempts: 3,
@@ -130,6 +131,7 @@ pub(crate) async fn fork_snapshot(
         claim_snapshot_restore_source_on_connection(&state.db, &mut tx, snapshot_id, &ctx, now)
             .await?;
     let child = Sandbox {
+        execution_class: restore_source.execution_class.clone(),
         id: SandboxId::new(),
         tenant_id: ctx.tenant_id.clone(),
         name: request
@@ -155,12 +157,14 @@ pub(crate) async fn fork_snapshot(
             "childSandboxId": child.id,
             "snapshotId": snapshot_id,
             "provisionSpec": SandboxProvisionSpec {
+                execution_class: child.execution_class.clone(),
                 memory_limit: child.memory_limit.clone(),
                 network_egress: child.network_egress.clone(),
                 workspace_mode: child.workspace_mode.clone(),
             }
         }),
         required_capability: fork_capability(&child.network_egress),
+        required_execution_class: child.execution_class.clone(),
         priority: 0,
         attempts: 0,
         max_attempts: 3,
@@ -207,6 +211,7 @@ pub(crate) async fn fork_snapshot(
 #[derive(Debug)]
 pub(crate) struct SnapshotRestoreSource {
     source_sandbox_id: SandboxId,
+    execution_class: ExecutionClass,
 }
 
 pub(crate) async fn claim_snapshot_restore_source_on_connection(
@@ -221,7 +226,8 @@ pub(crate) async fn claim_snapshot_restore_source_on_connection(
         SqlDialect::Sqlite => "",
     };
     let sql = format!(
-        "select snapshot_restore_sources.source_sandbox_id
+        "select snapshot_restore_sources.source_sandbox_id,
+                snapshot_restore_sources.execution_class
            from snapshot_restore_sources
           where snapshot_restore_sources.snapshot_id = {}
             and snapshot_restore_sources.tenant_id = {}
@@ -245,8 +251,11 @@ pub(crate) async fn claim_snapshot_restore_source_on_connection(
         )));
     };
     let source_sandbox_id: String = row.try_get("source_sandbox_id")?;
+    let execution_class: String = row.try_get("execution_class")?;
     Ok(SnapshotRestoreSource {
         source_sandbox_id: SandboxId(parse_uuid(&source_sandbox_id)?),
+        execution_class: ExecutionClass::parse_db_str(&execution_class)
+            .map_err(|_| ApiError::internal("database contains invalid execution class"))?,
     })
 }
 
@@ -355,8 +364,8 @@ pub(crate) async fn insert_snapshot_on_connection(
         .await?;
     let restore_sql = format!(
         "insert into snapshot_restore_sources
-         (snapshot_id, tenant_id, source_sandbox_id, status, expires_at)
-         select {}, tenant_id, {}, {}, {} from sandboxes where id = {}",
+         (snapshot_id, tenant_id, source_sandbox_id, execution_class, status, expires_at)
+         select {}, tenant_id, {}, execution_class, {}, {} from sandboxes where id = {}",
         db.placeholder(1),
         db.placeholder(2),
         db.placeholder(3),
@@ -732,7 +741,7 @@ pub(crate) async fn queue_forks_waiting_on_snapshot_on_connection(
     parent_sandbox_id: SandboxId,
 ) -> Result<(), ApiError> {
     let sql = format!(
-        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode,
+        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, execution_class,
                 created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where parent_snapshot_id = {} and state = 'planning'
@@ -761,12 +770,14 @@ pub(crate) async fn queue_forks_waiting_on_snapshot_on_connection(
                     "childSandboxId": child.id,
                     "snapshotId": snapshot_id,
                     "provisionSpec": SandboxProvisionSpec {
+                        execution_class: child.execution_class.clone(),
                         memory_limit: child.memory_limit.clone(),
                         network_egress: child.network_egress.clone(),
                         workspace_mode: child.workspace_mode.clone(),
                     }
                 }),
                 required_capability: fork_capability(&child.network_egress),
+                required_execution_class: child.execution_class.clone(),
                 priority: 0,
                 attempts: 0,
                 max_attempts: 3,
@@ -803,7 +814,7 @@ pub(crate) async fn fail_sandboxes_waiting_on_snapshot_on_connection(
     error: &str,
 ) -> Result<(), ApiError> {
     let sql = format!(
-        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode,
+        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, execution_class,
                 created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where parent_snapshot_id = {} and state = 'planning'

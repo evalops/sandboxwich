@@ -39,8 +39,14 @@ pub(crate) fn provision_spec_from_request(
         .clone()
         .or_else(|| parent.map(|sandbox| sandbox.workspace_mode.clone()))
         .unwrap_or_default();
+    let execution_class = request
+        .execution_class
+        .clone()
+        .or_else(|| parent.map(|sandbox| sandbox.execution_class.clone()))
+        .unwrap_or_default();
     validate_network_egress(&network_egress)?;
     Ok(SandboxProvisionSpec {
+        execution_class,
         memory_limit,
         network_egress,
         workspace_mode,
@@ -114,6 +120,14 @@ pub(crate) fn provision_capability(network_egress: &NetworkEgress) -> WorkerCapa
     }
 }
 
+pub(crate) fn execution_capability(execution_class: &ExecutionClass) -> WorkerCapability {
+    match execution_class {
+        ExecutionClass::DevelopmentContainer => WorkerCapability::ProvisionSandbox,
+        ExecutionClass::SandboxedContainer => WorkerCapability::SandboxedContainer,
+        ExecutionClass::VirtualMachine => WorkerCapability::VirtualMachine,
+    }
+}
+
 pub(crate) fn fork_capability(network_egress: &NetworkEgress) -> WorkerCapability {
     if network_egress
         .rules()
@@ -149,6 +163,7 @@ pub(crate) async fn create_sandbox(
     let now = Utc::now();
     let provision_spec = provision_spec_from_request(&request, None)?;
     let sandbox = Sandbox {
+        execution_class: provision_spec.execution_class.clone(),
         id: SandboxId::new(),
         tenant_id: ctx.tenant_id.clone(),
         name: request.name.unwrap_or_else(|| "fresh-sandwich".to_string()),
@@ -170,6 +185,7 @@ pub(crate) async fn create_sandbox(
         status: JobStatus::Queued,
         payload: json!({"sandboxId": sandbox.id, "provisionSpec": provision_spec}),
         required_capability: provision_capability(&sandbox.network_egress),
+        required_execution_class: sandbox.execution_class.clone(),
         priority: 0,
         attempts: 0,
         max_attempts: 3,
@@ -222,7 +238,7 @@ pub(crate) async fn list_sandboxes(
     let cursor = resolve_page_cursor(&page)?;
 
     let base_sql = format!(
-        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode,
+        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, execution_class,
                 created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where tenant_id = {}",
@@ -305,6 +321,7 @@ pub(crate) async fn stop_sandbox(
             "deleteGkeFqdnPolicy": delete_gke_fqdn_policy,
         }),
         required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: sandbox.execution_class.clone(),
         priority: 100,
         attempts: 0,
         max_attempts: 3,
@@ -397,6 +414,7 @@ pub(crate) async fn fork_sandbox(
         error: None,
     };
     let child = Sandbox {
+        execution_class: provision_spec.execution_class,
         id: SandboxId::new(),
         tenant_id: parent.tenant_id.clone(),
         name: request
@@ -419,9 +437,15 @@ pub(crate) async fn fork_sandbox(
         kind: JobKind::CreateSnapshot,
         status: JobStatus::Queued,
         payload: json!({"sandboxId": parent.id, "snapshotId": snapshot.id,
-            "operation": { "kind": OperationKind::ForkSandbox, "resourceId": child.id },
-            "provisionSpec": SandboxProvisionSpec { memory_limit: parent.memory_limit.clone(), network_egress: parent.network_egress.clone(), workspace_mode: parent.workspace_mode.clone() }}),
+        "operation": { "kind": OperationKind::ForkSandbox, "resourceId": child.id },
+        "provisionSpec": SandboxProvisionSpec {
+            execution_class: parent.execution_class.clone(),
+            memory_limit: parent.memory_limit.clone(),
+            network_egress: parent.network_egress.clone(),
+            workspace_mode: parent.workspace_mode.clone(),
+        }}),
         required_capability: WorkerCapability::Snapshot,
+        required_execution_class: parent.execution_class.clone(),
         priority: 0,
         attempts: 0,
         max_attempts: 3,
@@ -656,7 +680,7 @@ pub(crate) async fn fetch_sandbox(
     sandbox_id: SandboxId,
 ) -> Result<Sandbox, ApiError> {
     let sql = format!(
-        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode,
+        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, execution_class,
                 created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where id = {}",
@@ -679,7 +703,7 @@ pub(crate) async fn fetch_sandbox_on_connection(
     sandbox_id: SandboxId,
 ) -> Result<Sandbox, ApiError> {
     let sql = format!(
-        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode,
+        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, execution_class,
                 created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where id = {}",
@@ -745,10 +769,10 @@ pub(crate) async fn insert_sandbox_on_connection(
 ) -> Result<(), ApiError> {
     let sql = format!(
         "insert into sandboxes
-         (id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode,
+         (id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, execution_class,
           created_at, updated_at, ttl_seconds, parent_snapshot_id)
          values ({})",
-        db.placeholders(12)
+        db.placeholders(13)
     );
     sqlx::query(&sql)
         .bind(sandbox.id.to_string())
@@ -759,6 +783,7 @@ pub(crate) async fn insert_sandbox_on_connection(
         .bind(memory_limit_to_str(&sandbox.memory_limit))
         .bind(network_egress_mode_to_str(&sandbox.network_egress.mode()))
         .bind(sandbox.workspace_mode.as_db_str())
+        .bind(sandbox.execution_class.as_db_str())
         .bind(sandbox.created_at.to_rfc3339())
         .bind(sandbox.updated_at.to_rfc3339())
         .bind(sandbox.ttl_seconds.map(|ttl| ttl as i64))
