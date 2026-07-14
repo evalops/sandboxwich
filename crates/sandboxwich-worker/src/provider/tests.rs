@@ -392,6 +392,7 @@ fn configured_workspace_storage_overrides_non_default_tier_disk_size() {
 fn kubernetes_dry_run_renders_resource_network_and_runtime_class_controls() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Gvisor)
             .with_runtime_class_name(Some("gvisor".to_string()));
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
@@ -435,7 +436,52 @@ fn kubernetes_dry_run_renders_resource_network_and_runtime_class_controls() {
         provider
             .capability_report()
             .capabilities
+            .contains(&WorkerCapability::SandboxedContainer)
+    );
+    assert!(
+        !provider
+            .capability_report()
+            .capabilities
+            .contains(&WorkerCapability::VirtualMachine)
+    );
+    assert!(
+        !provider
+            .capability_report()
+            .capabilities
             .contains(&WorkerCapability::GvisorSandbox)
+    );
+}
+
+#[test]
+fn kubernetes_dry_run_reports_exact_typed_isolation_capability() {
+    let development =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_runtime_class_name(Some("arbitrary-runtime".to_string()));
+    assert!(
+        !development
+            .capability_report()
+            .capabilities
+            .iter()
+            .any(|capability| matches!(
+                capability,
+                WorkerCapability::SandboxedContainer | WorkerCapability::VirtualMachine
+            ))
+    );
+
+    let kata =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Kata)
+            .with_runtime_class_name(Some("kata-qemu".to_string()));
+    assert!(
+        kata.capability_report()
+            .capabilities
+            .contains(&WorkerCapability::VirtualMachine)
+    );
+    assert!(
+        !kata
+            .capability_report()
+            .capabilities
+            .contains(&WorkerCapability::SandboxedContainer)
     );
 }
 

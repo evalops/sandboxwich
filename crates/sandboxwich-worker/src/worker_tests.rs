@@ -597,7 +597,9 @@ fn resume_sandbox_job_fails_instead_of_silently_succeeding() {
 
 #[test]
 fn default_registration_capabilities_cover_supported_worker_jobs() {
-    let capabilities = capabilities_from_args(Vec::new(), None, false);
+    let capabilities =
+        capabilities_from_args(Vec::new(), IsolationProfile::Development, None, false)
+            .expect("development capability defaults are valid");
 
     assert!(capabilities.contains(&WorkerCapability::ProvisionSandbox));
     assert!(capabilities.contains(&WorkerCapability::RunCommand));
@@ -605,25 +607,135 @@ fn default_registration_capabilities_cover_supported_worker_jobs() {
     assert!(capabilities.contains(&WorkerCapability::Snapshot));
     assert!(capabilities.contains(&WorkerCapability::K8sPod));
     assert!(!capabilities.contains(&WorkerCapability::GvisorSandbox));
+    assert!(!capabilities.contains(&WorkerCapability::SandboxedContainer));
+    assert!(!capabilities.contains(&WorkerCapability::VirtualMachine));
 }
 
 #[test]
-fn default_registration_capabilities_include_gvisor_when_runtime_class_is_configured() {
-    let capabilities = capabilities_from_args(Vec::new(), Some("gvisor"), false);
+fn capabilities_from_args_report_only_the_typed_isolation_profile() {
+    let gvisor =
+        capabilities_from_args(Vec::new(), IsolationProfile::Gvisor, Some("gvisor"), false)
+            .expect("gVisor with a RuntimeClass is valid");
+    assert!(gvisor.contains(&WorkerCapability::SandboxedContainer));
+    assert!(!gvisor.contains(&WorkerCapability::VirtualMachine));
+    assert!(!gvisor.contains(&WorkerCapability::GvisorSandbox));
 
-    assert!(capabilities.contains(&WorkerCapability::GvisorSandbox));
+    let kata = capabilities_from_args(Vec::new(), IsolationProfile::Kata, Some("kata-qemu"), false)
+        .expect("Kata with a RuntimeClass is valid");
+    assert!(kata.contains(&WorkerCapability::VirtualMachine));
+    assert!(!kata.contains(&WorkerCapability::SandboxedContainer));
+    assert!(!kata.contains(&WorkerCapability::GvisorSandbox));
+
+    let development = capabilities_from_args(
+        Vec::new(),
+        IsolationProfile::Development,
+        Some("arbitrary-runtime"),
+        false,
+    )
+    .expect("development may render an operator-owned RuntimeClass");
+    assert!(!development.contains(&WorkerCapability::SandboxedContainer));
+    assert!(!development.contains(&WorkerCapability::VirtualMachine));
+    assert!(!development.contains(&WorkerCapability::GvisorSandbox));
+}
+
+#[test]
+fn capabilities_from_args_reject_invalid_isolation_configuration() {
+    assert!(capabilities_from_args(Vec::new(), IsolationProfile::Gvisor, None, false).is_err());
+    assert!(capabilities_from_args(Vec::new(), IsolationProfile::Kata, None, false).is_err());
+    for hostile_override in [
+        CapabilityArg::SandboxedContainer,
+        CapabilityArg::VirtualMachine,
+        CapabilityArg::GvisorSandbox,
+    ] {
+        assert!(
+            capabilities_from_args(
+                vec![hostile_override],
+                IsolationProfile::Development,
+                None,
+                false,
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn isolation_profile_cli_is_typed_validated_and_passed_to_provider() {
+    let missing_runtime_class = Cli::try_parse_from([
+        "sandboxwich-worker",
+        "provider-capabilities",
+        "--isolation-profile",
+        "gvisor",
+    ])
+    .expect("gVisor is a typed isolation profile");
+    let Command::ProviderCapabilities(args) = missing_runtime_class.command else {
+        panic!("expected provider-capabilities command");
+    };
+    assert!(provider_from_args(args).is_err());
+
+    let kata = Cli::try_parse_from([
+        "sandboxwich-worker",
+        "provider-capabilities",
+        "--isolation-profile",
+        "kata",
+        "--runtime-class-name",
+        "kata-qemu",
+    ])
+    .expect("Kata profile and operator-owned RuntimeClass parse");
+    let Command::ProviderCapabilities(args) = kata.command else {
+        panic!("expected provider-capabilities command");
+    };
+    let report = provider_from_args(args)
+        .expect("Kata with a RuntimeClass is valid")
+        .capability_report();
+    assert_eq!(
+        report.labels.get("isolation_profile"),
+        Some(&"kata".to_string())
+    );
+    assert_eq!(
+        report.labels.get("runtime_class_name"),
+        Some(&"kata-qemu".to_string())
+    );
+    assert!(
+        report
+            .capabilities
+            .contains(&WorkerCapability::VirtualMachine)
+    );
+    assert!(
+        !report
+            .capabilities
+            .contains(&WorkerCapability::SandboxedContainer)
+    );
+
+    assert!(
+        Cli::try_parse_from([
+            "sandboxwich-worker",
+            "provider-capabilities",
+            "--isolation-profile",
+            "untyped-runtime",
+        ])
+        .is_err()
+    );
 }
 
 #[test]
 fn default_registration_capabilities_include_fqdn_when_a_backend_is_enabled() {
-    let capabilities = capabilities_from_args(Vec::new(), None, true);
+    let capabilities =
+        capabilities_from_args(Vec::new(), IsolationProfile::Development, None, true)
+            .expect("development FQDN defaults are valid");
 
     assert!(capabilities.contains(&WorkerCapability::FqdnEgress));
 }
 
 #[test]
 fn explicit_registration_capabilities_can_select_fqdn_egress() {
-    let capabilities = capabilities_from_args(vec![CapabilityArg::FqdnEgress], None, false);
+    let capabilities = capabilities_from_args(
+        vec![CapabilityArg::FqdnEgress],
+        IsolationProfile::Development,
+        None,
+        false,
+    )
+    .expect("functional capability override is valid");
 
     assert_eq!(capabilities, vec![WorkerCapability::FqdnEgress]);
 }

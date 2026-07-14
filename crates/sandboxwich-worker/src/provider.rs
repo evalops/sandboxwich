@@ -13,6 +13,7 @@ use std::{
 use anyhow::{Context, bail};
 use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
+use clap::ValueEnum;
 use ipnet::IpNet;
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, MemoryLimit, NetworkAllowRuleKind, NetworkEgress,
@@ -33,6 +34,24 @@ use crate::egress_gateway::EgressGatewayPolicy;
 pub enum RetryDisposition {
     Retryable,
     Permanent,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum IsolationProfile {
+    #[default]
+    Development,
+    Gvisor,
+    Kata,
+}
+
+impl IsolationProfile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Development => "development",
+            Self::Gvisor => "gvisor",
+            Self::Kata => "kata",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -268,6 +287,7 @@ pub struct KubernetesDryRunProvider {
     workspace_storage: String,
     workspace_storage_override: bool,
     ssh_authorized_keys_secret: Option<String>,
+    isolation_profile: IsolationProfile,
     runtime_class_name: Option<String>,
     isolation_backend: String,
     /// Dedicated namespace sandbox pods/services/PVCs/NetworkPolicies are
@@ -329,6 +349,7 @@ impl KubernetesDryRunProvider {
             workspace_storage: "2Gi".to_string(),
             workspace_storage_override: false,
             ssh_authorized_keys_secret: None,
+            isolation_profile: IsolationProfile::Development,
             runtime_class_name: None,
             isolation_backend: "kubernetes".to_string(),
             sandbox_namespace: None,
@@ -373,6 +394,11 @@ impl KubernetesDryRunProvider {
 
     pub fn with_ssh_authorized_keys_secret(mut self, secret: Option<String>) -> Self {
         self.ssh_authorized_keys_secret = secret;
+        self
+    }
+
+    pub fn with_isolation_profile(mut self, isolation_profile: IsolationProfile) -> Self {
+        self.isolation_profile = isolation_profile;
         self
     }
 
@@ -565,6 +591,10 @@ impl KubernetesDryRunProvider {
             "workspace_storage".to_string(),
             self.workspace_storage.clone(),
         );
+        labels.insert(
+            "isolation_profile".to_string(),
+            self.isolation_profile.as_str().to_string(),
+        );
         if let Some(secret) = &self.ssh_authorized_keys_secret {
             labels.insert("ssh_authorized_keys_secret".to_string(), secret.clone());
         }
@@ -650,6 +680,7 @@ impl KubernetesDryRunProvider {
     fn isolation_metadata(&self) -> serde_json::Value {
         json!({
             "backend": self.isolation_backend,
+            "profile": self.isolation_profile.as_str(),
             "runtimeClassName": self.runtime_class_name
         })
     }
@@ -3504,7 +3535,15 @@ impl SandboxProvider for KubernetesDryRunProvider {
             WorkerCapability::DesktopStream,
         ];
         if self.runtime_class_name.is_some() {
-            capabilities.push(WorkerCapability::GvisorSandbox);
+            match self.isolation_profile {
+                IsolationProfile::Development => {}
+                IsolationProfile::Gvisor => {
+                    capabilities.push(WorkerCapability::SandboxedContainer);
+                }
+                IsolationProfile::Kata => {
+                    capabilities.push(WorkerCapability::VirtualMachine);
+                }
+            }
         }
         if self.fqdn_egress_backend.as_deref() == Some("cilium")
             || self
