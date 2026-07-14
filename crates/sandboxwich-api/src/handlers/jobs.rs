@@ -2,6 +2,7 @@ use crate::auth::*;
 use crate::db::*;
 use crate::error::*;
 use crate::handlers::commands::*;
+use crate::handlers::files::*;
 use crate::handlers::leases::*;
 use crate::handlers::sandboxes::*;
 use crate::handlers::snapshots::*;
@@ -13,6 +14,7 @@ use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
 use chrono::Utc;
 use sandboxwich_core::*;
+use sha2::Digest;
 use sqlx::AnyConnection;
 use uuid::Uuid;
 
@@ -23,6 +25,16 @@ pub(crate) async fn create_job(
 ) -> Result<Json<JobResponse>, ApiError> {
     if request.kind == JobKind::RunCommand {
         validate_run_command_job_input(&request.payload)?;
+    }
+    if request.kind == JobKind::MaterializeFile {
+        validate_materialize_file_job_input(&request.payload)?;
+    }
+    if request.kind == JobKind::MaterializeFile
+        && request.required_capability != WorkerCapability::MaterializeFile
+    {
+        return Err(ApiError::bad_request(
+            "materialize_file requires the materialize_file capability",
+        ));
     }
     let now = Utc::now();
     let mut job = Job {
@@ -47,6 +59,42 @@ pub(crate) async fn create_job(
         ok: true,
         job: job.into(),
     }))
+}
+
+pub(crate) fn validate_materialize_file_job_input(
+    payload: &serde_json::Value,
+) -> Result<(), ApiError> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("materialization payload must be an object"))?;
+    const REQUIRED_KEYS: [&str; 4] = ["sandboxId", "fileId", "destination", "expectedSha256"];
+    if object.len() != REQUIRED_KEYS.len()
+        || REQUIRED_KEYS.iter().any(|key| !object.contains_key(*key))
+    {
+        return Err(ApiError::bad_request(
+            "materialization payload must contain only sandboxId, fileId, destination, and expectedSha256",
+        ));
+    }
+    let probe = Job {
+        id: JobId::new(),
+        tenant_id: String::new(),
+        kind: JobKind::MaterializeFile,
+        status: JobStatus::Queued,
+        payload: payload.clone(),
+        required_capability: WorkerCapability::MaterializeFile,
+        priority: 0,
+        attempts: 0,
+        max_attempts: 1,
+        scheduled_at: Utc::now(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        last_error: None,
+    };
+    sandbox_id_from_job(&probe)?;
+    file_id_from_job(&probe)?;
+    materialization_destination_from_job(&probe)?;
+    materialization_digest_from_job(&probe)?;
+    Ok(())
 }
 
 fn validate_run_command_job_input(payload: &serde_json::Value) -> Result<(), ApiError> {
@@ -122,7 +170,8 @@ pub(crate) async fn enrich_job_payload_with_provision_spec(
         JobKind::RunPrompt
         | JobKind::CreateSnapshot
         | JobKind::StopSandbox
-        | JobKind::ResumeSandbox => {}
+        | JobKind::ResumeSandbox
+        | JobKind::MaterializeFile => {}
     }
     Ok(())
 }
@@ -162,6 +211,19 @@ pub(crate) async fn validate_job_payload_tenant(
             let command = fetch_command(db, command_id_from_job(job)?).await?;
             ensure_sandbox_tenant(db, command.sandbox_id, ctx).await?;
         }
+        JobKind::MaterializeFile => {
+            let sandbox = ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
+            let file_id = file_id_from_job(job)?;
+            let stored = fetch_sandbox_file(db, sandbox.id, file_id).await?;
+            let expected = materialization_digest_from_job(job)?;
+            let observed = format!("{:x}", sha2::Sha256::digest(&stored.content));
+            if expected != observed {
+                return Err(ApiError::bad_request(
+                    "materialization digest does not match file",
+                ));
+            }
+            materialization_destination_from_job(job)?;
+        }
         JobKind::RunPrompt => {
             ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
         }
@@ -182,6 +244,47 @@ pub(crate) async fn validate_job_payload_tenant(
         }
     }
     Ok(())
+}
+
+pub(crate) fn file_id_from_job(job: &Job) -> Result<FileId, ApiError> {
+    let value = job
+        .payload
+        .get("fileId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ApiError::bad_request("materialization fileId is required"))?;
+    Ok(FileId(Uuid::parse_str(value).map_err(|_| {
+        ApiError::bad_request("materialization fileId is invalid")
+    })?))
+}
+
+pub(crate) fn materialization_digest_from_job(job: &Job) -> Result<&str, ApiError> {
+    let value = job
+        .payload
+        .get("expectedSha256")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ApiError::bad_request("materialization expectedSha256 is required"))?;
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(ApiError::bad_request(
+            "materialization expectedSha256 is invalid",
+        ));
+    }
+    Ok(value)
+}
+
+pub(crate) fn materialization_destination_from_job(
+    job: &Job,
+) -> Result<MaterializeFileDestination, ApiError> {
+    serde_json::from_value(
+        job.payload
+            .get("destination")
+            .cloned()
+            .ok_or_else(|| ApiError::bad_request("materialization destination is required"))?,
+    )
+    .map_err(|_| ApiError::bad_request("materialization destination is invalid"))
 }
 
 pub(crate) async fn list_jobs(
@@ -308,6 +411,9 @@ pub(crate) fn job_references(job: &Job) -> Result<JobReferences, ApiError> {
         JobKind::RunCommand => {
             references.sandbox_id = Some(sandbox_id_from_job(job)?);
             references.command_id = Some(command_id_from_job(job)?);
+        }
+        JobKind::MaterializeFile => {
+            references.sandbox_id = Some(sandbox_id_from_job(job)?);
         }
         JobKind::RunPrompt => {
             references.sandbox_id = Some(sandbox_id_from_job(job)?);

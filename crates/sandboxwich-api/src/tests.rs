@@ -1,6 +1,7 @@
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use serde_json::json;
+use sha2::Digest;
 use sqlx::Row;
 use sqlx::any::AnyPoolOptions;
 use std::collections::BTreeMap;
@@ -11,6 +12,7 @@ use crate::cleanup::*;
 use crate::config::*;
 use crate::db::*;
 use crate::handlers::commands::*;
+use crate::handlers::files::*;
 use crate::handlers::jobs::*;
 use crate::handlers::leases::*;
 use crate::handlers::sandboxes::*;
@@ -19,6 +21,90 @@ use crate::handlers::workers::*;
 use crate::state::{Principal, TenantContext};
 use sandboxwich_core::*;
 use std::collections::BTreeSet;
+
+#[test]
+fn materialization_job_input_is_ref_only_and_exact() {
+    let sandbox_id = SandboxId::new();
+    let file_id = FileId::new();
+    let digest = "a".repeat(64);
+    validate_materialize_file_job_input(&json!({
+        "sandboxId": sandbox_id,
+        "fileId": file_id,
+        "destination": "apex_task",
+        "expectedSha256": digest,
+    }))
+    .expect("closed ref-only payload should be valid");
+
+    for forbidden in ["transientContentBase64", "content", "extra"] {
+        let mut payload = json!({
+            "sandboxId": sandbox_id,
+            "fileId": file_id,
+            "destination": "apex_task",
+            "expectedSha256": "a".repeat(64),
+        });
+        payload[forbidden] = json!("private");
+        let error = validate_materialize_file_job_input(&payload).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+}
+
+#[tokio::test]
+async fn materialization_rejects_a_file_from_another_sandbox() {
+    let db = test_sqlite_db().await;
+    let now = Utc::now();
+    let make = |name: &str| Sandbox {
+        id: SandboxId::new(),
+        tenant_id: "tenant-a".into(),
+        name: name.into(),
+        state: SandboxState::Ready,
+        template: "apex".into(),
+        memory_limit: MemoryLimit::FourG,
+        network_egress: NetworkEgress::default(),
+        workspace_mode: WorkspaceMode::Persistent,
+        created_at: now,
+        updated_at: now,
+        ttl_seconds: Some(600),
+        parent_snapshot_id: None,
+    };
+    let first = make("first");
+    let second = make("second");
+    insert_sandbox(&db, &first).await.unwrap();
+    insert_sandbox(&db, &second).await.unwrap();
+    let content = b"private";
+    let file = upsert_sandbox_file(
+        &db,
+        first.id,
+        "/input/task",
+        Some("application/octet-stream"),
+        content,
+    )
+    .await
+    .unwrap();
+    let job = Job {
+        id: JobId::new(),
+        tenant_id: "tenant-a".into(),
+        kind: JobKind::MaterializeFile,
+        status: JobStatus::Queued,
+        payload: json!({"sandboxId":second.id,"fileId":file.id,"destination":"apex_task",
+            "expectedSha256":format!("{:x}", sha2::Sha256::digest(content))}),
+        required_capability: WorkerCapability::MaterializeFile,
+        priority: 0,
+        attempts: 0,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+    };
+    let ctx = TenantContext {
+        tenant_id: "tenant-a".into(),
+        principal: Principal::Tenant,
+    };
+    let error = validate_job_payload_tenant(&db, &job, &ctx)
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, StatusCode::NOT_FOUND);
+}
 
 #[test]
 fn db_enum_registry_covers_persisted_variant_columns() {

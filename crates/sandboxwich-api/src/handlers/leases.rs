@@ -2,6 +2,7 @@ use crate::auth::*;
 use crate::db::*;
 use crate::error::*;
 use crate::handlers::commands::*;
+use crate::handlers::files::*;
 use crate::handlers::jobs::*;
 use crate::handlers::sandboxes::*;
 use crate::handlers::snapshots::*;
@@ -11,6 +12,7 @@ use crate::state::*;
 use axum::Json;
 use axum::extract::{Extension, Path, State};
 use axum::http::HeaderMap;
+use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Utc};
 use sandboxwich_core::*;
 use serde_json::json;
@@ -68,6 +70,7 @@ pub(crate) async fn claim_lease(
     if let Some(operation_id) = operation_id
         && let Some(lease) = fetch_claim_operation(&state.db, worker_id, operation_id).await?
     {
+        let lease = enrich_materialization_lease(&state.db, lease).await?;
         return Ok(Json(ClaimLeaseResponse {
             ok: true,
             lease: Some(lease),
@@ -196,6 +199,7 @@ pub(crate) async fn claim_lease(
         )
         .await?
         {
+            let lease = enrich_materialization_lease(&state.db, lease).await?;
             return Ok(Json(ClaimLeaseResponse {
                 ok: true,
                 lease: Some(lease),
@@ -207,6 +211,27 @@ pub(crate) async fn claim_lease(
         ok: true,
         lease: None,
     }))
+}
+
+async fn enrich_materialization_lease(
+    db: &Database,
+    mut lease: JobLease,
+) -> Result<JobLease, ApiError> {
+    if lease.job.kind != JobKind::MaterializeFile {
+        return Ok(lease);
+    }
+    let sandbox_id = sandbox_id_from_job(&lease.job)?;
+    let stored = fetch_sandbox_file(db, sandbox_id, file_id_from_job(&lease.job)?).await?;
+    let payload = lease
+        .job
+        .payload
+        .as_object_mut()
+        .ok_or_else(|| ApiError::internal("materialization payload is not an object"))?;
+    payload.insert(
+        "transientContentBase64".to_string(),
+        json!(general_purpose::STANDARD.encode(stored.content)),
+    );
+    Ok(lease)
 }
 
 /// True if `job` references `sandbox_id` as its own sandbox, its fork parent, or its
@@ -1472,6 +1497,38 @@ pub(crate) async fn apply_completed_job_on_connection(
             )
             .await?;
         }
+        (JobKind::MaterializeFile, WorkerJobResult::MaterializeFile { receipt }) => {
+            let sandbox_id = sandbox_id_from_job(job)?;
+            let file_id = file_id_from_job(job)?;
+            let stored =
+                fetch_sandbox_file_metadata_on_connection(db, connection, sandbox_id, file_id)
+                    .await?;
+            if receipt.sandbox_id != sandbox_id
+                || receipt.file_id != file_id
+                || receipt.destination != materialization_destination_from_job(job)?
+                || receipt.sha256 != materialization_digest_from_job(job)?
+                || receipt.size_bytes != stored.size_bytes
+            {
+                return Err(ApiError::bad_request(
+                    "materialization completion does not match job",
+                ));
+            }
+            delete_sandbox_file_on_connection(db, connection, sandbox_id, file_id).await?;
+            insert_event_on_connection(
+                db,
+                connection,
+                sandbox_id,
+                SandboxEventKind::FileMaterialized,
+                json!({
+                    "materialized": true,
+                    "fileId": file_id,
+                    "destination": receipt.destination,
+                    "sha256": receipt.sha256,
+                    "sizeBytes": receipt.size_bytes
+                }),
+            )
+            .await?;
+        }
         (JobKind::CreateSnapshot, WorkerJobResult::CreateSnapshot { handle }) => {
             let snapshot_id = snapshot_id_from_job(job)?;
             if handle.snapshot_id != snapshot_id {
@@ -1661,7 +1718,10 @@ pub(crate) async fn apply_claimed_job_on_connection(
             )
             .await?;
         }
-        JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {}
+        JobKind::ProvisionSandbox
+        | JobKind::StopSandbox
+        | JobKind::ResumeSandbox
+        | JobKind::MaterializeFile => {}
     }
     Ok(())
 }
@@ -1735,7 +1795,10 @@ pub(crate) async fn apply_retryable_job_on_connection(
             )
             .await?;
         }
-        JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {}
+        JobKind::ProvisionSandbox
+        | JobKind::StopSandbox
+        | JobKind::ResumeSandbox
+        | JobKind::MaterializeFile => {}
     }
     Ok(())
 }
@@ -1834,7 +1897,10 @@ pub(crate) async fn apply_failed_job_on_connection(
             )
             .await?;
         }
-        JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {}
+        JobKind::ProvisionSandbox
+        | JobKind::StopSandbox
+        | JobKind::ResumeSandbox
+        | JobKind::MaterializeFile => {}
     }
     Ok(())
 }

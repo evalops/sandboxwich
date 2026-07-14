@@ -37,6 +37,7 @@ pub(crate) fn operation_from_job(job: &Job) -> Result<Operation, ApiError> {
             JobKind::StopSandbox => OperationKind::StopSandbox,
             JobKind::ResumeSandbox => OperationKind::ResumeSandbox,
             JobKind::RunCommand => OperationKind::RunCommand,
+            JobKind::MaterializeFile => OperationKind::MaterializeFile,
             JobKind::CreateSnapshot => OperationKind::CreateSnapshot,
             JobKind::ForkSandbox => OperationKind::ForkSandbox,
             JobKind::RunPrompt => {

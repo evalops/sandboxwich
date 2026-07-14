@@ -1,11 +1,12 @@
 use super::*;
 use crate::provider::SandboxTeardownSpec;
-use base64::{Engine as _, engine::general_purpose};
+use base64::engine::general_purpose;
 use chrono::Utc;
 use sandboxwich_core::{
     Job, JobId, JobStatus, MAX_COMMAND_STDIN_BYTES, RuntimeResourceKind, RuntimeResourcePurpose,
     SandboxId, SnapshotId,
 };
+use sha2::Digest;
 
 fn provider() -> KubernetesDryRunProvider {
     KubernetesDryRunProvider::with_snapshot_class(
@@ -370,6 +371,39 @@ fn oversized_command_stdin_is_rejected_before_provider_dispatch() {
 
     assert!(error.to_string().contains("command_stdin_too_large"));
     assert!(!error.to_string().contains(&"x".repeat(64)));
+}
+
+#[test]
+fn materialization_dispatches_transient_bytes_and_returns_only_safe_receipt() {
+    let sandbox_id = SandboxId::new();
+    let file_id = sandboxwich_core::FileId::new();
+    let content = b"private-apex-archive";
+    let digest = format!("{:x}", sha2::Sha256::digest(content));
+    let outcome = execute_job(
+        &job(
+            JobKind::MaterializeFile,
+            json!({
+                "sandboxId": sandbox_id,
+                "fileId": file_id,
+                "destination": "apex_task",
+                "expectedSha256": digest,
+                "transientContentBase64": general_purpose::STANDARD.encode(content),
+            }),
+            WorkerCapability::MaterializeFile,
+        ),
+        &provider(),
+        &CancelSignal::never_cancelled(),
+    )
+    .expect("materialization should execute");
+    let WorkerJobResult::MaterializeFile { receipt } = completed_result(outcome) else {
+        panic!("expected materialization receipt");
+    };
+    assert_eq!(receipt.sandbox_id, sandbox_id);
+    assert_eq!(receipt.file_id, file_id);
+    assert_eq!(receipt.size_bytes, content.len() as u64);
+    let serialized = serde_json::to_string(&receipt).unwrap();
+    assert!(!serialized.contains("private-apex-archive"));
+    assert!(!serialized.contains("transientContentBase64"));
 }
 
 /// Test double whose `exec_handoff` always returns a fixed

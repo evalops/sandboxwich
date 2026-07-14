@@ -9,6 +9,7 @@ use std::{
 };
 
 use anyhow::Context;
+use base64::{Engine as _, engine::general_purpose};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use provider::{
     CancelSignal, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES, KUBERNETES_MUTATION_ENV,
@@ -442,6 +443,7 @@ struct ProviderApplyArgs {
 enum CapabilityArg {
     ProvisionSandbox,
     RunCommand,
+    MaterializeFile,
     Snapshot,
     DesktopStream,
     FqdnEgress,
@@ -539,6 +541,32 @@ impl SandboxProvider for RuntimeProvider {
         match self {
             Self::DryRun(provider) => provider.exec_handoff(sandbox_id, spec, request, cancelled),
             Self::Apply(provider) => provider.exec_handoff(sandbox_id, spec, request, cancelled),
+        }
+    }
+
+    fn materialize_file(
+        &self,
+        sandbox_id: sandboxwich_core::SandboxId,
+        destination: sandboxwich_core::MaterializeFileDestination,
+        expected_sha256: &str,
+        content: &[u8],
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::DryRun(provider) => provider.materialize_file(
+                sandbox_id,
+                destination,
+                expected_sha256,
+                content,
+                cancelled,
+            ),
+            Self::Apply(provider) => provider.materialize_file(
+                sandbox_id,
+                destination,
+                expected_sha256,
+                content,
+                cancelled,
+            ),
         }
     }
 
@@ -1852,6 +1880,52 @@ fn execute_job_with_reporter(
                 result,
             }))
         }
+        JobKind::MaterializeFile => {
+            let sandbox_id = sandbox_id_from_payload(&job.payload)?;
+            let file_id = sandboxwich_core::FileId(uuid_from_payload(&job.payload, "fileId")?);
+            let destination: sandboxwich_core::MaterializeFileDestination = serde_json::from_value(
+                job.payload
+                    .get("destination")
+                    .cloned()
+                    .context("materialization destination is missing")?,
+            )
+            .context("materialization destination is invalid")?;
+            let expected_sha256 = job
+                .payload
+                .get("expectedSha256")
+                .and_then(serde_json::Value::as_str)
+                .context("materialization digest is missing")?;
+            let content = job
+                .payload
+                .get("transientContentBase64")
+                .and_then(serde_json::Value::as_str)
+                .context("materialization content was not supplied by the API")?;
+            let content = general_purpose::STANDARD
+                .decode(content)
+                .context("materialization content is invalid")?;
+            anyhow::ensure!(
+                content.len() as u64 <= sandboxwich_core::MAX_SANDBOX_FILE_BYTES,
+                "materialization exceeds 64 MiB"
+            );
+            provider.materialize_file(
+                sandbox_id,
+                destination.clone(),
+                expected_sha256,
+                &content,
+                cancelled,
+            )?;
+            Ok(WorkerJobOutcome::Complete(
+                WorkerJobResult::MaterializeFile {
+                    receipt: sandboxwich_core::MaterializeFileReceipt {
+                        sandbox_id,
+                        file_id,
+                        destination,
+                        sha256: expected_sha256.to_string(),
+                        size_bytes: content.len() as u64,
+                    },
+                },
+            ))
+        }
         JobKind::RunPrompt => Ok(WorkerJobOutcome::Complete(WorkerJobResult::RunPrompt {
             output: prompt_output_from_payload(&job.payload)?,
         })),
@@ -2079,6 +2153,7 @@ fn capabilities_from_args(
             WorkerCapability::K8sPod,
             WorkerCapability::ProvisionSandbox,
             WorkerCapability::RunCommand,
+            WorkerCapability::MaterializeFile,
             WorkerCapability::Snapshot,
             WorkerCapability::DesktopStream,
         ];
@@ -2124,6 +2199,7 @@ fn to_capability(value: CapabilityArg) -> WorkerCapability {
     match value {
         CapabilityArg::ProvisionSandbox => WorkerCapability::ProvisionSandbox,
         CapabilityArg::RunCommand => WorkerCapability::RunCommand,
+        CapabilityArg::MaterializeFile => WorkerCapability::MaterializeFile,
         CapabilityArg::Snapshot => WorkerCapability::Snapshot,
         CapabilityArg::DesktopStream => WorkerCapability::DesktopStream,
         CapabilityArg::FqdnEgress => WorkerCapability::FqdnEgress,

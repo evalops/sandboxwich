@@ -15,20 +15,25 @@ use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use ipnet::IpNet;
 use sandboxwich_core::{
-    AgentCommandRequest, AgentCommandResult, MemoryLimit, NetworkAllowRuleKind, NetworkEgress,
-    ProviderCapabilityReport, ProviderForkHandle, ProviderHealthReport, ProviderHealthStatus,
-    ProviderRuntimeResource, ProviderSandboxHandle, ProviderSnapshotHandle, ProvisioningErrorClass,
-    ProvisioningStage, ProvisioningStageUpdateRequest, RuntimeResourceInventoryResponse,
-    RuntimeResourceKind, RuntimeResourcePurpose, RuntimeResourceStatus, SandboxId,
-    SandboxProvisionSpec, SnapshotId, WorkerCapability, WorkspaceMode,
-    validate_agent_command_request,
+    AgentCommandRequest, AgentCommandResult, MAX_SANDBOX_FILE_BYTES, MaterializeFileDestination,
+    MemoryLimit, NetworkAllowRuleKind, NetworkEgress, ProviderCapabilityReport, ProviderForkHandle,
+    ProviderHealthReport, ProviderHealthStatus, ProviderRuntimeResource, ProviderSandboxHandle,
+    ProviderSnapshotHandle, ProvisioningErrorClass, ProvisioningStage,
+    ProvisioningStageUpdateRequest, RuntimeResourceInventoryResponse, RuntimeResourceKind,
+    RuntimeResourcePurpose, RuntimeResourceStatus, SandboxId, SandboxProvisionSpec, SnapshotId,
+    WorkerCapability, WorkspaceMode, validate_agent_command_request,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::egress_gateway::EgressGatewayPolicy;
+
+fn sha256_hex(content: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(content))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetryDisposition {
@@ -234,6 +239,17 @@ pub trait SandboxProvider {
         request: AgentCommandRequest,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<AgentCommandResult>;
+    fn materialize_file(
+        &self,
+        sandbox_id: SandboxId,
+        destination: MaterializeFileDestination,
+        expected_sha256: &str,
+        content: &[u8],
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<()> {
+        let _ = (sandbox_id, destination, expected_sha256, content, cancelled);
+        anyhow::bail!("provider does not support file materialization")
+    }
     fn create_snapshot(
         &self,
         sandbox_id: SandboxId,
@@ -3509,6 +3525,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
             WorkerCapability::K8sPod,
             WorkerCapability::ProvisionSandbox,
             WorkerCapability::RunCommand,
+            WorkerCapability::MaterializeFile,
             WorkerCapability::Snapshot,
             WorkerCapability::DesktopStream,
         ];
@@ -3585,6 +3602,21 @@ impl SandboxProvider for KubernetesDryRunProvider {
             started_at,
             finished_at,
         })
+    }
+
+    fn materialize_file(
+        &self,
+        _sandbox_id: SandboxId,
+        _destination: MaterializeFileDestination,
+        expected_sha256: &str,
+        content: &[u8],
+        _cancelled: &CancelSignal,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            sha256_hex(content) == expected_sha256,
+            "materialization digest mismatch"
+        );
+        Ok(())
     }
 
     fn create_snapshot(
@@ -3838,6 +3870,55 @@ impl SandboxProvider for KubernetesApplyProvider {
             started_at,
             finished_at,
         })
+    }
+
+    fn materialize_file(
+        &self,
+        sandbox_id: SandboxId,
+        destination: MaterializeFileDestination,
+        expected_sha256: &str,
+        content: &[u8],
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<()> {
+        Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
+        anyhow::ensure!(
+            content.len() as u64 <= MAX_SANDBOX_FILE_BYTES,
+            "materialization exceeds 64 MiB"
+        );
+        anyhow::ensure!(
+            sha256_hex(content) == expected_sha256,
+            "materialization digest mismatch"
+        );
+        anyhow::ensure!(
+            self.pod_exists(sandbox_id, cancelled)?,
+            "sandbox pod is unavailable"
+        );
+        let request = AgentCommandRequest {
+            argv: vec![
+                "/opt/apex/bin/import-file".to_string(),
+                "--destination".to_string(),
+                destination.guest_path().to_string(),
+                "--sha256".to_string(),
+                expected_sha256.to_string(),
+            ],
+            cwd: None,
+            env: Default::default(),
+            // An empty marker causes `exec_args` to add `-i`; the content
+            // itself is passed once, as a borrowed slice, below.
+            stdin: Some(Vec::new()),
+            timeout_secs: Some(300),
+        };
+        let output = run_kubectl_command_with_stdin(
+            &self.kubectl,
+            &self.exec_args(sandbox_id, &request),
+            Some(content),
+            "materialize sandbox file",
+            Duration::from_secs(300),
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        anyhow::ensure!(output.success, "sandbox file materialization failed");
+        Ok(())
     }
 
     fn create_snapshot(

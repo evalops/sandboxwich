@@ -1534,6 +1534,7 @@ pub enum SandboxEventKind {
     DesktopExpired => "desktop_expired",
     GuestHealthFailed => "guest_health_failed",
     FileUploaded => "file_uploaded",
+    FileMaterialized => "file_materialized",
     DivergenceDetected => "divergence_detected",
 }
 }
@@ -1568,6 +1569,7 @@ db_variant_enum! {
 pub enum WorkerCapability {
     ProvisionSandbox => "provision_sandbox",
     RunCommand => "run_command",
+    MaterializeFile => "materialize_file",
     AgentPrompt => "agent_prompt",
     Snapshot => "snapshot",
     DesktopStream => "desktop_stream",
@@ -1676,6 +1678,7 @@ pub enum JobKind {
     StopSandbox => "stop_sandbox",
     ResumeSandbox => "resume_sandbox",
     RunCommand => "run_command",
+    MaterializeFile => "materialize_file",
     RunPrompt => "run_prompt",
     CreateSnapshot => "create_snapshot",
     ForkSandbox => "fork_sandbox",
@@ -2017,6 +2020,7 @@ pub enum OperationKind {
     StopSandbox,
     ResumeSandbox,
     RunCommand,
+    MaterializeFile,
     CreateSnapshot,
     ForkSandbox,
 }
@@ -2265,6 +2269,9 @@ pub enum WorkerJobResult {
     RunCommand {
         result: AgentCommandResult,
     },
+    MaterializeFile {
+        receipt: MaterializeFileReceipt,
+    },
     RunPrompt {
         output: String,
     },
@@ -2282,6 +2289,37 @@ pub enum WorkerJobResult {
         provider: String,
         sandbox_id: SandboxId,
     },
+}
+
+/// A closed set of roots writable by the APEX materialization job. The grader
+/// destination is deliberately distinct so callers can gate it on frozen
+/// mission authority before creating the job.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MaterializeFileDestination {
+    ApexWorld,
+    ApexTask,
+    ApexGradingBundle,
+}
+
+impl MaterializeFileDestination {
+    pub fn guest_path(&self) -> &'static str {
+        match self {
+            Self::ApexWorld => "/workspace/.apex/input/world",
+            Self::ApexTask => "/workspace/.apex/input/task",
+            Self::ApexGradingBundle => "/workspace/.apex/grader/bundle.zip",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaterializeFileReceipt {
+    pub sandbox_id: SandboxId,
+    pub file_id: FileId,
+    pub destination: MaterializeFileDestination,
+    pub sha256: String,
+    pub size_bytes: u64,
 }
 
 db_variant_enum! {
@@ -2367,6 +2405,22 @@ pub struct SshKeyListResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn materialization_destinations_are_closed_and_keep_grader_bundle_outside_input() {
+        assert_eq!(
+            MaterializeFileDestination::ApexWorld.guest_path(),
+            "/workspace/.apex/input/world"
+        );
+        assert_eq!(
+            MaterializeFileDestination::ApexTask.guest_path(),
+            "/workspace/.apex/input/task"
+        );
+        assert_eq!(
+            MaterializeFileDestination::ApexGradingBundle.guest_path(),
+            "/workspace/.apex/grader/bundle.zip"
+        );
+    }
     use serde::{Serialize, de::DeserializeOwned};
     use std::{collections::BTreeSet, fmt::Debug};
 

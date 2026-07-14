@@ -283,24 +283,31 @@ async fn fetch_sandbox_placement_proof(
     let worker_id: String = row.try_get("worker_id")?;
     let provider: String = row.try_get("provider")?;
     if provider.is_empty() {
-        return Err(ApiError::internal("worker placement provider is missing"));
+        return Ok(None);
     }
     let labels: String = row.try_get("labels")?;
-    let labels: HashMap<String, String> = serde_json::from_str(&labels)
-        .map_err(|_| ApiError::internal("worker placement labels are invalid"))?;
-    let provider_mode = labels
+    let Ok(labels) = serde_json::from_str::<HashMap<String, String>>(&labels) else {
+        return Ok(None);
+    };
+    let Some(provider_mode) = labels
         .get("provider_mode")
         .filter(|value| !value.is_empty())
         .cloned()
-        .ok_or_else(|| ApiError::internal("worker placement provider mode is missing"))?;
-    let runtime_image = labels
+    else {
+        return Ok(None);
+    };
+    let Some(runtime_image) = labels
         .get("runtime_image")
         .filter(|value| immutable_sha256_image(value))
         .cloned()
-        .ok_or_else(|| ApiError::internal("worker placement runtime image is not digest-pinned"))?;
+    else {
+        return Ok(None);
+    };
+    let Ok(worker_id) = Uuid::parse_str(&worker_id) else {
+        return Ok(None);
+    };
     Ok(Some(SandboxPlacementProof {
-        worker_id: Uuid::parse_str(&worker_id)
-            .map_err(|_| ApiError::internal("worker placement id is invalid"))?,
+        worker_id,
         provider,
         provider_mode,
         runtime_image,
