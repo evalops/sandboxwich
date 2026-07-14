@@ -264,6 +264,13 @@ pub(crate) const DB_ENUM_COLUMNS: &[DbEnumColumn] = &[
         "invalid sandbox execution class",
     ),
     DbEnumColumn::new(
+        "snapshot_restore_sources",
+        "execution_class",
+        "snapshot_restore_sources_execution_class_check",
+        <ExecutionClass as DbVariant>::VALUES,
+        "invalid snapshot restore source execution class",
+    ),
+    DbEnumColumn::new(
         "sandbox_network_egress_rules",
         "kind",
         "sandbox_network_egress_rules_kind_check",

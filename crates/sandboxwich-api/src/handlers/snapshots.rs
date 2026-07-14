@@ -131,7 +131,7 @@ pub(crate) async fn fork_snapshot(
         claim_snapshot_restore_source_on_connection(&state.db, &mut tx, snapshot_id, &ctx, now)
             .await?;
     let child = Sandbox {
-        execution_class: ExecutionClass::DevelopmentContainer,
+        execution_class: restore_source.execution_class.clone(),
         id: SandboxId::new(),
         tenant_id: ctx.tenant_id.clone(),
         name: request
@@ -211,6 +211,7 @@ pub(crate) async fn fork_snapshot(
 #[derive(Debug)]
 pub(crate) struct SnapshotRestoreSource {
     source_sandbox_id: SandboxId,
+    execution_class: ExecutionClass,
 }
 
 pub(crate) async fn claim_snapshot_restore_source_on_connection(
@@ -225,7 +226,8 @@ pub(crate) async fn claim_snapshot_restore_source_on_connection(
         SqlDialect::Sqlite => "",
     };
     let sql = format!(
-        "select snapshot_restore_sources.source_sandbox_id
+        "select snapshot_restore_sources.source_sandbox_id,
+                snapshot_restore_sources.execution_class
            from snapshot_restore_sources
           where snapshot_restore_sources.snapshot_id = {}
             and snapshot_restore_sources.tenant_id = {}
@@ -249,8 +251,11 @@ pub(crate) async fn claim_snapshot_restore_source_on_connection(
         )));
     };
     let source_sandbox_id: String = row.try_get("source_sandbox_id")?;
+    let execution_class: String = row.try_get("execution_class")?;
     Ok(SnapshotRestoreSource {
         source_sandbox_id: SandboxId(parse_uuid(&source_sandbox_id)?),
+        execution_class: ExecutionClass::parse_db_str(&execution_class)
+            .map_err(|_| ApiError::internal("database contains invalid execution class"))?,
     })
 }
 
@@ -359,8 +364,8 @@ pub(crate) async fn insert_snapshot_on_connection(
         .await?;
     let restore_sql = format!(
         "insert into snapshot_restore_sources
-         (snapshot_id, tenant_id, source_sandbox_id, status, expires_at)
-         select {}, tenant_id, {}, {}, {} from sandboxes where id = {}",
+         (snapshot_id, tenant_id, source_sandbox_id, execution_class, status, expires_at)
+         select {}, tenant_id, {}, execution_class, {}, {} from sandboxes where id = {}",
         db.placeholder(1),
         db.placeholder(2),
         db.placeholder(3),

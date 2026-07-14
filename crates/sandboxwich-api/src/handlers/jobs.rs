@@ -21,6 +21,7 @@ pub(crate) async fn create_job(
     Extension(ctx): Extension<TenantContext>,
     Json(request): Json<CreateJobRequest>,
 ) -> Result<Json<JobResponse>, ApiError> {
+    validate_functional_required_capability(&request.required_capability)?;
     let now = Utc::now();
     let mut job = Job {
         id: JobId::new(),
@@ -42,6 +43,24 @@ pub(crate) async fn create_job(
     enrich_job_payload_with_provision_spec(&state.db, &mut job).await?;
     insert_job(&state.db, &job).await?;
     Ok(Json(JobResponse { ok: true, job }))
+}
+
+fn validate_functional_required_capability(capability: &WorkerCapability) -> Result<(), ApiError> {
+    match capability {
+        WorkerCapability::SandboxedContainer | WorkerCapability::VirtualMachine => {
+            Err(ApiError::bad_request(
+                "required_capability must be a functional worker capability; isolation is selected by the sandbox execution_class",
+            ))
+        }
+        WorkerCapability::ProvisionSandbox
+        | WorkerCapability::RunCommand
+        | WorkerCapability::AgentPrompt
+        | WorkerCapability::Snapshot
+        | WorkerCapability::DesktopStream
+        | WorkerCapability::K8sPod
+        | WorkerCapability::GvisorSandbox
+        | WorkerCapability::FqdnEgress => Ok(()),
+    }
 }
 
 pub(crate) async fn get_job(

@@ -89,6 +89,87 @@ pub(crate) async fn job_can_be_fetched_by_id_with_tenant_isolation() {
     assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+pub(crate) async fn tenant_job_creation_rejects_isolation_only_required_capabilities() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("sandboxwich-job-capability-test.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+    let sandbox = create_sandbox(&client, &server, "job-capability-boundary").await;
+    let jobs_before: JobListResponse = client
+        .get(format!("{}/jobs", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    for required_capability in [
+        WorkerCapability::SandboxedContainer,
+        WorkerCapability::VirtualMachine,
+    ] {
+        let response = client
+            .post(format!("{}/jobs", server.base_url))
+            .json(&CreateJobRequest {
+                kind: JobKind::ProvisionSandbox,
+                payload: serde_json::json!({"sandboxId": sandbox.sandbox.id}),
+                required_capability,
+                priority: None,
+                max_attempts: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: ErrorEnvelope = response.json().await.unwrap();
+        assert_eq!(error.code, "bad_request");
+        assert!(error.message.contains("required_capability"));
+    }
+
+    let jobs_after_rejections: JobListResponse = client
+        .get(format!("{}/jobs", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(jobs_after_rejections.jobs.len(), jobs_before.jobs.len());
+
+    let accepted: JobResponse = client
+        .post(format!("{}/jobs", server.base_url))
+        .json(&CreateJobRequest {
+            kind: JobKind::ProvisionSandbox,
+            payload: serde_json::json!({"sandboxId": sandbox.sandbox.id}),
+            required_capability: WorkerCapability::ProvisionSandbox,
+            priority: None,
+            max_attempts: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        accepted.job.required_capability,
+        WorkerCapability::ProvisionSandbox
+    );
+}
+
 /// Registers a worker capable of `ProvisionSandbox`, `RunCommand`, and `K8sPod`
 /// jobs against `server`, returning it. Shared by the claim-filter tests below.
 async fn register_claim_filter_worker(
