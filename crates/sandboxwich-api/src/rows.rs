@@ -14,6 +14,7 @@ pub(crate) fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
     let memory_limit: String = row.try_get("memory_limit")?;
     let network_egress_mode: String = row.try_get("network_egress_mode")?;
     let workspace_mode: String = row.try_get("workspace_mode")?;
+    let execution_class: String = row.try_get("execution_class")?;
     let created_at: String = row.try_get("created_at")?;
     let updated_at: String = row.try_get("updated_at")?;
     let ttl_seconds: Option<i64> = row.try_get("ttl_seconds")?;
@@ -25,7 +26,8 @@ pub(crate) fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
     };
 
     Ok(Sandbox {
-        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
+        execution_class: ExecutionClass::parse_db_str(&execution_class)
+            .map_err(|_| ApiError::internal("database contains invalid execution class"))?,
         id: SandboxId(parse_uuid(&id)?),
         tenant_id: row.try_get("tenant_id")?,
         name: row.try_get("name")?,

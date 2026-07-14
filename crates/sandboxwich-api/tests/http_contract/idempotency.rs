@@ -82,6 +82,20 @@ async fn assert_idempotency_contract(server: TestServer) {
     let mismatch: ErrorEnvelope = mismatch.json().await.unwrap();
     assert_eq!(mismatch.code, "idempotency_key_reused");
 
+    let execution_class_mismatch = client
+        .post(&url)
+        .header("idempotency-key", &key)
+        .json(&CreateSandboxRequest {
+            execution_class: Some(ExecutionClass::VirtualMachine),
+            ..request.clone()
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(execution_class_mismatch.status(), StatusCode::CONFLICT);
+    let execution_class_mismatch: ErrorEnvelope = execution_class_mismatch.json().await.unwrap();
+    assert_eq!(execution_class_mismatch.code, "idempotency_key_reused");
+
     let tenant_b = reqwest::Client::new()
         .post(&url)
         .bearer_auth(TEST_TENANT_B_TOKEN)

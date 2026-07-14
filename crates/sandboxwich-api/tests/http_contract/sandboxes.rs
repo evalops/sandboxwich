@@ -3,6 +3,104 @@ use reqwest::StatusCode;
 use sandboxwich_core::*;
 
 #[tokio::test]
+async fn execution_class_defaults_persists_and_inherits_through_fork() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("execution-class.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+
+    let defaulted: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            execution_class: None,
+            workspace_mode: None,
+            name: Some("execution-default".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        defaulted.sandbox.execution_class,
+        ExecutionClass::DevelopmentContainer
+    );
+
+    let vm: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            execution_class: Some(ExecutionClass::VirtualMachine),
+            workspace_mode: None,
+            name: Some("execution-vm".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(vm.sandbox.execution_class, ExecutionClass::VirtualMachine);
+
+    let fetched: SandboxResponse = client
+        .get(format!("{}/sandboxes/{}", server.base_url, vm.sandbox.id))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        fetched.sandbox.execution_class,
+        ExecutionClass::VirtualMachine
+    );
+
+    let child: SandboxResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/fork",
+            server.base_url, vm.sandbox.id
+        ))
+        .json(&CreateSandboxRequest {
+            execution_class: None,
+            workspace_mode: None,
+            name: Some("execution-vm-child".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        child.sandbox.execution_class,
+        ExecutionClass::VirtualMachine
+    );
+}
+
+#[tokio::test]
 async fn disposable_workspace_mode_round_trips_and_rejects_durable_operations() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!(
