@@ -56,7 +56,7 @@ pub(crate) fn effective_command_timeout_secs(requested: Option<u64>) -> u64 {
         .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS)
 }
 
-#[utoipa::path(post, path = "/v1/sandboxes/{sandbox_id}/commands", params(("sandbox_id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = "Tenant-scoped replay key"), ("X-Request-Id" = Option<String>, Header), ("traceparent" = Option<String>, Header)), request_body = CommandRequest, responses((status = 202, description = "Command accepted with an Operation resource", body = QueueCommandResponse), (status = 400, body = ErrorEnvelope)))]
+#[utoipa::path(post, path = "/v1/sandboxes/{sandbox_id}/commands", params(("sandbox_id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = "Tenant-scoped replay key"), ("X-Request-Id" = Option<String>, Header), ("traceparent" = Option<String>, Header)), request_body = CommandRequest, responses((status = 202, description = "Command accepted with an Operation resource", body = QueueCommandResponse), (status = 400, body = ErrorEnvelope), (status = 413, description = "Decoded command stdin exceeds 1 MiB", body = ErrorEnvelope)))]
 pub(crate) async fn queue_command(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
@@ -66,12 +66,23 @@ pub(crate) async fn queue_command(
     if request.argv.is_empty() {
         return Err(ApiError::bad_request("argv must contain at least one item"));
     }
+    if request
+        .stdin
+        .as_ref()
+        .is_some_and(|stdin| stdin.len() > MAX_COMMAND_STDIN_BYTES)
+    {
+        return Err(ApiError::payload_too_large(
+            "command_stdin_too_large",
+            "command stdin exceeds 1048576 bytes",
+        ));
+    }
 
     let sandbox_id = SandboxId(sandbox_id);
     let sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
 
     let now = Utc::now();
     let env = request.env;
+    let stdin = request.stdin;
     let timeout_secs = effective_command_timeout_secs(request.timeout_secs);
     let command = CommandRun {
         id: CommandId::new(),
@@ -97,6 +108,7 @@ pub(crate) async fn queue_command(
             "argv": command.argv,
             "cwd": command.cwd,
             "env": env,
+            "stdin": stdin,
             "timeoutSecs": timeout_secs,
             "provisionSpec": SandboxProvisionSpec {
                 memory_limit: sandbox.memory_limit.clone(),

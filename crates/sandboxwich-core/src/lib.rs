@@ -1309,18 +1309,38 @@ pub const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 300;
 /// unbounded.
 pub const MAX_COMMAND_TIMEOUT_SECS: u64 = 3600;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+/// Maximum decoded byte length accepted for one command's non-secret stdin.
+pub const MAX_COMMAND_STDIN_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CommandRequest {
     pub argv: Vec<String>,
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Bounded, non-secret bytes delivered to the guest process's stdin.
+    #[serde(default, with = "serde_optional_base64_bytes")]
+    #[schema(value_type = Option<String>)]
+    pub stdin: Option<Vec<u8>>,
     /// Maximum time the command may run before the executor kills it and
     /// reports a timeout failure. Clamped to
     /// `(0, MAX_COMMAND_TIMEOUT_SECS]` by `queue_command`; `None`/omitted
     /// falls back to `DEFAULT_COMMAND_TIMEOUT_SECS`.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+}
+
+impl std::fmt::Debug for CommandRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CommandRequest")
+            .field("argv", &self.argv)
+            .field("cwd", &self.cwd)
+            .field("env", &self.env)
+            .field("stdin", &self.stdin.as_ref().map(|bytes| bytes.len()))
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
 }
 
 db_variant_enum! {
@@ -1850,17 +1870,33 @@ pub struct OperationResponse {
     pub operation: Operation,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentCommandRequest {
     pub argv: Vec<String>,
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Bounded, non-secret bytes delivered to the child process's stdin.
+    #[serde(default, with = "serde_optional_base64_bytes")]
+    pub stdin: Option<Vec<u8>>,
     /// Bound applied by `execute_streaming` around `child.wait()`; the child
     /// is killed and a distinct timeout failure reported if it runs longer
     /// than this. `None` falls back to `DEFAULT_COMMAND_TIMEOUT_SECS`.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+}
+
+impl std::fmt::Debug for AgentCommandRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentCommandRequest")
+            .field("argv", &self.argv)
+            .field("cwd", &self.cwd)
+            .field("env", &self.env)
+            .field("stdin", &self.stdin.as_ref().map(|bytes| bytes.len()))
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1916,6 +1952,34 @@ mod serde_base64_bytes {
         general_purpose::STANDARD
             .decode(encoded)
             .map_err(serde::de::Error::custom)
+    }
+}
+
+pub mod serde_optional_base64_bytes {
+    use super::*;
+
+    pub fn serialize<S>(content: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        content
+            .as_deref()
+            .map(|bytes| general_purpose::STANDARD.encode(bytes))
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let encoded = Option::<String>::deserialize(deserializer)?;
+        encoded
+            .map(|encoded| {
+                general_purpose::STANDARD
+                    .decode(encoded)
+                    .map_err(serde::de::Error::custom)
+            })
+            .transpose()
     }
 }
 

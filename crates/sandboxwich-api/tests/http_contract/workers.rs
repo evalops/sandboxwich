@@ -447,6 +447,7 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
             argv: vec!["true".to_string()],
             cwd: None,
             env: Default::default(),
+            stdin: None,
             timeout_secs: None,
         })
         .send()

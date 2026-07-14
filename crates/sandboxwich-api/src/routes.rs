@@ -27,6 +27,7 @@ use sandboxwich_core::*;
 /// only ever accept small JSON payloads; the file upload route below opts into a much larger,
 /// explicit limit instead of every route inheriting one sized for 512 MB file bodies.
 pub(crate) const DEFAULT_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+const COMMAND_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 
 pub(crate) fn app(state: AppState) -> Router {
     let upload_body_limit = usize::try_from(MAX_SANDBOX_FILE_BYTES + 1024 * 1024)
@@ -73,7 +74,9 @@ pub(crate) fn app(state: AppState) -> Router {
         )
         .route(
             "/sandboxes/{sandbox_id}/commands",
-            get(list_commands).post(queue_command),
+            get(list_commands)
+                .post(queue_command)
+                .layer(DefaultBodyLimit::max(COMMAND_BODY_LIMIT_BYTES)),
         )
         .route("/sandboxes/{sandbox_id}/prompt", post(queue_prompt))
         .route("/sandboxes/{sandbox_id}/events", get(list_events))

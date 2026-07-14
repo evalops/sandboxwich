@@ -87,6 +87,7 @@ async fn archived_sandbox_cleanup_cascades_dependent_rows_on_sqlite() {
             argv: vec!["true".to_string()],
             cwd: None,
             env: Default::default(),
+            stdin: None,
             timeout_secs: None,
         })
         .send()

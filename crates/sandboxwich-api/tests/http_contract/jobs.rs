@@ -397,6 +397,7 @@ pub(crate) async fn claim_lease_kinds_filter_excludes_other_kinds() {
             argv: vec!["echo".to_string(), "hi".to_string()],
             cwd: None,
             env: Default::default(),
+            stdin: None,
             timeout_secs: None,
         })
         .send()
@@ -619,6 +620,7 @@ pub(crate) async fn assert_retryable_failure_requeues_command(
             argv: vec!["false".to_string()],
             cwd: None,
             env: Default::default(),
+            stdin: None,
             timeout_secs: None,
         })
         .send()
@@ -805,6 +807,7 @@ pub(crate) async fn assert_command_status_is_derived_from_exit_code(
                 ],
                 cwd: None,
                 env: Default::default(),
+                stdin: None,
                 timeout_secs: None,
             })
             .send()
@@ -916,6 +919,7 @@ pub(crate) async fn assert_expired_lease_requeues_command(
             argv: vec!["sleep".to_string(), "1".to_string()],
             cwd: None,
             env: Default::default(),
+            stdin: None,
             timeout_secs: None,
         })
         .send()

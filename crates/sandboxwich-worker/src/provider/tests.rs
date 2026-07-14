@@ -177,6 +177,7 @@ fn kubernetes_dry_run_covers_provider_smoke_path_without_cluster_mutation() {
                 argv: vec!["echo".to_string(), "hello".to_string()],
                 cwd: None,
                 env: BTreeMap::new(),
+                stdin: None,
                 timeout_secs: None,
             },
             &CancelSignal::never_cancelled(),
@@ -802,6 +803,7 @@ fn kubernetes_apply_provider_can_use_in_cluster_service_account() {
         argv: vec!["printf".to_string(), "ok".to_string()],
         cwd: None,
         env: BTreeMap::new(),
+        stdin: None,
         timeout_secs: None,
     };
     let exec_args = apply.exec_args(sandbox_id, &request);
@@ -835,6 +837,7 @@ fn exec_args_never_render_env_values_on_argv() {
         argv: vec!["printf".to_string(), "ok".to_string()],
         cwd: None,
         env,
+        stdin: None,
         timeout_secs: None,
     };
 
@@ -885,6 +888,7 @@ fn exec_args_without_env_do_not_request_stdin_or_a_wrapper() {
         argv: vec!["printf".to_string(), "ok".to_string()],
         cwd: None,
         env: BTreeMap::new(),
+        stdin: None,
         timeout_secs: None,
     };
 
@@ -893,6 +897,38 @@ fn exec_args_without_env_do_not_request_stdin_or_a_wrapper() {
     assert!(!exec_args.contains(&"-i".to_string()));
     assert!(!exec_args.contains(&"bash".to_string()));
     assert!(KubernetesApplyProvider::exec_stdin_payload(&request).is_none());
+}
+
+#[test]
+fn exec_args_with_command_stdin_request_interactive_transport_without_exposing_bytes() {
+    let provider = KubernetesDryRunProvider::with_snapshot_class(
+        "k3s-ci",
+        "sandboxwich-ci",
+        Some("local-path".to_string()),
+        None,
+    );
+    let apply = KubernetesApplyProvider::new(provider, "kubectl");
+    let marker = b"apex-private-input".to_vec();
+    let request = AgentCommandRequest {
+        argv: vec!["sha256sum".to_string()],
+        cwd: None,
+        env: BTreeMap::new(),
+        stdin: Some(marker.clone()),
+        timeout_secs: None,
+    };
+
+    let exec_args = apply.exec_args(SandboxId::new(), &request);
+    let payload = KubernetesApplyProvider::exec_stdin_payload(&request)
+        .expect("command stdin should produce a kubectl stdin payload");
+
+    assert!(exec_args.contains(&"-i".to_string()));
+    assert_eq!(payload, marker);
+    assert!(
+        !exec_args
+            .iter()
+            .any(|arg| arg.contains("apex-private-input"))
+    );
+    assert!(!format!("{request:?}").contains("apex-private-input"));
 }
 
 #[test]
@@ -910,6 +946,7 @@ fn exec_args_carry_cwd_through_the_env_wrapper_when_both_are_set() {
         argv: vec!["pwd".to_string()],
         cwd: Some("/workspace/project".to_string()),
         env,
+        stdin: None,
         timeout_secs: None,
     };
 
@@ -930,6 +967,7 @@ fn exec_stdin_payload_nul_delimits_key_value_pairs() {
         argv: vec!["true".to_string()],
         cwd: None,
         env,
+        stdin: None,
         timeout_secs: None,
     };
 
@@ -940,6 +978,46 @@ fn exec_stdin_payload_nul_delimits_key_value_pairs() {
 
     assert!(entries.contains(&"A=1"));
     assert!(entries.contains(&"B=two"));
+}
+
+#[test]
+fn exec_stdin_payload_preserves_command_bytes_after_the_env_prefix() {
+    let mut env = BTreeMap::new();
+    env.insert("A".to_string(), "1".to_string());
+    env.insert("B".to_string(), "two".to_string());
+    let command_stdin = vec![0, b'j', b's', b'o', b'n', b'\n', 255];
+    let request = AgentCommandRequest {
+        argv: vec!["cat".to_string()],
+        cwd: None,
+        env,
+        stdin: Some(command_stdin.clone()),
+        timeout_secs: None,
+    };
+
+    let payload = KubernetesApplyProvider::exec_stdin_payload(&request).unwrap();
+
+    assert!(payload.starts_with(b"A=1\0B=two\0"));
+    assert!(payload.ends_with(&command_stdin));
+}
+
+#[test]
+fn provider_mode_distinguishes_apply_execution_from_dry_run_simulation() {
+    let dry_run = KubernetesDryRunProvider::with_snapshot_class(
+        "k3s-ci",
+        "sandboxwich-ci",
+        Some("local-path".to_string()),
+        None,
+    );
+    let apply = KubernetesApplyProvider::new(dry_run.clone(), "kubectl");
+
+    assert_eq!(
+        dry_run.capability_report().labels.get("provider_mode"),
+        Some(&"dry_run".to_string())
+    );
+    assert_eq!(
+        apply.capability_report().labels.get("provider_mode"),
+        Some(&"apply".to_string())
+    );
 }
 
 #[test]

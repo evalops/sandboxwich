@@ -2,6 +2,111 @@ use crate::common::*;
 use sandboxwich_core::*;
 
 #[tokio::test]
+pub(crate) async fn command_stdin_over_one_mib_is_rejected_before_job_dispatch() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("sandboxwich-command-stdin-limit.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+    let created: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            workspace_mode: None,
+            name: Some("stdin-limit-test".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let accepted = client
+        .post(format!(
+            "{}/sandboxes/{}/commands",
+            server.base_url, created.sandbox.id
+        ))
+        .json(&CommandRequest {
+            argv: vec!["sha256sum".to_string()],
+            cwd: None,
+            env: Default::default(),
+            stdin: Some(vec![b'x'; MAX_COMMAND_STDIN_BYTES]),
+            timeout_secs: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), reqwest::StatusCode::ACCEPTED);
+
+    let response = client
+        .post(format!(
+            "{}/sandboxes/{}/commands",
+            server.base_url, created.sandbox.id
+        ))
+        .json(&CommandRequest {
+            argv: vec!["sha256sum".to_string()],
+            cwd: None,
+            env: Default::default(),
+            stdin: Some(vec![b'x'; MAX_COMMAND_STDIN_BYTES + 1]),
+            timeout_secs: None,
+        })
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    let error: ErrorEnvelope = response.json().await.unwrap();
+    assert_eq!(error.code, "command_stdin_too_large");
+
+    let jobs: JobListResponse = client
+        .get(format!("{}/jobs", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        jobs.jobs
+            .iter()
+            .filter(|job| job.kind == JobKind::RunCommand)
+            .count(),
+        1,
+        "only the exactly-at-limit request may dispatch a command job"
+    );
+
+    let events: EventListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/events",
+            server.base_url, created.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rendered_events = serde_json::to_string(&events).unwrap();
+    assert!(!rendered_events.contains("stdin"));
+    assert!(!rendered_events.contains(&"x".repeat(64)));
+}
+
+#[tokio::test]
 pub(crate) async fn small_body_route_rejects_oversized_json_but_upload_route_accepts_large_file() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!(
@@ -135,6 +240,7 @@ pub(crate) async fn list_commands_respect_limit_and_paginate_with_cursor() {
                 argv: vec!["echo".to_string(), index.to_string()],
                 cwd: None,
                 env: Default::default(),
+                stdin: None,
                 timeout_secs: None,
             })
             .send()

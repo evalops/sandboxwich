@@ -2703,6 +2703,7 @@ impl KubernetesApplyProvider {
                     argv: vec!["echo".to_string(), "sandboxwich".to_string()],
                     cwd: None,
                     env: BTreeMap::new(),
+                    stdin: None,
                     timeout_secs: None,
                 },
                 &CancelSignal::never_cancelled(),
@@ -3130,15 +3131,16 @@ impl KubernetesApplyProvider {
     /// positional `KEY=VALUE` args to `env` -- as this used to do -- leaks
     /// them to anything with process-listing access. When `request.env`
     /// is non-empty, this instead wires up `kubectl exec -i` plus a small
-    /// `bash -c` wrapper that reads NUL-delimited `KEY=VALUE` pairs from
-    /// stdin and `export`s them before `exec`ing the real command; the
+    /// `bash -c` wrapper that reads a counted prefix of NUL-delimited
+    /// `KEY=VALUE` pairs from stdin and `export`s them before `exec`ing the
+    /// real command with any remaining bytes still available on stdin; the
     /// caller must pipe `exec_stdin_payload(request)` to that invocation's
     /// stdin. NUL is a safe delimiter because POSIX environment variable
     /// values can never contain an embedded NUL byte, unlike newlines.
     fn exec_args(&self, sandbox_id: SandboxId, request: &AgentCommandRequest) -> Vec<String> {
         let mut args = self.kubectl_base_args();
         let needs_env = !request.env.is_empty();
-        if needs_env {
+        if needs_env || request.stdin.is_some() {
             args.push("-i".to_string());
         }
         args.extend([
@@ -3153,6 +3155,7 @@ impl KubernetesApplyProvider {
                 "-c".to_string(),
                 EXEC_ENV_WRAPPER_SCRIPT.to_string(),
                 "sandboxwich-exec".to_string(),
+                request.env.len().to_string(),
             ]);
             if let Some(cwd) = &request.cwd {
                 args.push("1".to_string());
@@ -3180,13 +3183,12 @@ impl KubernetesApplyProvider {
         args
     }
 
-    /// Builds the NUL-delimited `KEY=VALUE` payload that must be piped to
-    /// the stdin of the `kubectl exec` invocation built by `exec_args` when
-    /// `request.env` is non-empty. Returns `None` when there's nothing to
-    /// send, so callers know not to bother opening a piped stdin at all.
+    /// Builds the counted NUL-delimited `KEY=VALUE` prefix followed by the
+    /// exact command stdin bytes. Returns `None` when neither input exists,
+    /// so callers preserve the previous non-interactive behavior.
     fn exec_stdin_payload(request: &AgentCommandRequest) -> Option<Vec<u8>> {
         if request.env.is_empty() {
-            return None;
+            return request.stdin.clone();
         }
         let mut payload = Vec::new();
         for (key, value) in &request.env {
@@ -3195,19 +3197,25 @@ impl KubernetesApplyProvider {
             payload.extend_from_slice(value.as_bytes());
             payload.push(0);
         }
+        if let Some(stdin) = &request.stdin {
+            payload.extend_from_slice(stdin);
+        }
         Some(payload)
     }
 }
 
 /// Guest-side wrapper invoked via `bash -c` by `exec_args` when the request
 /// carries env vars. Argument order (after the `bash -c` command string
-/// itself, `$0` is `sandboxwich-exec`): `$1` is `"1"`/`"0"` for
-/// has-cwd, `$2` is the cwd (only present when `$1 == "1"`), and the
-/// remaining args are the real command to run. Env `KEY=VALUE` pairs are
-/// read from stdin, NUL-delimited, before anything else runs.
+/// itself, `$0` is `sandboxwich-exec`): `$1` is the env-pair count, the next
+/// argument is `"1"`/`"0"` for has-cwd, then the cwd when present, and the
+/// remaining args are the real command. Reading exactly the counted
+/// NUL-delimited env prefix leaves all remaining stdin bytes for that command.
 const EXEC_ENV_WRAPPER_SCRIPT: &str = concat!(
-    "while IFS= read -r -d '' kv; do ",
+    "env_count=\"$1\"; shift; ",
+    "while [ \"$env_count\" -gt 0 ]; do ",
+    "IFS= read -r -d '' kv || exit 1; ",
     "case \"$kv\" in *=*) export \"${kv%%=*}\"=\"${kv#*=}\" ;; esac; ",
+    "env_count=$((env_count - 1)); ",
     "done; ",
     "has_cwd=\"$1\"; shift; ",
     "if [ \"$has_cwd\" = \"1\" ]; then cd \"$1\" || exit 1; shift; fi; ",

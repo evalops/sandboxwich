@@ -1,8 +1,10 @@
 use super::*;
 use crate::provider::SandboxTeardownSpec;
+use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use sandboxwich_core::{
-    Job, JobId, JobStatus, RuntimeResourceKind, RuntimeResourcePurpose, SandboxId, SnapshotId,
+    Job, JobId, JobStatus, MAX_COMMAND_STDIN_BYTES, RuntimeResourceKind, RuntimeResourcePurpose,
+    SandboxId, SnapshotId,
 };
 
 fn provider() -> KubernetesDryRunProvider {
@@ -305,6 +307,69 @@ fn dispatches_command_job_to_provider_exec_handoff() {
     assert_eq!(result.exit_code, Some(0));
     assert!(result.stdout.contains("\"operation\":\"exec\""));
     assert!(result.stdout.contains("\"memoryLimit\":\"4g\""));
+}
+
+#[test]
+fn command_stdin_is_decoded_for_dispatch_but_absent_from_dry_run_result() {
+    let sandbox_id = SandboxId::new();
+    let marker = b"apex-private-input";
+    let outcome = execute_job(
+        &job(
+            JobKind::RunCommand,
+            json!({
+                "sandboxId": sandbox_id,
+                "provisionSpec": SandboxProvisionSpec::default(),
+                "argv": ["sha256sum"],
+                "env": {},
+                "stdin": "YXBleC1wcml2YXRlLWlucHV0"
+            }),
+            WorkerCapability::RunCommand,
+        ),
+        &provider(),
+        &CancelSignal::never_cancelled(),
+    )
+    .expect("command job should decode bounded stdin");
+    let WorkerJobResult::RunCommand { result } = completed_result(outcome) else {
+        panic!("expected run command result");
+    };
+
+    assert!(
+        !result
+            .stdout
+            .as_bytes()
+            .windows(marker.len())
+            .any(|w| w == marker)
+    );
+    assert!(
+        !serde_json::to_string(&result)
+            .unwrap()
+            .contains("apex-private-input")
+    );
+}
+
+#[test]
+fn oversized_command_stdin_is_rejected_before_provider_dispatch() {
+    let sandbox_id = SandboxId::new();
+    let encoded = general_purpose::STANDARD.encode(vec![b'x'; MAX_COMMAND_STDIN_BYTES + 1]);
+    let error = execute_job(
+        &job(
+            JobKind::RunCommand,
+            json!({
+                "sandboxId": sandbox_id,
+                "provisionSpec": SandboxProvisionSpec::default(),
+                "argv": ["true"],
+                "env": {},
+                "stdin": encoded
+            }),
+            WorkerCapability::RunCommand,
+        ),
+        &provider(),
+        &CancelSignal::never_cancelled(),
+    )
+    .expect_err("oversized stdin must fail before provider dispatch");
+
+    assert!(error.to_string().contains("command_stdin_too_large"));
+    assert!(!error.to_string().contains(&"x".repeat(64)));
 }
 
 /// Test double whose `exec_handoff` always returns a fixed

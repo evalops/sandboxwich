@@ -169,6 +169,7 @@ async fn v1_contract_exposes_operations_openapi_request_ids_and_honest_prompt_st
         argv: vec!["echo".to_string(), "hello".to_string()],
         cwd: None,
         env: Default::default(),
+        stdin: None,
         timeout_secs: None,
     };
     let queued = client

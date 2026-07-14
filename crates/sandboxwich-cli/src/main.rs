@@ -696,6 +696,7 @@ async fn main() -> anyhow::Result<()> {
                     argv: args.argv,
                     cwd: args.cwd,
                     env: args.env.into_iter().collect(),
+                    stdin: None,
                     timeout_secs: args.command_timeout_secs,
                 })
                 .send()

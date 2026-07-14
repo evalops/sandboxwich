@@ -17,9 +17,9 @@ use provider::{
 };
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse,
-    CompleteLeaseRequest, FailLeaseRequest, JobKind, LeaseResponse, ProvisioningOperationResponse,
-    ProvisioningStageUpdateRequest, RegisterWorkerRequest, RenewLeaseRequest,
-    RuntimeResourceInventoryResponse, SandboxProvisionSpec, WorkerCapability,
+    CompleteLeaseRequest, FailLeaseRequest, JobKind, LeaseResponse, MAX_COMMAND_STDIN_BYTES,
+    ProvisioningOperationResponse, ProvisioningStageUpdateRequest, RegisterWorkerRequest,
+    RenewLeaseRequest, RuntimeResourceInventoryResponse, SandboxProvisionSpec, WorkerCapability,
     WorkerHeartbeatRequest, WorkerJobResult, WorkerResponse, build_api_client,
 };
 use serde_json::json;
@@ -651,6 +651,7 @@ async fn main() -> anyhow::Result<()> {
                     argv: vec!["echo".to_string(), "sandboxwich".to_string()],
                     cwd: None,
                     env: BTreeMap::new(),
+                    stdin: None,
                     timeout_secs: None,
                 },
                 &CancelSignal::never_cancelled(),
@@ -1936,12 +1937,35 @@ fn agent_request_from_payload(payload: &serde_json::Value) -> anyhow::Result<Age
         .transpose()
         .context("job payload env is invalid")?
         .unwrap_or_else(BTreeMap::new);
+    let stdin = payload
+        .get("stdin")
+        .cloned()
+        .map(|value| {
+            serde_json::from_value(json!({
+                "argv": [],
+                "cwd": null,
+                "env": {},
+                "stdin": value,
+                "timeout_secs": null
+            }))
+            .map(|request: AgentCommandRequest| request.stdin)
+        })
+        .transpose()
+        .context("job payload stdin is invalid")?
+        .flatten();
+    if stdin
+        .as_ref()
+        .is_some_and(|stdin| stdin.len() > MAX_COMMAND_STDIN_BYTES)
+    {
+        anyhow::bail!("command_stdin_too_large: command stdin exceeds 1048576 bytes");
+    }
     let timeout_secs = payload.get("timeoutSecs").and_then(|value| value.as_u64());
 
     Ok(AgentCommandRequest {
         argv,
         cwd,
         env,
+        stdin,
         timeout_secs,
     })
 }

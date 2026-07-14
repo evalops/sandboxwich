@@ -319,6 +319,7 @@ pub(crate) async fn run_contract(server: TestServer) {
             argv: vec!["echo".to_string(), "hello".to_string()],
             cwd: None,
             env: Default::default(),
+            stdin: None,
             timeout_secs: None,
         })
         .send()
@@ -484,6 +485,7 @@ pub(crate) async fn run_contract(server: TestServer) {
             argv: vec!["echo".to_string(), "second".to_string()],
             cwd: None,
             env: Default::default(),
+            stdin: None,
             timeout_secs: None,
         })
         .send()

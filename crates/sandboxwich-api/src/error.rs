@@ -52,6 +52,14 @@ impl ApiError {
         }
     }
 
+    pub(crate) fn payload_too_large(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            code,
+            message: message.into(),
+        }
+    }
+
     pub(crate) fn unsupported(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_IMPLEMENTED,
