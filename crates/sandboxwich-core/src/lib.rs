@@ -827,6 +827,21 @@ impl NetworkEgress {
     }
 }
 
+db_variant_enum! {
+pub enum ExecutionClass {
+    DevelopmentContainer => "development_container",
+    SandboxedContainer => "sandboxed_container",
+    VirtualMachine => "virtual_machine",
+}
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for ExecutionClass {
+    fn default() -> Self {
+        Self::DevelopmentContainer
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub struct SandboxProvisionSpec {
     #[serde(default)]
@@ -835,6 +850,8 @@ pub struct SandboxProvisionSpec {
     pub network_egress: NetworkEgress,
     #[serde(default)]
     pub workspace_mode: WorkspaceMode,
+    #[serde(default)]
+    pub execution_class: ExecutionClass,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -899,6 +916,8 @@ pub struct Sandbox {
     pub network_egress: NetworkEgress,
     #[serde(default)]
     pub workspace_mode: WorkspaceMode,
+    #[serde(default)]
+    pub execution_class: ExecutionClass,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub ttl_seconds: Option<u64>,
@@ -912,6 +931,7 @@ pub struct CreateSandboxRequest {
     pub memory_limit: Option<MemoryLimit>,
     pub network_egress: Option<NetworkEgress>,
     pub workspace_mode: Option<WorkspaceMode>,
+    pub execution_class: Option<ExecutionClass>,
     pub ttl_seconds: Option<u64>,
 }
 
@@ -2126,6 +2146,7 @@ mod tests {
         assert_db_variant_contract::<MemoryLimit>();
         assert_db_variant_contract::<NetworkEgressMode>();
         assert_db_variant_contract::<NetworkAllowRuleKind>();
+        assert_db_variant_contract::<ExecutionClass>();
         assert_db_variant_contract::<CommandStatus>();
         assert_db_variant_contract::<CommandOutputStream>();
         assert_db_variant_contract::<SandboxEventKind>();
@@ -2137,6 +2158,26 @@ mod tests {
         assert_db_variant_contract::<ProviderHealthStatus>();
         assert_db_variant_contract::<GuestStatus>();
         assert_db_variant_contract::<SshKeyStatus>();
+    }
+
+    #[test]
+    fn execution_class_has_stable_database_json_and_default_contract() {
+        assert_eq!(
+            ExecutionClass::VALUES,
+            &[
+                "development_container",
+                "sandboxed_container",
+                "virtual_machine"
+            ]
+        );
+        assert_eq!(
+            serde_json::to_string(&ExecutionClass::VirtualMachine).unwrap(),
+            "\"virtual_machine\""
+        );
+        assert_eq!(
+            ExecutionClass::default(),
+            ExecutionClass::DevelopmentContainer
+        );
     }
 
     #[test]
