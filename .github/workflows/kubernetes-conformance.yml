@@ -68,16 +68,8 @@ jobs:
               docker exec -i "${node}" tee \
                 /etc/containerd/certs.d/localhost:5001/hosts.toml >/dev/null
           done
-          docker tag sandboxwich-worker:conformance \
-            localhost:5001/sandboxwich-worker:conformance
-          docker push localhost:5001/sandboxwich-worker:conformance
-          gateway_image="$(docker image inspect localhost:5001/sandboxwich-worker:conformance \
-            --format '{{range .RepoDigests}}{{println .}}{{end}}' | head -n1)"
-          [[ "${gateway_image}" == *@sha256:* ]]
-          docker image rm -f sandboxwich-worker:conformance \
-            localhost:5001/sandboxwich-worker:conformance
-          docker image prune --force
-
+          # Publish and discard the largest local image first so the registry
+          # never overlaps it with another redundant runtime image copy.
           docker tag sandboxwich-runtime:conformance \
             localhost:5001/sandboxwich-runtime:conformance
           docker push localhost:5001/sandboxwich-runtime:conformance
@@ -86,6 +78,16 @@ jobs:
           [[ "${runtime_image}" == *@sha256:* ]]
           docker image rm -f sandboxwich-runtime:conformance \
             localhost:5001/sandboxwich-runtime:conformance
+          docker image prune --force
+
+          docker tag sandboxwich-worker:conformance \
+            localhost:5001/sandboxwich-worker:conformance
+          docker push localhost:5001/sandboxwich-worker:conformance
+          gateway_image="$(docker image inspect localhost:5001/sandboxwich-worker:conformance \
+            --format '{{range .RepoDigests}}{{println .}}{{end}}' | head -n1)"
+          [[ "${gateway_image}" == *@sha256:* ]]
+          docker image rm -f sandboxwich-worker:conformance \
+            localhost:5001/sandboxwich-worker:conformance
           docker image prune --force
 
           for node in $(kind get nodes --name sandboxwich-conformance); do
