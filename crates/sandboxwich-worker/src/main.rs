@@ -867,20 +867,12 @@ async fn main() -> anyhow::Result<()> {
                 args.provider.provider.apex_trusted_supervisor_v1,
             )?;
             let mut labels: BTreeMap<_, _> = args.label.into_iter().collect();
-            if args.provider.provider.apex_trusted_supervisor_v1 {
-                labels.insert(
-                    "runtime_profile".to_string(),
-                    "apex_trusted_supervisor_v1".to_string(),
-                );
-                labels.insert(
-                    "runtime_image".to_string(),
-                    args.provider
-                        .provider
-                        .runtime_image
-                        .clone()
-                        .expect("validated digest-pinned runtime image"),
-                );
-            }
+            add_placement_proof_labels(
+                &mut labels,
+                args.provider.provider_mode,
+                args.provider.provider.runtime_image.as_deref(),
+                args.provider.provider.apex_trusted_supervisor_v1,
+            );
             let response = register_worker(
                 &client,
                 &api,
@@ -1153,6 +1145,31 @@ fn validate_apex_trusted_supervisor_config(args: &ProviderArgs) -> anyhow::Resul
         );
     }
     Ok(())
+}
+
+fn add_placement_proof_labels(
+    labels: &mut BTreeMap<String, String>,
+    provider_mode: ProviderModeArg,
+    runtime_image: Option<&str>,
+    apex_trusted_supervisor_v1: bool,
+) {
+    labels.insert(
+        "provider_mode".to_string(),
+        match provider_mode {
+            ProviderModeArg::DryRun => "dry_run",
+            ProviderModeArg::Apply => "apply",
+        }
+        .to_string(),
+    );
+    if let Some(runtime_image) = runtime_image.filter(|value| !value.trim().is_empty()) {
+        labels.insert("runtime_image".to_string(), runtime_image.to_string());
+    }
+    if apex_trusted_supervisor_v1 {
+        labels.insert(
+            "runtime_profile".to_string(),
+            "apex_trusted_supervisor_v1".to_string(),
+        );
+    }
 }
 
 async fn claim(

@@ -870,6 +870,41 @@ fn isolation_profile_cli_is_typed_validated_and_passed_to_provider() {
 }
 
 #[test]
+fn run_registration_labels_include_actual_placement_proof() {
+    let image = "registry.example/sandbox@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mut labels = BTreeMap::from([
+        ("provider_mode".to_string(), "forged".to_string()),
+        ("runtime_image".to_string(), "forged:latest".to_string()),
+    ]);
+
+    add_placement_proof_labels(&mut labels, ProviderModeArg::Apply, Some(image), false);
+
+    assert_eq!(labels.get("provider_mode"), Some(&"apply".to_string()));
+    assert_eq!(labels.get("runtime_image"), Some(&image.to_string()));
+    assert!(!labels.contains_key("runtime_profile"));
+}
+
+#[test]
+fn apex_registration_labels_include_closed_runtime_profile() {
+    let mut labels = BTreeMap::new();
+
+    add_placement_proof_labels(
+        &mut labels,
+        ProviderModeArg::DryRun,
+        Some(
+            "registry.example/sandbox@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
+        true,
+    );
+
+    assert_eq!(labels.get("provider_mode"), Some(&"dry_run".to_string()));
+    assert_eq!(
+        labels.get("runtime_profile"),
+        Some(&"apex_trusted_supervisor_v1".to_string())
+    );
+}
+
+#[test]
 fn default_registration_capabilities_include_fqdn_when_a_backend_is_enabled() {
     let capabilities =
         capabilities_from_args(Vec::new(), IsolationProfile::Development, None, true, false)
