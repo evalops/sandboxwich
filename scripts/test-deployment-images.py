@@ -43,6 +43,20 @@ class DeploymentImagesTest(unittest.TestCase):
             'docker exec "${node}" crictl pull "${gateway_image}"', workflow
         )
 
+    def test_kind_runtime_placement_proof_uses_the_published_digest(self) -> None:
+        script = (ROOT / "deploy/kubernetes/kind-conformance.sh").read_text()
+        workflow = (ROOT / ".github/workflows/kubernetes-conformance.yml").read_text()
+        self.assertIn(
+            'SANDBOXWICH_RUNTIME_IMAGE must be digest-pinned', script
+        )
+        self.assertIn(
+            'docker exec "${node}" crictl pull "${runtime_image}"', workflow
+        )
+        self.assertIn(
+            'echo "SANDBOXWICH_RUNTIME_IMAGE=${runtime_image}" >>"${GITHUB_ENV}"',
+            workflow,
+        )
+
     def test_private_dns_probe_cannot_bypass_the_gateway_via_no_proxy(self) -> None:
         script = (ROOT / "deploy/kubernetes/kind-conformance.sh").read_text()
         self.assertIn(
