@@ -14,6 +14,7 @@ pub(crate) fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
     let memory_limit: String = row.try_get("memory_limit")?;
     let network_egress_mode: String = row.try_get("network_egress_mode")?;
     let workspace_mode: String = row.try_get("workspace_mode")?;
+    let runtime_profile: String = row.try_get("runtime_profile")?;
     let execution_class: String = row.try_get("execution_class")?;
     let created_at: String = row.try_get("created_at")?;
     let updated_at: String = row.try_get("updated_at")?;
@@ -37,6 +38,8 @@ pub(crate) fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
         network_egress,
         workspace_mode: WorkspaceMode::parse_db_str(&workspace_mode)
             .map_err(|_| ApiError::internal("database contains invalid workspace mode"))?,
+        runtime_profile: SandboxRuntimeProfile::parse_db_str(&runtime_profile)
+            .map_err(|_| ApiError::internal("database contains invalid runtime profile"))?,
         created_at: parse_timestamp(&created_at)?,
         updated_at: parse_timestamp(&updated_at)?,
         ttl_seconds: ttl_seconds.map(|ttl| ttl as u64),
@@ -153,6 +156,11 @@ pub(crate) fn row_to_snapshot(row: AnyRow) -> Result<Snapshot, ApiError> {
         label: row.try_get("label")?,
         inventory: serde_json::from_str(&inventory)?,
         provider_metadata: serde_json::from_str(&provider_metadata)?,
+        runtime_image: row.try_get("runtime_image")?,
+        provision_spec: row
+            .try_get::<Option<String>, _>("provision_spec")?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?,
         created_at: parse_timestamp(&created_at)?,
         ready_at: ready_at.map(|time| parse_timestamp(&time)).transpose()?,
         expires_at: expires_at.map(|time| parse_timestamp(&time)).transpose()?,

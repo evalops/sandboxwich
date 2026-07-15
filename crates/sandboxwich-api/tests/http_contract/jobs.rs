@@ -1,6 +1,489 @@
 use crate::common::*;
 use reqwest::StatusCode;
 use sandboxwich_core::*;
+use sha2::{Digest, Sha256};
+
+async fn legacy_provision_fixture(name: &str) -> (TestServer, SandboxResponse, WorkerResponse) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join(format!("{name}.db")).display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let client = server.client();
+    let sandbox: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some(name.to_string()),
+            template: None,
+            memory_limit: Some(MemoryLimit::FourG),
+            network_egress: Some(NetworkEgress::DenyAll),
+            workspace_mode: Some(WorkspaceMode::Persistent),
+            runtime_profile: None,
+            ttl_seconds: None,
+            execution_class: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let worker: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: format!("{name}-worker"),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![WorkerCapability::ProvisionSandbox],
+            max_concurrent_jobs: Some(1),
+            labels: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    (server, sandbox, worker)
+}
+
+#[tokio::test]
+async fn legacy_queued_job_is_authoritatively_repaired_and_claimed() {
+    let (server, sandbox, worker) = legacy_provision_fixture("legacy-repair").await;
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .connect(&server.database_url)
+        .await
+        .unwrap();
+    let forged_image = format!("ghcr.io/attacker/root@sha256:{}", "f".repeat(64));
+    sqlx::query("update jobs set payload = ? where kind = 'provision_sandbox'")
+        .bind(
+            serde_json::json!({
+                "sandboxId": sandbox.sandbox.id,
+                "runtimeImage": forged_image,
+                "provisionSpec": {
+                    "memory_limit": "16g",
+                    "network_egress": {"mode": "deny_all"},
+                    "workspace_mode": "persistent",
+                    "runtime_profile": "apex_trusted_supervisor_v1"
+                }
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let claimed: ClaimLeaseResponse = worker_client(&worker)
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox.sandbox.id),
+            kinds: Some(vec![JobKind::ProvisionSandbox]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claimed
+        .lease
+        .expect("legacy job should be repaired and claimed");
+    assert_eq!(
+        lease.job.payload["runtimeImage"],
+        serde_json::json!(sandbox.sandbox.template)
+    );
+    assert_eq!(
+        lease.job.payload["provisionSpec"]["memory_limit"],
+        serde_json::json!("4g")
+    );
+    assert_eq!(
+        lease.job.payload["provisionSpec"]["runtime_profile"],
+        serde_json::json!("unprivileged")
+    );
+    assert_ne!(
+        lease.job.payload["runtimeImage"],
+        serde_json::json!(forged_image)
+    );
+}
+
+#[tokio::test]
+async fn irreparable_legacy_queued_job_becomes_observably_dead() {
+    let (server, _sandbox, worker) = legacy_provision_fixture("legacy-dead").await;
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .connect(&server.database_url)
+        .await
+        .unwrap();
+    sqlx::query("update jobs set payload = '{}' where kind = 'provision_sandbox'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let claimed: ClaimLeaseResponse = worker_client(&worker)
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: Some(vec![JobKind::ProvisionSandbox]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(claimed.lease.is_none());
+    let jobs: JobListResponse = server
+        .client()
+        .get(format!("{}/jobs", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let job = jobs
+        .jobs
+        .iter()
+        .find(|job| job.kind == JobKind::ProvisionSandbox)
+        .unwrap();
+    assert_eq!(job.status, JobStatus::Dead);
+    assert_eq!(
+        job.last_error.as_deref(),
+        Some("authoritative_placement_unavailable")
+    );
+}
+
+#[tokio::test]
+async fn materialization_bytes_are_worker_fenced_ref_only_and_consumed_only_when_terminal() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("materialization.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+    let runtime_image = format!("image@sha256:{}", "a".repeat(64));
+    let sandbox: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("materialization".to_string()),
+            template: Some(runtime_image.clone()),
+            memory_limit: None,
+            network_egress: Some(NetworkEgress::DenyAll),
+            workspace_mode: None,
+            runtime_profile: Some(SandboxRuntimeProfile::ApexTrustedSupervisorV1),
+            ttl_seconds: Some(120),
+            execution_class: Some(ExecutionClass::SandboxedContainer),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let worker: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "materialization-worker".into(),
+            provider: "kubernetes".into(),
+            capabilities: vec![
+                WorkerCapability::ProvisionSandbox,
+                WorkerCapability::MaterializeFile,
+                WorkerCapability::ApexTrustedSupervisorV1,
+                WorkerCapability::SandboxedContainer,
+            ],
+            max_concurrent_jobs: Some(1),
+            labels: [
+                ("provider_mode".into(), "apply".into()),
+                ("runtime_image".into(), runtime_image),
+            ]
+            .into(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let worker_client = worker_client(&worker);
+    let provision: ClaimLeaseResponse = worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox.sandbox.id),
+            kinds: Some(vec![JobKind::ProvisionSandbox]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let provision = provision.lease.unwrap();
+    worker_client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, provision.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::ProvisionSandbox {
+                handle: ProviderSandboxHandle {
+                    provider: "kubernetes".into(),
+                    sandbox_id: sandbox.sandbox.id,
+                    resources: provision_resources(sandbox.sandbox.id),
+                    metadata: serde_json::json!({}),
+                },
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let secret = b"private-apex-task".to_vec();
+    let uploaded: FileResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/files",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .multipart(
+            reqwest::multipart::Form::new()
+                .text("path", "task.zip")
+                .part("file", reqwest::multipart::Part::bytes(secret.clone())),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let digest = format!("{:x}", Sha256::digest(&secret));
+    let queued: JobResponse = client
+        .post(format!("{}/jobs", server.base_url))
+        .json(&CreateJobRequest {
+            kind: JobKind::MaterializeFile,
+            payload: serde_json::json!({
+                "sandboxId": sandbox.sandbox.id,
+                "fileId": uploaded.file.id,
+                "destination": "apex_task",
+                "expectedSha256": digest,
+            }),
+            required_capability: WorkerCapability::MaterializeFile,
+            priority: None,
+            max_attempts: Some(2),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    async fn claim_materialization(
+        client: &reqwest::Client,
+        server: &TestServer,
+        worker: &WorkerResponse,
+        sandbox: SandboxId,
+    ) -> JobLease {
+        let claimed: ClaimLeaseResponse = client
+            .post(format!(
+                "{}/workers/{}/leases/claim",
+                server.base_url, worker.worker.id
+            ))
+            .json(&ClaimLeaseRequest {
+                lease_seconds: Some(60),
+                sandbox_id: Some(sandbox),
+                kinds: Some(vec![JobKind::MaterializeFile]),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        claimed.lease.unwrap()
+    }
+
+    let first = claim_materialization(&worker_client, &server, &worker, sandbox.sandbox.id).await;
+    assert_eq!(first.job.id, queued.job.id);
+    assert!(first.job.payload.get("transientContentBase64").is_none());
+    let tenant_fetch = client
+        .get(format!(
+            "{}/leases/{}/materialization",
+            server.base_url, first.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tenant_fetch.status(), StatusCode::UNAUTHORIZED);
+    let fetched = worker_client
+        .get(format!(
+            "{}/leases/{}/materialization",
+            server.base_url, first.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(fetched.content_length(), Some(secret.len() as u64));
+    assert_eq!(fetched.bytes().await.unwrap().as_ref(), secret.as_slice());
+    worker_client
+        .post(format!("{}/leases/{}/fail", server.base_url, first.id))
+        .json(&FailLeaseRequest {
+            error: "retry".into(),
+            retry: true,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let retained: ListFilesResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/files",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(retained.files.len(), 1);
+
+    let second = claim_materialization(&worker_client, &server, &worker, sandbox.sandbox.id).await;
+    worker_client
+        .post(format!("{}/leases/{}/fail", server.base_url, second.id))
+        .json(&FailLeaseRequest {
+            error: "terminal".into(),
+            retry: false,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let consumed: ListFilesResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/files",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(consumed.files.is_empty());
+
+    let cancelled_file: FileResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/files",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .multipart(
+            reqwest::multipart::Form::new()
+                .text("path", "cancelled-task.zip")
+                .part("file", reqwest::multipart::Part::bytes(secret.clone())),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let cancelled_job: JobResponse = client
+        .post(format!("{}/jobs", server.base_url))
+        .json(&CreateJobRequest {
+            kind: JobKind::MaterializeFile,
+            payload: serde_json::json!({
+                "sandboxId": sandbox.sandbox.id,
+                "fileId": cancelled_file.file.id,
+                "destination": "apex_task",
+                "expectedSha256": format!("{:x}", Sha256::digest(&secret)),
+            }),
+            required_capability: WorkerCapability::MaterializeFile,
+            priority: None,
+            max_attempts: Some(1),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    client
+        .post(format!(
+            "{}/operations/{}/cancel",
+            server.base_url, cancelled_job.job.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let cancelled_consumed: ListFilesResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/files",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(cancelled_consumed.files.is_empty());
+}
 
 #[tokio::test]
 pub(crate) async fn job_can_be_fetched_by_id_with_tenant_isolation() {
@@ -17,6 +500,7 @@ pub(crate) async fn job_can_be_fetched_by_id_with_tenant_isolation() {
         .json(&CreateSandboxRequest {
             execution_class: Some(ExecutionClass::VirtualMachine),
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("job-fetch".to_string()),
             template: None,
             memory_limit: None,
@@ -209,6 +693,7 @@ async fn create_sandbox(
         .json(&CreateSandboxRequest {
             execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some(name.to_string()),
             template: None,
             memory_limit: None,
@@ -492,6 +977,7 @@ pub(crate) async fn claim_lease_kinds_filter_excludes_other_kinds() {
             argv: vec!["echo".to_string(), "hi".to_string()],
             cwd: None,
             env: Default::default(),
+            stdin: None,
             timeout_secs: None,
         })
         .send()
@@ -580,26 +1066,7 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
     sandbox: &SandboxResponse,
     worker: &WorkerResponse,
 ) {
-    let queued: JobResponse = client
-        .post(format!("{}/jobs", server.base_url))
-        .json(&CreateJobRequest {
-            kind: JobKind::ProvisionSandbox,
-            payload: serde_json::json!({
-                "sandboxId": sandbox.sandbox.id
-            }),
-            required_capability: WorkerCapability::ProvisionSandbox,
-            priority: Some(9),
-            max_attempts: None,
-        })
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-
+    let sibling = create_sandbox(client, server, "same-tenant-completion-target").await;
     let worker_client = worker_client(worker);
     let claim_operation_id = uuid::Uuid::now_v7();
     let claimed: ClaimLeaseResponse = worker_client
@@ -610,7 +1077,7 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
         .header("idempotency-key", claim_operation_id.to_string())
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
-            sandbox_id: None,
+            sandbox_id: Some(sibling.sandbox.id),
             kinds: None,
         })
         .send()
@@ -624,7 +1091,7 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
     let lease = claimed
         .lease
         .expect("expected worker to claim rollback probe job");
-    assert_eq!(lease.job.id, queued.job.id);
+    assert_eq!(payload_sandbox_id(&lease.job), sibling.sandbox.id);
 
     let replayed_claim: ClaimLeaseResponse = worker_client
         .post(format!(
@@ -634,7 +1101,7 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
         .header("idempotency-key", claim_operation_id.to_string())
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
-            sandbox_id: None,
+            sandbox_id: Some(sibling.sandbox.id),
             kinds: None,
         })
         .send()
@@ -647,16 +1114,16 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
         .unwrap();
     assert_eq!(replayed_claim.lease.unwrap().id, lease.id);
 
-    let mut resources = provision_resources(sandbox.sandbox.id);
-    resources[0].provider = String::new();
-    let rejected = worker_client
+    let mut malformed = provision_resources(sibling.sandbox.id);
+    malformed[0].provider = String::new();
+    let malformed_rejected = worker_client
         .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
         .json(&CompleteLeaseRequest {
             result: Some(WorkerJobResult::ProvisionSandbox {
                 handle: ProviderSandboxHandle {
                     provider: "kubernetes".to_string(),
-                    sandbox_id: sandbox.sandbox.id,
-                    resources,
+                    sandbox_id: sibling.sandbox.id,
+                    resources: malformed,
                     metadata: serde_json::json!({}),
                 },
             }),
@@ -664,13 +1131,41 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
         .send()
         .await
         .unwrap();
-    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(malformed_rejected.status(), StatusCode::BAD_REQUEST);
 
-    let failed: LeaseResponse = worker_client
-        .post(format!("{}/leases/{}/fail", server.base_url, lease.id))
-        .json(&FailLeaseRequest {
-            error: "rollback probe".to_string(),
-            retry: false,
+    let mut same_tenant_collision = provision_resources(sibling.sandbox.id);
+    same_tenant_collision[0].resource_name = provision_resources(sandbox.sandbox.id)[0]
+        .resource_name
+        .clone();
+    let collision_rejected = worker_client
+        .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::ProvisionSandbox {
+                handle: ProviderSandboxHandle {
+                    provider: "kubernetes".to_string(),
+                    sandbox_id: sibling.sandbox.id,
+                    resources: same_tenant_collision,
+                    metadata: serde_json::json!({}),
+                },
+            }),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(collision_rejected.status(), StatusCode::BAD_REQUEST);
+
+    let tenant_b_sandbox: SandboxResponse = reqwest::Client::new()
+        .post(format!("{}/sandboxes", server.base_url))
+        .bearer_auth(TEST_TENANT_B_TOKEN)
+        .json(&CreateSandboxRequest {
+            execution_class: None,
+            workspace_mode: None,
+            runtime_profile: None,
+            name: Some("tenant-b-completion-target".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: Some(120),
         })
         .send()
         .await
@@ -680,13 +1175,37 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
         .json()
         .await
         .unwrap();
-    assert_eq!(failed.lease.job.status, JobStatus::Failed);
 
-    let replayed: LeaseResponse = worker_client
-        .post(format!("{}/leases/{}/fail", server.base_url, lease.id))
-        .json(&FailLeaseRequest {
-            error: "rollback probe".to_string(),
-            retry: false,
+    let mut cross_tenant = provision_resources(sibling.sandbox.id);
+    cross_tenant[0].sandbox_id = tenant_b_sandbox.sandbox.id;
+    let cross_tenant_rejected = worker_client
+        .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::ProvisionSandbox {
+                handle: ProviderSandboxHandle {
+                    provider: "kubernetes".to_string(),
+                    sandbox_id: sibling.sandbox.id,
+                    resources: cross_tenant,
+                    metadata: serde_json::json!({}),
+                },
+            }),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_tenant_rejected.status(), StatusCode::BAD_REQUEST);
+
+    let completed: LeaseResponse = worker_client
+        .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::ProvisionSandbox {
+                handle: ProviderSandboxHandle {
+                    provider: "kubernetes".to_string(),
+                    sandbox_id: sibling.sandbox.id,
+                    resources: provision_resources(sibling.sandbox.id),
+                    metadata: serde_json::json!({}),
+                },
+            }),
         })
         .send()
         .await
@@ -696,7 +1215,7 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
         .json()
         .await
         .unwrap();
-    assert_eq!(replayed.lease.status, LeaseStatus::Failed);
+    assert_eq!(completed.lease.job.status, JobStatus::Succeeded);
 }
 
 pub(crate) async fn assert_retryable_failure_requeues_command(
@@ -714,6 +1233,7 @@ pub(crate) async fn assert_retryable_failure_requeues_command(
             argv: vec!["false".to_string()],
             cwd: None,
             env: Default::default(),
+            stdin: None,
             timeout_secs: None,
         })
         .send()
@@ -900,6 +1420,7 @@ pub(crate) async fn assert_command_status_is_derived_from_exit_code(
                 ],
                 cwd: None,
                 env: Default::default(),
+                stdin: None,
                 timeout_secs: None,
             })
             .send()
@@ -1011,6 +1532,7 @@ pub(crate) async fn assert_expired_lease_requeues_command(
             argv: vec!["sleep".to_string(), "1".to_string()],
             cwd: None,
             env: Default::default(),
+            stdin: None,
             timeout_secs: None,
         })
         .send()
@@ -1109,4 +1631,161 @@ pub(crate) async fn assert_prompt_job_lifecycle(
     assert_eq!(prompt.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
     let error: ErrorEnvelope = prompt.json().await.unwrap();
     assert_eq!(error.code, "agent_prompt_unavailable");
+}
+
+#[tokio::test]
+pub(crate) async fn concurrent_provider_identity_collision_is_classified_over_postgres() {
+    let Ok(database_url) = std::env::var("SANDBOXWICH_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let server = TestServer::start(database_url, None).await;
+    let client = server.client();
+    let first_worker = register_claim_filter_worker(&client, &server).await;
+    let second_worker: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "concurrent-collision-worker".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![WorkerCapability::K8sPod, WorkerCapability::ProvisionSandbox],
+            max_concurrent_jobs: Some(4),
+            labels: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let first_worker_client = worker_client(&first_worker);
+    let second_worker_client = worker_client(&second_worker);
+
+    for attempt in 0..8 {
+        let first = create_sandbox(&client, &server, &format!("collision-first-{attempt}")).await;
+        let second = create_sandbox(&client, &server, &format!("collision-second-{attempt}")).await;
+        let first_claim: ClaimLeaseResponse = first_worker_client
+            .post(format!(
+                "{}/workers/{}/leases/claim",
+                server.base_url, first_worker.worker.id
+            ))
+            .json(&ClaimLeaseRequest {
+                lease_seconds: Some(60),
+                sandbox_id: Some(first.sandbox.id),
+                kinds: Some(vec![JobKind::ProvisionSandbox]),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let second_claim: ClaimLeaseResponse = second_worker_client
+            .post(format!(
+                "{}/workers/{}/leases/claim",
+                server.base_url, second_worker.worker.id
+            ))
+            .json(&ClaimLeaseRequest {
+                lease_seconds: Some(60),
+                sandbox_id: Some(second.sandbox.id),
+                kinds: Some(vec![JobKind::ProvisionSandbox]),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let first_lease = first_claim.lease.expect("first collision lease");
+        let second_lease = second_claim.lease.expect("second collision lease");
+        let resource_name = format!("concurrent-provider-identity-{attempt}");
+        let first_resource = provider_resource(
+            first.sandbox.id,
+            None,
+            RuntimeResourceKind::PersistentVolumeClaim,
+            RuntimeResourcePurpose::Workspace,
+            resource_name.clone(),
+        );
+        let second_resource = provider_resource(
+            second.sandbox.id,
+            None,
+            RuntimeResourceKind::PersistentVolumeClaim,
+            RuntimeResourcePurpose::Workspace,
+            resource_name,
+        );
+        let first_request = first_worker_client
+            .post(format!(
+                "{}/leases/{}/complete",
+                server.base_url, first_lease.id
+            ))
+            .json(&CompleteLeaseRequest {
+                result: Some(WorkerJobResult::ProvisionSandbox {
+                    handle: ProviderSandboxHandle {
+                        provider: "kubernetes".to_string(),
+                        sandbox_id: first.sandbox.id,
+                        resources: vec![first_resource],
+                        metadata: serde_json::json!({}),
+                    },
+                }),
+            });
+        let second_request = second_worker_client
+            .post(format!(
+                "{}/leases/{}/complete",
+                server.base_url, second_lease.id
+            ))
+            .json(&CompleteLeaseRequest {
+                result: Some(WorkerJobResult::ProvisionSandbox {
+                    handle: ProviderSandboxHandle {
+                        provider: "kubernetes".to_string(),
+                        sandbox_id: second.sandbox.id,
+                        resources: vec![second_resource],
+                        metadata: serde_json::json!({}),
+                    },
+                }),
+            });
+
+        let (first_response, second_response) =
+            tokio::join!(first_request.send(), second_request.send(),);
+        let statuses = [
+            first_response.unwrap().status(),
+            second_response.unwrap().status(),
+        ];
+        assert_eq!(
+            statuses.iter().filter(|status| status.is_success()).count(),
+            1,
+            "exactly one first writer must win: {statuses:?}"
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::BAD_REQUEST)
+                .count(),
+            1,
+            "the displaced association must be classified as 400, never 409: {statuses:?}"
+        );
+
+        let (loser_client, loser_lease_id) = if statuses[0] == StatusCode::BAD_REQUEST {
+            (&first_worker_client, first_lease.id)
+        } else {
+            (&second_worker_client, second_lease.id)
+        };
+        loser_client
+            .post(format!(
+                "{}/leases/{}/fail",
+                server.base_url, loser_lease_id
+            ))
+            .json(&FailLeaseRequest {
+                error: "expected concurrent identity collision".to_string(),
+                retry: false,
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
 }

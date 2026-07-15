@@ -22,7 +22,7 @@ use sandboxwich_core::{
     AgentHealthResponse, AppendCommandOutputRequest, ClaimLeaseRequest, ClaimLeaseResponse,
     CommandOutputStream, CompleteLeaseRequest, DEFAULT_COMMAND_TIMEOUT_SECS, FailLeaseRequest,
     GuestStatus, JobKind, LeaseId, LeaseResponse, RenewLeaseRequest, SandboxId,
-    UpdateGuestHealthRequest, WorkerJobResult, build_api_client,
+    UpdateGuestHealthRequest, WorkerJobResult, build_api_client, validate_agent_command_request,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -585,6 +585,7 @@ async fn exec(args: ExecArgs) -> anyhow::Result<()> {
             argv: args.argv,
             cwd: args.cwd,
             env: args.env.into_iter().collect(),
+            stdin: None,
             timeout_secs: args.timeout_secs,
         },
         client.as_ref(),
@@ -975,22 +976,43 @@ async fn execute_streaming(
     max_captured_output_bytes: u64,
     cancelled: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<AgentCommandResult> {
-    let Some((program, args)) = request.argv.split_first() else {
+    validate_agent_command_request(&request)?;
+    let AgentCommandRequest {
+        argv,
+        cwd,
+        env,
+        stdin,
+        timeout_secs,
+    } = request;
+    let Some((program, args)) = argv.split_first() else {
         bail!("argv must contain at least one item");
     };
-    let timeout = Duration::from_secs(request.timeout_secs.unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS));
+    let timeout = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS));
 
     let started_at = Utc::now();
     let mut command = ProcessCommand::new(program);
     command.args(args);
-    if let Some(cwd) = request.cwd {
+    if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    command.envs(request.env);
+    command.envs(env);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
+    if stdin.is_some() {
+        command.stdin(Stdio::piped());
+    }
 
     let mut child = command.spawn().context("failed to execute command")?;
+    let stdin_task = match stdin {
+        Some(bytes) => {
+            let mut pipe = child.stdin.take().context("failed to open command stdin")?;
+            Some(tokio::spawn(async move {
+                pipe.write_all(&bytes).await?;
+                Ok::<_, std::io::Error>(())
+            }))
+        }
+        None => None,
+    };
     let stdout = child.stdout.take().context("failed to capture stdout")?;
     let stderr = child.stderr.take().context("failed to capture stderr")?;
     let stdout_task = tokio::spawn(stream_reader(
@@ -1061,6 +1083,15 @@ async fn execute_streaming(
             );
         }
     };
+
+    if status.success()
+        && let Some(stdin_task) = stdin_task
+    {
+        stdin_task
+            .await
+            .context("command stdin writer task failed")?
+            .context("failed to write command stdin")?;
+    }
     let stdout = stdout_task.await.context("stdout stream task failed")??;
     let stderr = stderr_task.await.context("stderr stream task failed")??;
     let finished_at = Utc::now();
@@ -1297,13 +1328,38 @@ fn agent_request_from_payload(payload: &serde_json::Value) -> anyhow::Result<Age
         .transpose()
         .context("job payload env is invalid")?
         .unwrap_or_else(BTreeMap::new);
+    let stdin = payload
+        .get("stdin")
+        .cloned()
+        .map(|value| {
+            serde_json::from_value(serde_json::json!({
+                "argv": [],
+                "cwd": null,
+                "env": {},
+                "stdin": value,
+                "timeout_secs": null
+            }))
+            .map(|request: AgentCommandRequest| request.stdin)
+        })
+        .transpose()
+        .map_err(|error| {
+            if error.to_string().contains("command_stdin_too_large") {
+                anyhow::anyhow!("command_stdin_too_large: command stdin exceeds 1048576 bytes")
+            } else {
+                anyhow::Error::new(error).context("job payload stdin is invalid")
+            }
+        })?
+        .flatten();
     let timeout_secs = payload.get("timeoutSecs").and_then(|value| value.as_u64());
-    Ok(AgentCommandRequest {
+    let request = AgentCommandRequest {
         argv,
         cwd,
         env,
+        stdin,
         timeout_secs,
-    })
+    };
+    validate_agent_command_request(&request)?;
+    Ok(request)
 }
 
 async fn decode_json<T>(response: reqwest::Response) -> Result<T, AgentRequestError>
@@ -1657,6 +1713,7 @@ mod tests {
             argv: vec!["sh".to_string(), "-c".to_string(), "echo ok".to_string()],
             cwd: None,
             env: BTreeMap::new(),
+            stdin: None,
             timeout_secs: Some(5),
         };
         let result = execute_streaming(
@@ -1674,6 +1731,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_stdin_reaches_guest_but_not_result_debug_or_serialization() {
+        let marker = b"apex-private-input".to_vec();
+        let request = AgentCommandRequest {
+            argv: vec!["sh".to_string(), "-c".to_string(), "sha256sum".to_string()],
+            cwd: None,
+            env: BTreeMap::new(),
+            stdin: Some(marker),
+            timeout_secs: Some(5),
+        };
+
+        let debug = format!("{request:?}");
+        let serialized = serde_json::to_string(&request).expect("request should serialize");
+        let result = execute_streaming(
+            request,
+            None,
+            None,
+            None,
+            DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
+            None,
+        )
+        .await
+        .expect("stdin hashing command should complete");
+
+        assert!(
+            result
+                .stdout
+                .contains("f825ba6c6c1ddd75498ea957ba3e31ab2f3b8855baa87fe32197e14096e553c2")
+        );
+        for rendering in [debug, serialized, serde_json::to_string(&result).unwrap()] {
+            assert!(!rendering.contains("apex-private-input"));
+        }
+    }
+
+    #[tokio::test]
     async fn execute_streaming_kills_and_errors_on_timeout() {
         // Regression test for item 3(a): before this fix, `execute_streaming`
         // called `child.wait().await` with no bound at all, so a wedged (or
@@ -1685,6 +1776,7 @@ mod tests {
             argv: vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
             cwd: None,
             env: BTreeMap::new(),
+            stdin: None,
             timeout_secs: Some(1),
         };
         let started = std::time::Instant::now();
@@ -1724,6 +1816,7 @@ mod tests {
             argv: vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
             cwd: None,
             env: BTreeMap::new(),
+            stdin: None,
             timeout_secs: Some(60), // Long enough that the timeout branch can't win the race.
         };
         let cancelled = Arc::new(AtomicBool::new(false));

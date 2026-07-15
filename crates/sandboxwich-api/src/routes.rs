@@ -1,5 +1,6 @@
 use crate::api_contract::openapi;
 use crate::auth::*;
+use crate::handlers::apex_instructions::*;
 use crate::handlers::commands::*;
 use crate::handlers::desktop::*;
 use crate::handlers::divergence::*;
@@ -27,6 +28,9 @@ use sandboxwich_core::*;
 /// only ever accept small JSON payloads; the file upload route below opts into a much larger,
 /// explicit limit instead of every route inheriting one sized for 512 MB file bodies.
 pub(crate) const DEFAULT_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+const COMMAND_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+const APEX_READ_BODY_LIMIT_BYTES: usize = 2048;
+pub(crate) const APEX_CALLBACK_BODY_LIMIT_BYTES: usize = 1536 * 1024;
 
 pub(crate) fn app(state: AppState) -> Router {
     let upload_body_limit = usize::try_from(MAX_SANDBOX_FILE_BYTES + 1024 * 1024)
@@ -73,7 +77,9 @@ pub(crate) fn app(state: AppState) -> Router {
         )
         .route(
             "/sandboxes/{sandbox_id}/commands",
-            get(list_commands).post(queue_command),
+            get(list_commands)
+                .post(queue_command)
+                .layer(DefaultBodyLimit::max(COMMAND_BODY_LIMIT_BYTES)),
         )
         .route("/sandboxes/{sandbox_id}/prompt", post(queue_prompt))
         .route("/sandboxes/{sandbox_id}/events", get(list_events))
@@ -125,6 +131,16 @@ pub(crate) fn app(state: AppState) -> Router {
         .route("/ssh-keys/{ssh_key_id}/status", post(update_ssh_key_status))
         .route_layer(middleware::from_fn(require_tenant_principal));
 
+    // Live instruction bytes must never pass through the generic idempotency
+    // response cache. Their dedicated durable row stores lineage only.
+    let ephemeral_tenant_routes = Router::new()
+        .route(
+            "/sandboxes/{sandbox_id}/apex-task-instructions",
+            post(read_apex_task_instructions)
+                .layer(DefaultBodyLimit::max(APEX_READ_BODY_LIMIT_BYTES)),
+        )
+        .route_layer(middleware::from_fn(require_tenant_principal));
+
     // Registration returns a one-time raw worker credential. It deliberately does not use the
     // generic response-replay middleware because raw worker tokens must never be persisted.
     let registration_routes = Router::new()
@@ -146,11 +162,20 @@ pub(crate) fn app(state: AppState) -> Router {
             "/workers/{worker_id}/sandboxes/{sandbox_id}/guest-token",
             post(mint_guest_token),
         )
+        .route(
+            "/workers/{worker_id}/apex-instruction-callbacks/{callback_nonce}",
+            post(deliver_apex_task_instructions)
+                .layer(DefaultBodyLimit::max(APEX_CALLBACK_BODY_LIMIT_BYTES)),
+        )
         .route_layer(middleware::from_fn(require_worker_principal));
 
     let guest_routes = Router::new()
         .route("/workers/{worker_id}/leases/claim", post(claim_lease))
         .route("/leases/{lease_id}/renew", post(renew_lease))
+        .route(
+            "/leases/{lease_id}/materialization",
+            get(fetch_lease_materialization),
+        )
         .route(
             "/leases/{lease_id}/provisioning",
             put(update_provisioning_stage),
@@ -181,6 +206,10 @@ pub(crate) fn app(state: AppState) -> Router {
         state.clone(),
         enforce_tenant_limits,
     ));
+    let ephemeral_tenant_routes = ephemeral_tenant_routes.layer(middleware::from_fn_with_state(
+        state.clone(),
+        enforce_tenant_limits,
+    ));
     let guest_routes = guest_routes.layer(middleware::from_fn_with_state(
         state.clone(),
         enforce_tenant_limits,
@@ -192,6 +221,7 @@ pub(crate) fn app(state: AppState) -> Router {
 
     let versioned_routes = Router::new()
         .merge(tenant_routes.clone())
+        .merge(ephemeral_tenant_routes.clone())
         .merge(worker_routes.clone())
         .merge(guest_routes.clone())
         .merge(registration_routes.clone());
@@ -212,6 +242,7 @@ pub(crate) fn app(state: AppState) -> Router {
         .nest("/v1", versioned_routes)
         .nest("/v1/operator", operator_routes)
         .merge(tenant_routes)
+        .merge(ephemeral_tenant_routes)
         .merge(worker_routes)
         .merge(guest_routes)
         .merge(registration_routes)

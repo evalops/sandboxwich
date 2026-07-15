@@ -9,7 +9,8 @@ until its real provider path is exercised by an end-to-end conformance test.
 | Typed execution classes | Experimental | Callers request `development_container`, `sandboxed_container`, or `virtual_machine`; workers advertise operator-configured isolation support. VM execution remains experimental until SW-3 live conformance certification passes. |
 | Kubernetes pod provisioning | Experimental | Apply mode mutates a configured sandbox namespace. Require gVisor or Kata for hostile multi-tenant workloads. |
 | FQDN egress allowlists | Experimental | Workers with a digest-pinned `SANDBOXWICH_EGRESS_GATEWAY_IMAGE` provision a per-Sandbox proxy and fail-closed NetworkPolicies. Cilium-managed namespaces may use `SANDBOXWICH_CILIUM_FQDN_EGRESS=true`. Native additive GKE FQDN policy is not an enforcement boundary. |
-| Command execution | Experimental | Kubernetes apply mode uses `kubectl exec`; dry-run mode is simulation only. |
+| Command execution | Experimental | Kubernetes apply mode uses `kubectl exec`; dry-run mode is simulation only. Command requests may carry up to 1 MiB of base64-encoded, non-secret stdin bytes; providers pipe the decoded bytes to the guest and close the stream. |
+| APEX task instructions | Experimental | Apply-mode workers use one fixed executable and return at most 1 MiB through an instance-affine, worker-authenticated callback. Plaintext is live-only; durable rows contain lineage, digest, and byte count. Replays report output unavailable. |
 | Snapshots and forks | Experimental | Requires a working CSI `VolumeSnapshotClass`; not all clusters support it. |
 | SSH and browser desktop metadata | Experimental | Access records do not provide an ingress tunnel by themselves. |
 | Prompt/model execution | Unsupported | The current worker has no model executor. Dry-run acknowledgements are not model output. |
@@ -19,6 +20,8 @@ until its real provider path is exercised by an end-to-end conformance test.
 
 Provider capability reports must distinguish `dry_run` from `apply`; clients
 must not treat a simulated result as evidence that runtime work occurred.
+Only `provider_mode=apply` is real-provider execution evidence;
+`provider_mode=dry_run` is never proof that a guest process ran.
 
 ## Execution class ownership
 
@@ -27,6 +30,13 @@ field. Omitting it preserves the compatibility default of
 `development_container`. The selected class is durable, is inherited by forks,
 and constrains worker claim routing. It does not name a Kubernetes
 `RuntimeClass`, choose a node, or prove that a cluster isolation backend works.
+The closed apex_trusted_supervisor_v1 runtime profile is an additional,
+conjunctive trust requirement: the API accepts it only with
+execution_class=sandboxed_container, and a worker may advertise it only with
+--isolation-profile gvisor, a nonempty RuntimeClass, and the exact
+digest-pinned APEX image. Snapshot/fork and claim-time authoritative refresh
+preserve both dimensions; neither profile can downgrade the other.
+
 
 Operators configure how workers satisfy that request:
 

@@ -123,6 +123,7 @@ const PUBLIC_V1_OPERATIONS: &[(&str, &str)] = &[
     ),
     ("post", "/v1/workers/{worker_id}/leases/claim"),
     ("post", "/v1/leases/{lease_id}/renew"),
+    ("get", "/v1/leases/{lease_id}/materialization"),
     ("post", "/v1/leases/{lease_id}/output"),
     ("post", "/v1/leases/{lease_id}/complete"),
     ("post", "/v1/leases/{lease_id}/fail"),

@@ -1,6 +1,11 @@
 # Changelog
 
 ## Unreleased
+- APEX trusted-supervisor sandboxes now require the typed
+  sandboxed_container execution class end to end. Worker registration,
+  provider dispatch, snapshot restore, materialization, and lease claims all
+  enforce both the exact APEX profile/image and the gVisor isolation class.
+
 
 - Sandbox creation now carries a durable typed `execution_class` HTTP field.
   Callers choose the provider-neutral workload class, while operators configure

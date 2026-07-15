@@ -2,6 +2,7 @@ use crate::auth::*;
 use crate::db::*;
 use crate::error::*;
 use crate::handlers::commands::*;
+use crate::handlers::files::*;
 use crate::handlers::leases::*;
 use crate::handlers::sandboxes::*;
 use crate::handlers::snapshots::*;
@@ -13,6 +14,8 @@ use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
 use chrono::Utc;
 use sandboxwich_core::*;
+use serde_json::json;
+use sha2::Digest;
 use sqlx::AnyConnection;
 use uuid::Uuid;
 
@@ -21,6 +24,24 @@ pub(crate) async fn create_job(
     Extension(ctx): Extension<TenantContext>,
     Json(request): Json<CreateJobRequest>,
 ) -> Result<Json<JobResponse>, ApiError> {
+    if request.kind == JobKind::ApexTaskInstructions {
+        return Err(ApiError::bad_request(
+            "apex_task_instructions jobs can only be created by the live instruction endpoint",
+        ));
+    }
+    if request.kind == JobKind::RunCommand {
+        validate_run_command_job_input(&request.payload)?;
+    }
+    if request.kind == JobKind::MaterializeFile {
+        validate_materialize_file_job_input(&request.payload)?;
+    }
+    if request.kind == JobKind::MaterializeFile
+        && request.required_capability != WorkerCapability::MaterializeFile
+    {
+        return Err(ApiError::bad_request(
+            "materialize_file requires the materialize_file capability",
+        ));
+    }
     validate_functional_required_capability(&request.required_capability)?;
     let now = Utc::now();
     let mut job = Job {
@@ -42,7 +63,91 @@ pub(crate) async fn create_job(
     validate_job_payload_tenant(&state.db, &job, &ctx).await?;
     enrich_job_payload_with_provision_spec(&state.db, &mut job).await?;
     insert_job(&state.db, &job).await?;
-    Ok(Json(JobResponse { ok: true, job }))
+    Ok(Json(JobResponse {
+        ok: true,
+        job: job.into(),
+    }))
+}
+
+pub(crate) fn validate_materialize_file_job_input(
+    payload: &serde_json::Value,
+) -> Result<(), ApiError> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("materialization payload must be an object"))?;
+    const REQUIRED_KEYS: [&str; 4] = ["sandboxId", "fileId", "destination", "expectedSha256"];
+    if object.len() != REQUIRED_KEYS.len()
+        || REQUIRED_KEYS.iter().any(|key| !object.contains_key(*key))
+    {
+        return Err(ApiError::bad_request(
+            "materialization payload must contain only sandboxId, fileId, destination, and expectedSha256",
+        ));
+    }
+    let probe = Job {
+        id: JobId::new(),
+        tenant_id: String::new(),
+        kind: JobKind::MaterializeFile,
+        status: JobStatus::Queued,
+        payload: payload.clone(),
+        required_capability: WorkerCapability::MaterializeFile,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
+        priority: 0,
+        attempts: 0,
+        max_attempts: 1,
+        scheduled_at: Utc::now(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        last_error: None,
+    };
+    sandbox_id_from_job(&probe)?;
+    file_id_from_job(&probe)?;
+    materialization_destination_from_job(&probe)?;
+    materialization_digest_from_job(&probe)?;
+    Ok(())
+}
+
+fn validate_run_command_job_input(payload: &serde_json::Value) -> Result<(), ApiError> {
+    let env = payload
+        .get("env")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| ApiError::bad_request("job payload env is invalid"))?
+        .unwrap_or_default();
+    let stdin = payload
+        .get("stdin")
+        .cloned()
+        .map(|value| {
+            serde_json::from_value(serde_json::json!({
+                "argv": [],
+                "cwd": null,
+                "env": {},
+                "stdin": value,
+                "timeout_secs": null
+            }))
+            .map(|request: AgentCommandRequest| request.stdin)
+        })
+        .transpose()
+        .map_err(|error| {
+            if error.to_string().contains("command_stdin_too_large") {
+                ApiError::payload_too_large(
+                    "command_stdin_too_large",
+                    "command stdin exceeds 1048576 bytes",
+                )
+            } else {
+                ApiError::bad_request("job payload stdin is invalid")
+            }
+        })?
+        .flatten();
+    validate_command_input(&stdin, &env).map_err(|error| match error {
+        CommandExecutionRequestError::StdinTooLarge => ApiError::payload_too_large(
+            "command_stdin_too_large",
+            "command stdin exceeds 1048576 bytes",
+        ),
+        CommandExecutionRequestError::EnvironmentContainsNul => {
+            ApiError::bad_request(error.to_string())
+        }
+    })
 }
 
 fn validate_functional_required_capability(capability: &WorkerCapability) -> Result<(), ApiError> {
@@ -54,12 +159,15 @@ fn validate_functional_required_capability(capability: &WorkerCapability) -> Res
         }
         WorkerCapability::ProvisionSandbox
         | WorkerCapability::RunCommand
+        | WorkerCapability::MaterializeFile
+        | WorkerCapability::ApexTaskInstructions
         | WorkerCapability::AgentPrompt
         | WorkerCapability::Snapshot
         | WorkerCapability::DesktopStream
         | WorkerCapability::K8sPod
         | WorkerCapability::GvisorSandbox
-        | WorkerCapability::FqdnEgress => Ok(()),
+        | WorkerCapability::FqdnEgress
+        | WorkerCapability::ApexTrustedSupervisorV1 => Ok(()),
     }
 }
 
@@ -70,7 +178,10 @@ pub(crate) async fn get_job(
 ) -> Result<Json<JobResponse>, ApiError> {
     let job = fetch_job(&state.db, JobId(job_id)).await?;
     ensure_job_tenant(&job, &ctx)?;
-    Ok(Json(JobResponse { ok: true, job }))
+    Ok(Json(JobResponse {
+        ok: true,
+        job: job.into(),
+    }))
 }
 
 pub(crate) async fn enrich_job_payload_with_provision_spec(
@@ -78,7 +189,14 @@ pub(crate) async fn enrich_job_payload_with_provision_spec(
     job: &mut Job,
 ) -> Result<(), ApiError> {
     match job.kind {
-        JobKind::ProvisionSandbox | JobKind::RunCommand => {
+        JobKind::ProvisionSandbox
+        | JobKind::RunCommand
+        | JobKind::RunPrompt
+        | JobKind::CreateSnapshot
+        | JobKind::StopSandbox
+        | JobKind::ResumeSandbox
+        | JobKind::MaterializeFile
+        | JobKind::ApexTaskInstructions => {
             let sandbox = fetch_sandbox(db, sandbox_id_from_job(job)?).await?;
             job.required_execution_class = sandbox.execution_class.clone();
             add_provision_spec_to_payload(job, &sandbox)?;
@@ -88,14 +206,6 @@ pub(crate) async fn enrich_job_payload_with_provision_spec(
             job.required_execution_class = child.execution_class.clone();
             add_provision_spec_to_payload(job, &child)?;
         }
-        JobKind::RunPrompt | JobKind::StopSandbox | JobKind::ResumeSandbox => {
-            let sandbox = fetch_sandbox(db, sandbox_id_from_job(job)?).await?;
-            job.required_execution_class = sandbox.execution_class;
-        }
-        JobKind::CreateSnapshot => {
-            let sandbox = fetch_sandbox(db, sandbox_id_from_job(job)?).await?;
-            job.required_execution_class = sandbox.execution_class;
-        }
     }
     Ok(())
 }
@@ -104,12 +214,13 @@ pub(crate) fn add_provision_spec_to_payload(
     job: &mut Job,
     sandbox: &Sandbox,
 ) -> Result<(), ApiError> {
-    if job.payload.get("provisionSpec").is_some() {
-        return Ok(());
-    }
     let Some(payload) = job.payload.as_object_mut() else {
         return Err(ApiError::bad_request("job payload must be an object"));
     };
+    // This is authoritative control-plane enrichment, not a caller-provided
+    // image selector. Profile-bound jobs must stay on the exact worker image
+    // that owns the sandbox placement.
+    payload.insert("runtimeImage".to_string(), json!(sandbox.template));
     payload.insert(
         "provisionSpec".to_string(),
         serde_json::to_value(SandboxProvisionSpec {
@@ -117,6 +228,7 @@ pub(crate) fn add_provision_spec_to_payload(
             memory_limit: sandbox.memory_limit.clone(),
             network_egress: sandbox.network_egress.clone(),
             workspace_mode: sandbox.workspace_mode.clone(),
+            runtime_profile: sandbox.runtime_profile.clone(),
         })?,
     );
     Ok(())
@@ -135,6 +247,32 @@ pub(crate) async fn validate_job_payload_tenant(
             ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
             let command = fetch_command(db, command_id_from_job(job)?).await?;
             ensure_sandbox_tenant(db, command.sandbox_id, ctx).await?;
+        }
+        JobKind::MaterializeFile => {
+            let sandbox = ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
+            if sandbox.runtime_profile != SandboxRuntimeProfile::ApexTrustedSupervisorV1 {
+                return Err(ApiError::bad_request(
+                    "materialize_file requires apex_trusted_supervisor_v1",
+                ));
+            }
+            let file_id = file_id_from_job(job)?;
+            let stored = fetch_sandbox_file(db, sandbox.id, file_id).await?;
+            let expected = materialization_digest_from_job(job)?;
+            let observed = format!("{:x}", sha2::Sha256::digest(&stored.content));
+            if expected != observed {
+                return Err(ApiError::bad_request(
+                    "materialization digest does not match file",
+                ));
+            }
+            materialization_destination_from_job(job)?;
+        }
+        JobKind::ApexTaskInstructions => {
+            let sandbox = ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
+            if sandbox.runtime_profile != SandboxRuntimeProfile::ApexTrustedSupervisorV1 {
+                return Err(ApiError::bad_request(
+                    "apex_task_instructions requires apex_trusted_supervisor_v1",
+                ));
+            }
         }
         JobKind::RunPrompt => {
             ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
@@ -156,6 +294,47 @@ pub(crate) async fn validate_job_payload_tenant(
         }
     }
     Ok(())
+}
+
+pub(crate) fn file_id_from_job(job: &Job) -> Result<FileId, ApiError> {
+    let value = job
+        .payload
+        .get("fileId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ApiError::bad_request("materialization fileId is required"))?;
+    Ok(FileId(Uuid::parse_str(value).map_err(|_| {
+        ApiError::bad_request("materialization fileId is invalid")
+    })?))
+}
+
+pub(crate) fn materialization_digest_from_job(job: &Job) -> Result<&str, ApiError> {
+    let value = job
+        .payload
+        .get("expectedSha256")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ApiError::bad_request("materialization expectedSha256 is required"))?;
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(ApiError::bad_request(
+            "materialization expectedSha256 is invalid",
+        ));
+    }
+    Ok(value)
+}
+
+pub(crate) fn materialization_destination_from_job(
+    job: &Job,
+) -> Result<MaterializeFileDestination, ApiError> {
+    serde_json::from_value(
+        job.payload
+            .get("destination")
+            .cloned()
+            .ok_or_else(|| ApiError::bad_request("materialization destination is required"))?,
+    )
+    .map_err(|_| ApiError::bad_request("materialization destination is invalid"))
 }
 
 pub(crate) async fn list_jobs(
@@ -184,7 +363,7 @@ pub(crate) async fn list_jobs(
 
     Ok(Json(JobListResponse {
         ok: true,
-        jobs,
+        jobs: jobs.into_iter().map(PublicJob::from).collect(),
         next_cursor,
     }))
 }
@@ -285,6 +464,9 @@ pub(crate) fn job_references(job: &Job) -> Result<JobReferences, ApiError> {
             references.sandbox_id = Some(sandbox_id_from_job(job)?);
             references.command_id = Some(command_id_from_job(job)?);
         }
+        JobKind::MaterializeFile | JobKind::ApexTaskInstructions => {
+            references.sandbox_id = Some(sandbox_id_from_job(job)?);
+        }
         JobKind::RunPrompt => {
             references.sandbox_id = Some(sandbox_id_from_job(job)?);
             references.prompt_event_id = Some(prompt_event_id_from_job(job)?);
@@ -342,6 +524,9 @@ pub(crate) async fn try_claim_job(
     let mut tx = db.pool.begin().await?;
     let claimed = async {
         lock_worker_for_claim_on_connection(db, &mut tx, worker.id).await?;
+        if !lock_apex_instruction_placement_on_connection(db, &mut tx, worker, job).await? {
+            return Ok(None);
+        }
         let active_leases =
             active_lease_count_for_worker_on_connection(db, &mut tx, worker.id).await?;
         if active_leases >= worker.max_concurrent_jobs {
@@ -422,6 +607,53 @@ pub(crate) async fn try_claim_job(
             Err(error)
         }
     }
+}
+
+async fn lock_apex_instruction_placement_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    worker: &Worker,
+    job: &Job,
+) -> Result<bool, ApiError> {
+    if job.kind != JobKind::ApexTaskInstructions {
+        return Ok(true);
+    }
+    let Some(target_worker_id) = job
+        .payload
+        .get("targetWorkerId")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+    else {
+        return Ok(false);
+    };
+    let Some(target_generation) = job
+        .payload
+        .get("targetPlacementGeneration")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| i64::try_from(value).ok())
+    else {
+        return Ok(false);
+    };
+    if target_worker_id != worker.id.0 {
+        return Ok(false);
+    }
+    // The no-op update both verifies and locks the exact placement tuple for
+    // the remainder of this claim transaction. A concurrent placement move
+    // must complete before this check or wait until after the lease commits.
+    let sql = format!(
+        "update sandbox_placements set updated_at = updated_at
+         where sandbox_id = {} and worker_id = {} and generation = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+    );
+    let result = sqlx::query(&sql)
+        .bind(sandbox_id_from_job(job)?.to_string())
+        .bind(worker.id.to_string())
+        .bind(target_generation)
+        .execute(&mut *connection)
+        .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 async fn bind_sandbox_placement_on_connection(

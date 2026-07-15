@@ -9,6 +9,7 @@ use std::{
 };
 
 use anyhow::Context;
+use base64::Engine as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use provider::{
     CancelSignal, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES, IsolationProfile, KUBERNETES_MUTATION_ENV,
@@ -16,13 +17,16 @@ use provider::{
     RetryDisposition, SandboxProvider, image_is_digest_pinned,
 };
 use sandboxwich_core::{
-    AgentCommandRequest, AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse,
+    AgentCommandRequest, AgentCommandResult, ApexTaskInstructionsCallbackRequest,
+    ApexTaskInstructionsCallbackResponse, ClaimLeaseRequest, ClaimLeaseResponse,
     CompleteLeaseRequest, FailLeaseRequest, JobKind, LeaseResponse, ProvisioningOperationResponse,
     ProvisioningStageUpdateRequest, RegisterWorkerRequest, RenewLeaseRequest,
     RuntimeResourceInventoryResponse, SandboxProvisionSpec, WorkerCapability,
     WorkerHeartbeatRequest, WorkerJobResult, WorkerResponse, build_api_client,
+    validate_agent_command_request,
 };
 use serde_json::json;
+use sha2::Digest;
 use uuid::Uuid;
 
 const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
@@ -253,6 +257,15 @@ struct ProviderArgs {
     #[arg(long, env = "SANDBOXWICH_RUNTIME_IMAGE")]
     runtime_image: Option<String>,
 
+    /// Enables the one closed uid-0 trusted-supervisor profile. This is only
+    /// advertised when the configured runtime image is digest-pinned.
+    #[arg(
+        long,
+        env = "SANDBOXWICH_APEX_TRUSTED_SUPERVISOR_V1",
+        default_value_t = false
+    )]
+    apex_trusted_supervisor_v1: bool,
+
     #[arg(long, env = "SANDBOXWICH_EGRESS_GATEWAY_IMAGE")]
     egress_gateway_image: Option<String>,
 
@@ -449,6 +462,8 @@ struct ProviderApplyArgs {
 enum CapabilityArg {
     ProvisionSandbox,
     RunCommand,
+    MaterializeFile,
+    ApexTaskInstructions,
     Snapshot,
     DesktopStream,
     FqdnEgress,
@@ -544,9 +559,47 @@ impl SandboxProvider for RuntimeProvider {
         request: AgentCommandRequest,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<sandboxwich_core::AgentCommandResult> {
+        validate_agent_command_request(&request)?;
         match self {
             Self::DryRun(provider) => provider.exec_handoff(sandbox_id, spec, request, cancelled),
             Self::Apply(provider) => provider.exec_handoff(sandbox_id, spec, request, cancelled),
+        }
+    }
+
+    fn materialize_file(
+        &self,
+        sandbox_id: sandboxwich_core::SandboxId,
+        destination: sandboxwich_core::MaterializeFileDestination,
+        expected_sha256: &str,
+        content: &[u8],
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::DryRun(provider) => provider.materialize_file(
+                sandbox_id,
+                destination,
+                expected_sha256,
+                content,
+                cancelled,
+            ),
+            Self::Apply(provider) => provider.materialize_file(
+                sandbox_id,
+                destination,
+                expected_sha256,
+                content,
+                cancelled,
+            ),
+        }
+    }
+
+    fn read_apex_task_instructions(
+        &self,
+        sandbox_id: sandboxwich_core::SandboxId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<Vec<u8>> {
+        match self {
+            Self::DryRun(provider) => provider.read_apex_task_instructions(sandbox_id, cancelled),
+            Self::Apply(provider) => provider.read_apex_task_instructions(sandbox_id, cancelled),
         }
     }
 
@@ -660,6 +713,7 @@ async fn main() -> anyhow::Result<()> {
                     argv: vec!["echo".to_string(), "sandboxwich".to_string()],
                     cwd: None,
                     env: BTreeMap::new(),
+                    stdin: None,
                     timeout_secs: None,
                 },
                 &CancelSignal::never_cancelled(),
@@ -727,6 +781,7 @@ async fn main() -> anyhow::Result<()> {
                     args.capability,
                     IsolationProfile::Development,
                     None,
+                    false,
                     false,
                 )?,
                 args.label.into_iter().collect(),
@@ -803,13 +858,21 @@ async fn main() -> anyhow::Result<()> {
                     .egress_gateway_image
                     .as_deref()
                     .is_some_and(image_is_digest_pinned);
+            validate_apex_trusted_supervisor_config(&args.provider.provider)?;
             let capabilities = capabilities_from_args(
                 args.capability,
                 isolation_profile,
                 runtime_class_name,
                 fqdn_egress_backend,
+                args.provider.provider.apex_trusted_supervisor_v1,
             )?;
-            let labels: BTreeMap<_, _> = args.label.into_iter().collect();
+            let mut labels: BTreeMap<_, _> = args.label.into_iter().collect();
+            add_placement_proof_labels(
+                &mut labels,
+                args.provider.provider_mode,
+                args.provider.provider.runtime_image.as_deref(),
+                args.provider.provider.apex_trusted_supervisor_v1,
+            );
             let response = register_worker(
                 &client,
                 &api,
@@ -897,6 +960,7 @@ fn provider_from_args(args: ProviderArgs) -> anyhow::Result<KubernetesDryRunProv
         non_empty(args.snapshot_class),
     )
     .with_runtime_image(non_empty(args.runtime_image))
+    .with_apex_trusted_supervisor_v1(args.apex_trusted_supervisor_v1)
     .with_egress_gateway_image(non_empty(args.egress_gateway_image))
     .with_workspace_storage(non_empty(args.workspace_storage))
     .with_ssh_authorized_keys_secret(non_empty(args.ssh_authorized_keys_secret))
@@ -1042,6 +1106,7 @@ fn apply_provider_from_args(args: ProviderApplyArgs) -> anyhow::Result<Kubernete
 }
 
 fn runtime_provider_from_args(args: RuntimeProviderArgs) -> anyhow::Result<RuntimeProvider> {
+    validate_apex_trusted_supervisor_config(&args.provider)?;
     if matches!(args.provider_mode, ProviderModeArg::Apply) {
         require_explicit_runtime_image_for_apply(&args.provider)?;
     }
@@ -1068,6 +1133,43 @@ fn runtime_provider_from_args(args: RuntimeProviderArgs) -> anyhow::Result<Runti
             )
         }
     })
+}
+
+fn validate_apex_trusted_supervisor_config(args: &ProviderArgs) -> anyhow::Result<()> {
+    if args.apex_trusted_supervisor_v1 {
+        anyhow::ensure!(
+            args.runtime_image
+                .as_deref()
+                .is_some_and(image_is_digest_pinned),
+            "apex_trusted_supervisor_v1 requires SANDBOXWICH_RUNTIME_IMAGE pinned by sha256 digest"
+        );
+    }
+    Ok(())
+}
+
+fn add_placement_proof_labels(
+    labels: &mut BTreeMap<String, String>,
+    provider_mode: ProviderModeArg,
+    runtime_image: Option<&str>,
+    apex_trusted_supervisor_v1: bool,
+) {
+    labels.insert(
+        "provider_mode".to_string(),
+        match provider_mode {
+            ProviderModeArg::DryRun => "dry_run",
+            ProviderModeArg::Apply => "apply",
+        }
+        .to_string(),
+    );
+    if let Some(runtime_image) = runtime_image.filter(|value| !value.trim().is_empty()) {
+        labels.insert("runtime_image".to_string(), runtime_image.to_string());
+    }
+    if apex_trusted_supervisor_v1 {
+        labels.insert(
+            "runtime_profile".to_string(),
+            "apex_trusted_supervisor_v1".to_string(),
+        );
+    }
 }
 
 async fn claim(
@@ -1679,6 +1781,30 @@ where
             }
         }
     });
+    let materialization = if lease.job.kind == JobKind::MaterializeFile {
+        match fetch_materialization(client, api, lease_id).await {
+            Ok(content) if !cancelled.is_cancelled() => Some(content),
+            Ok(_) | Err(_) => {
+                renew_task.abort();
+                let _ = renew_task.await;
+                let payload = FailLeaseRequest {
+                    error: "materialization fetch failed".to_string(),
+                    retry: true,
+                };
+                return with_retries("fail lease", API_RETRY_ATTEMPTS, || async {
+                    let response = client
+                        .post(format!("{api}/leases/{lease_id}/fail"))
+                        .json(&payload)
+                        .send()
+                        .await?;
+                    decode_json::<LeaseResponse>(response).await
+                })
+                .await;
+            }
+        }
+    } else {
+        None
+    };
 
     // Job execution shells out to `kubectl` and blocks synchronously; run it on a
     // blocking-pool thread so it can't stall the async runtime (and the heartbeat/
@@ -1708,7 +1834,13 @@ where
             ))?;
             Ok(())
         };
-        execute_job_with_reporter(&job, exec_provider.as_ref(), &exec_cancelled, &mut reporter)
+        execute_job_with_reporter(
+            &job,
+            materialization.as_deref(),
+            exec_provider.as_ref(),
+            &exec_cancelled,
+            &mut reporter,
+        )
     })
     .await
     .unwrap_or_else(|join_error| {
@@ -1734,6 +1866,93 @@ where
                 decode_json::<LeaseResponse>(response).await
             })
             .await
+        }
+        Ok(WorkerJobOutcome::ApexTaskInstructions {
+            request_id,
+            sandbox_id,
+            provider_apply_id,
+            callback_nonce,
+            callback_url,
+            sha256,
+            bytes,
+        }) => {
+            let callback =
+                validate_apex_callback_url(&callback_url, callback_nonce).and_then(|url| {
+                    Ok((
+                        url,
+                        ApexTaskInstructionsCallbackRequest {
+                            request_id,
+                            lease_id: lease_id.0,
+                            lease_attempt: u64::try_from(lease_attempt)
+                                .context("instruction lease attempt is invalid")?,
+                            provider_apply_id,
+                            sha256: sha256.clone(),
+                            byte_count: u64::try_from(bytes.len())
+                                .context("instruction byte count is invalid")?,
+                            output_base64: Some(
+                                base64::engine::general_purpose::STANDARD.encode(&bytes),
+                            ),
+                        },
+                    ))
+                });
+            let callback = match callback {
+                Ok((url, payload)) => {
+                    with_retries(
+                        "deliver APEX instruction callback",
+                        API_RETRY_ATTEMPTS,
+                        || async {
+                            let response = client.post(url.clone()).json(&payload).send().await?;
+                            decode_json::<ApexTaskInstructionsCallbackResponse>(response).await
+                        },
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            match callback {
+                Ok(callback) => {
+                    let payload = CompleteLeaseRequest {
+                        result: Some(WorkerJobResult::ApexTaskInstructions {
+                            request_id,
+                            sandbox_id,
+                            lease_id,
+                            lease_attempt,
+                            provider_apply_id,
+                            sha256,
+                            byte_count: u64::try_from(bytes.len())
+                                .expect("instruction output is capped at 1 MiB"),
+                            output_unavailable: callback.output_unavailable,
+                        }),
+                    };
+                    with_retries("complete lease", API_RETRY_ATTEMPTS, || async {
+                        let response = client
+                            .post(format!("{api}/leases/{lease_id}/complete"))
+                            .json(&payload)
+                            .send()
+                            .await?;
+                        decode_json::<LeaseResponse>(response).await
+                    })
+                    .await
+                }
+                Err(error) => {
+                    let payload = FailLeaseRequest {
+                        error: "APEX instruction callback delivery failed".to_string(),
+                        // The provider read already happened. Re-queuing this
+                        // lease would execute the one-time reader again.
+                        retry: false,
+                    };
+                    with_retries("fail lease", API_RETRY_ATTEMPTS, || async {
+                        let response = client
+                            .post(format!("{api}/leases/{lease_id}/fail"))
+                            .json(&payload)
+                            .send()
+                            .await?;
+                        decode_json::<LeaseResponse>(response).await
+                    })
+                    .await
+                    .with_context(|| format!("instruction callback failed: {error:#}"))
+                }
+            }
         }
         Ok(WorkerJobOutcome::Fail { error, retry }) => {
             let payload = FailLeaseRequest { error, retry };
@@ -1765,10 +1984,54 @@ where
     }
 }
 
+async fn fetch_materialization(
+    client: &reqwest::Client,
+    api: &str,
+    lease_id: sandboxwich_core::LeaseId,
+) -> anyhow::Result<Vec<u8>> {
+    let mut response = client
+        .get(format!("{api}/leases/{lease_id}/materialization"))
+        .send()
+        .await?
+        .error_for_status()?;
+    let declared = response
+        .content_length()
+        .context("materialization response has no content-length")?;
+    anyhow::ensure!(
+        declared <= sandboxwich_core::MAX_SANDBOX_FILE_BYTES,
+        "materialization response exceeds 64 MiB"
+    );
+    let mut content = Vec::with_capacity(declared as usize);
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(
+            content.len() + chunk.len() <= sandboxwich_core::MAX_SANDBOX_FILE_BYTES as usize,
+            "materialization response exceeds 64 MiB"
+        );
+        content.extend_from_slice(&chunk);
+    }
+    anyhow::ensure!(
+        content.len() as u64 == declared,
+        "materialization response length mismatch"
+    );
+    Ok(content)
+}
+
 #[derive(Debug)]
 enum WorkerJobOutcome {
     Complete(WorkerJobResult),
-    Fail { error: String, retry: bool },
+    ApexTaskInstructions {
+        request_id: Uuid,
+        sandbox_id: sandboxwich_core::SandboxId,
+        provider_apply_id: Uuid,
+        callback_nonce: Uuid,
+        callback_url: String,
+        sha256: String,
+        bytes: Vec<u8>,
+    },
+    Fail {
+        error: String,
+        retry: bool,
+    },
 }
 
 fn provisioning_stage_request(
@@ -1788,17 +2051,47 @@ fn provisioning_stage_request(
     )
 }
 
+fn validate_apex_callback_url(url: &str, nonce: Uuid) -> anyhow::Result<reqwest::Url> {
+    let parsed = reqwest::Url::parse(url).context("instruction callback URL is invalid")?;
+    anyhow::ensure!(
+        matches!(parsed.scheme(), "http" | "https")
+            && parsed.host_str().is_some()
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+            && parsed.query().is_none()
+            && parsed.fragment().is_none(),
+        "instruction callback URL must be an http(s) origin and fixed callback path"
+    );
+    let expected_suffix = format!("/apex-instruction-callbacks/{nonce}");
+    anyhow::ensure!(
+        parsed.path().ends_with(&expected_suffix),
+        "instruction callback URL nonce does not match job lineage"
+    );
+    Ok(parsed)
+}
+
 #[cfg(test)]
 fn execute_job(
     job: &sandboxwich_core::Job,
     provider: &impl SandboxProvider,
     cancelled: &CancelSignal,
 ) -> anyhow::Result<WorkerJobOutcome> {
-    execute_job_with_reporter(job, provider, cancelled, &mut |_| Ok(()))
+    execute_job_with_reporter(job, None, provider, cancelled, &mut |_| Ok(()))
+}
+
+#[cfg(test)]
+fn execute_materialization_job(
+    job: &sandboxwich_core::Job,
+    content: &[u8],
+    provider: &impl SandboxProvider,
+    cancelled: &CancelSignal,
+) -> anyhow::Result<WorkerJobOutcome> {
+    execute_job_with_reporter(job, Some(content), provider, cancelled, &mut |_| Ok(()))
 }
 
 fn execute_job_with_reporter(
     job: &sandboxwich_core::Job,
+    materialization: Option<&[u8]>,
     provider: &impl SandboxProvider,
     cancelled: &CancelSignal,
     report: &mut dyn FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
@@ -1870,6 +2163,91 @@ fn execute_job_with_reporter(
             Ok(WorkerJobOutcome::Complete(WorkerJobResult::RunCommand {
                 result,
             }))
+        }
+        JobKind::MaterializeFile => {
+            let sandbox_id = sandbox_id_from_payload(&job.payload)?;
+            let file_id = sandboxwich_core::FileId(uuid_from_payload(&job.payload, "fileId")?);
+            let destination: sandboxwich_core::MaterializeFileDestination = serde_json::from_value(
+                job.payload
+                    .get("destination")
+                    .cloned()
+                    .context("materialization destination is missing")?,
+            )
+            .context("materialization destination is invalid")?;
+            let expected_sha256 = job
+                .payload
+                .get("expectedSha256")
+                .and_then(serde_json::Value::as_str)
+                .context("materialization digest is missing")?;
+            let content = materialization.context("materialization content was not fetched")?;
+            anyhow::ensure!(
+                content.len() as u64 <= sandboxwich_core::MAX_SANDBOX_FILE_BYTES,
+                "materialization exceeds 64 MiB"
+            );
+            provider.materialize_file(
+                sandbox_id,
+                destination.clone(),
+                expected_sha256,
+                content,
+                cancelled,
+            )?;
+            Ok(WorkerJobOutcome::Complete(
+                WorkerJobResult::MaterializeFile {
+                    receipt: sandboxwich_core::MaterializeFileReceipt {
+                        sandbox_id,
+                        file_id,
+                        destination,
+                        sha256: expected_sha256.to_string(),
+                        size_bytes: content.len() as u64,
+                    },
+                },
+            ))
+        }
+        JobKind::ApexTaskInstructions => {
+            let sandbox_id = sandbox_id_from_payload(&job.payload)?;
+            let request_id = uuid_from_payload(&job.payload, "requestId")?;
+            let provider_apply_id = uuid_from_payload(&job.payload, "providerApplyId")?;
+            let callback_nonce = uuid_from_payload(&job.payload, "callbackNonce")?;
+            let callback_url = job
+                .payload
+                .get("callbackUrl")
+                .and_then(serde_json::Value::as_str)
+                .context("instruction callback URL is missing")?
+                .to_string();
+            validate_apex_callback_url(&callback_url, callback_nonce)?;
+            let expected_sha256 = job
+                .payload
+                .get("expectedSha256")
+                .and_then(serde_json::Value::as_str)
+                .context("instruction digest is missing")?;
+            anyhow::ensure!(
+                expected_sha256.len() == 64
+                    && expected_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+                "instruction digest is invalid"
+            );
+            let expected_byte_count = job
+                .payload
+                .get("expectedByteCount")
+                .and_then(serde_json::Value::as_u64)
+                .context("instruction byte count is missing")?;
+            let bytes = provider.read_apex_task_instructions(sandbox_id, cancelled)?;
+            let sha256 = format!("{:x}", sha2::Sha256::digest(&bytes));
+            anyhow::ensure!(
+                u64::try_from(bytes.len()).ok() == Some(expected_byte_count)
+                    && sha256 == expected_sha256,
+                "apex_instruction_output_mismatch"
+            );
+            Ok(WorkerJobOutcome::ApexTaskInstructions {
+                request_id,
+                sandbox_id,
+                provider_apply_id,
+                callback_nonce,
+                callback_url,
+                sha256,
+                bytes,
+            })
         }
         JobKind::RunPrompt => Ok(WorkerJobOutcome::Complete(WorkerJobResult::RunPrompt {
             output: prompt_output_from_payload(&job.payload)?,
@@ -1958,14 +2336,38 @@ fn agent_request_from_payload(payload: &serde_json::Value) -> anyhow::Result<Age
         .transpose()
         .context("job payload env is invalid")?
         .unwrap_or_else(BTreeMap::new);
+    let stdin = payload
+        .get("stdin")
+        .cloned()
+        .map(|value| {
+            serde_json::from_value(json!({
+                "argv": [],
+                "cwd": null,
+                "env": {},
+                "stdin": value,
+                "timeout_secs": null
+            }))
+            .map(|request: AgentCommandRequest| request.stdin)
+        })
+        .transpose()
+        .map_err(|error| {
+            if error.to_string().contains("command_stdin_too_large") {
+                anyhow::anyhow!("command_stdin_too_large: command stdin exceeds 1048576 bytes")
+            } else {
+                anyhow::Error::new(error).context("job payload stdin is invalid")
+            }
+        })?
+        .flatten();
     let timeout_secs = payload.get("timeoutSecs").and_then(|value| value.as_u64());
-
-    Ok(AgentCommandRequest {
+    let request = AgentCommandRequest {
         argv,
         cwd,
         env,
+        stdin,
         timeout_secs,
-    })
+    };
+    validate_agent_command_request(&request)?;
+    Ok(request)
 }
 
 fn prompt_output_from_payload(payload: &serde_json::Value) -> anyhow::Result<String> {
@@ -2069,8 +2471,12 @@ fn capabilities_from_args(
     isolation_profile: IsolationProfile,
     runtime_class_name: Option<&str>,
     fqdn_egress_backend: bool,
+    apex_trusted_supervisor_v1: bool,
 ) -> anyhow::Result<Vec<WorkerCapability>> {
     validate_isolation_configuration(isolation_profile, runtime_class_name)?;
+    if apex_trusted_supervisor_v1 && isolation_profile != IsolationProfile::Gvisor {
+        anyhow::bail!("--apex-trusted-supervisor-v1 requires --isolation-profile gvisor");
+    }
     if capabilities.iter().any(|capability| {
         matches!(
             capability,
@@ -2090,6 +2496,7 @@ fn capabilities_from_args(
             WorkerCapability::K8sPod,
             WorkerCapability::ProvisionSandbox,
             WorkerCapability::RunCommand,
+            WorkerCapability::MaterializeFile,
             WorkerCapability::Snapshot,
             WorkerCapability::DesktopStream,
         ]
@@ -2106,6 +2513,13 @@ fn capabilities_from_args(
         && !resolved.contains(&WorkerCapability::FqdnEgress)
     {
         resolved.push(WorkerCapability::FqdnEgress);
+    }
+    if apex_trusted_supervisor_v1 && !resolved.contains(&WorkerCapability::ApexTrustedSupervisorV1)
+    {
+        resolved.push(WorkerCapability::ApexTrustedSupervisorV1);
+    }
+    if apex_trusted_supervisor_v1 && !resolved.contains(&WorkerCapability::ApexTaskInstructions) {
+        resolved.push(WorkerCapability::ApexTaskInstructions);
     }
     Ok(resolved)
 }
@@ -2157,6 +2571,8 @@ fn to_capability(value: CapabilityArg) -> WorkerCapability {
     match value {
         CapabilityArg::ProvisionSandbox => WorkerCapability::ProvisionSandbox,
         CapabilityArg::RunCommand => WorkerCapability::RunCommand,
+        CapabilityArg::MaterializeFile => WorkerCapability::MaterializeFile,
+        CapabilityArg::ApexTaskInstructions => WorkerCapability::ApexTaskInstructions,
         CapabilityArg::Snapshot => WorkerCapability::Snapshot,
         CapabilityArg::DesktopStream => WorkerCapability::DesktopStream,
         CapabilityArg::FqdnEgress => WorkerCapability::FqdnEgress,

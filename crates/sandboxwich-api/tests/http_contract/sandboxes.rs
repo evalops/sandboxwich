@@ -1,6 +1,163 @@
 use crate::common::*;
 use reqwest::StatusCode;
 use sandboxwich_core::*;
+use sqlx::any::AnyPoolOptions;
+use uuid::Uuid;
+
+#[tokio::test]
+async fn sandbox_read_reports_actual_worker_placement_proof() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("sandbox-placement-proof.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+    let created: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("placement-proof".into()),
+            template: Some(
+                "image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .into(),
+            ),
+            memory_limit: None,
+            network_egress: None,
+            workspace_mode: None,
+            runtime_profile: None,
+            ttl_seconds: Some(120),
+            execution_class: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new()
+        .connect(&server.database_url)
+        .await
+        .unwrap();
+    let worker_id = Uuid::now_v7().to_string();
+    sqlx::query("insert into workers (id,tenant_id,name,status,provider,capabilities,labels,registered_at,last_heartbeat_at) values (?,?,?,?,?,?,?,?,?)")
+        .bind(&worker_id).bind("default").bind("actual-worker").bind("online")
+        .bind("kubernetes").bind("[\"provision_sandbox\"]")
+        .bind("{\"provider_mode\":\"apply\",\"runtime_image\":\"image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}")
+        .bind("2026-07-14T00:00:00Z").bind("2026-07-14T00:00:00Z")
+        .execute(&pool).await.unwrap();
+    sqlx::query("insert into sandbox_placements (sandbox_id,worker_id,provider,cluster,generation,created_at,updated_at) values (?,?,?,?,?,?,?)")
+        .bind(created.sandbox.id.to_string()).bind(&worker_id).bind("kubernetes")
+        .bind("cluster-a").bind(1_i64).bind("2026-07-14T00:00:00Z").bind("2026-07-14T00:00:00Z")
+        .execute(&pool).await.unwrap();
+    let fetched: SandboxResponse = client
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, created.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let proof = fetched.placement.expect("actual placement proof");
+    assert_eq!(proof.worker_id.to_string(), worker_id);
+    assert_eq!(proof.provider, "kubernetes");
+    assert_eq!(proof.provider_mode, "apply");
+    assert_eq!(
+        proof.runtime_image,
+        "image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    let tenant_b = reqwest::Client::builder()
+        .default_headers(
+            [(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {TEST_TENANT_B_TOKEN}").parse().unwrap(),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .build()
+        .unwrap();
+    let forbidden = tenant_b
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, created.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::NOT_FOUND);
+
+    sqlx::query("update workers set labels = '{}' where id = ?")
+        .bind(&worker_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let corrupt_placed = client
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, created.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(corrupt_placed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let unplaced: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("unplaced-proof".into()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            workspace_mode: None,
+            runtime_profile: None,
+            ttl_seconds: Some(120),
+            execution_class: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let planning: SandboxResponse = client
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, unplaced.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(planning.placement.is_none());
+    sqlx::query("update sandboxes set state = 'ready' where id = ?")
+        .bind(unplaced.sandbox.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let missing_ready = client
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, unplaced.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_ready.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
 
 #[tokio::test]
 async fn execution_class_defaults_persists_and_inherits_through_fork() {
@@ -22,6 +179,7 @@ async fn execution_class_defaults_persists_and_inherits_through_fork() {
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            runtime_profile: None,
         })
         .send()
         .await
@@ -46,6 +204,7 @@ async fn execution_class_defaults_persists_and_inherits_through_fork() {
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            runtime_profile: None,
         })
         .send()
         .await
@@ -85,6 +244,7 @@ async fn execution_class_defaults_persists_and_inherits_through_fork() {
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            runtime_profile: None,
         })
         .send()
         .await
@@ -117,6 +277,7 @@ async fn disposable_workspace_mode_round_trips_and_rejects_durable_operations() 
         .json(&CreateSandboxRequest {
             execution_class: None,
             workspace_mode: Some(WorkspaceMode::Ephemeral),
+            runtime_profile: None,
             name: Some("disposable-contract".to_string()),
             template: None,
             memory_limit: None,
@@ -176,6 +337,7 @@ async fn disposable_workspace_mode_round_trips_and_rejects_durable_operations() 
         .json(&CreateSandboxRequest {
             execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("unsupported-child".to_string()),
             template: None,
             memory_limit: None,
@@ -214,6 +376,7 @@ pub(crate) async fn list_sandboxes_hydrates_each_allowlist_sandboxes_own_rules()
         .json(&CreateSandboxRequest {
             execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("egress-batch-single-rule".to_string()),
             template: None,
             memory_limit: None,
@@ -239,6 +402,7 @@ pub(crate) async fn list_sandboxes_hydrates_each_allowlist_sandboxes_own_rules()
         .json(&CreateSandboxRequest {
             execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("egress-batch-multi-rule".to_string()),
             template: None,
             memory_limit: None,
@@ -270,6 +434,7 @@ pub(crate) async fn list_sandboxes_hydrates_each_allowlist_sandboxes_own_rules()
         .json(&CreateSandboxRequest {
             execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("egress-batch-deny-all".to_string()),
             template: None,
             memory_limit: None,
@@ -351,6 +516,7 @@ async fn stop_before_first_provision_is_claimable_and_cannot_be_undone() {
         .json(&CreateSandboxRequest {
             execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("stop-before-provision".to_string()),
             template: None,
             memory_limit: None,
@@ -389,7 +555,15 @@ async fn stop_before_first_provision_is_claimable_and_cannot_be_undone() {
             provider: "kubernetes".to_string(),
             capabilities: vec![WorkerCapability::ProvisionSandbox],
             max_concurrent_jobs: Some(1),
-            labels: Default::default(),
+            labels: [
+                ("provider_mode".to_string(), "apply".to_string()),
+                (
+                    "runtime_image".to_string(),
+                    "image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                ),
+            ]
+            .into(),
         })
         .send()
         .await
@@ -508,6 +682,7 @@ pub(crate) async fn assert_resource_tiers_and_file_contracts(
         .json(&CreateSandboxRequest {
             execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("sized-contract".to_string()),
             template: None,
             memory_limit: Some(MemoryLimit::FourG),
@@ -543,6 +718,7 @@ pub(crate) async fn assert_resource_tiers_and_file_contracts(
         .json(&CreateSandboxRequest {
             execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("host-egress-contract".to_string()),
             template: None,
             memory_limit: Some(MemoryLimit::OneG),
@@ -768,7 +944,16 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
                 WorkerCapability::ProvisionSandbox,
             ],
             max_concurrent_jobs: Some(1),
-            labels: [("cluster".to_string(), "k3s-dev".to_string())].into(),
+            labels: [
+                ("cluster".to_string(), "k3s-dev".to_string()),
+                ("provider_mode".to_string(), "apply".to_string()),
+                (
+                    "runtime_image".to_string(),
+                    "image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                ),
+            ]
+            .into(),
         })
         .send()
         .await
@@ -788,6 +973,7 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
         .json(&CreateSandboxRequest {
             execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("race-child".to_string()),
             template: None,
             memory_limit: None,
@@ -904,20 +1090,24 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
         .expect("expected race worker to claim the fork job");
     assert_eq!(fork_lease.job.id, fork_job.id);
 
-    let provisioning_child: SandboxResponse = client
-        .get(format!(
-            "{}/sandboxes/{}",
-            server.base_url, forked.sandbox.id
-        ))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
+    // A claimed fork is provisioning before a placement proof exists, so the
+    // public GET intentionally fails closed. Verify the fenced state directly.
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&server.database_url)
         .await
         .unwrap();
-    assert_eq!(provisioning_child.sandbox.state, SandboxState::Provisioning);
+    let state: String = sqlx::query_scalar(&format!(
+        "select state from sandboxes where id = {}",
+        crate::types::placeholders(&server.database_url, 1)
+    ))
+    .bind(forked.sandbox.id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, SandboxState::Provisioning.as_db_str());
+    pool.close().await;
 
     // Race: archive the child while its ForkSandbox job is still in flight,
     // *before* the lease is completed below.

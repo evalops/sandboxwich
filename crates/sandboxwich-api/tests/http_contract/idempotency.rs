@@ -31,6 +31,7 @@ async fn assert_idempotency_contract(server: TestServer) {
     let request = CreateSandboxRequest {
         execution_class: None,
         workspace_mode: None,
+        runtime_profile: None,
         name: Some("idempotent-sandbox".to_string()),
         template: None,
         memory_limit: None,
@@ -72,6 +73,7 @@ async fn assert_idempotency_contract(server: TestServer) {
         .json(&CreateSandboxRequest {
             execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("different".to_string()),
             ..request.clone()
         })
@@ -103,6 +105,7 @@ async fn assert_idempotency_contract(server: TestServer) {
         .json(&CreateSandboxRequest {
             execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("tenant-b-idempotent".to_string()),
             ..request
         })

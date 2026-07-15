@@ -258,6 +258,13 @@ pub(crate) const DB_ENUM_COLUMNS: &[DbEnumColumn] = &[
     ),
     DbEnumColumn::new(
         "sandboxes",
+        "runtime_profile",
+        "sandboxes_runtime_profile_check",
+        <SandboxRuntimeProfile as DbVariant>::VALUES,
+        "invalid sandbox runtime profile",
+    ),
+    DbEnumColumn::new(
+        "sandboxes",
         "execution_class",
         "sandboxes_execution_class_check",
         <ExecutionClass as DbVariant>::VALUES,

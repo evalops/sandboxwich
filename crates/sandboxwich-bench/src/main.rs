@@ -708,6 +708,7 @@ async fn run_sandbox_ttft_once(
                 memory_limit: None,
                 network_egress: None,
                 workspace_mode: Some(sandboxwich_core::WorkspaceMode::GenericEphemeral),
+                runtime_profile: None,
                 ttl_seconds: Some(120),
             }),
     )
@@ -743,6 +744,7 @@ async fn run_sandbox_ttft_once(
                 argv: vec!["printf".to_string(), "sandboxwich-ttft\n".to_string()],
                 cwd: None,
                 env: Default::default(),
+                stdin: None,
                 timeout_secs: None,
             }),
     )

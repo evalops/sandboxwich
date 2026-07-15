@@ -341,3 +341,16 @@ project has dedicated, quiet benchmark runners.
 
 - Add Helm or Kustomize overlays for k3s, staging, and production.
 - Add cluster-specific RuntimeClass examples for gVisor, runsc, and Kata.
+# Instance-affine APEX callbacks
+
+The checked-in API Deployment derives `SANDBOXWICH_APEX_CALLBACK_BASE_URL`
+from each pod's own `status.podIP`. Do not replace it with the
+`sandboxwich-api` Service URL: instruction bytes are delivered to an in-memory
+waiter owned by exactly one API process, while the database stores only request,
+lease, digest, and byte-count lineage. A callback routed to another replica is
+acknowledged as `outputUnavailable`, and a caller must reacquire with a fresh
+claim-scoped idempotency key.
+
+For a single-process local API, set the variable to that process's reachable
+origin, for example `http://127.0.0.1:3217`. The API rejects credentials, paths,
+queries, fragments, and non-HTTP schemes at startup.

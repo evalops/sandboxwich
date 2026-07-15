@@ -1,3 +1,4 @@
+pub(crate) mod apex_instructions;
 pub(crate) mod commands;
 pub(crate) mod desktop;
 pub(crate) mod divergence;

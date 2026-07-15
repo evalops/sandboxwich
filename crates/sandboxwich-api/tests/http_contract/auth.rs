@@ -59,6 +59,7 @@ pub(crate) async fn api_token_is_required_when_configured() {
         .json(&CreateSandboxRequest {
             execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("spoof-attempt".to_string()),
             template: None,
             memory_limit: None,
@@ -153,6 +154,7 @@ pub(crate) async fn worker_tokens_are_role_scoped_and_never_reserialized() {
             .json(&CreateSandboxRequest {
                 execution_class: None,
                 workspace_mode: None,
+                runtime_profile: None,
                 name: Some("must-not-exist".to_string()),
                 template: None,
                 memory_limit: None,
@@ -247,6 +249,7 @@ pub(crate) async fn unauthenticated_deployment_rejects_tenant_header_spoofing() 
         .json(&CreateSandboxRequest {
             execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("should-never-be-created".to_string()),
             template: None,
             memory_limit: None,
@@ -366,6 +369,7 @@ pub(crate) async fn assert_tenant_boundaries_are_enforced(
         .json(&CreateSandboxRequest {
             execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("tenant-b-sandbox".to_string()),
             template: None,
             memory_limit: None,

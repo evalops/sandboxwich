@@ -27,6 +27,7 @@ async fn run_divergence_contract(server: TestServer) {
         .json(&CreateSandboxRequest {
             execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("divergence-contract".to_string()),
             template: None,
             memory_limit: None,

@@ -28,6 +28,7 @@ pub(crate) async fn metrics_are_scoped_to_the_authenticated_tenant() {
             .json(&CreateSandboxRequest {
                 execution_class: None,
                 workspace_mode: None,
+                runtime_profile: None,
                 name: Some(format!("metrics-default-{index}")),
                 template: None,
                 memory_limit: None,
@@ -50,6 +51,7 @@ pub(crate) async fn metrics_are_scoped_to_the_authenticated_tenant() {
             .json(&CreateSandboxRequest {
                 execution_class: None,
                 workspace_mode: None,
+                runtime_profile: None,
                 name: Some(format!("metrics-tenant-b-{index}")),
                 template: None,
                 memory_limit: None,

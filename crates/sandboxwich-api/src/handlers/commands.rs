@@ -56,7 +56,7 @@ pub(crate) fn effective_command_timeout_secs(requested: Option<u64>) -> u64 {
         .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS)
 }
 
-#[utoipa::path(post, path = "/v1/sandboxes/{sandbox_id}/commands", params(("sandbox_id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = "Tenant-scoped replay key"), ("X-Request-Id" = Option<String>, Header), ("traceparent" = Option<String>, Header)), request_body = CommandRequest, responses((status = 202, description = "Command accepted with an Operation resource", body = QueueCommandResponse), (status = 400, body = ErrorEnvelope)))]
+#[utoipa::path(post, path = "/v1/sandboxes/{sandbox_id}/commands", params(("sandbox_id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = "Tenant-scoped replay key"), ("X-Request-Id" = Option<String>, Header), ("traceparent" = Option<String>, Header)), request_body = CommandRequest, responses((status = 202, description = "Command accepted with an Operation resource", body = QueueCommandResponse), (status = 400, body = ErrorEnvelope), (status = 413, description = "Decoded command stdin exceeds 1 MiB", body = ErrorEnvelope)))]
 pub(crate) async fn queue_command(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
@@ -66,12 +66,24 @@ pub(crate) async fn queue_command(
     if request.argv.is_empty() {
         return Err(ApiError::bad_request("argv must contain at least one item"));
     }
+    if let Err(error) = validate_command_input(&request.stdin, &request.env) {
+        return match error {
+            CommandExecutionRequestError::StdinTooLarge => Err(ApiError::payload_too_large(
+                "command_stdin_too_large",
+                "command stdin exceeds 1048576 bytes",
+            )),
+            CommandExecutionRequestError::EnvironmentContainsNul => {
+                Err(ApiError::bad_request(error.to_string()))
+            }
+        };
+    }
 
     let sandbox_id = SandboxId(sandbox_id);
     let sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
 
     let now = Utc::now();
     let env = request.env;
+    let stdin = request.stdin.as_deref().map(encode_command_stdin_base64);
     let timeout_secs = effective_command_timeout_secs(request.timeout_secs);
     let command = CommandRun {
         id: CommandId::new(),
@@ -86,9 +98,9 @@ pub(crate) async fn queue_command(
         finished_at: None,
     };
 
-    let job = Job {
+    let mut job = Job {
         id: JobId::new(),
-        tenant_id: sandbox.tenant_id,
+        tenant_id: sandbox.tenant_id.clone(),
         kind: JobKind::RunCommand,
         status: JobStatus::Queued,
         payload: json!({
@@ -97,16 +109,18 @@ pub(crate) async fn queue_command(
             "argv": command.argv,
             "cwd": command.cwd,
             "env": env,
+            "stdin": stdin,
             "timeoutSecs": timeout_secs,
             "provisionSpec": SandboxProvisionSpec {
                 execution_class: sandbox.execution_class.clone(),
                 memory_limit: sandbox.memory_limit.clone(),
                 network_egress: sandbox.network_egress.clone(),
                 workspace_mode: sandbox.workspace_mode.clone(),
+                runtime_profile: sandbox.runtime_profile.clone(),
             }
         }),
         required_capability: WorkerCapability::RunCommand,
-        required_execution_class: sandbox.execution_class,
+        required_execution_class: sandbox.execution_class.clone(),
         priority: 0,
         attempts: 0,
         max_attempts: 3,
@@ -115,6 +129,7 @@ pub(crate) async fn queue_command(
         updated_at: now,
         last_error: None,
     };
+    add_provision_spec_to_payload(&mut job, &sandbox)?;
 
     let mut tx = state.db.pool.begin().await?;
     insert_command_on_connection(&state.db, &mut tx, &command).await?;

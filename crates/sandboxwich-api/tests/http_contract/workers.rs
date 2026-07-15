@@ -44,6 +44,7 @@ async fn create_execution_sandbox(
             memory_limit: None,
             network_egress,
             ttl_seconds: Some(120),
+            runtime_profile: None,
         })
         .send()
         .await
@@ -309,6 +310,7 @@ pub(crate) async fn runtime_resource_inventory_is_worker_scoped_and_bounded() {
         .json(&CreateSandboxRequest {
             execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("inventory-sandbox".to_string()),
             template: None,
             memory_limit: None,
@@ -514,6 +516,7 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
             .json(&CreateSandboxRequest {
                 execution_class: None,
                 workspace_mode: None,
+                runtime_profile: None,
                 name: Some(name.to_string()),
                 template: None,
                 memory_limit: None,
@@ -701,6 +704,7 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
             argv: vec!["true".to_string()],
             cwd: None,
             env: Default::default(),
+            stdin: None,
             timeout_secs: None,
         })
         .send()

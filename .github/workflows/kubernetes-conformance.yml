@@ -54,7 +54,7 @@ jobs:
         run: >-
           kind create cluster --name sandboxwich-conformance
           --config deploy/kubernetes/kind-conformance.yaml --wait 120s
-      - name: Publish digest-pinned gateway image to the disposable registry
+      - name: Publish digest-pinned runtime images to the disposable registry
         run: |
           docker run -d --restart=always -p 127.0.0.1:5001:5000 \
             --name sandboxwich-kind-registry registry:2
@@ -68,16 +68,57 @@ jobs:
               docker exec -i "${node}" tee \
                 /etc/containerd/certs.d/localhost:5001/hosts.toml >/dev/null
           done
+          # Publish and discard the largest local image first so the registry
+          # never overlaps it with another redundant runtime image copy.
+          docker tag sandboxwich-runtime:conformance \
+            localhost:5001/sandboxwich-runtime:conformance
+          docker push localhost:5001/sandboxwich-runtime:conformance
+          runtime_image="$(docker image inspect localhost:5001/sandboxwich-runtime:conformance \
+            --format '{{range .RepoDigests}}{{println .}}{{end}}' | head -n1)"
+          [[ "${runtime_image}" == *@sha256:* ]]
+          docker image rm -f sandboxwich-runtime:conformance \
+            localhost:5001/sandboxwich-runtime:conformance
+          docker image prune --force
+
           docker tag sandboxwich-worker:conformance \
             localhost:5001/sandboxwich-worker:conformance
           docker push localhost:5001/sandboxwich-worker:conformance
           gateway_image="$(docker image inspect localhost:5001/sandboxwich-worker:conformance \
             --format '{{range .RepoDigests}}{{println .}}{{end}}' | head -n1)"
           [[ "${gateway_image}" == *@sha256:* ]]
+          docker image rm -f sandboxwich-worker:conformance \
+            localhost:5001/sandboxwich-worker:conformance
+          docker image prune --force
+
+          docker tag sandboxwich-api:conformance \
+            localhost:5001/sandboxwich-api:conformance
+          docker push localhost:5001/sandboxwich-api:conformance
+          api_image="$(docker image inspect localhost:5001/sandboxwich-api:conformance \
+            --format '{{range .RepoDigests}}{{println .}}{{end}}' | head -n1)"
+          [[ "${api_image}" == *@sha256:* ]]
+          docker image rm -f sandboxwich-api:conformance \
+            localhost:5001/sandboxwich-api:conformance
+          docker image prune --force
+
+          docker tag postgres:conformance localhost:5001/postgres:conformance
+          docker push localhost:5001/postgres:conformance
+          postgres_image="$(docker image inspect localhost:5001/postgres:conformance \
+            --format '{{range .RepoDigests}}{{println .}}{{end}}' | head -n1)"
+          [[ "${postgres_image}" == *@sha256:* ]]
+          docker image rm -f postgres:conformance localhost:5001/postgres:conformance
+          docker image prune --force
+
           for node in $(kind get nodes --name sandboxwich-conformance); do
             docker exec "${node}" crictl pull "${gateway_image}"
+            docker exec "${node}" crictl pull "${runtime_image}"
           done
-          echo "SANDBOXWICH_GATEWAY_IMAGE=${gateway_image}" >>"${GITHUB_ENV}"
+          {
+            echo "SANDBOXWICH_API_IMAGE=${api_image}"
+            echo "SANDBOXWICH_GATEWAY_IMAGE=${gateway_image}"
+            echo "SANDBOXWICH_POSTGRES_IMAGE=${postgres_image}"
+            echo "SANDBOXWICH_WORKER_IMAGE=${gateway_image}"
+            echo "SANDBOXWICH_RUNTIME_IMAGE=${runtime_image}"
+          } >>"${GITHUB_ENV}"
       - name: Run live conformance and chaos checks
         run: deploy/kubernetes/kind-conformance.sh
       - name: Collect cluster diagnostics

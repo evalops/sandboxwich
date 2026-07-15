@@ -479,6 +479,7 @@ async fn main() -> anyhow::Result<()> {
                     memory_limit: args.memory_limit.map(Into::into),
                     network_egress: Some(network_egress),
                     workspace_mode: Some(args.workspace_mode.into()),
+                    runtime_profile: None,
                     execution_class: None,
                     ttl_seconds: args.ttl_seconds,
                 })
@@ -493,6 +494,7 @@ async fn main() -> anyhow::Result<()> {
                     ok: true,
                     sandbox,
                     operation: None,
+                    placement: None,
                 })?;
             } else {
                 print_value(&created)?;
@@ -542,6 +544,7 @@ async fn main() -> anyhow::Result<()> {
                     memory_limit: None,
                     network_egress: None,
                     workspace_mode: None,
+                    runtime_profile: None,
                     execution_class: None,
                     ttl_seconds: args.ttl_seconds,
                 })
@@ -698,6 +701,7 @@ async fn main() -> anyhow::Result<()> {
                     argv: args.argv,
                     cwd: args.cwd,
                     env: args.env.into_iter().collect(),
+                    stdin: None,
                     timeout_secs: args.command_timeout_secs,
                 })
                 .send()

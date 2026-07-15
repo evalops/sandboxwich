@@ -40,6 +40,33 @@ pub(crate) struct ApiConfig {
     pub(crate) default_tenant_id: String,
     pub(crate) sweep_interval_ms: u64,
     pub(crate) disable_expiry_sweeper: bool,
+    pub(crate) apex_callback_base_url: Option<String>,
+}
+
+pub(crate) fn parse_apex_callback_base_url(
+    value: Option<String>,
+) -> anyhow::Result<Option<String>> {
+    let Some(value) = value.map(|value| value.trim().trim_end_matches('/').to_string()) else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let scheme_end = value.find("://");
+    let valid_scheme = value.starts_with("http://") || value.starts_with("https://");
+    let authority = scheme_end
+        .and_then(|index| value.get(index + 3..))
+        .unwrap_or_default();
+    if !valid_scheme
+        || authority.is_empty()
+        || authority.contains(['/', '?', '#', '@'])
+        || value.chars().any(char::is_whitespace)
+    {
+        anyhow::bail!(
+            "invalid SANDBOXWICH_APEX_CALLBACK_BASE_URL: expected an http(s) origin without credentials, path, query, or fragment"
+        );
+    }
+    Ok(Some(value))
 }
 
 pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
@@ -70,6 +97,8 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
         .unwrap_or_else(|| "default".to_string());
     let sweep_interval_ms = u64::from(parse_env_u32("SANDBOXWICH_SWEEP_INTERVAL_MS", 1000)?.max(1));
     let disable_expiry_sweeper = parse_env_bool("SANDBOXWICH_DISABLE_EXPIRY_SWEEPER", false)?;
+    let apex_callback_base_url =
+        parse_apex_callback_base_url(std::env::var("SANDBOXWICH_APEX_CALLBACK_BASE_URL").ok())?;
 
     Ok(ApiConfig {
         command,
@@ -84,6 +113,7 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
         default_tenant_id,
         sweep_interval_ms,
         disable_expiry_sweeper,
+        apex_callback_base_url,
     })
 }
 
@@ -158,4 +188,26 @@ pub(crate) fn parse_tenant_tokens(value: Option<&str>) -> anyhow::Result<Vec<Ten
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apex_callback_base_is_an_instance_origin_or_startup_fails() {
+        assert_eq!(
+            parse_apex_callback_base_url(Some(" http://10.0.0.7:3217/ ".into())).unwrap(),
+            Some("http://10.0.0.7:3217".into())
+        );
+        for invalid in [
+            "sandboxwich-api:3217",
+            "ftp://10.0.0.7",
+            "http://user@10.0.0.7",
+            "http://10.0.0.7/path",
+            "http://10.0.0.7?query=1",
+        ] {
+            assert!(parse_apex_callback_base_url(Some(invalid.into())).is_err());
+        }
+    }
 }

@@ -148,6 +148,7 @@ pub(crate) async fn run_contract(server: TestServer) {
         .json(&CreateSandboxRequest {
             execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("contract-test".to_string()),
             template: None,
             memory_limit: None,
@@ -186,7 +187,16 @@ pub(crate) async fn run_contract(server: TestServer) {
                 WorkerCapability::RunCommand,
             ],
             max_concurrent_jobs: Some(1),
-            labels: [("cluster".to_string(), "k3s-dev".to_string())].into(),
+            labels: [
+                ("cluster".to_string(), "k3s-dev".to_string()),
+                ("provider_mode".to_string(), "apply".to_string()),
+                (
+                    "runtime_image".to_string(),
+                    "image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                ),
+            ]
+            .into(),
         })
         .send()
         .await
@@ -210,7 +220,16 @@ pub(crate) async fn run_contract(server: TestServer) {
         ))
         .json(&WorkerHeartbeatRequest {
             max_concurrent_jobs: None,
-            labels: [("node".to_string(), "k3s-node-1".to_string())].into(),
+            labels: [
+                ("node".to_string(), "k3s-node-1".to_string()),
+                ("provider_mode".to_string(), "apply".to_string()),
+                (
+                    "runtime_image".to_string(),
+                    "image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                ),
+            ]
+            .into(),
         })
         .send()
         .await
@@ -320,6 +339,7 @@ pub(crate) async fn run_contract(server: TestServer) {
             argv: vec!["echo".to_string(), "hello".to_string()],
             cwd: None,
             env: Default::default(),
+            stdin: None,
             timeout_secs: None,
         })
         .send()
@@ -485,6 +505,7 @@ pub(crate) async fn run_contract(server: TestServer) {
             argv: vec!["echo".to_string(), "second".to_string()],
             cwd: None,
             env: Default::default(),
+            stdin: None,
             timeout_secs: None,
         })
         .send()
@@ -806,7 +827,7 @@ where
     None
 }
 
-pub(crate) fn job_for_command(jobs: &[Job], command_id: CommandId) -> Job {
+pub(crate) fn job_for_command(jobs: &[PublicJob], command_id: CommandId) -> PublicJob {
     jobs.iter()
         .find(|job| {
             job.kind == JobKind::RunCommand
@@ -821,7 +842,7 @@ pub(crate) fn job_for_command(jobs: &[Job], command_id: CommandId) -> Job {
         .expect("expected command job")
 }
 
-pub(crate) fn job_for_child_sandbox(jobs: &[Job], child_sandbox_id: &str) -> Job {
+pub(crate) fn job_for_child_sandbox(jobs: &[PublicJob], child_sandbox_id: &str) -> PublicJob {
     jobs.iter()
         .find(|job| {
             job.payload
@@ -833,7 +854,7 @@ pub(crate) fn job_for_child_sandbox(jobs: &[Job], child_sandbox_id: &str) -> Job
         .expect("expected fork job")
 }
 
-pub(crate) fn job_for_snapshot(jobs: &[Job], snapshot_id: &str) -> Job {
+pub(crate) fn job_for_snapshot(jobs: &[PublicJob], snapshot_id: &str) -> PublicJob {
     jobs.iter()
         .find(|job| {
             job.payload

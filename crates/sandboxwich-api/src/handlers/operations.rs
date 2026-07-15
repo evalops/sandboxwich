@@ -1,7 +1,9 @@
 use crate::db::Database;
 use crate::error::ApiError;
 use crate::handlers::commands::command_id_from_job;
-use crate::handlers::jobs::{fetch_job, job_references};
+use crate::handlers::files::delete_sandbox_file_if_present_on_connection;
+use crate::handlers::jobs::{fetch_job, file_id_from_job, job_references};
+use crate::handlers::sandboxes::sandbox_id_from_job;
 use crate::rows::job_status_to_str;
 use crate::state::{AppState, TenantContext};
 use async_stream::stream;
@@ -37,6 +39,10 @@ pub(crate) fn operation_from_job(job: &Job) -> Result<Operation, ApiError> {
             JobKind::StopSandbox => OperationKind::StopSandbox,
             JobKind::ResumeSandbox => OperationKind::ResumeSandbox,
             JobKind::RunCommand => OperationKind::RunCommand,
+            JobKind::MaterializeFile => OperationKind::MaterializeFile,
+            JobKind::ApexTaskInstructions => {
+                return Err(ApiError::not_found("operation not found"));
+            }
             JobKind::CreateSnapshot => OperationKind::CreateSnapshot,
             JobKind::ForkSandbox => OperationKind::ForkSandbox,
             JobKind::RunPrompt => {
@@ -109,7 +115,7 @@ pub(crate) async fn cancel_operation(
             "only queued operations can be cancelled",
         ));
     }
-    if job.kind != JobKind::RunCommand {
+    if !matches!(job.kind, JobKind::RunCommand | JobKind::MaterializeFile) {
         return Err(ApiError::conflict_code(
             "operation_not_cancellable",
             "this operation cannot be cancelled safely",
@@ -135,19 +141,33 @@ pub(crate) async fn cancel_operation(
             "operation is no longer cancellable",
         ));
     }
-    let command_id = command_id_from_job(&job)?;
-    let command_sql = format!(
-        "update commands set status = {}, finished_at = {} where id = {} and status = 'queued'",
-        state.db.placeholder(1),
-        state.db.placeholder(2),
-        state.db.placeholder(3)
-    );
-    sqlx::query(&command_sql)
-        .bind(CommandStatus::Failed.as_db_str())
-        .bind(now.to_rfc3339())
-        .bind(command_id.to_string())
-        .execute(&mut *tx)
-        .await?;
+    match job.kind {
+        JobKind::RunCommand => {
+            let command_id = command_id_from_job(&job)?;
+            let command_sql = format!(
+                "update commands set status = {}, finished_at = {} where id = {} and status = 'queued'",
+                state.db.placeholder(1),
+                state.db.placeholder(2),
+                state.db.placeholder(3)
+            );
+            sqlx::query(&command_sql)
+                .bind(CommandStatus::Failed.as_db_str())
+                .bind(now.to_rfc3339())
+                .bind(command_id.to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
+        JobKind::MaterializeFile => {
+            delete_sandbox_file_if_present_on_connection(
+                &state.db,
+                &mut tx,
+                sandbox_id_from_job(&job)?,
+                file_id_from_job(&job)?,
+            )
+            .await?;
+        }
+        _ => unreachable!("cancellation kind was validated above"),
+    }
     tx.commit().await?;
     get_operation(State(state), Extension(ctx), Path(id)).await
 }
