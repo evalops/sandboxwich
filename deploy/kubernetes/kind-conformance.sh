@@ -41,7 +41,7 @@ kind get clusters | grep -Fxq "${CLUSTER_NAME}" || fail "kind cluster ${CLUSTER_
 kubectl --context "${KUBE_CONTEXT}" -n kube-system rollout status deployment/coredns --timeout=120s
 
 kind load docker-image --name "${CLUSTER_NAME}" \
-  "${API_IMAGE}" "${WORKER_IMAGE}" "${POSTGRES_IMAGE}"
+  "${API_IMAGE}" "${POSTGRES_IMAGE}"
 kubectl config use-context "${KUBE_CONTEXT}" >/dev/null
 
 kubectl create namespace sandboxwich

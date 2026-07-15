@@ -53,8 +53,18 @@ class DeploymentImagesTest(unittest.TestCase):
             'docker exec "${node}" crictl pull "${runtime_image}"', workflow
         )
         self.assertIn(
-            'echo "SANDBOXWICH_RUNTIME_IMAGE=${runtime_image}" >>"${GITHUB_ENV}"',
+            'echo "SANDBOXWICH_RUNTIME_IMAGE=${runtime_image}"',
             workflow,
+        )
+        self.assertIn(
+            'echo "SANDBOXWICH_WORKER_IMAGE=${gateway_image}"',
+            workflow,
+        )
+        self.assertIn(
+            'docker image rm -f sandboxwich-runtime:conformance', workflow
+        )
+        self.assertIn(
+            '"${API_IMAGE}" "${POSTGRES_IMAGE}"', script
         )
 
     def test_private_dns_probe_cannot_bypass_the_gateway_via_no_proxy(self) -> None:
