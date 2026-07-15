@@ -234,7 +234,7 @@ pub(crate) async fn read_apex_task_instructions(
         )
     })?;
     let placement_sql = format!(
-        "select worker_id from sandbox_placements where sandbox_id = {}",
+        "select worker_id, generation from sandbox_placements where sandbox_id = {}",
         state.db.placeholder(1)
     );
     let placement = sqlx::query(&placement_sql)
@@ -243,6 +243,10 @@ pub(crate) async fn read_apex_task_instructions(
         .await?
         .ok_or_else(|| ApiError::conflict("sandbox provider placement is unavailable"))?;
     let worker_id = parse_uuid(&placement.try_get::<String, _>("worker_id")?, "worker_id")?;
+    let placement_generation = parse_u64(
+        placement.try_get("generation")?,
+        "sandbox placement generation",
+    )?;
 
     let request_id = Uuid::now_v7();
     let provider_apply_id = Uuid::now_v7();
@@ -265,6 +269,8 @@ pub(crate) async fn read_apex_task_instructions(
             "providerApplyId": provider_apply_id,
             "callbackNonce": callback_nonce,
             "callbackUrl": callback_url,
+            "targetWorkerId": worker_id,
+            "targetPlacementGeneration": placement_generation,
             "expectedSha256": request.expected_sha256,
             "expectedByteCount": request.expected_byte_count,
             "claimLeaseGeneration": request.claim_lease_generation,
@@ -273,7 +279,10 @@ pub(crate) async fn read_apex_task_instructions(
         required_execution_class: sandbox.execution_class.clone(),
         priority: 100,
         attempts: 0,
-        max_attempts: 3,
+        // The fixed provider read is a one-time capability. Once claimed it
+        // must become terminal on callback failure, worker loss, or expiry;
+        // only a fresh tenant claim key may execute the reader again.
+        max_attempts: 1,
         scheduled_at: now,
         created_at: now,
         updated_at: now,
@@ -427,7 +436,8 @@ pub(crate) async fn deliver_apex_task_instructions(
         "update apex_instruction_reads
          set lease_id = {}, lease_attempt = {}, observed_sha256 = {}, observed_byte_count = {},
              state = {}, completed_at = {}
-         where request_id = {} and callback_nonce = {} and state = 'pending'",
+         where request_id = {} and callback_nonce = {}
+           and (state = 'pending' or (state = 'unavailable' and lease_id is null))",
         state.db.placeholder(1),
         state.db.placeholder(2),
         state.db.placeholder(3),
@@ -451,9 +461,39 @@ pub(crate) async fn deliver_apex_task_instructions(
         .execute(&state.db.pool)
         .await?;
     if updated.rows_affected() == 0 {
+        let replay_sql = format!(
+            "select lease_id, lease_attempt, provider_apply_id, observed_sha256,
+                    observed_byte_count, state
+             from apex_instruction_reads
+             where request_id = {} and callback_nonce = {}",
+            state.db.placeholder(1),
+            state.db.placeholder(2),
+        );
+        let replay = sqlx::query(&replay_sql)
+            .bind(request.request_id.to_string())
+            .bind(callback_nonce.to_string())
+            .fetch_optional(&state.db.pool)
+            .await?
+            .ok_or_else(|| ApiError::not_found("instruction callback not found"))?;
+        let persisted_lease_id: Option<String> = replay.try_get("lease_id")?;
+        let persisted_attempt: i64 = replay.try_get("lease_attempt")?;
+        let persisted_provider_apply_id: String = replay.try_get("provider_apply_id")?;
+        let persisted_sha256: Option<String> = replay.try_get("observed_sha256")?;
+        let persisted_count: Option<i64> = replay.try_get("observed_byte_count")?;
+        let persisted_state: String = replay.try_get("state")?;
+        let exact_replay = persisted_lease_id.as_deref()
+            == Some(request.lease_id.to_string().as_str())
+            && u64::try_from(persisted_attempt).ok() == Some(request.lease_attempt)
+            && persisted_provider_apply_id == request.provider_apply_id.to_string()
+            && persisted_sha256.as_deref() == Some(observed_sha256.as_str())
+            && persisted_count.and_then(|value| u64::try_from(value).ok()) == Some(observed_count)
+            && matches!(persisted_state.as_str(), "completed" | "unavailable");
+        if !exact_replay {
+            return Err(ApiError::not_found("instruction callback not found"));
+        }
         return Ok(Json(ApexTaskInstructionsCallbackResponse {
             ok: true,
-            output_unavailable: true,
+            output_unavailable: persisted_state == "unavailable",
         }));
     }
     if let Some(sender) = sender {
@@ -495,7 +535,10 @@ mod tests {
     use crate::db::{connect_database, migrate_database};
     use crate::handlers::jobs::insert_job;
     use crate::handlers::jobs::{fetch_job, try_claim_job};
-    use crate::handlers::leases::insert_lease_on_connection;
+    use crate::handlers::leases::{
+        complete_lease_in_transaction, expire_lease_if_still_active, fail_lease_in_transaction,
+        insert_lease_on_connection,
+    };
     use crate::handlers::sandboxes::{insert_sandbox, sandbox_id_from_job};
     use crate::handlers::workers::insert_worker;
     use crate::routes::APEX_CALLBACK_BODY_LIMIT_BYTES;
@@ -925,7 +968,7 @@ mod tests {
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let bytes = b"PRIVATE_SENTINEL";
 
-        let (first, first_job, _) = run_live_http_read(
+        let (first, first_job, first_lease) = run_live_http_read(
             &client,
             &base_url,
             &state,
@@ -942,6 +985,56 @@ mod tests {
                 .unwrap(),
             bytes
         );
+        assert_eq!(
+            first_job.max_attempts, 1,
+            "a private one-time read must never be leased twice"
+        );
+
+        // Model a successful first callback whose HTTP response was lost. The
+        // exact authenticated replay must acknowledge the already-delivered
+        // state so the worker can complete this lease without rereading.
+        let callback_replay = ApexTaskInstructionsCallbackRequest {
+            request_id: first.request_id,
+            lease_id: first_lease.id.0,
+            lease_attempt: u64::try_from(first_lease.attempt).unwrap(),
+            provider_apply_id: first.provider_apply_id,
+            sha256: first.sha256.clone(),
+            byte_count: first.byte_count,
+            output_base64: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+        };
+        let callback_replay = client
+            .post(first_job.payload["callbackUrl"].as_str().unwrap())
+            .bearer_auth(TEST_WORKER_TOKEN)
+            .header("x-sandboxwich-tenant", "tenant-apex")
+            .json(&callback_replay)
+            .send()
+            .await
+            .unwrap();
+        assert!(callback_replay.status().is_success());
+        let callback_replay = callback_replay
+            .json::<ApexTaskInstructionsCallbackResponse>()
+            .await
+            .unwrap();
+        assert!(
+            !callback_replay.output_unavailable,
+            "an exact callback replay must return the persisted successful acknowledgement"
+        );
+        complete_lease_in_transaction(
+            &state.db,
+            first_lease.id,
+            WorkerJobResult::ApexTaskInstructions {
+                request_id: first.request_id,
+                sandbox_id,
+                lease_id: first_lease.id,
+                lease_attempt: first_lease.attempt,
+                provider_apply_id: first.provider_apply_id,
+                sha256: first.sha256.clone(),
+                byte_count: first.byte_count,
+                output_unavailable: callback_replay.output_unavailable,
+            },
+        )
+        .await
+        .unwrap();
 
         let replay = client
             .post(format!(
@@ -1066,7 +1159,7 @@ mod tests {
             "same-key race must converge to one durable job"
         );
 
-        let (fresh, _, _) = run_live_http_read(
+        let (fresh, fresh_job, fresh_lease) = run_live_http_read(
             &client,
             &base_url,
             &state,
@@ -1078,6 +1171,61 @@ mod tests {
         .await;
         assert!(!fresh.output_unavailable);
         assert_ne!(fresh.request_id, first.request_id);
+
+        let mut callback_failure_invocations = 1_u64;
+        fail_lease_in_transaction(
+            &state.db,
+            fresh_lease.id,
+            true,
+            "simulated lost callback response",
+        )
+        .await
+        .unwrap();
+        let failed_job = fetch_job(&state.db, fresh_job.id).await.unwrap();
+        if failed_job.status == JobStatus::Queued
+            && try_claim_job(&state.db, &worker, &failed_job, Some(60), None)
+                .await
+                .unwrap()
+                .is_some()
+        {
+            callback_failure_invocations += 1;
+        }
+        assert_eq!(
+            callback_failure_invocations, 1,
+            "callback failure must not execute the one-time provider read again"
+        );
+
+        let (_expiry, expiry_job, expiry_lease) = run_live_http_read(
+            &client,
+            &base_url,
+            &state,
+            &worker,
+            sandbox_id,
+            ("live-claim-expiry-7", 7),
+            bytes,
+        )
+        .await;
+        let mut expiry_invocations = 1_u64;
+        expire_lease_if_still_active(
+            &state.db,
+            expiry_lease.id,
+            expiry_lease.expires_at + chrono::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+        let expired_job = fetch_job(&state.db, expiry_job.id).await.unwrap();
+        if expired_job.status == JobStatus::Queued
+            && try_claim_job(&state.db, &worker, &expired_job, Some(60), None)
+                .await
+                .unwrap()
+                .is_some()
+        {
+            expiry_invocations += 1;
+        }
+        assert_eq!(
+            expiry_invocations, 1,
+            "lease expiry must not execute the one-time provider read again"
+        );
 
         let sentinel_base64 = base64::engine::general_purpose::STANDARD.encode(bytes);
         let durable = sqlx::query(
@@ -1110,5 +1258,102 @@ mod tests {
         assert_eq!(cached, 0, "live response must bypass response persistence");
         assert!(!first_job.payload.to_string().contains("PRIVATE_SENTINEL"));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn instruction_claim_is_bound_to_exact_worker_and_placement_generation() {
+        let (state, _ctx, worker, seeded_lease, _, _, _, bytes) =
+            callback_fixture(Utc::now() + chrono::Duration::seconds(35)).await;
+        let sandbox_id = sandbox_id_from_job(&seeded_lease.job).unwrap();
+        let tenant_ctx = TenantContext {
+            tenant_id: worker.tenant_id.clone(),
+            principal: Principal::Tenant,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "placement-fence-8".parse().unwrap());
+        let read_state = state.clone();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let read = tokio::spawn(async move {
+            read_apex_task_instructions(
+                State(read_state),
+                Extension(tenant_ctx),
+                Path(sandbox_id.0),
+                headers,
+                Json(ApexTaskInstructionsReadRequest {
+                    expected_sha256: digest,
+                    expected_byte_count: u64::try_from(bytes.len()).unwrap(),
+                    claim_lease_generation: 8,
+                }),
+            )
+            .await
+        });
+        let job = loop {
+            if let Some(row) =
+                sqlx::query("select job_id from apex_instruction_reads where idempotency_key = ?")
+                    .bind("placement-fence-8")
+                    .fetch_optional(&state.db.pool)
+                    .await
+                    .unwrap()
+            {
+                let id = JobId(Uuid::parse_str(&row.get::<String, _>("job_id")).unwrap());
+                break fetch_job(&state.db, id).await.unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+
+        let other_worker = Worker {
+            id: WorkerId::new(),
+            tenant_id: worker.tenant_id.clone(),
+            name: "same-cluster-worker".into(),
+            status: WorkerStatus::Online,
+            provider: worker.provider.clone(),
+            capabilities: worker.capabilities.clone(),
+            max_concurrent_jobs: 4,
+            labels: worker.labels.clone(),
+            registered_at: Utc::now(),
+            last_heartbeat_at: Some(Utc::now()),
+        };
+        insert_worker(
+            &state.db,
+            &other_worker,
+            &crate::auth::hash_worker_token("sbw_wtok_other-worker"),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            try_claim_job(&state.db, &other_worker, &job, Some(60), None)
+                .await
+                .unwrap()
+                .is_none(),
+            "a same-provider worker must not claim another worker's private read"
+        );
+
+        sqlx::query(
+            "update sandbox_placements
+             set worker_id = ?, generation = generation + 1, updated_at = ?
+             where sandbox_id = ?",
+        )
+        .bind(other_worker.id.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .bind(sandbox_id.to_string())
+        .execute(&state.db.pool)
+        .await
+        .unwrap();
+        assert!(
+            try_claim_job(&state.db, &worker, &job, Some(60), None)
+                .await
+                .unwrap()
+                .is_none(),
+            "the original worker must fail closed after placement generation changes"
+        );
+        assert!(
+            try_claim_job(&state.db, &other_worker, &job, Some(60), None)
+                .await
+                .unwrap()
+                .is_none(),
+            "a replacement worker cannot inherit an already-issued private read"
+        );
+        read.abort();
     }
 }

@@ -524,6 +524,9 @@ pub(crate) async fn try_claim_job(
     let mut tx = db.pool.begin().await?;
     let claimed = async {
         lock_worker_for_claim_on_connection(db, &mut tx, worker.id).await?;
+        if !lock_apex_instruction_placement_on_connection(db, &mut tx, worker, job).await? {
+            return Ok(None);
+        }
         let active_leases =
             active_lease_count_for_worker_on_connection(db, &mut tx, worker.id).await?;
         if active_leases >= worker.max_concurrent_jobs {
@@ -604,6 +607,53 @@ pub(crate) async fn try_claim_job(
             Err(error)
         }
     }
+}
+
+async fn lock_apex_instruction_placement_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    worker: &Worker,
+    job: &Job,
+) -> Result<bool, ApiError> {
+    if job.kind != JobKind::ApexTaskInstructions {
+        return Ok(true);
+    }
+    let Some(target_worker_id) = job
+        .payload
+        .get("targetWorkerId")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+    else {
+        return Ok(false);
+    };
+    let Some(target_generation) = job
+        .payload
+        .get("targetPlacementGeneration")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| i64::try_from(value).ok())
+    else {
+        return Ok(false);
+    };
+    if target_worker_id != worker.id.0 {
+        return Ok(false);
+    }
+    // The no-op update both verifies and locks the exact placement tuple for
+    // the remainder of this claim transaction. A concurrent placement move
+    // must complete before this check or wait until after the lease commits.
+    let sql = format!(
+        "update sandbox_placements set updated_at = updated_at
+         where sandbox_id = {} and worker_id = {} and generation = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+    );
+    let result = sqlx::query(&sql)
+        .bind(sandbox_id_from_job(job)?.to_string())
+        .bind(worker.id.to_string())
+        .bind(target_generation)
+        .execute(&mut *connection)
+        .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 async fn bind_sandbox_placement_on_connection(

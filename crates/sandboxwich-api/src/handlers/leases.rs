@@ -142,7 +142,7 @@ pub(crate) async fn claim_lease(
                  and (p.worker_id = ",
         )
         .push_bind(worker.id.to_string())
-        .push(" or (p.provider = ")
+        .push(" or (jobs.kind != 'apex_task_instructions' and p.provider = ")
         .push_bind(&worker.provider)
         .push(" and (p.cluster is null or p.cluster = ")
         .push_bind(worker.labels.get("cluster").cloned().unwrap_or_default())

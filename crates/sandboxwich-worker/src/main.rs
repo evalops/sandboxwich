@@ -1920,7 +1920,9 @@ where
                 Err(error) => {
                     let payload = FailLeaseRequest {
                         error: "APEX instruction callback delivery failed".to_string(),
-                        retry: true,
+                        // The provider read already happened. Re-queuing this
+                        // lease would execute the one-time reader again.
+                        retry: false,
                     };
                     with_retries("fail lease", API_RETRY_ATTEMPTS, || async {
                         let response = client
