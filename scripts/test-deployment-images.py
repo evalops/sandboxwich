@@ -61,11 +61,15 @@ class DeploymentImagesTest(unittest.TestCase):
             workflow,
         )
         self.assertIn(
-            'docker image rm -f sandboxwich-runtime:conformance', workflow
+            'echo "SANDBOXWICH_API_IMAGE=${api_image}"', workflow
         )
         self.assertIn(
-            '"${API_IMAGE}" "${POSTGRES_IMAGE}"', script
+            'echo "SANDBOXWICH_POSTGRES_IMAGE=${postgres_image}"', workflow
         )
+        self.assertIn(
+            'docker image rm -f sandboxwich-runtime:conformance', workflow
+        )
+        self.assertNotIn("kind load docker-image", script)
 
     def test_private_dns_probe_cannot_bypass_the_gateway_via_no_proxy(self) -> None:
         script = (ROOT / "deploy/kubernetes/kind-conformance.sh").read_text()
