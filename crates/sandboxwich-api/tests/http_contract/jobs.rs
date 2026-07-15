@@ -1632,3 +1632,160 @@ pub(crate) async fn assert_prompt_job_lifecycle(
     let error: ErrorEnvelope = prompt.json().await.unwrap();
     assert_eq!(error.code, "agent_prompt_unavailable");
 }
+
+#[tokio::test]
+pub(crate) async fn concurrent_provider_identity_collision_is_classified_over_postgres() {
+    let Ok(database_url) = std::env::var("SANDBOXWICH_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let server = TestServer::start(database_url, None).await;
+    let client = server.client();
+    let first_worker = register_claim_filter_worker(&client, &server).await;
+    let second_worker: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "concurrent-collision-worker".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![WorkerCapability::K8sPod, WorkerCapability::ProvisionSandbox],
+            max_concurrent_jobs: Some(4),
+            labels: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let first_worker_client = worker_client(&first_worker);
+    let second_worker_client = worker_client(&second_worker);
+
+    for attempt in 0..8 {
+        let first = create_sandbox(&client, &server, &format!("collision-first-{attempt}")).await;
+        let second = create_sandbox(&client, &server, &format!("collision-second-{attempt}")).await;
+        let first_claim: ClaimLeaseResponse = first_worker_client
+            .post(format!(
+                "{}/workers/{}/leases/claim",
+                server.base_url, first_worker.worker.id
+            ))
+            .json(&ClaimLeaseRequest {
+                lease_seconds: Some(60),
+                sandbox_id: Some(first.sandbox.id),
+                kinds: Some(vec![JobKind::ProvisionSandbox]),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let second_claim: ClaimLeaseResponse = second_worker_client
+            .post(format!(
+                "{}/workers/{}/leases/claim",
+                server.base_url, second_worker.worker.id
+            ))
+            .json(&ClaimLeaseRequest {
+                lease_seconds: Some(60),
+                sandbox_id: Some(second.sandbox.id),
+                kinds: Some(vec![JobKind::ProvisionSandbox]),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let first_lease = first_claim.lease.expect("first collision lease");
+        let second_lease = second_claim.lease.expect("second collision lease");
+        let resource_name = format!("concurrent-provider-identity-{attempt}");
+        let first_resource = provider_resource(
+            first.sandbox.id,
+            None,
+            RuntimeResourceKind::PersistentVolumeClaim,
+            RuntimeResourcePurpose::Workspace,
+            resource_name.clone(),
+        );
+        let second_resource = provider_resource(
+            second.sandbox.id,
+            None,
+            RuntimeResourceKind::PersistentVolumeClaim,
+            RuntimeResourcePurpose::Workspace,
+            resource_name,
+        );
+        let first_request = first_worker_client
+            .post(format!(
+                "{}/leases/{}/complete",
+                server.base_url, first_lease.id
+            ))
+            .json(&CompleteLeaseRequest {
+                result: Some(WorkerJobResult::ProvisionSandbox {
+                    handle: ProviderSandboxHandle {
+                        provider: "kubernetes".to_string(),
+                        sandbox_id: first.sandbox.id,
+                        resources: vec![first_resource],
+                        metadata: serde_json::json!({}),
+                    },
+                }),
+            });
+        let second_request = second_worker_client
+            .post(format!(
+                "{}/leases/{}/complete",
+                server.base_url, second_lease.id
+            ))
+            .json(&CompleteLeaseRequest {
+                result: Some(WorkerJobResult::ProvisionSandbox {
+                    handle: ProviderSandboxHandle {
+                        provider: "kubernetes".to_string(),
+                        sandbox_id: second.sandbox.id,
+                        resources: vec![second_resource],
+                        metadata: serde_json::json!({}),
+                    },
+                }),
+            });
+
+        let (first_response, second_response) =
+            tokio::join!(first_request.send(), second_request.send(),);
+        let statuses = [
+            first_response.unwrap().status(),
+            second_response.unwrap().status(),
+        ];
+        assert_eq!(
+            statuses.iter().filter(|status| status.is_success()).count(),
+            1,
+            "exactly one first writer must win: {statuses:?}"
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::BAD_REQUEST)
+                .count(),
+            1,
+            "the displaced association must be classified as 400, never 409: {statuses:?}"
+        );
+
+        let (loser_client, loser_lease_id) = if statuses[0] == StatusCode::BAD_REQUEST {
+            (&first_worker_client, first_lease.id)
+        } else {
+            (&second_worker_client, second_lease.id)
+        };
+        loser_client
+            .post(format!(
+                "{}/leases/{}/fail",
+                server.base_url, loser_lease_id
+            ))
+            .json(&FailLeaseRequest {
+                error: "expected concurrent identity collision".to_string(),
+                retry: false,
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+}

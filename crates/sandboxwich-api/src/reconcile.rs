@@ -354,39 +354,53 @@ pub(crate) async fn upsert_provider_runtime_resource_on_connection(
         &resource.resource_name,
     )
     .await?;
-    if let Some(resource_id) = existing_id {
-        let existing = fetch_runtime_resource_on_connection(db, connection, resource_id).await?;
-        if existing.sandbox_id != resource.sandbox_id
-            || existing.snapshot_id != resource.snapshot_id
-            || existing.source_snapshot_id != resource.source_snapshot_id
-        {
-            return Err(ApiError::bad_request(
-                "runtime resource provider identity belongs to a different association",
-            ));
-        }
-        if let Some(tenant_id) = tenant_id {
-            ensure_sandbox_tenant_on_connection(db, connection, existing.sandbox_id, tenant_id)
-                .await?;
-        }
-        update_runtime_resource_from_provider_on_connection(
-            db,
-            connection,
-            resource_id,
-            resource,
-            observed_at,
-            last_reconciled_at,
-        )
-        .await
+    let resource_id = if let Some(resource_id) = existing_id {
+        resource_id
+    } else if let Some(inserted) = insert_runtime_resource_from_provider_on_connection(
+        db,
+        connection,
+        resource,
+        observed_at,
+        last_reconciled_at,
+    )
+    .await?
+    {
+        return Ok(inserted);
     } else {
-        insert_runtime_resource_from_provider_on_connection(
+        fetch_runtime_resource_id_on_connection(
             db,
             connection,
-            resource,
-            observed_at,
-            last_reconciled_at,
+            &resource.provider,
+            &resource.resource_kind,
+            &resource.namespace,
+            &resource.cluster,
+            &resource.resource_name,
         )
-        .await
+        .await?
+        .ok_or_else(|| ApiError::internal("conflicting runtime resource disappeared"))?
+    };
+
+    let existing = fetch_runtime_resource_on_connection(db, connection, resource_id).await?;
+    if existing.sandbox_id != resource.sandbox_id
+        || existing.snapshot_id != resource.snapshot_id
+        || existing.source_snapshot_id != resource.source_snapshot_id
+    {
+        return Err(ApiError::bad_request(
+            "runtime resource provider identity belongs to a different association",
+        ));
     }
+    if let Some(tenant_id) = tenant_id {
+        ensure_sandbox_tenant_on_connection(db, connection, existing.sandbox_id, tenant_id).await?;
+    }
+    update_runtime_resource_from_provider_on_connection(
+        db,
+        connection,
+        resource_id,
+        resource,
+        observed_at,
+        last_reconciled_at,
+    )
+    .await
 }
 
 pub(crate) async fn insert_runtime_resource_from_provider_on_connection(
@@ -395,7 +409,7 @@ pub(crate) async fn insert_runtime_resource_from_provider_on_connection(
     resource: &ProviderRuntimeResource,
     observed_at: Option<DateTime<Utc>>,
     last_reconciled_at: Option<DateTime<Utc>>,
-) -> Result<RuntimeResource, ApiError> {
+) -> Result<Option<RuntimeResource>, ApiError> {
     let now = Utc::now();
     let resource_id = RuntimeResourceId::new();
     let deleted_at = deleted_at_for_runtime_resource(&resource.status, now);
@@ -405,10 +419,11 @@ pub(crate) async fn insert_runtime_resource_from_provider_on_connection(
           status, cluster, storage_class, snapshot_class, storage_size, runtime_image, service_port,
           target_port, source_snapshot_id, created_at, updated_at, observed_at, last_reconciled_at,
           ready_at, deleted_at, error)
-         values ({})",
+         values ({})
+         on conflict do nothing",
         db.placeholders(24)
     );
-    sqlx::query(&sql)
+    let result = sqlx::query(&sql)
         .bind(resource_id.to_string())
         .bind(resource.sandbox_id.to_string())
         .bind(
@@ -443,7 +458,12 @@ pub(crate) async fn insert_runtime_resource_from_provider_on_connection(
         .bind(&resource.error)
         .execute(&mut *connection)
         .await?;
-    fetch_runtime_resource_on_connection(db, connection, resource_id).await
+    if result.rows_affected() == 0 {
+        return Ok(None);
+    }
+    fetch_runtime_resource_on_connection(db, connection, resource_id)
+        .await
+        .map(Some)
 }
 
 pub(crate) async fn update_runtime_resource_from_provider_on_connection(
