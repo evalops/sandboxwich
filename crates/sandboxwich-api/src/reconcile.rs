@@ -355,9 +355,16 @@ pub(crate) async fn upsert_provider_runtime_resource_on_connection(
     )
     .await?;
     if let Some(resource_id) = existing_id {
+        let existing = fetch_runtime_resource_on_connection(db, connection, resource_id).await?;
+        if existing.sandbox_id != resource.sandbox_id
+            || existing.snapshot_id != resource.snapshot_id
+            || existing.source_snapshot_id != resource.source_snapshot_id
+        {
+            return Err(ApiError::bad_request(
+                "runtime resource provider identity belongs to a different association",
+            ));
+        }
         if let Some(tenant_id) = tenant_id {
-            let existing =
-                fetch_runtime_resource_on_connection(db, connection, resource_id).await?;
             ensure_sandbox_tenant_on_connection(db, connection, existing.sandbox_id, tenant_id)
                 .await?;
         }

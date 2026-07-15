@@ -18,6 +18,7 @@ use crate::handlers::leases::*;
 use crate::handlers::sandboxes::*;
 use crate::handlers::snapshots::*;
 use crate::handlers::workers::*;
+use crate::reconcile::*;
 use crate::state::{Principal, TenantContext};
 use sandboxwich_core::*;
 use std::collections::BTreeSet;
@@ -1862,6 +1863,19 @@ async fn apex_execution_class_migration_backfills_legacy_rows() {
     insert_sandbox(&db, &sandbox)
         .await
         .expect("insert legacy sandbox");
+    let mut deleted_source = sandbox.clone();
+    deleted_source.id = SandboxId::new();
+    deleted_source.name = "deleted-apex-source".to_string();
+    insert_sandbox(&db, &deleted_source)
+        .await
+        .expect("insert source that will be deleted");
+    let mut non_apex = sandbox.clone();
+    non_apex.id = SandboxId::new();
+    non_apex.name = "legacy-unprivileged".to_string();
+    non_apex.runtime_profile = SandboxRuntimeProfile::Unprivileged;
+    insert_sandbox(&db, &non_apex)
+        .await
+        .expect("insert non-APEX control sandbox");
 
     let job = Job {
         id: JobId::new(),
@@ -1880,28 +1894,81 @@ async fn apex_execution_class_migration_backfills_legacy_rows() {
         last_error: None,
     };
     insert_job(&db, &job).await.expect("insert legacy job");
+    let snapshot_job = Job {
+        id: JobId::new(),
+        kind: JobKind::CreateSnapshot,
+        payload: json!({
+            "sandboxId": sandbox.id,
+            "snapshotId": SnapshotId::new(),
+        }),
+        required_capability: WorkerCapability::Snapshot,
+        ..job.clone()
+    };
+    insert_job(&db, &snapshot_job)
+        .await
+        .expect("insert legacy snapshot job");
+    let fork_job = Job {
+        id: JobId::new(),
+        kind: JobKind::ForkSandbox,
+        payload: json!({
+            "parentSandboxId": non_apex.id,
+            "childSandboxId": sandbox.id,
+            "snapshotId": SnapshotId::new(),
+        }),
+        ..job.clone()
+    };
+    insert_job(&db, &fork_job)
+        .await
+        .expect("insert legacy fork-child job");
+    let non_apex_job = Job {
+        id: JobId::new(),
+        payload: json!({"sandboxId": non_apex.id}),
+        ..job.clone()
+    };
+    insert_job(&db, &non_apex_job)
+        .await
+        .expect("insert non-APEX control job");
 
     let snapshot_id = SnapshotId::new();
+    let deleted_restore_id = SnapshotId::new();
+    let non_apex_restore_id = SnapshotId::new();
     let provision_spec = serde_json::to_string(&SandboxProvisionSpec {
         runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
         execution_class: ExecutionClass::DevelopmentContainer,
         ..SandboxProvisionSpec::default()
     })
     .expect("serialize legacy provision spec");
-    sqlx::query(
-        "insert into snapshot_restore_sources
-         (snapshot_id, tenant_id, source_sandbox_id, execution_class, status, provision_spec)
-         values (?, ?, ?, ?, ?, ?)",
-    )
-    .bind(snapshot_id.to_string())
-    .bind(&sandbox.tenant_id)
-    .bind(sandbox.id.to_string())
-    .bind("development_container")
-    .bind("ready")
-    .bind(provision_spec)
-    .execute(&db.pool)
-    .await
-    .expect("insert legacy restore source");
+    let non_apex_provision_spec = serde_json::to_string(&SandboxProvisionSpec::default())
+        .expect("serialize non-APEX provision spec");
+    for (restore_id, source_sandbox_id, spec) in [
+        (snapshot_id, sandbox.id, provision_spec.clone()),
+        (
+            deleted_restore_id,
+            deleted_source.id,
+            provision_spec.clone(),
+        ),
+        (non_apex_restore_id, non_apex.id, non_apex_provision_spec),
+    ] {
+        sqlx::query(
+            "insert into snapshot_restore_sources
+             (snapshot_id, tenant_id, source_sandbox_id, execution_class, status, provision_spec)
+             values (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(restore_id.to_string())
+        .bind(&sandbox.tenant_id)
+        .bind(source_sandbox_id.to_string())
+        .bind("development_container")
+        .bind("ready")
+        .bind(spec)
+        .execute(&db.pool)
+        .await
+        .expect("insert legacy restore source");
+    }
+    sqlx::query("delete from sandboxes where id = ?")
+        .bind(deleted_source.id.to_string())
+        .execute(&db.pool)
+        .await
+        .expect("delete APEX restore source before backfill");
 
     migrations
         .run(&db.pool)
@@ -1940,4 +2007,160 @@ async fn apex_execution_class_migration_backfills_legacy_rows() {
     assert_eq!(sandbox_class, "sandboxed_container");
     assert_eq!(job_class, "sandboxed_container");
     assert_eq!(restore_class, "sandboxed_container");
+
+    for backfilled_job_id in [snapshot_job.id, fork_job.id] {
+        let class: String = sqlx::query("select required_execution_class from jobs where id = ?")
+            .bind(backfilled_job_id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .expect("fetch backfilled job class")
+            .try_get("required_execution_class")
+            .expect("backfilled job required_execution_class");
+        assert_eq!(class, "sandboxed_container");
+    }
+    let deleted_restore_class: String =
+        sqlx::query("select execution_class from snapshot_restore_sources where snapshot_id = ?")
+            .bind(deleted_restore_id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .expect("fetch deleted-source restore class")
+            .try_get("execution_class")
+            .expect("deleted-source execution_class");
+    assert_eq!(deleted_restore_class, "sandboxed_container");
+
+    let non_apex_sandbox_class: String =
+        sqlx::query("select execution_class from sandboxes where id = ?")
+            .bind(non_apex.id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .expect("fetch non-APEX sandbox class")
+            .try_get("execution_class")
+            .expect("non-APEX sandbox execution_class");
+    let non_apex_job_class: String =
+        sqlx::query("select required_execution_class from jobs where id = ?")
+            .bind(non_apex_job.id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .expect("fetch non-APEX job class")
+            .try_get("required_execution_class")
+            .expect("non-APEX job required_execution_class");
+    let non_apex_restore_class: String =
+        sqlx::query("select execution_class from snapshot_restore_sources where snapshot_id = ?")
+            .bind(non_apex_restore_id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .expect("fetch non-APEX restore class")
+            .try_get("execution_class")
+            .expect("non-APEX restore execution_class");
+    assert_eq!(non_apex_sandbox_class, "development_container");
+    assert_eq!(non_apex_job_class, "development_container");
+    assert_eq!(non_apex_restore_class, "development_container");
+}
+
+#[tokio::test]
+async fn provider_identity_collision_requires_exact_association_tuple() {
+    let db = test_sqlite_db().await;
+    let first = seed_sandbox_with_state(&db, SandboxState::Ready).await;
+    let second = seed_sandbox_with_state(&db, SandboxState::Ready).await;
+    let snapshot_one = SnapshotId::new();
+    let snapshot_two = SnapshotId::new();
+    for snapshot_id in [snapshot_one, snapshot_two] {
+        sqlx::query(
+            "insert into snapshots
+             (id, sandbox_id, tenant_id, status, label, inventory, provider_metadata, created_at)
+             values (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(snapshot_id.to_string())
+        .bind(first.id.to_string())
+        .bind(&first.tenant_id)
+        .bind("ready")
+        .bind("identity-collision-test")
+        .bind("{}")
+        .bind("{}")
+        .bind(Utc::now().to_rfc3339())
+        .execute(&db.pool)
+        .await
+        .expect("seed snapshot association");
+    }
+    let make_resource =
+        |name: &str,
+         sandbox_id: SandboxId,
+         snapshot_id: Option<SnapshotId>,
+         source_snapshot_id: Option<SnapshotId>| ProviderRuntimeResource {
+            sandbox_id,
+            snapshot_id,
+            provider: "kubernetes".to_string(),
+            resource_kind: RuntimeResourceKind::Pod,
+            purpose: RuntimeResourcePurpose::Runtime,
+            resource_name: name.to_string(),
+            namespace: "identity-collision-test".to_string(),
+            status: RuntimeResourceStatus::Ready,
+            cluster: Some("test-cluster".to_string()),
+            storage_class: None,
+            snapshot_class: None,
+            storage_size: None,
+            runtime_image: Some("image@sha256:test".to_string()),
+            service_port: None,
+            target_port: None,
+            source_snapshot_id,
+            ready_at: Some(Utc::now()),
+            error: None,
+        };
+    let cases = [
+        make_resource("provision-sibling", first.id, None, None),
+        make_resource("snapshot-move", first.id, Some(snapshot_one), None),
+        make_resource("fork-child-move", first.id, None, Some(snapshot_one)),
+        make_resource("fork-source-move", first.id, None, Some(snapshot_one)),
+    ];
+    let mut connection = db.pool.acquire().await.expect("acquire connection");
+
+    for (index, original) in cases.into_iter().enumerate() {
+        let inserted = upsert_provider_runtime_resource_on_connection(
+            &db,
+            &mut connection,
+            &original,
+            None,
+            None,
+            Some(&first.tenant_id),
+        )
+        .await
+        .expect("insert original provider identity");
+        let retried = upsert_provider_runtime_resource_on_connection(
+            &db,
+            &mut connection,
+            &original,
+            None,
+            None,
+            Some(&first.tenant_id),
+        )
+        .await
+        .expect("an exact association retry must be accepted");
+        assert_eq!(retried.id, inserted.id);
+
+        let mut displaced = original.clone();
+        match index {
+            0 | 2 => displaced.sandbox_id = second.id,
+            1 => displaced.snapshot_id = Some(snapshot_two),
+            3 => displaced.source_snapshot_id = Some(snapshot_two),
+            _ => unreachable!(),
+        }
+        let error = upsert_provider_runtime_resource_on_connection(
+            &db,
+            &mut connection,
+            &displaced,
+            None,
+            None,
+            Some(&first.tenant_id),
+        )
+        .await
+        .expect_err("provider identity ownership cannot move");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+
+        let persisted = fetch_runtime_resource_on_connection(&db, &mut connection, inserted.id)
+            .await
+            .expect("fetch persisted association");
+        assert_eq!(persisted.sandbox_id, original.sandbox_id);
+        assert_eq!(persisted.snapshot_id, original.snapshot_id);
+        assert_eq!(persisted.source_snapshot_id, original.source_snapshot_id);
+    }
 }

@@ -1066,26 +1066,7 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
     sandbox: &SandboxResponse,
     worker: &WorkerResponse,
 ) {
-    let queued: JobResponse = client
-        .post(format!("{}/jobs", server.base_url))
-        .json(&CreateJobRequest {
-            kind: JobKind::ProvisionSandbox,
-            payload: serde_json::json!({
-                "sandboxId": sandbox.sandbox.id
-            }),
-            required_capability: WorkerCapability::ProvisionSandbox,
-            priority: Some(9),
-            max_attempts: None,
-        })
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-
+    let sibling = create_sandbox(client, server, "same-tenant-completion-target").await;
     let worker_client = worker_client(worker);
     let claim_operation_id = uuid::Uuid::now_v7();
     let claimed: ClaimLeaseResponse = worker_client
@@ -1096,7 +1077,7 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
         .header("idempotency-key", claim_operation_id.to_string())
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
-            sandbox_id: None,
+            sandbox_id: Some(sibling.sandbox.id),
             kinds: None,
         })
         .send()
@@ -1110,7 +1091,7 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
     let lease = claimed
         .lease
         .expect("expected worker to claim rollback probe job");
-    assert_eq!(lease.job.id, queued.job.id);
+    assert_eq!(payload_sandbox_id(&lease.job), sibling.sandbox.id);
 
     let replayed_claim: ClaimLeaseResponse = worker_client
         .post(format!(
@@ -1120,7 +1101,7 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
         .header("idempotency-key", claim_operation_id.to_string())
         .json(&ClaimLeaseRequest {
             lease_seconds: Some(60),
-            sandbox_id: None,
+            sandbox_id: Some(sibling.sandbox.id),
             kinds: None,
         })
         .send()
@@ -1132,6 +1113,46 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
         .await
         .unwrap();
     assert_eq!(replayed_claim.lease.unwrap().id, lease.id);
+
+    let mut malformed = provision_resources(sibling.sandbox.id);
+    malformed[0].provider = String::new();
+    let malformed_rejected = worker_client
+        .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::ProvisionSandbox {
+                handle: ProviderSandboxHandle {
+                    provider: "kubernetes".to_string(),
+                    sandbox_id: sibling.sandbox.id,
+                    resources: malformed,
+                    metadata: serde_json::json!({}),
+                },
+            }),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(malformed_rejected.status(), StatusCode::BAD_REQUEST);
+
+    let mut same_tenant_collision = provision_resources(sibling.sandbox.id);
+    same_tenant_collision[0].resource_name = provision_resources(sandbox.sandbox.id)[0]
+        .resource_name
+        .clone();
+    let collision_rejected = worker_client
+        .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::ProvisionSandbox {
+                handle: ProviderSandboxHandle {
+                    provider: "kubernetes".to_string(),
+                    sandbox_id: sibling.sandbox.id,
+                    resources: same_tenant_collision,
+                    metadata: serde_json::json!({}),
+                },
+            }),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(collision_rejected.status(), StatusCode::BAD_REQUEST);
 
     let tenant_b_sandbox: SandboxResponse = reqwest::Client::new()
         .post(format!("{}/sandboxes", server.base_url))
@@ -1155,19 +1176,16 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
         .await
         .unwrap();
 
-    let mut resources = provision_resources(sandbox.sandbox.id);
-    // Keep the top-level handle authoritative but forge one nested runtime
-    // resource toward a different tenant. Completion must reject the whole
-    // handle instead of persisting the nested cross-tenant reference.
-    resources[0].sandbox_id = tenant_b_sandbox.sandbox.id;
-    let rejected = worker_client
+    let mut cross_tenant = provision_resources(sibling.sandbox.id);
+    cross_tenant[0].sandbox_id = tenant_b_sandbox.sandbox.id;
+    let cross_tenant_rejected = worker_client
         .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
         .json(&CompleteLeaseRequest {
             result: Some(WorkerJobResult::ProvisionSandbox {
                 handle: ProviderSandboxHandle {
                     provider: "kubernetes".to_string(),
-                    sandbox_id: sandbox.sandbox.id,
-                    resources,
+                    sandbox_id: sibling.sandbox.id,
+                    resources: cross_tenant,
                     metadata: serde_json::json!({}),
                 },
             }),
@@ -1175,13 +1193,19 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
         .send()
         .await
         .unwrap();
-    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(cross_tenant_rejected.status(), StatusCode::BAD_REQUEST);
 
-    let failed: LeaseResponse = worker_client
-        .post(format!("{}/leases/{}/fail", server.base_url, lease.id))
-        .json(&FailLeaseRequest {
-            error: "rollback probe".to_string(),
-            retry: false,
+    let completed: LeaseResponse = worker_client
+        .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::ProvisionSandbox {
+                handle: ProviderSandboxHandle {
+                    provider: "kubernetes".to_string(),
+                    sandbox_id: sibling.sandbox.id,
+                    resources: provision_resources(sibling.sandbox.id),
+                    metadata: serde_json::json!({}),
+                },
+            }),
         })
         .send()
         .await
@@ -1191,23 +1215,7 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
         .json()
         .await
         .unwrap();
-    assert_eq!(failed.lease.job.status, JobStatus::Failed);
-
-    let replayed: LeaseResponse = worker_client
-        .post(format!("{}/leases/{}/fail", server.base_url, lease.id))
-        .json(&FailLeaseRequest {
-            error: "rollback probe".to_string(),
-            retry: false,
-        })
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(replayed.lease.status, LeaseStatus::Failed);
+    assert_eq!(completed.lease.job.status, JobStatus::Succeeded);
 }
 
 pub(crate) async fn assert_retryable_failure_requeues_command(
