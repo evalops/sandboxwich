@@ -65,6 +65,7 @@ fn authoritative_job_enrichment_overwrites_caller_placement_metadata() {
         updated_at: now,
         ttl_seconds: None,
         parent_snapshot_id: None,
+        execution_class: ExecutionClass::SandboxedContainer,
     };
     let mut job = Job {
         id: JobId::new(),
@@ -84,6 +85,7 @@ fn authoritative_job_enrichment_overwrites_caller_placement_metadata() {
         created_at: now,
         updated_at: now,
         last_error: None,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
     };
 
     add_provision_spec_to_payload(&mut job, &sandbox).expect("enrich job");
@@ -97,6 +99,7 @@ fn authoritative_job_enrichment_overwrites_caller_placement_metadata() {
             network_egress: sandbox.network_egress,
             workspace_mode: sandbox.workspace_mode,
             runtime_profile: sandbox.runtime_profile,
+            execution_class: ExecutionClass::SandboxedContainer,
         }
     );
 }
@@ -112,6 +115,7 @@ fn apex_runtime_profile_requires_pinned_image_and_deny_by_default_egress() {
         workspace_mode: None,
         runtime_profile: Some(SandboxRuntimeProfile::ApexTrustedSupervisorV1),
         ttl_seconds: None,
+        execution_class: Some(ExecutionClass::SandboxedContainer),
     };
     assert!(provision_spec_from_request(&request(&pinned, NetworkEgress::DenyAll), None).is_ok());
     assert!(
@@ -137,6 +141,9 @@ fn apex_runtime_profile_requires_pinned_image_and_deny_by_default_egress() {
         .is_err()
     );
     assert!(provision_spec_from_request(&request(&pinned, NetworkEgress::AllowAll), None).is_err());
+    let mut wrong_execution_class = request(&pinned, NetworkEgress::DenyAll);
+    wrong_execution_class.execution_class = Some(ExecutionClass::DevelopmentContainer);
+    assert!(provision_spec_from_request(&wrong_execution_class, None).is_err());
     let now = Utc::now();
     let parent = Sandbox {
         id: SandboxId::new(),
@@ -152,6 +159,7 @@ fn apex_runtime_profile_requires_pinned_image_and_deny_by_default_egress() {
         updated_at: now,
         ttl_seconds: None,
         parent_snapshot_id: None,
+        execution_class: ExecutionClass::SandboxedContainer,
     };
     let inherited = CreateSandboxRequest {
         name: None,
@@ -161,6 +169,7 @@ fn apex_runtime_profile_requires_pinned_image_and_deny_by_default_egress() {
         workspace_mode: None,
         runtime_profile: None,
         ttl_seconds: None,
+        execution_class: None,
     };
     assert!(provision_spec_from_request(&inherited, Some(&parent)).is_ok());
 }
@@ -176,7 +185,9 @@ fn snapshot_fork_request_rejects_placement_mismatches() {
             network_egress: NetworkEgress::DenyAll,
             workspace_mode: WorkspaceMode::Persistent,
             runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
+            execution_class: ExecutionClass::SandboxedContainer,
         },
+        execution_class: ExecutionClass::SandboxedContainer,
     };
     let matching = ForkSnapshotRequest {
         name: None,
@@ -220,6 +231,7 @@ async fn transient_authority_refresh_error_leaves_queued_job_retryable() {
         created_at: now,
         updated_at: now,
         last_error: None,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
     };
     insert_job(&db, &job).await.expect("insert queued job");
     sqlx::query("alter table sandboxes rename to unavailable_sandboxes")
@@ -258,6 +270,7 @@ fn apex_profile_bound_jobs_only_match_the_exact_profile_worker_image() {
                 network_egress: NetworkEgress::DenyAll,
                 workspace_mode: WorkspaceMode::Persistent,
                 runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
+                execution_class: ExecutionClass::SandboxedContainer,
             }
         }),
         required_capability: WorkerCapability::MaterializeFile,
@@ -268,6 +281,7 @@ fn apex_profile_bound_jobs_only_match_the_exact_profile_worker_image() {
         created_at: now,
         updated_at: now,
         last_error: None,
+        required_execution_class: ExecutionClass::SandboxedContainer,
     };
     let worker = |capabilities, image: &str| Worker {
         id: WorkerId::new(),
@@ -374,6 +388,7 @@ async fn materialization_rejects_a_file_from_another_sandbox() {
         updated_at: now,
         ttl_seconds: Some(600),
         parent_snapshot_id: None,
+        execution_class: ExecutionClass::SandboxedContainer,
     };
     let first = make("first");
     let second = make("second");
@@ -404,6 +419,7 @@ async fn materialization_rejects_a_file_from_another_sandbox() {
         created_at: now,
         updated_at: now,
         last_error: None,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
     };
     let ctx = TenantContext {
         tenant_id: "tenant-a".into(),
@@ -447,6 +463,7 @@ fn db_enum_registry_covers_persisted_variant_columns() {
         ("sandboxes", "state"),
         ("sandboxes", "memory_limit"),
         ("sandboxes", "network_egress_mode"),
+        ("sandboxes", "execution_class"),
         ("sandbox_network_egress_rules", "kind"),
         ("commands", "status"),
         ("command_output_chunks", "stream"),
@@ -455,6 +472,7 @@ fn db_enum_registry_covers_persisted_variant_columns() {
         ("jobs", "kind"),
         ("jobs", "status"),
         ("jobs", "required_capability"),
+        ("jobs", "required_execution_class"),
         ("job_leases", "status"),
         ("guest_health", "status"),
         ("snapshots", "status"),
@@ -594,7 +612,7 @@ fn looks_like_cidr_rejects_garbage_and_out_of_range_prefixes() {
 #[test]
 fn db_enum_fingerprint_is_versioned_and_stable_for_current_registry() {
     let fingerprint = db_enum_schema_fingerprint();
-    assert!(fingerprint.starts_with("db-enum-v4:"));
+    assert!(fingerprint.starts_with("db-enum-v5:"));
     assert_eq!(fingerprint, db_enum_schema_fingerprint());
 }
 
@@ -756,6 +774,7 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
         status: JobStatus::Leased,
         payload: json!({ "sandboxId": sandbox.id }),
         required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
         priority: 0,
         attempts: 1,
         max_attempts: 3,
@@ -1064,6 +1083,7 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
         status: JobStatus::Leased,
         payload: json!({ "sandboxId": sandbox.id }),
         required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
         priority: 0,
         attempts: 1,
         max_attempts: 3,
@@ -1141,6 +1161,7 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
         status: JobStatus::Leased,
         payload: json!({ "sandboxId": sandbox.id }),
         required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
         priority: 0,
         attempts: 1,
         max_attempts: 3,
@@ -1215,6 +1236,7 @@ async fn seed_provision_job(db: &Database) -> Job {
         status: JobStatus::Leased,
         payload: json!({ "sandboxId": Uuid::now_v7().to_string() }),
         required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
         priority: 0,
         attempts: 0,
         max_attempts: 3,
@@ -1373,6 +1395,7 @@ async fn expire_due_leases_does_not_double_process_concurrent_sweeps() {
     let worker_id = seed_worker(&db).await;
     let now = Utc::now();
     let sandbox = Sandbox {
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         runtime_profile: SandboxRuntimeProfile::Unprivileged,
         id: SandboxId::new(),
@@ -1399,6 +1422,7 @@ async fn expire_due_leases_does_not_double_process_concurrent_sweeps() {
             "promptEventId": prompt_event_id.to_string(),
         }),
         required_capability: WorkerCapability::AgentPrompt,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
         priority: 0,
         attempts: 0,
         max_attempts: 3,
@@ -1435,6 +1459,7 @@ async fn expire_due_leases_does_not_double_process_concurrent_sweeps() {
 async fn seed_sandbox_with_state(db: &Database, state: SandboxState) -> Sandbox {
     let now = Utc::now();
     let sandbox = Sandbox {
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         runtime_profile: SandboxRuntimeProfile::Unprivileged,
         id: SandboxId::new(),
@@ -1489,6 +1514,7 @@ async fn snapshot_restore_claim_rejects_expired_ready_source() {
             network_egress: sandbox.network_egress.clone(),
             workspace_mode: sandbox.workspace_mode.clone(),
             runtime_profile: sandbox.runtime_profile.clone(),
+            execution_class: ExecutionClass::DevelopmentContainer,
         }),
         created_at: now,
         ready_at: Some(now),
@@ -1546,6 +1572,7 @@ async fn snapshot_restore_claim_retains_authoritative_placement_after_source_del
         network_egress: sandbox.network_egress.clone(),
         workspace_mode: sandbox.workspace_mode.clone(),
         runtime_profile: sandbox.runtime_profile.clone(),
+        execution_class: ExecutionClass::DevelopmentContainer,
     };
     let snapshot = Snapshot {
         id: SnapshotId::new(),
@@ -1738,6 +1765,7 @@ async fn cleanup_archived_sandboxes_never_deletes_a_sandbox_with_a_live_restore_
     let db = test_sqlite_db().await;
     let now = Utc::now();
     let sandbox = Sandbox {
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         runtime_profile: SandboxRuntimeProfile::Unprivileged,
         id: SandboxId::new(),

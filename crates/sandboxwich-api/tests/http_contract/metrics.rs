@@ -26,6 +26,7 @@ pub(crate) async fn metrics_are_scoped_to_the_authenticated_tenant() {
         let _: SandboxResponse = default_client
             .post(format!("{}/sandboxes", server.base_url))
             .json(&CreateSandboxRequest {
+                execution_class: None,
                 workspace_mode: None,
                 runtime_profile: None,
                 name: Some(format!("metrics-default-{index}")),
@@ -48,6 +49,7 @@ pub(crate) async fn metrics_are_scoped_to_the_authenticated_tenant() {
             .post(format!("{}/sandboxes", server.base_url))
             .bearer_auth(TEST_TENANT_B_TOKEN)
             .json(&CreateSandboxRequest {
+                execution_class: None,
                 workspace_mode: None,
                 runtime_profile: None,
                 name: Some(format!("metrics-tenant-b-{index}")),

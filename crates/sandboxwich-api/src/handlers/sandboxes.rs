@@ -44,13 +44,26 @@ pub(crate) fn provision_spec_from_request(
         .clone()
         .or_else(|| parent.map(|sandbox| sandbox.runtime_profile.clone()))
         .unwrap_or_default();
+    let execution_class = request
+        .execution_class
+        .clone()
+        .or_else(|| parent.map(|sandbox| sandbox.execution_class.clone()))
+        .unwrap_or_default();
     validate_network_egress(&network_egress)?;
     let effective_template = request
         .template
         .as_deref()
         .or_else(|| parent.map(|sandbox| sandbox.template.as_str()));
     validate_runtime_profile(&runtime_profile, &network_egress, effective_template)?;
+    if runtime_profile == SandboxRuntimeProfile::ApexTrustedSupervisorV1
+        && execution_class != ExecutionClass::SandboxedContainer
+    {
+        return Err(ApiError::bad_request(
+            "apex_trusted_supervisor_v1 requires sandboxed_container execution_class",
+        ));
+    }
     Ok(SandboxProvisionSpec {
+        execution_class,
         memory_limit,
         network_egress,
         workspace_mode,
@@ -152,6 +165,14 @@ pub(crate) fn provision_capability(
     }
 }
 
+pub(crate) fn execution_capability(execution_class: &ExecutionClass) -> WorkerCapability {
+    match execution_class {
+        ExecutionClass::DevelopmentContainer => WorkerCapability::ProvisionSandbox,
+        ExecutionClass::SandboxedContainer => WorkerCapability::SandboxedContainer,
+        ExecutionClass::VirtualMachine => WorkerCapability::VirtualMachine,
+    }
+}
+
 pub(crate) fn fork_capability(
     runtime_profile: &SandboxRuntimeProfile,
     network_egress: &NetworkEgress,
@@ -193,6 +214,7 @@ pub(crate) async fn create_sandbox(
     let now = Utc::now();
     let provision_spec = provision_spec_from_request(&request, None)?;
     let sandbox = Sandbox {
+        execution_class: provision_spec.execution_class.clone(),
         id: SandboxId::new(),
         tenant_id: ctx.tenant_id.clone(),
         name: request.name.unwrap_or_else(|| "fresh-sandwich".to_string()),
@@ -213,11 +235,16 @@ pub(crate) async fn create_sandbox(
         tenant_id: sandbox.tenant_id.clone(),
         kind: JobKind::ProvisionSandbox,
         status: JobStatus::Queued,
-        payload: json!({"sandboxId": sandbox.id, "runtimeImage": sandbox.template, "provisionSpec": provision_spec}),
+        payload: json!({
+            "sandboxId": sandbox.id,
+            "runtimeImage": sandbox.template,
+            "provisionSpec": provision_spec
+        }),
         required_capability: provision_capability(
             &sandbox.runtime_profile,
             &sandbox.network_egress,
         ),
+        required_execution_class: sandbox.execution_class.clone(),
         priority: 0,
         attempts: 0,
         max_attempts: 3,
@@ -272,7 +299,7 @@ pub(crate) async fn list_sandboxes(
     let cursor = resolve_page_cursor(&page)?;
 
     let base_sql = format!(
-        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile,
+        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
                 created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where tenant_id = {}",
@@ -418,6 +445,7 @@ pub(crate) async fn stop_sandbox(
             "deleteGkeFqdnPolicy": delete_gke_fqdn_policy,
         }),
         required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: sandbox.execution_class.clone(),
         priority: 100,
         attempts: 0,
         max_attempts: 3,
@@ -508,6 +536,7 @@ pub(crate) async fn fork_sandbox(
         }),
         runtime_image: Some(parent.template.clone()),
         provision_spec: Some(SandboxProvisionSpec {
+            execution_class: parent.execution_class.clone(),
             memory_limit: parent.memory_limit.clone(),
             network_egress: parent.network_egress.clone(),
             workspace_mode: parent.workspace_mode.clone(),
@@ -519,6 +548,7 @@ pub(crate) async fn fork_sandbox(
         error: None,
     };
     let child = Sandbox {
+        execution_class: provision_spec.execution_class,
         id: SandboxId::new(),
         tenant_id: parent.tenant_id.clone(),
         name: request
@@ -541,11 +571,21 @@ pub(crate) async fn fork_sandbox(
         tenant_id: parent.tenant_id.clone(),
         kind: JobKind::CreateSnapshot,
         status: JobStatus::Queued,
-        payload: json!({"sandboxId": parent.id, "snapshotId": snapshot.id,
+        payload: json!({
+            "sandboxId": parent.id,
+            "snapshotId": snapshot.id,
             "operation": { "kind": OperationKind::ForkSandbox, "resourceId": child.id },
             "runtimeImage": parent.template,
-            "provisionSpec": SandboxProvisionSpec { memory_limit: parent.memory_limit.clone(), network_egress: parent.network_egress.clone(), workspace_mode: parent.workspace_mode.clone(), runtime_profile: parent.runtime_profile.clone() }}),
+            "provisionSpec": SandboxProvisionSpec {
+                execution_class: parent.execution_class.clone(),
+                memory_limit: parent.memory_limit.clone(),
+                network_egress: parent.network_egress.clone(),
+                workspace_mode: parent.workspace_mode.clone(),
+                runtime_profile: parent.runtime_profile.clone(),
+            }
+        }),
         required_capability: WorkerCapability::Snapshot,
+        required_execution_class: parent.execution_class.clone(),
         priority: 0,
         attempts: 0,
         max_attempts: 3,
@@ -782,7 +822,7 @@ pub(crate) async fn fetch_sandbox(
     sandbox_id: SandboxId,
 ) -> Result<Sandbox, ApiError> {
     let sql = format!(
-        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile,
+        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
                 created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where id = {}",
@@ -805,7 +845,7 @@ pub(crate) async fn fetch_sandbox_on_connection(
     sandbox_id: SandboxId,
 ) -> Result<Sandbox, ApiError> {
     let sql = format!(
-        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile,
+        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
                 created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where id = {}",
@@ -871,10 +911,10 @@ pub(crate) async fn insert_sandbox_on_connection(
 ) -> Result<(), ApiError> {
     let sql = format!(
         "insert into sandboxes
-         (id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile,
+         (id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
           created_at, updated_at, ttl_seconds, parent_snapshot_id)
          values ({})",
-        db.placeholders(13)
+        db.placeholders(14)
     );
     sqlx::query(&sql)
         .bind(sandbox.id.to_string())
@@ -886,6 +926,7 @@ pub(crate) async fn insert_sandbox_on_connection(
         .bind(network_egress_mode_to_str(&sandbox.network_egress.mode()))
         .bind(sandbox.workspace_mode.as_db_str())
         .bind(sandbox.runtime_profile.as_db_str())
+        .bind(sandbox.execution_class.as_db_str())
         .bind(sandbox.created_at.to_rfc3339())
         .bind(sandbox.updated_at.to_rfc3339())
         .bind(sandbox.ttl_seconds.map(|ttl| ttl as i64))

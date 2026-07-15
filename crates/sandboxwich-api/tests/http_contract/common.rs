@@ -146,6 +146,7 @@ pub(crate) async fn run_contract(server: TestServer) {
     let created: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
             runtime_profile: None,
             name: Some("contract-test".to_string()),

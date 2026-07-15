@@ -21,6 +21,24 @@ use sqlx::AnyConnection;
 use sqlx::Row;
 use uuid::Uuid;
 
+fn worker_execution_classes(capabilities: &[WorkerCapability]) -> Vec<ExecutionClass> {
+    let mut classes = vec![ExecutionClass::DevelopmentContainer];
+    if capabilities.contains(&WorkerCapability::SandboxedContainer) {
+        classes.push(ExecutionClass::SandboxedContainer);
+    }
+    if capabilities.contains(&WorkerCapability::VirtualMachine) {
+        classes.push(ExecutionClass::VirtualMachine);
+    }
+    classes
+}
+
+fn worker_supports_execution_class(worker: &Worker, execution_class: &ExecutionClass) -> bool {
+    *execution_class == ExecutionClass::DevelopmentContainer
+        || worker
+            .capabilities
+            .contains(&execution_capability(execution_class))
+}
+
 pub(crate) async fn claim_lease(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
@@ -82,6 +100,7 @@ pub(crate) async fn claim_lease(
         .iter()
         .map(worker_capability_to_str)
         .collect::<Vec<_>>();
+    let execution_classes = worker_execution_classes(&worker.capabilities);
     if capabilities.is_empty() {
         return Ok(Json(ClaimLeaseResponse {
             ok: true,
@@ -89,7 +108,7 @@ pub(crate) async fn claim_lease(
         }));
     }
     let mut query = state.db.query_builder(
-        "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
+        "select id, tenant_id, kind, status, payload, required_capability, required_execution_class, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
          from jobs
          where tenant_id = ",
@@ -103,6 +122,13 @@ pub(crate) async fn claim_lease(
         let mut required = query.separated(", ");
         for capability in capabilities {
             required.push_bind(capability);
+        }
+    }
+    query.push(") and required_execution_class in (");
+    {
+        let mut required = query.separated(", ");
+        for execution_class in execution_classes {
+            required.push_bind(execution_class.as_db_str());
         }
     }
     query
@@ -182,6 +208,9 @@ pub(crate) async fn claim_lease(
             continue;
         }
         if !worker_supports_runtime_profile(&worker, &job) {
+            continue;
+        }
+        if !worker_supports_execution_class(&worker, &job.required_execution_class) {
             continue;
         }
         // Defense in depth: re-check the caller's sandbox/kind filters (if any) against
@@ -283,14 +312,17 @@ pub(crate) async fn authoritatively_refresh_job_placement(
         return Ok(false);
     }
     let sql = format!(
-        "update jobs set payload = {}, updated_at = {}
+        "update jobs
+         set payload = {}, required_execution_class = {}, updated_at = {}
          where id = {} and status = 'queued'",
         db.placeholder(1),
         db.placeholder(2),
-        db.placeholder(3)
+        db.placeholder(3),
+        db.placeholder(4)
     );
     let updated = sqlx::query(&sql)
         .bind(serde_json::to_string(&job.payload)?)
+        .bind(job.required_execution_class.as_db_str())
         .bind(Utc::now().to_rfc3339())
         .bind(job.id.to_string())
         .execute(&db.pool)
@@ -1310,7 +1342,11 @@ pub(crate) async fn fetch_lease(db: &Database, lease_id: LeaseId) -> Result<JobL
         .ok_or_else(|| ApiError::not_found("lease not found"))?;
     let lease = row_to_lease_without_job(row)?;
     let job = fetch_job(db, lease.job_id).await?;
-    Ok(JobLease { job, ..lease })
+    Ok(JobLease {
+        required_execution_class: job.required_execution_class.clone(),
+        job,
+        ..lease
+    })
 }
 
 pub(crate) async fn fetch_lease_on_connection(
@@ -1331,7 +1367,11 @@ pub(crate) async fn fetch_lease_on_connection(
         .ok_or_else(|| ApiError::not_found("lease not found"))?;
     let lease = row_to_lease_without_job(row)?;
     let job = fetch_job_on_connection(db, connection, lease.job_id).await?;
-    Ok(JobLease { job, ..lease })
+    Ok(JobLease {
+        required_execution_class: job.required_execution_class.clone(),
+        job,
+        ..lease
+    })
 }
 
 pub(crate) async fn complete_active_lease_on_connection(

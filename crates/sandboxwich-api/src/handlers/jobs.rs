@@ -37,6 +37,7 @@ pub(crate) async fn create_job(
             "materialize_file requires the materialize_file capability",
         ));
     }
+    validate_functional_required_capability(&request.required_capability)?;
     let now = Utc::now();
     let mut job = Job {
         id: JobId::new(),
@@ -45,6 +46,7 @@ pub(crate) async fn create_job(
         status: JobStatus::Queued,
         payload: request.payload,
         required_capability: request.required_capability,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
         priority: request.priority.unwrap_or(0),
         attempts: 0,
         max_attempts: request.max_attempts.unwrap_or(3).max(1),
@@ -83,6 +85,7 @@ pub(crate) fn validate_materialize_file_job_input(
         status: JobStatus::Queued,
         payload: payload.clone(),
         required_capability: WorkerCapability::MaterializeFile,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
         priority: 0,
         attempts: 0,
         max_attempts: 1,
@@ -142,6 +145,26 @@ fn validate_run_command_job_input(payload: &serde_json::Value) -> Result<(), Api
     })
 }
 
+fn validate_functional_required_capability(capability: &WorkerCapability) -> Result<(), ApiError> {
+    match capability {
+        WorkerCapability::SandboxedContainer | WorkerCapability::VirtualMachine => {
+            Err(ApiError::bad_request(
+                "required_capability must be a functional worker capability; isolation is selected by the sandbox execution_class",
+            ))
+        }
+        WorkerCapability::ProvisionSandbox
+        | WorkerCapability::RunCommand
+        | WorkerCapability::MaterializeFile
+        | WorkerCapability::AgentPrompt
+        | WorkerCapability::Snapshot
+        | WorkerCapability::DesktopStream
+        | WorkerCapability::K8sPod
+        | WorkerCapability::GvisorSandbox
+        | WorkerCapability::FqdnEgress
+        | WorkerCapability::ApexTrustedSupervisorV1 => Ok(()),
+    }
+}
+
 pub(crate) async fn get_job(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
@@ -168,10 +191,12 @@ pub(crate) async fn enrich_job_payload_with_provision_spec(
         | JobKind::ResumeSandbox
         | JobKind::MaterializeFile => {
             let sandbox = fetch_sandbox(db, sandbox_id_from_job(job)?).await?;
+            job.required_execution_class = sandbox.execution_class.clone();
             add_provision_spec_to_payload(job, &sandbox)?;
         }
         JobKind::ForkSandbox => {
             let child = fetch_sandbox(db, child_sandbox_id_from_job(job)?).await?;
+            job.required_execution_class = child.execution_class.clone();
             add_provision_spec_to_payload(job, &child)?;
         }
     }
@@ -192,6 +217,7 @@ pub(crate) fn add_provision_spec_to_payload(
     payload.insert(
         "provisionSpec".to_string(),
         serde_json::to_value(SandboxProvisionSpec {
+            execution_class: sandbox.execution_class.clone(),
             memory_limit: sandbox.memory_limit.clone(),
             network_egress: sandbox.network_egress.clone(),
             workspace_mode: sandbox.workspace_mode.clone(),
@@ -304,7 +330,7 @@ pub(crate) async fn list_jobs(
     let limit = resolve_page_limit(page.limit)?;
     let cursor = resolve_page_cursor(&page)?;
     let base_sql = format!(
-        "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
+        "select id, tenant_id, kind, status, payload, required_capability, required_execution_class, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
          from jobs
          where tenant_id = {}",
@@ -331,11 +357,11 @@ pub(crate) async fn insert_job(db: &Database, job: &Job) -> Result<(), ApiError>
     let references = job_references(job)?;
     let sql = format!(
         "insert into jobs
-         (id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
+         (id, tenant_id, kind, status, payload, required_capability, required_execution_class, priority, attempts, max_attempts,
           scheduled_at, created_at, updated_at, last_error, sandbox_id, command_id, snapshot_id,
           parent_sandbox_id, child_sandbox_id, prompt_event_id)
          values ({})",
-        db.placeholders(19)
+        db.placeholders(20)
     );
     sqlx::query(&sql)
         .bind(job.id.to_string())
@@ -344,6 +370,7 @@ pub(crate) async fn insert_job(db: &Database, job: &Job) -> Result<(), ApiError>
         .bind(job_status_to_str(&job.status))
         .bind(serde_json::to_string(&job.payload)?)
         .bind(worker_capability_to_str(&job.required_capability))
+        .bind(job.required_execution_class.as_db_str())
         .bind(job.priority)
         .bind(job.attempts)
         .bind(job.max_attempts)
@@ -370,11 +397,11 @@ pub(crate) async fn insert_job_on_connection(
     let references = job_references(job)?;
     let sql = format!(
         "insert into jobs
-         (id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
+         (id, tenant_id, kind, status, payload, required_capability, required_execution_class, priority, attempts, max_attempts,
           scheduled_at, created_at, updated_at, last_error, sandbox_id, command_id, snapshot_id,
           parent_sandbox_id, child_sandbox_id, prompt_event_id)
          values ({})",
-        db.placeholders(19)
+        db.placeholders(20)
     );
     sqlx::query(&sql)
         .bind(job.id.to_string())
@@ -383,6 +410,7 @@ pub(crate) async fn insert_job_on_connection(
         .bind(job_status_to_str(&job.status))
         .bind(serde_json::to_string(&job.payload)?)
         .bind(worker_capability_to_str(&job.required_capability))
+        .bind(job.required_execution_class.as_db_str())
         .bind(job.priority)
         .bind(job.attempts)
         .bind(job.max_attempts)
@@ -511,6 +539,7 @@ pub(crate) async fn try_claim_job(
             return Ok(None);
         }
 
+        let leased_job = fetch_job_on_connection(db, &mut tx, job.id).await?;
         let lease = JobLease {
             id: LeaseId::new(),
             job_id: job.id,
@@ -521,7 +550,8 @@ pub(crate) async fn try_claim_job(
             expires_at,
             completed_at: None,
             error: None,
-            job: fetch_job_on_connection(db, &mut tx, job.id).await?,
+            required_execution_class: leased_job.required_execution_class.clone(),
+            job: leased_job,
         };
         insert_lease_on_connection(db, &mut tx, &lease).await?;
         bind_sandbox_placement_on_connection(db, &mut tx, &lease.job, worker).await?;
@@ -620,7 +650,7 @@ pub(crate) async fn lock_worker_for_claim_on_connection(
 
 pub(crate) async fn fetch_job(db: &Database, job_id: JobId) -> Result<Job, ApiError> {
     let sql = format!(
-        "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
+        "select id, tenant_id, kind, status, payload, required_capability, required_execution_class, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
          from jobs
          where id = {}",
@@ -640,7 +670,7 @@ pub(crate) async fn fetch_job_on_connection(
     job_id: JobId,
 ) -> Result<Job, ApiError> {
     let sql = format!(
-        "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
+        "select id, tenant_id, kind, status, payload, required_capability, required_execution_class, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
          from jobs
          where id = {}",

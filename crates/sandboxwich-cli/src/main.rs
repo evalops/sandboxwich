@@ -480,6 +480,7 @@ async fn main() -> anyhow::Result<()> {
                     network_egress: Some(network_egress),
                     workspace_mode: Some(args.workspace_mode.into()),
                     runtime_profile: None,
+                    execution_class: None,
                     ttl_seconds: args.ttl_seconds,
                 })
                 .send()
@@ -544,6 +545,7 @@ async fn main() -> anyhow::Result<()> {
                     network_egress: None,
                     workspace_mode: None,
                     runtime_profile: None,
+                    execution_class: None,
                     ttl_seconds: args.ttl_seconds,
                 })
                 .send()

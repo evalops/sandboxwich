@@ -29,7 +29,7 @@ denies when an allowed hostname resolves to a protected address.
 - Run `sandboxwich-api migrate` as a Job before or during rollouts.
 - Store state in Postgres through `SANDBOXWICH_DATABASE_URL`.
 - Expose the API with a ClusterIP Service.
-- Register workers with typed provider labels such as `provider=kubernetes` and capabilities such as `k8s_pod`, `run_command`, and, when configured, `gvisor_sandbox`.
+- Register workers with typed provider labels such as `provider=kubernetes` and capabilities such as `k8s_pod`, `run_command`, and, when configured through an isolation profile, `sandboxed_container` or `virtual_machine`.
 - Persist provider-created Pods, PVCs, Services, NetworkPolicies, and VolumeSnapshots in the `runtime_resources` table for controller cleanup and capacity accounting.
 
 The worker binary can register and heartbeat today:
@@ -80,6 +80,7 @@ SANDBOXWICH_K8S_ENABLE_MUTATION=1 sandboxwich-worker --api http://sandboxwich-ap
   --namespace sandboxwich \
   --sandbox-namespace sandboxwich-sandboxes \
   --storage-class local-path \
+  --isolation-profile gvisor \
   --runtime-class-name gvisor \
   --workspace-storage 2Gi \
   --label cluster=k3s-dev
@@ -95,7 +96,33 @@ Apply-mode workers compare labeled Pods, PVCs, Services, Secrets, and NetworkPol
 
 Reconciliation is dry-run unless both `--orphan-reconciliation-apply` and `SANDBOXWICH_ORPHAN_RECONCILIATION_APPLY=1` are set. Apply mode sends a Kubernetes `DeleteOptions` request with the observed UID as a precondition. Roll back immediately by removing either opt-in; use `--orphan-reconciliation-interval-secs`, `--orphan-reconciliation-max-scanned`, `--orphan-reconciliation-max-deleted`, and `--orphan-reconciliation-max-elapsed-secs` to tune the bounded loop.
 
-Sandbox creation carries a typed provision spec: memory tier (`1g`, `4g`, `16g`, `64g`) and network egress (`deny_all`, `allow_all`, or `allowlist`). The Kubernetes provider maps tiers to CPU/memory requests and PVC size, renders deny-by-default egress with explicit CIDR allow rules, sets `runAsNonRoot`, drops all container capabilities, and uses `RuntimeDefault` seccomp. `--runtime-class-name gvisor` or `--runtime-class-name kata` enables a RuntimeClass-backed isolation backend when the cluster supports it.
+Sandbox creation carries a typed provision spec: memory tier (`1g`, `4g`, `16g`, `64g`), network egress (`deny_all`, `allow_all`, or `allowlist`), and execution class (`development_container`, `sandboxed_container`, or `virtual_machine`). The Kubernetes provider maps tiers to CPU/memory requests and PVC size, renders deny-by-default egress with explicit CIDR allow rules, sets `runAsNonRoot`, drops all container capabilities, and uses `RuntimeDefault` seccomp.
+
+### Execution class and isolation ownership
+
+The caller's `execution_class` HTTP field is a provider-neutral workload
+requirement. The operator decides how a worker satisfies it with
+`--isolation-profile development|gvisor|kata` (or
+`SANDBOXWICH_ISOLATION_PROFILE`) and the independently supplied
+`--runtime-class-name`. The mapping is exact: `development` advertises no
+hostile-workload capability, `gvisor` advertises `sandboxed_container`, and
+`kata` advertises `virtual_machine`. gVisor and Kata profiles require a
+nonempty RuntimeClass name; a RuntimeClass name by itself does not select or
+imply an isolation profile.
+
+Sandboxwich does not create or discover RuntimeClasses, install runtime
+handlers, inspect node compatibility, or schedule supporting node labels. The
+cluster operator must provision compatible nodes and runtime handlers and set
+any required affinity, taints, or tolerations outside this contract. The
+operator is likewise responsible for an enforceable CNI configuration, the
+selected `StorageClass` and CSI `VolumeSnapshotClass`, and live conformance of
+provision, command, snapshot, fork, and cleanup paths.
+
+Worker registration and provider dry-run output report configured capability;
+they do not certify that the cluster can execute it. VM-class
+(`virtual_machine`/Kata) execution remains experimental until SW-3 live
+conformance certification passes. Do not route production hostile workloads to
+that class based only on registration or rendered manifests.
 
 Inspect the persisted runtime view with:
 

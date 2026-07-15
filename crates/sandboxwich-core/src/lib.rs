@@ -844,6 +844,21 @@ impl NetworkEgress {
     }
 }
 
+db_variant_enum! {
+pub enum ExecutionClass {
+    DevelopmentContainer => "development_container",
+    SandboxedContainer => "sandboxed_container",
+    VirtualMachine => "virtual_machine",
+}
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for ExecutionClass {
+    fn default() -> Self {
+        Self::DevelopmentContainer
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default, utoipa::ToSchema)]
 pub struct SandboxProvisionSpec {
     #[serde(default)]
@@ -854,6 +869,8 @@ pub struct SandboxProvisionSpec {
     pub workspace_mode: WorkspaceMode,
     #[serde(default)]
     pub runtime_profile: SandboxRuntimeProfile,
+    #[serde(default)]
+    pub execution_class: ExecutionClass,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -920,6 +937,8 @@ pub struct Sandbox {
     pub workspace_mode: WorkspaceMode,
     #[serde(default)]
     pub runtime_profile: SandboxRuntimeProfile,
+    #[serde(default)]
+    pub execution_class: ExecutionClass,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub ttl_seconds: Option<u64>,
@@ -934,6 +953,7 @@ pub struct CreateSandboxRequest {
     pub network_egress: Option<NetworkEgress>,
     pub workspace_mode: Option<WorkspaceMode>,
     pub runtime_profile: Option<SandboxRuntimeProfile>,
+    pub execution_class: Option<ExecutionClass>,
     pub ttl_seconds: Option<u64>,
 }
 
@@ -1596,6 +1616,8 @@ pub enum WorkerStatus {
 db_variant_enum! {
 pub enum WorkerCapability {
     ProvisionSandbox => "provision_sandbox",
+    SandboxedContainer => "sandboxed_container",
+    VirtualMachine => "virtual_machine",
     RunCommand => "run_command",
     MaterializeFile => "materialize_file",
     AgentPrompt => "agent_prompt",
@@ -1777,6 +1799,8 @@ pub struct Job {
     pub status: JobStatus,
     pub payload: serde_json::Value,
     pub required_capability: WorkerCapability,
+    #[serde(default)]
+    pub required_execution_class: ExecutionClass,
     pub priority: i64,
     pub attempts: i64,
     pub max_attempts: i64,
@@ -1814,6 +1838,7 @@ impl fmt::Debug for Job {
             .field("status", &self.status)
             .field("payload", &redacted_job_payload(&self.payload))
             .field("required_capability", &self.required_capability)
+            .field("required_execution_class", &self.required_execution_class)
             .field("priority", &self.priority)
             .field("attempts", &self.attempts)
             .field("max_attempts", &self.max_attempts)
@@ -1836,6 +1861,8 @@ pub struct JobLease {
     pub expires_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub required_execution_class: ExecutionClass,
     pub job: Job,
 }
 
@@ -1852,6 +1879,7 @@ impl fmt::Debug for JobLease {
             .field("expires_at", &self.expires_at)
             .field("completed_at", &self.completed_at)
             .field("error", &self.error)
+            .field("required_execution_class", &self.required_execution_class)
             .field("job", &self.job)
             .finish()
     }
@@ -1888,6 +1916,8 @@ pub struct PublicJob {
     #[serde(serialize_with = "serialize_redacted_job_payload")]
     pub payload: serde_json::Value,
     pub required_capability: WorkerCapability,
+    #[serde(default)]
+    pub required_execution_class: ExecutionClass,
     pub priority: i64,
     pub attempts: i64,
     pub max_attempts: i64,
@@ -1906,6 +1936,7 @@ impl From<Job> for PublicJob {
             status: job.status,
             payload: redacted_job_payload(&job.payload),
             required_capability: job.required_capability,
+            required_execution_class: job.required_execution_class,
             priority: job.priority,
             attempts: job.attempts,
             max_attempts: job.max_attempts,
@@ -1927,6 +1958,7 @@ impl fmt::Debug for PublicJob {
             .field("status", &self.status)
             .field("payload", &redacted_job_payload(&self.payload))
             .field("required_capability", &self.required_capability)
+            .field("required_execution_class", &self.required_execution_class)
             .field("priority", &self.priority)
             .field("attempts", &self.attempts)
             .field("max_attempts", &self.max_attempts)
@@ -2515,6 +2547,7 @@ mod tests {
         assert_db_variant_contract::<MemoryLimit>();
         assert_db_variant_contract::<NetworkEgressMode>();
         assert_db_variant_contract::<NetworkAllowRuleKind>();
+        assert_db_variant_contract::<ExecutionClass>();
         assert_db_variant_contract::<CommandStatus>();
         assert_db_variant_contract::<CommandOutputStream>();
         assert_db_variant_contract::<SandboxEventKind>();
@@ -2526,6 +2559,26 @@ mod tests {
         assert_db_variant_contract::<ProviderHealthStatus>();
         assert_db_variant_contract::<GuestStatus>();
         assert_db_variant_contract::<SshKeyStatus>();
+    }
+
+    #[test]
+    fn execution_class_has_stable_database_json_and_default_contract() {
+        assert_eq!(
+            ExecutionClass::VALUES,
+            &[
+                "development_container",
+                "sandboxed_container",
+                "virtual_machine"
+            ]
+        );
+        assert_eq!(
+            serde_json::to_string(&ExecutionClass::VirtualMachine).unwrap(),
+            "\"virtual_machine\""
+        );
+        assert_eq!(
+            ExecutionClass::default(),
+            ExecutionClass::DevelopmentContainer
+        );
     }
 
     #[test]

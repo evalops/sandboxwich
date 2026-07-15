@@ -1859,6 +1859,7 @@ mod tests {
             status: sandboxwich_core::JobStatus::Leased,
             payload,
             required_capability: sandboxwich_core::WorkerCapability::RunCommand,
+            required_execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
             priority: 0,
             attempts: 1,
             max_attempts: 3,

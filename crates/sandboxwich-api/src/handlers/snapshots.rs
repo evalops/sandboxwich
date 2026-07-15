@@ -62,6 +62,7 @@ pub(crate) async fn create_snapshot(
             "snapshotId": snapshot.id
         }),
         required_capability: WorkerCapability::Snapshot,
+        required_execution_class: sandbox.execution_class.clone(),
         priority: 0,
         attempts: 0,
         max_attempts: 3,
@@ -138,6 +139,7 @@ pub(crate) async fn fork_snapshot(
         Some(&restore_source.runtime_image),
     )?;
     let child = Sandbox {
+        execution_class: restore_source.execution_class.clone(),
         id: SandboxId::new(),
         tenant_id: ctx.tenant_id.clone(),
         name: request
@@ -165,6 +167,7 @@ pub(crate) async fn fork_snapshot(
             "snapshotId": snapshot_id,
             "runtimeImage": child.template,
             "provisionSpec": SandboxProvisionSpec {
+                execution_class: child.execution_class.clone(),
                 memory_limit: child.memory_limit.clone(),
                 network_egress: child.network_egress.clone(),
                 workspace_mode: child.workspace_mode.clone(),
@@ -172,6 +175,7 @@ pub(crate) async fn fork_snapshot(
             }
         }),
         required_capability: fork_capability(&child.runtime_profile, &child.network_egress),
+        required_execution_class: child.execution_class.clone(),
         priority: 0,
         attempts: 0,
         max_attempts: 3,
@@ -221,6 +225,7 @@ pub(crate) struct SnapshotRestoreSource {
     pub(crate) source_sandbox_id: SandboxId,
     pub(crate) runtime_image: String,
     pub(crate) provision_spec: SandboxProvisionSpec,
+    pub(crate) execution_class: ExecutionClass,
 }
 
 pub(crate) fn validate_snapshot_fork_request(
@@ -253,7 +258,8 @@ pub(crate) async fn claim_snapshot_restore_source_on_connection(
     let sql = format!(
         "select snapshot_restore_sources.source_sandbox_id,
                 snapshot_restore_sources.runtime_image,
-                snapshot_restore_sources.provision_spec
+                snapshot_restore_sources.provision_spec,
+                snapshot_restore_sources.execution_class
            from snapshot_restore_sources
           where snapshot_restore_sources.snapshot_id = {}
             and snapshot_restore_sources.tenant_id = {}
@@ -285,15 +291,22 @@ pub(crate) async fn claim_snapshot_restore_source_on_connection(
             "snapshot placement metadata is unavailable",
         ));
     };
-    Ok(SnapshotRestoreSource {
-        source_sandbox_id: SandboxId(parse_uuid(&source_sandbox_id)?),
-        runtime_image,
-        provision_spec: serde_json::from_str(&provision_spec).map_err(|_| {
+    let execution_class: String = row.try_get("execution_class")?;
+    let execution_class = ExecutionClass::parse_db_str(&execution_class)
+        .map_err(|_| ApiError::internal("database contains invalid execution class"))?;
+    let mut provision_spec: SandboxProvisionSpec =
+        serde_json::from_str(&provision_spec).map_err(|_| {
             ApiError::conflict_code(
                 "snapshot_placement_unavailable",
                 "snapshot placement metadata is invalid",
             )
-        })?,
+        })?;
+    provision_spec.execution_class = execution_class.clone();
+    Ok(SnapshotRestoreSource {
+        source_sandbox_id: SandboxId(parse_uuid(&source_sandbox_id)?),
+        runtime_image,
+        provision_spec,
+        execution_class,
     })
 }
 
@@ -358,6 +371,7 @@ pub(crate) fn pending_snapshot_from_request(
         provider_metadata: request.provider_metadata.unwrap_or_else(|| json!({})),
         runtime_image: Some(sandbox.template.clone()),
         provision_spec: Some(SandboxProvisionSpec {
+            execution_class: sandbox.execution_class.clone(),
             memory_limit: sandbox.memory_limit.clone(),
             network_egress: sandbox.network_egress.clone(),
             workspace_mode: sandbox.workspace_mode.clone(),
@@ -417,8 +431,8 @@ pub(crate) async fn insert_snapshot_on_connection(
         .await?;
     let restore_sql = format!(
         "insert into snapshot_restore_sources
-         (snapshot_id, tenant_id, source_sandbox_id, status, expires_at, runtime_image, provision_spec)
-         select {}, tenant_id, {}, {}, {}, {}, {} from sandboxes where id = {}",
+         (snapshot_id, tenant_id, source_sandbox_id, execution_class, status, expires_at, runtime_image, provision_spec)
+         select {}, tenant_id, {}, execution_class, {}, {}, {}, {} from sandboxes where id = {}",
         db.placeholder(1),
         db.placeholder(2),
         db.placeholder(3),
@@ -804,7 +818,7 @@ pub(crate) async fn queue_forks_waiting_on_snapshot_on_connection(
     parent_sandbox_id: SandboxId,
 ) -> Result<(), ApiError> {
     let sql = format!(
-        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile,
+        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
                 created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where parent_snapshot_id = {} and state = 'planning'
@@ -834,6 +848,7 @@ pub(crate) async fn queue_forks_waiting_on_snapshot_on_connection(
                     "snapshotId": snapshot_id,
                     "runtimeImage": child.template,
                     "provisionSpec": SandboxProvisionSpec {
+                        execution_class: child.execution_class.clone(),
                         memory_limit: child.memory_limit.clone(),
                         network_egress: child.network_egress.clone(),
                         workspace_mode: child.workspace_mode.clone(),
@@ -841,6 +856,7 @@ pub(crate) async fn queue_forks_waiting_on_snapshot_on_connection(
                     }
                 }),
                 required_capability: fork_capability(&child.runtime_profile, &child.network_egress),
+                required_execution_class: child.execution_class.clone(),
                 priority: 0,
                 attempts: 0,
                 max_attempts: 3,
@@ -877,7 +893,7 @@ pub(crate) async fn fail_sandboxes_waiting_on_snapshot_on_connection(
     error: &str,
 ) -> Result<(), ApiError> {
     let sql = format!(
-        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile,
+        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
                 created_at, updated_at, ttl_seconds, parent_snapshot_id
          from sandboxes
          where parent_snapshot_id = {} and state = 'planning'

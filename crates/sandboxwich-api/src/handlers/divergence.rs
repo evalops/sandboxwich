@@ -366,6 +366,7 @@ async fn request_divergence_stop_on_connection(
         status: JobStatus::Queued,
         payload: json!({"sandboxId": finding.sandbox_id, "divergenceFindingId": finding.id}),
         required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: sandbox.execution_class.clone(),
         priority: 100,
         attempts: 0,
         max_attempts: 3,
