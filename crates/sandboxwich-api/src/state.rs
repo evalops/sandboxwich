@@ -80,6 +80,7 @@ pub(crate) struct ApexCallbackTestHook {
     armed: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) reached: Arc<Semaphore>,
     pub(crate) release: Arc<Semaphore>,
+    read_timeout: Option<Duration>,
 }
 
 #[cfg(test)]
@@ -89,6 +90,7 @@ impl Default for ApexCallbackTestHook {
             armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reached: Arc::new(Semaphore::new(0)),
             release: Arc::new(Semaphore::new(0)),
+            read_timeout: None,
         }
     }
 }
@@ -104,6 +106,15 @@ impl ApexCallbackTestHook {
                 .expect("callback test hook release semaphore closed")
                 .forget();
         }
+    }
+
+    pub(crate) fn with_read_timeout(mut self, timeout: Duration) -> Self {
+        self.read_timeout = Some(timeout);
+        self
+    }
+
+    pub(crate) fn read_timeout(&self) -> Option<Duration> {
+        self.read_timeout
     }
 }
 

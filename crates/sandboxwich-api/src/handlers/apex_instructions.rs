@@ -178,7 +178,7 @@ fn idempotency_key(headers: &HeaderMap) -> Result<&str, ApiError> {
 async fn mark_unavailable(db: &Database, request_id: Uuid) -> Result<(), ApiError> {
     let sql = format!(
         "update apex_instruction_reads set state = 'unavailable', completed_at = {}
-         where request_id = {} and state in ('pending', 'completed')",
+         where request_id = {} and state = 'pending'",
         db.placeholder(1),
         db.placeholder(2)
     );
@@ -341,7 +341,15 @@ pub(crate) async fn read_apex_task_instructions(
     insert_job_on_connection(&state.db, &mut tx, &job).await?;
     tx.commit().await?;
 
-    let delivery = match tokio::time::timeout(APEX_INSTRUCTION_READ_TIMEOUT, receiver).await {
+    #[cfg(test)]
+    let read_timeout = state
+        .apex_callback_test_hook
+        .as_ref()
+        .and_then(|hook| hook.read_timeout())
+        .unwrap_or(APEX_INSTRUCTION_READ_TIMEOUT);
+    #[cfg(not(test))]
+    let read_timeout = APEX_INSTRUCTION_READ_TIMEOUT;
+    let delivery = match tokio::time::timeout(read_timeout, receiver).await {
         Ok(Ok(delivery)) => delivery,
         Ok(Err(_)) | Err(_) => {
             mark_unavailable(&state.db, request_id).await?;
@@ -935,6 +943,134 @@ mod tests {
         assert!(!payload.contains(&base64::engine::general_purpose::STANDARD.encode(&bytes)));
     }
 
+    #[tokio::test]
+    async fn tenant_timeout_after_callback_cas_cannot_downgrade_completed_authority() {
+        let (mut state, _ctx, worker, seeded_lease, _, _, _, bytes) =
+            callback_fixture(Utc::now() + chrono::Duration::seconds(35)).await;
+        let sandbox_id = sandbox_id_from_job(&seeded_lease.job).unwrap();
+        let hook = ApexCallbackTestHook::default().with_read_timeout(Duration::from_secs(2));
+        state.apex_callback_test_hook = Some(hook.clone());
+
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "post-cas-timeout-9".parse().unwrap());
+        let read_state = state.clone();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let expected_byte_count = u64::try_from(bytes.len()).unwrap();
+        let read = tokio::spawn(async move {
+            read_apex_task_instructions(
+                State(read_state),
+                Extension(TenantContext {
+                    tenant_id: "tenant-apex".into(),
+                    principal: Principal::Tenant,
+                }),
+                Path(sandbox_id.0),
+                headers,
+                Json(ApexTaskInstructionsReadRequest {
+                    expected_sha256: digest,
+                    expected_byte_count,
+                    claim_lease_generation: 9,
+                }),
+            )
+            .await
+        });
+
+        let job = loop {
+            if let Some(row) =
+                sqlx::query("select job_id from apex_instruction_reads where idempotency_key = ?")
+                    .bind("post-cas-timeout-9")
+                    .fetch_optional(&state.db.pool)
+                    .await
+                    .unwrap()
+            {
+                let id = JobId(Uuid::parse_str(&row.get::<String, _>("job_id")).unwrap());
+                break fetch_job(&state.db, id).await.unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let lease = try_claim_job(&state.db, &worker, &job, Some(60), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let request_id = Uuid::parse_str(job.payload["requestId"].as_str().unwrap()).unwrap();
+        let provider_apply_id =
+            Uuid::parse_str(job.payload["providerApplyId"].as_str().unwrap()).unwrap();
+        let callback_nonce =
+            Uuid::parse_str(job.payload["callbackNonce"].as_str().unwrap()).unwrap();
+        let callback_request = ApexTaskInstructionsCallbackRequest {
+            request_id,
+            lease_id: lease.id.0,
+            lease_attempt: u64::try_from(lease.attempt).unwrap(),
+            provider_apply_id,
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+            byte_count: u64::try_from(bytes.len()).unwrap(),
+            output_base64: Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+        };
+        let callback_state = state.clone();
+        let worker_id = worker.id;
+        let callback = tokio::spawn(async move {
+            deliver_apex_task_instructions(
+                State(callback_state),
+                Extension(TenantContext {
+                    tenant_id: "tenant-apex".into(),
+                    principal: Principal::Worker(worker_id),
+                }),
+                Path((worker_id.0, callback_nonce)),
+                Json(callback_request),
+            )
+            .await
+        });
+
+        hook.reached
+            .acquire()
+            .await
+            .expect("callback must durably complete before the forced tenant timeout")
+            .forget();
+        assert!(
+            !read.is_finished(),
+            "tenant timeout must occur after the callback durable CAS"
+        );
+        let timed_out = tokio::time::timeout(Duration::from_secs(3), read)
+            .await
+            .expect("configured tenant timeout should fire")
+            .unwrap()
+            .unwrap()
+            .0;
+        assert!(timed_out.output_unavailable);
+        assert!(timed_out.output_base64.is_none());
+
+        let state_after_timeout: String =
+            sqlx::query("select state from apex_instruction_reads where request_id = ?")
+                .bind(request_id.to_string())
+                .fetch_one(&state.db.pool)
+                .await
+                .unwrap()
+                .get("state");
+        assert_eq!(
+            state_after_timeout, "completed",
+            "a timeout after callback CAS must not poison completed authority"
+        );
+
+        hook.release.add_permits(1);
+        let callback = callback.await.unwrap().unwrap().0;
+        assert!(!callback.output_unavailable);
+        let completed = complete_lease_in_transaction(
+            &state.db,
+            lease.id,
+            WorkerJobResult::ApexTaskInstructions {
+                request_id,
+                sandbox_id,
+                lease_id: lease.id,
+                lease_attempt: lease.attempt,
+                provider_apply_id,
+                sha256: format!("{:x}", Sha256::digest(&bytes)),
+                byte_count: u64::try_from(bytes.len()).unwrap(),
+                output_unavailable: callback.output_unavailable,
+            },
+        )
+        .await
+        .expect("post-CAS timeout must preserve consistent lease completion");
+        assert_eq!(completed.status, LeaseStatus::Completed);
+    }
     #[tokio::test]
     async fn expired_read_returns_unavailable_without_new_job_or_waiter() {
         let (state, _ctx, _worker, lease, request_id, provider_apply_id, _nonce, bytes) =
