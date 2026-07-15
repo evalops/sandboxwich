@@ -24,6 +24,11 @@ pub(crate) async fn create_job(
     Extension(ctx): Extension<TenantContext>,
     Json(request): Json<CreateJobRequest>,
 ) -> Result<Json<JobResponse>, ApiError> {
+    if request.kind == JobKind::ApexTaskInstructions {
+        return Err(ApiError::bad_request(
+            "apex_task_instructions jobs can only be created by the live instruction endpoint",
+        ));
+    }
     if request.kind == JobKind::RunCommand {
         validate_run_command_job_input(&request.payload)?;
     }
@@ -155,6 +160,7 @@ fn validate_functional_required_capability(capability: &WorkerCapability) -> Res
         WorkerCapability::ProvisionSandbox
         | WorkerCapability::RunCommand
         | WorkerCapability::MaterializeFile
+        | WorkerCapability::ApexTaskInstructions
         | WorkerCapability::AgentPrompt
         | WorkerCapability::Snapshot
         | WorkerCapability::DesktopStream
@@ -189,7 +195,8 @@ pub(crate) async fn enrich_job_payload_with_provision_spec(
         | JobKind::CreateSnapshot
         | JobKind::StopSandbox
         | JobKind::ResumeSandbox
-        | JobKind::MaterializeFile => {
+        | JobKind::MaterializeFile
+        | JobKind::ApexTaskInstructions => {
             let sandbox = fetch_sandbox(db, sandbox_id_from_job(job)?).await?;
             job.required_execution_class = sandbox.execution_class.clone();
             add_provision_spec_to_payload(job, &sandbox)?;
@@ -258,6 +265,14 @@ pub(crate) async fn validate_job_payload_tenant(
                 ));
             }
             materialization_destination_from_job(job)?;
+        }
+        JobKind::ApexTaskInstructions => {
+            let sandbox = ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
+            if sandbox.runtime_profile != SandboxRuntimeProfile::ApexTrustedSupervisorV1 {
+                return Err(ApiError::bad_request(
+                    "apex_task_instructions requires apex_trusted_supervisor_v1",
+                ));
+            }
         }
         JobKind::RunPrompt => {
             ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
@@ -449,7 +464,7 @@ pub(crate) fn job_references(job: &Job) -> Result<JobReferences, ApiError> {
             references.sandbox_id = Some(sandbox_id_from_job(job)?);
             references.command_id = Some(command_id_from_job(job)?);
         }
-        JobKind::MaterializeFile => {
+        JobKind::MaterializeFile | JobKind::ApexTaskInstructions => {
             references.sandbox_id = Some(sandbox_id_from_job(job)?);
         }
         JobKind::RunPrompt => {

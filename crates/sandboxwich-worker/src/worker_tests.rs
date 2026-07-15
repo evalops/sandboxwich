@@ -1,6 +1,6 @@
 use super::*;
 use crate::provider::SandboxTeardownSpec;
-use base64::{Engine as _, engine::general_purpose};
+use base64::engine::general_purpose;
 use chrono::Utc;
 use sandboxwich_core::{
     ExecutionClass, Job, JobId, JobStatus, MAX_COMMAND_STDIN_BYTES, RuntimeResourceKind,
@@ -40,6 +40,9 @@ fn job(kind: JobKind, payload: serde_json::Value, capability: WorkerCapability) 
 fn completed_result(outcome: WorkerJobOutcome) -> WorkerJobResult {
     match outcome {
         WorkerJobOutcome::Complete(value) => value,
+        WorkerJobOutcome::ApexTaskInstructions { .. } => {
+            panic!("expected durable completion, got ephemeral instruction outcome")
+        }
         WorkerJobOutcome::Fail { error, .. } => panic!("expected completion, got {error}"),
     }
 }
@@ -694,6 +697,9 @@ fn resume_sandbox_job_fails_instead_of_silently_succeeding() {
         WorkerJobOutcome::Complete(_) => {
             panic!("resume must not silently report success")
         }
+        WorkerJobOutcome::ApexTaskInstructions { .. } => {
+            panic!("resume must not produce an instruction callback")
+        }
     }
 }
 
@@ -774,6 +780,7 @@ fn apex_registration_requires_and_composes_with_sandboxed_container() {
     .expect("APEX with gVisor is valid");
     assert!(capabilities.contains(&WorkerCapability::SandboxedContainer));
     assert!(capabilities.contains(&WorkerCapability::ApexTrustedSupervisorV1));
+    assert!(capabilities.contains(&WorkerCapability::ApexTaskInstructions));
     assert!(!capabilities.contains(&WorkerCapability::VirtualMachine));
 }
 

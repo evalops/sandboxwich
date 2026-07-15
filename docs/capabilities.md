@@ -10,6 +10,7 @@ until its real provider path is exercised by an end-to-end conformance test.
 | Kubernetes pod provisioning | Experimental | Apply mode mutates a configured sandbox namespace. Require gVisor or Kata for hostile multi-tenant workloads. |
 | FQDN egress allowlists | Experimental | Workers with a digest-pinned `SANDBOXWICH_EGRESS_GATEWAY_IMAGE` provision a per-Sandbox proxy and fail-closed NetworkPolicies. Cilium-managed namespaces may use `SANDBOXWICH_CILIUM_FQDN_EGRESS=true`. Native additive GKE FQDN policy is not an enforcement boundary. |
 | Command execution | Experimental | Kubernetes apply mode uses `kubectl exec`; dry-run mode is simulation only. Command requests may carry up to 1 MiB of base64-encoded, non-secret stdin bytes; providers pipe the decoded bytes to the guest and close the stream. |
+| APEX task instructions | Experimental | Apply-mode workers use one fixed executable and return at most 1 MiB through an instance-affine, worker-authenticated callback. Plaintext is live-only; durable rows contain lineage, digest, and byte count. Replays report output unavailable. |
 | Snapshots and forks | Experimental | Requires a working CSI `VolumeSnapshotClass`; not all clusters support it. |
 | SSH and browser desktop metadata | Experimental | Access records do not provide an ingress tunnel by themselves. |
 | Prompt/model execution | Unsupported | The current worker has no model executor. Dry-run acknowledgements are not model output. |

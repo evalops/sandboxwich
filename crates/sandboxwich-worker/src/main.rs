@@ -9,6 +9,7 @@ use std::{
 };
 
 use anyhow::Context;
+use base64::Engine as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use provider::{
     CancelSignal, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES, IsolationProfile, KUBERNETES_MUTATION_ENV,
@@ -16,7 +17,8 @@ use provider::{
     RetryDisposition, SandboxProvider, image_is_digest_pinned,
 };
 use sandboxwich_core::{
-    AgentCommandRequest, AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse,
+    AgentCommandRequest, AgentCommandResult, ApexTaskInstructionsCallbackRequest,
+    ApexTaskInstructionsCallbackResponse, ClaimLeaseRequest, ClaimLeaseResponse,
     CompleteLeaseRequest, FailLeaseRequest, JobKind, LeaseResponse, ProvisioningOperationResponse,
     ProvisioningStageUpdateRequest, RegisterWorkerRequest, RenewLeaseRequest,
     RuntimeResourceInventoryResponse, SandboxProvisionSpec, WorkerCapability,
@@ -24,6 +26,7 @@ use sandboxwich_core::{
     validate_agent_command_request,
 };
 use serde_json::json;
+use sha2::Digest;
 use uuid::Uuid;
 
 const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
@@ -460,6 +463,7 @@ enum CapabilityArg {
     ProvisionSandbox,
     RunCommand,
     MaterializeFile,
+    ApexTaskInstructions,
     Snapshot,
     DesktopStream,
     FqdnEgress,
@@ -585,6 +589,17 @@ impl SandboxProvider for RuntimeProvider {
                 content,
                 cancelled,
             ),
+        }
+    }
+
+    fn read_apex_task_instructions(
+        &self,
+        sandbox_id: sandboxwich_core::SandboxId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<Vec<u8>> {
+        match self {
+            Self::DryRun(provider) => provider.read_apex_task_instructions(sandbox_id, cancelled),
+            Self::Apply(provider) => provider.read_apex_task_instructions(sandbox_id, cancelled),
         }
     }
 
@@ -1835,6 +1850,91 @@ where
             })
             .await
         }
+        Ok(WorkerJobOutcome::ApexTaskInstructions {
+            request_id,
+            sandbox_id,
+            provider_apply_id,
+            callback_nonce,
+            callback_url,
+            sha256,
+            bytes,
+        }) => {
+            let callback =
+                validate_apex_callback_url(&callback_url, callback_nonce).and_then(|url| {
+                    Ok((
+                        url,
+                        ApexTaskInstructionsCallbackRequest {
+                            request_id,
+                            lease_id: lease_id.0,
+                            lease_attempt: u64::try_from(lease_attempt)
+                                .context("instruction lease attempt is invalid")?,
+                            provider_apply_id,
+                            sha256: sha256.clone(),
+                            byte_count: u64::try_from(bytes.len())
+                                .context("instruction byte count is invalid")?,
+                            output_base64: Some(
+                                base64::engine::general_purpose::STANDARD.encode(&bytes),
+                            ),
+                        },
+                    ))
+                });
+            let callback = match callback {
+                Ok((url, payload)) => {
+                    with_retries(
+                        "deliver APEX instruction callback",
+                        API_RETRY_ATTEMPTS,
+                        || async {
+                            let response = client.post(url.clone()).json(&payload).send().await?;
+                            decode_json::<ApexTaskInstructionsCallbackResponse>(response).await
+                        },
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            match callback {
+                Ok(callback) => {
+                    let payload = CompleteLeaseRequest {
+                        result: Some(WorkerJobResult::ApexTaskInstructions {
+                            request_id,
+                            sandbox_id,
+                            lease_id,
+                            lease_attempt,
+                            provider_apply_id,
+                            sha256,
+                            byte_count: u64::try_from(bytes.len())
+                                .expect("instruction output is capped at 1 MiB"),
+                            output_unavailable: callback.output_unavailable,
+                        }),
+                    };
+                    with_retries("complete lease", API_RETRY_ATTEMPTS, || async {
+                        let response = client
+                            .post(format!("{api}/leases/{lease_id}/complete"))
+                            .json(&payload)
+                            .send()
+                            .await?;
+                        decode_json::<LeaseResponse>(response).await
+                    })
+                    .await
+                }
+                Err(error) => {
+                    let payload = FailLeaseRequest {
+                        error: "APEX instruction callback delivery failed".to_string(),
+                        retry: true,
+                    };
+                    with_retries("fail lease", API_RETRY_ATTEMPTS, || async {
+                        let response = client
+                            .post(format!("{api}/leases/{lease_id}/fail"))
+                            .json(&payload)
+                            .send()
+                            .await?;
+                        decode_json::<LeaseResponse>(response).await
+                    })
+                    .await
+                    .with_context(|| format!("instruction callback failed: {error:#}"))
+                }
+            }
+        }
         Ok(WorkerJobOutcome::Fail { error, retry }) => {
             let payload = FailLeaseRequest { error, retry };
             with_retries("fail lease", API_RETRY_ATTEMPTS, || async {
@@ -1900,7 +2000,19 @@ async fn fetch_materialization(
 #[derive(Debug)]
 enum WorkerJobOutcome {
     Complete(WorkerJobResult),
-    Fail { error: String, retry: bool },
+    ApexTaskInstructions {
+        request_id: Uuid,
+        sandbox_id: sandboxwich_core::SandboxId,
+        provider_apply_id: Uuid,
+        callback_nonce: Uuid,
+        callback_url: String,
+        sha256: String,
+        bytes: Vec<u8>,
+    },
+    Fail {
+        error: String,
+        retry: bool,
+    },
 }
 
 fn provisioning_stage_request(
@@ -1918,6 +2030,25 @@ fn provisioning_stage_request(
         ),
         request,
     )
+}
+
+fn validate_apex_callback_url(url: &str, nonce: Uuid) -> anyhow::Result<reqwest::Url> {
+    let parsed = reqwest::Url::parse(url).context("instruction callback URL is invalid")?;
+    anyhow::ensure!(
+        matches!(parsed.scheme(), "http" | "https")
+            && parsed.host_str().is_some()
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+            && parsed.query().is_none()
+            && parsed.fragment().is_none(),
+        "instruction callback URL must be an http(s) origin and fixed callback path"
+    );
+    let expected_suffix = format!("/apex-instruction-callbacks/{nonce}");
+    anyhow::ensure!(
+        parsed.path().ends_with(&expected_suffix),
+        "instruction callback URL nonce does not match job lineage"
+    );
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -2052,6 +2183,52 @@ fn execute_job_with_reporter(
                     },
                 },
             ))
+        }
+        JobKind::ApexTaskInstructions => {
+            let sandbox_id = sandbox_id_from_payload(&job.payload)?;
+            let request_id = uuid_from_payload(&job.payload, "requestId")?;
+            let provider_apply_id = uuid_from_payload(&job.payload, "providerApplyId")?;
+            let callback_nonce = uuid_from_payload(&job.payload, "callbackNonce")?;
+            let callback_url = job
+                .payload
+                .get("callbackUrl")
+                .and_then(serde_json::Value::as_str)
+                .context("instruction callback URL is missing")?
+                .to_string();
+            validate_apex_callback_url(&callback_url, callback_nonce)?;
+            let expected_sha256 = job
+                .payload
+                .get("expectedSha256")
+                .and_then(serde_json::Value::as_str)
+                .context("instruction digest is missing")?;
+            anyhow::ensure!(
+                expected_sha256.len() == 64
+                    && expected_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+                "instruction digest is invalid"
+            );
+            let expected_byte_count = job
+                .payload
+                .get("expectedByteCount")
+                .and_then(serde_json::Value::as_u64)
+                .context("instruction byte count is missing")?;
+            let bytes = provider.read_apex_task_instructions(sandbox_id, cancelled)?;
+            let sha256 = format!("{:x}", sha2::Sha256::digest(&bytes));
+            anyhow::ensure!(
+                u64::try_from(bytes.len()).ok() == Some(expected_byte_count)
+                    && sha256 == expected_sha256,
+                "apex_instruction_output_mismatch"
+            );
+            Ok(WorkerJobOutcome::ApexTaskInstructions {
+                request_id,
+                sandbox_id,
+                provider_apply_id,
+                callback_nonce,
+                callback_url,
+                sha256,
+                bytes,
+            })
         }
         JobKind::RunPrompt => Ok(WorkerJobOutcome::Complete(WorkerJobResult::RunPrompt {
             output: prompt_output_from_payload(&job.payload)?,
@@ -2322,6 +2499,9 @@ fn capabilities_from_args(
     {
         resolved.push(WorkerCapability::ApexTrustedSupervisorV1);
     }
+    if apex_trusted_supervisor_v1 && !resolved.contains(&WorkerCapability::ApexTaskInstructions) {
+        resolved.push(WorkerCapability::ApexTaskInstructions);
+    }
     Ok(resolved)
 }
 
@@ -2373,6 +2553,7 @@ fn to_capability(value: CapabilityArg) -> WorkerCapability {
         CapabilityArg::ProvisionSandbox => WorkerCapability::ProvisionSandbox,
         CapabilityArg::RunCommand => WorkerCapability::RunCommand,
         CapabilityArg::MaterializeFile => WorkerCapability::MaterializeFile,
+        CapabilityArg::ApexTaskInstructions => WorkerCapability::ApexTaskInstructions,
         CapabilityArg::Snapshot => WorkerCapability::Snapshot,
         CapabilityArg::DesktopStream => WorkerCapability::DesktopStream,
         CapabilityArg::FqdnEgress => WorkerCapability::FqdnEgress,

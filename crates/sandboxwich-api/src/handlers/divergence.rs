@@ -521,6 +521,8 @@ mod tests {
                 allow_insecure_no_auth: true,
             },
             default_tenant_id: "default".to_string(),
+            apex_callback_base_url: None,
+            apex_waiters: Default::default(),
         }
     }
 

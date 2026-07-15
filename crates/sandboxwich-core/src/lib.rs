@@ -1620,6 +1620,7 @@ pub enum WorkerCapability {
     VirtualMachine => "virtual_machine",
     RunCommand => "run_command",
     MaterializeFile => "materialize_file",
+    ApexTaskInstructions => "apex_task_instructions",
     AgentPrompt => "agent_prompt",
     Snapshot => "snapshot",
     DesktopStream => "desktop_stream",
@@ -1730,6 +1731,7 @@ pub enum JobKind {
     ResumeSandbox => "resume_sandbox",
     RunCommand => "run_command",
     MaterializeFile => "materialize_file",
+    ApexTaskInstructions => "apex_task_instructions",
     RunPrompt => "run_prompt",
     CreateSnapshot => "create_snapshot",
     ForkSandbox => "fork_sandbox",
@@ -1892,6 +1894,82 @@ pub struct CreateJobRequest {
     pub required_capability: WorkerCapability,
     pub priority: Option<i64>,
     pub max_attempts: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApexTaskInstructionsReadRequest {
+    pub expected_sha256: String,
+    pub expected_byte_count: u64,
+    pub claim_lease_generation: u64,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApexTaskInstructionsReadResponse {
+    pub ok: bool,
+    pub request_id: Uuid,
+    pub sandbox_id: SandboxId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<Uuid>,
+    pub lease_attempt: u64,
+    pub provider_apply_id: Uuid,
+    pub sha256: String,
+    pub byte_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_base64: Option<String>,
+    pub output_unavailable: bool,
+}
+
+impl fmt::Debug for ApexTaskInstructionsReadResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApexTaskInstructionsReadResponse")
+            .field("request_id", &self.request_id)
+            .field("sandbox_id", &self.sandbox_id)
+            .field("sha256", &self.sha256)
+            .field("byte_count", &self.byte_count)
+            .field("output_unavailable", &self.output_unavailable)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApexTaskInstructionsCallbackRequest {
+    pub request_id: Uuid,
+    pub lease_id: Uuid,
+    pub lease_attempt: u64,
+    pub provider_apply_id: Uuid,
+    pub sha256: String,
+    pub byte_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_base64: Option<String>,
+}
+
+impl fmt::Debug for ApexTaskInstructionsCallbackRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApexTaskInstructionsCallbackRequest")
+            .field("request_id", &self.request_id)
+            .field("lease_id", &self.lease_id)
+            .field("lease_attempt", &self.lease_attempt)
+            .field("provider_apply_id", &self.provider_apply_id)
+            .field("sha256", &self.sha256)
+            .field("byte_count", &self.byte_count)
+            .field(
+                "output_base64",
+                &self.output_base64.as_ref().map(String::len),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApexTaskInstructionsCallbackResponse {
+    pub ok: bool,
+    pub output_unavailable: bool,
 }
 
 impl fmt::Debug for CreateJobRequest {
@@ -2333,6 +2411,16 @@ pub enum WorkerJobResult {
     MaterializeFile {
         receipt: MaterializeFileReceipt,
     },
+    ApexTaskInstructions {
+        request_id: Uuid,
+        sandbox_id: SandboxId,
+        lease_id: LeaseId,
+        lease_attempt: i64,
+        provider_apply_id: Uuid,
+        sha256: String,
+        byte_count: u64,
+        output_unavailable: bool,
+    },
     RunPrompt {
         output: String,
     },
@@ -2360,6 +2448,7 @@ pub enum WorkerJobResult {
 pub enum MaterializeFileDestination {
     ApexWorld,
     ApexTask,
+    ApexTaskInstructions,
     ApexGradingBundle,
 }
 
@@ -2368,6 +2457,7 @@ impl MaterializeFileDestination {
         match self {
             Self::ApexWorld => "/workspace/.apex/input/world",
             Self::ApexTask => "/workspace/.apex/input/task",
+            Self::ApexTaskInstructions => "/workspace/.apex/input/task-instructions",
             Self::ApexGradingBundle => "/workspace/.apex/grader/bundle.zip",
         }
     }
@@ -2478,8 +2568,38 @@ mod tests {
             "/workspace/.apex/input/task"
         );
         assert_eq!(
+            MaterializeFileDestination::ApexTaskInstructions.guest_path(),
+            "/workspace/.apex/input/task-instructions"
+        );
+        assert_eq!(
             MaterializeFileDestination::ApexGradingBundle.guest_path(),
             "/workspace/.apex/grader/bundle.zip"
+        );
+    }
+
+    #[test]
+    fn apex_instruction_read_contract_is_closed_and_redacts_live_bytes() {
+        assert_eq!(
+            JobKind::ApexTaskInstructions.as_db_str(),
+            "apex_task_instructions"
+        );
+        assert_eq!(
+            WorkerCapability::ApexTaskInstructions.as_db_str(),
+            "apex_task_instructions"
+        );
+        let request: ApexTaskInstructionsReadRequest = serde_json::from_value(serde_json::json!({
+            "expectedSha256": "a".repeat(64),
+            "expectedByteCount": 7,
+            "claimLeaseGeneration": 1
+        }))
+        .expect("exact request should decode");
+        assert_eq!(request.claim_lease_generation, 1);
+        assert!(
+            serde_json::from_value::<ApexTaskInstructionsReadRequest>(serde_json::json!({
+                "expectedSha256": "a".repeat(64), "expectedByteCount": 7,
+                "claimLeaseGeneration": 1, "argv": ["cat"]
+            }))
+            .is_err()
         );
     }
     use serde::{Serialize, de::DeserializeOwned};

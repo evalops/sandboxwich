@@ -1714,6 +1714,75 @@ pub(crate) async fn apply_completed_job_on_connection(
             )
             .await?;
         }
+        (
+            JobKind::ApexTaskInstructions,
+            WorkerJobResult::ApexTaskInstructions {
+                request_id,
+                sandbox_id,
+                lease_id,
+                lease_attempt,
+                provider_apply_id,
+                sha256,
+                byte_count,
+                output_unavailable,
+            },
+        ) => {
+            if sandbox_id != sandbox_id_from_job(job)?
+                || job
+                    .payload
+                    .get("requestId")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(request_id.to_string().as_str())
+                || job
+                    .payload
+                    .get("providerApplyId")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(provider_apply_id.to_string().as_str())
+                || job
+                    .payload
+                    .get("expectedSha256")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(sha256.as_str())
+                || job
+                    .payload
+                    .get("expectedByteCount")
+                    .and_then(serde_json::Value::as_u64)
+                    != Some(byte_count)
+            {
+                return Err(ApiError::bad_request(
+                    "instruction completion does not match job lineage",
+                ));
+            }
+            let sql = format!(
+                "select lease_id, lease_attempt, provider_apply_id, observed_sha256,
+                        observed_byte_count, state
+                 from apex_instruction_reads where request_id = {}",
+                db.placeholder(1)
+            );
+            let row = sqlx::query(&sql)
+                .bind(request_id.to_string())
+                .fetch_optional(&mut *connection)
+                .await?
+                .ok_or_else(|| ApiError::bad_request("instruction read authority is missing"))?;
+            let persisted_lease_id: Option<String> = row.try_get("lease_id")?;
+            let persisted_attempt: i64 = row.try_get("lease_attempt")?;
+            let persisted_provider_apply_id: String = row.try_get("provider_apply_id")?;
+            let persisted_sha256: Option<String> = row.try_get("observed_sha256")?;
+            let persisted_count: Option<i64> = row.try_get("observed_byte_count")?;
+            let state: String = row.try_get("state")?;
+            if persisted_lease_id.as_deref() != Some(lease_id.to_string().as_str())
+                || persisted_attempt != lease_attempt
+                || persisted_provider_apply_id != provider_apply_id.to_string()
+                || persisted_sha256.as_deref() != Some(sha256.as_str())
+                || persisted_count.and_then(|value| u64::try_from(value).ok()) != Some(byte_count)
+                || (state == "unavailable") != output_unavailable
+                || !matches!(state.as_str(), "completed" | "unavailable")
+            {
+                return Err(ApiError::bad_request(
+                    "instruction completion does not match callback authority",
+                ));
+            }
+        }
         (JobKind::CreateSnapshot, WorkerJobResult::CreateSnapshot { handle }) => {
             let snapshot_id = snapshot_id_from_job(job)?;
             if handle.snapshot_id != snapshot_id {
@@ -1931,7 +2000,8 @@ pub(crate) async fn apply_claimed_job_on_connection(
         JobKind::ProvisionSandbox
         | JobKind::StopSandbox
         | JobKind::ResumeSandbox
-        | JobKind::MaterializeFile => {}
+        | JobKind::MaterializeFile
+        | JobKind::ApexTaskInstructions => {}
     }
     Ok(())
 }
@@ -2008,7 +2078,8 @@ pub(crate) async fn apply_retryable_job_on_connection(
         JobKind::ProvisionSandbox
         | JobKind::StopSandbox
         | JobKind::ResumeSandbox
-        | JobKind::MaterializeFile => {}
+        | JobKind::MaterializeFile
+        | JobKind::ApexTaskInstructions => {}
     }
     Ok(())
 }
@@ -2116,6 +2187,19 @@ pub(crate) async fn apply_failed_job_on_connection(
                 file_id_from_job(job)?,
             )
             .await?;
+        }
+        JobKind::ApexTaskInstructions => {
+            let sql = format!(
+                "update apex_instruction_reads set state = 'failed', completed_at = {}
+                 where job_id = {} and state = 'pending'",
+                db.placeholder(1),
+                db.placeholder(2)
+            );
+            sqlx::query(&sql)
+                .bind(Utc::now().to_rfc3339())
+                .bind(job.id.to_string())
+                .execute(&mut *connection)
+                .await?;
         }
     }
     Ok(())

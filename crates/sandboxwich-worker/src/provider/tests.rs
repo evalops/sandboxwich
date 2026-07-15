@@ -277,6 +277,11 @@ fn apex_trusted_supervisor_profile_is_closed_and_minimally_privileged() {
     assert!(
         report
             .capabilities
+            .contains(&WorkerCapability::ApexTaskInstructions)
+    );
+    assert!(
+        report
+            .capabilities
             .contains(&WorkerCapability::SandboxedContainer)
     );
     assert_eq!(
@@ -1046,6 +1051,70 @@ fn exec_args_never_render_env_values_on_argv() {
         &exec_args[exec_args.len() - 2..],
         ["printf".to_string(), "ok".to_string()]
     );
+}
+
+#[test]
+fn apex_task_instructions_exec_is_fixed_and_accepts_no_caller_process_fields() {
+    let provider = KubernetesDryRunProvider::with_snapshot_class(
+        "k3s-ci",
+        "sandboxwich-ci",
+        Some("local-path".to_string()),
+        None,
+    );
+    let apply = KubernetesApplyProvider::new(provider, "kubectl")
+        .with_kubectl_context(Some("in-cluster".to_string()));
+    let sandbox_id = SandboxId::new();
+
+    let args = apply.apex_task_instructions_args(sandbox_id);
+
+    assert!(!args.iter().any(|arg| arg == "-i"));
+    assert_eq!(
+        &args[args.len() - 4..],
+        [
+            "exec".to_string(),
+            format!("sandboxwich-{sandbox_id}"),
+            "--".to_string(),
+            "/opt/apex/bin/task-instructions".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn apex_task_instructions_live_read_returns_exact_bytes_and_rejects_oversize_output() {
+    let dir = std::env::temp_dir().join(format!("sandboxwich-apex-read-{}", SandboxId::new()));
+    std::fs::create_dir_all(&dir).expect("create fake kubectl dir");
+    let script_path = dir.join("kubectl");
+    std::fs::write(
+        &script_path,
+        "#!/bin/sh\ncase \" $* \" in *\" get pod \"*) printf 'pod/found\\n'; exit 0 ;; esac\nprintf 'private\\000instructions'\n",
+    )
+    .expect("write fake kubectl");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).unwrap();
+    }
+    let provider = apply_provider_with_fake_kubectl(&script_path);
+    let output = provider
+        .read_apex_task_instructions(SandboxId::new(), &CancelSignal::never_cancelled())
+        .expect("fixed live read should succeed");
+    assert_eq!(output, b"private\0instructions");
+
+    std::fs::write(
+        &script_path,
+        format!("#!/bin/sh\ncase \" $* \" in *\" get pod \"*) printf 'pod/found\\n'; exit 0 ;; esac\nhead -c {} /dev/zero\n", APEX_TASK_INSTRUCTIONS_MAX_BYTES + 1),
+    )
+    .expect("replace fake kubectl");
+    let error = provider
+        .read_apex_task_instructions(SandboxId::new(), &CancelSignal::never_cancelled())
+        .expect_err("more than 1 MiB must be rejected, never truncated");
+    assert!(
+        error
+            .to_string()
+            .contains("apex_task_instructions_too_large")
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]

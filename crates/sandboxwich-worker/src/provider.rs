@@ -161,6 +161,11 @@ pub(crate) fn image_is_digest_pinned(image: &str) -> bool {
 /// `sandboxwich-agent`'s `DEFAULT_MAX_CAPTURED_OUTPUT_BYTES`: without a cap, a
 /// chatty or misbehaving `kubectl` command could grow these unboundedly.
 pub const DEFAULT_MAX_CAPTURED_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
+/// Hard live-response limit for the fixed APEX instruction reader. The
+/// instruction body is returned to its caller only and must never flow into
+/// ordinary command/job output storage.
+pub const APEX_TASK_INSTRUCTIONS_MAX_BYTES: usize = 1024 * 1024;
+const APEX_TASK_INSTRUCTIONS_COMMAND: &str = "/opt/apex/bin/task-instructions";
 
 /// Default bound applied to every `kubectl` invocation made by
 /// [`KubernetesApplyProvider`] (see [`run_kubectl_command`]). Pod readiness
@@ -259,6 +264,17 @@ pub trait SandboxProvider {
         request: AgentCommandRequest,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<AgentCommandResult>;
+    /// Reads the APEX task instruction stream from a live sandbox through one
+    /// fixed executable. There is intentionally no request object: callers
+    /// cannot supply argv, cwd, environment, or stdin.
+    fn read_apex_task_instructions(
+        &self,
+        sandbox_id: SandboxId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<Vec<u8>> {
+        let _ = (sandbox_id, cancelled);
+        anyhow::bail!("provider does not support APEX task instruction reads")
+    }
     fn materialize_file(
         &self,
         sandbox_id: SandboxId,
@@ -3297,6 +3313,17 @@ impl KubernetesApplyProvider {
         args
     }
 
+    fn apex_task_instructions_args(&self, sandbox_id: SandboxId) -> Vec<String> {
+        let mut args = self.kubectl_base_args();
+        args.extend([
+            "exec".to_string(),
+            self.pod_name(sandbox_id),
+            "--".to_string(),
+            APEX_TASK_INSTRUCTIONS_COMMAND.to_string(),
+        ]);
+        args
+    }
+
     /// Builds the counted NUL-delimited `KEY=VALUE` prefix followed by the
     /// exact command stdin bytes. Returns `None` when neither input exists,
     /// so callers preserve the previous non-interactive behavior.
@@ -3458,6 +3485,141 @@ fn run_kubectl_command_with_stdin(
             .block_on(command),
     };
     result.map_err(|error| anyhow::Error::new(ProviderError::retryable(error)))
+}
+
+fn run_fixed_apex_task_instructions(
+    kubectl: &str,
+    args: &[String],
+    timeout: Duration,
+    cancelled: &CancelSignal,
+) -> anyhow::Result<Vec<u8>> {
+    let command = run_fixed_apex_task_instructions_async(kubectl, args, timeout, cancelled);
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(command),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build runtime for APEX instruction read")?
+            .block_on(command),
+    };
+    result.map_err(|error| anyhow::Error::new(ProviderError::retryable(error)))
+}
+
+async fn drain_bounded<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    retained_limit: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut retained = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(retained);
+        }
+        let remaining = retained_limit.saturating_sub(retained.len());
+        retained.extend_from_slice(&buffer[..read.min(remaining)]);
+    }
+}
+
+async fn run_fixed_apex_task_instructions_async(
+    kubectl: &str,
+    args: &[String],
+    timeout: Duration,
+    cancelled: &CancelSignal,
+) -> anyhow::Result<Vec<u8>> {
+    let mut child = tokio::process::Command::new(kubectl)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn fixed APEX task instruction reader")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture APEX stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture APEX stderr")?;
+    let mut stdout_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout
+            .take((APEX_TASK_INSTRUCTIONS_MAX_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await?;
+        Ok::<_, std::io::Error>(bytes)
+    });
+    // Drain stderr so the child cannot deadlock, but retain only a small
+    // diagnostic prefix. The bytes are deliberately never included in an
+    // error, log, event, or persisted result.
+    let stderr_task = tokio::spawn(drain_bounded(stderr, 4096));
+
+    enum First {
+        Status(std::io::Result<std::process::ExitStatus>),
+        Stdout(Result<std::io::Result<Vec<u8>>, tokio::task::JoinError>),
+        Cancelled,
+        TimedOut,
+    }
+    let first = tokio::select! {
+        status = child.wait() => First::Status(status),
+        stdout = &mut stdout_task => First::Stdout(stdout),
+        () = async {
+            loop {
+                if cancelled.is_cancelled() { return; }
+                tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
+            }
+        } => First::Cancelled,
+        () = tokio::time::sleep(timeout) => First::TimedOut,
+    };
+
+    let (status, output) = match first {
+        First::Status(status) => {
+            let status = status.context("failed waiting for fixed APEX instruction reader")?;
+            let output = stdout_task
+                .await
+                .context("APEX stdout reader task failed")?
+                .context("failed reading APEX stdout")?;
+            (status, output)
+        }
+        First::Stdout(output) => {
+            let output = output
+                .context("APEX stdout reader task failed")?
+                .context("failed reading APEX stdout")?;
+            if output.len() > APEX_TASK_INSTRUCTIONS_MAX_BYTES {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                stderr_task.abort();
+                anyhow::bail!("apex_task_instructions_too_large");
+            }
+            let status = tokio::time::timeout(timeout, child.wait())
+                .await
+                .context("fixed APEX instruction reader timed out")?
+                .context("failed waiting for fixed APEX instruction reader")?;
+            (status, output)
+        }
+        First::Cancelled => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            anyhow::bail!("fixed APEX instruction read cancelled after lease loss");
+        }
+        First::TimedOut => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            anyhow::bail!("fixed APEX instruction read timed out");
+        }
+    };
+    let _ = stderr_task.await;
+    anyhow::ensure!(
+        output.len() <= APEX_TASK_INSTRUCTIONS_MAX_BYTES,
+        "apex_task_instructions_too_large"
+    );
+    anyhow::ensure!(status.success(), "fixed APEX instruction reader failed");
+    Ok(output)
 }
 
 async fn run_kubectl_command_async(
@@ -3635,6 +3797,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
                 .is_some_and(|name| !name.trim().is_empty())
         {
             capabilities.push(WorkerCapability::ApexTrustedSupervisorV1);
+            capabilities.push(WorkerCapability::ApexTaskInstructions);
         }
         if self.runtime_class_name.is_some() {
             match self.isolation_profile {
@@ -3986,6 +4149,25 @@ impl SandboxProvider for KubernetesApplyProvider {
             started_at,
             finished_at,
         })
+    }
+
+    fn read_apex_task_instructions(
+        &self,
+        sandbox_id: SandboxId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<Vec<u8>> {
+        // A live read is valid only against a provider-owned pod that already
+        // exists. Never provision/re-apply as a side effect of this endpoint.
+        anyhow::ensure!(
+            self.pod_exists(sandbox_id, cancelled)?,
+            "sandbox provider apply proof is unavailable"
+        );
+        run_fixed_apex_task_instructions(
+            &self.kubectl,
+            &self.apex_task_instructions_args(sandbox_id),
+            self.kubectl_command_timeout,
+            cancelled,
+        )
     }
 
     fn materialize_file(

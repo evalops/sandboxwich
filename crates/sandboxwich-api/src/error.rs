@@ -60,6 +60,14 @@ impl ApiError {
         }
     }
 
+    pub(crate) fn too_many_requests(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code,
+            message: message.into(),
+        }
+    }
+
     pub(crate) fn unsupported(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_IMPLEMENTED,
