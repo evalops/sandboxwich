@@ -426,10 +426,6 @@ pub(crate) async fn deliver_apex_task_instructions(
     let observed_sha256 = format!("{:x}", Sha256::digest(&bytes));
 
     let waiter_available = state.apex_waiters.has_sender(&callback_nonce);
-    #[cfg(test)]
-    if let Some(hook) = state.apex_callback_test_hook.as_ref() {
-        hook.pause_once().await;
-    }
     let output_unavailable = !waiter_available;
     let next_state = if output_unavailable {
         "unavailable"
@@ -500,10 +496,16 @@ pub(crate) async fn deliver_apex_task_instructions(
             output_unavailable: persisted_state == "unavailable",
         }));
     }
+    #[cfg(test)]
+    if let Some(hook) = state.apex_callback_test_hook.as_ref() {
+        hook.pause_once().await;
+    }
     // Only the callback that won the durable pending-state transition may
     // consume the live waiter. Exact overlapping retries replay the persisted
-    // acknowledgement above and can neither steal delivery nor mark it
-    // unavailable first.
+    // acknowledgement above and can neither steal delivery nor change it.
+    // Waiter availability at this CAS is the delivery linearization point: a
+    // tenant disconnect after it cannot downgrade the completed acknowledgement
+    // that an overlapping callback or lease completion may already have seen.
     let sender = waiter_available
         .then(|| state.apex_waiters.take(&callback_nonce))
         .flatten();
@@ -525,21 +527,7 @@ pub(crate) async fn deliver_apex_task_instructions(
             lease_attempt: request.lease_attempt,
             provider_apply_id: request.provider_apply_id,
         };
-        if sender.send(delivery).is_err() {
-            mark_unavailable(&state.db, request.request_id).await?;
-            return Ok(Json(ApexTaskInstructionsCallbackResponse {
-                ok: true,
-                output_unavailable: true,
-            }));
-        }
-    } else if waiter_available {
-        // The tenant request ended between observation and the durable update.
-        // Fail closed without delivering bytes to a vanished receiver.
-        mark_unavailable(&state.db, request.request_id).await?;
-        return Ok(Json(ApexTaskInstructionsCallbackResponse {
-            ok: true,
-            output_unavailable: true,
-        }));
+        let _ = sender.send(delivery);
     }
     Ok(Json(ApexTaskInstructionsCallbackResponse {
         ok: true,
@@ -842,7 +830,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overlapping_exact_callback_cannot_steal_the_live_delivery() {
+    async fn post_cas_disconnect_and_overlapping_replay_keep_completed_ack_consistent() {
         let (mut state, ctx, worker, lease, request_id, provider_apply_id, nonce, bytes) =
             callback_fixture(Utc::now() + chrono::Duration::seconds(35)).await;
         let hook = ApexCallbackTestHook::default();
@@ -876,6 +864,7 @@ mod tests {
             .await
             .expect("first callback should reach the forced interleaving")
             .forget();
+        drop(state.apex_waiters.take(&nonce));
 
         let retry_state = state.clone();
         let retry = tokio::spawn(async move {
@@ -893,15 +882,32 @@ mod tests {
             .unwrap()
             .unwrap()
             .0;
+        let completed = complete_lease_in_transaction(
+            &state.db,
+            lease.id,
+            WorkerJobResult::ApexTaskInstructions {
+                request_id,
+                sandbox_id: sandbox_id_from_job(&lease.job).unwrap(),
+                lease_id: lease.id,
+                lease_attempt: lease.attempt,
+                provider_apply_id,
+                sha256: format!("{:x}", Sha256::digest(&bytes)),
+                byte_count: u64::try_from(bytes.len()).unwrap(),
+                output_unavailable: retry.output_unavailable,
+            },
+        )
+        .await
+        .expect("overlapping completed acknowledgement must authorize completion");
+        assert_eq!(completed.status, LeaseStatus::Completed);
         hook.release.add_permits(1);
         let first = first.await.unwrap().unwrap().0;
-        let delivery = receiver
-            .await
-            .expect("exactly one overlapping callback must retain the live delivery");
+        assert!(
+            receiver.await.is_err(),
+            "disconnected tenant gets no live bytes"
+        );
 
         assert!(!first.output_unavailable);
         assert!(!retry.output_unavailable);
-        assert_eq!(delivery.bytes, bytes);
         let row = sqlx::query(
             "select state, observed_sha256, observed_byte_count from apex_instruction_reads
              where request_id = ?",
@@ -919,6 +925,14 @@ mod tests {
             !row.get::<String, _>("observed_sha256")
                 .contains("PRIVATE_SENTINEL")
         );
+        let payload = sqlx::query("select payload from jobs where id = ?")
+            .bind(lease.job_id.to_string())
+            .fetch_one(&state.db.pool)
+            .await
+            .unwrap()
+            .get::<String, _>("payload");
+        assert!(!payload.contains("PRIVATE_SENTINEL"));
+        assert!(!payload.contains(&base64::engine::general_purpose::STANDARD.encode(&bytes)));
     }
 
     #[tokio::test]
