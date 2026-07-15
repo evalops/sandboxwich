@@ -6,6 +6,8 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+#[cfg(test)]
+use tokio::sync::Semaphore;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -56,12 +58,52 @@ impl ApexInstructionWaiters {
             .remove(nonce)
     }
 
+    pub(crate) fn has_sender(&self, nonce: &Uuid) -> bool {
+        self.0
+            .lock()
+            .expect("APEX waiter mutex poisoned")
+            .contains_key(nonce)
+    }
+
     #[cfg(test)]
     pub(crate) fn contains(&self, nonce: &Uuid) -> bool {
         self.0
             .lock()
             .expect("APEX waiter mutex poisoned")
             .contains_key(nonce)
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct ApexCallbackTestHook {
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) reached: Arc<Semaphore>,
+    pub(crate) release: Arc<Semaphore>,
+}
+
+#[cfg(test)]
+impl Default for ApexCallbackTestHook {
+    fn default() -> Self {
+        Self {
+            armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reached: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ApexCallbackTestHook {
+    pub(crate) async fn pause_once(&self) {
+        if !self.armed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.reached.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .expect("callback test hook release semaphore closed")
+                .forget();
+        }
     }
 }
 
@@ -142,6 +184,8 @@ pub(crate) struct AppState {
     pub(crate) default_tenant_id: String,
     pub(crate) apex_callback_base_url: Option<String>,
     pub(crate) apex_waiters: ApexInstructionWaiters,
+    #[cfg(test)]
+    pub(crate) apex_callback_test_hook: Option<ApexCallbackTestHook>,
 }
 
 #[derive(Clone, Debug)]

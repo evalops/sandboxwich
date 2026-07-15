@@ -425,8 +425,12 @@ pub(crate) async fn deliver_apex_task_instructions(
     let observed_count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     let observed_sha256 = format!("{:x}", Sha256::digest(&bytes));
 
-    let sender = state.apex_waiters.take(&callback_nonce);
-    let output_unavailable = sender.is_none();
+    let waiter_available = state.apex_waiters.has_sender(&callback_nonce);
+    #[cfg(test)]
+    if let Some(hook) = state.apex_callback_test_hook.as_ref() {
+        hook.pause_once().await;
+    }
+    let output_unavailable = !waiter_available;
     let next_state = if output_unavailable {
         "unavailable"
     } else {
@@ -496,6 +500,13 @@ pub(crate) async fn deliver_apex_task_instructions(
             output_unavailable: persisted_state == "unavailable",
         }));
     }
+    // Only the callback that won the durable pending-state transition may
+    // consume the live waiter. Exact overlapping retries replay the persisted
+    // acknowledgement above and can neither steal delivery nor mark it
+    // unavailable first.
+    let sender = waiter_available
+        .then(|| state.apex_waiters.take(&callback_nonce))
+        .flatten();
     if let Some(sender) = sender {
         let delivery = ApexInstructionDelivery {
             bytes,
@@ -521,6 +532,14 @@ pub(crate) async fn deliver_apex_task_instructions(
                 output_unavailable: true,
             }));
         }
+    } else if waiter_available {
+        // The tenant request ended between observation and the durable update.
+        // Fail closed without delivering bytes to a vanished receiver.
+        mark_unavailable(&state.db, request.request_id).await?;
+        return Ok(Json(ApexTaskInstructionsCallbackResponse {
+            ok: true,
+            output_unavailable: true,
+        }));
     }
     Ok(Json(ApexTaskInstructionsCallbackResponse {
         ok: true,
@@ -542,7 +561,7 @@ mod tests {
     use crate::handlers::sandboxes::{insert_sandbox, sandbox_id_from_job};
     use crate::handlers::workers::insert_worker;
     use crate::routes::APEX_CALLBACK_BODY_LIMIT_BYTES;
-    use crate::state::{ApexInstructionWaiters, Principal};
+    use crate::state::{ApexCallbackTestHook, ApexInstructionWaiters, Principal};
     use std::collections::BTreeMap;
     use std::time::Duration;
 
@@ -747,6 +766,7 @@ mod tests {
             // An empty fresh registry models restart or a callback routed to
             // the wrong API replica while durable lineage survives.
             apex_waiters: ApexInstructionWaiters::default(),
+            apex_callback_test_hook: None,
         };
         let ctx = TenantContext {
             tenant_id: sandbox.tenant_id,
@@ -819,6 +839,86 @@ mod tests {
             .unwrap()
             .get::<String, _>("payload");
         assert!(!payload.contains("PRIVATE_SENTINEL"));
+    }
+
+    #[tokio::test]
+    async fn overlapping_exact_callback_cannot_steal_the_live_delivery() {
+        let (mut state, ctx, worker, lease, request_id, provider_apply_id, nonce, bytes) =
+            callback_fixture(Utc::now() + chrono::Duration::seconds(35)).await;
+        let hook = ApexCallbackTestHook::default();
+        state.apex_callback_test_hook = Some(hook.clone());
+        let (sender, receiver) = oneshot::channel();
+        state.apex_waiters.try_insert(nonce, sender).unwrap();
+        let request = ApexTaskInstructionsCallbackRequest {
+            request_id,
+            lease_id: lease.id.0,
+            lease_attempt: 1,
+            provider_apply_id,
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+            byte_count: u64::try_from(bytes.len()).unwrap(),
+            output_base64: Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+        };
+
+        let first_state = state.clone();
+        let first_ctx = ctx.clone();
+        let first_request = request.clone();
+        let first = tokio::spawn(async move {
+            deliver_apex_task_instructions(
+                State(first_state),
+                Extension(first_ctx),
+                Path((worker.id.0, nonce)),
+                Json(first_request),
+            )
+            .await
+        });
+        hook.reached
+            .acquire()
+            .await
+            .expect("first callback should reach the forced interleaving")
+            .forget();
+
+        let retry_state = state.clone();
+        let retry = tokio::spawn(async move {
+            deliver_apex_task_instructions(
+                State(retry_state),
+                Extension(ctx),
+                Path((worker.id.0, nonce)),
+                Json(request),
+            )
+            .await
+        });
+        let retry = tokio::time::timeout(Duration::from_secs(1), retry)
+            .await
+            .expect("exact retry must finish while the first callback is paused")
+            .unwrap()
+            .unwrap()
+            .0;
+        hook.release.add_permits(1);
+        let first = first.await.unwrap().unwrap().0;
+        let delivery = receiver
+            .await
+            .expect("exactly one overlapping callback must retain the live delivery");
+
+        assert!(!first.output_unavailable);
+        assert!(!retry.output_unavailable);
+        assert_eq!(delivery.bytes, bytes);
+        let row = sqlx::query(
+            "select state, observed_sha256, observed_byte_count from apex_instruction_reads
+             where request_id = ?",
+        )
+        .bind(request_id.to_string())
+        .fetch_one(&state.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("state"), "completed");
+        assert_eq!(
+            row.get::<i64, _>("observed_byte_count"),
+            i64::try_from(bytes.len()).unwrap()
+        );
+        assert!(
+            !row.get::<String, _>("observed_sha256")
+                .contains("PRIVATE_SENTINEL")
+        );
     }
 
     #[tokio::test]
