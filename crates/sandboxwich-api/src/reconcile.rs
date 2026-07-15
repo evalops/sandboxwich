@@ -97,6 +97,7 @@ pub(crate) async fn upsert_provider_runtime_resources_on_connection(
     db: &Database,
     connection: &mut AnyConnection,
     resources: &[ProviderRuntimeResource],
+    tenant_id: &str,
 ) -> Result<(), ApiError> {
     let observed_at = Utc::now();
     for resource in resources {
@@ -106,7 +107,7 @@ pub(crate) async fn upsert_provider_runtime_resources_on_connection(
             resource,
             Some(observed_at),
             None,
-            None,
+            Some(tenant_id),
         )
         .await?;
     }
@@ -340,6 +341,9 @@ pub(crate) async fn upsert_provider_runtime_resource_on_connection(
     tenant_id: Option<&str>,
 ) -> Result<RuntimeResource, ApiError> {
     validate_provider_runtime_resource(resource)?;
+    if let Some(tenant_id) = tenant_id {
+        ensure_sandbox_tenant_on_connection(db, connection, resource.sandbox_id, tenant_id).await?;
+    }
     let existing_id = fetch_runtime_resource_id_on_connection(
         db,
         connection,

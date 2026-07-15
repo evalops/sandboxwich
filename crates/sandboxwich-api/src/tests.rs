@@ -1816,3 +1816,128 @@ async fn cleanup_archived_sandboxes_never_deletes_a_sandbox_with_a_live_restore_
          finds a reference"
     );
 }
+
+#[tokio::test]
+async fn apex_execution_class_migration_backfills_legacy_rows() {
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect upgrade database");
+    let migrations = sqlx::migrate!("./migrations");
+    let prior_migrations = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            migrations.migrations[..migrations.migrations.len() - 1].to_vec(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    prior_migrations
+        .run(&pool)
+        .await
+        .expect("migrate to pre-backfill schema");
+    let db = Database {
+        pool,
+        dialect: SqlDialect::Sqlite,
+    };
+    let now = Utc::now();
+    let sandbox = Sandbox {
+        id: SandboxId::new(),
+        tenant_id: "legacy-apex-tenant".to_string(),
+        name: "legacy-apex".to_string(),
+        state: SandboxState::Ready,
+        template: format!("ghcr.io/evalops/apex@sha256:{}", "a".repeat(64)),
+        memory_limit: MemoryLimit::FourG,
+        network_egress: NetworkEgress::DenyAll,
+        workspace_mode: WorkspaceMode::Persistent,
+        runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
+        execution_class: ExecutionClass::DevelopmentContainer,
+        created_at: now,
+        updated_at: now,
+        ttl_seconds: None,
+        parent_snapshot_id: None,
+    };
+    insert_sandbox(&db, &sandbox)
+        .await
+        .expect("insert legacy sandbox");
+
+    let job = Job {
+        id: JobId::new(),
+        tenant_id: sandbox.tenant_id.clone(),
+        kind: JobKind::ProvisionSandbox,
+        status: JobStatus::Queued,
+        payload: json!({"sandboxId": sandbox.id}),
+        required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
+        priority: 0,
+        attempts: 0,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+    };
+    insert_job(&db, &job).await.expect("insert legacy job");
+
+    let snapshot_id = SnapshotId::new();
+    let provision_spec = serde_json::to_string(&SandboxProvisionSpec {
+        runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
+        execution_class: ExecutionClass::DevelopmentContainer,
+        ..SandboxProvisionSpec::default()
+    })
+    .expect("serialize legacy provision spec");
+    sqlx::query(
+        "insert into snapshot_restore_sources
+         (snapshot_id, tenant_id, source_sandbox_id, execution_class, status, provision_spec)
+         values (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(snapshot_id.to_string())
+    .bind(&sandbox.tenant_id)
+    .bind(sandbox.id.to_string())
+    .bind("development_container")
+    .bind("ready")
+    .bind(provision_spec)
+    .execute(&db.pool)
+    .await
+    .expect("insert legacy restore source");
+
+    migrations
+        .run(&db.pool)
+        .await
+        .expect("apply corrective backfill migration");
+    sqlx::raw_sql(include_str!(
+        "../migrations/20260714000300_apex_execution_class_backfill.sql"
+    ))
+    .execute(&db.pool)
+    .await
+    .expect("corrective backfill remains idempotent");
+
+    let sandbox_class: String = sqlx::query("select execution_class from sandboxes where id = ?")
+        .bind(sandbox.id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .expect("fetch sandbox class")
+        .try_get("execution_class")
+        .expect("sandbox execution_class");
+    let job_class: String = sqlx::query("select required_execution_class from jobs where id = ?")
+        .bind(job.id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .expect("fetch job class")
+        .try_get("required_execution_class")
+        .expect("job required_execution_class");
+    let restore_class: String =
+        sqlx::query("select execution_class from snapshot_restore_sources where snapshot_id = ?")
+            .bind(snapshot_id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .expect("fetch restore source class")
+            .try_get("execution_class")
+            .expect("restore execution_class");
+
+    assert_eq!(sandbox_class, "sandboxed_container");
+    assert_eq!(job_class, "sandboxed_container");
+    assert_eq!(restore_class, "sandboxed_container");
+}

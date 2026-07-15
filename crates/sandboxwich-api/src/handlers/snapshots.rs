@@ -757,10 +757,12 @@ pub(crate) async fn mark_snapshot_ready_from_provider_handle_on_connection(
     db: &Database,
     connection: &mut AnyConnection,
     sandbox_id: SandboxId,
+    tenant_id: &str,
     handle: sandboxwich_core::ProviderSnapshotHandle,
 ) -> Result<(), ApiError> {
     let snapshot_id = handle.snapshot_id;
-    upsert_provider_runtime_resources_on_connection(db, connection, &handle.resources).await?;
+    upsert_provider_runtime_resources_on_connection(db, connection, &handle.resources, tenant_id)
+        .await?;
     let snapshot = fetch_snapshot_on_connection(db, connection, snapshot_id).await?;
     let provider = handle.provider.clone();
     let inventory = if snapshot.inventory == json!({}) {

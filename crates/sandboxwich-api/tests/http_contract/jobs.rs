@@ -1133,8 +1133,33 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
         .unwrap();
     assert_eq!(replayed_claim.lease.unwrap().id, lease.id);
 
+    let tenant_b_sandbox: SandboxResponse = reqwest::Client::new()
+        .post(format!("{}/sandboxes", server.base_url))
+        .bearer_auth(TEST_TENANT_B_TOKEN)
+        .json(&CreateSandboxRequest {
+            execution_class: None,
+            workspace_mode: None,
+            runtime_profile: None,
+            name: Some("tenant-b-completion-target".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
     let mut resources = provision_resources(sandbox.sandbox.id);
-    resources[0].provider = String::new();
+    // Keep the top-level handle authoritative but forge one nested runtime
+    // resource toward a different tenant. Completion must reject the whole
+    // handle instead of persisting the nested cross-tenant reference.
+    resources[0].sandbox_id = tenant_b_sandbox.sandbox.id;
     let rejected = worker_client
         .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
         .json(&CompleteLeaseRequest {

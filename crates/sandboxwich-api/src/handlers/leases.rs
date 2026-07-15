@@ -1592,6 +1592,27 @@ pub(crate) async fn replace_command_output_stream_on_connection(
     Ok(())
 }
 
+fn validate_completed_runtime_resources(
+    resources: &[ProviderRuntimeResource],
+    sandbox_id: SandboxId,
+    snapshot_id: Option<SnapshotId>,
+    allowed_source_snapshot_id: Option<SnapshotId>,
+) -> Result<(), ApiError> {
+    if resources.iter().any(|resource| {
+        resource.sandbox_id != sandbox_id
+            || resource.snapshot_id != snapshot_id
+            || resource
+                .source_snapshot_id
+                .is_some_and(|source_id| Some(source_id) != allowed_source_snapshot_id)
+    }) {
+        return Err(ApiError::bad_request(
+            "runtime resource completion does not match job",
+        ));
+    }
+
+    Ok(())
+}
+
 pub(crate) async fn apply_completed_job_on_connection(
     db: &Database,
     connection: &mut AnyConnection,
@@ -1700,10 +1721,18 @@ pub(crate) async fn apply_completed_job_on_connection(
                     "snapshot completion result does not match job snapshot",
                 ));
             }
+            let sandbox_id = sandbox_id_from_job(job)?;
+            validate_completed_runtime_resources(
+                &handle.resources,
+                sandbox_id,
+                Some(snapshot_id),
+                None,
+            )?;
             mark_snapshot_ready_from_provider_handle_on_connection(
                 db,
                 connection,
-                sandbox_id_from_job(job)?,
+                sandbox_id,
+                &job.tenant_id,
                 handle,
             )
             .await?;
@@ -1735,8 +1764,19 @@ pub(crate) async fn apply_completed_job_on_connection(
                     "fork completion result does not match job payload",
                 ));
             }
-            upsert_provider_runtime_resources_on_connection(db, connection, &handle.resources)
-                .await?;
+            validate_completed_runtime_resources(
+                &handle.resources,
+                child_id,
+                None,
+                Some(snapshot_id),
+            )?;
+            upsert_provider_runtime_resources_on_connection(
+                db,
+                connection,
+                &handle.resources,
+                &job.tenant_id,
+            )
+            .await?;
             let next_state = SandboxState::Ready;
             set_sandbox_state_on_connection(
                 db,
@@ -1759,8 +1799,14 @@ pub(crate) async fn apply_completed_job_on_connection(
                     "provision completion result does not match job sandbox",
                 ));
             }
-            upsert_provider_runtime_resources_on_connection(db, connection, &handle.resources)
-                .await?;
+            validate_completed_runtime_resources(&handle.resources, sandbox_id, None, None)?;
+            upsert_provider_runtime_resources_on_connection(
+                db,
+                connection,
+                &handle.resources,
+                &job.tenant_id,
+            )
+            .await?;
             let next_state = SandboxState::Ready;
             set_sandbox_state_on_connection(
                 db,
