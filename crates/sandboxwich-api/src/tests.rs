@@ -98,7 +98,10 @@ async fn resident_process_storage_has_generation_fence_and_no_secret_column() {
         assert!(names.contains(required), "missing column {required}");
     }
     for forbidden in ["bootstrap_content", "content", "secret", "token"] {
-        assert!(!names.contains(forbidden), "forbidden secret column {forbidden}");
+        assert!(
+            !names.contains(forbidden),
+            "forbidden secret column {forbidden}"
+        );
     }
 }
 

@@ -468,9 +468,7 @@ pub(crate) fn job_references(job: &Job) -> Result<JobReferences, ApiError> {
             references.sandbox_id = Some(sandbox_id_from_job(job)?);
             references.command_id = Some(command_id_from_job(job)?);
         }
-        JobKind::RunResidentProcess
-        | JobKind::MaterializeFile
-        | JobKind::ApexTaskInstructions => {
+        JobKind::RunResidentProcess | JobKind::MaterializeFile | JobKind::ApexTaskInstructions => {
             references.sandbox_id = Some(sandbox_id_from_job(job)?);
         }
         JobKind::RunPrompt => {

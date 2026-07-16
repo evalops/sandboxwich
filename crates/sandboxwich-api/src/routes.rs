@@ -8,6 +8,7 @@ use crate::handlers::files::*;
 use crate::handlers::jobs::*;
 use crate::handlers::leases::*;
 use crate::handlers::operations::*;
+use crate::handlers::resident_processes::*;
 use crate::handlers::sandboxes::*;
 use crate::handlers::snapshots::*;
 use crate::handlers::ssh::*;
@@ -61,6 +62,14 @@ pub(crate) fn app(state: AppState) -> Router {
             get(list_runtime_resources),
         )
         .route("/sandboxes/{sandbox_id}/stop", post(stop_sandbox))
+        .route(
+            "/sandboxes/{sandbox_id}/resident-processes/{name}",
+            get(get_resident_process).put(put_resident_process),
+        )
+        .route(
+            "/sandboxes/{sandbox_id}/resident-processes/{name}/stop",
+            post(stop_resident_process),
+        )
         .route("/sandboxes/{sandbox_id}/resume", post(resume_sandbox))
         .route("/sandboxes/{sandbox_id}/fork", post(fork_sandbox))
         .route(
@@ -171,6 +180,10 @@ pub(crate) fn app(state: AppState) -> Router {
 
     let guest_routes = Router::new()
         .route("/workers/{worker_id}/leases/claim", post(claim_lease))
+        .route(
+            "/resident-processes/{process_id}/bootstrap",
+            post(read_resident_process_bootstrap),
+        )
         .route("/leases/{lease_id}/renew", post(renew_lease))
         .route(
             "/leases/{lease_id}/materialization",

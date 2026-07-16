@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 pub(crate) const APEX_INSTRUCTION_READ_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const MAX_APEX_INSTRUCTION_WAITERS: usize = 256;
+pub(crate) const MAX_RESIDENT_BOOTSTRAPS: usize = 256;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum ApexWaiterInsertError {
@@ -135,6 +136,41 @@ impl Drop for ApexWaiterGuard {
     }
 }
 
+pub(crate) struct LiveResidentBootstrap {
+    pub(crate) content: Vec<u8>,
+    pub(crate) sha256: String,
+    pub(crate) target_file: String,
+    pub(crate) mode: u32,
+    pub(crate) generation: u64,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ResidentBootstrapStore(
+    Arc<Mutex<HashMap<ResidentProcessId, LiveResidentBootstrap>>>,
+);
+
+impl ResidentBootstrapStore {
+    pub(crate) fn insert(
+        &self,
+        id: ResidentProcessId,
+        bootstrap: LiveResidentBootstrap,
+    ) -> Result<(), ()> {
+        let mut values = self.0.lock().expect("resident bootstrap mutex poisoned");
+        if values.len() >= MAX_RESIDENT_BOOTSTRAPS && !values.contains_key(&id) {
+            return Err(());
+        }
+        values.insert(id, bootstrap);
+        Ok(())
+    }
+
+    pub(crate) fn take(&self, id: &ResidentProcessId) -> Option<LiveResidentBootstrap> {
+        self.0
+            .lock()
+            .expect("resident bootstrap mutex poisoned")
+            .remove(id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +231,7 @@ pub(crate) struct AppState {
     pub(crate) default_tenant_id: String,
     pub(crate) apex_callback_base_url: Option<String>,
     pub(crate) apex_waiters: ApexInstructionWaiters,
+    pub(crate) resident_bootstraps: ResidentBootstrapStore,
     #[cfg(test)]
     pub(crate) apex_callback_test_hook: Option<ApexCallbackTestHook>,
 }

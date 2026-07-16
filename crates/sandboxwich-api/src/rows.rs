@@ -49,7 +49,6 @@ pub(crate) fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
     })
 }
 
-#[allow(dead_code)]
 pub(crate) fn row_to_resident_process(row: AnyRow) -> Result<ResidentProcess, ApiError> {
     let id: String = row.try_get("id")?;
     let sandbox_id: String = row.try_get("sandbox_id")?;
@@ -109,9 +108,7 @@ pub(crate) fn row_to_resident_process(row: AnyRow) -> Result<ResidentProcess, Ap
             .map(|value| parse_timestamp(&value))
             .transpose()?,
         ready_at: ready_at.map(|value| parse_timestamp(&value)).transpose()?,
-        exited_at: exited_at
-            .map(|value| parse_timestamp(&value))
-            .transpose()?,
+        exited_at: exited_at.map(|value| parse_timestamp(&value)).transpose()?,
         exit_code: exit_code
             .map(i32::try_from)
             .transpose()

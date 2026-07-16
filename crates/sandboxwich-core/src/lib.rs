@@ -1860,6 +1860,42 @@ pub struct ResidentProcessObservationRequest {
     pub error_message: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResidentProcessBootstrapReadRequest {
+    pub generation: u64,
+    pub lease_id: Uuid,
+    pub expected_sha256: String,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentProcessBootstrapReadResponse {
+    pub ok: bool,
+    #[serde(with = "serde_base64_bytes")]
+    #[schema(value_type = String)]
+    pub content: Vec<u8>,
+    pub sha256: String,
+    pub target_file: String,
+    pub mode: u32,
+}
+
+impl fmt::Debug for ResidentProcessBootstrapReadResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResidentProcessBootstrapReadResponse")
+            .field("ok", &self.ok)
+            .field(
+                "content",
+                &format_args!("<redacted:{} bytes>", self.content.len()),
+            )
+            .field("sha256", &self.sha256)
+            .field("target_file", &self.target_file)
+            .field("mode", &format_args!("{:#o}", self.mode))
+            .finish()
+    }
+}
+
 impl fmt::Debug for ResidentProcessRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
