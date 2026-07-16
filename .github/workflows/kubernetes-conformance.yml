@@ -56,8 +56,10 @@ jobs:
           --config deploy/kubernetes/kind-conformance.yaml --wait 120s
       - name: Publish digest-pinned runtime images to the disposable registry
         run: |
+          # Pulled via the Docker Hub mirror to avoid docker.io's anonymous-pull
+          # rate limit.
           docker run -d --restart=always -p 127.0.0.1:5001:5000 \
-            --name sandboxwich-kind-registry registry:2
+            --name sandboxwich-kind-registry mirror.gcr.io/library/registry:2
           docker network connect kind sandboxwich-kind-registry
           for node in $(kind get nodes --name sandboxwich-conformance); do
             docker exec "${node}" mkdir -p /etc/containerd/certs.d/localhost:5001

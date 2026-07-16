@@ -3,8 +3,12 @@
 # digest with:
 #   docker buildx imagetools inspect rust:1-bookworm
 #   docker buildx imagetools inspect debian:bookworm-slim
-# and update both the tag comment and the digest below together.
-FROM rust:1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS builder
+# and update both the tag comment and the digest below together. Pulled via
+# the Docker Hub mirror (mirror.gcr.io) -- which serves identical content by
+# digest -- to avoid docker.io's anonymous-pull rate limit on shared
+# self-hosted runners; the imagetools inspect commands above still target
+# docker.io directly since that's the upstream source of truth for new tags.
+FROM mirror.gcr.io/library/rust:1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS builder
 
 ARG BIN
 WORKDIR /src
@@ -16,7 +20,7 @@ RUN cargo build --release -p "${BIN}" \
     && cp "target/release/${BIN}" /usr/local/bin/sandboxwich
 
 # debian:bookworm-slim, see digest-refresh instructions above.
-FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df AS runtime
+FROM mirror.gcr.io/library/debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df AS runtime
 
 ARG KUBECTL_VERSION=v1.34.7
 ARG TARGETARCH

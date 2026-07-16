@@ -15,7 +15,9 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:17
+        # Pulled via the Docker Hub mirror to avoid docker.io's anonymous-pull
+        # rate limit.
+        image: mirror.gcr.io/library/postgres:17
         env:
           POSTGRES_DB: sandboxwich
           POSTGRES_PASSWORD: postgres
