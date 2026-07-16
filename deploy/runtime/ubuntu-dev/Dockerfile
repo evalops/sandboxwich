@@ -1,7 +1,7 @@
 # ubuntu:24.04 multi-architecture index, refreshed 2026-07-09.
 # Pulled via the Docker Hub mirror (mirror.gcr.io) to avoid docker.io's
 # anonymous-pull rate limit on shared self-hosted runners.
-ARG ORB_EXECUTOR_IMAGE=ghcr.io/evalops/orb-executor@sha256:ff11270fa7371d7836efe3c3572a0d8869a32720ac070ee049f04fd98b073e5f
+ARG ORB_EXECUTOR_IMAGE=ghcr.io/evalops/sandboxwich-orb-executor@sha256:48cb58360ae8d63a8abb009d2802855e5fc90bf2040d97d82dbbf513a1aedd08
 FROM mirror.gcr.io/library/rust:1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS agent-builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
