@@ -692,13 +692,21 @@ pub(crate) async fn sqlite_rebuild_sandboxes_with_parent_snapshot_fk(
             memory_limit text not null default '1g',
             network_egress_mode text not null default 'deny_all',
             workspace_mode text not null default 'persistent'
-                check (workspace_mode in ('ephemeral', 'generic_ephemeral', 'persistent'))
+                check (workspace_mode in ('ephemeral', 'generic_ephemeral', 'persistent')),
+            execution_class text not null default 'development_container'
+                check (execution_class in ('development_container', 'sandboxed_container', 'virtual_machine')),
+            runtime_profile text not null default 'unprivileged'
+                check (runtime_profile in ('unprivileged', 'apex_trusted_supervisor_v1')),
+            max_lifetime_seconds integer,
+            idle_ttl_seconds integer
         )",
         "insert into sandboxes_new
             (id, name, state, template, created_at, updated_at, ttl_seconds,
-             parent_snapshot_id, tenant_id, memory_limit, network_egress_mode, workspace_mode)
+             parent_snapshot_id, tenant_id, memory_limit, network_egress_mode, workspace_mode,
+             execution_class, runtime_profile, max_lifetime_seconds, idle_ttl_seconds)
          select id, name, state, template, created_at, updated_at, ttl_seconds,
-                parent_snapshot_id, tenant_id, memory_limit, network_egress_mode, workspace_mode
+                parent_snapshot_id, tenant_id, memory_limit, network_egress_mode, workspace_mode,
+                execution_class, runtime_profile, max_lifetime_seconds, idle_ttl_seconds
          from sandboxes",
         "drop table sandboxes",
         "alter table sandboxes_new rename to sandboxes",
@@ -707,6 +715,7 @@ pub(crate) async fn sqlite_rebuild_sandboxes_with_parent_snapshot_fk(
         "create index if not exists idx_sandboxes_tenant_state on sandboxes(tenant_id, state)",
         "create index if not exists idx_sandboxes_workspace_mode on sandboxes(workspace_mode)",
         "create index if not exists idx_sandboxes_parent_snapshot_id on sandboxes(parent_snapshot_id)",
+        "create index if not exists idx_sandboxes_runtime_profile on sandboxes(runtime_profile)",
         "PRAGMA foreign_keys = ON",
     ] {
         sqlx::query(statement).execute(&db.pool).await?;
