@@ -2372,6 +2372,7 @@ pub enum OperationKind {
     StopSandbox,
     ResumeSandbox,
     RunCommand,
+    RunResidentProcess,
     MaterializeFile,
     CreateSnapshot,
     ForkSandbox,

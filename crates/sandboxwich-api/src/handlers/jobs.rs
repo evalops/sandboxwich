@@ -191,6 +191,7 @@ pub(crate) async fn enrich_job_payload_with_provision_spec(
     match job.kind {
         JobKind::ProvisionSandbox
         | JobKind::RunCommand
+        | JobKind::RunResidentProcess
         | JobKind::RunPrompt
         | JobKind::CreateSnapshot
         | JobKind::StopSandbox
@@ -247,6 +248,9 @@ pub(crate) async fn validate_job_payload_tenant(
             ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
             let command = fetch_command(db, command_id_from_job(job)?).await?;
             ensure_sandbox_tenant(db, command.sandbox_id, ctx).await?;
+        }
+        JobKind::RunResidentProcess => {
+            ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
         }
         JobKind::MaterializeFile => {
             let sandbox = ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
@@ -464,7 +468,9 @@ pub(crate) fn job_references(job: &Job) -> Result<JobReferences, ApiError> {
             references.sandbox_id = Some(sandbox_id_from_job(job)?);
             references.command_id = Some(command_id_from_job(job)?);
         }
-        JobKind::MaterializeFile | JobKind::ApexTaskInstructions => {
+        JobKind::RunResidentProcess
+        | JobKind::MaterializeFile
+        | JobKind::ApexTaskInstructions => {
             references.sandbox_id = Some(sandbox_id_from_job(job)?);
         }
         JobKind::RunPrompt => {

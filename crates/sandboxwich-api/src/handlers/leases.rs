@@ -2057,6 +2057,7 @@ pub(crate) async fn apply_claimed_job_on_connection(
         JobKind::ProvisionSandbox
         | JobKind::StopSandbox
         | JobKind::ResumeSandbox
+        | JobKind::RunResidentProcess
         | JobKind::MaterializeFile
         | JobKind::ApexTaskInstructions => {}
     }
@@ -2135,6 +2136,7 @@ pub(crate) async fn apply_retryable_job_on_connection(
         JobKind::ProvisionSandbox
         | JobKind::StopSandbox
         | JobKind::ResumeSandbox
+        | JobKind::RunResidentProcess
         | JobKind::MaterializeFile
         | JobKind::ApexTaskInstructions => {}
     }
@@ -2235,7 +2237,10 @@ pub(crate) async fn apply_failed_job_on_connection(
             )
             .await?;
         }
-        JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {}
+        JobKind::ProvisionSandbox
+        | JobKind::StopSandbox
+        | JobKind::ResumeSandbox
+        | JobKind::RunResidentProcess => {}
         JobKind::MaterializeFile => {
             delete_sandbox_file_if_present_on_connection(
                 db,
