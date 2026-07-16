@@ -490,6 +490,23 @@ impl Default for WorkspaceMode {
     }
 }
 
+db_variant_enum! {
+/// Closed runtime trust profiles. The APEX profile permits only the trusted
+/// image supervisor to start as uid 0; it is not a tenant-controlled root
+/// toggle and guest mission processes still run as uid 10001.
+pub enum SandboxRuntimeProfile {
+    Unprivileged => "unprivileged",
+    ApexTrustedSupervisorV1 => "apex_trusted_supervisor_v1",
+}
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for SandboxRuntimeProfile {
+    fn default() -> Self {
+        Self::Unprivileged
+    }
+}
+
 impl SandboxState {
     /// Every declared sandbox lifecycle state.
     pub const ALL: [SandboxState; 8] = [
@@ -827,7 +844,22 @@ impl NetworkEgress {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+db_variant_enum! {
+pub enum ExecutionClass {
+    DevelopmentContainer => "development_container",
+    SandboxedContainer => "sandboxed_container",
+    VirtualMachine => "virtual_machine",
+}
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for ExecutionClass {
+    fn default() -> Self {
+        Self::DevelopmentContainer
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default, utoipa::ToSchema)]
 pub struct SandboxProvisionSpec {
     #[serde(default)]
     pub memory_limit: MemoryLimit,
@@ -835,6 +867,10 @@ pub struct SandboxProvisionSpec {
     pub network_egress: NetworkEgress,
     #[serde(default)]
     pub workspace_mode: WorkspaceMode,
+    #[serde(default)]
+    pub runtime_profile: SandboxRuntimeProfile,
+    #[serde(default)]
+    pub execution_class: ExecutionClass,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -899,6 +935,10 @@ pub struct Sandbox {
     pub network_egress: NetworkEgress,
     #[serde(default)]
     pub workspace_mode: WorkspaceMode,
+    #[serde(default)]
+    pub runtime_profile: SandboxRuntimeProfile,
+    #[serde(default)]
+    pub execution_class: ExecutionClass,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub ttl_seconds: Option<u64>,
@@ -912,6 +952,8 @@ pub struct CreateSandboxRequest {
     pub memory_limit: Option<MemoryLimit>,
     pub network_egress: Option<NetworkEgress>,
     pub workspace_mode: Option<WorkspaceMode>,
+    pub runtime_profile: Option<SandboxRuntimeProfile>,
+    pub execution_class: Option<ExecutionClass>,
     pub ttl_seconds: Option<u64>,
 }
 
@@ -921,6 +963,16 @@ pub struct SandboxResponse {
     pub sandbox: Sandbox,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation: Option<Operation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<SandboxPlacementProof>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SandboxPlacementProof {
+    pub worker_id: Uuid,
+    pub provider: String,
+    pub provider_mode: String,
+    pub runtime_image: String,
 }
 
 /// Provider-facing projection used by external control planes to reconcile a
@@ -1142,6 +1194,10 @@ pub struct Snapshot {
     pub label: String,
     pub inventory: serde_json::Value,
     pub provider_metadata: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provision_spec: Option<SandboxProvisionSpec>,
     pub created_at: DateTime<Utc>,
     pub ready_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
@@ -1166,6 +1222,8 @@ pub struct ForkSnapshotRequest {
     pub memory_limit: MemoryLimit,
     #[serde(default)]
     pub network_egress: NetworkEgress,
+    #[serde(default)]
+    pub runtime_profile: SandboxRuntimeProfile,
     pub ttl_seconds: Option<u64>,
 }
 
@@ -1309,18 +1367,78 @@ pub const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 300;
 /// unbounded.
 pub const MAX_COMMAND_TIMEOUT_SECS: u64 = 3600;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+/// Maximum decoded byte length accepted for one command's non-secret stdin.
+pub const MAX_COMMAND_STDIN_BYTES: usize = 1024 * 1024;
+const MAX_COMMAND_STDIN_BASE64_BYTES: usize = MAX_COMMAND_STDIN_BYTES.div_ceil(3) * 4;
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum CommandExecutionRequestError {
+    #[error("command_stdin_too_large: command stdin exceeds 1048576 bytes")]
+    StdinTooLarge,
+    #[error(
+        "command_environment_contains_nul: command environment keys and values cannot contain NUL"
+    )]
+    EnvironmentContainsNul,
+}
+
+pub fn validate_command_input(
+    stdin: &Option<Vec<u8>>,
+    env: &BTreeMap<String, String>,
+) -> Result<(), CommandExecutionRequestError> {
+    if stdin
+        .as_ref()
+        .is_some_and(|stdin| stdin.len() > MAX_COMMAND_STDIN_BYTES)
+    {
+        return Err(CommandExecutionRequestError::StdinTooLarge);
+    }
+    if env
+        .iter()
+        .any(|(key, value)| key.contains('\0') || value.contains('\0'))
+    {
+        return Err(CommandExecutionRequestError::EnvironmentContainsNul);
+    }
+    Ok(())
+}
+
+pub fn validate_agent_command_request(
+    request: &AgentCommandRequest,
+) -> Result<(), CommandExecutionRequestError> {
+    validate_command_input(&request.stdin, &request.env)
+}
+
+pub fn encode_command_stdin_base64(stdin: &[u8]) -> String {
+    general_purpose::STANDARD.encode(stdin)
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CommandRequest {
     pub argv: Vec<String>,
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Bounded, non-secret bytes delivered to the guest process's stdin.
+    #[serde(default, with = "serde_optional_base64_bytes")]
+    #[schema(value_type = Option<String>)]
+    pub stdin: Option<Vec<u8>>,
     /// Maximum time the command may run before the executor kills it and
     /// reports a timeout failure. Clamped to
     /// `(0, MAX_COMMAND_TIMEOUT_SECS]` by `queue_command`; `None`/omitted
     /// falls back to `DEFAULT_COMMAND_TIMEOUT_SECS`.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+}
+
+impl std::fmt::Debug for CommandRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CommandRequest")
+            .field("argv", &self.argv)
+            .field("cwd", &self.cwd)
+            .field("env", &self.env)
+            .field("stdin", &self.stdin.as_ref().map(|bytes| bytes.len()))
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
 }
 
 db_variant_enum! {
@@ -1464,6 +1582,7 @@ pub enum SandboxEventKind {
     DesktopExpired => "desktop_expired",
     GuestHealthFailed => "guest_health_failed",
     FileUploaded => "file_uploaded",
+    FileMaterialized => "file_materialized",
     DivergenceDetected => "divergence_detected",
 }
 }
@@ -1497,13 +1616,18 @@ pub enum WorkerStatus {
 db_variant_enum! {
 pub enum WorkerCapability {
     ProvisionSandbox => "provision_sandbox",
+    SandboxedContainer => "sandboxed_container",
+    VirtualMachine => "virtual_machine",
     RunCommand => "run_command",
+    MaterializeFile => "materialize_file",
+    ApexTaskInstructions => "apex_task_instructions",
     AgentPrompt => "agent_prompt",
     Snapshot => "snapshot",
     DesktopStream => "desktop_stream",
     K8sPod => "k8s_pod",
     GvisorSandbox => "gvisor_sandbox",
     FqdnEgress => "fqdn_egress",
+    ApexTrustedSupervisorV1 => "apex_trusted_supervisor_v1",
 }
 }
 
@@ -1600,12 +1724,263 @@ pub struct CapacityResponse {
     pub total_available_slots: u32,
 }
 
+pub const MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES: usize = 64 * 1024;
+pub const RESIDENT_PROCESS_BOOTSTRAP_PREFIX: &str = "/run/sandboxwich/bootstrap";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(transparent)]
+pub struct ResidentProcessId(pub Uuid);
+
+impl ResidentProcessId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for ResidentProcessId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for ResidentProcessId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+db_variant_enum! {
+pub enum ResidentProcessRestartPolicy {
+    Never => "never",
+    OnFailure => "on_failure",
+}
+}
+
+db_variant_enum! {
+pub enum ResidentProcessDesiredState {
+    Running => "running",
+    Stopped => "stopped",
+}
+}
+
+db_variant_enum! {
+pub enum ResidentProcessObservedState {
+    Pending => "pending",
+    Starting => "starting",
+    Running => "running",
+    Failed => "failed",
+    Stopped => "stopped",
+    Lost => "lost",
+}
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentProcessBootstrap {
+    #[serde(with = "serde_base64_bytes")]
+    #[schema(value_type = String)]
+    pub content: Vec<u8>,
+    pub target_file: String,
+    pub mode: u32,
+}
+
+impl fmt::Debug for ResidentProcessBootstrap {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResidentProcessBootstrap")
+            .field(
+                "content",
+                &format_args!("<redacted:{} bytes>", self.content.len()),
+            )
+            .field("target_file", &self.target_file)
+            .field("mode", &format_args!("{:#o}", self.mode))
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentProcessRequest {
+    pub argv: Vec<String>,
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    pub restart_policy: ResidentProcessRestartPolicy,
+    pub expected_generation: u64,
+    pub bootstrap: Option<ResidentProcessBootstrap>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentProcess {
+    pub id: ResidentProcessId,
+    pub sandbox_id: SandboxId,
+    pub tenant_id: String,
+    pub name: String,
+    pub argv: Vec<String>,
+    pub cwd: Option<String>,
+    pub env: BTreeMap<String, String>,
+    pub bootstrap_sha256: Option<String>,
+    pub bootstrap_byte_count: Option<u64>,
+    pub bootstrap_target_file: Option<String>,
+    pub bootstrap_mode: Option<u32>,
+    pub restart_policy: ResidentProcessRestartPolicy,
+    pub desired_state: ResidentProcessDesiredState,
+    pub observed_state: ResidentProcessObservedState,
+    pub generation: u64,
+    pub active_lease_id: Option<Uuid>,
+    pub pid: Option<u32>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub ready_at: Option<DateTime<Utc>>,
+    pub exited_at: Option<DateTime<Utc>>,
+    pub exit_code: Option<i32>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentProcessResponse {
+    pub ok: bool,
+    pub resident_process: ResidentProcess,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<Operation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentProcessObservationRequest {
+    pub generation: u64,
+    pub lease_id: Uuid,
+    pub observed_state: ResidentProcessObservedState,
+    pub pid: Option<u32>,
+    pub exit_code: Option<i32>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResidentProcessBootstrapReadRequest {
+    pub generation: u64,
+    pub lease_id: Uuid,
+    pub expected_sha256: String,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentProcessBootstrapReadResponse {
+    pub ok: bool,
+    #[serde(with = "serde_base64_bytes")]
+    #[schema(value_type = String)]
+    pub content: Vec<u8>,
+    pub sha256: String,
+    pub target_file: String,
+    pub mode: u32,
+}
+
+impl fmt::Debug for ResidentProcessBootstrapReadResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResidentProcessBootstrapReadResponse")
+            .field("ok", &self.ok)
+            .field(
+                "content",
+                &format_args!("<redacted:{} bytes>", self.content.len()),
+            )
+            .field("sha256", &self.sha256)
+            .field("target_file", &self.target_file)
+            .field("mode", &format_args!("{:#o}", self.mode))
+            .finish()
+    }
+}
+
+impl fmt::Debug for ResidentProcessRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResidentProcessRequest")
+            .field("argv", &self.argv)
+            .field("cwd", &self.cwd)
+            .field("env", &self.env)
+            .field("restart_policy", &self.restart_policy)
+            .field("expected_generation", &self.expected_generation)
+            .field("bootstrap", &self.bootstrap)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum ResidentProcessRequestError {
+    #[error("resident process argv must not be empty")]
+    EmptyArgv,
+    #[error("resident process argv contains NUL")]
+    ArgvContainsNul,
+    #[error("resident process environment contains NUL")]
+    EnvironmentContainsNul,
+    #[error("resident process cwd must be absolute")]
+    CwdMustBeAbsolute,
+    #[error("resident process bootstrap exceeds 64 KiB")]
+    BootstrapTooLarge,
+    #[error("resident process bootstrap path is outside the allowed root")]
+    BootstrapPathOutsideAllowedRoot,
+    #[error("resident process bootstrap mode must be between 0400 and 0700")]
+    InvalidBootstrapMode,
+}
+
+pub fn validate_resident_process_request(
+    request: &ResidentProcessRequest,
+) -> Result<(), ResidentProcessRequestError> {
+    if request.argv.is_empty() {
+        return Err(ResidentProcessRequestError::EmptyArgv);
+    }
+    if request.argv.iter().any(|value| value.contains('\0')) {
+        return Err(ResidentProcessRequestError::ArgvContainsNul);
+    }
+    if request
+        .env
+        .iter()
+        .any(|(key, value)| key.contains('\0') || value.contains('\0'))
+    {
+        return Err(ResidentProcessRequestError::EnvironmentContainsNul);
+    }
+    if request
+        .cwd
+        .as_deref()
+        .is_some_and(|cwd| !std::path::Path::new(cwd).is_absolute())
+    {
+        return Err(ResidentProcessRequestError::CwdMustBeAbsolute);
+    }
+    if let Some(bootstrap) = &request.bootstrap {
+        if bootstrap.content.len() > MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES {
+            return Err(ResidentProcessRequestError::BootstrapTooLarge);
+        }
+        let target = std::path::Path::new(&bootstrap.target_file);
+        let root = std::path::Path::new(RESIDENT_PROCESS_BOOTSTRAP_PREFIX);
+        if !target.is_absolute()
+            || !target.starts_with(root)
+            || target
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+        {
+            return Err(ResidentProcessRequestError::BootstrapPathOutsideAllowedRoot);
+        }
+        if !(0o400..=0o700).contains(&bootstrap.mode) {
+            return Err(ResidentProcessRequestError::InvalidBootstrapMode);
+        }
+    }
+    Ok(())
+}
+
 db_variant_enum! {
 pub enum JobKind {
     ProvisionSandbox => "provision_sandbox",
     StopSandbox => "stop_sandbox",
     ResumeSandbox => "resume_sandbox",
     RunCommand => "run_command",
+    RunResidentProcess => "run_resident_process",
+    MaterializeFile => "materialize_file",
+    ApexTaskInstructions => "apex_task_instructions",
     RunPrompt => "run_prompt",
     CreateSnapshot => "create_snapshot",
     ForkSandbox => "fork_sandbox",
@@ -1667,7 +2042,7 @@ pub enum ProvisioningErrorClass {
 }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Job {
     pub id: JobId,
     pub tenant_id: String,
@@ -1675,6 +2050,8 @@ pub struct Job {
     pub status: JobStatus,
     pub payload: serde_json::Value,
     pub required_capability: WorkerCapability,
+    #[serde(default)]
+    pub required_execution_class: ExecutionClass,
     pub priority: i64,
     pub attempts: i64,
     pub max_attempts: i64,
@@ -1684,7 +2061,47 @@ pub struct Job {
     pub last_error: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+fn redacted_job_payload(payload: &serde_json::Value) -> serde_json::Value {
+    let mut redacted = payload.clone();
+    if let Some(object) = redacted.as_object_mut() {
+        object.remove("stdin");
+    }
+    redacted
+}
+
+fn serialize_redacted_job_payload<S>(
+    payload: &serde_json::Value,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    redacted_job_payload(payload).serialize(serializer)
+}
+
+impl fmt::Debug for Job {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Job")
+            .field("id", &self.id)
+            .field("tenant_id", &self.tenant_id)
+            .field("kind", &self.kind)
+            .field("status", &self.status)
+            .field("payload", &redacted_job_payload(&self.payload))
+            .field("required_capability", &self.required_capability)
+            .field("required_execution_class", &self.required_execution_class)
+            .field("priority", &self.priority)
+            .field("attempts", &self.attempts)
+            .field("max_attempts", &self.max_attempts)
+            .field("scheduled_at", &self.scheduled_at)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("last_error", &self.last_error)
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JobLease {
     pub id: LeaseId,
     pub job_id: JobId,
@@ -1695,16 +2112,189 @@ pub struct JobLease {
     pub expires_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub required_execution_class: ExecutionClass,
     pub job: Job,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+impl fmt::Debug for JobLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JobLease")
+            .field("id", &self.id)
+            .field("job_id", &self.job_id)
+            .field("worker_id", &self.worker_id)
+            .field("status", &self.status)
+            .field("attempt", &self.attempt)
+            .field("leased_at", &self.leased_at)
+            .field("expires_at", &self.expires_at)
+            .field("completed_at", &self.completed_at)
+            .field("error", &self.error)
+            .field("required_execution_class", &self.required_execution_class)
+            .field("job", &self.job)
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CreateJobRequest {
     pub kind: JobKind,
     pub payload: serde_json::Value,
     pub required_capability: WorkerCapability,
     pub priority: Option<i64>,
     pub max_attempts: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApexTaskInstructionsReadRequest {
+    pub expected_sha256: String,
+    pub expected_byte_count: u64,
+    pub claim_lease_generation: u64,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApexTaskInstructionsReadResponse {
+    pub ok: bool,
+    pub request_id: Uuid,
+    pub sandbox_id: SandboxId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<Uuid>,
+    pub lease_attempt: u64,
+    pub provider_apply_id: Uuid,
+    pub sha256: String,
+    pub byte_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_base64: Option<String>,
+    pub output_unavailable: bool,
+}
+
+impl fmt::Debug for ApexTaskInstructionsReadResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApexTaskInstructionsReadResponse")
+            .field("request_id", &self.request_id)
+            .field("sandbox_id", &self.sandbox_id)
+            .field("sha256", &self.sha256)
+            .field("byte_count", &self.byte_count)
+            .field("output_unavailable", &self.output_unavailable)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApexTaskInstructionsCallbackRequest {
+    pub request_id: Uuid,
+    pub lease_id: Uuid,
+    pub lease_attempt: u64,
+    pub provider_apply_id: Uuid,
+    pub sha256: String,
+    pub byte_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_base64: Option<String>,
+}
+
+impl fmt::Debug for ApexTaskInstructionsCallbackRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApexTaskInstructionsCallbackRequest")
+            .field("request_id", &self.request_id)
+            .field("lease_id", &self.lease_id)
+            .field("lease_attempt", &self.lease_attempt)
+            .field("provider_apply_id", &self.provider_apply_id)
+            .field("sha256", &self.sha256)
+            .field("byte_count", &self.byte_count)
+            .field(
+                "output_base64",
+                &self.output_base64.as_ref().map(String::len),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApexTaskInstructionsCallbackResponse {
+    pub ok: bool,
+    pub output_unavailable: bool,
+}
+
+impl fmt::Debug for CreateJobRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CreateJobRequest")
+            .field("kind", &self.kind)
+            .field("payload", &redacted_job_payload(&self.payload))
+            .field("required_capability", &self.required_capability)
+            .field("priority", &self.priority)
+            .field("max_attempts", &self.max_attempts)
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PublicJob {
+    pub id: JobId,
+    pub tenant_id: String,
+    pub kind: JobKind,
+    pub status: JobStatus,
+    #[serde(serialize_with = "serialize_redacted_job_payload")]
+    pub payload: serde_json::Value,
+    pub required_capability: WorkerCapability,
+    #[serde(default)]
+    pub required_execution_class: ExecutionClass,
+    pub priority: i64,
+    pub attempts: i64,
+    pub max_attempts: i64,
+    pub scheduled_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub last_error: Option<String>,
+}
+
+impl From<Job> for PublicJob {
+    fn from(job: Job) -> Self {
+        Self {
+            id: job.id,
+            tenant_id: job.tenant_id,
+            kind: job.kind,
+            status: job.status,
+            payload: redacted_job_payload(&job.payload),
+            required_capability: job.required_capability,
+            required_execution_class: job.required_execution_class,
+            priority: job.priority,
+            attempts: job.attempts,
+            max_attempts: job.max_attempts,
+            scheduled_at: job.scheduled_at,
+            created_at: job.created_at,
+            updated_at: job.updated_at,
+            last_error: job.last_error,
+        }
+    }
+}
+
+impl fmt::Debug for PublicJob {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicJob")
+            .field("id", &self.id)
+            .field("tenant_id", &self.tenant_id)
+            .field("kind", &self.kind)
+            .field("status", &self.status)
+            .field("payload", &redacted_job_payload(&self.payload))
+            .field("required_capability", &self.required_capability)
+            .field("required_execution_class", &self.required_execution_class)
+            .field("priority", &self.priority)
+            .field("attempts", &self.attempts)
+            .field("max_attempts", &self.max_attempts)
+            .field("scheduled_at", &self.scheduled_at)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("last_error", &self.last_error)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1788,13 +2378,13 @@ pub struct FailLeaseRequest {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JobResponse {
     pub ok: bool,
-    pub job: Job,
+    pub job: PublicJob,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JobListResponse {
     pub ok: bool,
-    pub jobs: Vec<Job>,
+    pub jobs: Vec<PublicJob>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
 }
@@ -1818,6 +2408,8 @@ pub enum OperationKind {
     StopSandbox,
     ResumeSandbox,
     RunCommand,
+    RunResidentProcess,
+    MaterializeFile,
     CreateSnapshot,
     ForkSandbox,
 }
@@ -1850,17 +2442,33 @@ pub struct OperationResponse {
     pub operation: Operation,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentCommandRequest {
     pub argv: Vec<String>,
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Bounded, non-secret bytes delivered to the child process's stdin.
+    #[serde(default, with = "serde_bounded_optional_base64_bytes")]
+    pub stdin: Option<Vec<u8>>,
     /// Bound applied by `execute_streaming` around `child.wait()`; the child
     /// is killed and a distinct timeout failure reported if it runs longer
     /// than this. `None` falls back to `DEFAULT_COMMAND_TIMEOUT_SECS`.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+}
+
+impl std::fmt::Debug for AgentCommandRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentCommandRequest")
+            .field("argv", &self.argv)
+            .field("cwd", &self.cwd)
+            .field("env", &self.env)
+            .field("stdin", &self.stdin.as_ref().map(|bytes| bytes.len()))
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1916,6 +2524,65 @@ mod serde_base64_bytes {
         general_purpose::STANDARD
             .decode(encoded)
             .map_err(serde::de::Error::custom)
+    }
+}
+
+pub mod serde_optional_base64_bytes {
+    use super::*;
+
+    pub fn serialize<S>(content: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        content
+            .as_deref()
+            .map(|bytes| general_purpose::STANDARD.encode(bytes))
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let encoded = Option::<String>::deserialize(deserializer)?;
+        encoded
+            .map(|encoded| {
+                general_purpose::STANDARD
+                    .decode(encoded)
+                    .map_err(serde::de::Error::custom)
+            })
+            .transpose()
+    }
+}
+
+mod serde_bounded_optional_base64_bytes {
+    use super::*;
+
+    pub fn serialize<S>(content: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serde_optional_base64_bytes::serialize(content, serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let encoded = Option::<String>::deserialize(deserializer)?;
+        let Some(encoded) = encoded else {
+            return Ok(None);
+        };
+        if encoded.len() > MAX_COMMAND_STDIN_BASE64_BYTES {
+            return Err(serde::de::Error::custom("command_stdin_too_large"));
+        }
+        let decoded = general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(serde::de::Error::custom)?;
+        if decoded.len() > MAX_COMMAND_STDIN_BYTES {
+            return Err(serde::de::Error::custom("command_stdin_too_large"));
+        }
+        Ok(Some(decoded))
     }
 }
 
@@ -1991,6 +2658,24 @@ pub enum WorkerJobResult {
     RunCommand {
         result: AgentCommandResult,
     },
+    RunResidentProcess {
+        process_id: ResidentProcessId,
+        generation: u64,
+        exit_code: Option<i32>,
+    },
+    MaterializeFile {
+        receipt: MaterializeFileReceipt,
+    },
+    ApexTaskInstructions {
+        request_id: Uuid,
+        sandbox_id: SandboxId,
+        lease_id: LeaseId,
+        lease_attempt: i64,
+        provider_apply_id: Uuid,
+        sha256: String,
+        byte_count: u64,
+        output_unavailable: bool,
+    },
     RunPrompt {
         output: String,
     },
@@ -2008,6 +2693,61 @@ pub enum WorkerJobResult {
         provider: String,
         sandbox_id: SandboxId,
     },
+}
+
+/// A closed set of roots writable by the APEX materialization job. The grader
+/// destination is deliberately distinct so callers can gate it on frozen
+/// mission authority before creating the job.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MaterializeFileDestination {
+    ApexWorld,
+    ApexTask,
+    ApexTaskInstructions,
+    ApexGradingBundle,
+}
+
+impl MaterializeFileDestination {
+    pub fn guest_path(&self) -> &'static str {
+        match self {
+            Self::ApexWorld => "/workspace/.apex/input/world",
+            Self::ApexTask => "/workspace/.apex/input/task",
+            Self::ApexTaskInstructions => "/workspace/.apex/input/task-instructions",
+            Self::ApexGradingBundle => "/workspace/.apex/grader/bundle.zip",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaterializeFileReceipt {
+    pub sandbox_id: SandboxId,
+    pub file_id: FileId,
+    pub destination: MaterializeFileDestination,
+    /// Digest of the staged source bytes, verified when the job is created.
+    pub sha256: String,
+    /// Digest observed by the provider at the selected destination after import.
+    pub destination_sha256: String,
+    /// Byte count of the staged source that the provider accepted for import.
+    pub size_bytes: u64,
+    pub cleanup_owner: MaterializeFileCleanupOwner,
+}
+
+/// The component responsible for deleting the staged control-plane file after
+/// the materialization job reaches a terminal state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MaterializeFileCleanupOwner {
+    ControlPlane,
+}
+
+/// Provider evidence produced only after the materialization boundary has
+/// accepted the bytes and observed the selected destination.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializeFileObservation {
+    pub destination_sha256: String,
+    /// Byte count of the staged source accepted by the materialization boundary.
+    pub size_bytes: u64,
 }
 
 db_variant_enum! {
@@ -2093,6 +2833,131 @@ pub struct SshKeyListResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn materialization_destinations_are_closed_and_keep_grader_bundle_outside_input() {
+        assert_eq!(
+            MaterializeFileDestination::ApexWorld.guest_path(),
+            "/workspace/.apex/input/world"
+        );
+        assert_eq!(
+            MaterializeFileDestination::ApexTask.guest_path(),
+            "/workspace/.apex/input/task"
+        );
+        assert_eq!(
+            MaterializeFileDestination::ApexTaskInstructions.guest_path(),
+            "/workspace/.apex/input/task-instructions"
+        );
+        assert_eq!(
+            MaterializeFileDestination::ApexGradingBundle.guest_path(),
+            "/workspace/.apex/grader/bundle.zip"
+        );
+    }
+
+    #[test]
+    fn apex_instruction_read_contract_is_closed_and_redacts_live_bytes() {
+        assert_eq!(
+            JobKind::ApexTaskInstructions.as_db_str(),
+            "apex_task_instructions"
+        );
+        assert_eq!(
+            WorkerCapability::ApexTaskInstructions.as_db_str(),
+            "apex_task_instructions"
+        );
+        let request: ApexTaskInstructionsReadRequest = serde_json::from_value(serde_json::json!({
+            "expectedSha256": "a".repeat(64),
+            "expectedByteCount": 7,
+            "claimLeaseGeneration": 1
+        }))
+        .expect("exact request should decode");
+        assert_eq!(request.claim_lease_generation, 1);
+        assert!(
+            serde_json::from_value::<ApexTaskInstructionsReadRequest>(serde_json::json!({
+                "expectedSha256": "a".repeat(64), "expectedByteCount": 7,
+                "claimLeaseGeneration": 1, "argv": ["cat"]
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn resident_process_request_validates_bootstrap_and_redacts_secret_bytes() {
+        let request = ResidentProcessRequest {
+            argv: vec!["/usr/local/bin/orb-executor".into()],
+            cwd: Some("/workspace".into()),
+            env: BTreeMap::from([(
+                "ORB_TOKEN_FILE".into(),
+                "/run/sandboxwich/bootstrap/orb-token".into(),
+            )]),
+            restart_policy: ResidentProcessRestartPolicy::OnFailure,
+            expected_generation: 0,
+            bootstrap: Some(ResidentProcessBootstrap {
+                content: b"canary-resident-secret".to_vec(),
+                target_file: "/run/sandboxwich/bootstrap/orb-token".into(),
+                mode: 0o600,
+            }),
+        };
+
+        validate_resident_process_request(&request).expect("valid resident process request");
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("canary-resident-secret"));
+        assert!(debug.contains("<redacted:22 bytes>"));
+    }
+
+    #[test]
+    fn resident_process_request_rejects_unsafe_process_and_bootstrap_inputs() {
+        let valid = ResidentProcessRequest {
+            argv: vec!["/usr/local/bin/orb-executor".into()],
+            cwd: Some("/workspace".into()),
+            env: BTreeMap::new(),
+            restart_policy: ResidentProcessRestartPolicy::Never,
+            expected_generation: 0,
+            bootstrap: None,
+        };
+
+        let mut empty_argv = valid.clone();
+        empty_argv.argv.clear();
+        assert_eq!(
+            validate_resident_process_request(&empty_argv),
+            Err(ResidentProcessRequestError::EmptyArgv)
+        );
+
+        let mut nul_env = valid.clone();
+        nul_env.env.insert("TOKEN".into(), "bad\0value".into());
+        assert_eq!(
+            validate_resident_process_request(&nul_env),
+            Err(ResidentProcessRequestError::EnvironmentContainsNul)
+        );
+
+        let mut relative_cwd = valid.clone();
+        relative_cwd.cwd = Some("workspace".into());
+        assert_eq!(
+            validate_resident_process_request(&relative_cwd),
+            Err(ResidentProcessRequestError::CwdMustBeAbsolute)
+        );
+
+        let mut escaped_bootstrap = valid.clone();
+        escaped_bootstrap.bootstrap = Some(ResidentProcessBootstrap {
+            content: b"secret".to_vec(),
+            target_file: "/tmp/orb-token".into(),
+            mode: 0o600,
+        });
+        assert_eq!(
+            validate_resident_process_request(&escaped_bootstrap),
+            Err(ResidentProcessRequestError::BootstrapPathOutsideAllowedRoot)
+        );
+
+        let mut oversized = valid;
+        oversized.bootstrap = Some(ResidentProcessBootstrap {
+            content: vec![b'x'; MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES + 1],
+            target_file: "/run/sandboxwich/bootstrap/orb-token".into(),
+            mode: 0o600,
+        });
+        assert_eq!(
+            validate_resident_process_request(&oversized),
+            Err(ResidentProcessRequestError::BootstrapTooLarge)
+        );
+    }
     use serde::{Serialize, de::DeserializeOwned};
     use std::{collections::BTreeSet, fmt::Debug};
 
@@ -2114,6 +2979,38 @@ mod tests {
     }
 
     #[test]
+    fn oversized_agent_command_stdin_is_rejected_during_deserialization() {
+        let encoded = general_purpose::STANDARD.encode(vec![b'x'; MAX_COMMAND_STDIN_BYTES + 1]);
+        let value = serde_json::json!({
+            "argv": ["true"],
+            "cwd": null,
+            "env": {},
+            "stdin": encoded,
+            "timeout_secs": null
+        });
+
+        let error = serde_json::from_value::<AgentCommandRequest>(value)
+            .expect_err("deserialization must reject stdin over the decoded limit");
+
+        assert!(error.to_string().contains("command_stdin_too_large"));
+
+        let precheck_value = serde_json::json!({
+            "argv": ["true"],
+            "cwd": null,
+            "env": {},
+            "stdin": "A".repeat(MAX_COMMAND_STDIN_BASE64_BYTES + 1),
+            "timeout_secs": null
+        });
+        let precheck_error = serde_json::from_value::<AgentCommandRequest>(precheck_value)
+            .expect_err("encoded-length precheck must reject oversized input");
+        assert!(
+            precheck_error
+                .to_string()
+                .contains("command_stdin_too_large")
+        );
+    }
+
+    #[test]
     fn db_variants_round_trip_through_declared_values_and_json() {
         assert_db_variant_contract::<SandboxState>();
         assert_db_variant_contract::<SnapshotStatus>();
@@ -2126,17 +3023,41 @@ mod tests {
         assert_db_variant_contract::<MemoryLimit>();
         assert_db_variant_contract::<NetworkEgressMode>();
         assert_db_variant_contract::<NetworkAllowRuleKind>();
+        assert_db_variant_contract::<ExecutionClass>();
         assert_db_variant_contract::<CommandStatus>();
         assert_db_variant_contract::<CommandOutputStream>();
         assert_db_variant_contract::<SandboxEventKind>();
         assert_db_variant_contract::<WorkerStatus>();
         assert_db_variant_contract::<WorkerCapability>();
+        assert_db_variant_contract::<ResidentProcessRestartPolicy>();
+        assert_db_variant_contract::<ResidentProcessDesiredState>();
+        assert_db_variant_contract::<ResidentProcessObservedState>();
         assert_db_variant_contract::<JobKind>();
         assert_db_variant_contract::<JobStatus>();
         assert_db_variant_contract::<LeaseStatus>();
         assert_db_variant_contract::<ProviderHealthStatus>();
         assert_db_variant_contract::<GuestStatus>();
         assert_db_variant_contract::<SshKeyStatus>();
+    }
+
+    #[test]
+    fn execution_class_has_stable_database_json_and_default_contract() {
+        assert_eq!(
+            ExecutionClass::VALUES,
+            &[
+                "development_container",
+                "sandboxed_container",
+                "virtual_machine"
+            ]
+        );
+        assert_eq!(
+            serde_json::to_string(&ExecutionClass::VirtualMachine).unwrap(),
+            "\"virtual_machine\""
+        );
+        assert_eq!(
+            ExecutionClass::default(),
+            ExecutionClass::DevelopmentContainer
+        );
     }
 
     #[test]

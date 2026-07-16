@@ -702,11 +702,13 @@ async fn run_sandbox_ttft_once(
         client
             .post(format!("{}/sandboxes", base_url.trim_end_matches('/')))
             .json(&CreateSandboxRequest {
+                execution_class: None,
                 name: Some(format!("ttft-bench-{index}")),
                 template: Some("ubuntu-dev".to_string()),
                 memory_limit: None,
                 network_egress: None,
                 workspace_mode: Some(sandboxwich_core::WorkspaceMode::GenericEphemeral),
+                runtime_profile: None,
                 ttl_seconds: Some(120),
             }),
     )
@@ -742,6 +744,7 @@ async fn run_sandbox_ttft_once(
                 argv: vec!["printf".to_string(), "sandboxwich-ttft\n".to_string()],
                 cwd: None,
                 env: Default::default(),
+                stdin: None,
                 timeout_secs: None,
             }),
     )

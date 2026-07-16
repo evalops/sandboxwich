@@ -55,7 +55,9 @@ async fn archived_sandbox_cleanup_cascades_dependent_rows_on_sqlite() {
     let sandbox: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("cascade-cleanup-me".to_string()),
             template: None,
             memory_limit: None,
@@ -87,6 +89,7 @@ async fn archived_sandbox_cleanup_cascades_dependent_rows_on_sqlite() {
             argv: vec!["true".to_string()],
             cwd: None,
             env: Default::default(),
+            stdin: None,
             timeout_secs: None,
         })
         .send()

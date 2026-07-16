@@ -29,7 +29,9 @@ async fn assert_idempotency_contract(server: TestServer) {
     let key = uuid::Uuid::now_v7().to_string();
     let url = format!("{}/v1/sandboxes", server.base_url);
     let request = CreateSandboxRequest {
+        execution_class: None,
         workspace_mode: None,
+        runtime_profile: None,
         name: Some("idempotent-sandbox".to_string()),
         template: None,
         memory_limit: None,
@@ -69,7 +71,9 @@ async fn assert_idempotency_contract(server: TestServer) {
         .post(&url)
         .header("idempotency-key", &key)
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("different".to_string()),
             ..request.clone()
         })
@@ -80,12 +84,28 @@ async fn assert_idempotency_contract(server: TestServer) {
     let mismatch: ErrorEnvelope = mismatch.json().await.unwrap();
     assert_eq!(mismatch.code, "idempotency_key_reused");
 
+    let execution_class_mismatch = client
+        .post(&url)
+        .header("idempotency-key", &key)
+        .json(&CreateSandboxRequest {
+            execution_class: Some(ExecutionClass::VirtualMachine),
+            ..request.clone()
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(execution_class_mismatch.status(), StatusCode::CONFLICT);
+    let execution_class_mismatch: ErrorEnvelope = execution_class_mismatch.json().await.unwrap();
+    assert_eq!(execution_class_mismatch.code, "idempotency_key_reused");
+
     let tenant_b = reqwest::Client::new()
         .post(&url)
         .bearer_auth(TEST_TENANT_B_TOKEN)
         .header("idempotency-key", &key)
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("tenant-b-idempotent".to_string()),
             ..request
         })

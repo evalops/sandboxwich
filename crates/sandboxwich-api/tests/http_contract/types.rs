@@ -24,6 +24,7 @@ pub(crate) async fn assert_database_rejects_invalid_typed_values(
     let invalid_job_kind_id = Uuid::now_v7().to_string();
     let invalid_job_status_id = Uuid::now_v7().to_string();
     let invalid_job_required_capability_id = Uuid::now_v7().to_string();
+    let invalid_job_required_execution_class_id = Uuid::now_v7().to_string();
     let valid_job_id = Uuid::now_v7().to_string();
     let invalid_lease_id = Uuid::now_v7().to_string();
     let invalid_cleanup_run_id = Uuid::now_v7().to_string();
@@ -43,6 +44,7 @@ pub(crate) async fn assert_database_rejects_invalid_typed_values(
         .bind("1g")
         .bind("deny_all")
         .bind("persistent")
+        .bind("development_container")
         .bind(now)
         .bind(now)
         .bind(120_i64)
@@ -62,6 +64,7 @@ pub(crate) async fn assert_database_rejects_invalid_typed_values(
         .bind("2g")
         .bind("deny_all")
         .bind("persistent")
+        .bind("development_container")
         .bind(now)
         .bind(now)
         .bind(120_i64)
@@ -81,6 +84,7 @@ pub(crate) async fn assert_database_rejects_invalid_typed_values(
         .bind("1g")
         .bind("sometimes")
         .bind("persistent")
+        .bind("development_container")
         .bind(now)
         .bind(now)
         .bind(120_i64)
@@ -100,6 +104,7 @@ pub(crate) async fn assert_database_rejects_invalid_typed_values(
         .bind("1g")
         .bind("deny_all")
         .bind("forever")
+        .bind("development_container")
         .bind(now)
         .bind(now)
         .bind(120_i64)
@@ -109,6 +114,26 @@ pub(crate) async fn assert_database_rejects_invalid_typed_values(
     assert!(
         invalid_workspace_mode_result.is_err(),
         "invalid sandbox workspace mode was accepted"
+    );
+
+    let invalid_execution_class_result = sqlx::query(&insert_sandbox_sql(database_url))
+        .bind(Uuid::now_v7().to_string())
+        .bind("invalid-execution-class")
+        .bind("ready")
+        .bind("ubuntu-dev")
+        .bind("1g")
+        .bind("deny_all")
+        .bind("persistent")
+        .bind("not_real")
+        .bind(now)
+        .bind(now)
+        .bind(120_i64)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await;
+    assert!(
+        invalid_execution_class_result.is_err(),
+        "invalid sandbox execution class was accepted"
     );
 
     let invalid_network_rule_result = sqlx::query(&insert_network_allow_rule_sql(database_url))
@@ -270,6 +295,7 @@ pub(crate) async fn assert_database_rejects_invalid_typed_values(
         .bind("queued")
         .bind("{}")
         .bind("run_command")
+        .bind("development_container")
         .bind(0_i64)
         .bind(0_i64)
         .bind(3_i64)
@@ -290,6 +316,7 @@ pub(crate) async fn assert_database_rejects_invalid_typed_values(
         .bind("not_real")
         .bind("{}")
         .bind("run_command")
+        .bind("development_container")
         .bind(0_i64)
         .bind(0_i64)
         .bind(3_i64)
@@ -310,6 +337,7 @@ pub(crate) async fn assert_database_rejects_invalid_typed_values(
         .bind("queued")
         .bind("{}")
         .bind("not_real")
+        .bind("development_container")
         .bind(0_i64)
         .bind(0_i64)
         .bind(3_i64)
@@ -324,12 +352,34 @@ pub(crate) async fn assert_database_rejects_invalid_typed_values(
         "invalid job required capability was accepted"
     );
 
+    let invalid_job_required_execution_class_result = sqlx::query(&insert_job_sql(database_url))
+        .bind(invalid_job_required_execution_class_id)
+        .bind("run_command")
+        .bind("queued")
+        .bind("{}")
+        .bind("run_command")
+        .bind("not_real")
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(3_i64)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await;
+    assert!(
+        invalid_job_required_execution_class_result.is_err(),
+        "invalid job required execution class was accepted"
+    );
+
     sqlx::query(&insert_job_sql(database_url))
         .bind(&valid_job_id)
         .bind("run_command")
         .bind("succeeded")
         .bind("{}")
         .bind("run_command")
+        .bind("development_container")
         .bind(0_i64)
         .bind(0_i64)
         .bind(3_i64)
@@ -548,10 +598,10 @@ pub(crate) async fn assert_database_rejects_invalid_typed_values(
 pub(crate) fn insert_sandbox_sql(database_url: &str) -> String {
     format!(
         "insert into sandboxes
-         (id, name, state, template, memory_limit, network_egress_mode, workspace_mode,
+         (id, name, state, template, memory_limit, network_egress_mode, workspace_mode, execution_class,
           created_at, updated_at, ttl_seconds, parent_snapshot_id)
          values ({})",
-        placeholders(database_url, 11)
+        placeholders(database_url, 12)
     )
 }
 
@@ -620,10 +670,10 @@ pub(crate) fn insert_worker_sql(database_url: &str) -> String {
 pub(crate) fn insert_job_sql(database_url: &str) -> String {
     format!(
         "insert into jobs
-         (id, kind, status, payload, required_capability, priority, attempts, max_attempts,
+         (id, kind, status, payload, required_capability, required_execution_class, priority, attempts, max_attempts,
           scheduled_at, created_at, updated_at, last_error)
          values ({})",
-        placeholders(database_url, 12)
+        placeholders(database_url, 13)
     )
 }
 

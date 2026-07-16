@@ -57,7 +57,13 @@ use sandboxwich_core::{
         DivergenceReconcileResponse,
         DivergenceFindingListResponse,
         crate::limits::TenantLimitPolicy,
-        crate::limits::PutTenantLimitPolicy
+        crate::limits::PutTenantLimitPolicy,
+        sandboxwich_core::ResidentProcess,
+        sandboxwich_core::ResidentProcessRequest,
+        sandboxwich_core::ResidentProcessResponse,
+        sandboxwich_core::ResidentProcessBootstrapReadRequest,
+        sandboxwich_core::ResidentProcessBootstrapReadResponse,
+        sandboxwich_core::ResidentProcessObservationRequest
     )),
     tags((name = "operations", description = "Asynchronous operation lifecycle"))
 )]
@@ -74,6 +80,22 @@ const PUBLIC_V1_OPERATIONS: &[(&str, &str)] = &[
     ("get", "/v1/sandboxes/{sandbox_id}/files/{file_id}"),
     ("get", "/v1/sandboxes/{sandbox_id}/runtime-resources"),
     ("post", "/v1/sandboxes/{sandbox_id}/stop"),
+    (
+        "get",
+        "/v1/sandboxes/{sandbox_id}/resident-processes/{name}",
+    ),
+    (
+        "put",
+        "/v1/sandboxes/{sandbox_id}/resident-processes/{name}",
+    ),
+    (
+        "post",
+        "/v1/sandboxes/{sandbox_id}/resident-processes/{name}/stop",
+    ),
+    (
+        "get",
+        "/v1/sandboxes/{sandbox_id}/resident-processes/{name}/events",
+    ),
     ("post", "/v1/sandboxes/{sandbox_id}/resume"),
     ("post", "/v1/sandboxes/{sandbox_id}/fork"),
     ("get", "/v1/sandboxes/{sandbox_id}/snapshots"),
@@ -122,7 +144,10 @@ const PUBLIC_V1_OPERATIONS: &[(&str, &str)] = &[
         "/v1/workers/{worker_id}/runtime-resources/reconcile",
     ),
     ("post", "/v1/workers/{worker_id}/leases/claim"),
+    ("post", "/v1/resident-processes/{process_id}/bootstrap"),
+    ("post", "/v1/resident-processes/{process_id}/observations"),
     ("post", "/v1/leases/{lease_id}/renew"),
+    ("get", "/v1/leases/{lease_id}/materialization"),
     ("post", "/v1/leases/{lease_id}/output"),
     ("post", "/v1/leases/{lease_id}/complete"),
     ("post", "/v1/leases/{lease_id}/fail"),
