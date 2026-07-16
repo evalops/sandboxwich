@@ -161,3 +161,39 @@ Full requested verification on the final follow-up tree passed:
 PostgreSQL-conditional contract bodies were skipped. The migration uses the
 shared `ALTER TABLE ... ADD COLUMN ...` syntax and the runtime fingerprint
 queries continue to use the repository's dialect-specific placeholders.
+
+## Capability-boundary review follow-up
+
+The remaining review finding was reproduced before its fix: parsed standalone
+`register` had no provider-mode field, standalone work commands had no claim
+kind filter, and the dry-run provider report still included
+`MaterializeFile`. This meant a stale or standalone worker could claim a
+materialization lease even though provider dispatch then failed closed; a
+terminal failure could consume the staged source without destination evidence.
+
+The final fix closes every concrete path:
+
+- `KubernetesDryRunProvider::capability_report` omits `MaterializeFile`.
+- `KubernetesApplyProvider::capability_report` explicitly adds it.
+- Standalone `register` now defaults to `--provider-mode dry-run`, filters its
+  capabilities, and records the authoritative provider-mode label. Operators
+  must select `--provider-mode apply` to register materialization capability.
+- Integrated `run` retains its existing mode-based capability filter.
+- Standalone and integrated `work-once`/`work-loop` build a closed dry-run
+  `JobKind` filter excluding `MaterializeFile`. Apply work remains unfiltered
+  and therefore can claim every job its registered capabilities allow.
+- This claim-time fence protects stale registrations as well as newly filtered
+  registrations, so a dry-run worker cannot fetch and terminally consume the
+  staged source.
+
+Focused regressions passed for the concrete dry-run/apply provider reports,
+parsed standalone register defaults and explicit apply selection, parsed
+`work-once` and `work-loop` claim filtering, provider dispatch failure, and
+registration capability filtering.
+
+Final full verification on `developer@dev-desktop` passed:
+
+- `cargo test -p sandboxwich-core -p sandboxwich-api -p sandboxwich-worker`:
+  250 tests passed (58 API unit, 44 API contract, 16 core, 132 worker).
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed.
+- `cargo fmt --all -- --check`: passed.

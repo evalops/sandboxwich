@@ -853,6 +853,64 @@ fn dry_run_registration_does_not_advertise_materialization_attestation() {
 }
 
 #[test]
+fn standalone_register_path_defaults_safe_and_requires_explicit_apply_for_materialization() {
+    let parse = |extra: &[&str]| {
+        let mut argv = vec!["sandboxwich-worker", "register", "--name", "standalone"];
+        argv.extend_from_slice(extra);
+        let cli = Cli::try_parse_from(argv).expect("standalone register parses");
+        let Command::Register(args) = cli.command else {
+            panic!("expected register command")
+        };
+        capabilities_for_provider_mode(
+            capabilities_from_args(
+                args.capability,
+                IsolationProfile::Development,
+                None,
+                false,
+                false,
+            )
+            .unwrap(),
+            args.provider_mode,
+        )
+    };
+
+    assert!(!parse(&[]).contains(&WorkerCapability::MaterializeFile));
+    assert!(parse(&["--provider-mode", "apply"]).contains(&WorkerCapability::MaterializeFile));
+}
+
+#[test]
+fn standalone_work_paths_filter_dry_run_materialization_claims() {
+    let worker_id = "00000000-0000-0000-0000-000000000001";
+    for command in ["work-once", "work-loop"] {
+        let dry_run = Cli::try_parse_from(["sandboxwich-worker", command, worker_id])
+            .expect("dry-run work command parses");
+        let dry_run_mode = match dry_run.command {
+            Command::WorkOnce(args) => args.provider.provider_mode,
+            Command::WorkLoop(args) => args.provider.provider_mode,
+            _ => panic!("expected work command"),
+        };
+        let dry_run_kinds = claim_kinds_for_provider_mode(dry_run_mode)
+            .expect("dry-run claim must be explicitly filtered");
+        assert!(!dry_run_kinds.contains(&JobKind::MaterializeFile));
+
+        let apply = Cli::try_parse_from([
+            "sandboxwich-worker",
+            command,
+            worker_id,
+            "--provider-mode",
+            "apply",
+        ])
+        .expect("apply work command parses");
+        let apply_mode = match apply.command {
+            Command::WorkOnce(args) => args.provider.provider_mode,
+            Command::WorkLoop(args) => args.provider.provider_mode,
+            _ => panic!("expected work command"),
+        };
+        assert!(claim_kinds_for_provider_mode(apply_mode).is_none());
+    }
+}
+
+#[test]
 fn capabilities_from_args_report_only_the_typed_isolation_profile() {
     let gvisor = capabilities_from_args(
         Vec::new(),

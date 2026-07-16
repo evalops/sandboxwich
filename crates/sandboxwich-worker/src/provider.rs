@@ -3784,7 +3784,6 @@ impl SandboxProvider for KubernetesDryRunProvider {
             WorkerCapability::K8sPod,
             WorkerCapability::ProvisionSandbox,
             WorkerCapability::RunCommand,
-            WorkerCapability::MaterializeFile,
             WorkerCapability::Snapshot,
             WorkerCapability::DesktopStream,
         ];
@@ -3993,6 +3992,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
 impl SandboxProvider for KubernetesApplyProvider {
     fn capability_report(&self) -> ProviderCapabilityReport {
         let mut report = self.dry_run.capability_report();
+        report.capabilities.push(WorkerCapability::MaterializeFile);
         report
             .labels
             .insert("provider_mode".to_string(), "apply".to_string());

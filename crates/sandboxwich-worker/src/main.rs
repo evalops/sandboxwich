@@ -110,6 +110,9 @@ struct RegisterArgs {
     #[arg(long = "label", value_parser = parse_label)]
     label: Vec<(String, String)>,
 
+    #[arg(long, value_enum, default_value_t = ProviderModeArg::DryRun)]
+    provider_mode: ProviderModeArg,
+
     #[arg(long)]
     max_concurrent_jobs: Option<u32>,
 }
@@ -160,7 +163,7 @@ struct HeartbeatArgs {
     max_concurrent_jobs: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy, Args)]
+#[derive(Debug, Clone, Args)]
 struct ClaimArgs {
     worker_id: Uuid,
 
@@ -169,6 +172,9 @@ struct ClaimArgs {
 
     #[arg(skip)]
     operation_id: Option<Uuid>,
+
+    #[arg(skip)]
+    kinds: Option<Vec<JobKind>>,
 }
 
 #[derive(Debug, Args)]
@@ -772,11 +778,7 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&outcome)?);
         }
         Command::Register(args) => {
-            let response = register_worker(
-                &client,
-                &api,
-                args.name,
-                args.provider,
+            let capabilities = capabilities_for_provider_mode(
                 capabilities_from_args(
                     args.capability,
                     IsolationProfile::Development,
@@ -784,7 +786,17 @@ async fn main() -> anyhow::Result<()> {
                     false,
                     false,
                 )?,
-                args.label.into_iter().collect(),
+                args.provider_mode,
+            );
+            let mut labels: BTreeMap<_, _> = args.label.into_iter().collect();
+            add_placement_proof_labels(&mut labels, args.provider_mode, None, false);
+            let response = register_worker(
+                &client,
+                &api,
+                args.name,
+                args.provider,
+                capabilities,
+                labels,
                 // Standalone registration may be consumed by multiple
                 // work-once/work-loop processes, so preserve the operator's
                 // declared aggregate capacity.
@@ -923,6 +935,7 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
         Command::WorkOnce(args) => {
+            let claim_kinds = claim_kinds_for_provider_mode(args.provider.provider_mode);
             let provider = Arc::new(runtime_provider_from_args(args.provider)?);
             let response = claim(
                 &client,
@@ -931,6 +944,7 @@ async fn main() -> anyhow::Result<()> {
                     worker_id: args.worker_id,
                     lease_seconds: args.lease_seconds,
                     operation_id: Some(Uuid::now_v7()),
+                    kinds: claim_kinds,
                 },
             )
             .await?;
@@ -1188,13 +1202,12 @@ async fn claim(
         )
         .json(&ClaimLeaseRequest {
             lease_seconds: args.lease_seconds,
-            // The host-side worker legitimately dispatches every job kind and sandbox
-            // its capabilities cover (it's what runs `kubectl exec` etc. on behalf of
-            // whichever sandbox a job targets), so it intentionally claims unfiltered
-            // -- unlike `sandboxwich-agent`'s guest daemon, which scopes claims to its
-            // own sandbox and to `run_command` only.
+            // Apply workers and explicit `claim` calls may claim any job their
+            // registered capabilities cover. Dry-run work commands supply a closed
+            // kind list that excludes materialization because they cannot attest a
+            // destination and must not consume its staged source.
             sandbox_id: None,
-            kinds: None,
+            kinds: args.kinds,
         })
         .send()
         .await?;
@@ -1565,6 +1578,7 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
             .ok()
             .as_deref(),
     );
+    let claim_kinds = claim_kinds_for_provider_mode(args.provider.provider_mode);
     let provider = Arc::new(runtime_provider_from_args(args.provider)?);
     let labels: BTreeMap<_, _> = args.label.into_iter().collect();
     let drain_timeout = Duration::from_secs(args.drain_timeout_secs);
@@ -1648,9 +1662,10 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
             worker_id: args.worker_id,
             lease_seconds: args.lease_seconds,
             operation_id: Some(Uuid::now_v7()),
+            kinds: claim_kinds.clone(),
         };
         let response = match with_retries("claim lease", API_RETRY_ATTEMPTS, || {
-            claim(client, api, claim_args)
+            claim(client, api, claim_args.clone())
         })
         .await
         {
@@ -2537,6 +2552,22 @@ fn capabilities_for_provider_mode(
         capabilities.retain(|capability| *capability != WorkerCapability::MaterializeFile);
     }
     capabilities
+}
+
+fn claim_kinds_for_provider_mode(provider_mode: ProviderModeArg) -> Option<Vec<JobKind>> {
+    if provider_mode == ProviderModeArg::Apply {
+        return None;
+    }
+    Some(vec![
+        JobKind::ProvisionSandbox,
+        JobKind::StopSandbox,
+        JobKind::ResumeSandbox,
+        JobKind::RunCommand,
+        JobKind::ApexTaskInstructions,
+        JobKind::RunPrompt,
+        JobKind::CreateSnapshot,
+        JobKind::ForkSandbox,
+    ])
 }
 
 fn validate_isolation_configuration(
