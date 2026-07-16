@@ -2357,18 +2357,34 @@ pub struct ClaimLeaseRequest {
     /// sandbox, or its fork parent/child sandbox). `None` preserves the previous
     /// behavior of claiming any job the worker's capabilities allow.
     ///
-    /// This is advisory, not a security boundary: the guest agent and the worker
-    /// it runs under share one worker-scoped token (see `sandboxwich-agent`'s
-    /// `--sandbox-id`), so a malicious or compromised guest can simply omit this
-    /// filter and claim any job the shared token's capabilities allow. The
-    /// server-side filtering below narrows the *default* blast radius of a
-    /// well-behaved agent claiming the wrong job; it does not stop an
-    /// adversarial one. A real fix needs per-sandbox claim tokens.
+    /// Whether this is a real security boundary or merely advisory depends on the
+    /// caller's credential:
+    ///
+    /// - A per-sandbox guest token (`sbw_gtok_...`, minted via the
+    ///   `/workers/{worker_id}/sandboxes/{sandbox_id}/guest-token` route, see
+    ///   `sandboxwich-agent`'s guest-token wiring) is bound server-side to exactly
+    ///   one `(worker_id, sandbox_id)`. When the caller authenticates this way, the
+    ///   API rejects (400) any claim that omits this field or sets it to a
+    ///   different sandbox, and further requires `kinds` to be exactly
+    ///   `[RunCommand]` -- this is enforced, not advisory: a compromised guest
+    ///   holding only its own guest token cannot claim, renew, complete, or fail a
+    ///   lease outside its own sandbox no matter what it puts in the request body.
+    /// - A worker-scoped token (`sbw_wtok_...`) is bound to a worker, not to any
+    ///   one sandbox, and a worker can run more than one sandbox concurrently. For
+    ///   that credential this field remains advisory only: the server-side
+    ///   filtering below narrows the *default* blast radius of a well-behaved agent
+    ///   claiming the wrong job, but a caller presenting a valid worker token can
+    ///   still omit or widen the filter and claim any job the token's capabilities
+    ///   allow. Deployments that want the enforced guarantee above must have the
+    ///   guest process use its own minted guest token rather than the shared
+    ///   worker token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_id: Option<SandboxId>,
     /// Restrict claimable jobs to one of the given kinds. `None` preserves the
     /// previous behavior of claiming any kind the worker's capabilities allow.
-    /// Same advisory caveat as `sandbox_id` above applies.
+    /// Same per-credential distinction as `sandbox_id` above applies: enforced
+    /// (and pinned to `[RunCommand]`) for guest-token callers, advisory for
+    /// worker-token callers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kinds: Option<Vec<JobKind>>,
 }
