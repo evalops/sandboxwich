@@ -197,7 +197,9 @@ jobs:
           echo "dependency_lock_digest=sha256:$(sha256sum Cargo.lock | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        if: github.event_name != 'pull_request'
+        # Same-repository PRs need authenticated read access to the private,
+        # digest-pinned Orb executor base. Never expose that package to forks.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
