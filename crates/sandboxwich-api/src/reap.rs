@@ -31,7 +31,14 @@ pub(crate) enum ReapTrigger {
 }
 
 impl ReapTrigger {
-    fn reason(self) -> &'static str {
+    /// The exact `reason` string this trigger writes into the reaped
+    /// sandbox's `LifecycleChanged` event. `pub(crate)` (not just used
+    /// internally by `reap_expired_active_sandboxes`) so callers outside
+    /// this module -- currently `scheduler::spawn_expiry_sweeper`'s log line
+    /// -- can report the *same* string instead of a `Debug`-derived
+    /// spelling of the enum variant, which would silently drift from the
+    /// event's `reason` field and make logs and events hard to correlate.
+    pub(crate) fn reason(self) -> &'static str {
         match self {
             ReapTrigger::MaxLifetime => "reaped_max_lifetime",
             ReapTrigger::IdleTtl => "reaped_idle_ttl",

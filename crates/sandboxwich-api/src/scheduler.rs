@@ -60,7 +60,14 @@ pub(crate) fn spawn_expiry_sweeper(
                         tracing::info!(
                             sandbox_id = %reaped.sandbox.id,
                             tenant_id = %reaped.sandbox.tenant_id,
-                            trigger = ?reaped.trigger,
+                            // Use the same `reason` string the reaped
+                            // sandbox's `LifecycleChanged` event carries
+                            // (rather than `?reaped.trigger`'s `Debug`
+                            // spelling of the enum variant) so a log line and
+                            // its corresponding event always say the exact
+                            // same thing and can be correlated by grepping
+                            // for one string.
+                            reason = reaped.trigger.reason(),
                             deadline = %reaped.deadline,
                             "reaped sandbox past its active-lifetime deadline"
                         );

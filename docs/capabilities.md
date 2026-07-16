@@ -40,6 +40,25 @@ three different things:
 - `idle_ttl_seconds` stops a live sandbox after a period with no observed
   activity (see the caveat above on what "activity" currently means).
 
+**`create`/`fork` vs. `fork_snapshot` inheritance is intentionally
+asymmetric.** `POST /sandboxes/{id}/fork` (an in-place fork) inherits the
+parent's `max_lifetime_seconds`/`idle_ttl_seconds` when the request omits
+them (`request.field.or(parent.field)`), then re-clamps under current
+operator policy. `POST /snapshots/{id}/fork` (restoring a sandbox from a
+snapshot) does **not** inherit the *source* sandbox's values at all -- only
+the fork-snapshot request's own field, defaulted/clamped by the operator
+config, applies. This means a caller-imposed cap on a sandbox can be shed by
+snapshotting it and restoring the snapshot into a fresh sandbox with no
+cap requested. It is not a loophole around *operator* policy: the
+operator-configured default/ceiling
+(`SANDBOXWICH_DEFAULT_MAX_LIFETIME_SECONDS`/`_MAX_MAX_LIFETIME_SECONDS` and
+the `idle_ttl` equivalents) still applies to every `fork_snapshot` request
+exactly as it does to `create`, regardless of what the source sandbox's
+values were. Restoring from a snapshot is a new sandbox with a new
+creation time, not a continuation of the old one, so there is no single
+"parent" whose cap would be unambiguous to inherit -- unlike an in-place
+fork, which has exactly one.
+
 See the README's "Sandbox lifetime: three separate knobs" section for the
 full config surface (env vars and CLI flags).
 
