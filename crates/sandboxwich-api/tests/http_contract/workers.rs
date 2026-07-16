@@ -44,6 +44,8 @@ async fn create_execution_sandbox(
             memory_limit: None,
             network_egress,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
             runtime_profile: None,
         })
         .send()
@@ -316,6 +318,8 @@ pub(crate) async fn runtime_resource_inventory_is_worker_scoped_and_bounded() {
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -522,6 +526,8 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
                 memory_limit: None,
                 network_egress: None,
                 ttl_seconds: Some(120),
+                max_lifetime_seconds: None,
+                idle_ttl_seconds: None,
             })
             .send()
             .await

@@ -25,6 +25,8 @@ pub(crate) async fn resident_process_create_is_idempotent_tenant_scoped_and_reda
             runtime_profile: None,
             execution_class: None,
             ttl_seconds: Some(3600),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await

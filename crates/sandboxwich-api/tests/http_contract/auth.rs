@@ -65,6 +65,8 @@ pub(crate) async fn api_token_is_required_when_configured() {
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -160,6 +162,8 @@ pub(crate) async fn worker_tokens_are_role_scoped_and_never_reserialized() {
                 memory_limit: None,
                 network_egress: None,
                 ttl_seconds: Some(120),
+                max_lifetime_seconds: None,
+                idle_ttl_seconds: None,
             })
             .send()
             .await
@@ -255,6 +259,8 @@ pub(crate) async fn unauthenticated_deployment_rejects_tenant_header_spoofing() 
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -375,6 +381,8 @@ pub(crate) async fn assert_tenant_boundaries_are_enforced(
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await

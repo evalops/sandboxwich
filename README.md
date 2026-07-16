@@ -85,6 +85,23 @@ If neither is set, the API fails closed: it refuses every non-probe request with
 
 `POST /snapshots/cleanup` performs cross-tenant maintenance (expiring snapshots and deleting archived sandboxes for every tenant) and is gated by a separate `SANDBOXWICH_OPERATOR_TOKEN` credential, checked via the `x-sandboxwich-operator-token` header. This token is intentionally distinct from tenant/shared tokens: a valid tenant credential is never sufficient to run cleanup, and cleanup is disabled (rejected) until an operator token is configured.
 
+### Sandbox lifetime: three separate knobs
+
+Sandboxes carry three independent, easy-to-conflate timing fields. Do not assume they're the same thing:
+
+- **`ttl_seconds`** — retention for an *already-`archived`* sandbox's record. It does not run until the sandbox has already been stopped (by a user, or by one of the two knobs below), and it only controls how long the row (and dependent rows) stay queryable before `POST /snapshots/cleanup` deletes them.
+- **`max_lifetime_seconds`** — a hard cap on how long a *live* sandbox may run at all, measured from creation. Once this passes, the background sweeper stops the sandbox through the same path `POST /sandboxes/{id}/stop` uses, regardless of activity.
+- **`idle_ttl_seconds`** — stops a live sandbox after a period of no observed activity, via the same path. "Activity" today means the more recent of the sandbox's last lifecycle-state transition and its most recently queued guest command; SSH sessions, desktop sessions, and resident-process output do not yet reset this clock, so treat it as a coarse signal, not true idle detection (see [capabilities.md](docs/capabilities.md)).
+
+All three are optional and independent of each other; a sandbox can have any combination set (or none). `max_lifetime_seconds` and `idle_ttl_seconds` are what actually reap idle or forgotten sandboxes to free host disk — `ttl_seconds` alone does not, since it never fires until something else has already stopped the sandbox.
+
+Set `--max-lifetime-seconds`/`--idle-ttl-seconds` on `sandboxwich new`/`sandboxwich fork`, or configure operator-wide policy:
+
+- `SANDBOXWICH_DEFAULT_MAX_LIFETIME_SECONDS` / `SANDBOXWICH_MAX_MAX_LIFETIME_SECONDS` — default and ceiling (clamp, never reject) for `max_lifetime_seconds`.
+- `SANDBOXWICH_DEFAULT_IDLE_TTL_SECONDS` / `SANDBOXWICH_MAX_IDLE_TTL_SECONDS` — same, for `idle_ttl_seconds`.
+
+All four are unset by default: with no operator configuration, a caller that omits both fields gets a sandbox with no active-lifetime cap at all, identical to behavior before these knobs existed. In particular, `workspace_mode: persistent` sandboxes get no default lifetime unless the operator explicitly configures one or the caller explicitly opts in — this is deliberate, not an oversight; a persistent workspace an operator hasn't opted into capping should not start expiring the day this ships. The reaping sweep itself runs inside the same background task as the lease/snapshot/desktop-session sweeps, so `SANDBOXWICH_DISABLE_EXPIRY_SWEEPER=true` also disables active-lifetime reaping.
+
 Sandbox create accepts typed memory tiers (`1g`, `4g`, `16g`, `64g`) and typed network egress policy. File upload/list/download state is persisted in SQL and command output chunks can carry typed file-citation annotations.
 
 Worker completions use typed result variants. Provider-created Pods, PVCs, Services, NetworkPolicies, and VolumeSnapshots are persisted as `runtime_resources` rows with constrained kind, purpose, and status columns; provider metadata is diagnostic compatibility data, not the durable source of runtime state. Runtime resources marked `deleted` were reconciled as missing or removed outside the cleanup path; resources marked `destroyed` were explicitly torn down by archived-sandbox cleanup. Kubernetes providers render deny-by-default egress, pod/container security contexts, resource requests/limits, and optional RuntimeClass isolation such as gVisor or Kata.
