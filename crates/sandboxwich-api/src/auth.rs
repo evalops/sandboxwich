@@ -318,9 +318,8 @@ pub(crate) async fn ensure_lease_worker_scope(
 }
 
 /// Like [`ensure_sandbox_tenant`], but additionally requires (see GH-64) that
-/// the request authenticated as the worker that provisioned or forked
-/// `sandbox_id` (determined from completed provision/fork job leases, the
-/// only source of truth for "which worker is running this sandbox's guest").
+/// the request authenticated as the worker currently placed for
+/// `sandbox_id`.
 /// Used on the guest-facing guest-health route so a worker-scoped token can
 /// only report health for sandboxes it actually owns, and a tenant-wide
 /// token is rejected outright.
@@ -392,45 +391,29 @@ pub(crate) async fn require_guest_route_principal(
     }
 }
 
-/// Whether `worker_id` has ever successfully completed a `provision_sandbox`
-/// or `fork_sandbox` job lease that produced (or targeted, for a fork) this
-/// exact sandbox. Sandboxes carry no persistent "owning worker" column;
-/// completed-lease history is the source of truth for which worker's guest
-/// environment a sandbox's agent actually runs in, and it can never name two
-/// different current workers for the same sandbox id (re-provisioning always
-/// mints a new sandbox id).
+/// Whether `worker_id` is the current placement for this exact sandbox.
+///
+/// Placement is bound atomically when a worker claims a provision or fork
+/// job. That makes it available before the worker creates the guest pod,
+/// which is when it must mint the sandbox-scoped guest token, while still
+/// preventing any other worker from minting or reporting health for it.
 pub(crate) async fn worker_owns_sandbox(
     db: &Database,
     worker_id: WorkerId,
     sandbox_id: SandboxId,
 ) -> Result<bool, ApiError> {
     let sql = format!(
-        "select j.kind, j.payload
-         from job_leases jl
-         join jobs j on j.id = jl.job_id
-         where jl.worker_id = {} and jl.status = 'completed'
-           and j.kind in ('provision_sandbox', 'fork_sandbox')",
-        db.placeholder(1)
+        "select 1 from sandbox_placements
+         where sandbox_id = {} and worker_id = {}",
+        db.placeholder(1),
+        db.placeholder(2)
     );
-    let rows = sqlx::query(&sql)
+    let exists = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
         .bind(worker_id.to_string())
-        .fetch_all(&db.pool)
+        .fetch_optional(&db.pool)
         .await?;
-    let sandbox_id_str = sandbox_id.to_string();
-    for row in rows {
-        let kind: String = row.try_get("kind")?;
-        let payload_raw: String = row.try_get("payload")?;
-        let payload: serde_json::Value = serde_json::from_str(&payload_raw)?;
-        let field = if kind == "fork_sandbox" {
-            "childSandboxId"
-        } else {
-            "sandboxId"
-        };
-        if payload.get(field).and_then(serde_json::Value::as_str) == Some(sandbox_id_str.as_str()) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(exists.is_some())
 }
 
 /// Header carrying the operator credential required by [`cleanup_snapshots`].
