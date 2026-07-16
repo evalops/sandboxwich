@@ -56,8 +56,26 @@ async fn openapi_covers_every_public_v1_operation() {
         ("POST", "/v1/sandboxes/{sandbox_id}/desktop-sessions"),
         ("GET", "/v1/sandboxes/{sandbox_id}/commands"),
         ("POST", "/v1/sandboxes/{sandbox_id}/commands"),
+        (
+            "GET",
+            "/v1/sandboxes/{sandbox_id}/resident-processes/{name}",
+        ),
+        (
+            "PUT",
+            "/v1/sandboxes/{sandbox_id}/resident-processes/{name}",
+        ),
+        (
+            "POST",
+            "/v1/sandboxes/{sandbox_id}/resident-processes/{name}/stop",
+        ),
+        (
+            "GET",
+            "/v1/sandboxes/{sandbox_id}/resident-processes/{name}/events",
+        ),
         ("POST", "/v1/sandboxes/{sandbox_id}/prompt"),
         ("GET", "/v1/sandboxes/{sandbox_id}/events"),
+        ("POST", "/v1/resident-processes/{process_id}/bootstrap"),
+        ("POST", "/v1/resident-processes/{process_id}/observations"),
         ("GET", "/v1/desktop-sessions/{desktop_session_id}"),
         ("POST", "/v1/desktop-sessions/{desktop_session_id}/status"),
         ("POST", "/v1/desktop-sessions/{desktop_session_id}/access"),
@@ -96,6 +114,7 @@ async fn openapi_covers_every_public_v1_operation() {
         ),
         ("POST", "/v1/workers/{worker_id}/leases/claim"),
         ("POST", "/v1/leases/{lease_id}/renew"),
+        ("GET", "/v1/leases/{lease_id}/materialization"),
         ("POST", "/v1/leases/{lease_id}/output"),
         ("POST", "/v1/leases/{lease_id}/complete"),
         ("POST", "/v1/leases/{lease_id}/fail"),
@@ -129,6 +148,7 @@ async fn v1_contract_exposes_operations_openapi_request_ids_and_honest_prompt_st
     let docs: serde_json::Value = docs.json().await.unwrap();
     assert_eq!(docs["info"]["version"], "1.0.0");
     assert!(docs["paths"]["/v1/operations/{operation_id}"].is_object());
+    assert!(docs["paths"]["/v1/leases/{lease_id}/materialization"]["get"].is_object());
     assert!(docs["components"]["schemas"]["Operation"].is_object());
 
     let malformed = client
@@ -145,12 +165,16 @@ async fn v1_contract_exposes_operations_openapi_request_ids_and_honest_prompt_st
     let created = client
         .post(format!("{}/v1/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("v1-contract".to_string()),
             template: None,
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -169,6 +193,7 @@ async fn v1_contract_exposes_operations_openapi_request_ids_and_honest_prompt_st
         argv: vec!["echo".to_string(), "hello".to_string()],
         cwd: None,
         env: Default::default(),
+        stdin: None,
         timeout_secs: None,
     };
     let queued = client
@@ -286,12 +311,16 @@ async fn platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_cor
     let unauthorized = reqwest::Client::new()
         .post(&create_url)
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("missing-tenant-identity".to_string()),
             template: None,
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -301,12 +330,16 @@ async fn platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_cor
     let idempotency_key = uuid::Uuid::now_v7().to_string();
     let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
     let request = CreateSandboxRequest {
+        execution_class: None,
         workspace_mode: None,
+        runtime_profile: None,
         name: Some("platform-provider-contract".to_string()),
         template: None,
         memory_limit: None,
         network_egress: None,
         ttl_seconds: Some(120),
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
     };
     let first = client
         .post(&create_url)
@@ -386,7 +419,10 @@ async fn platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_cor
             template: "ubuntu-dev".to_string(),
             memory_limit: MemoryLimit::OneG,
             network_egress: NetworkEgress::DenyAll,
+            runtime_profile: SandboxRuntimeProfile::Unprivileged,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -434,7 +470,10 @@ async fn platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_cor
         template: "ubuntu-dev".to_string(),
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::DenyAll,
+        runtime_profile: SandboxRuntimeProfile::Unprivileged,
         ttl_seconds: Some(120),
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
     };
     let restore_key = uuid::Uuid::now_v7().to_string();
     let restore_url = format!(

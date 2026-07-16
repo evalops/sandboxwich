@@ -13,26 +13,52 @@ use std::{
 use anyhow::{Context, bail};
 use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
+use clap::ValueEnum;
 use ipnet::IpNet;
 use sandboxwich_core::{
-    AgentCommandRequest, AgentCommandResult, MemoryLimit, NetworkAllowRuleKind, NetworkEgress,
-    ProviderCapabilityReport, ProviderForkHandle, ProviderHealthReport, ProviderHealthStatus,
-    ProviderRuntimeResource, ProviderSandboxHandle, ProviderSnapshotHandle, ProvisioningErrorClass,
-    ProvisioningStage, ProvisioningStageUpdateRequest, RuntimeResourceInventoryResponse,
-    RuntimeResourceKind, RuntimeResourcePurpose, RuntimeResourceStatus, SandboxId,
-    SandboxProvisionSpec, SnapshotId, WorkerCapability, WorkspaceMode,
+    AgentCommandRequest, AgentCommandResult, DbVariant, ExecutionClass, MAX_SANDBOX_FILE_BYTES,
+    MaterializeFileDestination, MaterializeFileObservation, MemoryLimit, NetworkAllowRuleKind,
+    NetworkEgress, ProviderCapabilityReport, ProviderForkHandle, ProviderHealthReport,
+    ProviderHealthStatus, ProviderRuntimeResource, ProviderSandboxHandle, ProviderSnapshotHandle,
+    ProvisioningErrorClass, ProvisioningStage, ProvisioningStageUpdateRequest,
+    RuntimeResourceInventoryResponse, RuntimeResourceKind, RuntimeResourcePurpose,
+    RuntimeResourceStatus, SandboxId, SandboxProvisionSpec, SandboxRuntimeProfile, SnapshotId,
+    WorkerCapability, WorkspaceMode, validate_agent_command_request,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::egress_gateway::EgressGatewayPolicy;
 
+fn sha256_hex(content: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(content))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetryDisposition {
     Retryable,
     Permanent,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum IsolationProfile {
+    #[default]
+    Development,
+    Gvisor,
+    Kata,
+}
+
+impl IsolationProfile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Development => "development",
+            Self::Gvisor => "gvisor",
+            Self::Kata => "kata",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -135,6 +161,11 @@ pub(crate) fn image_is_digest_pinned(image: &str) -> bool {
 /// `sandboxwich-agent`'s `DEFAULT_MAX_CAPTURED_OUTPUT_BYTES`: without a cap, a
 /// chatty or misbehaving `kubectl` command could grow these unboundedly.
 pub const DEFAULT_MAX_CAPTURED_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
+/// Hard live-response limit for the fixed APEX instruction reader. The
+/// instruction body is returned to its caller only and must never flow into
+/// ordinary command/job output storage.
+pub const APEX_TASK_INSTRUCTIONS_MAX_BYTES: usize = 1024 * 1024;
+const APEX_TASK_INSTRUCTIONS_COMMAND: &str = "/opt/apex/bin/task-instructions";
 
 /// Default bound applied to every `kubectl` invocation made by
 /// [`KubernetesApplyProvider`] (see [`run_kubectl_command`]). Pod readiness
@@ -233,6 +264,28 @@ pub trait SandboxProvider {
         request: AgentCommandRequest,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<AgentCommandResult>;
+    /// Reads the APEX task instruction stream from a live sandbox through one
+    /// fixed executable. There is intentionally no request object: callers
+    /// cannot supply argv, cwd, environment, or stdin.
+    fn read_apex_task_instructions(
+        &self,
+        sandbox_id: SandboxId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<Vec<u8>> {
+        let _ = (sandbox_id, cancelled);
+        anyhow::bail!("provider does not support APEX task instruction reads")
+    }
+    fn materialize_file(
+        &self,
+        sandbox_id: SandboxId,
+        destination: MaterializeFileDestination,
+        expected_sha256: &str,
+        content: &[u8],
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<MaterializeFileObservation> {
+        let _ = (sandbox_id, destination, expected_sha256, content, cancelled);
+        anyhow::bail!("provider does not support file materialization")
+    }
     fn create_snapshot(
         &self,
         sandbox_id: SandboxId,
@@ -264,10 +317,12 @@ pub struct KubernetesDryRunProvider {
     storage_class: Option<String>,
     snapshot_class: Option<String>,
     runtime_image: String,
+    apex_trusted_supervisor_v1: bool,
     egress_gateway_image: Option<String>,
     workspace_storage: String,
     workspace_storage_override: bool,
     ssh_authorized_keys_secret: Option<String>,
+    isolation_profile: IsolationProfile,
     runtime_class_name: Option<String>,
     isolation_backend: String,
     /// Dedicated namespace sandbox pods/services/PVCs/NetworkPolicies are
@@ -325,10 +380,12 @@ impl KubernetesDryRunProvider {
             storage_class,
             snapshot_class,
             runtime_image: DEFAULT_SANDBOX_GUEST_IMAGE.to_string(),
+            apex_trusted_supervisor_v1: false,
             egress_gateway_image: None,
             workspace_storage: "2Gi".to_string(),
             workspace_storage_override: false,
             ssh_authorized_keys_secret: None,
+            isolation_profile: IsolationProfile::Development,
             runtime_class_name: None,
             isolation_backend: "kubernetes".to_string(),
             sandbox_namespace: None,
@@ -355,6 +412,38 @@ impl KubernetesDryRunProvider {
         self
     }
 
+    pub fn with_apex_trusted_supervisor_v1(mut self, enabled: bool) -> Self {
+        self.apex_trusted_supervisor_v1 = enabled;
+        self
+    }
+
+    fn validate_runtime_profile(&self, spec: &SandboxProvisionSpec) -> anyhow::Result<()> {
+        self.validate_network_policy_egress(&spec.network_egress)?;
+        if spec.runtime_profile == SandboxRuntimeProfile::ApexTrustedSupervisorV1 {
+            anyhow::ensure!(
+                self.apex_trusted_supervisor_v1 && image_is_digest_pinned(&self.runtime_image),
+                "apex_trusted_supervisor_v1 is not configured for this digest-pinned runtime"
+            );
+            anyhow::ensure!(
+                spec.execution_class == ExecutionClass::SandboxedContainer,
+                "apex_trusted_supervisor_v1 requires sandboxed_container execution_class"
+            );
+            anyhow::ensure!(
+                self.isolation_profile == IsolationProfile::Gvisor
+                    && self
+                        .runtime_class_name
+                        .as_deref()
+                        .is_some_and(|name| !name.trim().is_empty()),
+                "apex_trusted_supervisor_v1 requires the gvisor isolation profile and RuntimeClass"
+            );
+            anyhow::ensure!(
+                !matches!(spec.network_egress, NetworkEgress::AllowAll),
+                "apex_trusted_supervisor_v1 requires deny-by-default egress"
+            );
+        }
+        Ok(())
+    }
+
     pub fn with_egress_gateway_image(mut self, image: Option<String>) -> Self {
         self.egress_gateway_image = image.and_then(|image| {
             let image = image.trim();
@@ -373,6 +462,11 @@ impl KubernetesDryRunProvider {
 
     pub fn with_ssh_authorized_keys_secret(mut self, secret: Option<String>) -> Self {
         self.ssh_authorized_keys_secret = secret;
+        self
+    }
+
+    pub fn with_isolation_profile(mut self, isolation_profile: IsolationProfile) -> Self {
+        self.isolation_profile = isolation_profile;
         self
     }
 
@@ -561,9 +655,21 @@ impl KubernetesDryRunProvider {
             labels.insert("snapshot_class".to_string(), snapshot_class.clone());
         }
         labels.insert("runtime_image".to_string(), self.runtime_image.clone());
+        if self.apex_trusted_supervisor_v1 {
+            labels.insert(
+                "runtime_profile".to_string(),
+                SandboxRuntimeProfile::ApexTrustedSupervisorV1
+                    .as_db_str()
+                    .to_string(),
+            );
+        }
         labels.insert(
             "workspace_storage".to_string(),
             self.workspace_storage.clone(),
+        );
+        labels.insert(
+            "isolation_profile".to_string(),
+            self.isolation_profile.as_str().to_string(),
         );
         if let Some(secret) = &self.ssh_authorized_keys_secret {
             labels.insert("ssh_authorized_keys_secret".to_string(), secret.clone());
@@ -584,6 +690,7 @@ impl KubernetesDryRunProvider {
         operation: &'static str,
         spec: &SandboxProvisionSpec,
     ) -> anyhow::Result<serde_json::Value> {
+        self.validate_runtime_profile(spec)?;
         let network_policy = self.network_policy_manifest(sandbox_id, &spec.network_egress)?;
         let egress_gateway_pod =
             self.egress_gateway_pod_manifest(sandbox_id, &spec.network_egress)?;
@@ -650,6 +757,7 @@ impl KubernetesDryRunProvider {
     fn isolation_metadata(&self) -> serde_json::Value {
         json!({
             "backend": self.isolation_backend,
+            "profile": self.isolation_profile.as_str(),
             "runtimeClassName": self.runtime_class_name
         })
     }
@@ -880,20 +988,50 @@ impl KubernetesDryRunProvider {
         }
 
         let ephemeral_storage = Self::ephemeral_storage_limit(&spec.memory_limit);
+        let apex_supervisor =
+            spec.runtime_profile == SandboxRuntimeProfile::ApexTrustedSupervisorV1;
+        let pod_security_context = if apex_supervisor {
+            json!({
+                "runAsNonRoot": false,
+                "runAsUser": 0,
+                "runAsGroup": 0,
+                "fsGroup": 10001,
+                "seccompProfile": { "type": "RuntimeDefault" }
+            })
+        } else {
+            json!({
+                "runAsNonRoot": true,
+                "runAsUser": 10001,
+                "runAsGroup": 10001,
+                "fsGroup": 10001,
+                "seccompProfile": { "type": "RuntimeDefault" }
+            })
+        };
+        let container_security_context = if apex_supervisor {
+            json!({
+                "allowPrivilegeEscalation": false,
+                "readOnlyRootFilesystem": false,
+                "runAsNonRoot": false,
+                "runAsUser": 0,
+                "runAsGroup": 0,
+                "capabilities": {
+                    "drop": ["ALL"],
+                    "add": ["CHOWN", "SETGID", "SETUID", "KILL", "DAC_READ_SEARCH"]
+                },
+                "seccompProfile": { "type": "RuntimeDefault" }
+            })
+        } else {
+            json!({
+                "allowPrivilegeEscalation": false,
+                "readOnlyRootFilesystem": false,
+                "runAsNonRoot": true,
+                "capabilities": { "drop": ["ALL"] },
+                "seccompProfile": { "type": "RuntimeDefault" }
+            })
+        };
         let mut pod_spec = Map::from_iter([
             ("automountServiceAccountToken".to_string(), json!(false)),
-            (
-                "securityContext".to_string(),
-                json!({
-                    "runAsNonRoot": true,
-                    "runAsUser": 10001,
-                    "runAsGroup": 10001,
-                    "fsGroup": 10001,
-                    "seccompProfile": {
-                        "type": "RuntimeDefault"
-                    }
-                }),
-            ),
+            ("securityContext".to_string(), pod_security_context),
             (
                 "containers".to_string(),
                 json!([{
@@ -919,17 +1057,7 @@ impl KubernetesDryRunProvider {
                             "ephemeral-storage": ephemeral_storage
                         }
                     },
-                    "securityContext": {
-                        "allowPrivilegeEscalation": false,
-                        "readOnlyRootFilesystem": false,
-                        "runAsNonRoot": true,
-                        "capabilities": {
-                            "drop": ["ALL"]
-                        },
-                        "seccompProfile": {
-                            "type": "RuntimeDefault"
-                        }
-                    },
+                    "securityContext": container_security_context,
                     "volumeMounts": volume_mounts
                 }]),
             ),
@@ -2703,6 +2831,7 @@ impl KubernetesApplyProvider {
                     argv: vec!["echo".to_string(), "sandboxwich".to_string()],
                     cwd: None,
                     env: BTreeMap::new(),
+                    stdin: None,
                     timeout_secs: None,
                 },
                 &CancelSignal::never_cancelled(),
@@ -2877,6 +3006,7 @@ impl KubernetesApplyProvider {
         sandbox_id: SandboxId,
         spec: &SandboxProvisionSpec,
     ) -> anyhow::Result<Vec<Value>> {
+        self.dry_run.validate_runtime_profile(spec)?;
         let mut manifests = Vec::new();
         if spec.workspace_mode == WorkspaceMode::Persistent {
             manifests.push(self.dry_run.pvc_manifest(
@@ -2919,6 +3049,7 @@ impl KubernetesApplyProvider {
         snapshot_id: SnapshotId,
         spec: &SandboxProvisionSpec,
     ) -> anyhow::Result<Vec<Value>> {
+        self.dry_run.validate_runtime_profile(spec)?;
         let mut manifests =
             vec![
                 self.dry_run
@@ -3130,15 +3261,16 @@ impl KubernetesApplyProvider {
     /// positional `KEY=VALUE` args to `env` -- as this used to do -- leaks
     /// them to anything with process-listing access. When `request.env`
     /// is non-empty, this instead wires up `kubectl exec -i` plus a small
-    /// `bash -c` wrapper that reads NUL-delimited `KEY=VALUE` pairs from
-    /// stdin and `export`s them before `exec`ing the real command; the
+    /// `bash -c` wrapper that reads a counted prefix of NUL-delimited
+    /// `KEY=VALUE` pairs from stdin and `export`s them before `exec`ing the
+    /// real command with any remaining bytes still available on stdin; the
     /// caller must pipe `exec_stdin_payload(request)` to that invocation's
     /// stdin. NUL is a safe delimiter because POSIX environment variable
     /// values can never contain an embedded NUL byte, unlike newlines.
     fn exec_args(&self, sandbox_id: SandboxId, request: &AgentCommandRequest) -> Vec<String> {
         let mut args = self.kubectl_base_args();
         let needs_env = !request.env.is_empty();
-        if needs_env {
+        if needs_env || request.stdin.is_some() {
             args.push("-i".to_string());
         }
         args.extend([
@@ -3153,6 +3285,7 @@ impl KubernetesApplyProvider {
                 "-c".to_string(),
                 EXEC_ENV_WRAPPER_SCRIPT.to_string(),
                 "sandboxwich-exec".to_string(),
+                request.env.len().to_string(),
             ]);
             if let Some(cwd) = &request.cwd {
                 args.push("1".to_string());
@@ -3180,13 +3313,23 @@ impl KubernetesApplyProvider {
         args
     }
 
-    /// Builds the NUL-delimited `KEY=VALUE` payload that must be piped to
-    /// the stdin of the `kubectl exec` invocation built by `exec_args` when
-    /// `request.env` is non-empty. Returns `None` when there's nothing to
-    /// send, so callers know not to bother opening a piped stdin at all.
+    fn apex_task_instructions_args(&self, sandbox_id: SandboxId) -> Vec<String> {
+        let mut args = self.kubectl_base_args();
+        args.extend([
+            "exec".to_string(),
+            self.pod_name(sandbox_id),
+            "--".to_string(),
+            APEX_TASK_INSTRUCTIONS_COMMAND.to_string(),
+        ]);
+        args
+    }
+
+    /// Builds the counted NUL-delimited `KEY=VALUE` prefix followed by the
+    /// exact command stdin bytes. Returns `None` when neither input exists,
+    /// so callers preserve the previous non-interactive behavior.
     fn exec_stdin_payload(request: &AgentCommandRequest) -> Option<Vec<u8>> {
         if request.env.is_empty() {
-            return None;
+            return request.stdin.clone();
         }
         let mut payload = Vec::new();
         for (key, value) in &request.env {
@@ -3195,19 +3338,25 @@ impl KubernetesApplyProvider {
             payload.extend_from_slice(value.as_bytes());
             payload.push(0);
         }
+        if let Some(stdin) = &request.stdin {
+            payload.extend_from_slice(stdin);
+        }
         Some(payload)
     }
 }
 
 /// Guest-side wrapper invoked via `bash -c` by `exec_args` when the request
 /// carries env vars. Argument order (after the `bash -c` command string
-/// itself, `$0` is `sandboxwich-exec`): `$1` is `"1"`/`"0"` for
-/// has-cwd, `$2` is the cwd (only present when `$1 == "1"`), and the
-/// remaining args are the real command to run. Env `KEY=VALUE` pairs are
-/// read from stdin, NUL-delimited, before anything else runs.
+/// itself, `$0` is `sandboxwich-exec`): `$1` is the env-pair count, the next
+/// argument is `"1"`/`"0"` for has-cwd, then the cwd when present, and the
+/// remaining args are the real command. Reading exactly the counted
+/// NUL-delimited env prefix leaves all remaining stdin bytes for that command.
 const EXEC_ENV_WRAPPER_SCRIPT: &str = concat!(
-    "while IFS= read -r -d '' kv; do ",
+    "env_count=\"$1\"; shift; ",
+    "while [ \"$env_count\" -gt 0 ]; do ",
+    "IFS= read -r -d '' kv || exit 1; ",
     "case \"$kv\" in *=*) export \"${kv%%=*}\"=\"${kv#*=}\" ;; esac; ",
+    "env_count=$((env_count - 1)); ",
     "done; ",
     "has_cwd=\"$1\"; shift; ",
     "if [ \"$has_cwd\" = \"1\" ]; then cd \"$1\" || exit 1; shift; fi; ",
@@ -3336,6 +3485,141 @@ fn run_kubectl_command_with_stdin(
             .block_on(command),
     };
     result.map_err(|error| anyhow::Error::new(ProviderError::retryable(error)))
+}
+
+fn run_fixed_apex_task_instructions(
+    kubectl: &str,
+    args: &[String],
+    timeout: Duration,
+    cancelled: &CancelSignal,
+) -> anyhow::Result<Vec<u8>> {
+    let command = run_fixed_apex_task_instructions_async(kubectl, args, timeout, cancelled);
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(command),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build runtime for APEX instruction read")?
+            .block_on(command),
+    };
+    result.map_err(|error| anyhow::Error::new(ProviderError::retryable(error)))
+}
+
+async fn drain_bounded<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    retained_limit: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut retained = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(retained);
+        }
+        let remaining = retained_limit.saturating_sub(retained.len());
+        retained.extend_from_slice(&buffer[..read.min(remaining)]);
+    }
+}
+
+async fn run_fixed_apex_task_instructions_async(
+    kubectl: &str,
+    args: &[String],
+    timeout: Duration,
+    cancelled: &CancelSignal,
+) -> anyhow::Result<Vec<u8>> {
+    let mut child = tokio::process::Command::new(kubectl)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn fixed APEX task instruction reader")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture APEX stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture APEX stderr")?;
+    let mut stdout_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout
+            .take((APEX_TASK_INSTRUCTIONS_MAX_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await?;
+        Ok::<_, std::io::Error>(bytes)
+    });
+    // Drain stderr so the child cannot deadlock, but retain only a small
+    // diagnostic prefix. The bytes are deliberately never included in an
+    // error, log, event, or persisted result.
+    let stderr_task = tokio::spawn(drain_bounded(stderr, 4096));
+
+    enum First {
+        Status(std::io::Result<std::process::ExitStatus>),
+        Stdout(Result<std::io::Result<Vec<u8>>, tokio::task::JoinError>),
+        Cancelled,
+        TimedOut,
+    }
+    let first = tokio::select! {
+        status = child.wait() => First::Status(status),
+        stdout = &mut stdout_task => First::Stdout(stdout),
+        () = async {
+            loop {
+                if cancelled.is_cancelled() { return; }
+                tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
+            }
+        } => First::Cancelled,
+        () = tokio::time::sleep(timeout) => First::TimedOut,
+    };
+
+    let (status, output) = match first {
+        First::Status(status) => {
+            let status = status.context("failed waiting for fixed APEX instruction reader")?;
+            let output = stdout_task
+                .await
+                .context("APEX stdout reader task failed")?
+                .context("failed reading APEX stdout")?;
+            (status, output)
+        }
+        First::Stdout(output) => {
+            let output = output
+                .context("APEX stdout reader task failed")?
+                .context("failed reading APEX stdout")?;
+            if output.len() > APEX_TASK_INSTRUCTIONS_MAX_BYTES {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                stderr_task.abort();
+                anyhow::bail!("apex_task_instructions_too_large");
+            }
+            let status = tokio::time::timeout(timeout, child.wait())
+                .await
+                .context("fixed APEX instruction reader timed out")?
+                .context("failed waiting for fixed APEX instruction reader")?;
+            (status, output)
+        }
+        First::Cancelled => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            anyhow::bail!("fixed APEX instruction read cancelled after lease loss");
+        }
+        First::TimedOut => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            anyhow::bail!("fixed APEX instruction read timed out");
+        }
+    };
+    let _ = stderr_task.await;
+    anyhow::ensure!(
+        output.len() <= APEX_TASK_INSTRUCTIONS_MAX_BYTES,
+        "apex_task_instructions_too_large"
+    );
+    anyhow::ensure!(status.success(), "fixed APEX instruction reader failed");
+    Ok(output)
 }
 
 async fn run_kubectl_command_async(
@@ -3503,8 +3787,27 @@ impl SandboxProvider for KubernetesDryRunProvider {
             WorkerCapability::Snapshot,
             WorkerCapability::DesktopStream,
         ];
+        if self.apex_trusted_supervisor_v1
+            && image_is_digest_pinned(&self.runtime_image)
+            && self.isolation_profile == IsolationProfile::Gvisor
+            && self
+                .runtime_class_name
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty())
+        {
+            capabilities.push(WorkerCapability::ApexTrustedSupervisorV1);
+            capabilities.push(WorkerCapability::ApexTaskInstructions);
+        }
         if self.runtime_class_name.is_some() {
-            capabilities.push(WorkerCapability::GvisorSandbox);
+            match self.isolation_profile {
+                IsolationProfile::Development => {}
+                IsolationProfile::Gvisor => {
+                    capabilities.push(WorkerCapability::SandboxedContainer);
+                }
+                IsolationProfile::Kata => {
+                    capabilities.push(WorkerCapability::VirtualMachine);
+                }
+            }
         }
         if self.fqdn_egress_backend.as_deref() == Some("cilium")
             || self
@@ -3555,6 +3858,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
         request: AgentCommandRequest,
         _cancelled: &CancelSignal,
     ) -> anyhow::Result<AgentCommandResult> {
+        validate_agent_command_request(&request)?;
         let started_at = Utc::now();
         let finished_at = Utc::now();
         Ok(AgentCommandResult {
@@ -3575,6 +3879,18 @@ impl SandboxProvider for KubernetesDryRunProvider {
             started_at,
             finished_at,
         })
+    }
+
+    fn materialize_file(
+        &self,
+        sandbox_id: SandboxId,
+        destination: MaterializeFileDestination,
+        expected_sha256: &str,
+        content: &[u8],
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<MaterializeFileObservation> {
+        let _ = (sandbox_id, destination, expected_sha256, content, cancelled);
+        anyhow::bail!("materialization attestation is unavailable in dry-run mode")
     }
 
     fn create_snapshot(
@@ -3618,6 +3934,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
         spec: &SandboxProvisionSpec,
         _cancelled: &CancelSignal,
     ) -> anyhow::Result<ProviderForkHandle> {
+        self.validate_runtime_profile(spec)?;
         self.validate_network_policy_egress(&spec.network_egress)?;
         let network_policy =
             self.network_policy_manifest(child_sandbox_id, &spec.network_egress)?;
@@ -3675,6 +3992,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
 impl SandboxProvider for KubernetesApplyProvider {
     fn capability_report(&self) -> ProviderCapabilityReport {
         let mut report = self.dry_run.capability_report();
+        report.capabilities.push(WorkerCapability::MaterializeFile);
         report
             .labels
             .insert("provider_mode".to_string(), "apply".to_string());
@@ -3793,6 +4111,7 @@ impl SandboxProvider for KubernetesApplyProvider {
         request: AgentCommandRequest,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<AgentCommandResult> {
+        validate_agent_command_request(&request)?;
         // Only provision when the pod is actually missing. Re-applying the full
         // manifest set (and re-waiting up to 120s) before every command is both slow
         // and unsafe: Pod `resources` are immutable, so an exec whose spec drifts from
@@ -3826,6 +4145,120 @@ impl SandboxProvider for KubernetesApplyProvider {
             stderr: output.stderr,
             started_at,
             finished_at,
+        })
+    }
+
+    fn read_apex_task_instructions(
+        &self,
+        sandbox_id: SandboxId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<Vec<u8>> {
+        // A live read is valid only against a provider-owned pod that already
+        // exists. Never provision/re-apply as a side effect of this endpoint.
+        anyhow::ensure!(
+            self.pod_exists(sandbox_id, cancelled)?,
+            "sandbox provider apply proof is unavailable"
+        );
+        run_fixed_apex_task_instructions(
+            &self.kubectl,
+            &self.apex_task_instructions_args(sandbox_id),
+            self.kubectl_command_timeout,
+            cancelled,
+        )
+    }
+
+    fn materialize_file(
+        &self,
+        sandbox_id: SandboxId,
+        destination: MaterializeFileDestination,
+        expected_sha256: &str,
+        content: &[u8],
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<MaterializeFileObservation> {
+        Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
+        anyhow::ensure!(
+            content.len() as u64 <= MAX_SANDBOX_FILE_BYTES,
+            "materialization exceeds 64 MiB"
+        );
+        anyhow::ensure!(
+            sha256_hex(content) == expected_sha256,
+            "materialization digest mismatch"
+        );
+        anyhow::ensure!(
+            self.pod_exists(sandbox_id, cancelled)?,
+            "sandbox pod is unavailable"
+        );
+        let request = AgentCommandRequest {
+            argv: vec![
+                "/opt/apex/bin/import-file".to_string(),
+                "--destination".to_string(),
+                destination.guest_path().to_string(),
+                "--sha256".to_string(),
+                expected_sha256.to_string(),
+            ],
+            cwd: None,
+            env: Default::default(),
+            // An empty marker causes `exec_args` to add `-i`; the content
+            // itself is passed once, as a borrowed slice, below.
+            stdin: Some(Vec::new()),
+            timeout_secs: Some(300),
+        };
+        let output = run_kubectl_command_with_stdin(
+            &self.kubectl,
+            &self.exec_args(sandbox_id, &request),
+            Some(content),
+            "materialize sandbox file",
+            Duration::from_secs(300),
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        anyhow::ensure!(output.success, "sandbox file materialization failed");
+        let observation_request = AgentCommandRequest {
+            argv: vec![
+                "/usr/bin/sha256sum".to_string(),
+                destination.guest_path().to_string(),
+            ],
+            cwd: None,
+            env: Default::default(),
+            stdin: None,
+            timeout_secs: Some(30),
+        };
+        let observation = run_kubectl_command_with_stdin(
+            &self.kubectl,
+            &self.exec_args(sandbox_id, &observation_request),
+            None,
+            "observe materialized sandbox file",
+            Duration::from_secs(30),
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        anyhow::ensure!(
+            observation.success,
+            "sandbox file materialization observation failed"
+        );
+        let mut fields = observation.stdout.split_ascii_whitespace();
+        let destination_sha256 = fields
+            .next()
+            .context("materialization observation digest is missing")?;
+        let observed_path = fields
+            .next()
+            .context("materialization observation destination is missing")?;
+        anyhow::ensure!(
+            fields.next().is_none()
+                && destination_sha256.len() == 64
+                && destination_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                && observed_path == destination.guest_path(),
+            "materialization observation is invalid"
+        );
+        anyhow::ensure!(
+            destination_sha256 == expected_sha256,
+            "materialized destination digest mismatch"
+        );
+        Ok(MaterializeFileObservation {
+            destination_sha256: destination_sha256.to_string(),
+            size_bytes: content.len() as u64,
         })
     }
 

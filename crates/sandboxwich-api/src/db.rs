@@ -131,9 +131,9 @@ pub(crate) async fn ensure_database_constraints(db: &Database) -> anyhow::Result
 }
 
 pub(crate) const DB_ENUM_SCHEMA_METADATA_KEY: &str = "db_enum_constraints_fingerprint";
-// v4 adds durable provisioning-stage observation constraints. Bumping the
-// version forces existing installations to install the new guards on upgrade.
-pub(crate) const DB_ENUM_SCHEMA_FINGERPRINT_VERSION: &str = "db-enum-v4";
+// v5 adds execution-class constraints. Bumping the version forces existing
+// installations to install the new guards on upgrade.
+pub(crate) const DB_ENUM_SCHEMA_FINGERPRINT_VERSION: &str = "db-enum-v5";
 pub(crate) const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 pub(crate) const FNV_PRIME: u64 = 0x00000100000001b3;
 
@@ -257,6 +257,27 @@ pub(crate) const DB_ENUM_COLUMNS: &[DbEnumColumn] = &[
         "invalid sandbox workspace mode",
     ),
     DbEnumColumn::new(
+        "sandboxes",
+        "runtime_profile",
+        "sandboxes_runtime_profile_check",
+        <SandboxRuntimeProfile as DbVariant>::VALUES,
+        "invalid sandbox runtime profile",
+    ),
+    DbEnumColumn::new(
+        "sandboxes",
+        "execution_class",
+        "sandboxes_execution_class_check",
+        <ExecutionClass as DbVariant>::VALUES,
+        "invalid sandbox execution class",
+    ),
+    DbEnumColumn::new(
+        "snapshot_restore_sources",
+        "execution_class",
+        "snapshot_restore_sources_execution_class_check",
+        <ExecutionClass as DbVariant>::VALUES,
+        "invalid snapshot restore source execution class",
+    ),
+    DbEnumColumn::new(
         "sandbox_network_egress_rules",
         "kind",
         "sandbox_network_egress_rules_kind_check",
@@ -311,6 +332,13 @@ pub(crate) const DB_ENUM_COLUMNS: &[DbEnumColumn] = &[
         "jobs_required_capability_check",
         <WorkerCapability as DbVariant>::VALUES,
         "invalid job required capability",
+    ),
+    DbEnumColumn::new(
+        "jobs",
+        "required_execution_class",
+        "jobs_required_execution_class_check",
+        <ExecutionClass as DbVariant>::VALUES,
+        "invalid job required execution class",
     ),
     DbEnumColumn::new(
         "job_leases",

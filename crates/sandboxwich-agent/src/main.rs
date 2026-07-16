@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
     collections::BTreeMap,
     io::{Read as _, Write as _},
@@ -22,7 +24,10 @@ use sandboxwich_core::{
     AgentHealthResponse, AppendCommandOutputRequest, ClaimLeaseRequest, ClaimLeaseResponse,
     CommandOutputStream, CompleteLeaseRequest, DEFAULT_COMMAND_TIMEOUT_SECS, FailLeaseRequest,
     GuestStatus, GuestTokenResponse, JobKind, LeaseId, LeaseResponse, MintGuestTokenRequest,
-    RenewLeaseRequest, SandboxId, UpdateGuestHealthRequest, WorkerJobResult, build_api_client,
+    RenewLeaseRequest, ResidentProcessBootstrapReadRequest, ResidentProcessBootstrapReadResponse,
+    ResidentProcessId, ResidentProcessObservationRequest, ResidentProcessObservedState,
+    ResidentProcessRestartPolicy, SandboxId, UpdateGuestHealthRequest, WorkerJobResult,
+    build_api_client, validate_agent_command_request,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -646,6 +651,7 @@ async fn exec(args: ExecArgs) -> anyhow::Result<()> {
             argv: args.argv,
             cwd: args.cwd,
             env: args.env.into_iter().collect(),
+            stdin: None,
             timeout_secs: args.timeout_secs,
         },
         client.as_ref(),
@@ -972,7 +978,7 @@ async fn claim_lease(
         .json(&ClaimLeaseRequest {
             lease_seconds,
             sandbox_id: Some(sandbox_id),
-            kinds: Some(vec![JobKind::RunCommand]),
+            kinds: Some(vec![JobKind::RunCommand, JobKind::RunResidentProcess]),
         })
         .send()
         .await?;
@@ -1057,7 +1063,7 @@ fn spawn_lease_renewal_task(
 /// so the intended executor still gets a chance to run it.
 #[derive(Debug, Eq, PartialEq)]
 enum LeaseScopeViolation {
-    /// This daemon only executes `run_command` jobs.
+    /// This daemon executes only guest command and resident-process jobs.
     WrongKind { kind: JobKind },
     /// The job's payload targets a different sandbox than this daemon's own
     /// `--sandbox-id`.
@@ -1069,7 +1075,7 @@ impl std::fmt::Display for LeaseScopeViolation {
         match self {
             LeaseScopeViolation::WrongKind { kind } => write!(
                 f,
-                "sandboxwich-agent daemon only handles run_command leases, got {kind:?}"
+                "sandboxwich-agent daemon cannot handle lease kind {kind:?}"
             ),
             LeaseScopeViolation::WrongSandbox { job_sandbox_id } => write!(
                 f,
@@ -1093,7 +1099,7 @@ fn lease_scope_violation(
     job: &sandboxwich_core::Job,
     sandbox_id: SandboxId,
 ) -> Option<LeaseScopeViolation> {
-    if job.kind != JobKind::RunCommand {
+    if !matches!(job.kind, JobKind::RunCommand | JobKind::RunResidentProcess) {
         return Some(LeaseScopeViolation::WrongKind {
             kind: job.kind.clone(),
         });
@@ -1127,6 +1133,10 @@ async fn handle_lease(
             .send()
             .await?;
         return decode_json(response).await.map_err(Into::into);
+    }
+
+    if lease.job.kind == JobKind::RunResidentProcess {
+        return handle_resident_process(client, api, lease).await;
     }
 
     let request = agent_request_from_payload(&lease.job.payload)?;
@@ -1180,6 +1190,252 @@ async fn handle_lease(
     }
 }
 
+async fn post_resident_observation(
+    client: &reqwest::Client,
+    api: &str,
+    process_id: ResidentProcessId,
+    request: ResidentProcessObservationRequest,
+) -> anyhow::Result<()> {
+    client
+        .post(format!(
+            "{api}/resident-processes/{process_id}/observations"
+        ))
+        .json(&request)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+async fn handle_resident_process(
+    client: &reqwest::Client,
+    api: &str,
+    lease: sandboxwich_core::JobLease,
+) -> anyhow::Result<LeaseResponse> {
+    let process_id: ResidentProcessId = serde_json::from_value(
+        lease
+            .job
+            .payload
+            .get("residentProcessId")
+            .cloned()
+            .context("residentProcessId is missing")?,
+    )
+    .context("residentProcessId is invalid")?;
+    let generation = lease
+        .job
+        .payload
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .context("resident generation is missing")?;
+    let argv: Vec<String> = serde_json::from_value(
+        lease
+            .job
+            .payload
+            .get("argv")
+            .cloned()
+            .context("resident argv is missing")?,
+    )
+    .context("resident argv is invalid")?;
+    let (program, args) = argv
+        .split_first()
+        .context("resident argv must contain a program")?;
+    let cwd = lease
+        .job
+        .payload
+        .get("cwd")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value::<String>(value.clone()))
+        .transpose()
+        .context("resident cwd is invalid")?;
+    let env = lease
+        .job
+        .payload
+        .get("env")
+        .cloned()
+        .map(serde_json::from_value::<BTreeMap<String, String>>)
+        .transpose()
+        .context("resident env is invalid")?
+        .unwrap_or_default();
+    let restart_policy: ResidentProcessRestartPolicy = serde_json::from_value(
+        lease
+            .job
+            .payload
+            .get("restartPolicy")
+            .cloned()
+            .context("resident restart policy is missing")?,
+    )
+    .context("resident restart policy is invalid")?;
+    let expected_sha256 = lease
+        .job
+        .payload
+        .get("bootstrapSha256")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+
+    if let Some(expected_sha256) = expected_sha256 {
+        let bootstrap: ResidentProcessBootstrapReadResponse = decode_json(
+            client
+                .post(format!("{api}/resident-processes/{process_id}/bootstrap"))
+                .json(&ResidentProcessBootstrapReadRequest {
+                    generation,
+                    lease_id: lease.id.0,
+                    expected_sha256,
+                })
+                .send()
+                .await?,
+        )
+        .await?;
+        let target = Path::new(&bootstrap.target_file);
+        anyhow::ensure!(
+            target.starts_with("/run/sandboxwich/bootstrap"),
+            "resident bootstrap path is outside the allowed root"
+        );
+        let parent = target
+            .parent()
+            .context("resident bootstrap has no parent")?;
+        std::fs::create_dir_all(parent)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(bootstrap.mode);
+        let mut file = options
+            .open(target)
+            .with_context(|| format!("failed to create {}", target.display()))?;
+        file.write_all(&bootstrap.content)?;
+        file.sync_all()?;
+    }
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let renew_task =
+        spawn_lease_renewal_task(client.clone(), api.to_string(), &lease, cancelled.clone());
+    let max_attempts = if restart_policy == ResidentProcessRestartPolicy::OnFailure {
+        3
+    } else {
+        1
+    };
+    let mut last_exit_code = None;
+    for attempt in 1..=max_attempts {
+        post_resident_observation(
+            client,
+            api,
+            process_id,
+            ResidentProcessObservationRequest {
+                generation,
+                lease_id: lease.id.0,
+                observed_state: ResidentProcessObservedState::Starting,
+                pid: None,
+                exit_code: None,
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .await?;
+        let mut command = ProcessCommand::new(program);
+        command.args(args).envs(&env);
+        if let Some(cwd) = &cwd {
+            command.current_dir(cwd);
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+        let mut child = command
+            .spawn()
+            .context("failed to spawn resident process")?;
+        let pid = child.id();
+        post_resident_observation(
+            client,
+            api,
+            process_id,
+            ResidentProcessObservationRequest {
+                generation,
+                lease_id: lease.id.0,
+                observed_state: ResidentProcessObservedState::Running,
+                pid,
+                exit_code: None,
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .await?;
+        let status = tokio::select! {
+            result = child.wait() => result.context("failed to wait for resident process")?,
+            () = async {
+                while !cancelled.load(Ordering::SeqCst) {
+                    tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
+                }
+            } => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                post_resident_observation(
+                    client,
+                    api,
+                    process_id,
+                    ResidentProcessObservationRequest {
+                        generation,
+                        lease_id: lease.id.0,
+                        observed_state: ResidentProcessObservedState::Lost,
+                        pid,
+                        exit_code: None,
+                        error_code: Some("lease_lost".into()),
+                        error_message: Some("resident process lease renewal was lost".into()),
+                    },
+                ).await?;
+                renew_task.abort();
+                let response = client
+                    .post(format!("{api}/leases/{}/fail", lease.id))
+                    .json(&FailLeaseRequest {
+                        error: "resident process lease renewal was lost".into(),
+                        retry: true,
+                    })
+                    .send()
+                    .await?;
+                return decode_json(response).await.map_err(Into::into);
+            }
+        };
+        last_exit_code = status.code();
+        if status.success() || attempt == max_attempts {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
+    }
+    renew_task.abort();
+    let _ = renew_task.await;
+    let observed_state = if last_exit_code == Some(0) {
+        ResidentProcessObservedState::Stopped
+    } else {
+        ResidentProcessObservedState::Failed
+    };
+    post_resident_observation(
+        client,
+        api,
+        process_id,
+        ResidentProcessObservationRequest {
+            generation,
+            lease_id: lease.id.0,
+            observed_state,
+            pid: None,
+            exit_code: last_exit_code,
+            error_code: (last_exit_code != Some(0)).then(|| "resident_process_exit".into()),
+            error_message: None,
+        },
+    )
+    .await?;
+    let response = client
+        .post(format!("{api}/leases/{}/complete", lease.id))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::RunResidentProcess {
+                process_id,
+                generation,
+                exit_code: last_exit_code,
+            }),
+        })
+        .send()
+        .await?;
+    decode_json(response).await.map_err(Into::into)
+}
+
 async fn execute_streaming(
     request: AgentCommandRequest,
     client: Option<&reqwest::Client>,
@@ -1188,22 +1444,43 @@ async fn execute_streaming(
     max_captured_output_bytes: u64,
     cancelled: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<AgentCommandResult> {
-    let Some((program, args)) = request.argv.split_first() else {
+    validate_agent_command_request(&request)?;
+    let AgentCommandRequest {
+        argv,
+        cwd,
+        env,
+        stdin,
+        timeout_secs,
+    } = request;
+    let Some((program, args)) = argv.split_first() else {
         bail!("argv must contain at least one item");
     };
-    let timeout = Duration::from_secs(request.timeout_secs.unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS));
+    let timeout = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS));
 
     let started_at = Utc::now();
     let mut command = ProcessCommand::new(program);
     command.args(args);
-    if let Some(cwd) = request.cwd {
+    if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    command.envs(request.env);
+    command.envs(env);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
+    if stdin.is_some() {
+        command.stdin(Stdio::piped());
+    }
 
     let mut child = command.spawn().context("failed to execute command")?;
+    let stdin_task = match stdin {
+        Some(bytes) => {
+            let mut pipe = child.stdin.take().context("failed to open command stdin")?;
+            Some(tokio::spawn(async move {
+                pipe.write_all(&bytes).await?;
+                Ok::<_, std::io::Error>(())
+            }))
+        }
+        None => None,
+    };
     let stdout = child.stdout.take().context("failed to capture stdout")?;
     let stderr = child.stderr.take().context("failed to capture stderr")?;
     let stdout_task = tokio::spawn(stream_reader(
@@ -1274,6 +1551,15 @@ async fn execute_streaming(
             );
         }
     };
+
+    if status.success()
+        && let Some(stdin_task) = stdin_task
+    {
+        stdin_task
+            .await
+            .context("command stdin writer task failed")?
+            .context("failed to write command stdin")?;
+    }
     let stdout = stdout_task.await.context("stdout stream task failed")??;
     let stderr = stderr_task.await.context("stderr stream task failed")??;
     let finished_at = Utc::now();
@@ -1510,13 +1796,38 @@ fn agent_request_from_payload(payload: &serde_json::Value) -> anyhow::Result<Age
         .transpose()
         .context("job payload env is invalid")?
         .unwrap_or_else(BTreeMap::new);
+    let stdin = payload
+        .get("stdin")
+        .cloned()
+        .map(|value| {
+            serde_json::from_value(serde_json::json!({
+                "argv": [],
+                "cwd": null,
+                "env": {},
+                "stdin": value,
+                "timeout_secs": null
+            }))
+            .map(|request: AgentCommandRequest| request.stdin)
+        })
+        .transpose()
+        .map_err(|error| {
+            if error.to_string().contains("command_stdin_too_large") {
+                anyhow::anyhow!("command_stdin_too_large: command stdin exceeds 1048576 bytes")
+            } else {
+                anyhow::Error::new(error).context("job payload stdin is invalid")
+            }
+        })?
+        .flatten();
     let timeout_secs = payload.get("timeoutSecs").and_then(|value| value.as_u64());
-    Ok(AgentCommandRequest {
+    let request = AgentCommandRequest {
         argv,
         cwd,
         env,
+        stdin,
         timeout_secs,
-    })
+    };
+    validate_agent_command_request(&request)?;
+    Ok(request)
 }
 
 async fn decode_json<T>(response: reqwest::Response) -> Result<T, AgentRequestError>
@@ -1903,6 +2214,7 @@ mod tests {
             argv: vec!["sh".to_string(), "-c".to_string(), "echo ok".to_string()],
             cwd: None,
             env: BTreeMap::new(),
+            stdin: None,
             timeout_secs: Some(5),
         };
         let result = execute_streaming(
@@ -1920,6 +2232,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_stdin_reaches_guest_but_not_result_debug_or_serialization() {
+        let marker = b"apex-private-input".to_vec();
+        let request = AgentCommandRequest {
+            argv: vec!["sh".to_string(), "-c".to_string(), "sha256sum".to_string()],
+            cwd: None,
+            env: BTreeMap::new(),
+            stdin: Some(marker),
+            timeout_secs: Some(5),
+        };
+
+        let debug = format!("{request:?}");
+        let serialized = serde_json::to_string(&request).expect("request should serialize");
+        let result = execute_streaming(
+            request,
+            None,
+            None,
+            None,
+            DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
+            None,
+        )
+        .await
+        .expect("stdin hashing command should complete");
+
+        assert!(
+            result
+                .stdout
+                .contains("f825ba6c6c1ddd75498ea957ba3e31ab2f3b8855baa87fe32197e14096e553c2")
+        );
+        for rendering in [debug, serialized, serde_json::to_string(&result).unwrap()] {
+            assert!(!rendering.contains("apex-private-input"));
+        }
+    }
+
+    #[tokio::test]
     async fn execute_streaming_kills_and_errors_on_timeout() {
         // Regression test for item 3(a): before this fix, `execute_streaming`
         // called `child.wait().await` with no bound at all, so a wedged (or
@@ -1931,6 +2277,7 @@ mod tests {
             argv: vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
             cwd: None,
             env: BTreeMap::new(),
+            stdin: None,
             timeout_secs: Some(1),
         };
         let started = std::time::Instant::now();
@@ -1970,6 +2317,7 @@ mod tests {
             argv: vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
             cwd: None,
             env: BTreeMap::new(),
+            stdin: None,
             timeout_secs: Some(60), // Long enough that the timeout branch can't win the race.
         };
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -2012,6 +2360,7 @@ mod tests {
             status: sandboxwich_core::JobStatus::Leased,
             payload,
             required_capability: sandboxwich_core::WorkerCapability::RunCommand,
+            required_execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
             priority: 0,
             attempts: 1,
             max_attempts: 3,
@@ -2058,6 +2407,22 @@ mod tests {
         let job = test_job(
             JobKind::RunCommand,
             serde_json::json!({ "sandboxId": sandbox_id, "argv": ["echo", "hi"] }),
+        );
+
+        assert_eq!(lease_scope_violation(&job, sandbox_id), None);
+    }
+
+    #[test]
+    fn lease_scope_violation_accepts_a_resident_process_for_its_own_sandbox() {
+        let sandbox_id = SandboxId(Uuid::now_v7());
+        let job = test_job(
+            JobKind::RunResidentProcess,
+            serde_json::json!({
+                "sandboxId": sandbox_id,
+                "residentProcessId": Uuid::now_v7(),
+                "generation": 1,
+                "argv": ["/usr/local/bin/orb-executor"]
+            }),
         );
 
         assert_eq!(lease_scope_violation(&job, sandbox_id), None);

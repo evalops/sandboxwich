@@ -2,6 +2,261 @@ use crate::common::*;
 use reqwest::StatusCode;
 use sandboxwich_core::*;
 
+async fn register_execution_worker(
+    client: &reqwest::Client,
+    server: &TestServer,
+    name: &str,
+    capabilities: Vec<WorkerCapability>,
+) -> WorkerResponse {
+    client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: name.to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities,
+            max_concurrent_jobs: Some(1),
+            labels: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+async fn create_execution_sandbox(
+    client: &reqwest::Client,
+    server: &TestServer,
+    name: &str,
+    execution_class: ExecutionClass,
+    network_egress: Option<NetworkEgress>,
+) -> SandboxResponse {
+    client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            execution_class: Some(execution_class),
+            workspace_mode: None,
+            name: Some(name.to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress,
+            ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+            runtime_profile: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+async fn claim_execution_job(
+    server: &TestServer,
+    worker: &WorkerResponse,
+    sandbox_id: SandboxId,
+) -> Option<JobLease> {
+    worker_client(worker)
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox_id),
+            kinds: Some(vec![JobKind::ProvisionSandbox]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<ClaimLeaseResponse>()
+        .await
+        .unwrap()
+        .lease
+}
+
+#[tokio::test]
+async fn workers_claim_only_jobs_matching_functional_and_execution_requirements() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("execution-routing.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+
+    let development = register_execution_worker(
+        &client,
+        &server,
+        "execution-development",
+        vec![WorkerCapability::ProvisionSandbox],
+    )
+    .await;
+    let sandboxed = register_execution_worker(
+        &client,
+        &server,
+        "execution-sandboxed",
+        vec![
+            WorkerCapability::ProvisionSandbox,
+            WorkerCapability::SandboxedContainer,
+        ],
+    )
+    .await;
+    let virtual_machine = register_execution_worker(
+        &client,
+        &server,
+        "execution-vm",
+        vec![
+            WorkerCapability::ProvisionSandbox,
+            WorkerCapability::VirtualMachine,
+        ],
+    )
+    .await;
+    let sandboxed_only = register_execution_worker(
+        &client,
+        &server,
+        "execution-sandboxed-only",
+        vec![WorkerCapability::SandboxedContainer],
+    )
+    .await;
+    let vm_only = register_execution_worker(
+        &client,
+        &server,
+        "execution-vm-only",
+        vec![WorkerCapability::VirtualMachine],
+    )
+    .await;
+
+    let development_sandbox = create_execution_sandbox(
+        &client,
+        &server,
+        "execution-development",
+        ExecutionClass::DevelopmentContainer,
+        None,
+    )
+    .await;
+    assert!(
+        claim_execution_job(&server, &sandboxed_only, development_sandbox.sandbox.id)
+            .await
+            .is_none(),
+        "sandboxed execution support must not replace the ProvisionSandbox functional capability"
+    );
+    assert!(
+        claim_execution_job(&server, &vm_only, development_sandbox.sandbox.id)
+            .await
+            .is_none(),
+        "VM execution support must not replace the ProvisionSandbox functional capability"
+    );
+    assert!(
+        claim_execution_job(&server, &development, development_sandbox.sandbox.id)
+            .await
+            .is_some()
+    );
+
+    let sandboxed_sandbox = create_execution_sandbox(
+        &client,
+        &server,
+        "execution-sandboxed",
+        ExecutionClass::SandboxedContainer,
+        None,
+    )
+    .await;
+    assert!(
+        claim_execution_job(&server, &virtual_machine, sandboxed_sandbox.sandbox.id)
+            .await
+            .is_none()
+    );
+    let sandboxed_lease = claim_execution_job(&server, &sandboxed, sandboxed_sandbox.sandbox.id)
+        .await
+        .expect("sandboxed worker should claim sandboxed-container work");
+    assert_eq!(
+        sandboxed_lease.required_execution_class,
+        ExecutionClass::SandboxedContainer
+    );
+
+    let vm_sandbox = create_execution_sandbox(
+        &client,
+        &server,
+        "execution-vm",
+        ExecutionClass::VirtualMachine,
+        None,
+    )
+    .await;
+    assert!(
+        claim_execution_job(&server, &sandboxed, vm_sandbox.sandbox.id)
+            .await
+            .is_none()
+    );
+    let vm_lease = claim_execution_job(&server, &virtual_machine, vm_sandbox.sandbox.id)
+        .await
+        .expect("VM worker should claim virtual-machine work");
+    assert_eq!(
+        vm_lease.required_execution_class,
+        ExecutionClass::VirtualMachine
+    );
+
+    let fqdn_only = register_execution_worker(
+        &client,
+        &server,
+        "execution-fqdn-only",
+        vec![WorkerCapability::FqdnEgress],
+    )
+    .await;
+    let vm_and_fqdn = register_execution_worker(
+        &client,
+        &server,
+        "execution-vm-fqdn",
+        vec![
+            WorkerCapability::VirtualMachine,
+            WorkerCapability::FqdnEgress,
+        ],
+    )
+    .await;
+    let vm_fqdn_sandbox = create_execution_sandbox(
+        &client,
+        &server,
+        "execution-vm-fqdn",
+        ExecutionClass::VirtualMachine,
+        Some(NetworkEgress::Allowlist {
+            rules: vec![NetworkAllowRule {
+                kind: NetworkAllowRuleKind::Host,
+                value: "api.example.com".to_string(),
+            }],
+        }),
+    )
+    .await;
+    assert!(
+        claim_execution_job(&server, &vm_only, vm_fqdn_sandbox.sandbox.id)
+            .await
+            .is_none()
+    );
+    assert!(
+        claim_execution_job(&server, &fqdn_only, vm_fqdn_sandbox.sandbox.id)
+            .await
+            .is_none()
+    );
+    let vm_fqdn_lease = claim_execution_job(&server, &vm_and_fqdn, vm_fqdn_sandbox.sandbox.id)
+        .await
+        .expect("worker satisfying both predicates should claim VM+FQDN work");
+    assert_eq!(
+        vm_fqdn_lease.job.required_capability,
+        WorkerCapability::FqdnEgress
+    );
+    assert_eq!(
+        vm_fqdn_lease.required_execution_class,
+        ExecutionClass::VirtualMachine
+    );
+}
+
 #[tokio::test]
 pub(crate) async fn runtime_resource_inventory_is_worker_scoped_and_bounded() {
     let data_dir = tempfile::tempdir().unwrap();
@@ -55,12 +310,16 @@ pub(crate) async fn runtime_resource_inventory_is_worker_scoped_and_bounded() {
     let sandbox: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("inventory-sandbox".to_string()),
             template: None,
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -259,12 +518,16 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
         client
             .post(format!("{}/sandboxes", server.base_url))
             .json(&CreateSandboxRequest {
+                execution_class: None,
                 workspace_mode: None,
+                runtime_profile: None,
                 name: Some(name.to_string()),
                 template: None,
                 memory_limit: None,
                 network_egress: None,
                 ttl_seconds: Some(120),
+                max_lifetime_seconds: None,
+                idle_ttl_seconds: None,
             })
             .send()
             .await
@@ -447,6 +710,7 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
             argv: vec!["true".to_string()],
             cwd: None,
             env: Default::default(),
+            stdin: None,
             timeout_secs: None,
         })
         .send()
@@ -841,7 +1105,11 @@ pub(crate) async fn guest_tokens_are_scoped_to_their_own_sandbox_within_one_work
                 template: None,
                 memory_limit: None,
                 network_egress: None,
+                runtime_profile: None,
+                execution_class: None,
                 ttl_seconds: Some(120),
+                max_lifetime_seconds: None,
+                idle_ttl_seconds: None,
             })
             .send()
             .await
@@ -972,6 +1240,7 @@ pub(crate) async fn guest_tokens_are_scoped_to_their_own_sandbox_within_one_work
             argv: vec!["true".to_string()],
             cwd: None,
             env: Default::default(),
+            stdin: None,
             timeout_secs: None,
         })
         .send()

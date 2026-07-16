@@ -2,6 +2,7 @@ use crate::auth::*;
 use crate::db::*;
 use crate::error::*;
 use crate::handlers::commands::*;
+use crate::handlers::files::*;
 use crate::handlers::jobs::*;
 use crate::handlers::sandboxes::*;
 use crate::handlers::snapshots::*;
@@ -9,14 +10,35 @@ use crate::reconcile::*;
 use crate::rows::*;
 use crate::state::*;
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::{Extension, Path, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use sandboxwich_core::*;
 use serde_json::json;
+use sha2::Digest;
 use sqlx::AnyConnection;
 use sqlx::Row;
 use uuid::Uuid;
+
+fn worker_execution_classes(capabilities: &[WorkerCapability]) -> Vec<ExecutionClass> {
+    let mut classes = vec![ExecutionClass::DevelopmentContainer];
+    if capabilities.contains(&WorkerCapability::SandboxedContainer) {
+        classes.push(ExecutionClass::SandboxedContainer);
+    }
+    if capabilities.contains(&WorkerCapability::VirtualMachine) {
+        classes.push(ExecutionClass::VirtualMachine);
+    }
+    classes
+}
+
+fn worker_supports_execution_class(worker: &Worker, execution_class: &ExecutionClass) -> bool {
+    *execution_class == ExecutionClass::DevelopmentContainer
+        || worker
+            .capabilities
+            .contains(&execution_capability(execution_class))
+}
 
 pub(crate) async fn claim_lease(
     State(state): State<AppState>,
@@ -38,10 +60,15 @@ pub(crate) async fn claim_lease(
     // below, which it can freely omit or widen.
     if let Some(sandbox_id) = ctx.guest_sandbox_id()
         && (request.sandbox_id != Some(sandbox_id)
-            || request.kinds.as_deref() != Some(&[JobKind::RunCommand]))
+            || request.kinds.as_deref().is_none_or(|kinds| {
+                kinds.is_empty()
+                    || kinds.iter().any(|kind| {
+                        !matches!(kind, JobKind::RunCommand | JobKind::RunResidentProcess)
+                    })
+            }))
     {
         return Err(ApiError::bad_request(
-            "guest lease claims must specify their own sandbox_id and only run_command kind",
+            "guest lease claims must specify their own sandbox_id and only guest-executable kinds",
         ));
     }
     let worker = ensure_worker_tenant(&state.db, worker_id, &ctx).await?;
@@ -86,6 +113,7 @@ pub(crate) async fn claim_lease(
         .iter()
         .map(worker_capability_to_str)
         .collect::<Vec<_>>();
+    let execution_classes = worker_execution_classes(&worker.capabilities);
     if capabilities.is_empty() {
         return Ok(Json(ClaimLeaseResponse {
             ok: true,
@@ -93,7 +121,7 @@ pub(crate) async fn claim_lease(
         }));
     }
     let mut query = state.db.query_builder(
-        "select id, tenant_id, kind, status, payload, required_capability, priority, attempts, max_attempts,
+        "select id, tenant_id, kind, status, payload, required_capability, required_execution_class, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
          from jobs
          where tenant_id = ",
@@ -109,6 +137,13 @@ pub(crate) async fn claim_lease(
             required.push_bind(capability);
         }
     }
+    query.push(") and required_execution_class in (");
+    {
+        let mut required = query.separated(", ");
+        for execution_class in execution_classes {
+            required.push_bind(execution_class.as_db_str());
+        }
+    }
     query
         .push(
             ")
@@ -120,7 +155,7 @@ pub(crate) async fn claim_lease(
                  and (p.worker_id = ",
         )
         .push_bind(worker.id.to_string())
-        .push(" or (p.provider = ")
+        .push(" or (jobs.kind != 'apex_task_instructions' and p.provider = ")
         .push_bind(&worker.provider)
         .push(" and (p.cluster is null or p.cluster = ")
         .push_bind(worker.labels.get("cluster").cloned().unwrap_or_default())
@@ -131,6 +166,9 @@ pub(crate) async fn claim_lease(
         );
     if let Some(job_id) = requested_job_id {
         query.push(" and id = ").push_bind(job_id.to_string());
+    }
+    if ctx.guest_sandbox_id().is_none() {
+        query.push(" and kind != 'run_resident_process'");
     }
     // Sandbox/kind scoping (see the doc comment on `ClaimLeaseRequest::sandbox_id`):
     // a caller such as `sandboxwich-agent`'s daemon loop can narrow claims to the
@@ -179,11 +217,20 @@ pub(crate) async fn claim_lease(
     let rows = query.build().fetch_all(&state.db.pool).await?;
 
     for row in rows {
-        let job = row_to_job(row)?;
+        let mut job = row_to_job(row)?;
         // Defense in depth: SQL is the efficient scheduling filter, but keep the typed
         // capability check at the claim boundary so a future query refactor cannot lease
         // work to an incompatible worker.
         if !worker.capabilities.contains(&job.required_capability) {
+            continue;
+        }
+        if !authoritatively_refresh_job_placement(&state.db, &mut job).await? {
+            continue;
+        }
+        if !worker_supports_runtime_profile(&worker, &job) {
+            continue;
+        }
+        if !worker_supports_execution_class(&worker, &job.required_execution_class) {
             continue;
         }
         // Defense in depth: re-check the caller's sandbox/kind filters (if any) against
@@ -218,6 +265,149 @@ pub(crate) async fn claim_lease(
         ok: true,
         lease: None,
     }))
+}
+
+fn authoritative_placement(job: &Job) -> Option<(SandboxProvisionSpec, &str)> {
+    let spec_object = job
+        .payload
+        .get("provisionSpec")
+        .and_then(serde_json::Value::as_object)?;
+    if [
+        "memory_limit",
+        "network_egress",
+        "workspace_mode",
+        "runtime_profile",
+    ]
+    .iter()
+    .any(|field| !spec_object.contains_key(*field))
+    {
+        return None;
+    }
+    let Ok(spec) = serde_json::from_value::<SandboxProvisionSpec>(
+        job.payload
+            .get("provisionSpec")
+            .cloned()
+            .unwrap_or_default(),
+    ) else {
+        return None;
+    };
+    let requested_image = job
+        .payload
+        .get("runtimeImage")
+        .and_then(serde_json::Value::as_str)
+        .filter(|image| !image.is_empty())?;
+    Some((spec, requested_image))
+}
+
+pub(crate) async fn authoritatively_refresh_job_placement(
+    db: &Database,
+    job: &mut Job,
+) -> Result<bool, ApiError> {
+    let reference_error = validate_authoritative_placement_reference(job).err();
+    let enrichment_error = match reference_error {
+        Some(error) => Some(error),
+        None => enrich_job_payload_with_provision_spec(db, job).await.err(),
+    };
+    if let Some(error) = enrichment_error {
+        if !matches!(
+            error.status,
+            StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND
+        ) {
+            return Err(error);
+        }
+        let sql = format!(
+            "update jobs
+             set status = 'dead', last_error = {}, updated_at = {}
+             where id = {} and status = 'queued'",
+            db.placeholder(1),
+            db.placeholder(2),
+            db.placeholder(3)
+        );
+        sqlx::query(&sql)
+            .bind("authoritative_placement_unavailable")
+            .bind(Utc::now().to_rfc3339())
+            .bind(job.id.to_string())
+            .execute(&db.pool)
+            .await?;
+        return Ok(false);
+    }
+    let sql = format!(
+        "update jobs
+         set payload = {}, required_execution_class = {}, updated_at = {}
+         where id = {} and status = 'queued'",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4)
+    );
+    let updated = sqlx::query(&sql)
+        .bind(serde_json::to_string(&job.payload)?)
+        .bind(job.required_execution_class.as_db_str())
+        .bind(Utc::now().to_rfc3339())
+        .bind(job.id.to_string())
+        .execute(&db.pool)
+        .await?;
+    Ok(updated.rows_affected() == 1)
+}
+
+fn validate_authoritative_placement_reference(job: &Job) -> Result<(), ApiError> {
+    let key = match job.kind {
+        JobKind::ForkSandbox => "childSandboxId",
+        _ => "sandboxId",
+    };
+    let value = job
+        .payload
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ApiError::bad_request(format!("job payload is missing {key}")))?;
+    Uuid::parse_str(value)
+        .map(|_| ())
+        .map_err(|_| ApiError::bad_request(format!("job payload contains invalid {key}")))
+}
+
+pub(crate) fn worker_supports_runtime_profile(worker: &Worker, job: &Job) -> bool {
+    let Some((spec, requested_image)) = authoritative_placement(job) else {
+        return false;
+    };
+    if spec.runtime_profile != SandboxRuntimeProfile::ApexTrustedSupervisorV1 {
+        return true;
+    }
+    worker
+        .capabilities
+        .contains(&WorkerCapability::ApexTrustedSupervisorV1)
+        && worker.labels.get("runtime_image").map(String::as_str) == Some(requested_image)
+}
+
+pub(crate) async fn fetch_lease_materialization(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path(lease_id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let lease = ensure_lease_worker_scope(&state.db, LeaseId(lease_id), &ctx).await?;
+    if lease.status != LeaseStatus::Active || lease.expires_at <= Utc::now() {
+        return Err(ApiError::bad_request("materialization lease is not active"));
+    }
+    if lease.job.kind != JobKind::MaterializeFile {
+        return Err(ApiError::not_found("materialization not found"));
+    }
+    let sandbox_id = sandbox_id_from_job(&lease.job)?;
+    let stored = fetch_sandbox_file(&state.db, sandbox_id, file_id_from_job(&lease.job)?).await?;
+    validate_file_size(stored.content.len() as u64)?;
+    if stored.file.size_bytes != stored.content.len() as u64 {
+        return Err(ApiError::internal(
+            "materialization file size is inconsistent",
+        ));
+    }
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_LENGTH, stored.content.len().to_string()),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+        ],
+        Bytes::from(stored.content),
+    )
+        .into_response())
 }
 
 /// True if `job` references `sandbox_id` as its own sandbox, its fork parent, or its
@@ -828,12 +1018,32 @@ pub(crate) async fn complete_lease_in_transaction(
     lease_id: LeaseId,
     result: WorkerJobResult,
 ) -> Result<JobLease, ApiError> {
+    let completion_fingerprint = completion_result_fingerprint(&result)?;
     let mut tx = db.pool.begin().await?;
 
     let completed = async {
         let lease = fetch_lease_on_connection(db, &mut tx, lease_id).await?;
         if lease.status == LeaseStatus::Completed {
-            return Ok(lease);
+            let stored_fingerprint: Option<String> = sqlx::query_scalar(&format!(
+                "select completion_fingerprint from job_leases where id = {}",
+                db.placeholder(1)
+            ))
+            .bind(lease_id.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+            match stored_fingerprint.as_deref() {
+                Some(stored) if stored == completion_fingerprint => return Ok(lease),
+                None => {
+                    return Err(ApiError::conflict_code(
+                        "completion_replay_unavailable",
+                        "completed lease predates persisted completion evidence",
+                    ));
+                }
+                Some(_) => {}
+            }
+            return Err(ApiError::bad_request(
+                "lease is already completed with a different result",
+            ));
         }
         if lease.status != LeaseStatus::Active {
             return Err(ApiError::bad_request(
@@ -842,9 +1052,11 @@ pub(crate) async fn complete_lease_in_transaction(
         }
 
         let now = Utc::now();
-        complete_active_lease_on_connection(db, &mut tx, lease_id, now).await?;
+        complete_active_lease_on_connection(db, &mut tx, lease_id, now, &completion_fingerprint)
+            .await?;
         let successful = match &result {
             WorkerJobResult::RunCommand { result } => result.exit_code == Some(0),
+            WorkerJobResult::RunResidentProcess { exit_code, .. } => *exit_code == Some(0),
             _ => true,
         };
         apply_completed_job_on_connection(db, &mut tx, &lease.job, result).await?;
@@ -867,6 +1079,34 @@ pub(crate) async fn complete_lease_in_transaction(
             }
             Err(error)
         }
+    }
+}
+
+pub(crate) fn completion_result_fingerprint(result: &WorkerJobResult) -> Result<String, ApiError> {
+    let mut canonical = serde_json::to_value(result)
+        .map_err(|_| ApiError::internal("failed to encode lease completion result"))?;
+    canonicalize_json(&mut canonical);
+    let encoded = serde_json::to_vec(&canonical)
+        .map_err(|_| ApiError::internal("failed to encode lease completion result"))?;
+    Ok(format!("sha256:v1:{:x}", sha2::Sha256::digest(encoded)))
+}
+
+fn canonicalize_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut entries: Vec<_> = std::mem::take(object).into_iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (key, mut value) in entries {
+                canonicalize_json(&mut value);
+                object.insert(key, value);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                canonicalize_json(value);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1175,7 +1415,11 @@ pub(crate) async fn fetch_lease(db: &Database, lease_id: LeaseId) -> Result<JobL
         .ok_or_else(|| ApiError::not_found("lease not found"))?;
     let lease = row_to_lease_without_job(row)?;
     let job = fetch_job(db, lease.job_id).await?;
-    Ok(JobLease { job, ..lease })
+    Ok(JobLease {
+        required_execution_class: job.required_execution_class.clone(),
+        job,
+        ..lease
+    })
 }
 
 pub(crate) async fn fetch_lease_on_connection(
@@ -1196,7 +1440,11 @@ pub(crate) async fn fetch_lease_on_connection(
         .ok_or_else(|| ApiError::not_found("lease not found"))?;
     let lease = row_to_lease_without_job(row)?;
     let job = fetch_job_on_connection(db, connection, lease.job_id).await?;
-    Ok(JobLease { job, ..lease })
+    Ok(JobLease {
+        required_execution_class: job.required_execution_class.clone(),
+        job,
+        ..lease
+    })
 }
 
 pub(crate) async fn complete_active_lease_on_connection(
@@ -1204,20 +1452,23 @@ pub(crate) async fn complete_active_lease_on_connection(
     connection: &mut AnyConnection,
     lease_id: LeaseId,
     completed_at: DateTime<Utc>,
+    completion_fingerprint: &str,
 ) -> Result<(), ApiError> {
     let sql = format!(
         "update job_leases
-         set status = {}, completed_at = {}, error = {}
+         set status = {}, completed_at = {}, error = {}, completion_fingerprint = {}
          where id = {} and status = 'active'",
         db.placeholder(1),
         db.placeholder(2),
         db.placeholder(3),
-        db.placeholder(4)
+        db.placeholder(4),
+        db.placeholder(5)
     );
     let result = sqlx::query(&sql)
         .bind(lease_status_to_str(&LeaseStatus::Completed))
         .bind(completed_at.to_rfc3339())
         .bind(Option::<String>::None)
+        .bind(completion_fingerprint)
         .bind(lease_id.to_string())
         .execute(&mut *connection)
         .await?;
@@ -1417,6 +1668,27 @@ pub(crate) async fn replace_command_output_stream_on_connection(
     Ok(())
 }
 
+fn validate_completed_runtime_resources(
+    resources: &[ProviderRuntimeResource],
+    sandbox_id: SandboxId,
+    snapshot_id: Option<SnapshotId>,
+    allowed_source_snapshot_id: Option<SnapshotId>,
+) -> Result<(), ApiError> {
+    if resources.iter().any(|resource| {
+        resource.sandbox_id != sandbox_id
+            || resource.snapshot_id != snapshot_id
+            || resource
+                .source_snapshot_id
+                .is_some_and(|source_id| Some(source_id) != allowed_source_snapshot_id)
+    }) {
+        return Err(ApiError::bad_request(
+            "runtime resource completion does not match job",
+        ));
+    }
+
+    Ok(())
+}
+
 pub(crate) async fn apply_completed_job_on_connection(
     db: &Database,
     connection: &mut AnyConnection,
@@ -1424,6 +1696,55 @@ pub(crate) async fn apply_completed_job_on_connection(
     result: WorkerJobResult,
 ) -> Result<(), ApiError> {
     match (&job.kind, result) {
+        (
+            JobKind::RunResidentProcess,
+            WorkerJobResult::RunResidentProcess {
+                process_id,
+                generation,
+                exit_code,
+            },
+        ) => {
+            if process_id != resident_process_id_from_job(job)?
+                || job.payload["generation"].as_u64() != Some(generation)
+            {
+                return Err(ApiError::bad_request(
+                    "resident process completion does not match job",
+                ));
+            }
+            let now = Utc::now();
+            let observed_state = if exit_code == Some(0) {
+                ResidentProcessObservedState::Stopped
+            } else {
+                ResidentProcessObservedState::Failed
+            };
+            let sql = format!(
+                "update resident_processes
+                 set observed_state = {}, exit_code = {}, exited_at = {}, updated_at = {},
+                     active_lease_id = null
+                 where id = {} and generation = {}",
+                db.placeholder(1),
+                db.placeholder(2),
+                db.placeholder(3),
+                db.placeholder(4),
+                db.placeholder(5),
+                db.placeholder(6)
+            );
+            let updated = sqlx::query(&sql)
+                .bind(observed_state.as_db_str())
+                .bind(exit_code.map(i64::from))
+                .bind(now.to_rfc3339())
+                .bind(now.to_rfc3339())
+                .bind(process_id.to_string())
+                .bind(generation as i64)
+                .execute(&mut *connection)
+                .await?;
+            if updated.rows_affected() != 1 {
+                return Err(ApiError::conflict_code(
+                    "resident_process_generation_conflict",
+                    "resident process changed before completion",
+                ));
+            }
+        }
         (JobKind::RunCommand, WorkerJobResult::RunCommand { result }) => {
             let command_id = command_id_from_job(job)?;
             let sandbox_id = sandbox_id_from_job(job)?;
@@ -1486,6 +1807,111 @@ pub(crate) async fn apply_completed_job_on_connection(
             )
             .await?;
         }
+        (JobKind::MaterializeFile, WorkerJobResult::MaterializeFile { receipt }) => {
+            let sandbox_id = sandbox_id_from_job(job)?;
+            let file_id = file_id_from_job(job)?;
+            let stored =
+                fetch_sandbox_file_metadata_on_connection(db, connection, sandbox_id, file_id)
+                    .await?;
+            if receipt.sandbox_id != sandbox_id
+                || receipt.file_id != file_id
+                || receipt.destination != materialization_destination_from_job(job)?
+                || receipt.sha256 != materialization_digest_from_job(job)?
+                || receipt.destination_sha256 != materialization_digest_from_job(job)?
+                || receipt.size_bytes != stored.size_bytes
+                || receipt.cleanup_owner != MaterializeFileCleanupOwner::ControlPlane
+            {
+                return Err(ApiError::bad_request(
+                    "materialization completion does not match job",
+                ));
+            }
+            delete_sandbox_file_on_connection(db, connection, sandbox_id, file_id).await?;
+            insert_event_on_connection(
+                db,
+                connection,
+                sandbox_id,
+                SandboxEventKind::FileMaterialized,
+                json!({
+                    "materialized": true,
+                    "fileId": file_id,
+                    "destination": receipt.destination,
+                    "sha256": receipt.sha256,
+                    "destinationSha256": receipt.destination_sha256,
+                    "sizeBytes": receipt.size_bytes,
+                    "cleanupOwner": receipt.cleanup_owner
+                }),
+            )
+            .await?;
+        }
+        (
+            JobKind::ApexTaskInstructions,
+            WorkerJobResult::ApexTaskInstructions {
+                request_id,
+                sandbox_id,
+                lease_id,
+                lease_attempt,
+                provider_apply_id,
+                sha256,
+                byte_count,
+                output_unavailable,
+            },
+        ) => {
+            if sandbox_id != sandbox_id_from_job(job)?
+                || job
+                    .payload
+                    .get("requestId")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(request_id.to_string().as_str())
+                || job
+                    .payload
+                    .get("providerApplyId")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(provider_apply_id.to_string().as_str())
+                || job
+                    .payload
+                    .get("expectedSha256")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(sha256.as_str())
+                || job
+                    .payload
+                    .get("expectedByteCount")
+                    .and_then(serde_json::Value::as_u64)
+                    != Some(byte_count)
+            {
+                return Err(ApiError::bad_request(
+                    "instruction completion does not match job lineage",
+                ));
+            }
+            let sql = format!(
+                "select lease_id, lease_attempt, provider_apply_id, observed_sha256,
+                        observed_byte_count, state
+                 from apex_instruction_reads where request_id = {}",
+                db.placeholder(1)
+            );
+            let row = sqlx::query(&sql)
+                .bind(request_id.to_string())
+                .fetch_optional(&mut *connection)
+                .await?
+                .ok_or_else(|| ApiError::bad_request("instruction read authority is missing"))?;
+            let persisted_lease_id: Option<String> = row.try_get("lease_id")?;
+            let persisted_attempt: i64 = row.try_get("lease_attempt")?;
+            let persisted_provider_apply_id: String = row.try_get("provider_apply_id")?;
+            let persisted_sha256: Option<String> = row.try_get("observed_sha256")?;
+            let persisted_count: Option<i64> = row.try_get("observed_byte_count")?;
+            let state: String = row.try_get("state")?;
+            if persisted_lease_id.as_deref() != Some(lease_id.to_string().as_str())
+                || persisted_attempt != lease_attempt
+                || persisted_provider_apply_id != provider_apply_id.to_string()
+                || persisted_sha256.as_deref() != Some(sha256.as_str())
+                || persisted_count.and_then(|value| u64::try_from(value).ok()) != Some(byte_count)
+                || (state == "unavailable") != output_unavailable
+                || !matches!(state.as_str(), "completed" | "unavailable")
+            {
+                return Err(ApiError::bad_request(
+                    "instruction completion does not match callback authority",
+                ));
+            }
+        }
         (JobKind::CreateSnapshot, WorkerJobResult::CreateSnapshot { handle }) => {
             let snapshot_id = snapshot_id_from_job(job)?;
             if handle.snapshot_id != snapshot_id {
@@ -1493,10 +1919,18 @@ pub(crate) async fn apply_completed_job_on_connection(
                     "snapshot completion result does not match job snapshot",
                 ));
             }
+            let sandbox_id = sandbox_id_from_job(job)?;
+            validate_completed_runtime_resources(
+                &handle.resources,
+                sandbox_id,
+                Some(snapshot_id),
+                None,
+            )?;
             mark_snapshot_ready_from_provider_handle_on_connection(
                 db,
                 connection,
-                sandbox_id_from_job(job)?,
+                sandbox_id,
+                &job.tenant_id,
                 handle,
             )
             .await?;
@@ -1528,8 +1962,19 @@ pub(crate) async fn apply_completed_job_on_connection(
                     "fork completion result does not match job payload",
                 ));
             }
-            upsert_provider_runtime_resources_on_connection(db, connection, &handle.resources)
-                .await?;
+            validate_completed_runtime_resources(
+                &handle.resources,
+                child_id,
+                None,
+                Some(snapshot_id),
+            )?;
+            upsert_provider_runtime_resources_on_connection(
+                db,
+                connection,
+                &handle.resources,
+                &job.tenant_id,
+            )
+            .await?;
             let next_state = SandboxState::Ready;
             set_sandbox_state_on_connection(
                 db,
@@ -1552,8 +1997,14 @@ pub(crate) async fn apply_completed_job_on_connection(
                     "provision completion result does not match job sandbox",
                 ));
             }
-            upsert_provider_runtime_resources_on_connection(db, connection, &handle.resources)
-                .await?;
+            validate_completed_runtime_resources(&handle.resources, sandbox_id, None, None)?;
+            upsert_provider_runtime_resources_on_connection(
+                db,
+                connection,
+                &handle.resources,
+                &job.tenant_id,
+            )
+            .await?;
             let next_state = SandboxState::Ready;
             set_sandbox_state_on_connection(
                 db,
@@ -1675,7 +2126,12 @@ pub(crate) async fn apply_claimed_job_on_connection(
             )
             .await?;
         }
-        JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {}
+        JobKind::ProvisionSandbox
+        | JobKind::StopSandbox
+        | JobKind::ResumeSandbox
+        | JobKind::RunResidentProcess
+        | JobKind::MaterializeFile
+        | JobKind::ApexTaskInstructions => {}
     }
     Ok(())
 }
@@ -1749,7 +2205,12 @@ pub(crate) async fn apply_retryable_job_on_connection(
             )
             .await?;
         }
-        JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {}
+        JobKind::ProvisionSandbox
+        | JobKind::StopSandbox
+        | JobKind::ResumeSandbox
+        | JobKind::RunResidentProcess
+        | JobKind::MaterializeFile
+        | JobKind::ApexTaskInstructions => {}
     }
     Ok(())
 }
@@ -1848,7 +2309,32 @@ pub(crate) async fn apply_failed_job_on_connection(
             )
             .await?;
         }
-        JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {}
+        JobKind::ProvisionSandbox
+        | JobKind::StopSandbox
+        | JobKind::ResumeSandbox
+        | JobKind::RunResidentProcess => {}
+        JobKind::MaterializeFile => {
+            delete_sandbox_file_if_present_on_connection(
+                db,
+                connection,
+                sandbox_id_from_job(job)?,
+                file_id_from_job(job)?,
+            )
+            .await?;
+        }
+        JobKind::ApexTaskInstructions => {
+            let sql = format!(
+                "update apex_instruction_reads set state = 'failed', completed_at = {}
+                 where job_id = {} and state = 'pending'",
+                db.placeholder(1),
+                db.placeholder(2)
+            );
+            sqlx::query(&sql)
+                .bind(Utc::now().to_rfc3339())
+                .bind(job.id.to_string())
+                .execute(&mut *connection)
+                .await?;
+        }
     }
     Ok(())
 }

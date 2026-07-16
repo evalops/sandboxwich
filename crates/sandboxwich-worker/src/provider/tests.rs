@@ -1,4 +1,5 @@
 use super::*;
+use sandboxwich_core::{MAX_COMMAND_STDIN_BYTES, NetworkAllowRule};
 
 #[tokio::test]
 async fn run_kubectl_command_async_succeeds_within_timeout() {
@@ -119,6 +120,12 @@ fn kubernetes_dry_run_reports_k8s_capabilities_and_health() {
             .capabilities
             .contains(&WorkerCapability::AgentPrompt)
     );
+    assert!(
+        !capabilities
+            .capabilities
+            .contains(&WorkerCapability::MaterializeFile),
+        "dry-run provider reports must not claim destination attestation"
+    );
     assert_eq!(
         capabilities.labels.get("storage_class").map(String::as_str),
         Some("local-path")
@@ -177,6 +184,7 @@ fn kubernetes_dry_run_covers_provider_smoke_path_without_cluster_mutation() {
                 argv: vec!["echo".to_string(), "hello".to_string()],
                 cwd: None,
                 env: BTreeMap::new(),
+                stdin: None,
                 timeout_secs: None,
             },
             &CancelSignal::never_cancelled(),
@@ -248,6 +256,123 @@ fn kubernetes_dry_run_uses_configured_runtime_image() {
         provisioned.metadata["manifests"]["pod"]["spec"]["containers"][0]["imagePullPolicy"],
         "IfNotPresent"
     );
+}
+
+#[test]
+fn apex_trusted_supervisor_profile_is_closed_and_minimally_privileged() {
+    let runtime_image = format!("ghcr.io/evalops/apex@sha256:{}", "a".repeat(64));
+    let configured =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_runtime_image(Some(runtime_image.clone()))
+            .with_isolation_profile(IsolationProfile::Gvisor)
+            .with_runtime_class_name(Some("gvisor".to_string()))
+            .with_apex_trusted_supervisor_v1(true);
+    let spec = SandboxProvisionSpec {
+        runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
+        execution_class: ExecutionClass::SandboxedContainer,
+        network_egress: NetworkEgress::DenyAll,
+        ..SandboxProvisionSpec::default()
+    };
+
+    let report = configured.capability_report();
+    assert!(
+        report
+            .capabilities
+            .contains(&WorkerCapability::ApexTrustedSupervisorV1)
+    );
+    assert!(
+        report
+            .capabilities
+            .contains(&WorkerCapability::ApexTaskInstructions)
+    );
+    assert!(
+        report
+            .capabilities
+            .contains(&WorkerCapability::SandboxedContainer)
+    );
+    assert_eq!(
+        report.labels.get("runtime_profile").map(String::as_str),
+        Some("apex_trusted_supervisor_v1")
+    );
+    assert_eq!(report.labels.get("runtime_image"), Some(&runtime_image));
+
+    let provisioned = configured
+        .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+        .expect("configured APEX supervisor profile should render");
+    let pod = &provisioned.metadata["manifests"]["pod"]["spec"];
+    assert_eq!(pod["runtimeClassName"], "gvisor");
+    assert_eq!(pod["automountServiceAccountToken"], false);
+    assert_eq!(pod["securityContext"]["runAsUser"], 0);
+    assert_eq!(pod["securityContext"]["runAsGroup"], 0);
+    assert_eq!(pod["securityContext"]["fsGroup"], 10001);
+    assert_eq!(
+        pod["securityContext"]["seccompProfile"]["type"],
+        "RuntimeDefault"
+    );
+    let container = &pod["containers"][0]["securityContext"];
+    assert_eq!(container["allowPrivilegeEscalation"], false);
+    assert_eq!(container["runAsUser"], 0);
+    assert_eq!(container["capabilities"]["drop"], json!(["ALL"]));
+    assert_eq!(
+        container["capabilities"]["add"],
+        json!(["CHOWN", "SETGID", "SETUID", "KILL", "DAC_READ_SEARCH"])
+    );
+
+    let unconfigured =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_runtime_image(Some(runtime_image.clone()))
+            .with_isolation_profile(IsolationProfile::Gvisor)
+            .with_runtime_class_name(Some("gvisor".to_string()));
+    assert!(
+        unconfigured
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+            .is_err()
+    );
+
+    let wrong_isolation =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_runtime_image(Some(runtime_image))
+            .with_apex_trusted_supervisor_v1(true);
+    assert!(
+        wrong_isolation
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+            .is_err(),
+        "the provider boundary must reject APEX on development isolation"
+    );
+    assert!(
+        !wrong_isolation
+            .capability_report()
+            .capabilities
+            .contains(&WorkerCapability::ApexTrustedSupervisorV1),
+        "an invalid APEX isolation configuration must not advertise APEX capability"
+    );
+
+    for network_egress in [
+        NetworkEgress::AllowAll,
+        NetworkEgress::Allowlist {
+            rules: vec![NetworkAllowRule {
+                kind: NetworkAllowRuleKind::Cidr,
+                value: "not-a-cidr".to_string(),
+            }],
+        },
+    ] {
+        let rejected = SandboxProvisionSpec {
+            runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
+            execution_class: ExecutionClass::SandboxedContainer,
+            network_egress,
+            ..SandboxProvisionSpec::default()
+        };
+        assert!(
+            configured
+                .provision(
+                    SandboxId::new(),
+                    &rejected,
+                    &CancelSignal::never_cancelled()
+                )
+                .is_err(),
+            "provider must independently reject unsafe APEX egress"
+        );
+    }
 }
 
 #[test]
@@ -330,8 +455,10 @@ fn kubernetes_workspace_modes_render_distinct_bounded_storage_contracts() {
     ] {
         let spec = SandboxProvisionSpec {
             workspace_mode: mode.clone(),
+            execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
             memory_limit: MemoryLimit::OneG,
             network_egress: NetworkEgress::DenyAll,
+            runtime_profile: Default::default(),
         };
         let provisioned = provider
             .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
@@ -373,8 +500,10 @@ fn configured_workspace_storage_overrides_non_default_tier_disk_size() {
             .with_workspace_storage(Some("20Gi".to_string()));
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::FourG,
         network_egress: NetworkEgress::DenyAll,
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -390,9 +519,11 @@ fn configured_workspace_storage_overrides_non_default_tier_disk_size() {
 fn kubernetes_dry_run_renders_resource_network_and_runtime_class_controls() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Gvisor)
             .with_runtime_class_name(Some("gvisor".to_string()));
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::FourG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -400,6 +531,7 @@ fn kubernetes_dry_run_renders_resource_network_and_runtime_class_controls() {
                 value: "10.0.0.0/8".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
     let provisioned = provider
         .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
@@ -432,7 +564,52 @@ fn kubernetes_dry_run_renders_resource_network_and_runtime_class_controls() {
         provider
             .capability_report()
             .capabilities
+            .contains(&WorkerCapability::SandboxedContainer)
+    );
+    assert!(
+        !provider
+            .capability_report()
+            .capabilities
+            .contains(&WorkerCapability::VirtualMachine)
+    );
+    assert!(
+        !provider
+            .capability_report()
+            .capabilities
             .contains(&WorkerCapability::GvisorSandbox)
+    );
+}
+
+#[test]
+fn kubernetes_dry_run_reports_exact_typed_isolation_capability() {
+    let development =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_runtime_class_name(Some("arbitrary-runtime".to_string()));
+    assert!(
+        !development
+            .capability_report()
+            .capabilities
+            .iter()
+            .any(|capability| matches!(
+                capability,
+                WorkerCapability::SandboxedContainer | WorkerCapability::VirtualMachine
+            ))
+    );
+
+    let kata =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Kata)
+            .with_runtime_class_name(Some("kata-qemu".to_string()));
+    assert!(
+        kata.capability_report()
+            .capabilities
+            .contains(&WorkerCapability::VirtualMachine)
+    );
+    assert!(
+        !kata
+            .capability_report()
+            .capabilities
+            .contains(&WorkerCapability::SandboxedContainer)
     );
 }
 
@@ -442,6 +619,7 @@ fn kubernetes_dry_run_rejects_host_allow_rules_for_standard_network_policy() {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -449,6 +627,7 @@ fn kubernetes_dry_run_rejects_host_allow_rules_for_standard_network_policy() {
                 value: "api.example.com".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
 
     let error = provider
@@ -464,6 +643,7 @@ fn cilium_fqdn_backend_renders_host_allow_rules() {
             .with_cilium_fqdn_egress(true);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -471,6 +651,7 @@ fn cilium_fqdn_backend_renders_host_allow_rules() {
                 value: "api.example.com".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -527,6 +708,7 @@ fn host_rules_render_a_separate_gateway_and_no_direct_public_egress() {
     let sandbox_id = SandboxId::new();
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -534,6 +716,7 @@ fn host_rules_render_a_separate_gateway_and_no_direct_public_egress() {
                 value: "api.example.com".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -655,6 +838,7 @@ fn host_rules_reject_an_unpinned_gateway_image() {
             ));
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -662,6 +846,7 @@ fn host_rules_reject_an_unpinned_gateway_image() {
                 value: "api.example.com".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
 
     let error = provider
@@ -802,6 +987,7 @@ fn kubernetes_apply_provider_can_use_in_cluster_service_account() {
         argv: vec!["printf".to_string(), "ok".to_string()],
         cwd: None,
         env: BTreeMap::new(),
+        stdin: None,
         timeout_secs: None,
     };
     let exec_args = apply.exec_args(sandbox_id, &request);
@@ -835,6 +1021,7 @@ fn exec_args_never_render_env_values_on_argv() {
         argv: vec!["printf".to_string(), "ok".to_string()],
         cwd: None,
         env,
+        stdin: None,
         timeout_secs: None,
     };
 
@@ -873,6 +1060,70 @@ fn exec_args_never_render_env_values_on_argv() {
 }
 
 #[test]
+fn apex_task_instructions_exec_is_fixed_and_accepts_no_caller_process_fields() {
+    let provider = KubernetesDryRunProvider::with_snapshot_class(
+        "k3s-ci",
+        "sandboxwich-ci",
+        Some("local-path".to_string()),
+        None,
+    );
+    let apply = KubernetesApplyProvider::new(provider, "kubectl")
+        .with_kubectl_context(Some("in-cluster".to_string()));
+    let sandbox_id = SandboxId::new();
+
+    let args = apply.apex_task_instructions_args(sandbox_id);
+
+    assert!(!args.iter().any(|arg| arg == "-i"));
+    assert_eq!(
+        &args[args.len() - 4..],
+        [
+            "exec".to_string(),
+            format!("sandboxwich-{sandbox_id}"),
+            "--".to_string(),
+            "/opt/apex/bin/task-instructions".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn apex_task_instructions_live_read_returns_exact_bytes_and_rejects_oversize_output() {
+    let dir = std::env::temp_dir().join(format!("sandboxwich-apex-read-{}", SandboxId::new()));
+    std::fs::create_dir_all(&dir).expect("create fake kubectl dir");
+    let script_path = dir.join("kubectl");
+    std::fs::write(
+        &script_path,
+        "#!/bin/sh\ncase \" $* \" in *\" get pod \"*) printf 'pod/found\\n'; exit 0 ;; esac\nprintf 'private\\000instructions'\n",
+    )
+    .expect("write fake kubectl");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).unwrap();
+    }
+    let provider = apply_provider_with_fake_kubectl(&script_path);
+    let output = provider
+        .read_apex_task_instructions(SandboxId::new(), &CancelSignal::never_cancelled())
+        .expect("fixed live read should succeed");
+    assert_eq!(output, b"private\0instructions");
+
+    std::fs::write(
+        &script_path,
+        format!("#!/bin/sh\ncase \" $* \" in *\" get pod \"*) printf 'pod/found\\n'; exit 0 ;; esac\nhead -c {} /dev/zero\n", APEX_TASK_INSTRUCTIONS_MAX_BYTES + 1),
+    )
+    .expect("replace fake kubectl");
+    let error = provider
+        .read_apex_task_instructions(SandboxId::new(), &CancelSignal::never_cancelled())
+        .expect_err("more than 1 MiB must be rejected, never truncated");
+    assert!(
+        error
+            .to_string()
+            .contains("apex_task_instructions_too_large")
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn exec_args_without_env_do_not_request_stdin_or_a_wrapper() {
     let provider = KubernetesDryRunProvider::with_snapshot_class(
         "k3s-ci",
@@ -885,6 +1136,7 @@ fn exec_args_without_env_do_not_request_stdin_or_a_wrapper() {
         argv: vec!["printf".to_string(), "ok".to_string()],
         cwd: None,
         env: BTreeMap::new(),
+        stdin: None,
         timeout_secs: None,
     };
 
@@ -893,6 +1145,38 @@ fn exec_args_without_env_do_not_request_stdin_or_a_wrapper() {
     assert!(!exec_args.contains(&"-i".to_string()));
     assert!(!exec_args.contains(&"bash".to_string()));
     assert!(KubernetesApplyProvider::exec_stdin_payload(&request).is_none());
+}
+
+#[test]
+fn exec_args_with_command_stdin_request_interactive_transport_without_exposing_bytes() {
+    let provider = KubernetesDryRunProvider::with_snapshot_class(
+        "k3s-ci",
+        "sandboxwich-ci",
+        Some("local-path".to_string()),
+        None,
+    );
+    let apply = KubernetesApplyProvider::new(provider, "kubectl");
+    let marker = b"apex-private-input".to_vec();
+    let request = AgentCommandRequest {
+        argv: vec!["sha256sum".to_string()],
+        cwd: None,
+        env: BTreeMap::new(),
+        stdin: Some(marker.clone()),
+        timeout_secs: None,
+    };
+
+    let exec_args = apply.exec_args(SandboxId::new(), &request);
+    let payload = KubernetesApplyProvider::exec_stdin_payload(&request)
+        .expect("command stdin should produce a kubectl stdin payload");
+
+    assert!(exec_args.contains(&"-i".to_string()));
+    assert_eq!(payload, marker);
+    assert!(
+        !exec_args
+            .iter()
+            .any(|arg| arg.contains("apex-private-input"))
+    );
+    assert!(!format!("{request:?}").contains("apex-private-input"));
 }
 
 #[test]
@@ -910,6 +1194,7 @@ fn exec_args_carry_cwd_through_the_env_wrapper_when_both_are_set() {
         argv: vec!["pwd".to_string()],
         cwd: Some("/workspace/project".to_string()),
         env,
+        stdin: None,
         timeout_secs: None,
     };
 
@@ -930,6 +1215,7 @@ fn exec_stdin_payload_nul_delimits_key_value_pairs() {
         argv: vec!["true".to_string()],
         cwd: None,
         env,
+        stdin: None,
         timeout_secs: None,
     };
 
@@ -940,6 +1226,191 @@ fn exec_stdin_payload_nul_delimits_key_value_pairs() {
 
     assert!(entries.contains(&"A=1"));
     assert!(entries.contains(&"B=two"));
+}
+
+#[test]
+fn exec_stdin_payload_preserves_command_bytes_after_the_env_prefix() {
+    let mut env = BTreeMap::new();
+    env.insert("A".to_string(), "1".to_string());
+    env.insert("B".to_string(), "two".to_string());
+    let command_stdin = vec![0, b'j', b's', b'o', b'n', b'\n', 255];
+    let request = AgentCommandRequest {
+        argv: vec!["cat".to_string()],
+        cwd: None,
+        env,
+        stdin: Some(command_stdin.clone()),
+        timeout_secs: None,
+    };
+
+    let payload = KubernetesApplyProvider::exec_stdin_payload(&request).unwrap();
+
+    assert!(payload.starts_with(b"A=1\0B=two\0"));
+    assert!(payload.ends_with(&command_stdin));
+}
+
+#[test]
+fn provider_mode_distinguishes_apply_execution_from_dry_run_simulation() {
+    let dry_run = KubernetesDryRunProvider::with_snapshot_class(
+        "k3s-ci",
+        "sandboxwich-ci",
+        Some("local-path".to_string()),
+        None,
+    );
+    let apply = KubernetesApplyProvider::new(dry_run.clone(), "kubectl");
+
+    assert_eq!(
+        dry_run.capability_report().labels.get("provider_mode"),
+        Some(&"dry_run".to_string())
+    );
+    assert_eq!(
+        apply.capability_report().labels.get("provider_mode"),
+        Some(&"apply".to_string())
+    );
+    assert!(
+        !dry_run
+            .capability_report()
+            .capabilities
+            .contains(&WorkerCapability::MaterializeFile)
+    );
+    assert!(
+        apply
+            .capability_report()
+            .capabilities
+            .contains(&WorkerCapability::MaterializeFile)
+    );
+}
+
+#[test]
+fn dry_run_provider_rejects_oversized_stdin_at_its_entrypoint() {
+    let provider = KubernetesDryRunProvider::with_snapshot_class(
+        "k3s-ci",
+        "sandboxwich-ci",
+        Some("local-path".to_string()),
+        None,
+    );
+    let request = AgentCommandRequest {
+        argv: vec!["true".to_string()],
+        cwd: None,
+        env: BTreeMap::new(),
+        stdin: Some(vec![b'x'; MAX_COMMAND_STDIN_BYTES + 1]),
+        timeout_secs: None,
+    };
+
+    let error = provider
+        .exec_handoff(
+            SandboxId::new(),
+            &SandboxProvisionSpec::default(),
+            request,
+            &CancelSignal::never_cancelled(),
+        )
+        .expect_err("dry-run provider boundary must reject oversized stdin");
+
+    assert!(error.to_string().contains("command_stdin_too_large"));
+}
+
+#[test]
+fn apply_provider_rejects_oversized_stdin_before_kubectl_lookup_or_provisioning() {
+    let (kubectl, log_path) = write_fake_kubectl(None);
+    let provider = apply_provider_with_fake_kubectl(&kubectl);
+    let request = AgentCommandRequest {
+        argv: vec!["true".to_string()],
+        cwd: None,
+        env: BTreeMap::new(),
+        stdin: Some(vec![b'x'; MAX_COMMAND_STDIN_BYTES + 1]),
+        timeout_secs: None,
+    };
+
+    let error = provider
+        .exec_handoff(
+            SandboxId::new(),
+            &SandboxProvisionSpec::default(),
+            request,
+            &CancelSignal::never_cancelled(),
+        )
+        .expect_err("apply provider boundary must reject before kubectl side effects");
+
+    assert!(error.to_string().contains("command_stdin_too_large"));
+    assert!(
+        !log_path.exists(),
+        "validation must run before kubectl lookup"
+    );
+    let _ = std::fs::remove_dir_all(kubectl.parent().unwrap());
+}
+
+#[test]
+fn providers_reject_nul_environment_before_guest_or_kubectl_and_preserve_binary_stdin_boundary() {
+    let mut env = BTreeMap::new();
+    env.insert("VALID_KEY".to_string(), "prefix\0shifted".to_string());
+    let binary_stdin = vec![0, 255, b'j', b's', b'o', b'n', b'\n'];
+    let request = AgentCommandRequest {
+        argv: vec!["cat".to_string()],
+        cwd: None,
+        env,
+        stdin: Some(binary_stdin),
+        timeout_secs: None,
+    };
+    let dry_run = KubernetesDryRunProvider::with_snapshot_class(
+        "k3s-ci",
+        "sandboxwich-ci",
+        Some("local-path".to_string()),
+        None,
+    );
+    let dry_error = dry_run
+        .exec_handoff(
+            SandboxId::new(),
+            &SandboxProvisionSpec::default(),
+            request.clone(),
+            &CancelSignal::never_cancelled(),
+        )
+        .expect_err("NUL environment value must fail at dry-run provider boundary");
+    assert!(
+        dry_error
+            .to_string()
+            .contains("command_environment_contains_nul")
+    );
+
+    let mut nul_key_env = BTreeMap::new();
+    nul_key_env.insert("BAD\0KEY".to_string(), "value".to_string());
+    let nul_key_error = dry_run
+        .exec_handoff(
+            SandboxId::new(),
+            &SandboxProvisionSpec::default(),
+            AgentCommandRequest {
+                argv: vec!["cat".to_string()],
+                cwd: None,
+                env: nul_key_env,
+                stdin: Some(vec![0, 255, b'x']),
+                timeout_secs: None,
+            },
+            &CancelSignal::never_cancelled(),
+        )
+        .expect_err("NUL environment key must fail at provider boundary");
+    assert!(
+        nul_key_error
+            .to_string()
+            .contains("command_environment_contains_nul")
+    );
+
+    let (kubectl, log_path) = write_fake_kubectl(None);
+    let apply = apply_provider_with_fake_kubectl(&kubectl);
+    let apply_error = apply
+        .exec_handoff(
+            SandboxId::new(),
+            &SandboxProvisionSpec::default(),
+            request,
+            &CancelSignal::never_cancelled(),
+        )
+        .expect_err("NUL environment value must fail before kubectl or guest start");
+    assert!(
+        apply_error
+            .to_string()
+            .contains("command_environment_contains_nul")
+    );
+    assert!(
+        !log_path.exists(),
+        "validation must run before kubectl lookup"
+    );
+    let _ = std::fs::remove_dir_all(kubectl.parent().unwrap());
 }
 
 #[test]
@@ -962,8 +1433,10 @@ fn allow_all_egress_carves_out_control_plane_and_dns_ranges() {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::AllowAll,
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -1024,6 +1497,7 @@ fn allowlist_egress_carves_out_control_plane_ranges_contained_within_allowed_cid
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -1031,6 +1505,7 @@ fn allowlist_egress_carves_out_control_plane_ranges_contained_within_allowed_cid
                 value: "10.0.0.0/8".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -1068,6 +1543,7 @@ fn allowlist_egress_leaves_disjoint_narrow_cidrs_untouched() {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -1075,6 +1551,7 @@ fn allowlist_egress_leaves_disjoint_narrow_cidrs_untouched() {
                 value: "192.168.1.0/24".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -1100,6 +1577,7 @@ fn allowlist_egress_rejects_cidr_fully_covered_by_an_excluded_range() {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -1107,6 +1585,7 @@ fn allowlist_egress_rejects_cidr_fully_covered_by_an_excluded_range() {
                 value: "169.254.169.0/24".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
 
     let err = provider
@@ -1121,6 +1600,7 @@ fn allowlist_egress_rejects_cidr_exactly_equal_to_an_excluded_range() {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -1128,6 +1608,7 @@ fn allowlist_egress_rejects_cidr_exactly_equal_to_an_excluded_range() {
                 value: "10.42.0.0/16".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
 
     provider
@@ -1141,6 +1622,7 @@ fn allowlist_egress_carves_out_control_plane_ranges_when_wide_open_cidr_is_allow
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -1148,6 +1630,7 @@ fn allowlist_egress_carves_out_control_plane_ranges_when_wide_open_cidr_is_allow
                 value: "0.0.0.0/0".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -1172,6 +1655,7 @@ fn ipv6_allowlist_cidr_containing_an_ipv6_excluded_range_carves_it_out() {
             .with_egress_excluded_cidrs(vec!["fd00:ec2::254/128".to_string()]);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -1179,6 +1663,7 @@ fn ipv6_allowlist_cidr_containing_an_ipv6_excluded_range_carves_it_out() {
                 value: "fd00::/8".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -1207,6 +1692,7 @@ fn ipv6_allow_rule_is_unaffected_by_default_ipv4_excluded_cidrs() {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::Allowlist {
             rules: vec![sandboxwich_core::NetworkAllowRule {
@@ -1214,6 +1700,7 @@ fn ipv6_allow_rule_is_unaffected_by_default_ipv4_excluded_cidrs() {
                 value: "2001:db8::/32".to_string(),
             }],
         },
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -1234,8 +1721,10 @@ fn operator_supplied_egress_excluded_cidrs_merge_with_defaults() {
             .with_egress_excluded_cidrs(vec!["172.16.0.0/12".to_string()]);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::AllowAll,
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -1265,8 +1754,10 @@ fn with_egress_excluded_cidrs_replace_drops_the_defaults() {
             .with_egress_excluded_cidrs_replace(vec!["172.16.0.0/12".to_string()]);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::AllowAll,
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -1289,8 +1780,10 @@ fn deny_all_egress_still_renders_no_egress_rules() {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::DenyAll,
+        runtime_profile: Default::default(),
     };
 
     let provisioned = provider
@@ -1369,8 +1862,10 @@ fn pod_disables_service_account_token_automount_and_sets_ephemeral_storage_limit
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::FourG,
         network_egress: NetworkEgress::DenyAll,
+        runtime_profile: Default::default(),
     };
     let provisioned = provider
         .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
@@ -1909,7 +2404,10 @@ fn provision_staged_stops_before_the_next_resource_when_reporting_fails() {
             },
         )
         .expect_err("reporting failure stops staged provisioning");
-    assert!(error.to_string().contains("lost provisioning lease"));
+    assert!(
+        error.to_string().contains("lost provisioning lease"),
+        "unexpected staged provision error: {error:#}"
+    );
 
     let log = std::fs::read_to_string(&log_path).expect("read failed-report kubectl log");
     assert_eq!(

@@ -118,12 +118,16 @@ async fn assert_limit_contract(server: TestServer) {
         .await
         .unwrap();
     let body = CreateSandboxRequest {
+        execution_class: None,
         workspace_mode: None,
+        runtime_profile: None,
         name: Some("quota-race".into()),
         template: None,
         memory_limit: None,
         network_egress: None,
         ttl_seconds: Some(120),
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
     };
     let first_key = uuid::Uuid::now_v7().to_string();
     let second_key = uuid::Uuid::now_v7().to_string();

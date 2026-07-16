@@ -6,7 +6,7 @@ CLUSTER_NAME="${SANDBOXWICH_KIND_CLUSTER:-sandboxwich-conformance}"
 API_IMAGE="${SANDBOXWICH_API_IMAGE:-sandboxwich-api:conformance}"
 WORKER_IMAGE="${SANDBOXWICH_WORKER_IMAGE:-sandboxwich-worker:conformance}"
 GATEWAY_IMAGE="${SANDBOXWICH_GATEWAY_IMAGE:-}"
-RUNTIME_IMAGE="${SANDBOXWICH_RUNTIME_IMAGE:-sandboxwich-runtime:conformance}"
+RUNTIME_IMAGE="${SANDBOXWICH_RUNTIME_IMAGE:-}"
 POSTGRES_IMAGE="${SANDBOXWICH_POSTGRES_IMAGE:-postgres:conformance}"
 API_TOKEN="sandboxwich-kind-conformance-token"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -36,11 +36,10 @@ for command in kind kubectl curl jq sed; do
   command -v "${command}" >/dev/null || fail "${command} is required"
 done
 [[ "${GATEWAY_IMAGE}" == *@sha256:* ]] || fail "SANDBOXWICH_GATEWAY_IMAGE must be digest-pinned"
+[[ "${RUNTIME_IMAGE}" == *@sha256:* ]] || fail "SANDBOXWICH_RUNTIME_IMAGE must be digest-pinned"
 kind get clusters | grep -Fxq "${CLUSTER_NAME}" || fail "kind cluster ${CLUSTER_NAME} does not exist"
 kubectl --context "${KUBE_CONTEXT}" -n kube-system rollout status deployment/coredns --timeout=120s
 
-kind load docker-image --name "${CLUSTER_NAME}" \
-  "${API_IMAGE}" "${WORKER_IMAGE}" "${RUNTIME_IMAGE}" "${POSTGRES_IMAGE}"
 kubectl config use-context "${KUBE_CONTEXT}" >/dev/null
 
 kubectl create namespace sandboxwich
@@ -62,9 +61,9 @@ sed \
   -e 's/imagePullPolicy: Always/imagePullPolicy: IfNotPresent/g' \
   -e 's/replicas: 2/replicas: 1/' \
   "${ROOT_DIR}/deploy/kubernetes/api.yaml" >"${TMP_DIR}/api.yaml"
-# Pin the guest image to the kind-loaded local tag. worker.yaml ships with an
-# explicit SANDBOXWICH_RUNTIME_IMAGE (required for apply mode); rewrite it so
-# the first worker pod never points at ghcr.io, which kind cannot pull.
+# Pin the guest image to the digest published into the disposable registry.
+# worker.yaml ships with an explicit SANDBOXWICH_RUNTIME_IMAGE (required for
+# apply mode); rewrite it to the exact image the kind nodes pre-pulled.
 sed \
   -e "s#ghcr.io/evalops/sandboxwich-worker@sha256:[0-9a-f]\{64\}#${WORKER_IMAGE}#g" \
   -e "s#ghcr.io/evalops/sandboxwich-ubuntu-dev@sha256:[a-f0-9]\{64\}#${RUNTIME_IMAGE}#g" \

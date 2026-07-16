@@ -317,7 +317,10 @@ pub(crate) async fn ensure_lease_worker_scope(
     let lease = ensure_lease_tenant(db, lease_id, ctx).await?;
     ensure_worker_scope(ctx, lease.worker_id)?;
     if let Some(sandbox_id) = ctx.guest_sandbox_id()
-        && (lease.job.kind != JobKind::RunCommand || !job_matches_sandbox(&lease.job, sandbox_id))
+        && (!matches!(
+            lease.job.kind,
+            JobKind::RunCommand | JobKind::RunResidentProcess
+        ) || !job_matches_sandbox(&lease.job, sandbox_id))
     {
         return Err(ApiError::not_found("resource not found"));
     }

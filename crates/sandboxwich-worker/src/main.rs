@@ -9,20 +9,24 @@ use std::{
 };
 
 use anyhow::Context;
+use base64::Engine as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use provider::{
-    CancelSignal, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES, KUBERNETES_MUTATION_ENV,
+    CancelSignal, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES, IsolationProfile, KUBERNETES_MUTATION_ENV,
     KubernetesApplyProvider, KubernetesDryRunProvider, ProviderError, ReconciliationLimits,
     RetryDisposition, SandboxProvider, image_is_digest_pinned,
 };
 use sandboxwich_core::{
-    AgentCommandRequest, AgentCommandResult, ClaimLeaseRequest, ClaimLeaseResponse,
+    AgentCommandRequest, AgentCommandResult, ApexTaskInstructionsCallbackRequest,
+    ApexTaskInstructionsCallbackResponse, ClaimLeaseRequest, ClaimLeaseResponse,
     CompleteLeaseRequest, FailLeaseRequest, JobKind, LeaseResponse, ProvisioningOperationResponse,
     ProvisioningStageUpdateRequest, RegisterWorkerRequest, RenewLeaseRequest,
     RuntimeResourceInventoryResponse, SandboxProvisionSpec, WorkerCapability,
     WorkerHeartbeatRequest, WorkerJobResult, WorkerResponse, build_api_client,
+    validate_agent_command_request,
 };
 use serde_json::json;
+use sha2::Digest;
 use uuid::Uuid;
 
 const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
@@ -106,6 +110,9 @@ struct RegisterArgs {
     #[arg(long = "label", value_parser = parse_label)]
     label: Vec<(String, String)>,
 
+    #[arg(long, value_enum, default_value_t = ProviderModeArg::DryRun)]
+    provider_mode: ProviderModeArg,
+
     #[arg(long)]
     max_concurrent_jobs: Option<u32>,
 }
@@ -156,7 +163,7 @@ struct HeartbeatArgs {
     max_concurrent_jobs: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy, Args)]
+#[derive(Debug, Clone, Args)]
 struct ClaimArgs {
     worker_id: Uuid,
 
@@ -165,6 +172,9 @@ struct ClaimArgs {
 
     #[arg(skip)]
     operation_id: Option<Uuid>,
+
+    #[arg(skip)]
+    kinds: Option<Vec<JobKind>>,
 }
 
 #[derive(Debug, Args)]
@@ -253,6 +263,15 @@ struct ProviderArgs {
     #[arg(long, env = "SANDBOXWICH_RUNTIME_IMAGE")]
     runtime_image: Option<String>,
 
+    /// Enables the one closed uid-0 trusted-supervisor profile. This is only
+    /// advertised when the configured runtime image is digest-pinned.
+    #[arg(
+        long,
+        env = "SANDBOXWICH_APEX_TRUSTED_SUPERVISOR_V1",
+        default_value_t = false
+    )]
+    apex_trusted_supervisor_v1: bool,
+
     #[arg(long, env = "SANDBOXWICH_EGRESS_GATEWAY_IMAGE")]
     egress_gateway_image: Option<String>,
 
@@ -264,6 +283,14 @@ struct ProviderArgs {
 
     #[arg(long, env = "SANDBOXWICH_RUNTIME_CLASS_NAME")]
     runtime_class_name: Option<String>,
+
+    #[arg(
+        long,
+        env = "SANDBOXWICH_ISOLATION_PROFILE",
+        value_enum,
+        default_value_t = IsolationProfile::Development
+    )]
+    isolation_profile: IsolationProfile,
 
     /// Enable CiliumNetworkPolicy `toFQDNs` rendering for host allow rules.
     /// The cluster must have Cilium CRDs and DNS proxy enforcement installed.
@@ -441,10 +468,14 @@ struct ProviderApplyArgs {
 enum CapabilityArg {
     ProvisionSandbox,
     RunCommand,
+    MaterializeFile,
+    ApexTaskInstructions,
     Snapshot,
     DesktopStream,
     FqdnEgress,
     K8sPod,
+    SandboxedContainer,
+    VirtualMachine,
     GvisorSandbox,
 }
 
@@ -534,9 +565,47 @@ impl SandboxProvider for RuntimeProvider {
         request: AgentCommandRequest,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<sandboxwich_core::AgentCommandResult> {
+        validate_agent_command_request(&request)?;
         match self {
             Self::DryRun(provider) => provider.exec_handoff(sandbox_id, spec, request, cancelled),
             Self::Apply(provider) => provider.exec_handoff(sandbox_id, spec, request, cancelled),
+        }
+    }
+
+    fn materialize_file(
+        &self,
+        sandbox_id: sandboxwich_core::SandboxId,
+        destination: sandboxwich_core::MaterializeFileDestination,
+        expected_sha256: &str,
+        content: &[u8],
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<sandboxwich_core::MaterializeFileObservation> {
+        match self {
+            Self::DryRun(provider) => provider.materialize_file(
+                sandbox_id,
+                destination,
+                expected_sha256,
+                content,
+                cancelled,
+            ),
+            Self::Apply(provider) => provider.materialize_file(
+                sandbox_id,
+                destination,
+                expected_sha256,
+                content,
+                cancelled,
+            ),
+        }
+    }
+
+    fn read_apex_task_instructions(
+        &self,
+        sandbox_id: sandboxwich_core::SandboxId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<Vec<u8>> {
+        match self {
+            Self::DryRun(provider) => provider.read_apex_task_instructions(sandbox_id, cancelled),
+            Self::Apply(provider) => provider.read_apex_task_instructions(sandbox_id, cancelled),
         }
     }
 
@@ -618,28 +687,27 @@ async fn main() -> anyhow::Result<()> {
                         "agent_prompt",
                         "snapshot",
                         "desktop_stream",
-                        "k8s_pod",
-                        "gvisor_sandbox"
+                        "k8s_pod"
                     ]
                 }))?
             );
         }
         Command::ProviderCapabilities(args) => {
-            let provider = provider_from_args(args);
+            let provider = provider_from_args(args)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&provider.capability_report())?
             );
         }
         Command::ProviderHealth(args) => {
-            let provider = provider_from_args(args);
+            let provider = provider_from_args(args)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&provider.health_report())?
             );
         }
         Command::ProviderSmoke(args) => {
-            let provider = provider_from_args(args);
+            let provider = provider_from_args(args)?;
             let sandbox_id = sandboxwich_core::SandboxId::new();
             let child_sandbox_id = sandboxwich_core::SandboxId::new();
             let snapshot_id = sandboxwich_core::SnapshotId::new();
@@ -651,6 +719,7 @@ async fn main() -> anyhow::Result<()> {
                     argv: vec!["echo".to_string(), "sandboxwich".to_string()],
                     cwd: None,
                     env: BTreeMap::new(),
+                    stdin: None,
                     timeout_secs: None,
                 },
                 &CancelSignal::never_cancelled(),
@@ -709,13 +778,25 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&outcome)?);
         }
         Command::Register(args) => {
+            let capabilities = capabilities_for_provider_mode(
+                capabilities_from_args(
+                    args.capability,
+                    IsolationProfile::Development,
+                    None,
+                    false,
+                    false,
+                )?,
+                args.provider_mode,
+            );
+            let mut labels: BTreeMap<_, _> = args.label.into_iter().collect();
+            add_placement_proof_labels(&mut labels, args.provider_mode, None, false);
             let response = register_worker(
                 &client,
                 &api,
                 args.name,
                 args.provider,
-                capabilities_from_args(args.capability, None, false),
-                args.label.into_iter().collect(),
+                capabilities,
+                labels,
                 // Standalone registration may be consumed by multiple
                 // work-once/work-loop processes, so preserve the operator's
                 // declared aggregate capacity.
@@ -780,6 +861,7 @@ async fn main() -> anyhow::Result<()> {
             print_json::<LeaseResponse>(response).await?;
         }
         Command::Run(args) => {
+            let isolation_profile = args.provider.provider.isolation_profile;
             let runtime_class_name = args.provider.provider.runtime_class_name.as_deref();
             let fqdn_egress_backend = args.provider.provider.cilium_fqdn_egress
                 || args
@@ -788,9 +870,24 @@ async fn main() -> anyhow::Result<()> {
                     .egress_gateway_image
                     .as_deref()
                     .is_some_and(image_is_digest_pinned);
-            let capabilities =
-                capabilities_from_args(args.capability, runtime_class_name, fqdn_egress_backend);
-            let labels: BTreeMap<_, _> = args.label.into_iter().collect();
+            validate_apex_trusted_supervisor_config(&args.provider.provider)?;
+            let capabilities = capabilities_for_provider_mode(
+                capabilities_from_args(
+                    args.capability,
+                    isolation_profile,
+                    runtime_class_name,
+                    fqdn_egress_backend,
+                    args.provider.provider.apex_trusted_supervisor_v1,
+                )?,
+                args.provider.provider_mode,
+            );
+            let mut labels: BTreeMap<_, _> = args.label.into_iter().collect();
+            add_placement_proof_labels(
+                &mut labels,
+                args.provider.provider_mode,
+                args.provider.provider.runtime_image.as_deref(),
+                args.provider.provider.apex_trusted_supervisor_v1,
+            );
             let response = register_worker(
                 &client,
                 &api,
@@ -838,6 +935,7 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
         Command::WorkOnce(args) => {
+            let claim_kinds = claim_kinds_for_provider_mode(args.provider.provider_mode);
             let provider = Arc::new(runtime_provider_from_args(args.provider)?);
             let response = claim(
                 &client,
@@ -846,6 +944,7 @@ async fn main() -> anyhow::Result<()> {
                     worker_id: args.worker_id,
                     lease_seconds: args.lease_seconds,
                     operation_id: Some(Uuid::now_v7()),
+                    kinds: claim_kinds,
                 },
             )
             .await?;
@@ -867,7 +966,9 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
+fn provider_from_args(args: ProviderArgs) -> anyhow::Result<KubernetesDryRunProvider> {
+    let runtime_class_name = non_empty(args.runtime_class_name);
+    validate_isolation_configuration(args.isolation_profile, runtime_class_name.as_deref())?;
     let dns_service_ips = runtime_dns_service_ips(args.dns_service_ips);
     let provider = KubernetesDryRunProvider::with_snapshot_class(
         args.cluster,
@@ -876,10 +977,12 @@ fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
         non_empty(args.snapshot_class),
     )
     .with_runtime_image(non_empty(args.runtime_image))
+    .with_apex_trusted_supervisor_v1(args.apex_trusted_supervisor_v1)
     .with_egress_gateway_image(non_empty(args.egress_gateway_image))
     .with_workspace_storage(non_empty(args.workspace_storage))
     .with_ssh_authorized_keys_secret(non_empty(args.ssh_authorized_keys_secret))
-    .with_runtime_class_name(non_empty(args.runtime_class_name))
+    .with_isolation_profile(args.isolation_profile)
+    .with_runtime_class_name(runtime_class_name)
     .with_cilium_fqdn_egress(args.cilium_fqdn_egress)
     .with_sandbox_namespace(non_empty(args.sandbox_namespace))
     .with_dns_namespace(non_empty(args.dns_namespace))
@@ -889,10 +992,10 @@ fn provider_from_args(args: ProviderArgs) -> KubernetesDryRunProvider {
     } else {
         provider.with_egress_excluded_cidrs(args.egress_excluded_cidrs)
     };
-    provider
+    Ok(provider
         .with_ingress_namespace(non_empty(args.ingress_namespace))
         .with_ingress_pod_selector(args.ingress_selector_label)
-        .with_vnc_password_secret(non_empty(args.vnc_password_secret))
+        .with_vnc_password_secret(non_empty(args.vnc_password_secret)))
 }
 
 fn resolver_ips_from_resolv_conf(contents: &str) -> Vec<IpAddr> {
@@ -1003,7 +1106,7 @@ fn require_explicit_runtime_image_for_apply(args: &ProviderArgs) -> anyhow::Resu
 
 fn apply_provider_from_args(args: ProviderApplyArgs) -> anyhow::Result<KubernetesApplyProvider> {
     require_explicit_runtime_image_for_apply(&args.provider)?;
-    let provider = provider_from_args(args.provider);
+    let provider = provider_from_args(args.provider)?;
     let mutation_enabled = KubernetesApplyProvider::mutation_enabled_from_env();
     if let Some(warning) = mutation_gate_force_enabled_warning(
         args.confirm_apply,
@@ -1020,10 +1123,11 @@ fn apply_provider_from_args(args: ProviderApplyArgs) -> anyhow::Result<Kubernete
 }
 
 fn runtime_provider_from_args(args: RuntimeProviderArgs) -> anyhow::Result<RuntimeProvider> {
+    validate_apex_trusted_supervisor_config(&args.provider)?;
     if matches!(args.provider_mode, ProviderModeArg::Apply) {
         require_explicit_runtime_image_for_apply(&args.provider)?;
     }
-    let provider = provider_from_args(args.provider);
+    let provider = provider_from_args(args.provider)?;
     Ok(match args.provider_mode {
         ProviderModeArg::DryRun => RuntimeProvider::DryRun(provider),
         ProviderModeArg::Apply => {
@@ -1048,6 +1152,43 @@ fn runtime_provider_from_args(args: RuntimeProviderArgs) -> anyhow::Result<Runti
     })
 }
 
+fn validate_apex_trusted_supervisor_config(args: &ProviderArgs) -> anyhow::Result<()> {
+    if args.apex_trusted_supervisor_v1 {
+        anyhow::ensure!(
+            args.runtime_image
+                .as_deref()
+                .is_some_and(image_is_digest_pinned),
+            "apex_trusted_supervisor_v1 requires SANDBOXWICH_RUNTIME_IMAGE pinned by sha256 digest"
+        );
+    }
+    Ok(())
+}
+
+fn add_placement_proof_labels(
+    labels: &mut BTreeMap<String, String>,
+    provider_mode: ProviderModeArg,
+    runtime_image: Option<&str>,
+    apex_trusted_supervisor_v1: bool,
+) {
+    labels.insert(
+        "provider_mode".to_string(),
+        match provider_mode {
+            ProviderModeArg::DryRun => "dry_run",
+            ProviderModeArg::Apply => "apply",
+        }
+        .to_string(),
+    );
+    if let Some(runtime_image) = runtime_image.filter(|value| !value.trim().is_empty()) {
+        labels.insert("runtime_image".to_string(), runtime_image.to_string());
+    }
+    if apex_trusted_supervisor_v1 {
+        labels.insert(
+            "runtime_profile".to_string(),
+            "apex_trusted_supervisor_v1".to_string(),
+        );
+    }
+}
+
 async fn claim(
     client: &reqwest::Client,
     api: &str,
@@ -1061,13 +1202,12 @@ async fn claim(
         )
         .json(&ClaimLeaseRequest {
             lease_seconds: args.lease_seconds,
-            // The host-side worker legitimately dispatches every job kind and sandbox
-            // its capabilities cover (it's what runs `kubectl exec` etc. on behalf of
-            // whichever sandbox a job targets), so it intentionally claims unfiltered
-            // -- unlike `sandboxwich-agent`'s guest daemon, which scopes claims to its
-            // own sandbox and to `run_command` only.
+            // Apply workers and explicit `claim` calls may claim any job their
+            // registered capabilities cover. Dry-run work commands supply a closed
+            // kind list that excludes materialization because they cannot attest a
+            // destination and must not consume its staged source.
             sandbox_id: None,
-            kinds: None,
+            kinds: args.kinds,
         })
         .send()
         .await?;
@@ -1438,6 +1578,7 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
             .ok()
             .as_deref(),
     );
+    let claim_kinds = claim_kinds_for_provider_mode(args.provider.provider_mode);
     let provider = Arc::new(runtime_provider_from_args(args.provider)?);
     let labels: BTreeMap<_, _> = args.label.into_iter().collect();
     let drain_timeout = Duration::from_secs(args.drain_timeout_secs);
@@ -1521,9 +1662,10 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
             worker_id: args.worker_id,
             lease_seconds: args.lease_seconds,
             operation_id: Some(Uuid::now_v7()),
+            kinds: claim_kinds.clone(),
         };
         let response = match with_retries("claim lease", API_RETRY_ATTEMPTS, || {
-            claim(client, api, claim_args)
+            claim(client, api, claim_args.clone())
         })
         .await
         {
@@ -1657,6 +1799,30 @@ where
             }
         }
     });
+    let materialization = if lease.job.kind == JobKind::MaterializeFile {
+        match fetch_materialization(client, api, lease_id).await {
+            Ok(content) if !cancelled.is_cancelled() => Some(content),
+            Ok(_) | Err(_) => {
+                renew_task.abort();
+                let _ = renew_task.await;
+                let payload = FailLeaseRequest {
+                    error: "materialization fetch failed".to_string(),
+                    retry: true,
+                };
+                return with_retries("fail lease", API_RETRY_ATTEMPTS, || async {
+                    let response = client
+                        .post(format!("{api}/leases/{lease_id}/fail"))
+                        .json(&payload)
+                        .send()
+                        .await?;
+                    decode_json::<LeaseResponse>(response).await
+                })
+                .await;
+            }
+        }
+    } else {
+        None
+    };
 
     // Job execution shells out to `kubectl` and blocks synchronously; run it on a
     // blocking-pool thread so it can't stall the async runtime (and the heartbeat/
@@ -1686,7 +1852,13 @@ where
             ))?;
             Ok(())
         };
-        execute_job_with_reporter(&job, exec_provider.as_ref(), &exec_cancelled, &mut reporter)
+        execute_job_with_reporter(
+            &job,
+            materialization.as_deref(),
+            exec_provider.as_ref(),
+            &exec_cancelled,
+            &mut reporter,
+        )
     })
     .await
     .unwrap_or_else(|join_error| {
@@ -1712,6 +1884,93 @@ where
                 decode_json::<LeaseResponse>(response).await
             })
             .await
+        }
+        Ok(WorkerJobOutcome::ApexTaskInstructions {
+            request_id,
+            sandbox_id,
+            provider_apply_id,
+            callback_nonce,
+            callback_url,
+            sha256,
+            bytes,
+        }) => {
+            let callback =
+                validate_apex_callback_url(&callback_url, callback_nonce).and_then(|url| {
+                    Ok((
+                        url,
+                        ApexTaskInstructionsCallbackRequest {
+                            request_id,
+                            lease_id: lease_id.0,
+                            lease_attempt: u64::try_from(lease_attempt)
+                                .context("instruction lease attempt is invalid")?,
+                            provider_apply_id,
+                            sha256: sha256.clone(),
+                            byte_count: u64::try_from(bytes.len())
+                                .context("instruction byte count is invalid")?,
+                            output_base64: Some(
+                                base64::engine::general_purpose::STANDARD.encode(&bytes),
+                            ),
+                        },
+                    ))
+                });
+            let callback = match callback {
+                Ok((url, payload)) => {
+                    with_retries(
+                        "deliver APEX instruction callback",
+                        API_RETRY_ATTEMPTS,
+                        || async {
+                            let response = client.post(url.clone()).json(&payload).send().await?;
+                            decode_json::<ApexTaskInstructionsCallbackResponse>(response).await
+                        },
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            match callback {
+                Ok(callback) => {
+                    let payload = CompleteLeaseRequest {
+                        result: Some(WorkerJobResult::ApexTaskInstructions {
+                            request_id,
+                            sandbox_id,
+                            lease_id,
+                            lease_attempt,
+                            provider_apply_id,
+                            sha256,
+                            byte_count: u64::try_from(bytes.len())
+                                .expect("instruction output is capped at 1 MiB"),
+                            output_unavailable: callback.output_unavailable,
+                        }),
+                    };
+                    with_retries("complete lease", API_RETRY_ATTEMPTS, || async {
+                        let response = client
+                            .post(format!("{api}/leases/{lease_id}/complete"))
+                            .json(&payload)
+                            .send()
+                            .await?;
+                        decode_json::<LeaseResponse>(response).await
+                    })
+                    .await
+                }
+                Err(error) => {
+                    let payload = FailLeaseRequest {
+                        error: "APEX instruction callback delivery failed".to_string(),
+                        // The provider read already happened. Re-queuing this
+                        // lease would execute the one-time reader again.
+                        retry: false,
+                    };
+                    with_retries("fail lease", API_RETRY_ATTEMPTS, || async {
+                        let response = client
+                            .post(format!("{api}/leases/{lease_id}/fail"))
+                            .json(&payload)
+                            .send()
+                            .await?;
+                        decode_json::<LeaseResponse>(response).await
+                    })
+                    .await
+                    .with_context(|| format!("instruction callback failed: {error:#}"))
+                }
+            }
         }
         Ok(WorkerJobOutcome::Fail { error, retry }) => {
             let payload = FailLeaseRequest { error, retry };
@@ -1743,10 +2002,54 @@ where
     }
 }
 
+async fn fetch_materialization(
+    client: &reqwest::Client,
+    api: &str,
+    lease_id: sandboxwich_core::LeaseId,
+) -> anyhow::Result<Vec<u8>> {
+    let mut response = client
+        .get(format!("{api}/leases/{lease_id}/materialization"))
+        .send()
+        .await?
+        .error_for_status()?;
+    let declared = response
+        .content_length()
+        .context("materialization response has no content-length")?;
+    anyhow::ensure!(
+        declared <= sandboxwich_core::MAX_SANDBOX_FILE_BYTES,
+        "materialization response exceeds 64 MiB"
+    );
+    let mut content = Vec::with_capacity(declared as usize);
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(
+            content.len() + chunk.len() <= sandboxwich_core::MAX_SANDBOX_FILE_BYTES as usize,
+            "materialization response exceeds 64 MiB"
+        );
+        content.extend_from_slice(&chunk);
+    }
+    anyhow::ensure!(
+        content.len() as u64 == declared,
+        "materialization response length mismatch"
+    );
+    Ok(content)
+}
+
 #[derive(Debug)]
 enum WorkerJobOutcome {
     Complete(WorkerJobResult),
-    Fail { error: String, retry: bool },
+    ApexTaskInstructions {
+        request_id: Uuid,
+        sandbox_id: sandboxwich_core::SandboxId,
+        provider_apply_id: Uuid,
+        callback_nonce: Uuid,
+        callback_url: String,
+        sha256: String,
+        bytes: Vec<u8>,
+    },
+    Fail {
+        error: String,
+        retry: bool,
+    },
 }
 
 fn provisioning_stage_request(
@@ -1766,17 +2069,47 @@ fn provisioning_stage_request(
     )
 }
 
+fn validate_apex_callback_url(url: &str, nonce: Uuid) -> anyhow::Result<reqwest::Url> {
+    let parsed = reqwest::Url::parse(url).context("instruction callback URL is invalid")?;
+    anyhow::ensure!(
+        matches!(parsed.scheme(), "http" | "https")
+            && parsed.host_str().is_some()
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+            && parsed.query().is_none()
+            && parsed.fragment().is_none(),
+        "instruction callback URL must be an http(s) origin and fixed callback path"
+    );
+    let expected_suffix = format!("/apex-instruction-callbacks/{nonce}");
+    anyhow::ensure!(
+        parsed.path().ends_with(&expected_suffix),
+        "instruction callback URL nonce does not match job lineage"
+    );
+    Ok(parsed)
+}
+
 #[cfg(test)]
 fn execute_job(
     job: &sandboxwich_core::Job,
     provider: &impl SandboxProvider,
     cancelled: &CancelSignal,
 ) -> anyhow::Result<WorkerJobOutcome> {
-    execute_job_with_reporter(job, provider, cancelled, &mut |_| Ok(()))
+    execute_job_with_reporter(job, None, provider, cancelled, &mut |_| Ok(()))
+}
+
+#[cfg(test)]
+fn execute_materialization_job(
+    job: &sandboxwich_core::Job,
+    content: &[u8],
+    provider: &impl SandboxProvider,
+    cancelled: &CancelSignal,
+) -> anyhow::Result<WorkerJobOutcome> {
+    execute_job_with_reporter(job, Some(content), provider, cancelled, &mut |_| Ok(()))
 }
 
 fn execute_job_with_reporter(
     job: &sandboxwich_core::Job,
+    materialization: Option<&[u8]>,
     provider: &impl SandboxProvider,
     cancelled: &CancelSignal,
     report: &mut dyn FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
@@ -1848,6 +2181,96 @@ fn execute_job_with_reporter(
             Ok(WorkerJobOutcome::Complete(WorkerJobResult::RunCommand {
                 result,
             }))
+        }
+        JobKind::RunResidentProcess => {
+            anyhow::bail!("run_resident_process jobs are executed by the sandbox guest agent")
+        }
+        JobKind::MaterializeFile => {
+            let sandbox_id = sandbox_id_from_payload(&job.payload)?;
+            let file_id = sandboxwich_core::FileId(uuid_from_payload(&job.payload, "fileId")?);
+            let destination: sandboxwich_core::MaterializeFileDestination = serde_json::from_value(
+                job.payload
+                    .get("destination")
+                    .cloned()
+                    .context("materialization destination is missing")?,
+            )
+            .context("materialization destination is invalid")?;
+            let expected_sha256 = job
+                .payload
+                .get("expectedSha256")
+                .and_then(serde_json::Value::as_str)
+                .context("materialization digest is missing")?;
+            let content = materialization.context("materialization content was not fetched")?;
+            anyhow::ensure!(
+                content.len() as u64 <= sandboxwich_core::MAX_SANDBOX_FILE_BYTES,
+                "materialization exceeds 64 MiB"
+            );
+            let observation = provider.materialize_file(
+                sandbox_id,
+                destination.clone(),
+                expected_sha256,
+                content,
+                cancelled,
+            )?;
+            Ok(WorkerJobOutcome::Complete(
+                WorkerJobResult::MaterializeFile {
+                    receipt: sandboxwich_core::MaterializeFileReceipt {
+                        sandbox_id,
+                        file_id,
+                        destination,
+                        sha256: expected_sha256.to_string(),
+                        destination_sha256: observation.destination_sha256,
+                        size_bytes: observation.size_bytes,
+                        cleanup_owner: sandboxwich_core::MaterializeFileCleanupOwner::ControlPlane,
+                    },
+                },
+            ))
+        }
+        JobKind::ApexTaskInstructions => {
+            let sandbox_id = sandbox_id_from_payload(&job.payload)?;
+            let request_id = uuid_from_payload(&job.payload, "requestId")?;
+            let provider_apply_id = uuid_from_payload(&job.payload, "providerApplyId")?;
+            let callback_nonce = uuid_from_payload(&job.payload, "callbackNonce")?;
+            let callback_url = job
+                .payload
+                .get("callbackUrl")
+                .and_then(serde_json::Value::as_str)
+                .context("instruction callback URL is missing")?
+                .to_string();
+            validate_apex_callback_url(&callback_url, callback_nonce)?;
+            let expected_sha256 = job
+                .payload
+                .get("expectedSha256")
+                .and_then(serde_json::Value::as_str)
+                .context("instruction digest is missing")?;
+            anyhow::ensure!(
+                expected_sha256.len() == 64
+                    && expected_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+                "instruction digest is invalid"
+            );
+            let expected_byte_count = job
+                .payload
+                .get("expectedByteCount")
+                .and_then(serde_json::Value::as_u64)
+                .context("instruction byte count is missing")?;
+            let bytes = provider.read_apex_task_instructions(sandbox_id, cancelled)?;
+            let sha256 = format!("{:x}", sha2::Sha256::digest(&bytes));
+            anyhow::ensure!(
+                u64::try_from(bytes.len()).ok() == Some(expected_byte_count)
+                    && sha256 == expected_sha256,
+                "apex_instruction_output_mismatch"
+            );
+            Ok(WorkerJobOutcome::ApexTaskInstructions {
+                request_id,
+                sandbox_id,
+                provider_apply_id,
+                callback_nonce,
+                callback_url,
+                sha256,
+                bytes,
+            })
         }
         JobKind::RunPrompt => Ok(WorkerJobOutcome::Complete(WorkerJobResult::RunPrompt {
             output: prompt_output_from_payload(&job.payload)?,
@@ -1936,14 +2359,38 @@ fn agent_request_from_payload(payload: &serde_json::Value) -> anyhow::Result<Age
         .transpose()
         .context("job payload env is invalid")?
         .unwrap_or_else(BTreeMap::new);
+    let stdin = payload
+        .get("stdin")
+        .cloned()
+        .map(|value| {
+            serde_json::from_value(json!({
+                "argv": [],
+                "cwd": null,
+                "env": {},
+                "stdin": value,
+                "timeout_secs": null
+            }))
+            .map(|request: AgentCommandRequest| request.stdin)
+        })
+        .transpose()
+        .map_err(|error| {
+            if error.to_string().contains("command_stdin_too_large") {
+                anyhow::anyhow!("command_stdin_too_large: command stdin exceeds 1048576 bytes")
+            } else {
+                anyhow::Error::new(error).context("job payload stdin is invalid")
+            }
+        })?
+        .flatten();
     let timeout_secs = payload.get("timeoutSecs").and_then(|value| value.as_u64());
-
-    Ok(AgentCommandRequest {
+    let request = AgentCommandRequest {
         argv,
         cwd,
         env,
+        stdin,
         timeout_secs,
-    })
+    };
+    validate_agent_command_request(&request)?;
+    Ok(request)
 }
 
 fn prompt_output_from_payload(payload: &serde_json::Value) -> anyhow::Result<String> {
@@ -2044,27 +2491,103 @@ fn uuid_from_payload(payload: &serde_json::Value, field: &'static str) -> anyhow
 
 fn capabilities_from_args(
     capabilities: Vec<CapabilityArg>,
+    isolation_profile: IsolationProfile,
     runtime_class_name: Option<&str>,
     fqdn_egress_backend: bool,
-) -> Vec<WorkerCapability> {
-    if capabilities.is_empty() {
-        let mut defaults = vec![
+    apex_trusted_supervisor_v1: bool,
+) -> anyhow::Result<Vec<WorkerCapability>> {
+    validate_isolation_configuration(isolation_profile, runtime_class_name)?;
+    if apex_trusted_supervisor_v1 && isolation_profile != IsolationProfile::Gvisor {
+        anyhow::bail!("--apex-trusted-supervisor-v1 requires --isolation-profile gvisor");
+    }
+    if capabilities.iter().any(|capability| {
+        matches!(
+            capability,
+            CapabilityArg::SandboxedContainer
+                | CapabilityArg::VirtualMachine
+                | CapabilityArg::GvisorSandbox
+        )
+    }) {
+        anyhow::bail!(
+            "hostile-workload capabilities are derived from --isolation-profile and cannot be overridden with --capability"
+        );
+    }
+
+    let uses_default_capabilities = capabilities.is_empty();
+    let mut resolved = if uses_default_capabilities {
+        vec![
             WorkerCapability::K8sPod,
             WorkerCapability::ProvisionSandbox,
             WorkerCapability::RunCommand,
+            WorkerCapability::MaterializeFile,
             WorkerCapability::Snapshot,
             WorkerCapability::DesktopStream,
-        ];
-        if runtime_class_name.is_some_and(|value| !value.trim().is_empty()) {
-            defaults.push(WorkerCapability::GvisorSandbox);
-        }
-        if fqdn_egress_backend {
-            defaults.push(WorkerCapability::FqdnEgress);
-        }
-        defaults
+        ]
     } else {
         capabilities.into_iter().map(to_capability).collect()
+    };
+    match isolation_profile {
+        IsolationProfile::Development => {}
+        IsolationProfile::Gvisor => resolved.push(WorkerCapability::SandboxedContainer),
+        IsolationProfile::Kata => resolved.push(WorkerCapability::VirtualMachine),
     }
+    if uses_default_capabilities
+        && fqdn_egress_backend
+        && !resolved.contains(&WorkerCapability::FqdnEgress)
+    {
+        resolved.push(WorkerCapability::FqdnEgress);
+    }
+    if apex_trusted_supervisor_v1 && !resolved.contains(&WorkerCapability::ApexTrustedSupervisorV1)
+    {
+        resolved.push(WorkerCapability::ApexTrustedSupervisorV1);
+    }
+    if apex_trusted_supervisor_v1 && !resolved.contains(&WorkerCapability::ApexTaskInstructions) {
+        resolved.push(WorkerCapability::ApexTaskInstructions);
+    }
+    Ok(resolved)
+}
+
+fn capabilities_for_provider_mode(
+    mut capabilities: Vec<WorkerCapability>,
+    provider_mode: ProviderModeArg,
+) -> Vec<WorkerCapability> {
+    if provider_mode == ProviderModeArg::DryRun {
+        capabilities.retain(|capability| *capability != WorkerCapability::MaterializeFile);
+    }
+    capabilities
+}
+
+fn claim_kinds_for_provider_mode(provider_mode: ProviderModeArg) -> Option<Vec<JobKind>> {
+    if provider_mode == ProviderModeArg::Apply {
+        return None;
+    }
+    Some(vec![
+        JobKind::ProvisionSandbox,
+        JobKind::StopSandbox,
+        JobKind::ResumeSandbox,
+        JobKind::RunCommand,
+        JobKind::ApexTaskInstructions,
+        JobKind::RunPrompt,
+        JobKind::CreateSnapshot,
+        JobKind::ForkSandbox,
+    ])
+}
+
+fn validate_isolation_configuration(
+    isolation_profile: IsolationProfile,
+    runtime_class_name: Option<&str>,
+) -> anyhow::Result<()> {
+    if matches!(
+        isolation_profile,
+        IsolationProfile::Gvisor | IsolationProfile::Kata
+    ) && runtime_class_name.is_none_or(|value| value.trim().is_empty())
+    {
+        anyhow::bail!(
+            "--isolation-profile {} requires a non-empty --runtime-class-name",
+            isolation_profile.as_str()
+        );
+    }
+    Ok(())
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -2097,10 +2620,14 @@ fn to_capability(value: CapabilityArg) -> WorkerCapability {
     match value {
         CapabilityArg::ProvisionSandbox => WorkerCapability::ProvisionSandbox,
         CapabilityArg::RunCommand => WorkerCapability::RunCommand,
+        CapabilityArg::MaterializeFile => WorkerCapability::MaterializeFile,
+        CapabilityArg::ApexTaskInstructions => WorkerCapability::ApexTaskInstructions,
         CapabilityArg::Snapshot => WorkerCapability::Snapshot,
         CapabilityArg::DesktopStream => WorkerCapability::DesktopStream,
         CapabilityArg::FqdnEgress => WorkerCapability::FqdnEgress,
         CapabilityArg::K8sPod => WorkerCapability::K8sPod,
+        CapabilityArg::SandboxedContainer => WorkerCapability::SandboxedContainer,
+        CapabilityArg::VirtualMachine => WorkerCapability::VirtualMachine,
         CapabilityArg::GvisorSandbox => WorkerCapability::GvisorSandbox,
     }
 }
