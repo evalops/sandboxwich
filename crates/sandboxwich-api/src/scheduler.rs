@@ -5,6 +5,7 @@ use crate::handlers::snapshots::*;
 use crate::handlers::workers::*;
 use crate::idempotency::expire_idempotency_records;
 use crate::limits::expire_tenant_limit_counters;
+use crate::reap::reap_expired_active_sandboxes;
 use std::time::Duration;
 
 /// Runs the lease/snapshot/desktop-session expiry sweeps on a fixed interval in
@@ -18,6 +19,12 @@ use std::time::Duration;
 /// entirely. Integration tests that don't assert on sweep-driven expiry
 /// disable it by default so the sweeper's periodic writes can't race with
 /// foreground test assertions against the same server.
+///
+/// This is also what makes active-lifetime reaping (`reap_expired_active_
+/// sandboxes`) run at all: disabling this sweeper means `max_lifetime_seconds`
+/// and `idle_ttl_seconds` are stored but never enforced on this instance,
+/// exactly as leases/snapshots/desktop-sessions/idempotency/tenant-limits
+/// already behave when disabled.
 pub(crate) fn spawn_expiry_sweeper(
     db: Database,
     interval: Duration,
@@ -46,6 +53,22 @@ pub(crate) fn spawn_expiry_sweeper(
             }
             if let Err(error) = expire_tenant_limit_counters(&db).await {
                 tracing::warn!(?error, "tenant limit counter retention sweep failed");
+            }
+            match reap_expired_active_sandboxes(&db).await {
+                Ok(reaped) => {
+                    for reaped in &reaped {
+                        tracing::info!(
+                            sandbox_id = %reaped.sandbox.id,
+                            tenant_id = %reaped.sandbox.tenant_id,
+                            trigger = ?reaped.trigger,
+                            deadline = %reaped.deadline,
+                            "reaped sandbox past its active-lifetime deadline"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(?error, "active sandbox lifetime reap sweep failed");
+                }
             }
         }
     })

@@ -941,7 +941,30 @@ pub struct Sandbox {
     pub execution_class: ExecutionClass,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Retention window for an *already-`archived`* sandbox's record: how
+    /// long its row (and dependent rows) stay queryable after teardown before
+    /// `run_cleanup_controller` deletes them. Does **not** govern how long a
+    /// live sandbox may run -- see `max_lifetime_seconds` and
+    /// `idle_ttl_seconds` for that. The three knobs are independent and
+    /// commonly all set on the same sandbox; see `docs/capabilities.md` for
+    /// the full distinction.
     pub ttl_seconds: Option<u64>,
+    /// Hard cap on how long this sandbox may stay outside `Archived`,
+    /// measured from `created_at`. `None` (the default) means no cap. The
+    /// background expiry sweeper drives an expired sandbox through the same
+    /// `stop_sandbox` path a user-initiated stop uses once this deadline
+    /// passes, regardless of activity.
+    #[serde(default)]
+    pub max_lifetime_seconds: Option<u64>,
+    /// Rolling idle window: if no activity is observed for this many
+    /// seconds, the background expiry sweeper stops the sandbox the same way
+    /// `max_lifetime_seconds` does. `None` (the default) disables idle
+    /// reaping. "Activity" today means the more recent of this sandbox's own
+    /// last lifecycle-state transition and its most recently queued guest
+    /// command -- SSH sessions, desktop sessions, and resident-process
+    /// output do not yet reset this clock; see `docs/capabilities.md`.
+    #[serde(default)]
+    pub idle_ttl_seconds: Option<u64>,
     pub parent_snapshot_id: Option<SnapshotId>,
 }
 
@@ -955,6 +978,18 @@ pub struct CreateSandboxRequest {
     pub runtime_profile: Option<SandboxRuntimeProfile>,
     pub execution_class: Option<ExecutionClass>,
     pub ttl_seconds: Option<u64>,
+    /// See `Sandbox::max_lifetime_seconds`. Server-side default/clamp config
+    /// (`SANDBOXWICH_DEFAULT_MAX_LIFETIME_SECONDS` /
+    /// `SANDBOXWICH_MAX_MAX_LIFETIME_SECONDS`) applies when this is omitted
+    /// or exceeds the operator-configured ceiling.
+    #[serde(default)]
+    pub max_lifetime_seconds: Option<u64>,
+    /// See `Sandbox::idle_ttl_seconds`. Server-side default/clamp config
+    /// (`SANDBOXWICH_DEFAULT_IDLE_TTL_SECONDS` /
+    /// `SANDBOXWICH_MAX_IDLE_TTL_SECONDS`) applies when this is omitted or
+    /// exceeds the operator-configured ceiling.
+    #[serde(default)]
+    pub idle_ttl_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -1225,6 +1260,14 @@ pub struct ForkSnapshotRequest {
     #[serde(default)]
     pub runtime_profile: SandboxRuntimeProfile,
     pub ttl_seconds: Option<u64>,
+    /// See `Sandbox::max_lifetime_seconds`. Restoring a sandbox from a
+    /// snapshot is a sandbox-creation path like `create`/`fork`, so it goes
+    /// through the same server-side default/clamp.
+    #[serde(default)]
+    pub max_lifetime_seconds: Option<u64>,
+    /// See `Sandbox::idle_ttl_seconds`.
+    #[serde(default)]
+    pub idle_ttl_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]

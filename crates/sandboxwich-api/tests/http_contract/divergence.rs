@@ -33,6 +33,8 @@ async fn run_divergence_contract(server: TestServer) {
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await

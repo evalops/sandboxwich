@@ -123,6 +123,8 @@ async fn resident_process_storage_round_trips_public_metadata() {
         created_at: now,
         updated_at: now,
         ttl_seconds: Some(3600),
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         parent_snapshot_id: None,
     };
     let mut tx = db.pool.begin().await.unwrap();
@@ -216,6 +218,8 @@ fn authoritative_job_enrichment_overwrites_caller_placement_metadata() {
         created_at: now,
         updated_at: now,
         ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         parent_snapshot_id: None,
         execution_class: ExecutionClass::SandboxedContainer,
     };
@@ -267,6 +271,8 @@ fn apex_runtime_profile_requires_pinned_image_and_deny_by_default_egress() {
         workspace_mode: None,
         runtime_profile: Some(SandboxRuntimeProfile::ApexTrustedSupervisorV1),
         ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         execution_class: Some(ExecutionClass::SandboxedContainer),
     };
     assert!(provision_spec_from_request(&request(&pinned, NetworkEgress::DenyAll), None).is_ok());
@@ -310,6 +316,8 @@ fn apex_runtime_profile_requires_pinned_image_and_deny_by_default_egress() {
         created_at: now,
         updated_at: now,
         ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         parent_snapshot_id: None,
         execution_class: ExecutionClass::SandboxedContainer,
     };
@@ -321,6 +329,8 @@ fn apex_runtime_profile_requires_pinned_image_and_deny_by_default_egress() {
         workspace_mode: None,
         runtime_profile: None,
         ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         execution_class: None,
     };
     assert!(provision_spec_from_request(&inherited, Some(&parent)).is_ok());
@@ -348,6 +358,8 @@ fn snapshot_fork_request_rejects_placement_mismatches() {
         network_egress: NetworkEgress::DenyAll,
         runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
         ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
     };
     validate_snapshot_fork_request(&matching, &source).expect("matching placement");
     let mut mismatch = matching.clone();
@@ -539,6 +551,8 @@ async fn materialization_rejects_a_file_from_another_sandbox() {
         created_at: now,
         updated_at: now,
         ttl_seconds: Some(600),
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         parent_snapshot_id: None,
         execution_class: ExecutionClass::SandboxedContainer,
     };
@@ -1560,6 +1574,8 @@ async fn expire_due_leases_does_not_double_process_concurrent_sweeps() {
         created_at: now,
         updated_at: now,
         ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         parent_snapshot_id: None,
     };
     insert_sandbox(&db, &sandbox).await.expect("insert sandbox");
@@ -1624,6 +1640,8 @@ async fn seed_sandbox_with_state(db: &Database, state: SandboxState) -> Sandbox 
         created_at: now,
         updated_at: now,
         ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         parent_snapshot_id: None,
     };
     insert_sandbox(db, &sandbox).await.expect("insert sandbox");
@@ -1930,6 +1948,8 @@ async fn cleanup_archived_sandboxes_never_deletes_a_sandbox_with_a_live_restore_
         created_at: now,
         updated_at: now,
         ttl_seconds: Some(0),
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         parent_snapshot_id: None,
     };
     insert_sandbox(&db, &sandbox)
@@ -1978,9 +1998,43 @@ async fn apex_execution_class_migration_backfills_legacy_rows() {
         .await
         .expect("connect upgrade database");
     let migrations = sqlx::migrate!("./migrations");
+    // This test simulates rows written *before* the corrective backfill
+    // migration below, then applies it and asserts it ran correctly.
+    //
+    // It used to build "prior_migrations" by slicing off just the literal
+    // last migration, on the assumption that the backfill migration was
+    // always the newest one -- true when this test was written, but silently
+    // stale since (several unrelated migrations, most recently the active-
+    // lifetime-reaping columns, have landed after it without breaking this
+    // test, purely because none of them touched a column the legacy inserts
+    // below depend on -- unlike the active-lifetime columns, which
+    // `insert_sandbox` now unconditionally writes).
+    //
+    // The fix excludes only the backfill migration itself (found by name,
+    // not position) rather than truncating everything after it, so
+    // `insert_sandbox`/`insert_job` below run against the *current* full
+    // schema (every column they need exists) with only this one migration's
+    // row-level fixup not yet applied -- exactly the legacy state this test
+    // means to construct, regardless of how many migrations land on either
+    // side of the backfill one in the future.
+    let backfill_index = migrations
+        .migrations
+        .iter()
+        .position(|migration| {
+            migration
+                .description
+                .contains("apex execution class backfill")
+        })
+        .expect("apex_execution_class_backfill migration must still exist");
     let prior_migrations = sqlx::migrate::Migrator {
         migrations: std::borrow::Cow::Owned(
-            migrations.migrations[..migrations.migrations.len() - 1].to_vec(),
+            migrations
+                .migrations
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != backfill_index)
+                .map(|(_, migration)| migration.clone())
+                .collect(),
         ),
         ignore_missing: false,
         locking: true,
@@ -2009,6 +2063,8 @@ async fn apex_execution_class_migration_backfills_legacy_rows() {
         created_at: now,
         updated_at: now,
         ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         parent_snapshot_id: None,
     };
     insert_sandbox(&db, &sandbox)

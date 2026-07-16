@@ -154,6 +154,22 @@ pub(crate) async fn fork_snapshot(
         created_at: now,
         updated_at: now,
         ttl_seconds: request.ttl_seconds,
+        // Same default/clamp treatment as `create_sandbox`/`fork_sandbox`:
+        // restoring from a snapshot is a sandbox-creation path too, and must
+        // not be a loophole around operator-configured active-lifetime
+        // policy. Unlike an in-place fork there is no single "parent" whose
+        // value would make sense to inherit here, so this only applies the
+        // request/server default, like `create_sandbox` does.
+        max_lifetime_seconds: clamp_optional_lifetime(
+            request.max_lifetime_seconds,
+            state.sandbox_lifetime.default_max_lifetime_seconds,
+            state.sandbox_lifetime.max_max_lifetime_seconds,
+        ),
+        idle_ttl_seconds: clamp_optional_lifetime(
+            request.idle_ttl_seconds,
+            state.sandbox_lifetime.default_idle_ttl_seconds,
+            state.sandbox_lifetime.max_idle_ttl_seconds,
+        ),
         parent_snapshot_id: Some(snapshot_id),
     };
     let job = Job {
@@ -821,7 +837,7 @@ pub(crate) async fn queue_forks_waiting_on_snapshot_on_connection(
 ) -> Result<(), ApiError> {
     let sql = format!(
         "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
-                created_at, updated_at, ttl_seconds, parent_snapshot_id
+                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, parent_snapshot_id
          from sandboxes
          where parent_snapshot_id = {} and state = 'planning'
          order by created_at asc, id asc",
@@ -896,7 +912,7 @@ pub(crate) async fn fail_sandboxes_waiting_on_snapshot_on_connection(
 ) -> Result<(), ApiError> {
     let sql = format!(
         "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
-                created_at, updated_at, ttl_seconds, parent_snapshot_id
+                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, parent_snapshot_id
          from sandboxes
          where parent_snapshot_id = {} and state = 'planning'
          order by created_at asc, id asc",

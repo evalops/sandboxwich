@@ -173,6 +173,8 @@ async fn v1_contract_exposes_operations_openapi_request_ids_and_honest_prompt_st
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -317,6 +319,8 @@ async fn platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_cor
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -334,6 +338,8 @@ async fn platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_cor
         memory_limit: None,
         network_egress: None,
         ttl_seconds: Some(120),
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
     };
     let first = client
         .post(&create_url)
@@ -415,6 +421,8 @@ async fn platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_cor
             network_egress: NetworkEgress::DenyAll,
             runtime_profile: SandboxRuntimeProfile::Unprivileged,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -464,6 +472,8 @@ async fn platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_cor
         network_egress: NetworkEgress::DenyAll,
         runtime_profile: SandboxRuntimeProfile::Unprivileged,
         ttl_seconds: Some(120),
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
     };
     let restore_key = uuid::Uuid::now_v7().to_string();
     let restore_url = format!(

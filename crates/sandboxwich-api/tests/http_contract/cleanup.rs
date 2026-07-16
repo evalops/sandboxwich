@@ -63,6 +63,8 @@ async fn archived_sandbox_cleanup_cascades_dependent_rows_on_sqlite() {
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(0),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await

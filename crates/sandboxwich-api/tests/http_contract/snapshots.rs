@@ -28,6 +28,8 @@ pub(crate) async fn legacy_snapshot_reads_and_expiry_survive_missing_placement_b
             workspace_mode: Some(WorkspaceMode::Persistent),
             runtime_profile: None,
             ttl_seconds: None,
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
             execution_class: None,
         })
         .send()
@@ -124,6 +126,8 @@ pub(crate) async fn legacy_snapshot_reads_and_expiry_survive_missing_placement_b
             network_egress: created.sandbox.network_egress.clone(),
             runtime_profile: created.sandbox.runtime_profile.clone(),
             ttl_seconds: None,
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -187,6 +191,8 @@ pub(crate) async fn apex_snapshot_claim_requires_exact_profile_and_runtime_image
             workspace_mode: Some(WorkspaceMode::Persistent),
             runtime_profile: Some(SandboxRuntimeProfile::ApexTrustedSupervisorV1),
             ttl_seconds: None,
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
             execution_class: Some(ExecutionClass::SandboxedContainer),
         })
         .send()
@@ -389,6 +395,8 @@ async fn snapshot_fork_preserves_vm_execution_class_and_requires_vm_worker() {
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
             runtime_profile: None,
         })
         .send()
@@ -489,6 +497,8 @@ async fn snapshot_fork_preserves_vm_execution_class_and_requires_vm_worker() {
             memory_limit: source.sandbox.memory_limit.clone(),
             network_egress: source.sandbox.network_egress.clone(),
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
             runtime_profile: source.sandbox.runtime_profile.clone(),
         })
         .send()
@@ -1071,6 +1081,8 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(0),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -1173,6 +1185,8 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -1428,6 +1442,8 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
