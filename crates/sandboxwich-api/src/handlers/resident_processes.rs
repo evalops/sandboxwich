@@ -4,13 +4,17 @@ use crate::error::ApiError;
 use crate::handlers::jobs::{add_provision_spec_to_payload, insert_job_on_connection};
 use crate::rows::row_to_resident_process;
 use crate::state::{AppState, LiveResidentBootstrap, Principal, TenantContext};
+use async_stream::stream;
 use axum::Json;
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use chrono::Utc;
 use sandboxwich_core::*;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::convert::Infallible;
+use std::time::Duration;
 use uuid::Uuid;
 
 async fn fetch_named_resident_process(
@@ -157,6 +161,11 @@ pub(crate) async fn put_resident_process(
             "sandboxId": sandbox_id,
             "residentProcessId": process.id,
             "generation": process.generation,
+            "argv": process.argv,
+            "cwd": process.cwd,
+            "env": process.env,
+            "restartPolicy": process.restart_policy,
+            "bootstrapSha256": process.bootstrap_sha256,
             "operation": {
                 "kind": OperationKind::RunResidentProcess,
                 "resourceId": process.id.0,
@@ -339,4 +348,139 @@ pub(crate) async fn read_resident_process_bootstrap(
         target_file: bootstrap.target_file,
         mode: bootstrap.mode,
     }))
+}
+
+pub(crate) async fn observe_resident_process(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path(process_id): Path<Uuid>,
+    Json(request): Json<ResidentProcessObservationRequest>,
+) -> Result<Json<ResidentProcessResponse>, ApiError> {
+    if request
+        .error_message
+        .as_ref()
+        .is_some_and(|message| message.len() > 1024)
+    {
+        return Err(ApiError::bad_request(
+            "resident process error message exceeds 1024 bytes",
+        ));
+    }
+    let process_id = ResidentProcessId(process_id);
+    let process = fetch_resident_process_by_id(&state.db, process_id).await?;
+    let Principal::Guest {
+        sandbox_id,
+        worker_id: _,
+    } = ctx.principal
+    else {
+        return Err(ApiError::unauthorized(
+            "resident observations require a guest credential",
+        ));
+    };
+    if process.tenant_id != ctx.tenant_id || process.sandbox_id != sandbox_id {
+        return Err(ApiError::not_found("resident process not found"));
+    }
+    if process.generation != request.generation || process.active_lease_id != Some(request.lease_id)
+    {
+        return Err(ApiError::conflict_code(
+            "resident_process_generation_conflict",
+            "resident observation does not match the active lease",
+        ));
+    }
+    let now = Utc::now();
+    let started_at = matches!(
+        request.observed_state,
+        ResidentProcessObservedState::Starting | ResidentProcessObservedState::Running
+    )
+    .then(|| now.to_rfc3339());
+    let ready_at =
+        (request.observed_state == ResidentProcessObservedState::Running).then(|| now.to_rfc3339());
+    let exited_at = matches!(
+        request.observed_state,
+        ResidentProcessObservedState::Failed
+            | ResidentProcessObservedState::Stopped
+            | ResidentProcessObservedState::Lost
+    )
+    .then(|| now.to_rfc3339());
+    let last_error = request.error_message.or(request.error_code);
+    let sql = format!(
+        "update resident_processes
+         set observed_state = {}, pid = {}, exit_code = {}, last_error = {},
+             started_at = coalesce(started_at, {}), ready_at = coalesce(ready_at, {}),
+             exited_at = {}, updated_at = {}
+         where id = {} and generation = {} and active_lease_id = {}",
+        state.db.placeholder(1),
+        state.db.placeholder(2),
+        state.db.placeholder(3),
+        state.db.placeholder(4),
+        state.db.placeholder(5),
+        state.db.placeholder(6),
+        state.db.placeholder(7),
+        state.db.placeholder(8),
+        state.db.placeholder(9),
+        state.db.placeholder(10),
+        state.db.placeholder(11)
+    );
+    let result = sqlx::query(&sql)
+        .bind(request.observed_state.as_db_str())
+        .bind(request.pid.map(i64::from))
+        .bind(request.exit_code.map(i64::from))
+        .bind(last_error)
+        .bind(started_at)
+        .bind(ready_at)
+        .bind(exited_at)
+        .bind(now.to_rfc3339())
+        .bind(process_id.to_string())
+        .bind(request.generation as i64)
+        .bind(request.lease_id.to_string())
+        .execute(&state.db.pool)
+        .await?;
+    if result.rows_affected() != 1 {
+        return Err(ApiError::conflict_code(
+            "resident_process_generation_conflict",
+            "resident process changed while applying observation",
+        ));
+    }
+    let process = fetch_resident_process_by_id(&state.db, process_id).await?;
+    Ok(Json(ResidentProcessResponse {
+        ok: true,
+        resident_process: process,
+        operation: None,
+    }))
+}
+
+pub(crate) async fn resident_process_events(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path((sandbox_id, name)): Path<(Uuid, String)>,
+) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let sandbox_id = SandboxId(sandbox_id);
+    ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
+    let initial = fetch_named_resident_process(&state.db, sandbox_id, &name).await?;
+    let db = state.db.clone();
+    let process_id = initial.id;
+    let tenant_id = ctx.tenant_id;
+    let output = stream! {
+        let mut last_updated = None;
+        loop {
+            let process = fetch_resident_process_by_id(&db, process_id).await;
+            let Ok(process) = process else { break; };
+            if process.tenant_id != tenant_id { break; }
+            let event_id = process.updated_at.to_rfc3339();
+            if last_updated.as_deref() != Some(event_id.as_str()) {
+                let data = serde_json::to_string(&process).unwrap_or_else(|_| "{}".into());
+                yield Ok(Event::default().id(event_id.clone()).event("resident_process").data(data));
+                last_updated = Some(event_id);
+            }
+            if matches!(
+                process.observed_state,
+                ResidentProcessObservedState::Failed
+                    | ResidentProcessObservedState::Stopped
+                    | ResidentProcessObservedState::Lost
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    };
+    Ok(Sse::new(output).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }

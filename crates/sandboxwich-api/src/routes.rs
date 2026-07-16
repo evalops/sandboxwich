@@ -70,6 +70,10 @@ pub(crate) fn app(state: AppState) -> Router {
             "/sandboxes/{sandbox_id}/resident-processes/{name}/stop",
             post(stop_resident_process),
         )
+        .route(
+            "/sandboxes/{sandbox_id}/resident-processes/{name}/events",
+            get(resident_process_events),
+        )
         .route("/sandboxes/{sandbox_id}/resume", post(resume_sandbox))
         .route("/sandboxes/{sandbox_id}/fork", post(fork_sandbox))
         .route(
@@ -183,6 +187,10 @@ pub(crate) fn app(state: AppState) -> Router {
         .route(
             "/resident-processes/{process_id}/bootstrap",
             post(read_resident_process_bootstrap),
+        )
+        .route(
+            "/resident-processes/{process_id}/observations",
+            post(observe_resident_process),
         )
         .route("/leases/{lease_id}/renew", post(renew_lease))
         .route(

@@ -465,6 +465,20 @@ pub(crate) async fn stop_sandbox(
         json!({"state": SandboxState::Archiving, "reason": "stop_requested"}),
     )
     .await?;
+    let stop_residents_sql = format!(
+        "update resident_processes
+         set desired_state = 'stopped', updated_at = {}
+         where sandbox_id = {} and tenant_id = {} and desired_state = 'running'",
+        state.db.placeholder(1),
+        state.db.placeholder(2),
+        state.db.placeholder(3)
+    );
+    sqlx::query(&stop_residents_sql)
+        .bind(now.to_rfc3339())
+        .bind(sandbox_id.to_string())
+        .bind(&ctx.tenant_id)
+        .execute(&mut *tx)
+        .await?;
     insert_job_on_connection(&state.db, &mut tx, &job).await?;
     let revoke_sql = format!(
         "update guest_tokens set revoked_at = {}

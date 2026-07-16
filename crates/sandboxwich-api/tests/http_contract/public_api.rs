@@ -56,8 +56,26 @@ async fn openapi_covers_every_public_v1_operation() {
         ("POST", "/v1/sandboxes/{sandbox_id}/desktop-sessions"),
         ("GET", "/v1/sandboxes/{sandbox_id}/commands"),
         ("POST", "/v1/sandboxes/{sandbox_id}/commands"),
+        (
+            "GET",
+            "/v1/sandboxes/{sandbox_id}/resident-processes/{name}",
+        ),
+        (
+            "PUT",
+            "/v1/sandboxes/{sandbox_id}/resident-processes/{name}",
+        ),
+        (
+            "POST",
+            "/v1/sandboxes/{sandbox_id}/resident-processes/{name}/stop",
+        ),
+        (
+            "GET",
+            "/v1/sandboxes/{sandbox_id}/resident-processes/{name}/events",
+        ),
         ("POST", "/v1/sandboxes/{sandbox_id}/prompt"),
         ("GET", "/v1/sandboxes/{sandbox_id}/events"),
+        ("POST", "/v1/resident-processes/{process_id}/bootstrap"),
+        ("POST", "/v1/resident-processes/{process_id}/observations"),
         ("GET", "/v1/desktop-sessions/{desktop_session_id}"),
         ("POST", "/v1/desktop-sessions/{desktop_session_id}/status"),
         ("POST", "/v1/desktop-sessions/{desktop_session_id}/access"),

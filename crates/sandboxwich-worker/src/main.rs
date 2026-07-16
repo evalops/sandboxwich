@@ -2182,6 +2182,9 @@ fn execute_job_with_reporter(
                 result,
             }))
         }
+        JobKind::RunResidentProcess => {
+            anyhow::bail!("run_resident_process jobs are executed by the sandbox guest agent")
+        }
         JobKind::MaterializeFile => {
             let sandbox_id = sandbox_id_from_payload(&job.payload)?;
             let file_id = sandboxwich_core::FileId(uuid_from_payload(&job.payload, "fileId")?);

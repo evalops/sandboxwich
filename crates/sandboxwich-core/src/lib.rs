@@ -2658,6 +2658,11 @@ pub enum WorkerJobResult {
     RunCommand {
         result: AgentCommandResult,
     },
+    RunResidentProcess {
+        process_id: ResidentProcessId,
+        generation: u64,
+        exit_code: Option<i32>,
+    },
     MaterializeFile {
         receipt: MaterializeFileReceipt,
     },
