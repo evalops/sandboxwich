@@ -1884,6 +1884,81 @@ fn pod_disables_service_account_token_automount_and_sets_ephemeral_storage_limit
 }
 
 #[test]
+fn guest_token_is_mounted_as_a_file_and_redacted_from_provider_metadata() {
+    let sandbox_id = SandboxId::new();
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_guest_credentials(
+                sandbox_id,
+                "http://sandboxwich-api.evalops.svc.cluster.local:3217",
+                "sbw_gtok_supersecret",
+            );
+    let handle = provider
+        .provision(
+            sandbox_id,
+            &SandboxProvisionSpec::default(),
+            &CancelSignal::never_cancelled(),
+        )
+        .unwrap();
+    let pod = &handle.metadata["manifests"]["pod"];
+    let env = pod["spec"]["containers"][0]["env"].as_array().unwrap();
+    assert!(env.iter().any(|entry| {
+        entry["name"] == "SANDBOXWICH_API_TOKEN_FILE"
+            && entry["value"] == "/run/sandboxwich/guest/api-token"
+    }));
+    assert!(env.iter().any(|entry| {
+        entry["name"] == "SANDBOXWICH_SANDBOX_ID" && entry["value"] == sandbox_id.to_string()
+    }));
+    let serialized = serde_json::to_string(&handle.metadata).unwrap();
+    assert!(!serialized.contains("sbw_gtok_supersecret"));
+    assert_eq!(
+        handle.metadata["manifests"]["guestTokenSecret"]["stringData"]["api-token"],
+        GUEST_TOKEN_REDACTED
+    );
+}
+
+#[test]
+fn apply_manifests_carry_guest_token_only_in_the_secret_before_the_pod() {
+    let sandbox_id = SandboxId::new();
+    let dry_run =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_guest_credentials(
+                sandbox_id,
+                "http://sandboxwich-api.evalops.svc.cluster.local:3217",
+                "sbw_gtok_supersecret",
+            );
+    let provider = KubernetesApplyProvider::new(dry_run, "kubectl");
+    let manifests = provider
+        .provision_manifests(sandbox_id, &SandboxProvisionSpec::default())
+        .unwrap();
+    let secret_index = manifests
+        .iter()
+        .position(|manifest| manifest["kind"] == "Secret")
+        .unwrap();
+    let pod_index = manifests
+        .iter()
+        .position(|manifest| manifest["kind"] == "Pod")
+        .unwrap();
+    assert!(secret_index < pod_index);
+    assert_eq!(
+        manifests[secret_index]["stringData"]["api-token"],
+        "sbw_gtok_supersecret"
+    );
+    assert_eq!(
+        manifests
+            .iter()
+            .filter(|manifest| {
+                serde_json::to_string(manifest)
+                    .unwrap()
+                    .contains("sbw_gtok_supersecret")
+            })
+            .count(),
+        1
+    );
+    assert!(SANDBOX_TEARDOWN_RESOURCE_KINDS.contains("secret"));
+}
+
+#[test]
 fn vnc_password_secret_is_mounted_as_a_read_only_file_not_an_env_var() {
     // The VNC password must be mounted as a file (mirroring the SSH
     // authorized-keys handling) rather than injected via

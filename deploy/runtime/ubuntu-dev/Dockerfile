@@ -1,6 +1,12 @@
 # ubuntu:24.04 multi-architecture index, refreshed 2026-07-09.
 # Pulled via the Docker Hub mirror (mirror.gcr.io) to avoid docker.io's
 # anonymous-pull rate limit on shared self-hosted runners.
+FROM mirror.gcr.io/library/rust:1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS agent-builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --release -p sandboxwich-agent
+
 FROM mirror.gcr.io/library/ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
 
 ARG SANDBOX_USER=sandbox
@@ -98,8 +104,9 @@ RUN groupadd --gid "${SANDBOX_GID}" "${SANDBOX_USER}" \
 # code execution as this user was one `sudo` away from root, defeating
 # runAsNonRoot/capability-drop/seccomp at the pod securityContext layer.
 
-COPY sandboxwich-entrypoint.sh /usr/local/bin/sandboxwich-entrypoint
-RUN chmod 0755 /usr/local/bin/sandboxwich-entrypoint
+COPY --from=agent-builder /src/target/release/sandboxwich-agent /usr/local/bin/sandboxwich-agent
+COPY deploy/runtime/ubuntu-dev/sandboxwich-entrypoint.sh /usr/local/bin/sandboxwich-entrypoint
+RUN chmod 0755 /usr/local/bin/sandboxwich-agent /usr/local/bin/sandboxwich-entrypoint
 
 EXPOSE 2222 6080
 VOLUME ["/workspace"]
