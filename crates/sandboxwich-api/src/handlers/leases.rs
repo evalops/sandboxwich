@@ -1692,7 +1692,9 @@ pub(crate) async fn apply_completed_job_on_connection(
                 || receipt.file_id != file_id
                 || receipt.destination != materialization_destination_from_job(job)?
                 || receipt.sha256 != materialization_digest_from_job(job)?
+                || receipt.destination_sha256 != materialization_digest_from_job(job)?
                 || receipt.size_bytes != stored.size_bytes
+                || receipt.cleanup_owner != MaterializeFileCleanupOwner::ControlPlane
             {
                 return Err(ApiError::bad_request(
                     "materialization completion does not match job",
@@ -1709,7 +1711,9 @@ pub(crate) async fn apply_completed_job_on_connection(
                     "fileId": file_id,
                     "destination": receipt.destination,
                     "sha256": receipt.sha256,
-                    "sizeBytes": receipt.size_bytes
+                    "destinationSha256": receipt.destination_sha256,
+                    "sizeBytes": receipt.size_bytes,
+                    "cleanupOwner": receipt.cleanup_owner
                 }),
             )
             .await?;

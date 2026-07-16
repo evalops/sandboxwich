@@ -573,7 +573,7 @@ impl SandboxProvider for RuntimeProvider {
         expected_sha256: &str,
         content: &[u8],
         cancelled: &CancelSignal,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<sandboxwich_core::MaterializeFileObservation> {
         match self {
             Self::DryRun(provider) => provider.materialize_file(
                 sandbox_id,
@@ -2184,7 +2184,7 @@ fn execute_job_with_reporter(
                 content.len() as u64 <= sandboxwich_core::MAX_SANDBOX_FILE_BYTES,
                 "materialization exceeds 64 MiB"
             );
-            provider.materialize_file(
+            let observation = provider.materialize_file(
                 sandbox_id,
                 destination.clone(),
                 expected_sha256,
@@ -2198,7 +2198,9 @@ fn execute_job_with_reporter(
                         file_id,
                         destination,
                         sha256: expected_sha256.to_string(),
-                        size_bytes: content.len() as u64,
+                        destination_sha256: observation.destination_sha256,
+                        size_bytes: observation.size_bytes,
+                        cleanup_owner: sandboxwich_core::MaterializeFileCleanupOwner::ControlPlane,
                     },
                 },
             ))

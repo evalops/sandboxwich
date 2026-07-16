@@ -17,13 +17,13 @@ use clap::ValueEnum;
 use ipnet::IpNet;
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, DbVariant, ExecutionClass, MAX_SANDBOX_FILE_BYTES,
-    MaterializeFileDestination, MemoryLimit, NetworkAllowRuleKind, NetworkEgress,
-    ProviderCapabilityReport, ProviderForkHandle, ProviderHealthReport, ProviderHealthStatus,
-    ProviderRuntimeResource, ProviderSandboxHandle, ProviderSnapshotHandle, ProvisioningErrorClass,
-    ProvisioningStage, ProvisioningStageUpdateRequest, RuntimeResourceInventoryResponse,
-    RuntimeResourceKind, RuntimeResourcePurpose, RuntimeResourceStatus, SandboxId,
-    SandboxProvisionSpec, SandboxRuntimeProfile, SnapshotId, WorkerCapability, WorkspaceMode,
-    validate_agent_command_request,
+    MaterializeFileDestination, MaterializeFileObservation, MemoryLimit, NetworkAllowRuleKind,
+    NetworkEgress, ProviderCapabilityReport, ProviderForkHandle, ProviderHealthReport,
+    ProviderHealthStatus, ProviderRuntimeResource, ProviderSandboxHandle, ProviderSnapshotHandle,
+    ProvisioningErrorClass, ProvisioningStage, ProvisioningStageUpdateRequest,
+    RuntimeResourceInventoryResponse, RuntimeResourceKind, RuntimeResourcePurpose,
+    RuntimeResourceStatus, SandboxId, SandboxProvisionSpec, SandboxRuntimeProfile, SnapshotId,
+    WorkerCapability, WorkspaceMode, validate_agent_command_request,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -282,7 +282,7 @@ pub trait SandboxProvider {
         expected_sha256: &str,
         content: &[u8],
         cancelled: &CancelSignal,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<MaterializeFileObservation> {
         let _ = (sandbox_id, destination, expected_sha256, content, cancelled);
         anyhow::bail!("provider does not support file materialization")
     }
@@ -3889,12 +3889,15 @@ impl SandboxProvider for KubernetesDryRunProvider {
         expected_sha256: &str,
         content: &[u8],
         _cancelled: &CancelSignal,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<MaterializeFileObservation> {
         anyhow::ensure!(
             sha256_hex(content) == expected_sha256,
             "materialization digest mismatch"
         );
-        Ok(())
+        Ok(MaterializeFileObservation {
+            destination_sha256: sha256_hex(content),
+            size_bytes: content.len() as u64,
+        })
     }
 
     fn create_snapshot(
@@ -4177,7 +4180,7 @@ impl SandboxProvider for KubernetesApplyProvider {
         expected_sha256: &str,
         content: &[u8],
         cancelled: &CancelSignal,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<MaterializeFileObservation> {
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
         anyhow::ensure!(
             content.len() as u64 <= MAX_SANDBOX_FILE_BYTES,
@@ -4216,7 +4219,53 @@ impl SandboxProvider for KubernetesApplyProvider {
             self.max_captured_output_bytes,
         )?;
         anyhow::ensure!(output.success, "sandbox file materialization failed");
-        Ok(())
+        let observation_request = AgentCommandRequest {
+            argv: vec![
+                "/usr/bin/sha256sum".to_string(),
+                destination.guest_path().to_string(),
+            ],
+            cwd: None,
+            env: Default::default(),
+            stdin: None,
+            timeout_secs: Some(30),
+        };
+        let observation = run_kubectl_command_with_stdin(
+            &self.kubectl,
+            &self.exec_args(sandbox_id, &observation_request),
+            None,
+            "observe materialized sandbox file",
+            Duration::from_secs(30),
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        anyhow::ensure!(
+            observation.success,
+            "sandbox file materialization observation failed"
+        );
+        let mut fields = observation.stdout.split_ascii_whitespace();
+        let destination_sha256 = fields
+            .next()
+            .context("materialization observation digest is missing")?;
+        let observed_path = fields
+            .next()
+            .context("materialization observation destination is missing")?;
+        anyhow::ensure!(
+            fields.next().is_none()
+                && destination_sha256.len() == 64
+                && destination_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                && observed_path == destination.guest_path(),
+            "materialization observation is invalid"
+        );
+        anyhow::ensure!(
+            destination_sha256 == expected_sha256,
+            "materialized destination digest mismatch"
+        );
+        Ok(MaterializeFileObservation {
+            destination_sha256: destination_sha256.to_string(),
+            size_bytes: content.len() as u64,
+        })
     }
 
     fn create_snapshot(

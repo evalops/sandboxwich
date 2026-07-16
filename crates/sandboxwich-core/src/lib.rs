@@ -2469,7 +2469,27 @@ pub struct MaterializeFileReceipt {
     pub sandbox_id: SandboxId,
     pub file_id: FileId,
     pub destination: MaterializeFileDestination,
+    /// Digest of the staged source bytes, verified when the job is created.
     pub sha256: String,
+    /// Digest observed by the provider at the selected destination after import.
+    pub destination_sha256: String,
+    pub size_bytes: u64,
+    pub cleanup_owner: MaterializeFileCleanupOwner,
+}
+
+/// The component responsible for deleting the staged control-plane file after
+/// the materialization job reaches a terminal state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MaterializeFileCleanupOwner {
+    ControlPlane,
+}
+
+/// Provider evidence produced only after the materialization boundary has
+/// accepted the bytes and observed the selected destination.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializeFileObservation {
+    pub destination_sha256: String,
     pub size_bytes: u64,
 }
 

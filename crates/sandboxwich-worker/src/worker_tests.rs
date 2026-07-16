@@ -408,7 +408,13 @@ fn materialization_dispatches_fetched_bytes_and_returns_only_safe_receipt() {
     };
     assert_eq!(receipt.sandbox_id, sandbox_id);
     assert_eq!(receipt.file_id, file_id);
+    assert_eq!(receipt.sha256, digest);
+    assert_eq!(receipt.destination_sha256, digest);
     assert_eq!(receipt.size_bytes, content.len() as u64);
+    assert_eq!(
+        receipt.cleanup_owner,
+        sandboxwich_core::MaterializeFileCleanupOwner::ControlPlane
+    );
     let serialized = serde_json::to_string(&receipt).unwrap();
     assert!(!serialized.contains("private-apex-archive"));
     assert!(!serialized.contains("transientContentBase64"));

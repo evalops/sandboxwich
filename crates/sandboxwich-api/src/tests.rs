@@ -47,6 +47,15 @@ fn materialization_job_input_is_ref_only_and_exact() {
         let error = validate_materialize_file_job_input(&payload).unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
+
+    let traversal = validate_materialize_file_job_input(&json!({
+        "sandboxId": sandbox_id,
+        "fileId": file_id,
+        "destination": "../../workspace/.apex/grader",
+        "expectedSha256": "a".repeat(64),
+    }))
+    .unwrap_err();
+    assert_eq!(traversal.status, StatusCode::BAD_REQUEST);
 }
 
 #[test]
