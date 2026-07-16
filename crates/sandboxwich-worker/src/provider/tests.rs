@@ -120,6 +120,12 @@ fn kubernetes_dry_run_reports_k8s_capabilities_and_health() {
             .capabilities
             .contains(&WorkerCapability::AgentPrompt)
     );
+    assert!(
+        !capabilities
+            .capabilities
+            .contains(&WorkerCapability::MaterializeFile),
+        "dry-run provider reports must not claim destination attestation"
+    );
     assert_eq!(
         capabilities.labels.get("storage_class").map(String::as_str),
         Some("local-path")
@@ -1259,6 +1265,18 @@ fn provider_mode_distinguishes_apply_execution_from_dry_run_simulation() {
     assert_eq!(
         apply.capability_report().labels.get("provider_mode"),
         Some(&"apply".to_string())
+    );
+    assert!(
+        !dry_run
+            .capability_report()
+            .capabilities
+            .contains(&WorkerCapability::MaterializeFile)
+    );
+    assert!(
+        apply
+            .capability_report()
+            .capabilities
+            .contains(&WorkerCapability::MaterializeFile)
     );
 }
 

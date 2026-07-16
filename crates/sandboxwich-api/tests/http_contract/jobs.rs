@@ -483,6 +483,195 @@ async fn materialization_bytes_are_worker_fenced_ref_only_and_consumed_only_when
         .await
         .unwrap();
     assert!(cancelled_consumed.files.is_empty());
+
+    let attested_file: FileResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/files",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .multipart(
+            reqwest::multipart::Form::new()
+                .text("path", "attested-task.zip")
+                .part("file", reqwest::multipart::Part::bytes(secret.clone())),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let attested_job: JobResponse = client
+        .post(format!("{}/jobs", server.base_url))
+        .json(&CreateJobRequest {
+            kind: JobKind::MaterializeFile,
+            payload: serde_json::json!({
+                "sandboxId": sandbox.sandbox.id,
+                "fileId": attested_file.file.id,
+                "destination": "apex_task",
+                "expectedSha256": digest,
+            }),
+            required_capability: WorkerCapability::MaterializeFile,
+            priority: None,
+            max_attempts: Some(1),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let attested =
+        claim_materialization(&worker_client, &server, &worker, sandbox.sandbox.id).await;
+    assert_eq!(attested.job.id, attested_job.job.id);
+    let completion = CompleteLeaseRequest {
+        result: Some(WorkerJobResult::MaterializeFile {
+            receipt: MaterializeFileReceipt {
+                sandbox_id: sandbox.sandbox.id,
+                file_id: attested_file.file.id,
+                destination: MaterializeFileDestination::ApexTask,
+                sha256: digest.clone(),
+                destination_sha256: digest.clone(),
+                size_bytes: secret.len() as u64,
+                cleanup_owner: MaterializeFileCleanupOwner::ControlPlane,
+            },
+        }),
+    };
+    let mut forged_observation = completion.clone();
+    let Some(WorkerJobResult::MaterializeFile { receipt }) = forged_observation.result.as_mut()
+    else {
+        unreachable!("materialization completion fixture")
+    };
+    receipt.destination_sha256 = "f".repeat(64);
+    let rejected = worker_client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, attested.id
+        ))
+        .json(&forged_observation)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    worker_client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, attested.id
+        ))
+        .json(&completion)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let replay = worker_client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, attested.id
+        ))
+        .json(&completion)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+
+    let mut changed_digest_replay = completion.clone();
+    let Some(WorkerJobResult::MaterializeFile { receipt }) = changed_digest_replay.result.as_mut()
+    else {
+        unreachable!("materialization completion fixture")
+    };
+    receipt.destination_sha256 = "f".repeat(64);
+    let mut changed_file_replay = completion.clone();
+    let Some(WorkerJobResult::MaterializeFile { receipt }) = changed_file_replay.result.as_mut()
+    else {
+        unreachable!("materialization completion fixture")
+    };
+    receipt.file_id = FileId::new();
+    let changed_kind_replay = CompleteLeaseRequest {
+        result: Some(WorkerJobResult::RunPrompt {
+            output: "not a materialization receipt".into(),
+        }),
+    };
+    for changed_replay in [
+        changed_digest_replay,
+        changed_file_replay,
+        changed_kind_replay,
+    ] {
+        let rejected = worker_client
+            .post(format!(
+                "{}/leases/{}/complete",
+                server.base_url, attested.id
+            ))
+            .json(&changed_replay)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let mut invalid_cleanup_replay = serde_json::to_value(&completion).unwrap();
+    invalid_cleanup_replay["result"]["receipt"]["cleanupOwner"] = serde_json::json!("worker");
+    let invalid_cleanup_replay = worker_client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, attested.id
+        ))
+        .json(&invalid_cleanup_replay)
+        .send()
+        .await
+        .unwrap();
+    assert!(invalid_cleanup_replay.status().is_client_error());
+    assert_ne!(invalid_cleanup_replay.status(), StatusCode::OK);
+
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&server.database_url)
+        .await
+        .unwrap();
+    sqlx::query("update job_leases set completion_fingerprint = null where id = ?")
+        .bind(attested.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let legacy_replay = worker_client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, attested.id
+        ))
+        .json(&completion)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(legacy_replay.status(), StatusCode::CONFLICT);
+    let legacy_error: ErrorEnvelope = legacy_replay.json().await.unwrap();
+    assert_eq!(legacy_error.code, "completion_replay_unavailable");
+
+    let events: EventListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/events",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let materialized: Vec<_> = events
+        .events
+        .iter()
+        .filter(|event| event.kind == SandboxEventKind::FileMaterialized)
+        .collect();
+    assert_eq!(materialized.len(), 1);
+    assert_eq!(materialized[0].data["sha256"], digest);
+    assert_eq!(materialized[0].data["destinationSha256"], digest);
+    assert_eq!(materialized[0].data["cleanupOwner"], "control_plane");
 }
 
 #[tokio::test]
@@ -1346,14 +1535,15 @@ pub(crate) async fn assert_retryable_failure_requeues_command(
         .unwrap();
     let retry_lease = claimed_again.lease.expect("expected retry lease");
     assert_eq!(retry_lease.job.id, lease.job.id);
+    let completion = CompleteLeaseRequest {
+        result: Some(command_result("retried\n", "", 0)),
+    };
     let completed: LeaseResponse = worker_client
         .post(format!(
             "{}/leases/{}/complete",
             server.base_url, retry_lease.id
         ))
-        .json(&CompleteLeaseRequest {
-            result: Some(command_result("retried\n", "", 0)),
-        })
+        .json(&completion)
         .send()
         .await
         .unwrap()
@@ -1369,9 +1559,7 @@ pub(crate) async fn assert_retryable_failure_requeues_command(
             "{}/leases/{}/complete",
             server.base_url, retry_lease.id
         ))
-        .json(&CompleteLeaseRequest {
-            result: Some(command_result("retried\n", "", 0)),
-        })
+        .json(&completion)
         .send()
         .await
         .unwrap()
