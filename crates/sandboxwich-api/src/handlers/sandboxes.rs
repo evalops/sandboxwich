@@ -441,6 +441,17 @@ pub(crate) async fn get_sandbox_observed_state(
 /// then flows into the pre-existing `cleanup_archived_sandboxes` retention
 /// sweep once its provider teardown completes.
 ///
+/// Returns `Ok(None)` (rather than proceeding anyway) if the sandbox is no
+/// longer in a `STOP_LEGAL_FROM` state by the time the state-transition CAS
+/// runs -- i.e. a concurrent actor (another `stop_sandbox_via_job` caller:
+/// a racing manual stop, or the reaper) already won the same race. Before
+/// this check existed, a CAS-miss here still fell through and enqueued a
+/// second `StopSandbox` job, flipped resident processes to `stopped` again,
+/// and re-revoked guest tokens -- all no-ops against an already-archiving
+/// sandbox, but wasted work and job-queue noise that gets exercised far
+/// more routinely now that the reaper is a second, automated caller of this
+/// function racing every manual stop.
+///
 /// Uses `sandbox.tenant_id` (not a caller-supplied tenant context) for every
 /// tenant-scoped write, since the reaper acts across all tenants the same
 /// way `cleanup_archived_sandboxes` does; the HTTP handler's own
@@ -450,7 +461,7 @@ pub(crate) async fn stop_sandbox_via_job(
     db: &Database,
     sandbox: &Sandbox,
     lifecycle_event_data: serde_json::Value,
-) -> Result<Job, ApiError> {
+) -> Result<Option<Job>, ApiError> {
     let sandbox_id = sandbox.id;
     let delete_gke_fqdn_policy = list_runtime_resources_for_sandbox(db, sandbox_id)
         .await?
@@ -482,7 +493,7 @@ pub(crate) async fn stop_sandbox_via_job(
     };
     add_provision_spec_to_payload(&mut job, sandbox)?;
     let mut tx = db.pool.begin().await?;
-    set_sandbox_state_on_connection(
+    let transitioned = set_sandbox_state_on_connection(
         db,
         &mut tx,
         sandbox_id,
@@ -491,6 +502,13 @@ pub(crate) async fn stop_sandbox_via_job(
         lifecycle_event_data,
     )
     .await?;
+    if !transitioned {
+        // Nothing written on this connection yet besides the failed CAS
+        // itself (which affected zero rows) -- rolling back is just
+        // hygiene, not undoing real work.
+        tx.rollback().await?;
+        return Ok(None);
+    }
     let stop_residents_sql = format!(
         "update resident_processes
          set desired_state = 'stopped', updated_at = {}
@@ -520,7 +538,7 @@ pub(crate) async fn stop_sandbox_via_job(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(job)
+    Ok(Some(job))
 }
 
 pub(crate) async fn stop_sandbox(
@@ -531,12 +549,19 @@ pub(crate) async fn stop_sandbox(
     let sandbox_id = SandboxId(sandbox_id);
     let mut sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
     let now = Utc::now();
-    let job = stop_sandbox_via_job(
+    let Some(job) = stop_sandbox_via_job(
         &state.db,
         &sandbox,
         json!({"state": SandboxState::Archiving, "reason": "stop_requested"}),
     )
-    .await?;
+    .await?
+    else {
+        // A concurrent actor (another stop request, or the active-lifetime
+        // reaper) already moved this sandbox out of `STOP_LEGAL_FROM` since
+        // it was fetched above. Report the conflict honestly instead of
+        // returning 202 with a job that was never actually enqueued.
+        return Err(sandbox_state_http_conflict(&state.db, sandbox_id).await?);
+    };
     sandbox.state = SandboxState::Archiving;
     sandbox.updated_at = now;
     Ok((
@@ -548,6 +573,28 @@ pub(crate) async fn stop_sandbox(
             placement: None,
         }),
     ))
+}
+
+/// Builds a 409 (or 404, if the sandbox vanished entirely) describing the
+/// sandbox's actual current state, for the live `stop_sandbox` handler's
+/// CAS-miss path. Deliberately not shared with the `#[cfg(test)]`-only
+/// [`sandbox_state_conflict`] below: that one takes the specific
+/// `allowed_from`/`next_state` a *particular* action attempted (useful for
+/// unit tests exercising one transition at a time), whereas this one only
+/// needs to report "someone else already moved it" for the one live route
+/// that calls [`stop_sandbox_via_job`] directly.
+async fn sandbox_state_http_conflict(
+    db: &Database,
+    sandbox_id: SandboxId,
+) -> Result<ApiError, ApiError> {
+    Ok(match fetch_sandbox_state(db, sandbox_id).await? {
+        None => ApiError::not_found("sandbox not found"),
+        Some(actual) => ApiError::conflict(format!(
+            "cannot stop sandbox {sandbox_id}: it was concurrently stopped or archived \
+             already (currently {})",
+            state_to_str(&actual)
+        )),
+    })
 }
 
 pub(crate) async fn resume_sandbox(
@@ -814,7 +861,10 @@ pub(crate) async fn sandbox_state_conflict(
     })
 }
 
-#[cfg(test)]
+/// Used by both the `#[cfg(test)]` `sandbox_state_conflict` helper and the
+/// live `sandbox_state_http_conflict` (`stop_sandbox`'s CAS-miss path), so
+/// -- unlike its two `#[cfg(test)]` siblings above -- this one is not
+/// test-only.
 pub(crate) async fn fetch_sandbox_state(
     db: &Database,
     sandbox_id: SandboxId,
@@ -840,8 +890,15 @@ pub(crate) async fn fetch_sandbox_state(
 /// a sandbox that has moved on since the job started -- e.g. a
 /// `ProvisionSandbox`/`ForkSandbox` job completing after the sandbox was
 /// concurrently archived must leave it archived, not resurrect it. So on a
-/// compare-and-swap miss this logs a warning and returns `Ok(())` instead of
-/// applying the write or raising an error.
+/// compare-and-swap miss this logs a warning and returns `Ok(false)` instead
+/// of applying the write or raising an error; `Ok(true)` means the CAS won
+/// and the `LifecycleChanged` event was recorded.
+///
+/// Callers that perform further side effects contingent on the transition
+/// actually happening (see [`stop_sandbox_via_job`]) must check this return
+/// value rather than assuming success -- a `false` here with no further
+/// checks is exactly how a concurrent actor winning the same race used to
+/// result in a redundant, no-op job/token-revoke/resident-stop sequence.
 pub(crate) async fn set_sandbox_state_on_connection(
     db: &Database,
     connection: &mut AnyConnection,
@@ -849,7 +906,7 @@ pub(crate) async fn set_sandbox_state_on_connection(
     allowed_from: &'static [SandboxState],
     next_state: SandboxState,
     event_data: serde_json::Value,
-) -> Result<(), ApiError> {
+) -> Result<bool, ApiError> {
     let now = Utc::now();
     let state = state_to_str(&next_state);
     let allowed_values: Vec<&str> = allowed_from.iter().map(state_to_str).collect();
@@ -875,7 +932,7 @@ pub(crate) async fn set_sandbox_state_on_connection(
             "skipping sandbox state transition: sandbox is no longer in an expected \
              predecessor state (likely concurrently stopped/resumed by another request)"
         );
-        return Ok(());
+        return Ok(false);
     }
 
     insert_event_on_connection(
@@ -886,7 +943,7 @@ pub(crate) async fn set_sandbox_state_on_connection(
         event_data,
     )
     .await?;
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) async fn fetch_sandbox(

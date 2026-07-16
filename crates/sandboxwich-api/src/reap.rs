@@ -46,6 +46,7 @@ impl ReapTrigger {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct ReapedSandbox {
     pub(crate) sandbox: Sandbox,
     pub(crate) trigger: ReapTrigger,
@@ -148,6 +149,97 @@ async fn expired_deadline(
     Ok(None)
 }
 
+/// Outcome of attempting to reap one candidate sandbox. A distinct enum
+/// (rather than folding everything into `Option<ReapedSandbox>`) so tests
+/// can assert on exactly which branch [`attempt_reap_candidate`] took --
+/// in particular [`CandidateOutcome::Skipped`], which is returned from the
+/// *same* match arm that emits the "reap skipped" log line, making the
+/// returned variant a reliable stand-in for "that log fired" without
+/// needing a tracing-capture test harness this codebase has no other use
+/// for.
+#[derive(Debug)]
+pub(crate) enum CandidateOutcome {
+    /// Not past either deadline; nothing to do.
+    NotDue,
+    /// Past a deadline and successfully driven into `Archiving`. Boxed
+    /// because `ReapedSandbox` embeds a full `Sandbox`, which otherwise
+    /// makes this the dominant, size-setting variant of the enum for every
+    /// caller regardless of which variant they actually get back.
+    Reaped(Box<ReapedSandbox>),
+    /// Past a deadline, but a concurrent actor (a manual stop, or another
+    /// sweep tick) already moved the sandbox out of `STOP_LEGAL_FROM` by the
+    /// time `stop_sandbox_via_job`'s CAS ran.
+    Skipped,
+    /// `stop_sandbox_via_job` itself failed (already logged here).
+    Failed,
+}
+
+/// Attempts to reap one candidate sandbox (already fetched by the caller --
+/// see [`reap_expired_active_sandboxes`]), driving it through
+/// [`stop_sandbox_via_job`] if it's past a deadline. Split out from the
+/// sweep loop so a test can exercise the CAS-miss race deterministically: by
+/// calling this directly with a candidate snapshot fetched *before* a
+/// concurrent stop won the race, instead of relying on real timing.
+pub(crate) async fn attempt_reap_candidate(
+    db: &Database,
+    mut sandbox: Sandbox,
+    now: DateTime<Utc>,
+) -> Result<CandidateOutcome, ApiError> {
+    hydrate_sandbox_network_egress(db, &mut sandbox).await?;
+    let Some((trigger, deadline)) = expired_deadline(db, &sandbox, now).await? else {
+        return Ok(CandidateOutcome::NotDue);
+    };
+    let stop = stop_sandbox_via_job(
+        db,
+        &sandbox,
+        json!({
+            "state": SandboxState::Archiving,
+            "reason": trigger.reason(),
+            "deadline": deadline,
+            "triggeredBy": "expiry_sweeper",
+        }),
+    )
+    .await;
+    Ok(match stop {
+        Ok(Some(_job)) => {
+            sandbox.state = SandboxState::Archiving;
+            CandidateOutcome::Reaped(Box::new(ReapedSandbox {
+                sandbox,
+                trigger,
+                deadline,
+            }))
+        }
+        Ok(None) => {
+            // Selected as a candidate by the caller's query, but by the time
+            // `stop_sandbox_via_job`'s own CAS ran, a concurrent actor (a
+            // manual stop, or another sweep tick racing this one) had
+            // already moved the sandbox out of `STOP_LEGAL_FROM`. Not a
+            // failure -- the sandbox is already being (or already was)
+            // stopped, which is the outcome this sweep wants; there is just
+            // nothing left for *this* attempt to do. Logged separately from
+            // a successful reap (and from the error branch below) so
+            // "reaped" in a log search means a reap this sweep actually
+            // drove, not one it merely observed.
+            tracing::info!(
+                sandbox_id = %sandbox.id,
+                reason = trigger.reason(),
+                "reap skipped: sandbox concurrently transitioned out of a stoppable \
+                 state before this sweep's stop attempt landed"
+            );
+            CandidateOutcome::Skipped
+        }
+        Err(error) => {
+            tracing::warn!(
+                sandbox_id = %sandbox.id,
+                reason = trigger.reason(),
+                ?error,
+                "failed to reap sandbox past its active-lifetime deadline"
+            );
+            CandidateOutcome::Failed
+        }
+    })
+}
+
 /// Finds every reapable-state sandbox with a `max_lifetime_seconds` and/or
 /// `idle_ttl_seconds` set, stops the ones past their deadline through
 /// [`stop_sandbox_via_job`], and returns what it reaped. Called from
@@ -172,39 +264,11 @@ pub(crate) async fn reap_expired_active_sandboxes(
     let now = Utc::now();
     let mut reaped = Vec::new();
     for row in rows {
-        let mut sandbox = row_to_sandbox(row)?;
-        hydrate_sandbox_network_egress(db, &mut sandbox).await?;
-        let Some((trigger, deadline)) = expired_deadline(db, &sandbox, now).await? else {
-            continue;
-        };
-        let stop = stop_sandbox_via_job(
-            db,
-            &sandbox,
-            json!({
-                "state": SandboxState::Archiving,
-                "reason": trigger.reason(),
-                "deadline": deadline,
-                "triggeredBy": "expiry_sweeper",
-            }),
-        )
-        .await;
-        match stop {
-            Ok(_job) => {
-                sandbox.state = SandboxState::Archiving;
-                reaped.push(ReapedSandbox {
-                    sandbox,
-                    trigger,
-                    deadline,
-                });
-            }
-            Err(error) => {
-                tracing::warn!(
-                    sandbox_id = %sandbox.id,
-                    trigger = trigger.reason(),
-                    ?error,
-                    "failed to reap sandbox past its active-lifetime deadline"
-                );
-            }
+        let sandbox = row_to_sandbox(row)?;
+        if let CandidateOutcome::Reaped(reaped_sandbox) =
+            attempt_reap_candidate(db, sandbox, now).await?
+        {
+            reaped.push(*reaped_sandbox);
         }
     }
     Ok(reaped)
