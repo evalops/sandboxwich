@@ -1,11 +1,14 @@
 # ubuntu:24.04 multi-architecture index, refreshed 2026-07-09.
 # Pulled via the Docker Hub mirror (mirror.gcr.io) to avoid docker.io's
 # anonymous-pull rate limit on shared self-hosted runners.
+ARG ORB_EXECUTOR_IMAGE=ghcr.io/evalops/orb-executor@sha256:ff11270fa7371d7836efe3c3572a0d8869a32720ac070ee049f04fd98b073e5f
 FROM mirror.gcr.io/library/rust:1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS agent-builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN cargo build --release -p sandboxwich-agent
+
+FROM ${ORB_EXECUTOR_IMAGE} AS orb-executor
 
 FROM mirror.gcr.io/library/ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
 
@@ -23,6 +26,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV SANDBOXWICH_WORKSPACE=/workspace
 ENV SANDBOXWICH_AUTHORIZED_KEYS_FILE=/run/sandboxwich/ssh/authorized_keys
 ENV SANDBOXWICH_SSH_PORT=2222
+ENV HOME=/home/sandbox
+ENV CODEX_HOME=/home/sandbox/.codex
+ENV ORB_AGENT_ADAPTERS_FILE=/opt/orb/agent-adapters.json
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -97,16 +103,25 @@ RUN groupadd --gid "${SANDBOX_GID}" "${SANDBOX_USER}" \
         --uid "${SANDBOX_UID}" \
         --gid "${SANDBOX_GID}" \
         "${SANDBOX_USER}" \
-    && mkdir -p /run/sshd /run/sandboxwich/ssh /workspace \
-    && chown -R "${SANDBOX_USER}:${SANDBOX_USER}" /run/sandboxwich /workspace "/home/${SANDBOX_USER}"
+    && mkdir -p /run/sshd /run/sandboxwich/ssh /workspace "/home/${SANDBOX_USER}/.codex" /opt/orb \
+    && chown -R "${SANDBOX_USER}:${SANDBOX_USER}" /run/sandboxwich /workspace "/home/${SANDBOX_USER}" /opt/orb
 # NOTE (GH-75): intentionally no passwordless (or any) sudoers grant for
 # ${SANDBOX_USER}. The previous `ALL=(ALL) NOPASSWD:ALL` entry meant any
 # code execution as this user was one `sudo` away from root, defeating
 # runAsNonRoot/capability-drop/seccomp at the pod securityContext layer.
 
 COPY --from=agent-builder /src/target/release/sandboxwich-agent /usr/local/bin/sandboxwich-agent
+COPY --from=orb-executor /usr/local/bin/orb-executor /usr/local/bin/orb-executor
+COPY --from=orb-executor /usr/local/bin/codex /usr/local/bin/codex
+COPY --from=orb-executor /usr/local/bin/orb-deterministic-agent /usr/local/bin/orb-deterministic-agent
+COPY --from=orb-executor /opt/orb/agent-adapters.json /opt/orb/agent-adapters.json
 COPY deploy/runtime/ubuntu-dev/sandboxwich-entrypoint.sh /usr/local/bin/sandboxwich-entrypoint
-RUN chmod 0755 /usr/local/bin/sandboxwich-agent /usr/local/bin/sandboxwich-entrypoint
+RUN chmod 0755 \
+        /usr/local/bin/codex \
+        /usr/local/bin/orb-deterministic-agent \
+        /usr/local/bin/orb-executor \
+        /usr/local/bin/sandboxwich-agent \
+        /usr/local/bin/sandboxwich-entrypoint
 
 EXPOSE 2222 6080
 VOLUME ["/workspace"]
