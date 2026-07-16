@@ -1,3 +1,4 @@
+use crate::activity::bump_sandbox_activity_best_effort;
 use crate::auth::ensure_sandbox_tenant;
 use crate::db::Database;
 use crate::error::ApiError;
@@ -440,6 +441,11 @@ pub(crate) async fn observe_resident_process(
             "resident process changed while applying observation",
         ));
     }
+    // The guest reports observations periodically for as long as the
+    // resident process is alive -- a real, repeating heartbeat and one of
+    // the idle-TTL activity signals. Best-effort: must not fail this
+    // request (the guest's ack) if the bump itself fails.
+    bump_sandbox_activity_best_effort(&state.db, sandbox_id, now).await;
     let process = fetch_resident_process_by_id(&state.db, process_id).await?;
     Ok(Json(ResidentProcessResponse {
         ok: true,

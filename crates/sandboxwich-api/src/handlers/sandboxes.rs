@@ -239,6 +239,7 @@ pub(crate) async fn create_sandbox(
             state.sandbox_lifetime.max_idle_ttl_seconds,
         ),
         parent_snapshot_id: None,
+        last_activity_at: None,
     };
 
     let mut job = Job {
@@ -311,7 +312,7 @@ pub(crate) async fn list_sandboxes(
 
     let base_sql = format!(
         "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
-                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, parent_snapshot_id
+                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, last_activity_at, parent_snapshot_id
          from sandboxes
          where tenant_id = {}",
         state.db.placeholder(1)
@@ -636,6 +637,7 @@ pub(crate) async fn fork_sandbox(
             state.sandbox_lifetime.max_idle_ttl_seconds,
         ),
         parent_snapshot_id: Some(snapshot.id),
+        last_activity_at: None,
     };
 
     let job = Job {
@@ -895,7 +897,7 @@ pub(crate) async fn fetch_sandbox(
 ) -> Result<Sandbox, ApiError> {
     let sql = format!(
         "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
-                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, parent_snapshot_id
+                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, last_activity_at, parent_snapshot_id
          from sandboxes
          where id = {}",
         db.placeholder(1)
@@ -918,7 +920,7 @@ pub(crate) async fn fetch_sandbox_on_connection(
 ) -> Result<Sandbox, ApiError> {
     let sql = format!(
         "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
-                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, parent_snapshot_id
+                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, last_activity_at, parent_snapshot_id
          from sandboxes
          where id = {}",
         db.placeholder(1)
@@ -984,9 +986,9 @@ pub(crate) async fn insert_sandbox_on_connection(
     let sql = format!(
         "insert into sandboxes
          (id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
-          created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, parent_snapshot_id)
+          created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, last_activity_at, parent_snapshot_id)
          values ({})",
-        db.placeholders(16)
+        db.placeholders(17)
     );
     sqlx::query(&sql)
         .bind(sandbox.id.to_string())
@@ -1004,6 +1006,7 @@ pub(crate) async fn insert_sandbox_on_connection(
         .bind(sandbox.ttl_seconds.map(|ttl| ttl as i64))
         .bind(sandbox.max_lifetime_seconds.map(|ttl| ttl as i64))
         .bind(sandbox.idle_ttl_seconds.map(|ttl| ttl as i64))
+        .bind(sandbox.last_activity_at.map(|value| value.to_rfc3339()))
         .bind(
             sandbox
                 .parent_snapshot_id

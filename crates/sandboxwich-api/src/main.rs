@@ -1,3 +1,4 @@
+mod activity;
 mod api_contract;
 mod auth;
 mod cleanup;
