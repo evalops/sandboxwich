@@ -38,10 +38,10 @@ jobs:
             --cache-from type=gha,scope=kind-worker \
             --cache-to type=gha,mode=max,scope=kind-worker \
             -t sandboxwich-worker:conformance .
-          docker buildx build --load \
+          docker buildx build --load -f deploy/runtime/ubuntu-dev/Dockerfile \
             --cache-from type=gha,scope=kind-runtime \
             --cache-to type=gha,mode=max,scope=kind-runtime \
-            -t sandboxwich-runtime:conformance deploy/runtime/ubuntu-dev
+            -t sandboxwich-runtime:conformance .
           docker buildx build --load -f deploy/kubernetes/postgres.Dockerfile \
             --cache-from type=gha,scope=kind-postgres \
             --cache-to type=gha,mode=max,scope=kind-postgres \
