@@ -40,6 +40,48 @@ pub(crate) struct ApiConfig {
     pub(crate) default_tenant_id: String,
     pub(crate) sweep_interval_ms: u64,
     pub(crate) disable_expiry_sweeper: bool,
+    pub(crate) apex_callback_base_url: Option<String>,
+    pub(crate) sandbox_lifetime: SandboxLifetimeConfig,
+}
+
+/// Server-side default/ceiling for the two active-lifetime reaping knobs
+/// (`max_lifetime_seconds`, `idle_ttl_seconds`). Every field defaults to
+/// `None` (unset): with no operator configuration at all, `create`/`fork`
+/// behavior is byte-for-byte what it was before these knobs existed, and
+/// `workspace_mode: persistent` sandboxes in particular get no lifetime cap
+/// unless the operator (or the caller) explicitly opts in.
+#[derive(Clone, Default)]
+pub(crate) struct SandboxLifetimeConfig {
+    pub(crate) default_max_lifetime_seconds: Option<u64>,
+    pub(crate) max_max_lifetime_seconds: Option<u64>,
+    pub(crate) default_idle_ttl_seconds: Option<u64>,
+    pub(crate) max_idle_ttl_seconds: Option<u64>,
+}
+
+pub(crate) fn parse_apex_callback_base_url(
+    value: Option<String>,
+) -> anyhow::Result<Option<String>> {
+    let Some(value) = value.map(|value| value.trim().trim_end_matches('/').to_string()) else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let scheme_end = value.find("://");
+    let valid_scheme = value.starts_with("http://") || value.starts_with("https://");
+    let authority = scheme_end
+        .and_then(|index| value.get(index + 3..))
+        .unwrap_or_default();
+    if !valid_scheme
+        || authority.is_empty()
+        || authority.contains(['/', '?', '#', '@'])
+        || value.chars().any(char::is_whitespace)
+    {
+        anyhow::bail!(
+            "invalid SANDBOXWICH_APEX_CALLBACK_BASE_URL: expected an http(s) origin without credentials, path, query, or fragment"
+        );
+    }
+    Ok(Some(value))
 }
 
 pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
@@ -70,6 +112,16 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
         .unwrap_or_else(|| "default".to_string());
     let sweep_interval_ms = u64::from(parse_env_u32("SANDBOXWICH_SWEEP_INTERVAL_MS", 1000)?.max(1));
     let disable_expiry_sweeper = parse_env_bool("SANDBOXWICH_DISABLE_EXPIRY_SWEEPER", false)?;
+    let apex_callback_base_url =
+        parse_apex_callback_base_url(std::env::var("SANDBOXWICH_APEX_CALLBACK_BASE_URL").ok())?;
+    let sandbox_lifetime = SandboxLifetimeConfig {
+        default_max_lifetime_seconds: parse_env_optional_u64(
+            "SANDBOXWICH_DEFAULT_MAX_LIFETIME_SECONDS",
+        )?,
+        max_max_lifetime_seconds: parse_env_optional_u64("SANDBOXWICH_MAX_MAX_LIFETIME_SECONDS")?,
+        default_idle_ttl_seconds: parse_env_optional_u64("SANDBOXWICH_DEFAULT_IDLE_TTL_SECONDS")?,
+        max_idle_ttl_seconds: parse_env_optional_u64("SANDBOXWICH_MAX_IDLE_TTL_SECONDS")?,
+    };
 
     Ok(ApiConfig {
         command,
@@ -84,6 +136,8 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
         default_tenant_id,
         sweep_interval_ms,
         disable_expiry_sweeper,
+        apex_callback_base_url,
+        sandbox_lifetime,
     })
 }
 
@@ -123,6 +177,35 @@ pub(crate) fn parse_env_u32(name: &'static str, default: u32) -> anyhow::Result<
         .with_context(|| format!("invalid {name} value: {value}"))
 }
 
+/// Like `parse_env_u32`, but for the optional (no forced default) active-
+/// lifetime knobs: an unset or blank env var means "not configured"
+/// (`None`), not some numeric fallback -- callers that want a default wire it
+/// in themselves (see `SandboxLifetimeConfig`).
+pub(crate) fn parse_env_optional_u64(name: &'static str) -> anyhow::Result<Option<u64>> {
+    parse_optional_u64_value(name, std::env::var(name).ok().as_deref())
+}
+
+/// The pure parsing half of `parse_env_optional_u64`, split out so it can be
+/// unit tested against plain values instead of mutating real process env vars
+/// (this workspace forbids `unsafe_code`, which `std::env::set_var` requires
+/// since edition 2024).
+pub(crate) fn parse_optional_u64_value(
+    name: &'static str,
+    value: Option<&str>,
+) -> anyhow::Result<Option<u64>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value
+        .parse()
+        .map(Some)
+        .with_context(|| format!("invalid {name} value: {value}"))
+}
+
 pub(crate) fn parse_env_bool(name: &'static str, default: bool) -> anyhow::Result<bool> {
     let Some(value) = std::env::var(name).ok() else {
         return Ok(default);
@@ -158,4 +241,41 @@ pub(crate) fn parse_tenant_tokens(value: Option<&str>) -> anyhow::Result<Vec<Ten
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apex_callback_base_is_an_instance_origin_or_startup_fails() {
+        assert_eq!(
+            parse_apex_callback_base_url(Some(" http://10.0.0.7:3217/ ".into())).unwrap(),
+            Some("http://10.0.0.7:3217".into())
+        );
+        for invalid in [
+            "sandboxwich-api:3217",
+            "ftp://10.0.0.7",
+            "http://user@10.0.0.7",
+            "http://10.0.0.7/path",
+            "http://10.0.0.7?query=1",
+        ] {
+            assert!(parse_apex_callback_base_url(Some(invalid.into())).is_err());
+        }
+    }
+
+    #[test]
+    fn optional_u64_value_is_none_when_unset_or_blank() {
+        assert_eq!(parse_optional_u64_value("TEST", None).unwrap(), None);
+        assert_eq!(parse_optional_u64_value("TEST", Some("   ")).unwrap(), None);
+    }
+
+    #[test]
+    fn optional_u64_value_parses_a_set_value_and_rejects_garbage() {
+        assert_eq!(
+            parse_optional_u64_value("TEST", Some(" 3600 ")).unwrap(),
+            Some(3600)
+        );
+        assert!(parse_optional_u64_value("TEST", Some("not-a-number")).is_err());
+    }
 }

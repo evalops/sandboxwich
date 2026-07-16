@@ -1,5 +1,7 @@
 # ubuntu:24.04 multi-architecture index, refreshed 2026-07-09.
-FROM ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
+# Pulled via the Docker Hub mirror (mirror.gcr.io) to avoid docker.io's
+# anonymous-pull rate limit on shared self-hosted runners.
+FROM mirror.gcr.io/library/ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
 
 ARG SANDBOX_USER=sandbox
 ARG SANDBOX_UID=10001

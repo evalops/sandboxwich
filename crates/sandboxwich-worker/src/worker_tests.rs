@@ -1,9 +1,12 @@
 use super::*;
 use crate::provider::SandboxTeardownSpec;
+use base64::engine::general_purpose;
 use chrono::Utc;
 use sandboxwich_core::{
-    Job, JobId, JobStatus, RuntimeResourceKind, RuntimeResourcePurpose, SandboxId, SnapshotId,
+    ExecutionClass, Job, JobId, JobStatus, MAX_COMMAND_STDIN_BYTES, RuntimeResourceKind,
+    RuntimeResourcePurpose, SandboxId, SnapshotId,
 };
+use sha2::Digest;
 
 fn provider() -> KubernetesDryRunProvider {
     KubernetesDryRunProvider::with_snapshot_class(
@@ -12,6 +15,96 @@ fn provider() -> KubernetesDryRunProvider {
         Some("local-path".to_string()),
         Some("local-path-snapshot".to_string()),
     )
+}
+
+struct AttestingMaterializationProvider {
+    inner: KubernetesDryRunProvider,
+}
+
+impl SandboxProvider for AttestingMaterializationProvider {
+    fn capability_report(&self) -> sandboxwich_core::ProviderCapabilityReport {
+        self.inner.capability_report()
+    }
+
+    fn health_report(&self) -> sandboxwich_core::ProviderHealthReport {
+        self.inner.health_report()
+    }
+
+    fn provision(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<sandboxwich_core::ProviderSandboxHandle> {
+        self.inner.provision(sandbox_id, spec, cancelled)
+    }
+
+    fn exec_handoff(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxProvisionSpec,
+        request: AgentCommandRequest,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<AgentCommandResult> {
+        self.inner
+            .exec_handoff(sandbox_id, spec, request, cancelled)
+    }
+
+    fn materialize_file(
+        &self,
+        _sandbox_id: SandboxId,
+        _destination: sandboxwich_core::MaterializeFileDestination,
+        expected_sha256: &str,
+        content: &[u8],
+        _cancelled: &CancelSignal,
+    ) -> anyhow::Result<sandboxwich_core::MaterializeFileObservation> {
+        let destination_sha256 = format!("{:x}", sha2::Sha256::digest(content));
+        anyhow::ensure!(destination_sha256 == expected_sha256, "digest mismatch");
+        Ok(sandboxwich_core::MaterializeFileObservation {
+            destination_sha256,
+            size_bytes: content.len() as u64,
+        })
+    }
+
+    fn create_snapshot(
+        &self,
+        sandbox_id: SandboxId,
+        snapshot_id: SnapshotId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<sandboxwich_core::ProviderSnapshotHandle> {
+        self.inner
+            .create_snapshot(sandbox_id, snapshot_id, cancelled)
+    }
+
+    fn fork(
+        &self,
+        parent_sandbox_id: SandboxId,
+        child_sandbox_id: SandboxId,
+        snapshot_id: SnapshotId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<sandboxwich_core::ProviderForkHandle> {
+        self.inner.fork(
+            parent_sandbox_id,
+            child_sandbox_id,
+            snapshot_id,
+            spec,
+            cancelled,
+        )
+    }
+
+    fn stop(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxTeardownSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<()> {
+        self.inner.stop(sandbox_id, spec, cancelled)
+    }
+}
+
+fn attesting_materialization_provider() -> AttestingMaterializationProvider {
+    AttestingMaterializationProvider { inner: provider() }
 }
 
 fn job(kind: JobKind, payload: serde_json::Value, capability: WorkerCapability) -> Job {
@@ -23,6 +116,7 @@ fn job(kind: JobKind, payload: serde_json::Value, capability: WorkerCapability) 
         status: JobStatus::Leased,
         payload,
         required_capability: capability,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
         priority: 0,
         attempts: 1,
         max_attempts: 3,
@@ -36,6 +130,9 @@ fn job(kind: JobKind, payload: serde_json::Value, capability: WorkerCapability) 
 fn completed_result(outcome: WorkerJobOutcome) -> WorkerJobResult {
     match outcome {
         WorkerJobOutcome::Complete(value) => value,
+        WorkerJobOutcome::ApexTaskInstructions { .. } => {
+            panic!("expected durable completion, got ephemeral instruction outcome")
+        }
         WorkerJobOutcome::Fail { error, .. } => panic!("expected completion, got {error}"),
     }
 }
@@ -78,6 +175,7 @@ fn dispatches_provision_stage_reports_before_returning_the_handle() {
             json!({ "sandboxId": sandbox_id }),
             WorkerCapability::ProvisionSandbox,
         ),
+        None,
         &provider(),
         &CancelSignal::never_cancelled(),
         &mut |report| {
@@ -245,6 +343,7 @@ fn provisioning_failure_reports_typed_error_against_last_durable_stage() {
             json!({ "sandboxId": sandbox_id }),
             WorkerCapability::ProvisionSandbox,
         ),
+        None,
         &FailingStagedProvider { inner: provider() },
         &CancelSignal::never_cancelled(),
         &mut |report| {
@@ -280,8 +379,10 @@ fn dispatches_command_job_to_provider_exec_handoff() {
     let sandbox_id = SandboxId::new();
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: sandboxwich_core::MemoryLimit::FourG,
         network_egress: Default::default(),
+        runtime_profile: Default::default(),
     };
     let outcome = execute_job(
         &job(
@@ -305,6 +406,125 @@ fn dispatches_command_job_to_provider_exec_handoff() {
     assert_eq!(result.exit_code, Some(0));
     assert!(result.stdout.contains("\"operation\":\"exec\""));
     assert!(result.stdout.contains("\"memoryLimit\":\"4g\""));
+}
+
+#[test]
+fn command_stdin_is_decoded_for_dispatch_but_absent_from_dry_run_result() {
+    let sandbox_id = SandboxId::new();
+    let marker = b"apex-private-input";
+    let outcome = execute_job(
+        &job(
+            JobKind::RunCommand,
+            json!({
+                "sandboxId": sandbox_id,
+                "provisionSpec": SandboxProvisionSpec::default(),
+                "argv": ["sha256sum"],
+                "env": {},
+                "stdin": "YXBleC1wcml2YXRlLWlucHV0"
+            }),
+            WorkerCapability::RunCommand,
+        ),
+        &provider(),
+        &CancelSignal::never_cancelled(),
+    )
+    .expect("command job should decode bounded stdin");
+    let WorkerJobResult::RunCommand { result } = completed_result(outcome) else {
+        panic!("expected run command result");
+    };
+
+    assert!(
+        !result
+            .stdout
+            .as_bytes()
+            .windows(marker.len())
+            .any(|w| w == marker)
+    );
+    assert!(
+        !serde_json::to_string(&result)
+            .unwrap()
+            .contains("apex-private-input")
+    );
+}
+
+#[test]
+fn oversized_command_stdin_is_rejected_before_provider_dispatch() {
+    let sandbox_id = SandboxId::new();
+    let encoded = general_purpose::STANDARD.encode(vec![b'x'; MAX_COMMAND_STDIN_BYTES + 1]);
+    let error = execute_job(
+        &job(
+            JobKind::RunCommand,
+            json!({
+                "sandboxId": sandbox_id,
+                "provisionSpec": SandboxProvisionSpec::default(),
+                "argv": ["true"],
+                "env": {},
+                "stdin": encoded
+            }),
+            WorkerCapability::RunCommand,
+        ),
+        &provider(),
+        &CancelSignal::never_cancelled(),
+    )
+    .expect_err("oversized stdin must fail before provider dispatch");
+
+    assert!(error.to_string().contains("command_stdin_too_large"));
+    assert!(!error.to_string().contains(&"x".repeat(64)));
+}
+
+#[test]
+fn materialization_dispatches_fetched_bytes_and_returns_only_safe_receipt() {
+    let sandbox_id = SandboxId::new();
+    let file_id = sandboxwich_core::FileId::new();
+    let content = b"private-apex-archive";
+    let digest = format!("{:x}", sha2::Sha256::digest(content));
+    let outcome = execute_materialization_job(
+        &job(
+            JobKind::MaterializeFile,
+            json!({
+                "sandboxId": sandbox_id,
+                "fileId": file_id,
+                "destination": "apex_task",
+                "expectedSha256": digest,
+            }),
+            WorkerCapability::MaterializeFile,
+        ),
+        content,
+        &attesting_materialization_provider(),
+        &CancelSignal::never_cancelled(),
+    )
+    .expect("materialization should execute");
+    let WorkerJobResult::MaterializeFile { receipt } = completed_result(outcome) else {
+        panic!("expected materialization receipt");
+    };
+    assert_eq!(receipt.sandbox_id, sandbox_id);
+    assert_eq!(receipt.file_id, file_id);
+    assert_eq!(receipt.sha256, digest);
+    assert_eq!(receipt.destination_sha256, digest);
+    assert_eq!(receipt.size_bytes, content.len() as u64);
+    assert_eq!(
+        receipt.cleanup_owner,
+        sandboxwich_core::MaterializeFileCleanupOwner::ControlPlane
+    );
+    let serialized = serde_json::to_string(&receipt).unwrap();
+    assert!(!serialized.contains("private-apex-archive"));
+    assert!(!serialized.contains("transientContentBase64"));
+}
+
+#[test]
+fn dry_run_provider_cannot_produce_materialization_attestation() {
+    let content = b"private-apex-archive";
+    let digest = format!("{:x}", sha2::Sha256::digest(content));
+    let error = provider()
+        .materialize_file(
+            SandboxId::new(),
+            sandboxwich_core::MaterializeFileDestination::ApexTask,
+            &digest,
+            content,
+            &CancelSignal::never_cancelled(),
+        )
+        .expect_err("dry-run does not observe a destination");
+
+    assert!(error.to_string().contains("attestation"));
 }
 
 /// Test double whose `exec_handoff` always returns a fixed
@@ -393,8 +613,10 @@ fn run_command_job_completes_the_lease_even_when_the_command_exits_non_zero() {
     let sandbox_id = SandboxId::new();
     let spec = SandboxProvisionSpec {
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: sandboxwich_core::MemoryLimit::FourG,
         network_egress: Default::default(),
+        runtime_profile: Default::default(),
     };
     let now = Utc::now();
     let provider = FixedExecResultProvider {
@@ -588,12 +810,22 @@ fn resume_sandbox_job_fails_instead_of_silently_succeeding() {
         WorkerJobOutcome::Complete(_) => {
             panic!("resume must not silently report success")
         }
+        WorkerJobOutcome::ApexTaskInstructions { .. } => {
+            panic!("resume must not produce an instruction callback")
+        }
     }
 }
 
 #[test]
 fn default_registration_capabilities_cover_supported_worker_jobs() {
-    let capabilities = capabilities_from_args(Vec::new(), None, false);
+    let capabilities = capabilities_from_args(
+        Vec::new(),
+        IsolationProfile::Development,
+        None,
+        false,
+        false,
+    )
+    .expect("development capability defaults are valid");
 
     assert!(capabilities.contains(&WorkerCapability::ProvisionSandbox));
     assert!(capabilities.contains(&WorkerCapability::RunCommand));
@@ -601,27 +833,346 @@ fn default_registration_capabilities_cover_supported_worker_jobs() {
     assert!(capabilities.contains(&WorkerCapability::Snapshot));
     assert!(capabilities.contains(&WorkerCapability::K8sPod));
     assert!(!capabilities.contains(&WorkerCapability::GvisorSandbox));
+    assert!(!capabilities.contains(&WorkerCapability::SandboxedContainer));
+    assert!(!capabilities.contains(&WorkerCapability::VirtualMachine));
+    assert!(!capabilities.contains(&WorkerCapability::ApexTrustedSupervisorV1));
 }
 
 #[test]
-fn default_registration_capabilities_include_gvisor_when_runtime_class_is_configured() {
-    let capabilities = capabilities_from_args(Vec::new(), Some("gvisor"), false);
+fn dry_run_registration_does_not_advertise_materialization_attestation() {
+    let capabilities = vec![
+        WorkerCapability::ProvisionSandbox,
+        WorkerCapability::MaterializeFile,
+    ];
 
-    assert!(capabilities.contains(&WorkerCapability::GvisorSandbox));
+    let dry_run = capabilities_for_provider_mode(capabilities.clone(), ProviderModeArg::DryRun);
+    assert!(!dry_run.contains(&WorkerCapability::MaterializeFile));
+
+    let apply = capabilities_for_provider_mode(capabilities, ProviderModeArg::Apply);
+    assert!(apply.contains(&WorkerCapability::MaterializeFile));
+}
+
+#[test]
+fn standalone_register_path_defaults_safe_and_requires_explicit_apply_for_materialization() {
+    let parse = |extra: &[&str]| {
+        let mut argv = vec!["sandboxwich-worker", "register", "--name", "standalone"];
+        argv.extend_from_slice(extra);
+        let cli = Cli::try_parse_from(argv).expect("standalone register parses");
+        let Command::Register(args) = cli.command else {
+            panic!("expected register command")
+        };
+        capabilities_for_provider_mode(
+            capabilities_from_args(
+                args.capability,
+                IsolationProfile::Development,
+                None,
+                false,
+                false,
+            )
+            .unwrap(),
+            args.provider_mode,
+        )
+    };
+
+    assert!(!parse(&[]).contains(&WorkerCapability::MaterializeFile));
+    assert!(parse(&["--provider-mode", "apply"]).contains(&WorkerCapability::MaterializeFile));
+}
+
+#[test]
+fn standalone_work_paths_filter_dry_run_materialization_claims() {
+    let worker_id = "00000000-0000-0000-0000-000000000001";
+    for command in ["work-once", "work-loop"] {
+        let dry_run = Cli::try_parse_from(["sandboxwich-worker", command, worker_id])
+            .expect("dry-run work command parses");
+        let dry_run_mode = match dry_run.command {
+            Command::WorkOnce(args) => args.provider.provider_mode,
+            Command::WorkLoop(args) => args.provider.provider_mode,
+            _ => panic!("expected work command"),
+        };
+        let dry_run_kinds = claim_kinds_for_provider_mode(dry_run_mode)
+            .expect("dry-run claim must be explicitly filtered");
+        assert!(!dry_run_kinds.contains(&JobKind::MaterializeFile));
+
+        let apply = Cli::try_parse_from([
+            "sandboxwich-worker",
+            command,
+            worker_id,
+            "--provider-mode",
+            "apply",
+        ])
+        .expect("apply work command parses");
+        let apply_mode = match apply.command {
+            Command::WorkOnce(args) => args.provider.provider_mode,
+            Command::WorkLoop(args) => args.provider.provider_mode,
+            _ => panic!("expected work command"),
+        };
+        assert!(claim_kinds_for_provider_mode(apply_mode).is_none());
+    }
+}
+
+#[test]
+fn capabilities_from_args_report_only_the_typed_isolation_profile() {
+    let gvisor = capabilities_from_args(
+        Vec::new(),
+        IsolationProfile::Gvisor,
+        Some("gvisor"),
+        false,
+        false,
+    )
+    .expect("gVisor with a RuntimeClass is valid");
+    assert!(gvisor.contains(&WorkerCapability::SandboxedContainer));
+    assert!(!gvisor.contains(&WorkerCapability::VirtualMachine));
+    assert!(!gvisor.contains(&WorkerCapability::GvisorSandbox));
+
+    let kata = capabilities_from_args(
+        Vec::new(),
+        IsolationProfile::Kata,
+        Some("kata-qemu"),
+        false,
+        false,
+    )
+    .expect("Kata with a RuntimeClass is valid");
+    assert!(kata.contains(&WorkerCapability::VirtualMachine));
+    assert!(!kata.contains(&WorkerCapability::SandboxedContainer));
+    assert!(!kata.contains(&WorkerCapability::GvisorSandbox));
+
+    let development = capabilities_from_args(
+        Vec::new(),
+        IsolationProfile::Development,
+        Some("arbitrary-runtime"),
+        false,
+        false,
+    )
+    .expect("development may render an operator-owned RuntimeClass");
+    assert!(!development.contains(&WorkerCapability::SandboxedContainer));
+    assert!(!development.contains(&WorkerCapability::VirtualMachine));
+    assert!(!development.contains(&WorkerCapability::GvisorSandbox));
+}
+
+#[test]
+fn apex_registration_requires_and_composes_with_sandboxed_container() {
+    assert!(
+        capabilities_from_args(Vec::new(), IsolationProfile::Development, None, false, true,)
+            .is_err()
+    );
+    let capabilities = capabilities_from_args(
+        Vec::new(),
+        IsolationProfile::Gvisor,
+        Some("gvisor"),
+        false,
+        true,
+    )
+    .expect("APEX with gVisor is valid");
+    assert!(capabilities.contains(&WorkerCapability::SandboxedContainer));
+    assert!(capabilities.contains(&WorkerCapability::ApexTrustedSupervisorV1));
+    assert!(capabilities.contains(&WorkerCapability::ApexTaskInstructions));
+    assert!(!capabilities.contains(&WorkerCapability::VirtualMachine));
+}
+
+#[test]
+fn capabilities_from_args_reject_invalid_isolation_configuration() {
+    assert!(
+        capabilities_from_args(Vec::new(), IsolationProfile::Gvisor, None, false, false,).is_err()
+    );
+    assert!(
+        capabilities_from_args(Vec::new(), IsolationProfile::Kata, None, false, false,).is_err()
+    );
+    for hostile_override in [
+        CapabilityArg::SandboxedContainer,
+        CapabilityArg::VirtualMachine,
+        CapabilityArg::GvisorSandbox,
+    ] {
+        assert!(
+            capabilities_from_args(
+                vec![hostile_override],
+                IsolationProfile::Development,
+                None,
+                false,
+                false,
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn isolation_profile_cli_is_typed_validated_and_passed_to_provider() {
+    let missing_runtime_class = Cli::try_parse_from([
+        "sandboxwich-worker",
+        "provider-capabilities",
+        "--isolation-profile",
+        "gvisor",
+    ])
+    .expect("gVisor is a typed isolation profile");
+    let Command::ProviderCapabilities(args) = missing_runtime_class.command else {
+        panic!("expected provider-capabilities command");
+    };
+    assert!(provider_from_args(args).is_err());
+
+    let kata = Cli::try_parse_from([
+        "sandboxwich-worker",
+        "provider-capabilities",
+        "--isolation-profile",
+        "kata",
+        "--runtime-class-name",
+        "kata-qemu",
+    ])
+    .expect("Kata profile and operator-owned RuntimeClass parse");
+    let Command::ProviderCapabilities(args) = kata.command else {
+        panic!("expected provider-capabilities command");
+    };
+    let report = provider_from_args(args)
+        .expect("Kata with a RuntimeClass is valid")
+        .capability_report();
+    assert_eq!(
+        report.labels.get("isolation_profile"),
+        Some(&"kata".to_string())
+    );
+    assert_eq!(
+        report.labels.get("runtime_class_name"),
+        Some(&"kata-qemu".to_string())
+    );
+    assert!(
+        report
+            .capabilities
+            .contains(&WorkerCapability::VirtualMachine)
+    );
+    assert!(
+        !report
+            .capabilities
+            .contains(&WorkerCapability::SandboxedContainer)
+    );
+
+    assert!(
+        Cli::try_parse_from([
+            "sandboxwich-worker",
+            "provider-capabilities",
+            "--isolation-profile",
+            "untyped-runtime",
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn run_registration_labels_include_actual_placement_proof() {
+    let image = "registry.example/sandbox@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mut labels = BTreeMap::from([
+        ("provider_mode".to_string(), "forged".to_string()),
+        ("runtime_image".to_string(), "forged:latest".to_string()),
+    ]);
+
+    add_placement_proof_labels(&mut labels, ProviderModeArg::Apply, Some(image), false);
+
+    assert_eq!(labels.get("provider_mode"), Some(&"apply".to_string()));
+    assert_eq!(labels.get("runtime_image"), Some(&image.to_string()));
+    assert!(!labels.contains_key("runtime_profile"));
+}
+
+#[test]
+fn apex_registration_labels_include_closed_runtime_profile() {
+    let mut labels = BTreeMap::new();
+
+    add_placement_proof_labels(
+        &mut labels,
+        ProviderModeArg::DryRun,
+        Some(
+            "registry.example/sandbox@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
+        true,
+    );
+
+    assert_eq!(labels.get("provider_mode"), Some(&"dry_run".to_string()));
+    assert_eq!(
+        labels.get("runtime_profile"),
+        Some(&"apex_trusted_supervisor_v1".to_string())
+    );
 }
 
 #[test]
 fn default_registration_capabilities_include_fqdn_when_a_backend_is_enabled() {
-    let capabilities = capabilities_from_args(Vec::new(), None, true);
+    let capabilities =
+        capabilities_from_args(Vec::new(), IsolationProfile::Development, None, true, false)
+            .expect("development FQDN defaults are valid");
 
     assert!(capabilities.contains(&WorkerCapability::FqdnEgress));
 }
 
 #[test]
 fn explicit_registration_capabilities_can_select_fqdn_egress() {
-    let capabilities = capabilities_from_args(vec![CapabilityArg::FqdnEgress], None, false);
+    let capabilities = capabilities_from_args(
+        vec![CapabilityArg::FqdnEgress],
+        IsolationProfile::Development,
+        None,
+        false,
+        false,
+    )
+    .expect("functional capability override is valid");
 
     assert_eq!(capabilities, vec![WorkerCapability::FqdnEgress]);
+}
+
+#[test]
+fn capability_derivation_preserves_explicit_fqdn_semantics_across_isolation_profiles() {
+    for (profile, runtime_class_name, isolation_capability) in [
+        (IsolationProfile::Development, None, None),
+        (
+            IsolationProfile::Gvisor,
+            Some("gvisor"),
+            Some(WorkerCapability::SandboxedContainer),
+        ),
+        (
+            IsolationProfile::Kata,
+            Some("kata-qemu"),
+            Some(WorkerCapability::VirtualMachine),
+        ),
+    ] {
+        for fqdn_egress_backend in [false, true] {
+            let defaults = capabilities_from_args(
+                Vec::new(),
+                profile,
+                runtime_class_name,
+                fqdn_egress_backend,
+                false,
+            )
+            .expect("default capability derivation is valid");
+            assert_eq!(
+                defaults.contains(&WorkerCapability::FqdnEgress),
+                fqdn_egress_backend,
+                "default FQDN capability must track backend availability for {profile:?}"
+            );
+            assert_eq!(
+                defaults
+                    .iter()
+                    .find(|capability| {
+                        matches!(
+                            capability,
+                            WorkerCapability::SandboxedContainer | WorkerCapability::VirtualMachine
+                        )
+                    })
+                    .cloned(),
+                isolation_capability.clone(),
+                "default isolation capability must track the typed profile"
+            );
+
+            let explicit = capabilities_from_args(
+                vec![CapabilityArg::RunCommand],
+                profile,
+                runtime_class_name,
+                fqdn_egress_backend,
+                false,
+            )
+            .expect("explicit capability derivation is valid");
+            let mut expected = vec![WorkerCapability::RunCommand];
+            if let Some(isolation_capability) = isolation_capability.as_ref() {
+                expected.push(isolation_capability.clone());
+            }
+            assert_eq!(
+                explicit, expected,
+                "an FQDN backend must not broaden an explicit capability list"
+            );
+        }
+    }
 }
 
 #[test]

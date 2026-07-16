@@ -104,6 +104,15 @@ spec:
           image: ghcr.io/evalops/sandboxwich-api@sha256:e722cecbe4072efbef95e6a80bfc687e90491ceeaa97a6b2ca04c88da5066c01
           imagePullPolicy: IfNotPresent
           env:
+            # The instruction callback must return to the exact API process
+            # holding the in-memory waiter. A Service URL would load-balance
+            # callbacks across replicas and deliberately lose live bytes.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: SANDBOXWICH_APEX_CALLBACK_BASE_URL
+              value: http://$(POD_IP):3217
             - name: SANDBOXWICH_BIND
               value: 0.0.0.0:3217
             - name: SANDBOXWICH_DATABASE_URL

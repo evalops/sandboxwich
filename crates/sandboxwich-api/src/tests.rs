@@ -1,6 +1,7 @@
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use serde_json::json;
+use sha2::Digest;
 use sqlx::Row;
 use sqlx::any::AnyPoolOptions;
 use std::collections::BTreeMap;
@@ -11,14 +12,600 @@ use crate::cleanup::*;
 use crate::config::*;
 use crate::db::*;
 use crate::handlers::commands::*;
+use crate::handlers::files::*;
 use crate::handlers::jobs::*;
 use crate::handlers::leases::*;
 use crate::handlers::sandboxes::*;
 use crate::handlers::snapshots::*;
 use crate::handlers::workers::*;
+use crate::reconcile::*;
+use crate::rows::*;
 use crate::state::{Principal, TenantContext};
 use sandboxwich_core::*;
 use std::collections::BTreeSet;
+
+#[test]
+fn materialization_job_input_is_ref_only_and_exact() {
+    let sandbox_id = SandboxId::new();
+    let file_id = FileId::new();
+    let digest = "a".repeat(64);
+    validate_materialize_file_job_input(&json!({
+        "sandboxId": sandbox_id,
+        "fileId": file_id,
+        "destination": "apex_task",
+        "expectedSha256": digest,
+    }))
+    .expect("closed ref-only payload should be valid");
+
+    for forbidden in ["transientContentBase64", "content", "extra"] {
+        let mut payload = json!({
+            "sandboxId": sandbox_id,
+            "fileId": file_id,
+            "destination": "apex_task",
+            "expectedSha256": "a".repeat(64),
+        });
+        payload[forbidden] = json!("private");
+        let error = validate_materialize_file_job_input(&payload).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    let traversal = validate_materialize_file_job_input(&json!({
+        "sandboxId": sandbox_id,
+        "fileId": file_id,
+        "destination": "../../workspace/.apex/grader",
+        "expectedSha256": "a".repeat(64),
+    }))
+    .unwrap_err();
+    assert_eq!(traversal.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn lease_completion_fingerprint_schema_is_applied() {
+    let db = test_sqlite_db().await;
+    let row = sqlx::query("select completion_fingerprint from job_leases where 1 = 0")
+        .fetch_optional(&db.pool)
+        .await
+        .expect("completion fingerprint column must be migrated");
+    assert!(row.is_none());
+}
+
+#[tokio::test]
+async fn resident_process_storage_has_generation_fence_and_no_secret_column() {
+    let db = test_sqlite_db().await;
+    let columns = sqlx::query("pragma table_info(resident_processes)")
+        .fetch_all(&db.pool)
+        .await
+        .expect("inspect resident_processes");
+    let names = columns
+        .iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<BTreeSet<_>>();
+
+    for required in [
+        "id",
+        "sandbox_id",
+        "tenant_id",
+        "name",
+        "argv",
+        "env",
+        "bootstrap_sha256",
+        "bootstrap_byte_count",
+        "generation",
+        "active_lease_id",
+        "desired_state",
+        "observed_state",
+    ] {
+        assert!(names.contains(required), "missing column {required}");
+    }
+    for forbidden in ["bootstrap_content", "content", "secret", "token"] {
+        assert!(
+            !names.contains(forbidden),
+            "forbidden secret column {forbidden}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn resident_process_storage_round_trips_public_metadata() {
+    let db = test_sqlite_db().await;
+    let now = Utc::now();
+    let sandbox = Sandbox {
+        id: SandboxId::new(),
+        tenant_id: "tenant-a".into(),
+        name: "resident-test".into(),
+        state: SandboxState::Ready,
+        template: "ubuntu-dev".into(),
+        memory_limit: MemoryLimit::default(),
+        network_egress: NetworkEgress::DenyAll,
+        workspace_mode: WorkspaceMode::default(),
+        runtime_profile: SandboxRuntimeProfile::default(),
+        execution_class: ExecutionClass::default(),
+        created_at: now,
+        updated_at: now,
+        ttl_seconds: Some(3600),
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
+        parent_snapshot_id: None,
+    };
+    let mut tx = db.pool.begin().await.unwrap();
+    insert_sandbox_on_connection(&db, &mut tx, &sandbox)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let id = ResidentProcessId::new();
+    sqlx::query(
+        "insert into resident_processes (
+            id, sandbox_id, tenant_id, name, argv, cwd, env,
+            bootstrap_sha256, bootstrap_byte_count, bootstrap_target_file, bootstrap_mode,
+            restart_policy, desired_state, observed_state, generation,
+            created_at, updated_at
+         ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(sandbox.id.to_string())
+    .bind(&sandbox.tenant_id)
+    .bind("orb-executor")
+    .bind(r#"["/usr/local/bin/orb-executor"]"#)
+    .bind("/workspace")
+    .bind(r#"{"ORB_TOKEN_FILE":"/run/sandboxwich/bootstrap/orb-token"}"#)
+    .bind("a".repeat(64))
+    .bind(6_i64)
+    .bind("/run/sandboxwich/bootstrap/orb-token")
+    .bind(0o600_i64)
+    .bind("on_failure")
+    .bind("running")
+    .bind("pending")
+    .bind(1_i64)
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let row = sqlx::query("select * from resident_processes where id = ?")
+        .bind(id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let resident = row_to_resident_process(row).unwrap();
+    assert_eq!(resident.id, id);
+    assert_eq!(resident.sandbox_id, sandbox.id);
+    assert_eq!(resident.generation, 1);
+    assert_eq!(
+        resident.env.get("ORB_TOKEN_FILE").map(String::as_str),
+        Some("/run/sandboxwich/bootstrap/orb-token")
+    );
+}
+
+#[test]
+fn lease_completion_fingerprint_is_versioned_and_canonicalizes_object_order() {
+    let sandbox_id = SandboxId::new();
+    let result = |metadata| WorkerJobResult::ProvisionSandbox {
+        handle: ProviderSandboxHandle {
+            provider: "kubernetes".into(),
+            sandbox_id,
+            resources: Vec::new(),
+            metadata,
+        },
+    };
+    let mut first = serde_json::Map::new();
+    first.insert("zeta".into(), json!(1));
+    first.insert("alpha".into(), json!({"nested_z": 2, "nested_a": 3}));
+    let mut second = serde_json::Map::new();
+    second.insert("alpha".into(), json!({"nested_a": 3, "nested_z": 2}));
+    second.insert("zeta".into(), json!(1));
+
+    let first = completion_result_fingerprint(&result(first.into())).unwrap();
+    let second = completion_result_fingerprint(&result(second.into())).unwrap();
+    assert_eq!(first, second);
+    assert!(first.starts_with("sha256:v1:"));
+}
+
+#[test]
+fn authoritative_job_enrichment_overwrites_caller_placement_metadata() {
+    let now = Utc::now();
+    let sandbox = Sandbox {
+        id: SandboxId::new(),
+        tenant_id: "tenant".to_string(),
+        name: "apex".to_string(),
+        state: SandboxState::Ready,
+        template: format!("ghcr.io/evalops/apex@sha256:{}", "a".repeat(64)),
+        memory_limit: MemoryLimit::FourG,
+        network_egress: NetworkEgress::DenyAll,
+        workspace_mode: WorkspaceMode::Persistent,
+        runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
+        created_at: now,
+        updated_at: now,
+        ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
+        parent_snapshot_id: None,
+        execution_class: ExecutionClass::SandboxedContainer,
+    };
+    let mut job = Job {
+        id: JobId::new(),
+        tenant_id: sandbox.tenant_id.clone(),
+        kind: JobKind::RunCommand,
+        status: JobStatus::Queued,
+        payload: json!({
+            "sandboxId": sandbox.id,
+            "runtimeImage": "attacker:latest",
+            "provisionSpec": SandboxProvisionSpec::default()
+        }),
+        required_capability: WorkerCapability::RunCommand,
+        priority: 0,
+        attempts: 0,
+        max_attempts: 1,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
+    };
+
+    add_provision_spec_to_payload(&mut job, &sandbox).expect("enrich job");
+
+    assert_eq!(job.payload["runtimeImage"], json!(sandbox.template));
+    assert_eq!(
+        serde_json::from_value::<SandboxProvisionSpec>(job.payload["provisionSpec"].clone())
+            .expect("provision spec"),
+        SandboxProvisionSpec {
+            memory_limit: sandbox.memory_limit,
+            network_egress: sandbox.network_egress,
+            workspace_mode: sandbox.workspace_mode,
+            runtime_profile: sandbox.runtime_profile,
+            execution_class: ExecutionClass::SandboxedContainer,
+        }
+    );
+}
+
+#[test]
+fn apex_runtime_profile_requires_pinned_image_and_deny_by_default_egress() {
+    let pinned = format!("ghcr.io/evalops/apex@sha256:{}", "a".repeat(64));
+    let request = |template: &str, network_egress| CreateSandboxRequest {
+        name: None,
+        template: Some(template.to_string()),
+        memory_limit: None,
+        network_egress: Some(network_egress),
+        workspace_mode: None,
+        runtime_profile: Some(SandboxRuntimeProfile::ApexTrustedSupervisorV1),
+        ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
+        execution_class: Some(ExecutionClass::SandboxedContainer),
+    };
+    assert!(provision_spec_from_request(&request(&pinned, NetworkEgress::DenyAll), None).is_ok());
+    assert!(
+        provision_spec_from_request(
+            &request(
+                &pinned,
+                NetworkEgress::Allowlist {
+                    rules: vec![NetworkAllowRule {
+                        kind: NetworkAllowRuleKind::Host,
+                        value: "model-gateway.example.com".to_string(),
+                    }],
+                },
+            ),
+            None,
+        )
+        .is_ok()
+    );
+    assert!(
+        provision_spec_from_request(
+            &request("ghcr.io/evalops/apex:latest", NetworkEgress::DenyAll),
+            None
+        )
+        .is_err()
+    );
+    assert!(provision_spec_from_request(&request(&pinned, NetworkEgress::AllowAll), None).is_err());
+    let mut wrong_execution_class = request(&pinned, NetworkEgress::DenyAll);
+    wrong_execution_class.execution_class = Some(ExecutionClass::DevelopmentContainer);
+    assert!(provision_spec_from_request(&wrong_execution_class, None).is_err());
+    let now = Utc::now();
+    let parent = Sandbox {
+        id: SandboxId::new(),
+        tenant_id: "tenant".to_string(),
+        name: "parent".to_string(),
+        state: SandboxState::Ready,
+        template: pinned,
+        memory_limit: MemoryLimit::FourG,
+        network_egress: NetworkEgress::DenyAll,
+        workspace_mode: WorkspaceMode::Persistent,
+        runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
+        created_at: now,
+        updated_at: now,
+        ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
+        parent_snapshot_id: None,
+        execution_class: ExecutionClass::SandboxedContainer,
+    };
+    let inherited = CreateSandboxRequest {
+        name: None,
+        template: None,
+        memory_limit: None,
+        network_egress: None,
+        workspace_mode: None,
+        runtime_profile: None,
+        ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
+        execution_class: None,
+    };
+    assert!(provision_spec_from_request(&inherited, Some(&parent)).is_ok());
+}
+
+#[test]
+fn snapshot_fork_request_rejects_placement_mismatches() {
+    let image = format!("ghcr.io/evalops/apex@sha256:{}", "e".repeat(64));
+    let source = SnapshotRestoreSource {
+        source_sandbox_id: SandboxId::new(),
+        runtime_image: image.clone(),
+        provision_spec: SandboxProvisionSpec {
+            memory_limit: MemoryLimit::FourG,
+            network_egress: NetworkEgress::DenyAll,
+            workspace_mode: WorkspaceMode::Persistent,
+            runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
+            execution_class: ExecutionClass::SandboxedContainer,
+        },
+        execution_class: ExecutionClass::SandboxedContainer,
+    };
+    let matching = ForkSnapshotRequest {
+        name: None,
+        template: image,
+        memory_limit: MemoryLimit::FourG,
+        network_egress: NetworkEgress::DenyAll,
+        runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
+        ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
+    };
+    validate_snapshot_fork_request(&matching, &source).expect("matching placement");
+    let mut mismatch = matching.clone();
+    mismatch.template = "attacker:latest".to_string();
+    assert!(validate_snapshot_fork_request(&mismatch, &source).is_err());
+    let mut mismatch = matching.clone();
+    mismatch.memory_limit = MemoryLimit::OneG;
+    assert!(validate_snapshot_fork_request(&mismatch, &source).is_err());
+    let mut mismatch = matching.clone();
+    mismatch.network_egress = NetworkEgress::AllowAll;
+    assert!(validate_snapshot_fork_request(&mismatch, &source).is_err());
+    let mut mismatch = matching;
+    mismatch.runtime_profile = SandboxRuntimeProfile::Unprivileged;
+    assert!(validate_snapshot_fork_request(&mismatch, &source).is_err());
+}
+
+#[tokio::test]
+async fn transient_authority_refresh_error_leaves_queued_job_retryable() {
+    let db = test_sqlite_db().await;
+    let sandbox = seed_sandbox_with_state(&db, SandboxState::Ready).await;
+    let now = Utc::now();
+    let mut job = Job {
+        id: JobId::new(),
+        tenant_id: sandbox.tenant_id.clone(),
+        kind: JobKind::ProvisionSandbox,
+        status: JobStatus::Queued,
+        payload: json!({"sandboxId": sandbox.id}),
+        required_capability: WorkerCapability::ProvisionSandbox,
+        priority: 0,
+        attempts: 0,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
+    };
+    insert_job(&db, &job).await.expect("insert queued job");
+    sqlx::query("alter table sandboxes rename to unavailable_sandboxes")
+        .execute(&db.pool)
+        .await
+        .expect("make authoritative store unavailable");
+
+    let error = authoritatively_refresh_job_placement(&db, &mut job)
+        .await
+        .expect_err("internal authority read must propagate");
+    assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    let status: String = sqlx::query("select status from jobs where id = ?")
+        .bind(job.id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read job")
+        .try_get("status")
+        .expect("status");
+    assert_eq!(status, "queued");
+}
+
+#[test]
+fn apex_profile_bound_jobs_only_match_the_exact_profile_worker_image() {
+    let now = Utc::now();
+    let requested_image = format!("ghcr.io/evalops/apex@sha256:{}", "a".repeat(64));
+    let job = Job {
+        id: JobId::new(),
+        tenant_id: "tenant-a".to_string(),
+        kind: JobKind::MaterializeFile,
+        status: JobStatus::Queued,
+        payload: json!({
+            "sandboxId": SandboxId::new(),
+            "runtimeImage": requested_image,
+            "provisionSpec": SandboxProvisionSpec {
+                memory_limit: MemoryLimit::FourG,
+                network_egress: NetworkEgress::DenyAll,
+                workspace_mode: WorkspaceMode::Persistent,
+                runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
+                execution_class: ExecutionClass::SandboxedContainer,
+            }
+        }),
+        required_capability: WorkerCapability::MaterializeFile,
+        priority: 0,
+        attempts: 0,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+        required_execution_class: ExecutionClass::SandboxedContainer,
+    };
+    let worker = |capabilities, image: &str| Worker {
+        id: WorkerId::new(),
+        tenant_id: "tenant-a".to_string(),
+        name: "worker".to_string(),
+        status: WorkerStatus::Online,
+        provider: "kubernetes".to_string(),
+        capabilities,
+        max_concurrent_jobs: 1,
+        labels: std::collections::BTreeMap::from([(
+            "runtime_image".to_string(),
+            image.to_string(),
+        )]),
+        registered_at: now,
+        last_heartbeat_at: Some(now),
+    };
+    assert!(worker_supports_runtime_profile(
+        &worker(
+            vec![
+                WorkerCapability::MaterializeFile,
+                WorkerCapability::ApexTrustedSupervisorV1,
+            ],
+            job.payload["runtimeImage"].as_str().unwrap(),
+        ),
+        &job,
+    ));
+    assert!(!worker_supports_runtime_profile(
+        &worker(
+            vec![WorkerCapability::ProvisionSandbox],
+            job.payload["runtimeImage"].as_str().unwrap()
+        ),
+        &job,
+    ));
+    assert!(!worker_supports_runtime_profile(
+        &worker(
+            vec![
+                WorkerCapability::MaterializeFile,
+                WorkerCapability::ApexTrustedSupervisorV1,
+            ],
+            &format!("ghcr.io/evalops/apex@sha256:{}", "b".repeat(64)),
+        ),
+        &job,
+    ));
+
+    let run_command = Job {
+        kind: JobKind::RunCommand,
+        required_capability: WorkerCapability::RunCommand,
+        ..job.clone()
+    };
+    assert!(worker_supports_runtime_profile(
+        &worker(
+            vec![
+                WorkerCapability::RunCommand,
+                WorkerCapability::ApexTrustedSupervisorV1,
+            ],
+            run_command.payload["runtimeImage"].as_str().unwrap(),
+        ),
+        &run_command,
+    ));
+    assert!(!worker_supports_runtime_profile(
+        &worker(
+            vec![WorkerCapability::RunCommand],
+            run_command.payload["runtimeImage"].as_str().unwrap(),
+        ),
+        &run_command,
+    ));
+    for payload in [
+        json!({"sandboxId": SandboxId::new()}),
+        json!({"sandboxId": SandboxId::new(), "runtimeImage": requested_image, "provisionSpec": {"runtime_profile": "apex_trusted_supervisor_v1"}}),
+        json!({"sandboxId": SandboxId::new(), "runtimeImage": requested_image, "provisionSpec": {"runtime_profile": "unknown"}}),
+    ] {
+        let malformed = Job {
+            payload,
+            ..run_command.clone()
+        };
+        assert!(!worker_supports_runtime_profile(
+            &worker(
+                vec![
+                    WorkerCapability::RunCommand,
+                    WorkerCapability::ApexTrustedSupervisorV1,
+                ],
+                run_command.payload["runtimeImage"].as_str().unwrap(),
+            ),
+            &malformed,
+        ));
+    }
+}
+
+#[tokio::test]
+async fn materialization_rejects_a_file_from_another_sandbox() {
+    let db = test_sqlite_db().await;
+    let now = Utc::now();
+    let make = |name: &str| Sandbox {
+        id: SandboxId::new(),
+        tenant_id: "tenant-a".into(),
+        name: name.into(),
+        state: SandboxState::Ready,
+        template: "apex".into(),
+        memory_limit: MemoryLimit::FourG,
+        network_egress: NetworkEgress::default(),
+        workspace_mode: WorkspaceMode::Persistent,
+        runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
+        created_at: now,
+        updated_at: now,
+        ttl_seconds: Some(600),
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
+        parent_snapshot_id: None,
+        execution_class: ExecutionClass::SandboxedContainer,
+    };
+    let first = make("first");
+    let second = make("second");
+    insert_sandbox(&db, &first).await.unwrap();
+    insert_sandbox(&db, &second).await.unwrap();
+    let content = b"private";
+    let file = upsert_sandbox_file(
+        &db,
+        first.id,
+        "/input/task",
+        Some("application/octet-stream"),
+        content,
+    )
+    .await
+    .unwrap();
+    let job = Job {
+        id: JobId::new(),
+        tenant_id: "tenant-a".into(),
+        kind: JobKind::MaterializeFile,
+        status: JobStatus::Queued,
+        payload: json!({"sandboxId":second.id,"fileId":file.id,"destination":"apex_task",
+            "expectedSha256":format!("{:x}", sha2::Sha256::digest(content))}),
+        required_capability: WorkerCapability::MaterializeFile,
+        priority: 0,
+        attempts: 0,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
+    };
+    let ctx = TenantContext {
+        tenant_id: "tenant-a".into(),
+        principal: Principal::Tenant,
+    };
+    let error = validate_job_payload_tenant(&db, &job, &ctx)
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, StatusCode::NOT_FOUND);
+
+    let mut generic = make("generic");
+    generic.runtime_profile = SandboxRuntimeProfile::Unprivileged;
+    insert_sandbox(&db, &generic).await.unwrap();
+    let mut generic_job = job;
+    generic_job.payload["sandboxId"] = json!(generic.id);
+    let error = validate_job_payload_tenant(&db, &generic_job, &ctx)
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+}
 
 #[test]
 fn db_enum_registry_covers_persisted_variant_columns() {
@@ -42,6 +629,7 @@ fn db_enum_registry_covers_persisted_variant_columns() {
         ("sandboxes", "state"),
         ("sandboxes", "memory_limit"),
         ("sandboxes", "network_egress_mode"),
+        ("sandboxes", "execution_class"),
         ("sandbox_network_egress_rules", "kind"),
         ("commands", "status"),
         ("command_output_chunks", "stream"),
@@ -50,6 +638,7 @@ fn db_enum_registry_covers_persisted_variant_columns() {
         ("jobs", "kind"),
         ("jobs", "status"),
         ("jobs", "required_capability"),
+        ("jobs", "required_execution_class"),
         ("job_leases", "status"),
         ("guest_health", "status"),
         ("snapshots", "status"),
@@ -189,7 +778,7 @@ fn looks_like_cidr_rejects_garbage_and_out_of_range_prefixes() {
 #[test]
 fn db_enum_fingerprint_is_versioned_and_stable_for_current_registry() {
     let fingerprint = db_enum_schema_fingerprint();
-    assert!(fingerprint.starts_with("db-enum-v5:"));
+    assert!(fingerprint.starts_with("db-enum-v6:"));
     assert_eq!(fingerprint, db_enum_schema_fingerprint());
 }
 
@@ -351,6 +940,7 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
         status: JobStatus::Leased,
         payload: json!({ "sandboxId": sandbox.id }),
         required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
         priority: 0,
         attempts: 1,
         max_attempts: 3,
@@ -659,6 +1249,7 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
         status: JobStatus::Leased,
         payload: json!({ "sandboxId": sandbox.id }),
         required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
         priority: 0,
         attempts: 1,
         max_attempts: 3,
@@ -736,6 +1327,7 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
         status: JobStatus::Leased,
         payload: json!({ "sandboxId": sandbox.id }),
         required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
         priority: 0,
         attempts: 1,
         max_attempts: 3,
@@ -810,6 +1402,7 @@ async fn seed_provision_job(db: &Database) -> Job {
         status: JobStatus::Leased,
         payload: json!({ "sandboxId": Uuid::now_v7().to_string() }),
         required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
         priority: 0,
         attempts: 0,
         max_attempts: 3,
@@ -968,7 +1561,9 @@ async fn expire_due_leases_does_not_double_process_concurrent_sweeps() {
     let worker_id = seed_worker(&db).await;
     let now = Utc::now();
     let sandbox = Sandbox {
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        runtime_profile: SandboxRuntimeProfile::Unprivileged,
         id: SandboxId::new(),
         tenant_id: "default".to_string(),
         name: "test-sandbox".to_string(),
@@ -979,6 +1574,8 @@ async fn expire_due_leases_does_not_double_process_concurrent_sweeps() {
         created_at: now,
         updated_at: now,
         ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         parent_snapshot_id: None,
     };
     insert_sandbox(&db, &sandbox).await.expect("insert sandbox");
@@ -993,6 +1590,7 @@ async fn expire_due_leases_does_not_double_process_concurrent_sweeps() {
             "promptEventId": prompt_event_id.to_string(),
         }),
         required_capability: WorkerCapability::AgentPrompt,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
         priority: 0,
         attempts: 0,
         max_attempts: 3,
@@ -1029,7 +1627,9 @@ async fn expire_due_leases_does_not_double_process_concurrent_sweeps() {
 async fn seed_sandbox_with_state(db: &Database, state: SandboxState) -> Sandbox {
     let now = Utc::now();
     let sandbox = Sandbox {
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        runtime_profile: SandboxRuntimeProfile::Unprivileged,
         id: SandboxId::new(),
         tenant_id: "default".to_string(),
         name: "test-sandbox".to_string(),
@@ -1040,6 +1640,8 @@ async fn seed_sandbox_with_state(db: &Database, state: SandboxState) -> Sandbox 
         created_at: now,
         updated_at: now,
         ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         parent_snapshot_id: None,
     };
     insert_sandbox(db, &sandbox).await.expect("insert sandbox");
@@ -1076,6 +1678,14 @@ async fn snapshot_restore_claim_rejects_expired_ready_source() {
         label: "expired-restore-source".to_string(),
         inventory: json!({}),
         provider_metadata: json!({}),
+        runtime_image: Some(sandbox.template.clone()),
+        provision_spec: Some(SandboxProvisionSpec {
+            memory_limit: sandbox.memory_limit.clone(),
+            network_egress: sandbox.network_egress.clone(),
+            workspace_mode: sandbox.workspace_mode.clone(),
+            runtime_profile: sandbox.runtime_profile.clone(),
+            execution_class: ExecutionClass::DevelopmentContainer,
+        }),
         created_at: now,
         ready_at: Some(now),
         expires_at: Some(now - chrono::Duration::seconds(1)),
@@ -1100,6 +1710,84 @@ async fn snapshot_restore_claim_rejects_expired_ready_source() {
     .expect_err("expired ready snapshot must not be restorable");
 
     assert_eq!(error.status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn snapshot_restore_claim_retains_authoritative_placement_after_source_deletion() {
+    let db = test_sqlite_db().await;
+    let mut sandbox = seed_sandbox_with_state(&db, SandboxState::Ready).await;
+    sandbox.template = format!("ghcr.io/evalops/apex@sha256:{}", "b".repeat(64));
+    sandbox.memory_limit = MemoryLimit::FourG;
+    sandbox.network_egress = NetworkEgress::DenyAll;
+    sandbox.workspace_mode = WorkspaceMode::Persistent;
+    sandbox.runtime_profile = SandboxRuntimeProfile::ApexTrustedSupervisorV1;
+    let sql = format!(
+        "update sandboxes set template = {}, memory_limit = {}, runtime_profile = {} where id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4)
+    );
+    sqlx::query(&sql)
+        .bind(&sandbox.template)
+        .bind("4g")
+        .bind("apex_trusted_supervisor_v1")
+        .bind(sandbox.id.to_string())
+        .execute(&db.pool)
+        .await
+        .expect("persist source placement");
+    let now = Utc::now();
+    let expected_spec = SandboxProvisionSpec {
+        memory_limit: sandbox.memory_limit.clone(),
+        network_egress: sandbox.network_egress.clone(),
+        workspace_mode: sandbox.workspace_mode.clone(),
+        runtime_profile: sandbox.runtime_profile.clone(),
+        execution_class: ExecutionClass::DevelopmentContainer,
+    };
+    let snapshot = Snapshot {
+        id: SnapshotId::new(),
+        sandbox_id: sandbox.id,
+        status: SnapshotStatus::Ready,
+        label: "durable-placement".to_string(),
+        inventory: json!({}),
+        provider_metadata: json!({}),
+        runtime_image: Some(sandbox.template.clone()),
+        provision_spec: Some(expected_spec.clone()),
+        created_at: now,
+        ready_at: Some(now),
+        expires_at: None,
+        error: None,
+    };
+    let mut connection = db.pool.acquire().await.expect("acquire connection");
+    insert_snapshot_on_connection(&db, &mut connection, &snapshot)
+        .await
+        .expect("insert snapshot");
+    sqlx::query("delete from snapshots where id = ?")
+        .bind(snapshot.id.to_string())
+        .execute(&mut *connection)
+        .await
+        .expect("delete tenant-facing snapshot row");
+    sqlx::query("delete from sandboxes where id = ?")
+        .bind(sandbox.id.to_string())
+        .execute(&mut *connection)
+        .await
+        .expect("delete source sandbox");
+
+    let restored = claim_snapshot_restore_source_on_connection(
+        &db,
+        &mut connection,
+        snapshot.id,
+        &TenantContext {
+            tenant_id: sandbox.tenant_id,
+            principal: Principal::Tenant,
+        },
+        now,
+    )
+    .await
+    .expect("retained restore source");
+
+    assert_eq!(Some(restored.runtime_image), snapshot.runtime_image);
+    assert_eq!(restored.provision_spec, expected_spec);
 }
 
 #[tokio::test]
@@ -1247,7 +1935,9 @@ async fn cleanup_archived_sandboxes_never_deletes_a_sandbox_with_a_live_restore_
     let db = test_sqlite_db().await;
     let now = Utc::now();
     let sandbox = Sandbox {
+        execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        runtime_profile: SandboxRuntimeProfile::Unprivileged,
         id: SandboxId::new(),
         tenant_id: "default".to_string(),
         name: "referenced-archived".to_string(),
@@ -1258,6 +1948,8 @@ async fn cleanup_archived_sandboxes_never_deletes_a_sandbox_with_a_live_restore_
         created_at: now,
         updated_at: now,
         ttl_seconds: Some(0),
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         parent_snapshot_id: None,
     };
     insert_sandbox(&db, &sandbox)
@@ -1316,9 +2008,13 @@ async fn sandbox_insert_rejects_a_nonexistent_parent_snapshot_id() {
         template: "default".to_string(),
         memory_limit: MemoryLimit::default(),
         network_egress: NetworkEgress::default(),
+        runtime_profile: SandboxRuntimeProfile::default(),
+        execution_class: ExecutionClass::default(),
         created_at: now,
         updated_at: now,
         ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         parent_snapshot_id: Some(SnapshotId::new()),
     };
 
@@ -1343,7 +2039,7 @@ async fn parent_snapshot_fk_migration_nulls_pre_existing_orphans_before_enforcin
     // nothing -- the column only ever had an index
     // (20260704000500_snapshots.sql), so nothing ever stopped that from
     // happening. The migration added alongside the FK
-    // (20260713000400_sandbox_parent_snapshot_fk.sql) must null those out
+    // (20260716000400_sandbox_parent_snapshot_fk.sql) must null those out
     // before `ensure_sqlite_constraints` starts enforcing the constraint, or
     // the upgrade itself would fail applying to real, already-drifted data.
     sqlx::any::install_default_drivers();
@@ -1353,7 +2049,7 @@ async fn parent_snapshot_fk_migration_nulls_pre_existing_orphans_before_enforcin
         .await
         .expect("connect in-memory sqlite");
 
-    const FK_MIGRATION_VERSION: i64 = 20260713000400;
+    const FK_MIGRATION_VERSION: i64 = 20260716000400;
     let mut migrations: Vec<_> = sqlx::migrate!("./migrations").iter().cloned().collect();
     migrations.sort_by_key(|migration| migration.version);
 
@@ -1433,4 +2129,387 @@ async fn parent_snapshot_fk_migration_nulls_pre_existing_orphans_before_enforcin
         result.is_err(),
         "the foreign key must reject the same dangling snapshot id post-upgrade"
     );
+}
+
+#[tokio::test]
+async fn apex_execution_class_migration_backfills_legacy_rows() {
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect upgrade database");
+    let migrations = sqlx::migrate!("./migrations");
+    // This test simulates rows written *before* the corrective backfill
+    // migration below, then applies it and asserts it ran correctly.
+    //
+    // It used to build "prior_migrations" by slicing off just the literal
+    // last migration, on the assumption that the backfill migration was
+    // always the newest one -- true when this test was written, but silently
+    // stale since (several unrelated migrations, most recently the active-
+    // lifetime-reaping columns, have landed after it without breaking this
+    // test, purely because none of them touched a column the legacy inserts
+    // below depend on -- unlike the active-lifetime columns, which
+    // `insert_sandbox` now unconditionally writes).
+    //
+    // The fix excludes only the backfill migration itself (found by name,
+    // not position) rather than truncating everything after it, so
+    // `insert_sandbox`/`insert_job` below run against the *current* full
+    // schema (every column they need exists) with only this one migration's
+    // row-level fixup not yet applied -- exactly the legacy state this test
+    // means to construct, regardless of how many migrations land on either
+    // side of the backfill one in the future.
+    let backfill_index = migrations
+        .migrations
+        .iter()
+        .position(|migration| {
+            migration
+                .description
+                .contains("apex execution class backfill")
+        })
+        .expect("apex_execution_class_backfill migration must still exist");
+    let prior_migrations = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            migrations
+                .migrations
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != backfill_index)
+                .map(|(_, migration)| migration.clone())
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    prior_migrations
+        .run(&pool)
+        .await
+        .expect("migrate to pre-backfill schema");
+    let db = Database {
+        pool,
+        dialect: SqlDialect::Sqlite,
+    };
+    let now = Utc::now();
+    let sandbox = Sandbox {
+        id: SandboxId::new(),
+        tenant_id: "legacy-apex-tenant".to_string(),
+        name: "legacy-apex".to_string(),
+        state: SandboxState::Ready,
+        template: format!("ghcr.io/evalops/apex@sha256:{}", "a".repeat(64)),
+        memory_limit: MemoryLimit::FourG,
+        network_egress: NetworkEgress::DenyAll,
+        workspace_mode: WorkspaceMode::Persistent,
+        runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
+        execution_class: ExecutionClass::DevelopmentContainer,
+        created_at: now,
+        updated_at: now,
+        ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
+        parent_snapshot_id: None,
+    };
+    insert_sandbox(&db, &sandbox)
+        .await
+        .expect("insert legacy sandbox");
+    let mut deleted_source = sandbox.clone();
+    deleted_source.id = SandboxId::new();
+    deleted_source.name = "deleted-apex-source".to_string();
+    insert_sandbox(&db, &deleted_source)
+        .await
+        .expect("insert source that will be deleted");
+    let mut non_apex = sandbox.clone();
+    non_apex.id = SandboxId::new();
+    non_apex.name = "legacy-unprivileged".to_string();
+    non_apex.runtime_profile = SandboxRuntimeProfile::Unprivileged;
+    insert_sandbox(&db, &non_apex)
+        .await
+        .expect("insert non-APEX control sandbox");
+
+    let job = Job {
+        id: JobId::new(),
+        tenant_id: sandbox.tenant_id.clone(),
+        kind: JobKind::ProvisionSandbox,
+        status: JobStatus::Queued,
+        payload: json!({"sandboxId": sandbox.id}),
+        required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
+        priority: 0,
+        attempts: 0,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+    };
+    insert_job(&db, &job).await.expect("insert legacy job");
+    let snapshot_job = Job {
+        id: JobId::new(),
+        kind: JobKind::CreateSnapshot,
+        payload: json!({
+            "sandboxId": sandbox.id,
+            "snapshotId": SnapshotId::new(),
+        }),
+        required_capability: WorkerCapability::Snapshot,
+        ..job.clone()
+    };
+    insert_job(&db, &snapshot_job)
+        .await
+        .expect("insert legacy snapshot job");
+    let fork_job = Job {
+        id: JobId::new(),
+        kind: JobKind::ForkSandbox,
+        payload: json!({
+            "parentSandboxId": non_apex.id,
+            "childSandboxId": sandbox.id,
+            "snapshotId": SnapshotId::new(),
+        }),
+        ..job.clone()
+    };
+    insert_job(&db, &fork_job)
+        .await
+        .expect("insert legacy fork-child job");
+    let non_apex_job = Job {
+        id: JobId::new(),
+        payload: json!({"sandboxId": non_apex.id}),
+        ..job.clone()
+    };
+    insert_job(&db, &non_apex_job)
+        .await
+        .expect("insert non-APEX control job");
+
+    let snapshot_id = SnapshotId::new();
+    let deleted_restore_id = SnapshotId::new();
+    let non_apex_restore_id = SnapshotId::new();
+    let provision_spec = serde_json::to_string(&SandboxProvisionSpec {
+        runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
+        execution_class: ExecutionClass::DevelopmentContainer,
+        ..SandboxProvisionSpec::default()
+    })
+    .expect("serialize legacy provision spec");
+    let non_apex_provision_spec = serde_json::to_string(&SandboxProvisionSpec::default())
+        .expect("serialize non-APEX provision spec");
+    for (restore_id, source_sandbox_id, spec) in [
+        (snapshot_id, sandbox.id, provision_spec.clone()),
+        (
+            deleted_restore_id,
+            deleted_source.id,
+            provision_spec.clone(),
+        ),
+        (non_apex_restore_id, non_apex.id, non_apex_provision_spec),
+    ] {
+        sqlx::query(
+            "insert into snapshot_restore_sources
+             (snapshot_id, tenant_id, source_sandbox_id, execution_class, status, provision_spec)
+             values (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(restore_id.to_string())
+        .bind(&sandbox.tenant_id)
+        .bind(source_sandbox_id.to_string())
+        .bind("development_container")
+        .bind("ready")
+        .bind(spec)
+        .execute(&db.pool)
+        .await
+        .expect("insert legacy restore source");
+    }
+    sqlx::query("delete from sandboxes where id = ?")
+        .bind(deleted_source.id.to_string())
+        .execute(&db.pool)
+        .await
+        .expect("delete APEX restore source before backfill");
+
+    migrations
+        .run(&db.pool)
+        .await
+        .expect("apply corrective backfill migration");
+    sqlx::raw_sql(include_str!(
+        "../migrations/20260714000300_apex_execution_class_backfill.sql"
+    ))
+    .execute(&db.pool)
+    .await
+    .expect("corrective backfill remains idempotent");
+
+    let sandbox_class: String = sqlx::query("select execution_class from sandboxes where id = ?")
+        .bind(sandbox.id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .expect("fetch sandbox class")
+        .try_get("execution_class")
+        .expect("sandbox execution_class");
+    let job_class: String = sqlx::query("select required_execution_class from jobs where id = ?")
+        .bind(job.id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .expect("fetch job class")
+        .try_get("required_execution_class")
+        .expect("job required_execution_class");
+    let restore_class: String =
+        sqlx::query("select execution_class from snapshot_restore_sources where snapshot_id = ?")
+            .bind(snapshot_id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .expect("fetch restore source class")
+            .try_get("execution_class")
+            .expect("restore execution_class");
+
+    assert_eq!(sandbox_class, "sandboxed_container");
+    assert_eq!(job_class, "sandboxed_container");
+    assert_eq!(restore_class, "sandboxed_container");
+
+    for backfilled_job_id in [snapshot_job.id, fork_job.id] {
+        let class: String = sqlx::query("select required_execution_class from jobs where id = ?")
+            .bind(backfilled_job_id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .expect("fetch backfilled job class")
+            .try_get("required_execution_class")
+            .expect("backfilled job required_execution_class");
+        assert_eq!(class, "sandboxed_container");
+    }
+    let deleted_restore_class: String =
+        sqlx::query("select execution_class from snapshot_restore_sources where snapshot_id = ?")
+            .bind(deleted_restore_id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .expect("fetch deleted-source restore class")
+            .try_get("execution_class")
+            .expect("deleted-source execution_class");
+    assert_eq!(deleted_restore_class, "sandboxed_container");
+
+    let non_apex_sandbox_class: String =
+        sqlx::query("select execution_class from sandboxes where id = ?")
+            .bind(non_apex.id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .expect("fetch non-APEX sandbox class")
+            .try_get("execution_class")
+            .expect("non-APEX sandbox execution_class");
+    let non_apex_job_class: String =
+        sqlx::query("select required_execution_class from jobs where id = ?")
+            .bind(non_apex_job.id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .expect("fetch non-APEX job class")
+            .try_get("required_execution_class")
+            .expect("non-APEX job required_execution_class");
+    let non_apex_restore_class: String =
+        sqlx::query("select execution_class from snapshot_restore_sources where snapshot_id = ?")
+            .bind(non_apex_restore_id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .expect("fetch non-APEX restore class")
+            .try_get("execution_class")
+            .expect("non-APEX restore execution_class");
+    assert_eq!(non_apex_sandbox_class, "development_container");
+    assert_eq!(non_apex_job_class, "development_container");
+    assert_eq!(non_apex_restore_class, "development_container");
+}
+
+#[tokio::test]
+async fn provider_identity_collision_requires_exact_association_tuple() {
+    let db = test_sqlite_db().await;
+    let first = seed_sandbox_with_state(&db, SandboxState::Ready).await;
+    let second = seed_sandbox_with_state(&db, SandboxState::Ready).await;
+    let snapshot_one = SnapshotId::new();
+    let snapshot_two = SnapshotId::new();
+    for snapshot_id in [snapshot_one, snapshot_two] {
+        sqlx::query(
+            "insert into snapshots
+             (id, sandbox_id, tenant_id, status, label, inventory, provider_metadata, created_at)
+             values (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(snapshot_id.to_string())
+        .bind(first.id.to_string())
+        .bind(&first.tenant_id)
+        .bind("ready")
+        .bind("identity-collision-test")
+        .bind("{}")
+        .bind("{}")
+        .bind(Utc::now().to_rfc3339())
+        .execute(&db.pool)
+        .await
+        .expect("seed snapshot association");
+    }
+    let make_resource =
+        |name: &str,
+         sandbox_id: SandboxId,
+         snapshot_id: Option<SnapshotId>,
+         source_snapshot_id: Option<SnapshotId>| ProviderRuntimeResource {
+            sandbox_id,
+            snapshot_id,
+            provider: "kubernetes".to_string(),
+            resource_kind: RuntimeResourceKind::Pod,
+            purpose: RuntimeResourcePurpose::Runtime,
+            resource_name: name.to_string(),
+            namespace: "identity-collision-test".to_string(),
+            status: RuntimeResourceStatus::Ready,
+            cluster: Some("test-cluster".to_string()),
+            storage_class: None,
+            snapshot_class: None,
+            storage_size: None,
+            runtime_image: Some("image@sha256:test".to_string()),
+            service_port: None,
+            target_port: None,
+            source_snapshot_id,
+            ready_at: Some(Utc::now()),
+            error: None,
+        };
+    let cases = [
+        make_resource("provision-sibling", first.id, None, None),
+        make_resource("snapshot-move", first.id, Some(snapshot_one), None),
+        make_resource("fork-child-move", first.id, None, Some(snapshot_one)),
+        make_resource("fork-source-move", first.id, None, Some(snapshot_one)),
+    ];
+    let mut connection = db.pool.acquire().await.expect("acquire connection");
+
+    for (index, original) in cases.into_iter().enumerate() {
+        let inserted = upsert_provider_runtime_resource_on_connection(
+            &db,
+            &mut connection,
+            &original,
+            None,
+            None,
+            Some(&first.tenant_id),
+        )
+        .await
+        .expect("insert original provider identity");
+        let retried = upsert_provider_runtime_resource_on_connection(
+            &db,
+            &mut connection,
+            &original,
+            None,
+            None,
+            Some(&first.tenant_id),
+        )
+        .await
+        .expect("an exact association retry must be accepted");
+        assert_eq!(retried.id, inserted.id);
+
+        let mut displaced = original.clone();
+        match index {
+            0 | 2 => displaced.sandbox_id = second.id,
+            1 => displaced.snapshot_id = Some(snapshot_two),
+            3 => displaced.source_snapshot_id = Some(snapshot_two),
+            _ => unreachable!(),
+        }
+        let error = upsert_provider_runtime_resource_on_connection(
+            &db,
+            &mut connection,
+            &displaced,
+            None,
+            None,
+            Some(&first.tenant_id),
+        )
+        .await
+        .expect_err("provider identity ownership cannot move");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+
+        let persisted = fetch_runtime_resource_on_connection(&db, &mut connection, inserted.id)
+            .await
+            .expect("fetch persisted association");
+        assert_eq!(persisted.sandbox_id, original.sandbox_id);
+        assert_eq!(persisted.snapshot_id, original.snapshot_id);
+        assert_eq!(persisted.source_snapshot_id, original.source_snapshot_id);
+    }
 }

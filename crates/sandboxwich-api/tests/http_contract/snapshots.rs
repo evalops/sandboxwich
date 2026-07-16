@@ -5,6 +5,602 @@ use sandboxwich_core::*;
 use sqlx::Row;
 use sqlx::any::AnyPoolOptions;
 
+#[tokio::test]
+pub(crate) async fn legacy_snapshot_reads_and_expiry_survive_missing_placement_but_restore_fails_closed()
+ {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir
+                .path()
+                .join("legacy-snapshot-placement.db")
+                .display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let client = server.client();
+    let created: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("legacy-snapshot".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            workspace_mode: Some(WorkspaceMode::Persistent),
+            runtime_profile: None,
+            ttl_seconds: None,
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+            execution_class: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let snapshot: SnapshotResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/snapshots",
+            server.base_url, created.sandbox.id
+        ))
+        .json(&CreateSnapshotRequest {
+            label: Some("legacy".to_string()),
+            inventory: None,
+            provider_metadata: None,
+            ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .connect(&server.database_url)
+        .await
+        .unwrap();
+    sqlx::query(
+        "update snapshots
+         set status = 'ready', runtime_image = null, provision_spec = null
+         where id = ?",
+    )
+    .bind(snapshot.snapshot.id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "update snapshot_restore_sources
+         set status = 'ready', runtime_image = null, provision_spec = null
+         where snapshot_id = ?",
+    )
+    .bind(snapshot.snapshot.id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let fetched: SnapshotResponse = client
+        .get(format!(
+            "{}/snapshots/{}",
+            server.base_url, snapshot.snapshot.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(fetched.snapshot.runtime_image.is_none());
+    assert!(fetched.snapshot.provision_spec.is_none());
+    let listed: SnapshotListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/snapshots",
+            server.base_url, created.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed.snapshots.len(), 1);
+    assert!(listed.snapshots[0].runtime_image.is_none());
+
+    let restore = client
+        .post(format!(
+            "{}/snapshots/{}/fork",
+            server.base_url, snapshot.snapshot.id
+        ))
+        .json(&ForkSnapshotRequest {
+            name: Some("must-not-restore".to_string()),
+            template: created.sandbox.template.clone(),
+            memory_limit: created.sandbox.memory_limit.clone(),
+            network_egress: created.sandbox.network_egress.clone(),
+            runtime_profile: created.sandbox.runtime_profile.clone(),
+            ttl_seconds: None,
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        restore.json::<ErrorEnvelope>().await.unwrap().code,
+        "snapshot_placement_unavailable"
+    );
+
+    sqlx::query("update snapshots set expires_at = ? where id = ?")
+        .bind((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339())
+        .bind(snapshot.snapshot.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    client
+        .post(format!("{}/snapshots/cleanup", server.base_url))
+        .header(OPERATOR_TOKEN_HEADER, TEST_OPERATOR_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let expired: SnapshotResponse = client
+        .get(format!(
+            "{}/snapshots/{}",
+            server.base_url, snapshot.snapshot.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(expired.snapshot.status, SnapshotStatus::Expired);
+}
+
+#[tokio::test]
+pub(crate) async fn apex_snapshot_claim_requires_exact_profile_and_runtime_image() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("apex-snapshot-claim.db").display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let client = server.client();
+    let runtime_image = format!("ghcr.io/evalops/apex@sha256:{}", "d".repeat(64));
+    let created: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("apex-snapshot".to_string()),
+            template: Some(runtime_image.clone()),
+            memory_limit: Some(MemoryLimit::FourG),
+            network_egress: Some(NetworkEgress::DenyAll),
+            workspace_mode: Some(WorkspaceMode::Persistent),
+            runtime_profile: Some(SandboxRuntimeProfile::ApexTrustedSupervisorV1),
+            ttl_seconds: None,
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+            execution_class: Some(ExecutionClass::SandboxedContainer),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let exact: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "exact-apex-snapshot".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![
+                WorkerCapability::ProvisionSandbox,
+                WorkerCapability::Snapshot,
+                WorkerCapability::ApexTrustedSupervisorV1,
+                WorkerCapability::SandboxedContainer,
+            ],
+            max_concurrent_jobs: Some(1),
+            labels: [("runtime_image".to_string(), runtime_image.clone())].into(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let provision: ClaimLeaseResponse = worker_client(&exact)
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, exact.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(created.sandbox.id),
+            kinds: Some(vec![JobKind::ProvisionSandbox]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let provision = provision.lease.expect("exact APEX worker claims provision");
+    let mut resources = provision_resources(created.sandbox.id);
+    for resource in &mut resources {
+        resource.runtime_image = Some(runtime_image.clone());
+    }
+    worker_client(&exact)
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, provision.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::ProvisionSandbox {
+                handle: ProviderSandboxHandle {
+                    provider: "kubernetes".to_string(),
+                    sandbox_id: created.sandbox.id,
+                    resources,
+                    metadata: serde_json::json!({}),
+                },
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    client
+        .post(format!(
+            "{}/sandboxes/{}/snapshots",
+            server.base_url, created.sandbox.id
+        ))
+        .json(&CreateSnapshotRequest {
+            label: Some("apex".to_string()),
+            inventory: None,
+            provider_metadata: None,
+            ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let wrong: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "generic-snapshot".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![WorkerCapability::Snapshot],
+            max_concurrent_jobs: Some(1),
+            labels: [("runtime_image".to_string(), runtime_image.clone())].into(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let wrong_claim: ClaimLeaseResponse = worker_client(&wrong)
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, wrong.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(created.sandbox.id),
+            kinds: Some(vec![JobKind::CreateSnapshot]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(wrong_claim.lease.is_none());
+
+    let exact_claim: ClaimLeaseResponse = worker_client(&exact)
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, exact.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(created.sandbox.id),
+            kinds: Some(vec![JobKind::CreateSnapshot]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = exact_claim
+        .lease
+        .expect("exact APEX worker claims snapshot");
+    assert_eq!(
+        lease.job.payload["runtimeImage"],
+        serde_json::json!(runtime_image)
+    );
+}
+
+async fn register_snapshot_worker(
+    client: &reqwest::Client,
+    server: &TestServer,
+    name: &str,
+    capabilities: Vec<WorkerCapability>,
+) -> WorkerResponse {
+    client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: name.to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities,
+            max_concurrent_jobs: Some(1),
+            labels: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn snapshot_fork_preserves_vm_execution_class_and_requires_vm_worker() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("snapshot-vm-fork.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+
+    let source: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            execution_class: Some(ExecutionClass::VirtualMachine),
+            workspace_mode: Some(WorkspaceMode::Persistent),
+            name: Some("snapshot-vm-source".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+            runtime_profile: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let vm_worker = register_snapshot_worker(
+        &client,
+        &server,
+        "snapshot-vm-worker",
+        vec![
+            WorkerCapability::ProvisionSandbox,
+            WorkerCapability::Snapshot,
+            WorkerCapability::VirtualMachine,
+        ],
+    )
+    .await;
+    assert_provision_job_persists_runtime_resources(&client, &server, &source, &vm_worker).await;
+
+    let snapshot: SnapshotResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/snapshots",
+            server.base_url, source.sandbox.id
+        ))
+        .json(&CreateSnapshotRequest {
+            label: Some("vm-restore-source".to_string()),
+            inventory: None,
+            provider_metadata: Some(serde_json::json!({
+                "executionClass": "development_container",
+                "diagnostic": "provider metadata is not ownership authority"
+            })),
+            ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let vm_worker_client = worker_client(&vm_worker);
+    let snapshot_claim: ClaimLeaseResponse = vm_worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, vm_worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: Some(vec![JobKind::CreateSnapshot]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let snapshot_lease = snapshot_claim
+        .lease
+        .expect("VM snapshot worker must claim the VM snapshot job");
+    vm_worker_client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, snapshot_lease.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::CreateSnapshot {
+                handle: ProviderSnapshotHandle {
+                    provider: "kubernetes".to_string(),
+                    snapshot_id: snapshot.snapshot.id,
+                    resources: snapshot_resources(source.sandbox.id, snapshot.snapshot.id),
+                    metadata: serde_json::json!({"executionClass":"development_container"}),
+                },
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let child: SandboxResponse = client
+        .post(format!(
+            "{}/snapshots/{}/fork",
+            server.base_url, snapshot.snapshot.id
+        ))
+        .json(&ForkSnapshotRequest {
+            name: Some("snapshot-vm-child".to_string()),
+            template: source.sandbox.template.clone(),
+            memory_limit: source.sandbox.memory_limit.clone(),
+            network_egress: source.sandbox.network_egress.clone(),
+            ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+            runtime_profile: source.sandbox.runtime_profile.clone(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        child.sandbox.execution_class,
+        ExecutionClass::VirtualMachine
+    );
+
+    let jobs: JobListResponse = client
+        .get(format!("{}/jobs", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let fork_job = jobs
+        .jobs
+        .iter()
+        .find(|job| {
+            job.kind == JobKind::ForkSandbox
+                && job.payload["childSandboxId"] == serde_json::json!(child.sandbox.id)
+        })
+        .expect("snapshot fork must queue a child fork job");
+    assert_eq!(
+        fork_job.required_execution_class,
+        ExecutionClass::VirtualMachine
+    );
+    assert_eq!(
+        fork_job.payload["provisionSpec"]["execution_class"],
+        serde_json::json!(ExecutionClass::VirtualMachine)
+    );
+
+    let development_worker = register_snapshot_worker(
+        &client,
+        &server,
+        "snapshot-development-worker",
+        vec![WorkerCapability::Snapshot],
+    )
+    .await;
+    let development_claim: ClaimLeaseResponse = worker_client(&development_worker)
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, development_worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: Some(vec![JobKind::ForkSandbox]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        development_claim.lease.is_none(),
+        "a development worker must not claim a VM snapshot fork"
+    );
+
+    let vm_claim: ClaimLeaseResponse = vm_worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, vm_worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: Some(vec![JobKind::ForkSandbox]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let vm_fork_lease = vm_claim
+        .lease
+        .expect("a VM-capable snapshot worker must claim the VM fork job");
+    assert_eq!(vm_fork_lease.job.id, fork_job.id);
+    assert_eq!(
+        vm_fork_lease.required_execution_class,
+        ExecutionClass::VirtualMachine
+    );
+}
+
 pub(crate) async fn assert_provision_job_persists_runtime_resources(
     client: &reqwest::Client,
     server: &TestServer,
@@ -273,7 +869,16 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
             provider: "kubernetes".to_string(),
             capabilities: vec![WorkerCapability::Snapshot],
             max_concurrent_jobs: Some(1),
-            labels: [("cluster".to_string(), "k3s-dev".to_string())].into(),
+            labels: [
+                ("cluster".to_string(), "k3s-dev".to_string()),
+                ("provider_mode".to_string(), "apply".to_string()),
+                (
+                    "runtime_image".to_string(),
+                    "image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                ),
+            ]
+            .into(),
         })
         .send()
         .await
@@ -329,6 +934,14 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .lease
         .expect("expected snapshot worker to claim manual snapshot job");
     assert_eq!(snapshot_lease.job.kind, JobKind::CreateSnapshot);
+    assert_eq!(
+        snapshot_lease.job.payload["runtimeImage"],
+        serde_json::json!(sandbox.sandbox.template)
+    );
+    assert_eq!(
+        snapshot_lease.job.payload["provisionSpec"]["runtime_profile"],
+        serde_json::json!(sandbox.sandbox.runtime_profile)
+    );
     let snapshot_id = snapshot.snapshot.id.to_string();
     assert_eq!(
         snapshot_lease
@@ -462,12 +1075,16 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
     let archived: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("cleanup-me".to_string()),
             template: None,
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(0),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -562,12 +1179,16 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
             server.base_url, sandbox.sandbox.id
         ))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("contract-child".to_string()),
             template: None,
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -830,12 +1451,16 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
             server.base_url, sandbox.sandbox.id
         ))
         .json(&CreateSandboxRequest {
+            execution_class: None,
             workspace_mode: None,
+            runtime_profile: None,
             name: Some("failed-child".to_string()),
             template: None,
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -902,20 +1527,26 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .await
         .unwrap();
     assert_eq!(failed.lease.job.status, JobStatus::Failed);
-    let failed_child: SandboxResponse = client
-        .get(format!(
-            "{}/sandboxes/{}",
-            server.base_url, failed_fork.sandbox.id
-        ))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
+    // A permanently failed fork has no placement proof, so the public GET
+    // intentionally fails closed. Verify the durable lifecycle transition
+    // directly instead of weakening the placement-proof contract.
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&server.database_url)
         .await
         .unwrap();
-    assert_eq!(failed_child.sandbox.state, SandboxState::Error);
+    let row = sqlx::query(&format!(
+        "select state from sandboxes where id = {}",
+        crate::types::placeholders(&server.database_url, 1)
+    ))
+    .bind(failed_fork.sandbox.id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let state: String = row.try_get("state").unwrap();
+    assert_eq!(state, SandboxState::Error.as_db_str());
+    pool.close().await;
 }
 
 /// Connects directly to the server's database and attempts to delete the
