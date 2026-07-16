@@ -49,6 +49,76 @@ pub(crate) fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
     })
 }
 
+pub(crate) fn row_to_resident_process(row: AnyRow) -> Result<ResidentProcess, ApiError> {
+    let id: String = row.try_get("id")?;
+    let sandbox_id: String = row.try_get("sandbox_id")?;
+    let argv: String = row.try_get("argv")?;
+    let env: String = row.try_get("env")?;
+    let restart_policy: String = row.try_get("restart_policy")?;
+    let desired_state: String = row.try_get("desired_state")?;
+    let observed_state: String = row.try_get("observed_state")?;
+    let generation: i64 = row.try_get("generation")?;
+    let active_lease_id: Option<String> = row.try_get("active_lease_id")?;
+    let pid: Option<i64> = row.try_get("pid")?;
+    let bootstrap_byte_count: Option<i64> = row.try_get("bootstrap_byte_count")?;
+    let bootstrap_mode: Option<i64> = row.try_get("bootstrap_mode")?;
+    let started_at: Option<String> = row.try_get("started_at")?;
+    let ready_at: Option<String> = row.try_get("ready_at")?;
+    let exited_at: Option<String> = row.try_get("exited_at")?;
+    let exit_code: Option<i64> = row.try_get("exit_code")?;
+    let created_at: String = row.try_get("created_at")?;
+    let updated_at: String = row.try_get("updated_at")?;
+
+    Ok(ResidentProcess {
+        id: ResidentProcessId(parse_uuid(&id)?),
+        sandbox_id: SandboxId(parse_uuid(&sandbox_id)?),
+        tenant_id: row.try_get("tenant_id")?,
+        name: row.try_get("name")?,
+        argv: serde_json::from_str(&argv)
+            .map_err(|_| ApiError::internal("database contains invalid resident argv"))?,
+        cwd: row.try_get("cwd")?,
+        env: serde_json::from_str(&env)
+            .map_err(|_| ApiError::internal("database contains invalid resident environment"))?,
+        bootstrap_sha256: row.try_get("bootstrap_sha256")?,
+        bootstrap_byte_count: bootstrap_byte_count
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| ApiError::internal("database contains invalid bootstrap byte count"))?,
+        bootstrap_target_file: row.try_get("bootstrap_target_file")?,
+        bootstrap_mode: bootstrap_mode
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| ApiError::internal("database contains invalid bootstrap mode"))?,
+        restart_policy: ResidentProcessRestartPolicy::parse_db_str(&restart_policy)
+            .map_err(|_| ApiError::internal("database contains invalid restart policy"))?,
+        desired_state: ResidentProcessDesiredState::parse_db_str(&desired_state)
+            .map_err(|_| ApiError::internal("database contains invalid desired state"))?,
+        observed_state: ResidentProcessObservedState::parse_db_str(&observed_state)
+            .map_err(|_| ApiError::internal("database contains invalid observed state"))?,
+        generation: u64::try_from(generation)
+            .map_err(|_| ApiError::internal("database contains invalid resident generation"))?,
+        active_lease_id: active_lease_id
+            .map(|value| parse_uuid(&value))
+            .transpose()?,
+        pid: pid
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| ApiError::internal("database contains invalid resident pid"))?,
+        started_at: started_at
+            .map(|value| parse_timestamp(&value))
+            .transpose()?,
+        ready_at: ready_at.map(|value| parse_timestamp(&value)).transpose()?,
+        exited_at: exited_at.map(|value| parse_timestamp(&value)).transpose()?,
+        exit_code: exit_code
+            .map(i32::try_from)
+            .transpose()
+            .map_err(|_| ApiError::internal("database contains invalid resident exit code"))?,
+        last_error: row.try_get("last_error")?,
+        created_at: parse_timestamp(&created_at)?,
+        updated_at: parse_timestamp(&updated_at)?,
+    })
+}
+
 pub(crate) fn row_to_network_allow_rule(row: AnyRow) -> Result<NetworkAllowRule, ApiError> {
     let kind: String = row.try_get("kind")?;
     Ok(NetworkAllowRule {

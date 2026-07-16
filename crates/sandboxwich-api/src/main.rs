@@ -107,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
             default_tenant_id: config.default_tenant_id,
             apex_callback_base_url: config.apex_callback_base_url,
             apex_waiters: Default::default(),
+            resident_bootstraps: Default::default(),
             #[cfg(test)]
             apex_callback_test_hook: None,
         }),

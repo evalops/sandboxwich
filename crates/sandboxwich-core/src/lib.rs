@@ -1724,12 +1724,261 @@ pub struct CapacityResponse {
     pub total_available_slots: u32,
 }
 
+pub const MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES: usize = 64 * 1024;
+pub const RESIDENT_PROCESS_BOOTSTRAP_PREFIX: &str = "/run/sandboxwich/bootstrap";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(transparent)]
+pub struct ResidentProcessId(pub Uuid);
+
+impl ResidentProcessId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for ResidentProcessId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for ResidentProcessId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+db_variant_enum! {
+pub enum ResidentProcessRestartPolicy {
+    Never => "never",
+    OnFailure => "on_failure",
+}
+}
+
+db_variant_enum! {
+pub enum ResidentProcessDesiredState {
+    Running => "running",
+    Stopped => "stopped",
+}
+}
+
+db_variant_enum! {
+pub enum ResidentProcessObservedState {
+    Pending => "pending",
+    Starting => "starting",
+    Running => "running",
+    Failed => "failed",
+    Stopped => "stopped",
+    Lost => "lost",
+}
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentProcessBootstrap {
+    #[serde(with = "serde_base64_bytes")]
+    #[schema(value_type = String)]
+    pub content: Vec<u8>,
+    pub target_file: String,
+    pub mode: u32,
+}
+
+impl fmt::Debug for ResidentProcessBootstrap {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResidentProcessBootstrap")
+            .field(
+                "content",
+                &format_args!("<redacted:{} bytes>", self.content.len()),
+            )
+            .field("target_file", &self.target_file)
+            .field("mode", &format_args!("{:#o}", self.mode))
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentProcessRequest {
+    pub argv: Vec<String>,
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    pub restart_policy: ResidentProcessRestartPolicy,
+    pub expected_generation: u64,
+    pub bootstrap: Option<ResidentProcessBootstrap>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentProcess {
+    pub id: ResidentProcessId,
+    pub sandbox_id: SandboxId,
+    pub tenant_id: String,
+    pub name: String,
+    pub argv: Vec<String>,
+    pub cwd: Option<String>,
+    pub env: BTreeMap<String, String>,
+    pub bootstrap_sha256: Option<String>,
+    pub bootstrap_byte_count: Option<u64>,
+    pub bootstrap_target_file: Option<String>,
+    pub bootstrap_mode: Option<u32>,
+    pub restart_policy: ResidentProcessRestartPolicy,
+    pub desired_state: ResidentProcessDesiredState,
+    pub observed_state: ResidentProcessObservedState,
+    pub generation: u64,
+    pub active_lease_id: Option<Uuid>,
+    pub pid: Option<u32>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub ready_at: Option<DateTime<Utc>>,
+    pub exited_at: Option<DateTime<Utc>>,
+    pub exit_code: Option<i32>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentProcessResponse {
+    pub ok: bool,
+    pub resident_process: ResidentProcess,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<Operation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentProcessObservationRequest {
+    pub generation: u64,
+    pub lease_id: Uuid,
+    pub observed_state: ResidentProcessObservedState,
+    pub pid: Option<u32>,
+    pub exit_code: Option<i32>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResidentProcessBootstrapReadRequest {
+    pub generation: u64,
+    pub lease_id: Uuid,
+    pub expected_sha256: String,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentProcessBootstrapReadResponse {
+    pub ok: bool,
+    #[serde(with = "serde_base64_bytes")]
+    #[schema(value_type = String)]
+    pub content: Vec<u8>,
+    pub sha256: String,
+    pub target_file: String,
+    pub mode: u32,
+}
+
+impl fmt::Debug for ResidentProcessBootstrapReadResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResidentProcessBootstrapReadResponse")
+            .field("ok", &self.ok)
+            .field(
+                "content",
+                &format_args!("<redacted:{} bytes>", self.content.len()),
+            )
+            .field("sha256", &self.sha256)
+            .field("target_file", &self.target_file)
+            .field("mode", &format_args!("{:#o}", self.mode))
+            .finish()
+    }
+}
+
+impl fmt::Debug for ResidentProcessRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResidentProcessRequest")
+            .field("argv", &self.argv)
+            .field("cwd", &self.cwd)
+            .field("env", &self.env)
+            .field("restart_policy", &self.restart_policy)
+            .field("expected_generation", &self.expected_generation)
+            .field("bootstrap", &self.bootstrap)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum ResidentProcessRequestError {
+    #[error("resident process argv must not be empty")]
+    EmptyArgv,
+    #[error("resident process argv contains NUL")]
+    ArgvContainsNul,
+    #[error("resident process environment contains NUL")]
+    EnvironmentContainsNul,
+    #[error("resident process cwd must be absolute")]
+    CwdMustBeAbsolute,
+    #[error("resident process bootstrap exceeds 64 KiB")]
+    BootstrapTooLarge,
+    #[error("resident process bootstrap path is outside the allowed root")]
+    BootstrapPathOutsideAllowedRoot,
+    #[error("resident process bootstrap mode must be between 0400 and 0700")]
+    InvalidBootstrapMode,
+}
+
+pub fn validate_resident_process_request(
+    request: &ResidentProcessRequest,
+) -> Result<(), ResidentProcessRequestError> {
+    if request.argv.is_empty() {
+        return Err(ResidentProcessRequestError::EmptyArgv);
+    }
+    if request.argv.iter().any(|value| value.contains('\0')) {
+        return Err(ResidentProcessRequestError::ArgvContainsNul);
+    }
+    if request
+        .env
+        .iter()
+        .any(|(key, value)| key.contains('\0') || value.contains('\0'))
+    {
+        return Err(ResidentProcessRequestError::EnvironmentContainsNul);
+    }
+    if request
+        .cwd
+        .as_deref()
+        .is_some_and(|cwd| !std::path::Path::new(cwd).is_absolute())
+    {
+        return Err(ResidentProcessRequestError::CwdMustBeAbsolute);
+    }
+    if let Some(bootstrap) = &request.bootstrap {
+        if bootstrap.content.len() > MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES {
+            return Err(ResidentProcessRequestError::BootstrapTooLarge);
+        }
+        let target = std::path::Path::new(&bootstrap.target_file);
+        let root = std::path::Path::new(RESIDENT_PROCESS_BOOTSTRAP_PREFIX);
+        if !target.is_absolute()
+            || !target.starts_with(root)
+            || target
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+        {
+            return Err(ResidentProcessRequestError::BootstrapPathOutsideAllowedRoot);
+        }
+        if !(0o400..=0o700).contains(&bootstrap.mode) {
+            return Err(ResidentProcessRequestError::InvalidBootstrapMode);
+        }
+    }
+    Ok(())
+}
+
 db_variant_enum! {
 pub enum JobKind {
     ProvisionSandbox => "provision_sandbox",
     StopSandbox => "stop_sandbox",
     ResumeSandbox => "resume_sandbox",
     RunCommand => "run_command",
+    RunResidentProcess => "run_resident_process",
     MaterializeFile => "materialize_file",
     ApexTaskInstructions => "apex_task_instructions",
     RunPrompt => "run_prompt",
@@ -2159,6 +2408,7 @@ pub enum OperationKind {
     StopSandbox,
     ResumeSandbox,
     RunCommand,
+    RunResidentProcess,
     MaterializeFile,
     CreateSnapshot,
     ForkSandbox,
@@ -2408,6 +2658,11 @@ pub enum WorkerJobResult {
     RunCommand {
         result: AgentCommandResult,
     },
+    RunResidentProcess {
+        process_id: ResidentProcessId,
+        generation: u64,
+        exit_code: Option<i32>,
+    },
     MaterializeFile {
         receipt: MaterializeFileReceipt,
     },
@@ -2624,6 +2879,85 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn resident_process_request_validates_bootstrap_and_redacts_secret_bytes() {
+        let request = ResidentProcessRequest {
+            argv: vec!["/usr/local/bin/orb-executor".into()],
+            cwd: Some("/workspace".into()),
+            env: BTreeMap::from([(
+                "ORB_TOKEN_FILE".into(),
+                "/run/sandboxwich/bootstrap/orb-token".into(),
+            )]),
+            restart_policy: ResidentProcessRestartPolicy::OnFailure,
+            expected_generation: 0,
+            bootstrap: Some(ResidentProcessBootstrap {
+                content: b"canary-resident-secret".to_vec(),
+                target_file: "/run/sandboxwich/bootstrap/orb-token".into(),
+                mode: 0o600,
+            }),
+        };
+
+        validate_resident_process_request(&request).expect("valid resident process request");
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("canary-resident-secret"));
+        assert!(debug.contains("<redacted:22 bytes>"));
+    }
+
+    #[test]
+    fn resident_process_request_rejects_unsafe_process_and_bootstrap_inputs() {
+        let valid = ResidentProcessRequest {
+            argv: vec!["/usr/local/bin/orb-executor".into()],
+            cwd: Some("/workspace".into()),
+            env: BTreeMap::new(),
+            restart_policy: ResidentProcessRestartPolicy::Never,
+            expected_generation: 0,
+            bootstrap: None,
+        };
+
+        let mut empty_argv = valid.clone();
+        empty_argv.argv.clear();
+        assert_eq!(
+            validate_resident_process_request(&empty_argv),
+            Err(ResidentProcessRequestError::EmptyArgv)
+        );
+
+        let mut nul_env = valid.clone();
+        nul_env.env.insert("TOKEN".into(), "bad\0value".into());
+        assert_eq!(
+            validate_resident_process_request(&nul_env),
+            Err(ResidentProcessRequestError::EnvironmentContainsNul)
+        );
+
+        let mut relative_cwd = valid.clone();
+        relative_cwd.cwd = Some("workspace".into());
+        assert_eq!(
+            validate_resident_process_request(&relative_cwd),
+            Err(ResidentProcessRequestError::CwdMustBeAbsolute)
+        );
+
+        let mut escaped_bootstrap = valid.clone();
+        escaped_bootstrap.bootstrap = Some(ResidentProcessBootstrap {
+            content: b"secret".to_vec(),
+            target_file: "/tmp/orb-token".into(),
+            mode: 0o600,
+        });
+        assert_eq!(
+            validate_resident_process_request(&escaped_bootstrap),
+            Err(ResidentProcessRequestError::BootstrapPathOutsideAllowedRoot)
+        );
+
+        let mut oversized = valid;
+        oversized.bootstrap = Some(ResidentProcessBootstrap {
+            content: vec![b'x'; MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES + 1],
+            target_file: "/run/sandboxwich/bootstrap/orb-token".into(),
+            mode: 0o600,
+        });
+        assert_eq!(
+            validate_resident_process_request(&oversized),
+            Err(ResidentProcessRequestError::BootstrapTooLarge)
+        );
+    }
     use serde::{Serialize, de::DeserializeOwned};
     use std::{collections::BTreeSet, fmt::Debug};
 
@@ -2695,6 +3029,9 @@ mod tests {
         assert_db_variant_contract::<SandboxEventKind>();
         assert_db_variant_contract::<WorkerStatus>();
         assert_db_variant_contract::<WorkerCapability>();
+        assert_db_variant_contract::<ResidentProcessRestartPolicy>();
+        assert_db_variant_contract::<ResidentProcessDesiredState>();
+        assert_db_variant_contract::<ResidentProcessObservedState>();
         assert_db_variant_contract::<JobKind>();
         assert_db_variant_contract::<JobStatus>();
         assert_db_variant_contract::<LeaseStatus>();

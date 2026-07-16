@@ -762,6 +762,7 @@ mod tests {
             // An empty fresh registry models restart or a callback routed to
             // the wrong API replica while durable lineage survives.
             apex_waiters: ApexInstructionWaiters::default(),
+            resident_bootstraps: Default::default(),
             apex_callback_test_hook: None,
         };
         let ctx = TenantContext {

@@ -39,6 +39,7 @@ pub(crate) fn operation_from_job(job: &Job) -> Result<Operation, ApiError> {
             JobKind::StopSandbox => OperationKind::StopSandbox,
             JobKind::ResumeSandbox => OperationKind::ResumeSandbox,
             JobKind::RunCommand => OperationKind::RunCommand,
+            JobKind::RunResidentProcess => OperationKind::RunResidentProcess,
             JobKind::MaterializeFile => OperationKind::MaterializeFile,
             JobKind::ApexTaskInstructions => {
                 return Err(ApiError::not_found("operation not found"));

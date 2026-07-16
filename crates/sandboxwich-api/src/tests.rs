@@ -19,6 +19,7 @@ use crate::handlers::sandboxes::*;
 use crate::handlers::snapshots::*;
 use crate::handlers::workers::*;
 use crate::reconcile::*;
+use crate::rows::*;
 use crate::state::{Principal, TenantContext};
 use sandboxwich_core::*;
 use std::collections::BTreeSet;
@@ -66,6 +67,113 @@ async fn lease_completion_fingerprint_schema_is_applied() {
         .await
         .expect("completion fingerprint column must be migrated");
     assert!(row.is_none());
+}
+
+#[tokio::test]
+async fn resident_process_storage_has_generation_fence_and_no_secret_column() {
+    let db = test_sqlite_db().await;
+    let columns = sqlx::query("pragma table_info(resident_processes)")
+        .fetch_all(&db.pool)
+        .await
+        .expect("inspect resident_processes");
+    let names = columns
+        .iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<BTreeSet<_>>();
+
+    for required in [
+        "id",
+        "sandbox_id",
+        "tenant_id",
+        "name",
+        "argv",
+        "env",
+        "bootstrap_sha256",
+        "bootstrap_byte_count",
+        "generation",
+        "active_lease_id",
+        "desired_state",
+        "observed_state",
+    ] {
+        assert!(names.contains(required), "missing column {required}");
+    }
+    for forbidden in ["bootstrap_content", "content", "secret", "token"] {
+        assert!(
+            !names.contains(forbidden),
+            "forbidden secret column {forbidden}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn resident_process_storage_round_trips_public_metadata() {
+    let db = test_sqlite_db().await;
+    let now = Utc::now();
+    let sandbox = Sandbox {
+        id: SandboxId::new(),
+        tenant_id: "tenant-a".into(),
+        name: "resident-test".into(),
+        state: SandboxState::Ready,
+        template: "ubuntu-dev".into(),
+        memory_limit: MemoryLimit::default(),
+        network_egress: NetworkEgress::DenyAll,
+        workspace_mode: WorkspaceMode::default(),
+        runtime_profile: SandboxRuntimeProfile::default(),
+        execution_class: ExecutionClass::default(),
+        created_at: now,
+        updated_at: now,
+        ttl_seconds: Some(3600),
+        parent_snapshot_id: None,
+    };
+    let mut tx = db.pool.begin().await.unwrap();
+    insert_sandbox_on_connection(&db, &mut tx, &sandbox)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let id = ResidentProcessId::new();
+    sqlx::query(
+        "insert into resident_processes (
+            id, sandbox_id, tenant_id, name, argv, cwd, env,
+            bootstrap_sha256, bootstrap_byte_count, bootstrap_target_file, bootstrap_mode,
+            restart_policy, desired_state, observed_state, generation,
+            created_at, updated_at
+         ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(sandbox.id.to_string())
+    .bind(&sandbox.tenant_id)
+    .bind("orb-executor")
+    .bind(r#"["/usr/local/bin/orb-executor"]"#)
+    .bind("/workspace")
+    .bind(r#"{"ORB_TOKEN_FILE":"/run/sandboxwich/bootstrap/orb-token"}"#)
+    .bind("a".repeat(64))
+    .bind(6_i64)
+    .bind("/run/sandboxwich/bootstrap/orb-token")
+    .bind(0o600_i64)
+    .bind("on_failure")
+    .bind("running")
+    .bind("pending")
+    .bind(1_i64)
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let row = sqlx::query("select * from resident_processes where id = ?")
+        .bind(id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let resident = row_to_resident_process(row).unwrap();
+    assert_eq!(resident.id, id);
+    assert_eq!(resident.sandbox_id, sandbox.id);
+    assert_eq!(resident.generation, 1);
+    assert_eq!(
+        resident.env.get("ORB_TOKEN_FILE").map(String::as_str),
+        Some("/run/sandboxwich/bootstrap/orb-token")
+    );
 }
 
 #[test]

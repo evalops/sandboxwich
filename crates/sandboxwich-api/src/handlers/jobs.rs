@@ -191,6 +191,7 @@ pub(crate) async fn enrich_job_payload_with_provision_spec(
     match job.kind {
         JobKind::ProvisionSandbox
         | JobKind::RunCommand
+        | JobKind::RunResidentProcess
         | JobKind::RunPrompt
         | JobKind::CreateSnapshot
         | JobKind::StopSandbox
@@ -248,6 +249,9 @@ pub(crate) async fn validate_job_payload_tenant(
             let command = fetch_command(db, command_id_from_job(job)?).await?;
             ensure_sandbox_tenant(db, command.sandbox_id, ctx).await?;
         }
+        JobKind::RunResidentProcess => {
+            ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
+        }
         JobKind::MaterializeFile => {
             let sandbox = ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
             if sandbox.runtime_profile != SandboxRuntimeProfile::ApexTrustedSupervisorV1 {
@@ -304,6 +308,17 @@ pub(crate) fn file_id_from_job(job: &Job) -> Result<FileId, ApiError> {
         .ok_or_else(|| ApiError::bad_request("materialization fileId is required"))?;
     Ok(FileId(Uuid::parse_str(value).map_err(|_| {
         ApiError::bad_request("materialization fileId is invalid")
+    })?))
+}
+
+pub(crate) fn resident_process_id_from_job(job: &Job) -> Result<ResidentProcessId, ApiError> {
+    let value = job
+        .payload
+        .get("residentProcessId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ApiError::bad_request("residentProcessId is required"))?;
+    Ok(ResidentProcessId(Uuid::parse_str(value).map_err(|_| {
+        ApiError::bad_request("residentProcessId is invalid")
     })?))
 }
 
@@ -464,7 +479,7 @@ pub(crate) fn job_references(job: &Job) -> Result<JobReferences, ApiError> {
             references.sandbox_id = Some(sandbox_id_from_job(job)?);
             references.command_id = Some(command_id_from_job(job)?);
         }
-        JobKind::MaterializeFile | JobKind::ApexTaskInstructions => {
+        JobKind::RunResidentProcess | JobKind::MaterializeFile | JobKind::ApexTaskInstructions => {
             references.sandbox_id = Some(sandbox_id_from_job(job)?);
         }
         JobKind::RunPrompt => {
@@ -588,6 +603,33 @@ pub(crate) async fn try_claim_job(
                 .await?;
         }
         apply_claimed_job_on_connection(db, &mut tx, &lease.job).await?;
+        if lease.job.kind == JobKind::RunResidentProcess {
+            let sql = format!(
+                "update resident_processes
+                 set active_lease_id = {}, observed_state = 'starting', updated_at = {}
+                 where id = {} and generation = {} and desired_state = 'running'",
+                db.placeholder(1),
+                db.placeholder(2),
+                db.placeholder(3),
+                db.placeholder(4)
+            );
+            let generation = lease.job.payload["generation"]
+                .as_u64()
+                .ok_or_else(|| ApiError::bad_request("resident generation is required"))?;
+            let result = sqlx::query(&sql)
+                .bind(lease.id.to_string())
+                .bind(now.to_rfc3339())
+                .bind(resident_process_id_from_job(&lease.job)?.to_string())
+                .bind(generation as i64)
+                .execute(&mut *tx)
+                .await?;
+            if result.rows_affected() != 1 {
+                return Err(ApiError::conflict_code(
+                    "resident_process_generation_conflict",
+                    "resident process generation changed before lease claim",
+                ));
+            }
+        }
         let lease = fetch_lease_on_connection(db, &mut tx, lease.id).await?;
         Ok(Some(lease))
     };

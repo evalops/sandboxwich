@@ -53,10 +53,15 @@ pub(crate) async fn claim_lease(
     ensure_worker_scope(&ctx, worker_id)?;
     if let Some(sandbox_id) = ctx.guest_sandbox_id()
         && (request.sandbox_id != Some(sandbox_id)
-            || request.kinds.as_deref() != Some(&[JobKind::RunCommand]))
+            || request.kinds.as_deref().is_none_or(|kinds| {
+                kinds.is_empty()
+                    || kinds.iter().any(|kind| {
+                        !matches!(kind, JobKind::RunCommand | JobKind::RunResidentProcess)
+                    })
+            }))
     {
         return Err(ApiError::bad_request(
-            "guest lease claims must specify their own sandbox_id and only run_command kind",
+            "guest lease claims must specify their own sandbox_id and only guest-executable kinds",
         ));
     }
     let worker = ensure_worker_tenant(&state.db, worker_id, &ctx).await?;
@@ -154,6 +159,9 @@ pub(crate) async fn claim_lease(
         );
     if let Some(job_id) = requested_job_id {
         query.push(" and id = ").push_bind(job_id.to_string());
+    }
+    if ctx.guest_sandbox_id().is_none() {
+        query.push(" and kind != 'run_resident_process'");
     }
     // Guest-facing scoping (advisory, see the doc comment on
     // `ClaimLeaseRequest::sandbox_id`): a caller such as `sandboxwich-agent`'s
@@ -1034,6 +1042,7 @@ pub(crate) async fn complete_lease_in_transaction(
             .await?;
         let successful = match &result {
             WorkerJobResult::RunCommand { result } => result.exit_code == Some(0),
+            WorkerJobResult::RunResidentProcess { exit_code, .. } => *exit_code == Some(0),
             _ => true,
         };
         apply_completed_job_on_connection(db, &mut tx, &lease.job, result).await?;
@@ -1673,6 +1682,55 @@ pub(crate) async fn apply_completed_job_on_connection(
     result: WorkerJobResult,
 ) -> Result<(), ApiError> {
     match (&job.kind, result) {
+        (
+            JobKind::RunResidentProcess,
+            WorkerJobResult::RunResidentProcess {
+                process_id,
+                generation,
+                exit_code,
+            },
+        ) => {
+            if process_id != resident_process_id_from_job(job)?
+                || job.payload["generation"].as_u64() != Some(generation)
+            {
+                return Err(ApiError::bad_request(
+                    "resident process completion does not match job",
+                ));
+            }
+            let now = Utc::now();
+            let observed_state = if exit_code == Some(0) {
+                ResidentProcessObservedState::Stopped
+            } else {
+                ResidentProcessObservedState::Failed
+            };
+            let sql = format!(
+                "update resident_processes
+                 set observed_state = {}, exit_code = {}, exited_at = {}, updated_at = {},
+                     active_lease_id = null
+                 where id = {} and generation = {}",
+                db.placeholder(1),
+                db.placeholder(2),
+                db.placeholder(3),
+                db.placeholder(4),
+                db.placeholder(5),
+                db.placeholder(6)
+            );
+            let updated = sqlx::query(&sql)
+                .bind(observed_state.as_db_str())
+                .bind(exit_code.map(i64::from))
+                .bind(now.to_rfc3339())
+                .bind(now.to_rfc3339())
+                .bind(process_id.to_string())
+                .bind(generation as i64)
+                .execute(&mut *connection)
+                .await?;
+            if updated.rows_affected() != 1 {
+                return Err(ApiError::conflict_code(
+                    "resident_process_generation_conflict",
+                    "resident process changed before completion",
+                ));
+            }
+        }
         (JobKind::RunCommand, WorkerJobResult::RunCommand { result }) => {
             let command_id = command_id_from_job(job)?;
             let sandbox_id = sandbox_id_from_job(job)?;
@@ -2057,6 +2115,7 @@ pub(crate) async fn apply_claimed_job_on_connection(
         JobKind::ProvisionSandbox
         | JobKind::StopSandbox
         | JobKind::ResumeSandbox
+        | JobKind::RunResidentProcess
         | JobKind::MaterializeFile
         | JobKind::ApexTaskInstructions => {}
     }
@@ -2135,6 +2194,7 @@ pub(crate) async fn apply_retryable_job_on_connection(
         JobKind::ProvisionSandbox
         | JobKind::StopSandbox
         | JobKind::ResumeSandbox
+        | JobKind::RunResidentProcess
         | JobKind::MaterializeFile
         | JobKind::ApexTaskInstructions => {}
     }
@@ -2235,7 +2295,10 @@ pub(crate) async fn apply_failed_job_on_connection(
             )
             .await?;
         }
-        JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {}
+        JobKind::ProvisionSandbox
+        | JobKind::StopSandbox
+        | JobKind::ResumeSandbox
+        | JobKind::RunResidentProcess => {}
         JobKind::MaterializeFile => {
             delete_sandbox_file_if_present_on_connection(
                 db,
