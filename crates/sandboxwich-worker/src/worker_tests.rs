@@ -17,6 +17,96 @@ fn provider() -> KubernetesDryRunProvider {
     )
 }
 
+struct AttestingMaterializationProvider {
+    inner: KubernetesDryRunProvider,
+}
+
+impl SandboxProvider for AttestingMaterializationProvider {
+    fn capability_report(&self) -> sandboxwich_core::ProviderCapabilityReport {
+        self.inner.capability_report()
+    }
+
+    fn health_report(&self) -> sandboxwich_core::ProviderHealthReport {
+        self.inner.health_report()
+    }
+
+    fn provision(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<sandboxwich_core::ProviderSandboxHandle> {
+        self.inner.provision(sandbox_id, spec, cancelled)
+    }
+
+    fn exec_handoff(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxProvisionSpec,
+        request: AgentCommandRequest,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<AgentCommandResult> {
+        self.inner
+            .exec_handoff(sandbox_id, spec, request, cancelled)
+    }
+
+    fn materialize_file(
+        &self,
+        _sandbox_id: SandboxId,
+        _destination: sandboxwich_core::MaterializeFileDestination,
+        expected_sha256: &str,
+        content: &[u8],
+        _cancelled: &CancelSignal,
+    ) -> anyhow::Result<sandboxwich_core::MaterializeFileObservation> {
+        let destination_sha256 = format!("{:x}", sha2::Sha256::digest(content));
+        anyhow::ensure!(destination_sha256 == expected_sha256, "digest mismatch");
+        Ok(sandboxwich_core::MaterializeFileObservation {
+            destination_sha256,
+            size_bytes: content.len() as u64,
+        })
+    }
+
+    fn create_snapshot(
+        &self,
+        sandbox_id: SandboxId,
+        snapshot_id: SnapshotId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<sandboxwich_core::ProviderSnapshotHandle> {
+        self.inner
+            .create_snapshot(sandbox_id, snapshot_id, cancelled)
+    }
+
+    fn fork(
+        &self,
+        parent_sandbox_id: SandboxId,
+        child_sandbox_id: SandboxId,
+        snapshot_id: SnapshotId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<sandboxwich_core::ProviderForkHandle> {
+        self.inner.fork(
+            parent_sandbox_id,
+            child_sandbox_id,
+            snapshot_id,
+            spec,
+            cancelled,
+        )
+    }
+
+    fn stop(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxTeardownSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<()> {
+        self.inner.stop(sandbox_id, spec, cancelled)
+    }
+}
+
+fn attesting_materialization_provider() -> AttestingMaterializationProvider {
+    AttestingMaterializationProvider { inner: provider() }
+}
+
 fn job(kind: JobKind, payload: serde_json::Value, capability: WorkerCapability) -> Job {
     let now = Utc::now();
     Job {
@@ -399,7 +489,7 @@ fn materialization_dispatches_fetched_bytes_and_returns_only_safe_receipt() {
             WorkerCapability::MaterializeFile,
         ),
         content,
-        &provider(),
+        &attesting_materialization_provider(),
         &CancelSignal::never_cancelled(),
     )
     .expect("materialization should execute");
@@ -418,6 +508,23 @@ fn materialization_dispatches_fetched_bytes_and_returns_only_safe_receipt() {
     let serialized = serde_json::to_string(&receipt).unwrap();
     assert!(!serialized.contains("private-apex-archive"));
     assert!(!serialized.contains("transientContentBase64"));
+}
+
+#[test]
+fn dry_run_provider_cannot_produce_materialization_attestation() {
+    let content = b"private-apex-archive";
+    let digest = format!("{:x}", sha2::Sha256::digest(content));
+    let error = provider()
+        .materialize_file(
+            SandboxId::new(),
+            sandboxwich_core::MaterializeFileDestination::ApexTask,
+            &digest,
+            content,
+            &CancelSignal::never_cancelled(),
+        )
+        .expect_err("dry-run does not observe a destination");
+
+    assert!(error.to_string().contains("attestation"));
 }
 
 /// Test double whose `exec_handoff` always returns a fixed
@@ -729,6 +836,20 @@ fn default_registration_capabilities_cover_supported_worker_jobs() {
     assert!(!capabilities.contains(&WorkerCapability::SandboxedContainer));
     assert!(!capabilities.contains(&WorkerCapability::VirtualMachine));
     assert!(!capabilities.contains(&WorkerCapability::ApexTrustedSupervisorV1));
+}
+
+#[test]
+fn dry_run_registration_does_not_advertise_materialization_attestation() {
+    let capabilities = vec![
+        WorkerCapability::ProvisionSandbox,
+        WorkerCapability::MaterializeFile,
+    ];
+
+    let dry_run = capabilities_for_provider_mode(capabilities.clone(), ProviderModeArg::DryRun);
+    assert!(!dry_run.contains(&WorkerCapability::MaterializeFile));
+
+    let apply = capabilities_for_provider_mode(capabilities, ProviderModeArg::Apply);
+    assert!(apply.contains(&WorkerCapability::MaterializeFile));
 }
 
 #[test]

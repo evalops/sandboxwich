@@ -2473,6 +2473,7 @@ pub struct MaterializeFileReceipt {
     pub sha256: String,
     /// Digest observed by the provider at the selected destination after import.
     pub destination_sha256: String,
+    /// Byte count of the staged source that the provider accepted for import.
     pub size_bytes: u64,
     pub cleanup_owner: MaterializeFileCleanupOwner,
 }
@@ -2490,6 +2491,7 @@ pub enum MaterializeFileCleanupOwner {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterializeFileObservation {
     pub destination_sha256: String,
+    /// Byte count of the staged source accepted by the materialization boundary.
     pub size_bytes: u64,
 }
 

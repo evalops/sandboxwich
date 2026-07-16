@@ -58,6 +58,40 @@ fn materialization_job_input_is_ref_only_and_exact() {
     assert_eq!(traversal.status, StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn lease_completion_fingerprint_schema_is_applied() {
+    let db = test_sqlite_db().await;
+    let row = sqlx::query("select completion_fingerprint from job_leases where 1 = 0")
+        .fetch_optional(&db.pool)
+        .await
+        .expect("completion fingerprint column must be migrated");
+    assert!(row.is_none());
+}
+
+#[test]
+fn lease_completion_fingerprint_is_versioned_and_canonicalizes_object_order() {
+    let sandbox_id = SandboxId::new();
+    let result = |metadata| WorkerJobResult::ProvisionSandbox {
+        handle: ProviderSandboxHandle {
+            provider: "kubernetes".into(),
+            sandbox_id,
+            resources: Vec::new(),
+            metadata,
+        },
+    };
+    let mut first = serde_json::Map::new();
+    first.insert("zeta".into(), json!(1));
+    first.insert("alpha".into(), json!({"nested_z": 2, "nested_a": 3}));
+    let mut second = serde_json::Map::new();
+    second.insert("alpha".into(), json!({"nested_a": 3, "nested_z": 2}));
+    second.insert("zeta".into(), json!(1));
+
+    let first = completion_result_fingerprint(&result(first.into())).unwrap();
+    let second = completion_result_fingerprint(&result(second.into())).unwrap();
+    assert_eq!(first, second);
+    assert!(first.starts_with("sha256:v1:"));
+}
+
 #[test]
 fn authoritative_job_enrichment_overwrites_caller_placement_metadata() {
     let now = Utc::now();

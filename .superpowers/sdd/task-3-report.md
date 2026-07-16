@@ -91,3 +91,73 @@ The live observation depends on the pinned APEX runtime image providing
 `/usr/bin/sha256sum`. The code path is compiled and contract-tested here, but no
 authorized live Kubernetes sandbox was available for an end-to-end provider
 observation in this task.
+
+## Review-fix follow-up
+
+### RED evidence
+
+The review findings were reproduced on `developer@dev-desktop` before their
+production fixes:
+
+- `dry_run_provider_cannot_produce_materialization_attestation` failed because
+  `KubernetesDryRunProvider` returned an apparently trusted observation made by
+  hashing source bytes without writing a destination.
+- The materialization HTTP contract expected a changed post-completion digest
+  replay to be rejected, but the endpoint returned `200` before inspecting the
+  body.
+- The provider-mode capability regression initially failed to compile because
+  there was no capability filter preventing a dry-run worker from advertising
+  `materialize_file`.
+- The rollout contract expected a migrated historical completion with a null
+  fingerprint to return `409 completion_replay_unavailable`, but it returned a
+  generic `400`.
+- The deterministic fingerprint contract failed because the original digest
+  had no explicit version prefix.
+
+### Review fixes
+
+- Kubernetes dry-run materialization now fails closed and integrated `run`
+  registration removes `MaterializeFile` in dry-run mode. Trusted receipt tests
+  use an explicit test-only attesting provider.
+- Migration `20260716000100_lease_completion_fingerprints.sql` adds the nullable
+  `job_leases.completion_fingerprint` column for both SQLite and PostgreSQL.
+  Successful completion stores a `sha256:v1:` fingerprint in the same
+  transaction as the terminal lease transition and job effects.
+- Fingerprints are computed from recursively key-sorted typed JSON, making
+  structured metadata deterministic across object insertion order.
+- Identical result-body replay remains `200`. Changed destination digest,
+  `file_id`, or result kind returns `400`; an unknown cleanup owner is rejected
+  by the closed enum before dispatch.
+- Historical completed leases migrated with `NULL` have no trustworthy body to
+  compare. Replay fails closed with explicit
+  `409 completion_replay_unavailable` rather than accepting an unverifiable
+  body.
+- `MaterializeFileReceipt.size_bytes` and the provider observation now document
+  that the value is the staged source byte count accepted for import.
+- An older lifecycle test constructed fresh timestamps for its purported
+  replay. It now reuses the exact typed completion request so it tests a truly
+  identical body.
+
+### Follow-up verification
+
+Focused tests on `developer@dev-desktop` passed:
+
+- dry-run attestation rejection
+- dry-run capability suppression
+- explicit attesting-provider receipt generation
+- completion fingerprint schema migration
+- versioned, object-order-independent canonical fingerprinting
+- materialization identical/changed/legacy replay contract
+- existing SQLite lifecycle replay contract
+
+Full requested verification on the final follow-up tree passed:
+
+- `cargo test -p sandboxwich-core -p sandboxwich-api -p sandboxwich-worker`:
+  248 tests passed (58 API unit, 44 API contract, 16 core, 130 worker).
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed.
+- `cargo fmt --all -- --check`: passed.
+
+`SANDBOXWICH_TEST_POSTGRES_URL` was not configured on `dev-desktop`, so the
+PostgreSQL-conditional contract bodies were skipped. The migration uses the
+shared `ALTER TABLE ... ADD COLUMN ...` syntax and the runtime fingerprint
+queries continue to use the repository's dialect-specific placeholders.

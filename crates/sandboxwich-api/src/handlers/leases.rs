@@ -17,6 +17,7 @@ use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use sandboxwich_core::*;
 use serde_json::json;
+use sha2::Digest;
 use sqlx::AnyConnection;
 use sqlx::Row;
 use uuid::Uuid;
@@ -995,12 +996,32 @@ pub(crate) async fn complete_lease_in_transaction(
     lease_id: LeaseId,
     result: WorkerJobResult,
 ) -> Result<JobLease, ApiError> {
+    let completion_fingerprint = completion_result_fingerprint(&result)?;
     let mut tx = db.pool.begin().await?;
 
     let completed = async {
         let lease = fetch_lease_on_connection(db, &mut tx, lease_id).await?;
         if lease.status == LeaseStatus::Completed {
-            return Ok(lease);
+            let stored_fingerprint: Option<String> = sqlx::query_scalar(&format!(
+                "select completion_fingerprint from job_leases where id = {}",
+                db.placeholder(1)
+            ))
+            .bind(lease_id.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+            match stored_fingerprint.as_deref() {
+                Some(stored) if stored == completion_fingerprint => return Ok(lease),
+                None => {
+                    return Err(ApiError::conflict_code(
+                        "completion_replay_unavailable",
+                        "completed lease predates persisted completion evidence",
+                    ));
+                }
+                Some(_) => {}
+            }
+            return Err(ApiError::bad_request(
+                "lease is already completed with a different result",
+            ));
         }
         if lease.status != LeaseStatus::Active {
             return Err(ApiError::bad_request(
@@ -1009,7 +1030,8 @@ pub(crate) async fn complete_lease_in_transaction(
         }
 
         let now = Utc::now();
-        complete_active_lease_on_connection(db, &mut tx, lease_id, now).await?;
+        complete_active_lease_on_connection(db, &mut tx, lease_id, now, &completion_fingerprint)
+            .await?;
         let successful = match &result {
             WorkerJobResult::RunCommand { result } => result.exit_code == Some(0),
             _ => true,
@@ -1034,6 +1056,34 @@ pub(crate) async fn complete_lease_in_transaction(
             }
             Err(error)
         }
+    }
+}
+
+pub(crate) fn completion_result_fingerprint(result: &WorkerJobResult) -> Result<String, ApiError> {
+    let mut canonical = serde_json::to_value(result)
+        .map_err(|_| ApiError::internal("failed to encode lease completion result"))?;
+    canonicalize_json(&mut canonical);
+    let encoded = serde_json::to_vec(&canonical)
+        .map_err(|_| ApiError::internal("failed to encode lease completion result"))?;
+    Ok(format!("sha256:v1:{:x}", sha2::Sha256::digest(encoded)))
+}
+
+fn canonicalize_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut entries: Vec<_> = std::mem::take(object).into_iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (key, mut value) in entries {
+                canonicalize_json(&mut value);
+                object.insert(key, value);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                canonicalize_json(value);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1379,20 +1429,23 @@ pub(crate) async fn complete_active_lease_on_connection(
     connection: &mut AnyConnection,
     lease_id: LeaseId,
     completed_at: DateTime<Utc>,
+    completion_fingerprint: &str,
 ) -> Result<(), ApiError> {
     let sql = format!(
         "update job_leases
-         set status = {}, completed_at = {}, error = {}
+         set status = {}, completed_at = {}, error = {}, completion_fingerprint = {}
          where id = {} and status = 'active'",
         db.placeholder(1),
         db.placeholder(2),
         db.placeholder(3),
-        db.placeholder(4)
+        db.placeholder(4),
+        db.placeholder(5)
     );
     let result = sqlx::query(&sql)
         .bind(lease_status_to_str(&LeaseStatus::Completed))
         .bind(completed_at.to_rfc3339())
         .bind(Option::<String>::None)
+        .bind(completion_fingerprint)
         .bind(lease_id.to_string())
         .execute(&mut *connection)
         .await?;

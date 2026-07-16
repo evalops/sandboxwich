@@ -3884,20 +3884,14 @@ impl SandboxProvider for KubernetesDryRunProvider {
 
     fn materialize_file(
         &self,
-        _sandbox_id: SandboxId,
-        _destination: MaterializeFileDestination,
+        sandbox_id: SandboxId,
+        destination: MaterializeFileDestination,
         expected_sha256: &str,
         content: &[u8],
-        _cancelled: &CancelSignal,
+        cancelled: &CancelSignal,
     ) -> anyhow::Result<MaterializeFileObservation> {
-        anyhow::ensure!(
-            sha256_hex(content) == expected_sha256,
-            "materialization digest mismatch"
-        );
-        Ok(MaterializeFileObservation {
-            destination_sha256: sha256_hex(content),
-            size_bytes: content.len() as u64,
-        })
+        let _ = (sandbox_id, destination, expected_sha256, content, cancelled);
+        anyhow::bail!("materialization attestation is unavailable in dry-run mode")
     }
 
     fn create_snapshot(

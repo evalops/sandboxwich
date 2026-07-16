@@ -859,13 +859,16 @@ async fn main() -> anyhow::Result<()> {
                     .as_deref()
                     .is_some_and(image_is_digest_pinned);
             validate_apex_trusted_supervisor_config(&args.provider.provider)?;
-            let capabilities = capabilities_from_args(
-                args.capability,
-                isolation_profile,
-                runtime_class_name,
-                fqdn_egress_backend,
-                args.provider.provider.apex_trusted_supervisor_v1,
-            )?;
+            let capabilities = capabilities_for_provider_mode(
+                capabilities_from_args(
+                    args.capability,
+                    isolation_profile,
+                    runtime_class_name,
+                    fqdn_egress_backend,
+                    args.provider.provider.apex_trusted_supervisor_v1,
+                )?,
+                args.provider.provider_mode,
+            );
             let mut labels: BTreeMap<_, _> = args.label.into_iter().collect();
             add_placement_proof_labels(
                 &mut labels,
@@ -2524,6 +2527,16 @@ fn capabilities_from_args(
         resolved.push(WorkerCapability::ApexTaskInstructions);
     }
     Ok(resolved)
+}
+
+fn capabilities_for_provider_mode(
+    mut capabilities: Vec<WorkerCapability>,
+    provider_mode: ProviderModeArg,
+) -> Vec<WorkerCapability> {
+    if provider_mode == ProviderModeArg::DryRun {
+        capabilities.retain(|capability| *capability != WorkerCapability::MaterializeFile);
+    }
+    capabilities
 }
 
 fn validate_isolation_configuration(
