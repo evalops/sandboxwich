@@ -75,7 +75,8 @@ pub(crate) fn max_lifetime_expired(
 }
 
 /// Pure "is `idle_ttl_seconds` past due" check given an already-resolved
-/// last-activity timestamp; see [`last_known_activity`] for what feeds this.
+/// last-activity timestamp; see [`resolve_last_activity`] for what feeds
+/// this.
 pub(crate) fn idle_ttl_expired(
     last_activity_at: DateTime<Utc>,
     idle_ttl_seconds: u64,
@@ -103,49 +104,46 @@ fn reapable_states() -> Vec<&'static str> {
 
 /// Best-known "last activity" signal for idle-TTL purposes: the more recent
 /// of the sandbox's own last lifecycle-state transition (`updated_at`) and
-/// its most recently *queued* guest command (`commands.created_at`). This is
-/// a real, recorded timestamp, not a guess -- but it is not a complete
-/// activity signal. SSH sessions, desktop sessions, and resident-process
-/// output do not currently touch either column, so a sandbox used
-/// exclusively through those surfaces can still be reaped as idle. See
-/// `docs/capabilities.md` for this documented as a known limitation rather
-/// than silently overclaiming true idle detection.
-async fn last_known_activity(db: &Database, sandbox: &Sandbox) -> Result<DateTime<Utc>, ApiError> {
-    let sql = format!(
-        "select max(created_at) as last_command_at from commands where sandbox_id = {}",
-        db.placeholder(1)
-    );
-    let row = sqlx::query(&sql)
-        .bind(sandbox.id.to_string())
-        .fetch_one(&db.pool)
-        .await?;
-    let last_command_at: Option<String> = row.try_get("last_command_at")?;
-    let last_command_at = last_command_at
-        .map(|value| parse_timestamp(&value))
-        .transpose()?;
-    Ok(match last_command_at {
-        Some(value) if value > sandbox.updated_at => value,
-        _ => sandbox.updated_at,
-    })
+/// its most recently *queued* guest command (`commands.created_at`, passed
+/// in as `last_command_at` -- see [`reap_expired_active_sandboxes`], which
+/// resolves it for every candidate in the same query as the candidates
+/// themselves, rather than one `select max(created_at) ...` per sandbox).
+/// This is a real, recorded timestamp, not a guess -- but it is not a
+/// complete activity signal. SSH sessions, desktop sessions, and
+/// resident-process output do not currently touch either column, so a
+/// sandbox used exclusively through those surfaces can still be reaped as
+/// idle. See `docs/capabilities.md` for this documented as a known
+/// limitation rather than silently overclaiming true idle detection.
+fn resolve_last_activity(
+    updated_at: DateTime<Utc>,
+    last_command_at: Option<DateTime<Utc>>,
+) -> DateTime<Utc> {
+    match last_command_at {
+        Some(value) if value > updated_at => value,
+        _ => updated_at,
+    }
 }
 
-async fn expired_deadline(
-    db: &Database,
+/// Pure deadline check for one candidate, given its already-resolved
+/// `last_command_at` (see [`resolve_last_activity`]). No longer touches the
+/// database itself -- see [`reap_expired_active_sandboxes`] for why.
+fn expired_deadline(
     sandbox: &Sandbox,
+    last_command_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
-) -> Result<Option<(ReapTrigger, DateTime<Utc>)>, ApiError> {
+) -> Option<(ReapTrigger, DateTime<Utc>)> {
     if let Some(max_lifetime_seconds) = sandbox.max_lifetime_seconds
         && let Some(deadline) = max_lifetime_expired(sandbox.created_at, max_lifetime_seconds, now)
     {
-        return Ok(Some((ReapTrigger::MaxLifetime, deadline)));
+        return Some((ReapTrigger::MaxLifetime, deadline));
     }
     if let Some(idle_ttl_seconds) = sandbox.idle_ttl_seconds {
-        let last_activity_at = last_known_activity(db, sandbox).await?;
+        let last_activity_at = resolve_last_activity(sandbox.updated_at, last_command_at);
         if let Some(deadline) = idle_ttl_expired(last_activity_at, idle_ttl_seconds, now) {
-            return Ok(Some((ReapTrigger::IdleTtl, deadline)));
+            return Some((ReapTrigger::IdleTtl, deadline));
         }
     }
-    Ok(None)
+    None
 }
 
 /// Finds every reapable-state sandbox with a `max_lifetime_seconds` and/or
@@ -155,16 +153,25 @@ async fn expired_deadline(
 /// session sweeps; a per-sandbox failure is logged and skipped rather than
 /// aborting the rest of the sweep, matching how `cleanup_archived_sandboxes`
 /// treats per-row failures.
+///
+/// Resolves each candidate's most recently queued command via a correlated
+/// scalar subquery in this same `select`, instead of issuing a separate
+/// `select max(created_at) from commands where sandbox_id = ?` per
+/// candidate after the fact (see evalops/sandboxwich#173): one round trip
+/// per sweep tick regardless of how many sandboxes have `idle_ttl_seconds`
+/// configured, portable across both the SQLite and Postgres backends since
+/// a correlated scalar subquery is standard SQL on both.
 pub(crate) async fn reap_expired_active_sandboxes(
     db: &Database,
 ) -> Result<Vec<ReapedSandbox>, ApiError> {
     let reapable = reapable_states();
     let sql = format!(
-        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
-                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, parent_snapshot_id
-         from sandboxes
-         where state in ({}) and (max_lifetime_seconds is not null or idle_ttl_seconds is not null)
-         order by created_at asc, id asc",
+        "select s.id, s.tenant_id, s.name, s.state, s.template, s.memory_limit, s.network_egress_mode, s.workspace_mode, s.runtime_profile, s.execution_class,
+                s.created_at, s.updated_at, s.ttl_seconds, s.max_lifetime_seconds, s.idle_ttl_seconds, s.parent_snapshot_id,
+                (select max(c.created_at) from commands c where c.sandbox_id = s.id) as last_command_at
+         from sandboxes s
+         where s.state in ({}) and (s.max_lifetime_seconds is not null or s.idle_ttl_seconds is not null)
+         order by s.created_at asc, s.id asc",
         sql_literal_list(&reapable)
     );
     let rows = sqlx::query(&sql).fetch_all(&db.pool).await?;
@@ -172,9 +179,17 @@ pub(crate) async fn reap_expired_active_sandboxes(
     let now = Utc::now();
     let mut reaped = Vec::new();
     for row in rows {
+        // Read the joined-in column before `row_to_sandbox` consumes `row`
+        // by value; `try_get` only borrows, so this ordering is safe and
+        // `row_to_sandbox` itself doesn't need to know this extra column
+        // exists (it only looks up the specific columns it needs by name).
+        let last_command_at: Option<String> = row.try_get("last_command_at")?;
+        let last_command_at = last_command_at
+            .map(|value| parse_timestamp(&value))
+            .transpose()?;
         let mut sandbox = row_to_sandbox(row)?;
         hydrate_sandbox_network_egress(db, &mut sandbox).await?;
-        let Some((trigger, deadline)) = expired_deadline(db, &sandbox, now).await? else {
+        let Some((trigger, deadline)) = expired_deadline(&sandbox, last_command_at, now) else {
             continue;
         };
         let stop = stop_sandbox_via_job(
