@@ -19,7 +19,7 @@ jobs:
     # CPU-parallel) and container/toolchain setup (~44s, fixed regardless
     # of vCPU) dominating -- compile doesn't dominate here, so doubling
     # cores again wouldn't be expected to pay for itself.
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     services:
       postgres:
         # Pulled via the Docker Hub mirror to avoid docker.io's anonymous-pull
@@ -56,7 +56,7 @@ jobs:
             -p sandboxwich-bench
 
   clippy:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -66,7 +66,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   audit:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -80,7 +80,7 @@ jobs:
 
   msrv:
     name: msrv (1.95)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       # Cargo.toml declares `rust-version = "1.95"`; every other job floats
