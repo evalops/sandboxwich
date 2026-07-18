@@ -13,7 +13,7 @@ class DeploymentImagesTest(unittest.TestCase):
         dockerfile = (ROOT / "deploy/runtime/ubuntu-dev/Dockerfile").read_text()
         self.assertRegex(
             dockerfile,
-            r"ARG ORB_EXECUTOR_IMAGE=ghcr\.io/evalops/sandboxwich-orb-executor@sha256:[0-9a-f]{64}",
+            r"ARG ORB_EXECUTOR_IMAGE=ghcr\.io/evalops/orb-sandboxwich-runtime@sha256:[0-9a-f]{64}",
         )
         self.assertIn(
             "COPY --from=orb-executor /usr/local/bin/orb-executor /usr/local/bin/orb-executor",
