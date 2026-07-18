@@ -2566,6 +2566,41 @@ fn provision_staged_stops_before_the_next_resource_when_reporting_fails() {
 }
 
 #[test]
+fn guest_token_secret_adoption_accepts_rotated_token_but_rejects_api_url_drift() {
+    // Regression for the chaos lost-response replay: every provisioning
+    // attempt mints a fresh guest token, so a replayed provision's desired
+    // Secret can never byte-match the token the live Secret holds. Adoption
+    // must accept that rotation (presence of `api-token`, not equality) but
+    // still refuse a Secret whose `api-url` points somewhere else, and still
+    // require the token key to exist at all.
+    let sandbox_id = SandboxId::new();
+    let render = |token: &str, api: &str| {
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_guest_credentials(sandbox_id, api, token)
+            .guest_token_secret_manifest(sandbox_id)
+            .expect("credentials render a guest-token secret")
+    };
+    let api = "http://sandboxwich-api.evalops.svc.cluster.local:3217";
+    let desired = render("sbw_gtok_attempt_two", api);
+
+    let existing_with_rotated_token = render("sbw_gtok_attempt_one", api);
+    validate_adoption_contract(&desired, &existing_with_rotated_token)
+        .expect("a rotated api-token value must not block adoption");
+
+    let existing_with_hostile_api = render("sbw_gtok_attempt_one", "http://attacker.example:3217");
+    validate_adoption_contract(&desired, &existing_with_hostile_api)
+        .expect_err("an api-url pointing at a different control plane must block adoption");
+
+    let mut existing_without_token = render("sbw_gtok_attempt_one", api);
+    existing_without_token["stringData"]
+        .as_object_mut()
+        .expect("stringData object")
+        .remove("api-token");
+    validate_adoption_contract(&desired, &existing_without_token)
+        .expect_err("a guest-token Secret without an api-token key must block adoption");
+}
+
+#[test]
 fn adoption_contract_rejects_immutable_or_security_drift_for_every_resource_kind() {
     let provider = KubernetesDryRunProvider::with_snapshot_class(
         "k3s-ci",

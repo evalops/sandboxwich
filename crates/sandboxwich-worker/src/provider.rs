@@ -203,6 +203,12 @@ pub const SANDBOX_TEARDOWN_RESOURCE_KINDS: &str =
 pub const SANDBOX_RECONCILIATION_RESOURCE_KINDS: &str =
     "pod,persistentvolumeclaim,service,secret,networkpolicy";
 pub const GUEST_TOKEN_REDACTED: &str = "[redacted]";
+
+/// Name prefix for the per-sandbox guest-token Secret (see
+/// `guest_token_secret_name`). Also used by the Secret adoption contract to
+/// recognize these Secrets and exempt their per-attempt-minted `api-token`
+/// value (only) from byte equality.
+pub const GUEST_TOKEN_SECRET_NAME_PREFIX: &str = "sandboxwich-guest-token-";
 const GKE_FQDN_RESOURCE_KIND: &str = "fqdnnetworkpolicy.networking.gke.io";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1155,7 +1161,7 @@ impl KubernetesDryRunProvider {
     }
 
     fn guest_token_secret_name(&self, sandbox_id: SandboxId) -> String {
-        format!("sandboxwich-guest-token-{sandbox_id}")
+        format!("{GUEST_TOKEN_SECRET_NAME_PREFIX}{sandbox_id}")
     }
 
     fn guest_token_secret_manifest(&self, sandbox_id: SandboxId) -> Option<serde_json::Value> {
@@ -2270,6 +2276,22 @@ fn adoption_contract(resource: &Value) -> anyhow::Result<Value> {
                         json!(general_purpose::STANDARD.encode(value.as_bytes())),
                     );
                 }
+            }
+            // The guest-token Secret's `api-token` is minted fresh for every
+            // provisioning attempt, so a replayed provision (lost-response
+            // recovery) can never byte-match the token the live Secret
+            // holds. Its adoption contract is presence, not equality: the
+            // existing token is the one the running pod already mounted and
+            // it stays valid on its own expiry/revocation schedule. Every
+            // other key -- notably `api-url` -- still must match exactly,
+            // because adopting a Secret that points the guest agent at a
+            // different control plane is precisely what this check refuses.
+            if resource["metadata"]["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with(GUEST_TOKEN_SECRET_NAME_PREFIX))
+                && let Some(token) = data.get_mut("api-token")
+            {
+                *token = json!("<present>");
             }
             json!({
                 "type": resource["type"],
