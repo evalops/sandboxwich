@@ -1673,6 +1673,7 @@ pub enum WorkerCapability {
     VirtualMachine => "virtual_machine",
     RunCommand => "run_command",
     UidIsolatedResidentProcess => "uid_isolated_resident_process",
+    ProviderIsolatedResidentProcessV1 => "provider_isolated_resident_process_v1",
     MaterializeFile => "materialize_file",
     ApexTaskInstructions => "apex_task_instructions",
     AgentPrompt => "agent_prompt",

@@ -4580,7 +4580,7 @@ impl SandboxProvider for KubernetesApplyProvider {
         if self.isolated_resident_process_configured() {
             report
                 .capabilities
-                .push(WorkerCapability::UidIsolatedResidentProcess);
+                .push(WorkerCapability::ProviderIsolatedResidentProcessV1);
         }
         report
             .labels

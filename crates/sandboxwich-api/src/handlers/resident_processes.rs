@@ -1,5 +1,5 @@
 use crate::activity::bump_sandbox_activity_best_effort;
-use crate::auth::ensure_sandbox_tenant;
+use crate::auth::{ensure_resident_lease_scope, ensure_sandbox_tenant};
 use crate::db::Database;
 use crate::error::ApiError;
 use crate::handlers::jobs::{add_provision_spec_to_payload, insert_job_on_connection};
@@ -210,14 +210,29 @@ pub(crate) async fn put_resident_process(
         ));
     }
     if name == ORB_SIDECAR_RESIDENT_PROCESS_NAME {
-        let guest_health = crate::handlers::workers::fetch_guest_health(&state.db, sandbox_id)
+        let placement_sql = format!(
+            "select w.capabilities
+             from sandbox_placements p
+             join workers w on w.id = p.worker_id
+             where p.sandbox_id = {} and w.tenant_id = {}",
+            state.db.placeholder(1),
+            state.db.placeholder(2)
+        );
+        let placed_worker_supports_sidecar = sqlx::query(&placement_sql)
+            .bind(sandbox_id.to_string())
+            .bind(&sandbox.tenant_id)
+            .fetch_optional(&state.db.pool)
             .await?
-            .filter(crate::handlers::workers::guest_supports_uid_isolated_resident_process);
-        if guest_health.is_none() {
+            .and_then(|row| row.try_get::<String, _>("capabilities").ok())
+            .and_then(|raw| serde_json::from_str::<Vec<WorkerCapability>>(&raw).ok())
+            .is_some_and(|capabilities| {
+                capabilities.contains(&WorkerCapability::ProviderIsolatedResidentProcessV1)
+            });
+        if !placed_worker_supports_sidecar {
             return Err(ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
-                code: "resident_sidecar_agent_unsupported",
-                message: "orb-sidecar requires a ready guest agent advertising uid-isolated resident-process v1 support".into(),
+                code: "resident_sidecar_worker_unsupported",
+                message: "orb-sidecar requires its placed worker to advertise provider-isolated resident-process v1 support".into(),
             });
         }
     }
@@ -276,7 +291,7 @@ pub(crate) async fn put_resident_process(
             }
         }),
         required_capability: if process.name == ORB_SIDECAR_RESIDENT_PROCESS_NAME {
-            WorkerCapability::UidIsolatedResidentProcess
+            WorkerCapability::ProviderIsolatedResidentProcessV1
         } else {
             WorkerCapability::RunCommand
         },
@@ -415,18 +430,18 @@ pub(crate) async fn read_resident_process_bootstrap(
 ) -> Result<Json<ResidentProcessBootstrapReadResponse>, ApiError> {
     let process_id = ResidentProcessId(process_id);
     let process = fetch_resident_process_by_id(&state.db, process_id).await?;
-    let Principal::Guest {
-        sandbox_id,
-        worker_id: _,
-    } = ctx.principal
-    else {
+    if !matches!(
+        ctx.principal,
+        Principal::Guest { .. } | Principal::Worker(_)
+    ) {
         return Err(ApiError::unauthorized(
-            "resident bootstrap requires a guest credential",
+            "resident bootstrap requires a worker or guest credential",
         ));
-    };
-    if process.tenant_id != ctx.tenant_id || process.sandbox_id != sandbox_id {
+    }
+    if process.tenant_id != ctx.tenant_id {
         return Err(ApiError::not_found("resident process not found"));
     }
+    ensure_resident_lease_scope(&state.db, &process, LeaseId(request.lease_id), &ctx).await?;
     let consumption = state
         .resident_bootstraps
         .begin_consume(&process_id)
@@ -490,7 +505,7 @@ pub(crate) async fn read_resident_process_bootstrap(
         .bind(now.to_rfc3339())
         .bind(process_id.to_string())
         .bind(&ctx.tenant_id)
-        .bind(sandbox_id.to_string())
+        .bind(process.sandbox_id.to_string())
         .bind(request.generation as i64)
         .bind(request.lease_id.to_string())
         .bind(&request.expected_sha256)
@@ -531,8 +546,13 @@ pub(crate) async fn read_resident_process_bootstrap(
                 "resident bootstrap request does not match the active lease",
             ));
         }
-        ensure_sidecar_ready_if_required(&state.db, sandbox_id, &current.tenant_id, &current.name)
-            .await?;
+        ensure_sidecar_ready_if_required(
+            &state.db,
+            process.sandbox_id,
+            &current.tenant_id,
+            &current.name,
+        )
+        .await?;
         return Err(ApiError {
             status: StatusCode::GONE,
             code: "resident_bootstrap_unavailable",
@@ -566,18 +586,18 @@ pub(crate) async fn observe_resident_process(
     }
     let process_id = ResidentProcessId(process_id);
     let process = fetch_resident_process_by_id(&state.db, process_id).await?;
-    let Principal::Guest {
-        sandbox_id,
-        worker_id: _,
-    } = ctx.principal
-    else {
+    if !matches!(
+        ctx.principal,
+        Principal::Guest { .. } | Principal::Worker(_)
+    ) {
         return Err(ApiError::unauthorized(
-            "resident observations require a guest credential",
+            "resident observations require a worker or guest credential",
         ));
-    };
-    if process.tenant_id != ctx.tenant_id || process.sandbox_id != sandbox_id {
+    }
+    if process.tenant_id != ctx.tenant_id {
         return Err(ApiError::not_found("resident process not found"));
     }
+    ensure_resident_lease_scope(&state.db, &process, LeaseId(request.lease_id), &ctx).await?;
     if process.generation != request.generation || process.active_lease_id != Some(request.lease_id)
     {
         return Err(ApiError::conflict_code(
@@ -643,7 +663,7 @@ pub(crate) async fn observe_resident_process(
     // resident process is alive -- a real, repeating heartbeat and one of
     // the idle-TTL activity signals. Best-effort: must not fail this
     // request (the guest's ack) if the bump itself fails.
-    bump_sandbox_activity_best_effort(&state.db, sandbox_id, now).await;
+    bump_sandbox_activity_best_effort(&state.db, process.sandbox_id, now).await;
     let process = fetch_resident_process_by_id(&state.db, process_id).await?;
     Ok(Json(ResidentProcessResponse {
         ok: true,

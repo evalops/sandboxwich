@@ -12,18 +12,22 @@ use anyhow::Context;
 use base64::Engine as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use provider::{
-    CancelSignal, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES, IsolationProfile, KUBERNETES_MUTATION_ENV,
-    KubernetesApplyProvider, KubernetesDryRunProvider, ProviderError, ReconciliationLimits,
-    RetryDisposition, SandboxProvider, image_is_digest_pinned,
+    CancelSignal, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES, IsolatedResidentProcessBootstrap,
+    IsolatedResidentProcessObservation, IsolatedResidentProcessSpec, IsolatedResidentProcessState,
+    IsolationProfile, KUBERNETES_MUTATION_ENV, KubernetesApplyProvider, KubernetesDryRunProvider,
+    ProviderError, ReconciliationLimits, RetryDisposition, SandboxProvider, image_is_digest_pinned,
 };
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, ApexTaskInstructionsCallbackRequest,
     ApexTaskInstructionsCallbackResponse, ClaimLeaseRequest, ClaimLeaseResponse,
-    CompleteLeaseRequest, FailLeaseRequest, GuestTokenResponse, JobKind, LeaseResponse,
-    MintGuestTokenRequest, ProvisioningOperationResponse, ProvisioningStageUpdateRequest,
-    RegisterWorkerRequest, RenewLeaseRequest, RuntimeResourceInventoryResponse,
-    SandboxProvisionSpec, WorkerCapability, WorkerHeartbeatRequest, WorkerJobResult,
-    WorkerResponse, build_api_client, validate_agent_command_request,
+    CompleteLeaseRequest, ErrorEnvelope, FailLeaseRequest, GuestTokenResponse, JobKind,
+    LeaseResponse, MintGuestTokenRequest, ORB_SIDECAR_RESIDENT_PROCESS_NAME,
+    ProvisioningOperationResponse, ProvisioningStageUpdateRequest, RegisterWorkerRequest,
+    RenewLeaseRequest, ResidentProcessBootstrapReadRequest, ResidentProcessBootstrapReadResponse,
+    ResidentProcessId, ResidentProcessObservationRequest, ResidentProcessObservedState,
+    ResidentProcessRestartPolicy, RuntimeResourceInventoryResponse, SandboxProvisionSpec,
+    WorkerCapability, WorkerHeartbeatRequest, WorkerJobResult, WorkerResponse, build_api_client,
+    validate_agent_command_request,
 };
 use serde_json::json;
 use sha2::Digest;
@@ -405,6 +409,12 @@ struct RuntimeProviderArgs {
     )]
     max_captured_output_bytes: u64,
 
+    /// Digest-pinned image used for provider-isolated orb-sidecar pods. This
+    /// capability is advertised only by apply workers when a RuntimeClass is
+    /// also configured.
+    #[arg(long, env = "SANDBOXWICH_ISOLATED_RESIDENT_PROCESS_IMAGE")]
+    isolated_resident_process_image: Option<String>,
+
     #[arg(
         long,
         env = "SANDBOXWICH_ORPHAN_RECONCILIATION_INTERVAL_SECS",
@@ -587,6 +597,22 @@ impl SandboxProvider for RuntimeProvider {
         match self {
             Self::DryRun(provider) => provider.exec_handoff(sandbox_id, spec, request, cancelled),
             Self::Apply(provider) => provider.exec_handoff(sandbox_id, spec, request, cancelled),
+        }
+    }
+
+    fn run_isolated_resident_process(
+        &self,
+        spec: &IsolatedResidentProcessSpec,
+        cancelled: &CancelSignal,
+        observe: &mut dyn FnMut(IsolatedResidentProcessObservation) -> anyhow::Result<()>,
+    ) -> anyhow::Result<provider::IsolatedResidentProcessResult> {
+        match self {
+            Self::DryRun(provider) => {
+                provider.run_isolated_resident_process(spec, cancelled, observe)
+            }
+            Self::Apply(provider) => {
+                provider.run_isolated_resident_process(spec, cancelled, observe)
+            }
         }
     }
 
@@ -805,6 +831,7 @@ async fn main() -> anyhow::Result<()> {
                     false,
                 )?,
                 args.provider_mode,
+                false,
             );
             let mut labels: BTreeMap<_, _> = args.label.into_iter().collect();
             add_placement_proof_labels(&mut labels, args.provider_mode, None, false);
@@ -889,6 +916,11 @@ async fn main() -> anyhow::Result<()> {
                     .as_deref()
                     .is_some_and(image_is_digest_pinned);
             validate_apex_trusted_supervisor_config(&args.provider.provider)?;
+            let provider_isolated_sidecar = validate_provider_isolated_sidecar_config(
+                args.provider.provider_mode,
+                args.provider.provider.runtime_class_name.as_deref(),
+                args.provider.isolated_resident_process_image.as_deref(),
+            )?;
             let capabilities = capabilities_for_provider_mode(
                 capabilities_from_args(
                     args.capability,
@@ -898,6 +930,7 @@ async fn main() -> anyhow::Result<()> {
                     args.provider.provider.apex_trusted_supervisor_v1,
                 )?,
                 args.provider.provider_mode,
+                provider_isolated_sidecar,
             );
             let mut labels: BTreeMap<_, _> = args.label.into_iter().collect();
             add_placement_proof_labels(
@@ -970,7 +1003,8 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&response)?);
                 return Ok(());
             };
-            let response = handle_lease(&client, &api, args.worker_id, lease, provider).await?;
+            let response =
+                handle_lease(&client, &api, args.worker_id, lease, provider, None).await?;
             println!("{}", serde_json::to_string_pretty(&response)?);
         }
         Command::WorkLoop(args) => {
@@ -1145,6 +1179,12 @@ fn runtime_provider_from_args(args: RuntimeProviderArgs) -> anyhow::Result<Runti
     if matches!(args.provider_mode, ProviderModeArg::Apply) {
         require_explicit_runtime_image_for_apply(&args.provider)?;
     }
+    let isolated_resident_process_image = non_empty(args.isolated_resident_process_image.clone());
+    validate_provider_isolated_sidecar_config(
+        args.provider_mode,
+        args.provider.runtime_class_name.as_deref(),
+        isolated_resident_process_image.as_deref(),
+    )?;
     let provider = provider_from_args(args.provider)?;
     Ok(match args.provider_mode {
         ProviderModeArg::DryRun => RuntimeProvider::DryRun(provider),
@@ -1164,7 +1204,8 @@ fn runtime_provider_from_args(args: RuntimeProviderArgs) -> anyhow::Result<Runti
                     .with_kubectl_command_timeout(kubectl_command_timeout(
                         args.kubectl_command_timeout_secs,
                     ))
-                    .with_max_captured_output_bytes(args.max_captured_output_bytes),
+                    .with_max_captured_output_bytes(args.max_captured_output_bytes)
+                    .with_isolated_resident_process_image(isolated_resident_process_image),
             )
         }
     })
@@ -1180,6 +1221,29 @@ fn validate_apex_trusted_supervisor_config(args: &ProviderArgs) -> anyhow::Resul
         );
     }
     Ok(())
+}
+
+fn validate_provider_isolated_sidecar_config(
+    provider_mode: ProviderModeArg,
+    runtime_class_name: Option<&str>,
+    image: Option<&str>,
+) -> anyhow::Result<bool> {
+    let Some(image) = image.filter(|value| !value.trim().is_empty()) else {
+        return Ok(false);
+    };
+    anyhow::ensure!(
+        provider_mode == ProviderModeArg::Apply,
+        "isolated resident-process sidecars require --provider-mode apply"
+    );
+    anyhow::ensure!(
+        image_is_digest_pinned(image),
+        "isolated resident-process sidecar image must be pinned by sha256 digest"
+    );
+    anyhow::ensure!(
+        runtime_class_name.is_some_and(|name| !name.trim().is_empty()),
+        "isolated resident-process sidecars require --runtime-class-name"
+    );
+    Ok(true)
 }
 
 fn add_placement_proof_labels(
@@ -1305,6 +1369,71 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Fallback lease duration used to size the renewal interval if a lease's
 /// `expires_at`/`leased_at` pair is somehow non-positive.
 const FALLBACK_LEASE_DURATION: Duration = Duration::from_secs(30);
+const MAX_RESIDENT_PROCESS_ATTEMPTS: u32 = 3;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum LeaseCancellationReason {
+    None = 0,
+    DesiredStop = 1,
+    LeaseLost = 2,
+    Shutdown = 3,
+}
+
+#[derive(Clone)]
+struct LeaseCancellation {
+    signal: CancelSignal,
+    reason: Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl LeaseCancellation {
+    fn new() -> Self {
+        Self {
+            signal: CancelSignal::new(),
+            reason: Arc::new(std::sync::atomic::AtomicU8::new(
+                LeaseCancellationReason::None as u8,
+            )),
+        }
+    }
+
+    fn cancel(&self, reason: LeaseCancellationReason) {
+        let _ = self.reason.compare_exchange(
+            LeaseCancellationReason::None as u8,
+            reason as u8,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        self.signal.cancel();
+    }
+
+    fn reason(&self) -> LeaseCancellationReason {
+        match self.reason.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => LeaseCancellationReason::DesiredStop,
+            2 => LeaseCancellationReason::LeaseLost,
+            3 => LeaseCancellationReason::Shutdown,
+            _ => LeaseCancellationReason::None,
+        }
+    }
+}
+
+fn is_resident_desired_stop(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let Some(WorkerRequestError::Status { body, .. }) =
+            cause.downcast_ref::<WorkerRequestError>()
+        else {
+            return false;
+        };
+        serde_json::from_str::<ErrorEnvelope>(body)
+            .is_ok_and(|envelope| envelope.code == "resident_process_stopped")
+    })
+}
+
+fn is_retryable_worker_request(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<WorkerRequestError>())
+        .is_some_and(WorkerRequestError::is_recoverable)
+}
 
 /// Error from a control-plane HTTP call, distinguishing transient/recoverable
 /// failures (connection issues, timeouts, 5xx, 429) from failures that should
@@ -1603,8 +1732,31 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
     let shutdown = spawn_shutdown_listener();
     let mut iterations = 0_u64;
     let mut last_reconciliation = None;
+    let mut resident_tasks: tokio::task::JoinSet<anyhow::Result<LeaseResponse>> =
+        tokio::task::JoinSet::new();
+    let mut resident_cancellations = std::collections::HashMap::new();
+    let worker_id = args.worker_id;
 
     loop {
+        while let Some(result) = resident_tasks.try_join_next_with_id() {
+            match result {
+                Ok((task_id, Ok(response))) => {
+                    resident_cancellations.remove(&task_id);
+                    eprintln!(
+                        "worker: provider-isolated resident lease {} finished",
+                        response.lease.id
+                    );
+                }
+                Ok((task_id, Err(error))) => {
+                    resident_cancellations.remove(&task_id);
+                    eprintln!("error: provider-isolated resident lease failed: {error:#}")
+                }
+                Err(error) => {
+                    resident_cancellations.remove(&error.id());
+                    eprintln!("error: resident lease task panicked: {error}");
+                }
+            }
+        }
         if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
             eprintln!(
                 "worker: shutdown requested, exiting work loop before claiming further leases"
@@ -1721,7 +1873,35 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
         // happened, so not finishing it just delays the job until the lease
         // expires and gets reclaimed by another worker.
         let lease_id = lease.id;
-        let handle_future = handle_lease(client, api, args.worker_id, lease, provider.clone());
+        if lease.job.kind == JobKind::RunResidentProcess
+            && lease
+                .job
+                .payload
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                == Some(ORB_SIDECAR_RESIDENT_PROCESS_NAME)
+        {
+            let resident_client = client.clone();
+            let resident_api = api.to_string();
+            let resident_provider = provider.clone();
+            let resident_cancellation = LeaseCancellation::new();
+            let task_cancellation = resident_cancellation.clone();
+            let task = resident_tasks.spawn(async move {
+                handle_lease(
+                    &resident_client,
+                    &resident_api,
+                    worker_id,
+                    lease,
+                    resident_provider,
+                    Some(task_cancellation),
+                )
+                .await
+            });
+            resident_cancellations.insert(task.id(), (lease_id, resident_cancellation));
+            continue;
+        }
+        let handle_future =
+            handle_lease(client, api, args.worker_id, lease, provider.clone(), None);
         let outcome = tokio::select! {
             result = handle_future => Some(result),
             _ = drain_watchdog(shutdown.clone(), drain_timeout) => None,
@@ -1754,6 +1934,29 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
         }
     }
 
+    for (_, cancellation) in resident_cancellations.values() {
+        cancellation.cancel(LeaseCancellationReason::Shutdown);
+    }
+    let drain_residents = async {
+        while let Some(result) = resident_tasks.join_next_with_id().await {
+            match result {
+                Ok((task_id, _)) => {
+                    resident_cancellations.remove(&task_id);
+                }
+                Err(error) => {
+                    resident_cancellations.remove(&error.id());
+                    eprintln!("error: resident lease task panicked while draining: {error}");
+                }
+            }
+        }
+    };
+    if tokio::time::timeout(drain_timeout, drain_residents)
+        .await
+        .is_err()
+    {
+        eprintln!("warning: provider-isolated resident leases exceeded the drain timeout");
+    }
+
     if let Err(error) = with_retries("mark worker draining", API_RETRY_ATTEMPTS, || {
         drain_worker(client, api, args.worker_id)
     })
@@ -1770,6 +1973,7 @@ async fn handle_lease<P>(
     worker_id: Uuid,
     lease: sandboxwich_core::JobLease,
     provider: Arc<P>,
+    external_cancellation: Option<LeaseCancellation>,
 ) -> anyhow::Result<LeaseResponse>
 where
     P: SandboxProvider + GuestCredentialProvider + Send + Sync + 'static,
@@ -1790,8 +1994,10 @@ where
     // path polls it and kills its own `kubectl` invocation, so the job stops running
     // instead of continuing (and possibly being re-queued and executed a second time
     // elsewhere) against a lease this worker can no longer prove is still its own.
-    let cancelled = CancelSignal::new();
-    let renew_cancelled = cancelled.clone();
+    let cancellation = external_cancellation.unwrap_or_else(LeaseCancellation::new);
+    let cancelled = cancellation.signal.clone();
+    let renew_cancellation = cancellation.clone();
+    let resident_lease = lease.job.kind == JobKind::RunResidentProcess;
     let renew_task = tokio::spawn(async move {
         loop {
             tokio::time::sleep(renew_interval).await;
@@ -1813,7 +2019,11 @@ where
                      cancelling the running job instead of letting it keep executing against \
                      a lease we can no longer prove is still ours"
                 );
-                renew_cancelled.cancel();
+                renew_cancellation.cancel(if resident_lease && is_resident_desired_stop(&error) {
+                    LeaseCancellationReason::DesiredStop
+                } else {
+                    LeaseCancellationReason::LeaseLost
+                });
                 return;
             }
         }
@@ -1827,6 +2037,47 @@ where
                 let payload = FailLeaseRequest {
                     error: "materialization fetch failed".to_string(),
                     retry: true,
+                };
+                return with_retries("fail lease", API_RETRY_ATTEMPTS, || async {
+                    let response = client
+                        .post(format!("{api}/leases/{lease_id}/fail"))
+                        .json(&payload)
+                        .send()
+                        .await?;
+                    decode_json::<LeaseResponse>(response).await
+                })
+                .await;
+            }
+        }
+    } else {
+        None
+    };
+    let resident_bootstrap = if lease.job.kind == JobKind::RunResidentProcess {
+        match fetch_resident_bootstrap(client, api, &lease).await {
+            Ok(bootstrap) if !cancelled.is_cancelled() => Some(bootstrap),
+            Ok(_) => {
+                renew_task.abort();
+                let _ = renew_task.await;
+                let payload = FailLeaseRequest {
+                    error: "resident-process bootstrap fetch failed".to_string(),
+                    retry: true,
+                };
+                return with_retries("fail lease", API_RETRY_ATTEMPTS, || async {
+                    let response = client
+                        .post(format!("{api}/leases/{lease_id}/fail"))
+                        .json(&payload)
+                        .send()
+                        .await?;
+                    decode_json::<LeaseResponse>(response).await
+                })
+                .await;
+            }
+            Err(error) => {
+                renew_task.abort();
+                let _ = renew_task.await;
+                let payload = FailLeaseRequest {
+                    error: "resident-process bootstrap fetch failed".to_string(),
+                    retry: is_retryable_worker_request(&error),
                 };
                 return with_retries("fail lease", API_RETRY_ATTEMPTS, || async {
                     let response = client
@@ -1890,13 +2141,44 @@ where
             ))?;
             Ok(())
         };
-        execute_job_with_reporter(
-            &job,
-            materialization.as_deref(),
-            exec_provider.as_ref(),
-            &exec_cancelled,
-            &mut reporter,
-        )
+        if let Some(bootstrap) = resident_bootstrap {
+            let observer_runtime = reporter_runtime.clone();
+            let observer_client = reporter_client.clone();
+            let observer_api = reporter_api.clone();
+            let process_id = uuid_from_payload(&job.payload, "residentProcessId")?;
+            let generation = job
+                .payload
+                .get("generation")
+                .and_then(serde_json::Value::as_u64)
+                .context("resident-process generation is missing")?;
+            let mut observer = |observation: IsolatedResidentProcessObservation| {
+                observer_runtime.block_on(report_resident_observation(
+                    &observer_client,
+                    &observer_api,
+                    process_id,
+                    generation,
+                    lease_id,
+                    observation,
+                ))
+            };
+            execute_isolated_resident_process_job(
+                &job,
+                lease_id,
+                bootstrap,
+                exec_provider.as_ref(),
+                &exec_cancelled,
+                &cancellation,
+                &mut observer,
+            )
+        } else {
+            execute_job_with_reporter(
+                &job,
+                materialization.as_deref(),
+                exec_provider.as_ref(),
+                &exec_cancelled,
+                &mut reporter,
+            )
+        }
     })
     .await
     .unwrap_or_else(|join_error| {
@@ -2090,6 +2372,85 @@ async fn fetch_materialization(
         "materialization response length mismatch"
     );
     Ok(content)
+}
+
+async fn fetch_resident_bootstrap(
+    client: &reqwest::Client,
+    api: &str,
+    lease: &sandboxwich_core::JobLease,
+) -> anyhow::Result<ResidentProcessBootstrapReadResponse> {
+    let process_id = uuid_from_payload(&lease.job.payload, "residentProcessId")?;
+    let generation = lease
+        .job
+        .payload
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .context("resident-process generation is missing")?;
+    let expected_sha256 = lease
+        .job
+        .payload
+        .get("bootstrapSha256")
+        .and_then(serde_json::Value::as_str)
+        .context("resident-process bootstrap digest is missing")?
+        .to_string();
+    let request = ResidentProcessBootstrapReadRequest {
+        generation,
+        lease_id: lease.id.0,
+        expected_sha256,
+    };
+    with_retries(
+        "fetch resident-process bootstrap",
+        API_RETRY_ATTEMPTS,
+        || async {
+            let response = client
+                .post(format!("{api}/resident-processes/{process_id}/bootstrap"))
+                .json(&request)
+                .send()
+                .await?;
+            decode_json::<ResidentProcessBootstrapReadResponse>(response).await
+        },
+    )
+    .await
+}
+
+async fn report_resident_observation(
+    client: &reqwest::Client,
+    api: &str,
+    process_id: Uuid,
+    generation: u64,
+    lease_id: sandboxwich_core::LeaseId,
+    observation: IsolatedResidentProcessObservation,
+) -> anyhow::Result<()> {
+    let observed_state = match observation.state {
+        IsolatedResidentProcessState::Starting => ResidentProcessObservedState::Starting,
+        IsolatedResidentProcessState::Running => ResidentProcessObservedState::Running,
+        IsolatedResidentProcessState::Succeeded => ResidentProcessObservedState::Stopped,
+        IsolatedResidentProcessState::Failed => ResidentProcessObservedState::Failed,
+    };
+    with_retries(
+        "report resident-process observation",
+        API_RETRY_ATTEMPTS,
+        || async {
+            let response = client
+                .post(format!(
+                    "{api}/resident-processes/{process_id}/observations"
+                ))
+                .json(&ResidentProcessObservationRequest {
+                    generation,
+                    lease_id: lease_id.0,
+                    observed_state: observed_state.clone(),
+                    pid: None,
+                    exit_code: observation.exit_code,
+                    error_code: None,
+                    error_message: None,
+                })
+                .send()
+                .await?;
+            decode_json::<sandboxwich_core::ResidentProcessResponse>(response).await
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -2388,6 +2749,125 @@ fn execute_job_with_reporter(
     }
 }
 
+fn execute_isolated_resident_process_job(
+    job: &sandboxwich_core::Job,
+    lease_id: sandboxwich_core::LeaseId,
+    bootstrap: ResidentProcessBootstrapReadResponse,
+    provider: &impl SandboxProvider,
+    cancelled: &CancelSignal,
+    cancellation: &LeaseCancellation,
+    observe: &mut dyn FnMut(IsolatedResidentProcessObservation) -> anyhow::Result<()>,
+) -> anyhow::Result<WorkerJobOutcome> {
+    anyhow::ensure!(
+        job.payload.get("name").and_then(serde_json::Value::as_str)
+            == Some(ORB_SIDECAR_RESIDENT_PROCESS_NAME),
+        "only orb-sidecar may use provider-isolated resident-process execution"
+    );
+    let sandbox_id = sandbox_id_from_payload(&job.payload)?;
+    let process_id = ResidentProcessId(uuid_from_payload(&job.payload, "residentProcessId")?);
+    let generation = job
+        .payload
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .context("resident-process generation is missing")?;
+    let argv = serde_json::from_value(
+        job.payload
+            .get("argv")
+            .cloned()
+            .context("resident-process argv is missing")?,
+    )
+    .context("resident-process argv is invalid")?;
+    let cwd = serde_json::from_value(job.payload.get("cwd").cloned().unwrap_or_default())
+        .context("resident-process cwd is invalid")?;
+    let env = serde_json::from_value(
+        job.payload
+            .get("env")
+            .cloned()
+            .context("resident-process environment is missing")?,
+    )
+    .context("resident-process environment is invalid")?;
+    let restart_policy: ResidentProcessRestartPolicy = serde_json::from_value(
+        job.payload
+            .get("restartPolicy")
+            .cloned()
+            .context("resident-process restart policy is missing")?,
+    )
+    .context("resident-process restart policy is invalid")?;
+    let spec = IsolatedResidentProcessSpec {
+        sandbox_id,
+        process_id,
+        generation,
+        lease_id: lease_id.0,
+        argv,
+        cwd,
+        env,
+        bootstrap: IsolatedResidentProcessBootstrap {
+            content: bootstrap.content,
+            target_file: bootstrap.target_file,
+            mode: bootstrap.mode,
+        },
+    };
+    let max_attempts = if restart_policy == ResidentProcessRestartPolicy::OnFailure {
+        MAX_RESIDENT_PROCESS_ATTEMPTS
+    } else {
+        1
+    };
+    for attempt in 1..=max_attempts {
+        match provider.run_isolated_resident_process(&spec, cancelled, observe) {
+            Ok(result) => {
+                let exit_code = result.final_observation.exit_code;
+                if result.final_observation.state == IsolatedResidentProcessState::Failed
+                    && attempt < max_attempts
+                    && !cancelled.is_cancelled()
+                {
+                    std::thread::sleep(Duration::from_millis(250 * u64::from(attempt)));
+                    continue;
+                }
+                return Ok(WorkerJobOutcome::Complete(
+                    WorkerJobResult::RunResidentProcess {
+                        process_id,
+                        generation,
+                        exit_code,
+                    },
+                ));
+            }
+            Err(_) if cancelled.is_cancelled() => {
+                let desired_stop = cancellation.reason() == LeaseCancellationReason::DesiredStop;
+                observe(IsolatedResidentProcessObservation {
+                    state: if desired_stop {
+                        IsolatedResidentProcessState::Succeeded
+                    } else {
+                        IsolatedResidentProcessState::Failed
+                    },
+                    pod_name: format!("sandboxwich-sidecar-{process_id}"),
+                    pod_uid: None,
+                    ready: false,
+                    exit_code: None,
+                })?;
+                return Ok(if desired_stop {
+                    WorkerJobOutcome::Complete(WorkerJobResult::RunResidentProcess {
+                        process_id,
+                        generation,
+                        exit_code: None,
+                    })
+                } else {
+                    WorkerJobOutcome::Fail {
+                        error: match cancellation.reason() {
+                            LeaseCancellationReason::Shutdown => {
+                                "resident process cancelled during worker shutdown".to_string()
+                            }
+                            _ => "resident process lease renewal was lost".to_string(),
+                        },
+                        retry: true,
+                    }
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("resident-process attempt loop always returns")
+}
+
 fn parse_label(value: &str) -> Result<(String, String), String> {
     let Some((key, value)) = value.split_once('=') else {
         return Err("labels must be formatted as key=value".to_string());
@@ -2577,7 +3057,6 @@ fn capabilities_from_args(
             WorkerCapability::K8sPod,
             WorkerCapability::ProvisionSandbox,
             WorkerCapability::RunCommand,
-            WorkerCapability::UidIsolatedResidentProcess,
             WorkerCapability::MaterializeFile,
             WorkerCapability::Snapshot,
             WorkerCapability::DesktopStream,
@@ -2609,9 +3088,15 @@ fn capabilities_from_args(
 fn capabilities_for_provider_mode(
     mut capabilities: Vec<WorkerCapability>,
     provider_mode: ProviderModeArg,
+    provider_isolated_sidecar: bool,
 ) -> Vec<WorkerCapability> {
     if provider_mode == ProviderModeArg::DryRun {
         capabilities.retain(|capability| *capability != WorkerCapability::MaterializeFile);
+    }
+    capabilities
+        .retain(|capability| *capability != WorkerCapability::ProviderIsolatedResidentProcessV1);
+    if provider_isolated_sidecar {
+        capabilities.push(WorkerCapability::ProviderIsolatedResidentProcessV1);
     }
     capabilities
 }

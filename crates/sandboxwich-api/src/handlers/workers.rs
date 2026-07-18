@@ -664,12 +664,6 @@ pub(crate) async fn fetch_guest_health(
     row.map(row_to_guest_health).transpose()
 }
 
-pub(crate) fn guest_supports_uid_isolated_resident_process(health: &GuestHealth) -> bool {
-    health.status == GuestStatus::Ready
-        && GuestAgentCapabilityReport::from_health_checks(&health.checks)
-            .is_some_and(|report| report.supports_uid_isolated_resident_process())
-}
-
 pub(crate) async fn upsert_guest_health(
     db: &Database,
     guest_health: &GuestHealth,

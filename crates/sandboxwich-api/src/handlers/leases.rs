@@ -167,9 +167,6 @@ pub(crate) async fn claim_lease(
     if let Some(job_id) = requested_job_id {
         query.push(" and id = ").push_bind(job_id.to_string());
     }
-    if ctx.guest_sandbox_id().is_none() {
-        query.push(" and kind != 'run_resident_process'");
-    }
     // Sandbox/kind scoping (see the doc comment on `ClaimLeaseRequest::sandbox_id`):
     // a caller such as `sandboxwich-agent`'s daemon loop can narrow claims to the
     // sandbox and job kinds it actually handles, so a job destined for a
@@ -245,10 +242,7 @@ pub(crate) async fn claim_lease(
         {
             continue;
         }
-        if job.kind == JobKind::RunResidentProcess
-            && job.payload.get("name").and_then(serde_json::Value::as_str)
-                == Some(ORB_SIDECAR_RESIDENT_PROCESS_NAME)
-        {
+        if job.kind == JobKind::RunResidentProcess {
             let Some(sandbox_id) = job
                 .payload
                 .get("sandboxId")
@@ -257,12 +251,30 @@ pub(crate) async fn claim_lease(
             else {
                 continue;
             };
-            let supported = crate::handlers::workers::fetch_guest_health(&state.db, sandbox_id)
+            let is_sidecar = job.payload.get("name").and_then(serde_json::Value::as_str)
+                == Some(ORB_SIDECAR_RESIDENT_PROCESS_NAME);
+            if is_sidecar == ctx.guest_sandbox_id().is_some()
+                || !worker_owns_sandbox(&state.db, worker.id, sandbox_id).await?
+            {
+                continue;
+            }
+            let running_sql = format!(
+                "select 1 from resident_processes where id = {} and desired_state = 'running'",
+                state.db.placeholder(1)
+            );
+            let Some(process_id) = job
+                .payload
+                .get("residentProcessId")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            if sqlx::query(&running_sql)
+                .bind(process_id)
+                .fetch_optional(&state.db.pool)
                 .await?
-                .is_some_and(|health| {
-                    crate::handlers::workers::guest_supports_uid_isolated_resident_process(&health)
-                });
-            if !supported {
+                .is_none()
+            {
                 continue;
             }
         }
@@ -478,23 +490,62 @@ pub(crate) async fn renew_lease(
     let lease_id = LeaseId(lease_id);
     // GH-64: guest-facing route -- only the worker holding this lease may
     // renew it; tenant-wide tokens are rejected.
-    ensure_lease_worker_scope(&state.db, lease_id, &ctx).await?;
+    let lease = ensure_lease_worker_scope(&state.db, lease_id, &ctx).await?;
     let now = Utc::now();
     let expires_at =
         now + chrono::Duration::seconds(effective_lease_seconds(request.lease_seconds) as i64);
     let sql = format!(
         "update job_leases
          set expires_at = {}
-         where id = {} and status = 'active'",
+         where id = {} and status = 'active'
+           and ({} != 'run_resident_process' or exists (
+             select 1 from resident_processes rp
+             where rp.id = {} and rp.desired_state = 'running'
+           ))",
         state.db.placeholder(1),
-        state.db.placeholder(2)
+        state.db.placeholder(2),
+        state.db.placeholder(3),
+        state.db.placeholder(4)
     );
     let result = sqlx::query(&sql)
         .bind(expires_at.to_rfc3339())
         .bind(lease_id.to_string())
+        .bind(lease.job.kind.as_db_str())
+        .bind(
+            lease
+                .job
+                .payload
+                .get("residentProcessId")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+        )
         .execute(&state.db.pool)
         .await?;
     if result.rows_affected() == 0 {
+        if lease.job.kind == JobKind::RunResidentProcess {
+            let stopped_sql = format!(
+                "select 1 from resident_processes where id = {} and desired_state = 'stopped'",
+                state.db.placeholder(1)
+            );
+            if sqlx::query(&stopped_sql)
+                .bind(
+                    lease
+                        .job
+                        .payload
+                        .get("residentProcessId")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default(),
+                )
+                .fetch_optional(&state.db.pool)
+                .await?
+                .is_some()
+            {
+                return Err(ApiError::conflict_code(
+                    "resident_process_stopped",
+                    "resident process no longer desires a running lease",
+                ));
+            }
+        }
         return Err(ApiError::not_found("active lease not found"));
     }
 

@@ -107,6 +107,148 @@ fn attesting_materialization_provider() -> AttestingMaterializationProvider {
     AttestingMaterializationProvider { inner: provider() }
 }
 
+struct ResidentTestProvider {
+    inner: KubernetesDryRunProvider,
+    calls: std::sync::atomic::AtomicUsize,
+    fail_with_error: bool,
+}
+
+impl ResidentTestProvider {
+    fn terminal_failure() -> Self {
+        Self {
+            inner: provider(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_with_error: false,
+        }
+    }
+
+    fn cancelled_error() -> Self {
+        Self {
+            inner: provider(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_with_error: true,
+        }
+    }
+}
+
+impl SandboxProvider for ResidentTestProvider {
+    fn capability_report(&self) -> sandboxwich_core::ProviderCapabilityReport {
+        self.inner.capability_report()
+    }
+
+    fn health_report(&self) -> sandboxwich_core::ProviderHealthReport {
+        self.inner.health_report()
+    }
+
+    fn provision(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<sandboxwich_core::ProviderSandboxHandle> {
+        self.inner.provision(sandbox_id, spec, cancelled)
+    }
+
+    fn exec_handoff(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxProvisionSpec,
+        request: AgentCommandRequest,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<AgentCommandResult> {
+        self.inner
+            .exec_handoff(sandbox_id, spec, request, cancelled)
+    }
+
+    fn run_isolated_resident_process(
+        &self,
+        spec: &IsolatedResidentProcessSpec,
+        _cancelled: &CancelSignal,
+        observe: &mut dyn FnMut(IsolatedResidentProcessObservation) -> anyhow::Result<()>,
+    ) -> anyhow::Result<provider::IsolatedResidentProcessResult> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_with_error {
+            anyhow::bail!("injected cancellation")
+        }
+        let observation = IsolatedResidentProcessObservation {
+            state: IsolatedResidentProcessState::Failed,
+            pod_name: format!("sandboxwich-sidecar-{}", spec.process_id),
+            pod_uid: Some("test-pod-uid".to_string()),
+            ready: false,
+            exit_code: Some(1),
+        };
+        observe(observation.clone())?;
+        Ok(provider::IsolatedResidentProcessResult {
+            final_observation: observation,
+        })
+    }
+
+    fn create_snapshot(
+        &self,
+        sandbox_id: SandboxId,
+        snapshot_id: SnapshotId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<sandboxwich_core::ProviderSnapshotHandle> {
+        self.inner
+            .create_snapshot(sandbox_id, snapshot_id, cancelled)
+    }
+
+    fn fork(
+        &self,
+        parent_sandbox_id: SandboxId,
+        child_sandbox_id: SandboxId,
+        snapshot_id: SnapshotId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<sandboxwich_core::ProviderForkHandle> {
+        self.inner.fork(
+            parent_sandbox_id,
+            child_sandbox_id,
+            snapshot_id,
+            spec,
+            cancelled,
+        )
+    }
+
+    fn stop(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxTeardownSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<()> {
+        self.inner.stop(sandbox_id, spec, cancelled)
+    }
+}
+
+fn resident_job(restart_policy: ResidentProcessRestartPolicy) -> Job {
+    let sandbox_id = SandboxId::new();
+    job(
+        JobKind::RunResidentProcess,
+        json!({
+            "sandboxId": sandbox_id,
+            "residentProcessId": ResidentProcessId::new(),
+            "name": ORB_SIDECAR_RESIDENT_PROCESS_NAME,
+            "generation": 1,
+            "argv": ["/usr/local/bin/orb-sidecar"],
+            "cwd": null,
+            "env": {},
+            "restartPolicy": restart_policy,
+            "bootstrapSha256": "a".repeat(64),
+        }),
+        WorkerCapability::ProviderIsolatedResidentProcessV1,
+    )
+}
+
+fn resident_bootstrap() -> ResidentProcessBootstrapReadResponse {
+    ResidentProcessBootstrapReadResponse {
+        ok: true,
+        content: b"secret".to_vec(),
+        sha256: "a".repeat(64),
+        target_file: "/run/sandboxwich/bootstrap/token".to_string(),
+        mode: 0o400,
+    }
+}
+
 fn job(kind: JobKind, payload: serde_json::Value, capability: WorkerCapability) -> Job {
     let now = Utc::now();
     Job {
@@ -836,6 +978,8 @@ fn default_registration_capabilities_cover_supported_worker_jobs() {
     assert!(!capabilities.contains(&WorkerCapability::SandboxedContainer));
     assert!(!capabilities.contains(&WorkerCapability::VirtualMachine));
     assert!(!capabilities.contains(&WorkerCapability::ApexTrustedSupervisorV1));
+    assert!(!capabilities.contains(&WorkerCapability::UidIsolatedResidentProcess));
+    assert!(!capabilities.contains(&WorkerCapability::ProviderIsolatedResidentProcessV1));
 }
 
 #[test]
@@ -845,11 +989,149 @@ fn dry_run_registration_does_not_advertise_materialization_attestation() {
         WorkerCapability::MaterializeFile,
     ];
 
-    let dry_run = capabilities_for_provider_mode(capabilities.clone(), ProviderModeArg::DryRun);
+    let dry_run =
+        capabilities_for_provider_mode(capabilities.clone(), ProviderModeArg::DryRun, false);
     assert!(!dry_run.contains(&WorkerCapability::MaterializeFile));
 
-    let apply = capabilities_for_provider_mode(capabilities, ProviderModeArg::Apply);
+    let apply = capabilities_for_provider_mode(capabilities, ProviderModeArg::Apply, false);
     assert!(apply.contains(&WorkerCapability::MaterializeFile));
+}
+
+#[test]
+fn provider_isolated_sidecar_capability_requires_apply_digest_and_runtime_class() {
+    let digest = "registry.example/orb-sidecar@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    assert!(
+        validate_provider_isolated_sidecar_config(
+            ProviderModeArg::DryRun,
+            Some("gvisor"),
+            Some(digest),
+        )
+        .is_err()
+    );
+    assert!(
+        validate_provider_isolated_sidecar_config(
+            ProviderModeArg::Apply,
+            Some("gvisor"),
+            Some("registry.example/orb-sidecar:latest"),
+        )
+        .is_err()
+    );
+    assert!(
+        validate_provider_isolated_sidecar_config(ProviderModeArg::Apply, None, Some(digest))
+            .is_err()
+    );
+    assert!(
+        validate_provider_isolated_sidecar_config(
+            ProviderModeArg::Apply,
+            Some("gvisor"),
+            Some(digest),
+        )
+        .unwrap()
+    );
+
+    let capabilities = capabilities_for_provider_mode(
+        vec![WorkerCapability::ProvisionSandbox],
+        ProviderModeArg::Apply,
+        true,
+    );
+    assert!(capabilities.contains(&WorkerCapability::ProviderIsolatedResidentProcessV1));
+    let unconfigured = capabilities_for_provider_mode(capabilities, ProviderModeArg::Apply, false);
+    assert!(!unconfigured.contains(&WorkerCapability::ProviderIsolatedResidentProcessV1));
+}
+
+#[test]
+fn provider_isolated_sidecar_restart_policy_is_bounded_like_the_guest_supervisor() {
+    let provider = ResidentTestProvider::terminal_failure();
+    let cancellation = LeaseCancellation::new();
+    let mut observations = Vec::new();
+    let outcome = execute_isolated_resident_process_job(
+        &resident_job(ResidentProcessRestartPolicy::OnFailure),
+        sandboxwich_core::LeaseId::new(),
+        resident_bootstrap(),
+        &provider,
+        &cancellation.signal,
+        &cancellation,
+        &mut |observation| {
+            observations.push(observation);
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+        MAX_RESIDENT_PROCESS_ATTEMPTS as usize
+    );
+    assert_eq!(observations.len(), MAX_RESIDENT_PROCESS_ATTEMPTS as usize);
+    let WorkerJobResult::RunResidentProcess {
+        exit_code: Some(1), ..
+    } = completed_result(outcome)
+    else {
+        panic!("expected terminal failed resident result")
+    };
+}
+
+#[test]
+fn provider_isolated_sidecar_distinguishes_desired_stop_from_lease_loss() {
+    for (reason, expect_complete) in [
+        (LeaseCancellationReason::DesiredStop, true),
+        (LeaseCancellationReason::LeaseLost, false),
+        (LeaseCancellationReason::Shutdown, false),
+    ] {
+        let provider = ResidentTestProvider::cancelled_error();
+        let cancellation = LeaseCancellation::new();
+        cancellation.cancel(reason);
+        let mut observations = Vec::new();
+        let outcome = execute_isolated_resident_process_job(
+            &resident_job(ResidentProcessRestartPolicy::Never),
+            sandboxwich_core::LeaseId::new(),
+            resident_bootstrap(),
+            &provider,
+            &cancellation.signal,
+            &cancellation,
+            &mut |observation| {
+                observations.push(observation);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            observations.last().map(|value| value.state),
+            Some(if expect_complete {
+                IsolatedResidentProcessState::Succeeded
+            } else {
+                IsolatedResidentProcessState::Failed
+            })
+        );
+        match outcome {
+            WorkerJobOutcome::Complete(WorkerJobResult::RunResidentProcess {
+                exit_code: None,
+                ..
+            }) if expect_complete => {}
+            WorkerJobOutcome::Fail { retry: true, .. } if !expect_complete => {}
+            other => panic!("unexpected cancellation outcome for {reason:?}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn desired_stop_cancellation_uses_the_typed_api_error_code() {
+    let stopped = anyhow::Error::new(WorkerRequestError::Status {
+        status: reqwest::StatusCode::CONFLICT,
+        body: serde_json::to_string(&ErrorEnvelope {
+            ok: false,
+            code: "resident_process_stopped".to_string(),
+            message: "stopped".to_string(),
+        })
+        .unwrap(),
+    });
+    assert!(is_resident_desired_stop(&stopped));
+
+    let prose_only = anyhow::Error::new(WorkerRequestError::Status {
+        status: reqwest::StatusCode::CONFLICT,
+        body: "resident_process_stopped".to_string(),
+    });
+    assert!(!is_resident_desired_stop(&prose_only));
 }
 
 #[test]
@@ -871,6 +1153,7 @@ fn standalone_register_path_defaults_safe_and_requires_explicit_apply_for_materi
             )
             .unwrap(),
             args.provider_mode,
+            false,
         )
     };
 

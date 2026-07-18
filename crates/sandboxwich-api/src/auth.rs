@@ -327,6 +327,43 @@ pub(crate) async fn ensure_lease_worker_scope(
     Ok(lease)
 }
 
+/// Requires the caller to own the exact active lease fencing a resident
+/// process. Both worker and guest credentials are accepted, but a guest is
+/// additionally bound to its sandbox by `ensure_lease_worker_scope`.
+pub(crate) async fn ensure_resident_lease_scope(
+    db: &Database,
+    process: &ResidentProcess,
+    lease_id: LeaseId,
+    ctx: &TenantContext,
+) -> Result<JobLease, ApiError> {
+    if process.active_lease_id != Some(lease_id.0) {
+        return Err(ApiError::conflict_code(
+            "resident_process_generation_conflict",
+            "resident request does not match the active lease",
+        ));
+    }
+    let lease = ensure_lease_worker_scope(db, lease_id, ctx).await?;
+    let process_id = lease
+        .job
+        .payload
+        .get("residentProcessId")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .map(ResidentProcessId);
+    if lease.status != LeaseStatus::Active
+        || lease.expires_at <= chrono::Utc::now()
+        || lease.job.kind != JobKind::RunResidentProcess
+        || process_id != Some(process.id)
+        || !job_matches_sandbox(&lease.job, process.sandbox_id)
+        || !worker_owns_sandbox(db, lease.worker_id, process.sandbox_id).await?
+    {
+        return Err(ApiError::not_found(
+            "active resident-process lease not found",
+        ));
+    }
+    Ok(lease)
+}
+
 /// Like [`ensure_sandbox_tenant`], but additionally requires (see GH-64) that
 /// the request authenticated as the worker currently placed for
 /// `sandbox_id`.

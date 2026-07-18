@@ -124,7 +124,7 @@ fn dry_run_does_not_claim_or_execute_isolated_resident_processes() {
         !provider
             .capability_report()
             .capabilities
-            .contains(&WorkerCapability::UidIsolatedResidentProcess)
+            .contains(&WorkerCapability::ProviderIsolatedResidentProcessV1)
     );
     let error = provider
         .run_isolated_resident_process(
@@ -221,7 +221,7 @@ fn isolated_sidecar_run_observes_terminal_state_and_always_cleans_up() {
         provider
             .capability_report()
             .capabilities
-            .contains(&WorkerCapability::UidIsolatedResidentProcess)
+            .contains(&WorkerCapability::ProviderIsolatedResidentProcessV1)
     );
     let bootstrap = b"sidecar-lifecycle-canary";
     let spec = isolated_sidecar_spec(bootstrap);
