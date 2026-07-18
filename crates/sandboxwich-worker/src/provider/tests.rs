@@ -2555,6 +2555,17 @@ fn guest_token_is_mounted_as_a_file_and_redacted_from_provider_metadata() {
 }
 
 #[test]
+fn runtime_entrypoint_starts_agent_with_guest_token_file() {
+    let entrypoint =
+        include_str!("../../../../deploy/runtime/ubuntu-dev/sandboxwich-entrypoint.sh");
+
+    assert!(entrypoint.contains(
+        "[[ ! -s \"${SANDBOXWICH_GUEST_TOKEN_FILE:-}\" && ! -s \"${SANDBOXWICH_API_TOKEN_FILE:-}\" ]]"
+    ));
+    assert!(entrypoint.contains("sandboxwich-agent daemon"));
+}
+
+#[test]
 fn apply_manifests_carry_guest_token_only_in_the_secret_before_the_pod() {
     let sandbox_id = SandboxId::new();
     let dry_run =
