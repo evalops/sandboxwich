@@ -941,7 +941,30 @@ pub struct Sandbox {
     pub execution_class: ExecutionClass,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Retention window for an *already-`archived`* sandbox's record: how
+    /// long its row (and dependent rows) stay queryable after teardown before
+    /// `run_cleanup_controller` deletes them. Does **not** govern how long a
+    /// live sandbox may run -- see `max_lifetime_seconds` and
+    /// `idle_ttl_seconds` for that. The three knobs are independent and
+    /// commonly all set on the same sandbox; see `docs/capabilities.md` for
+    /// the full distinction.
     pub ttl_seconds: Option<u64>,
+    /// Hard cap on how long this sandbox may stay outside `Archived`,
+    /// measured from `created_at`. `None` (the default) means no cap. The
+    /// background expiry sweeper drives an expired sandbox through the same
+    /// `stop_sandbox` path a user-initiated stop uses once this deadline
+    /// passes, regardless of activity.
+    #[serde(default)]
+    pub max_lifetime_seconds: Option<u64>,
+    /// Rolling idle window: if no activity is observed for this many
+    /// seconds, the background expiry sweeper stops the sandbox the same way
+    /// `max_lifetime_seconds` does. `None` (the default) disables idle
+    /// reaping. "Activity" today means the more recent of this sandbox's own
+    /// last lifecycle-state transition and its most recently queued guest
+    /// command -- SSH sessions, desktop sessions, and resident-process
+    /// output do not yet reset this clock; see `docs/capabilities.md`.
+    #[serde(default)]
+    pub idle_ttl_seconds: Option<u64>,
     pub parent_snapshot_id: Option<SnapshotId>,
 }
 
@@ -955,6 +978,18 @@ pub struct CreateSandboxRequest {
     pub runtime_profile: Option<SandboxRuntimeProfile>,
     pub execution_class: Option<ExecutionClass>,
     pub ttl_seconds: Option<u64>,
+    /// See `Sandbox::max_lifetime_seconds`. Server-side default/clamp config
+    /// (`SANDBOXWICH_DEFAULT_MAX_LIFETIME_SECONDS` /
+    /// `SANDBOXWICH_MAX_MAX_LIFETIME_SECONDS`) applies when this is omitted
+    /// or exceeds the operator-configured ceiling.
+    #[serde(default)]
+    pub max_lifetime_seconds: Option<u64>,
+    /// See `Sandbox::idle_ttl_seconds`. Server-side default/clamp config
+    /// (`SANDBOXWICH_DEFAULT_IDLE_TTL_SECONDS` /
+    /// `SANDBOXWICH_MAX_IDLE_TTL_SECONDS`) applies when this is omitted or
+    /// exceeds the operator-configured ceiling.
+    #[serde(default)]
+    pub idle_ttl_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -1225,6 +1260,14 @@ pub struct ForkSnapshotRequest {
     #[serde(default)]
     pub runtime_profile: SandboxRuntimeProfile,
     pub ttl_seconds: Option<u64>,
+    /// See `Sandbox::max_lifetime_seconds`. Restoring a sandbox from a
+    /// snapshot is a sandbox-creation path like `create`/`fork`, so it goes
+    /// through the same server-side default/clamp.
+    #[serde(default)]
+    pub max_lifetime_seconds: Option<u64>,
+    /// See `Sandbox::idle_ttl_seconds`.
+    #[serde(default)]
+    pub idle_ttl_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -2304,18 +2347,34 @@ pub struct ClaimLeaseRequest {
     /// sandbox, or its fork parent/child sandbox). `None` preserves the previous
     /// behavior of claiming any job the worker's capabilities allow.
     ///
-    /// This is advisory, not a security boundary: the guest agent and the worker
-    /// it runs under share one worker-scoped token (see `sandboxwich-agent`'s
-    /// `--sandbox-id`), so a malicious or compromised guest can simply omit this
-    /// filter and claim any job the shared token's capabilities allow. The
-    /// server-side filtering below narrows the *default* blast radius of a
-    /// well-behaved agent claiming the wrong job; it does not stop an
-    /// adversarial one. A real fix needs per-sandbox claim tokens.
+    /// Whether this is a real security boundary or merely advisory depends on the
+    /// caller's credential:
+    ///
+    /// - A per-sandbox guest token (`sbw_gtok_...`, minted via the
+    ///   `/workers/{worker_id}/sandboxes/{sandbox_id}/guest-token` route, see
+    ///   `sandboxwich-agent`'s guest-token wiring) is bound server-side to exactly
+    ///   one `(worker_id, sandbox_id)`. When the caller authenticates this way, the
+    ///   API rejects (400) any claim that omits this field or sets it to a
+    ///   different sandbox, and further requires `kinds` to be exactly
+    ///   `[RunCommand]` -- this is enforced, not advisory: a compromised guest
+    ///   holding only its own guest token cannot claim, renew, complete, or fail a
+    ///   lease outside its own sandbox no matter what it puts in the request body.
+    /// - A worker-scoped token (`sbw_wtok_...`) is bound to a worker, not to any
+    ///   one sandbox, and a worker can run more than one sandbox concurrently. For
+    ///   that credential this field remains advisory only: the server-side
+    ///   filtering below narrows the *default* blast radius of a well-behaved agent
+    ///   claiming the wrong job, but a caller presenting a valid worker token can
+    ///   still omit or widen the filter and claim any job the token's capabilities
+    ///   allow. Deployments that want the enforced guarantee above must have the
+    ///   guest process use its own minted guest token rather than the shared
+    ///   worker token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_id: Option<SandboxId>,
     /// Restrict claimable jobs to one of the given kinds. `None` preserves the
     /// previous behavior of claiming any kind the worker's capabilities allow.
-    /// Same advisory caveat as `sandbox_id` above applies.
+    /// Same per-credential distinction as `sandbox_id` above applies: enforced
+    /// (and pinned to `[RunCommand]`) for guest-token callers, advisory for
+    /// worker-token callers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kinds: Option<Vec<JobKind>>,
 }

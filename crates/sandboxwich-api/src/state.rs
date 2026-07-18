@@ -232,6 +232,7 @@ pub(crate) struct AppState {
     pub(crate) apex_callback_base_url: Option<String>,
     pub(crate) apex_waiters: ApexInstructionWaiters,
     pub(crate) resident_bootstraps: ResidentBootstrapStore,
+    pub(crate) sandbox_lifetime: SandboxLifetimeConfig,
     #[cfg(test)]
     pub(crate) apex_callback_test_hook: Option<ApexCallbackTestHook>,
 }

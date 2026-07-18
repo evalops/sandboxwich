@@ -710,6 +710,8 @@ async fn run_sandbox_ttft_once(
                 workspace_mode: Some(sandboxwich_core::WorkspaceMode::GenericEphemeral),
                 runtime_profile: None,
                 ttl_seconds: Some(120),
+                max_lifetime_seconds: None,
+                idle_ttl_seconds: None,
             }),
     )
     .await?;

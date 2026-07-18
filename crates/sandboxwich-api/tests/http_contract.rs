@@ -28,6 +28,8 @@ mod limits;
 mod metrics;
 #[path = "http_contract/public_api.rs"]
 mod public_api;
+#[path = "http_contract/reap.rs"]
+mod reap;
 #[path = "http_contract/resident_processes.rs"]
 mod resident_processes;
 #[path = "http_contract/sandboxes.rs"]

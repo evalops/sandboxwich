@@ -24,6 +24,8 @@ async fn legacy_provision_fixture(name: &str) -> (TestServer, SandboxResponse, W
             workspace_mode: Some(WorkspaceMode::Persistent),
             runtime_profile: None,
             ttl_seconds: None,
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
             execution_class: None,
         })
         .send()
@@ -195,6 +197,8 @@ async fn materialization_bytes_are_worker_fenced_ref_only_and_consumed_only_when
             workspace_mode: None,
             runtime_profile: Some(SandboxRuntimeProfile::ApexTrustedSupervisorV1),
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
             execution_class: Some(ExecutionClass::SandboxedContainer),
         })
         .send()
@@ -695,6 +699,8 @@ pub(crate) async fn job_can_be_fetched_by_id_with_tenant_isolation() {
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -888,6 +894,8 @@ async fn create_sandbox(
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -1355,6 +1363,8 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await

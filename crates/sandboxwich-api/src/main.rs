@@ -9,6 +9,7 @@ mod health;
 mod idempotency;
 mod limits;
 mod pagination;
+mod reap;
 mod reconcile;
 mod request_id;
 mod routes;
@@ -108,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
             apex_callback_base_url: config.apex_callback_base_url,
             apex_waiters: Default::default(),
             resident_bootstraps: Default::default(),
+            sandbox_lifetime: config.sandbox_lifetime,
             #[cfg(test)]
             apex_callback_test_hook: None,
         }),

@@ -131,9 +131,11 @@ pub(crate) async fn ensure_database_constraints(db: &Database) -> anyhow::Result
 }
 
 pub(crate) const DB_ENUM_SCHEMA_METADATA_KEY: &str = "db_enum_constraints_fingerprint";
-// v5 adds execution-class constraints. Bumping the version forces existing
-// installations to install the new guards on upgrade.
-pub(crate) const DB_ENUM_SCHEMA_FINGERPRINT_VERSION: &str = "db-enum-v5";
+// v6 combines execution-class constraints with the
+// sandboxes.parent_snapshot_id -> snapshot_restore_sources(snapshot_id)
+// foreign key. Bumping the version forces existing installations to install
+// the new guards on upgrade.
+pub(crate) const DB_ENUM_SCHEMA_FINGERPRINT_VERSION: &str = "db-enum-v6";
 pub(crate) const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 pub(crate) const FNV_PRIME: u64 = 0x00000100000001b3;
 
@@ -150,6 +152,10 @@ pub(crate) fn db_enum_schema_fingerprint() -> String {
         }
     }
     feed_hash(&mut hash, "runtime_resources.cluster:not_empty");
+    feed_hash(
+        &mut hash,
+        "sandboxes.parent_snapshot_id:fk_snapshot_restore_sources_restrict",
+    );
     for (from, to) in sandbox_legal_transition_pairs() {
         feed_hash(&mut hash, "sandboxes.state:transition");
         feed_hash(&mut hash, from);
@@ -522,7 +528,62 @@ pub(crate) async fn ensure_postgres_constraints(db: &Database) -> anyhow::Result
         sqlx::query(&statement).execute(&db.pool).await?;
     }
 
+    for statement in postgres_sandbox_parent_snapshot_fk_statements() {
+        sqlx::query(statement).execute(&db.pool).await?;
+    }
+
     Ok(())
+}
+
+/// Foreign key enforcing that `sandboxes.parent_snapshot_id` (set when a
+/// sandbox is forked from a snapshot; see `fork_sandbox` / `fork_snapshot`)
+/// always points at a snapshot id that genuinely existed.
+///
+/// Targets `snapshot_restore_sources(snapshot_id)`, **not** `snapshots(id)`.
+/// That looks backwards at first -- `parent_snapshot_id` conceptually points
+/// at a `snapshots` row -- but `snapshots` rows are not durable: they
+/// cascade-delete along with their owning sandbox
+/// (`snapshots.sandbox_id references sandboxes(id) on delete cascade`), and
+/// this codebase deliberately allows that even while some *other* sandbox's
+/// `parent_snapshot_id` still names that snapshot id. That's the entire
+/// point of `snapshot_restore_sources` (see
+/// `20260710000200_snapshot_tenant_ownership.sql`'s doc comment): every
+/// snapshot insert writes a matching, permanent
+/// `snapshot_restore_sources(snapshot_id)` row in the same transaction
+/// (`insert_snapshot_on_connection`), and nothing in this codebase ever
+/// deletes one -- so `POST /v1/snapshots/{id}/fork`
+/// (`claim_snapshot_restore_source_on_connection`) can still restore from a
+/// snapshot id whose source sandbox, and therefore whose `snapshots` row,
+/// has already been cleaned up. A hard FK to `snapshots(id)` would reject
+/// exactly that insert (proven by
+/// `platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_correlated`,
+/// which forks from a snapshot after deleting its source sandbox and
+/// expects `202 Accepted`, not a constraint violation).
+/// `snapshot_restore_sources(snapshot_id)` is the row that's actually
+/// guaranteed to still be there.
+///
+/// `ON DELETE RESTRICT`: nothing in this codebase ever deletes a
+/// `snapshot_restore_sources` row, so this is a pure backstop -- if some
+/// future code path ever tried to, while a sandbox's `parent_snapshot_id`
+/// still named it, this turns that into a loud constraint violation instead
+/// of a silently accepted `NULL`, matching how the enum/transition
+/// constraints above are backstops for invariants the application is
+/// already supposed to enforce, not a replacement for them.
+///
+/// `NOT VALID` + a separate `VALIDATE CONSTRAINT` rather than a plain `ADD
+/// CONSTRAINT`: the preceding migration
+/// (`20260716000400_sandbox_parent_snapshot_fk.sql`) already nulls out any
+/// pre-existing orphaned values, so validation here is expected to be a
+/// formality, but `NOT VALID` still avoids holding the constraint's
+/// `ACCESS EXCLUSIVE` lock for the length of a full-table scan on Postgres.
+pub(crate) fn postgres_sandbox_parent_snapshot_fk_statements() -> [&'static str; 3] {
+    [
+        "alter table sandboxes drop constraint if exists sandboxes_parent_snapshot_id_fkey",
+        "alter table sandboxes add constraint sandboxes_parent_snapshot_id_fkey \
+         foreign key (parent_snapshot_id) references snapshot_restore_sources(snapshot_id) \
+         on delete restrict not valid",
+        "alter table sandboxes validate constraint sandboxes_parent_snapshot_id_fkey",
+    ]
 }
 
 pub(crate) fn postgres_enum_constraint_statements(column: DbEnumColumn) -> [String; 2] {
@@ -543,6 +604,8 @@ pub(crate) fn postgres_enum_constraint_statements(column: DbEnumColumn) -> [Stri
 }
 
 pub(crate) async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<()> {
+    sqlite_rebuild_sandboxes_with_parent_snapshot_fk(db).await?;
+
     for &column in db_enum_columns() {
         for statement in sqlite_enum_trigger_statements(column) {
             sqlx::query(&statement).execute(&db.pool).await?;
@@ -576,6 +639,97 @@ pub(crate) async fn ensure_sqlite_constraints(db: &Database) -> anyhow::Result<(
 
     for statement in sqlite_sandbox_transition_guard_statements() {
         sqlx::query(&statement).execute(&db.pool).await?;
+    }
+
+    Ok(())
+}
+
+/// SQLite equivalent of [`postgres_sandbox_parent_snapshot_fk_statements`]
+/// (see its doc comment for why the FK target is
+/// `snapshot_restore_sources(snapshot_id)`, not `snapshots(id)`).
+/// SQLite's `ALTER TABLE` cannot add a foreign key to an existing column, so
+/// this performs the table-rebuild procedure the SQLite docs recommend for
+/// exactly this case (<https://www.sqlite.org/lang_altertable.html#otheralter>):
+/// disable foreign key enforcement, create a replacement table with the
+/// constraint baked in, copy every row across, drop the original, rename the
+/// replacement back to `sandboxes`, and recreate its indexes. Every other
+/// table's `references sandboxes(id)` clause is untouched and keeps
+/// resolving correctly after the rename, because SQLite looks up foreign key
+/// parents by table *name* at enforcement time rather than binding to some
+/// internal table identity created with the original `CREATE TABLE`.
+///
+/// Checks for the constraint first and returns early if it is already
+/// present, so this is safe to call more than once even though
+/// `ensure_sqlite_constraints` (the only real caller) is already gated by the
+/// enum-schema fingerprint and normally only runs this once per upgrade.
+pub(crate) async fn sqlite_rebuild_sandboxes_with_parent_snapshot_fk(
+    db: &Database,
+) -> anyhow::Result<()> {
+    let existing_fks = sqlx::query("pragma foreign_key_list(sandboxes)")
+        .fetch_all(&db.pool)
+        .await?;
+    let already_has_fk = existing_fks.iter().any(|row| {
+        row.try_get::<String, _>("table").ok().as_deref() == Some("snapshot_restore_sources")
+            && row.try_get::<String, _>("from").ok().as_deref() == Some("parent_snapshot_id")
+    });
+    if already_has_fk {
+        return Ok(());
+    }
+
+    for statement in [
+        "PRAGMA foreign_keys = OFF",
+        "drop table if exists sandboxes_new",
+        "create table sandboxes_new (
+            id text primary key not null,
+            name text not null,
+            state text not null,
+            template text not null,
+            created_at text not null,
+            updated_at text not null,
+            ttl_seconds integer,
+            parent_snapshot_id text references snapshot_restore_sources(snapshot_id) on delete restrict,
+            tenant_id text not null default 'default',
+            memory_limit text not null default '1g',
+            network_egress_mode text not null default 'deny_all',
+            workspace_mode text not null default 'persistent'
+                check (workspace_mode in ('ephemeral', 'generic_ephemeral', 'persistent')),
+            execution_class text not null default 'development_container'
+                check (execution_class in ('development_container', 'sandboxed_container', 'virtual_machine')),
+            runtime_profile text not null default 'unprivileged'
+                check (runtime_profile in ('unprivileged', 'apex_trusted_supervisor_v1')),
+            max_lifetime_seconds integer,
+            idle_ttl_seconds integer
+        )",
+        "insert into sandboxes_new
+            (id, name, state, template, created_at, updated_at, ttl_seconds,
+             parent_snapshot_id, tenant_id, memory_limit, network_egress_mode, workspace_mode,
+             execution_class, runtime_profile, max_lifetime_seconds, idle_ttl_seconds)
+         select id, name, state, template, created_at, updated_at, ttl_seconds,
+                parent_snapshot_id, tenant_id, memory_limit, network_egress_mode, workspace_mode,
+                execution_class, runtime_profile, max_lifetime_seconds, idle_ttl_seconds
+         from sandboxes",
+        "drop table sandboxes",
+        "alter table sandboxes_new rename to sandboxes",
+        "create index if not exists idx_sandboxes_state on sandboxes(state)",
+        "create index if not exists idx_sandboxes_created_at on sandboxes(created_at)",
+        "create index if not exists idx_sandboxes_tenant_state on sandboxes(tenant_id, state)",
+        "create index if not exists idx_sandboxes_workspace_mode on sandboxes(workspace_mode)",
+        "create index if not exists idx_sandboxes_parent_snapshot_id on sandboxes(parent_snapshot_id)",
+        "create index if not exists idx_sandboxes_runtime_profile on sandboxes(runtime_profile)",
+        "PRAGMA foreign_keys = ON",
+    ] {
+        sqlx::query(statement).execute(&db.pool).await?;
+    }
+
+    let violations = sqlx::query("pragma foreign_key_check(sandboxes)")
+        .fetch_all(&db.pool)
+        .await?;
+    if !violations.is_empty() {
+        anyhow::bail!(
+            "sandboxes table rebuild left {} foreign key violation(s) on parent_snapshot_id; \
+             the preceding orphan-cleanup migration should have prevented this",
+            violations.len()
+        );
     }
 
     Ok(())

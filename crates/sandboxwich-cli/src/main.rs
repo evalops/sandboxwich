@@ -171,6 +171,19 @@ struct NewArgs {
     #[arg(long)]
     ttl_seconds: Option<u64>,
 
+    /// Hard cap on how long this sandbox may run before the server's
+    /// background reaper stops it, regardless of activity. Unset means no
+    /// cap unless the server has its own configured default
+    /// (SANDBOXWICH_DEFAULT_MAX_LIFETIME_SECONDS).
+    #[arg(long)]
+    max_lifetime_seconds: Option<u64>,
+
+    /// Stop this sandbox if it sees no activity for this many seconds. Unset
+    /// means no idle reaping unless the server has its own configured
+    /// default (SANDBOXWICH_DEFAULT_IDLE_TTL_SECONDS).
+    #[arg(long)]
+    idle_ttl_seconds: Option<u64>,
+
     /// Wait until the sandbox reaches Ready or Error.
     #[arg(long)]
     wait: bool,
@@ -195,6 +208,16 @@ struct ForkArgs {
 
     #[arg(long)]
     ttl_seconds: Option<u64>,
+
+    /// See `sandboxwich new --max-lifetime-seconds`. Omitted means inherit
+    /// the parent's value (subject to the server's clamp).
+    #[arg(long)]
+    max_lifetime_seconds: Option<u64>,
+
+    /// See `sandboxwich new --idle-ttl-seconds`. Omitted means inherit the
+    /// parent's value (subject to the server's clamp).
+    #[arg(long)]
+    idle_ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -482,6 +505,8 @@ async fn main() -> anyhow::Result<()> {
                     runtime_profile: None,
                     execution_class: None,
                     ttl_seconds: args.ttl_seconds,
+                    max_lifetime_seconds: args.max_lifetime_seconds,
+                    idle_ttl_seconds: args.idle_ttl_seconds,
                 })
                 .send()
                 .await?;
@@ -547,6 +572,8 @@ async fn main() -> anyhow::Result<()> {
                     runtime_profile: None,
                     execution_class: None,
                     ttl_seconds: args.ttl_seconds,
+                    max_lifetime_seconds: args.max_lifetime_seconds,
+                    idle_ttl_seconds: args.idle_ttl_seconds,
                 })
                 .send()
                 .await?;
@@ -1522,6 +1549,8 @@ mod tests {
             template: None,
             memory_limit: None,
             ttl_seconds: None,
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
             wait: false,
             wait_timeout_secs: DEFAULT_WAIT_TIMEOUT_SECS,
             network_egress: NetworkEgressArg::Allowlist,

@@ -41,6 +41,21 @@ pub(crate) struct ApiConfig {
     pub(crate) sweep_interval_ms: u64,
     pub(crate) disable_expiry_sweeper: bool,
     pub(crate) apex_callback_base_url: Option<String>,
+    pub(crate) sandbox_lifetime: SandboxLifetimeConfig,
+}
+
+/// Server-side default/ceiling for the two active-lifetime reaping knobs
+/// (`max_lifetime_seconds`, `idle_ttl_seconds`). Every field defaults to
+/// `None` (unset): with no operator configuration at all, `create`/`fork`
+/// behavior is byte-for-byte what it was before these knobs existed, and
+/// `workspace_mode: persistent` sandboxes in particular get no lifetime cap
+/// unless the operator (or the caller) explicitly opts in.
+#[derive(Clone, Default)]
+pub(crate) struct SandboxLifetimeConfig {
+    pub(crate) default_max_lifetime_seconds: Option<u64>,
+    pub(crate) max_max_lifetime_seconds: Option<u64>,
+    pub(crate) default_idle_ttl_seconds: Option<u64>,
+    pub(crate) max_idle_ttl_seconds: Option<u64>,
 }
 
 pub(crate) fn parse_apex_callback_base_url(
@@ -99,6 +114,14 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
     let disable_expiry_sweeper = parse_env_bool("SANDBOXWICH_DISABLE_EXPIRY_SWEEPER", false)?;
     let apex_callback_base_url =
         parse_apex_callback_base_url(std::env::var("SANDBOXWICH_APEX_CALLBACK_BASE_URL").ok())?;
+    let sandbox_lifetime = SandboxLifetimeConfig {
+        default_max_lifetime_seconds: parse_env_optional_u64(
+            "SANDBOXWICH_DEFAULT_MAX_LIFETIME_SECONDS",
+        )?,
+        max_max_lifetime_seconds: parse_env_optional_u64("SANDBOXWICH_MAX_MAX_LIFETIME_SECONDS")?,
+        default_idle_ttl_seconds: parse_env_optional_u64("SANDBOXWICH_DEFAULT_IDLE_TTL_SECONDS")?,
+        max_idle_ttl_seconds: parse_env_optional_u64("SANDBOXWICH_MAX_IDLE_TTL_SECONDS")?,
+    };
 
     Ok(ApiConfig {
         command,
@@ -114,6 +137,7 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
         sweep_interval_ms,
         disable_expiry_sweeper,
         apex_callback_base_url,
+        sandbox_lifetime,
     })
 }
 
@@ -150,6 +174,35 @@ pub(crate) fn parse_env_u32(name: &'static str, default: u32) -> anyhow::Result<
     }
     value
         .parse()
+        .with_context(|| format!("invalid {name} value: {value}"))
+}
+
+/// Like `parse_env_u32`, but for the optional (no forced default) active-
+/// lifetime knobs: an unset or blank env var means "not configured"
+/// (`None`), not some numeric fallback -- callers that want a default wire it
+/// in themselves (see `SandboxLifetimeConfig`).
+pub(crate) fn parse_env_optional_u64(name: &'static str) -> anyhow::Result<Option<u64>> {
+    parse_optional_u64_value(name, std::env::var(name).ok().as_deref())
+}
+
+/// The pure parsing half of `parse_env_optional_u64`, split out so it can be
+/// unit tested against plain values instead of mutating real process env vars
+/// (this workspace forbids `unsafe_code`, which `std::env::set_var` requires
+/// since edition 2024).
+pub(crate) fn parse_optional_u64_value(
+    name: &'static str,
+    value: Option<&str>,
+) -> anyhow::Result<Option<u64>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value
+        .parse()
+        .map(Some)
         .with_context(|| format!("invalid {name} value: {value}"))
 }
 
@@ -209,5 +262,20 @@ mod tests {
         ] {
             assert!(parse_apex_callback_base_url(Some(invalid.into())).is_err());
         }
+    }
+
+    #[test]
+    fn optional_u64_value_is_none_when_unset_or_blank() {
+        assert_eq!(parse_optional_u64_value("TEST", None).unwrap(), None);
+        assert_eq!(parse_optional_u64_value("TEST", Some("   ")).unwrap(), None);
+    }
+
+    #[test]
+    fn optional_u64_value_parses_a_set_value_and_rejects_garbage() {
+        assert_eq!(
+            parse_optional_u64_value("TEST", Some(" 3600 ")).unwrap(),
+            Some(3600)
+        );
+        assert!(parse_optional_u64_value("TEST", Some("not-a-number")).is_err());
     }
 }

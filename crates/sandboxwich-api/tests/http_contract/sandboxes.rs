@@ -26,6 +26,8 @@ async fn sandbox_read_reports_actual_worker_placement_proof() {
             workspace_mode: None,
             runtime_profile: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
             execution_class: None,
         })
         .send()
@@ -119,6 +121,8 @@ async fn sandbox_read_reports_actual_worker_placement_proof() {
             workspace_mode: None,
             runtime_profile: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
             execution_class: None,
         })
         .send()
@@ -179,6 +183,8 @@ async fn execution_class_defaults_persists_and_inherits_through_fork() {
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
             runtime_profile: None,
         })
         .send()
@@ -204,6 +210,8 @@ async fn execution_class_defaults_persists_and_inherits_through_fork() {
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
             runtime_profile: None,
         })
         .send()
@@ -244,6 +252,8 @@ async fn execution_class_defaults_persists_and_inherits_through_fork() {
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
             runtime_profile: None,
         })
         .send()
@@ -283,6 +293,8 @@ async fn disposable_workspace_mode_round_trips_and_rejects_durable_operations() 
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -343,6 +355,8 @@ async fn disposable_workspace_mode_round_trips_and_rejects_durable_operations() 
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -387,6 +401,8 @@ pub(crate) async fn list_sandboxes_hydrates_each_allowlist_sandboxes_own_rules()
                 }],
             }),
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -419,6 +435,8 @@ pub(crate) async fn list_sandboxes_hydrates_each_allowlist_sandboxes_own_rules()
                 ],
             }),
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -440,6 +458,8 @@ pub(crate) async fn list_sandboxes_hydrates_each_allowlist_sandboxes_own_rules()
             memory_limit: None,
             network_egress: Some(NetworkEgress::DenyAll),
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -522,6 +542,8 @@ async fn stop_before_first_provision_is_claimable_and_cannot_be_undone() {
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -693,6 +715,8 @@ pub(crate) async fn assert_resource_tiers_and_file_contracts(
                 }],
             }),
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -729,6 +753,8 @@ pub(crate) async fn assert_resource_tiers_and_file_contracts(
                 }],
             }),
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -979,6 +1005,8 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
