@@ -101,15 +101,21 @@ fn reapable_states() -> Vec<&'static str> {
         .collect()
 }
 
-/// Best-known "last activity" signal for idle-TTL purposes: the more recent
-/// of the sandbox's own last lifecycle-state transition (`updated_at`) and
-/// its most recently *queued* guest command (`commands.created_at`). This is
-/// a real, recorded timestamp, not a guess -- but it is not a complete
-/// activity signal. SSH sessions, desktop sessions, and resident-process
-/// output do not currently touch either column, so a sandbox used
-/// exclusively through those surfaces can still be reaped as idle. See
-/// `docs/capabilities.md` for this documented as a known limitation rather
-/// than silently overclaiming true idle detection.
+/// Best-known "last activity" signal for idle-TTL purposes: the most recent
+/// of --
+/// - the sandbox's own last lifecycle-state transition (`updated_at`),
+/// - its most recently *queued* guest command (`commands.created_at`), and
+/// - `sandbox.last_activity_at`, bumped (throttled -- see `activity.rs`) by
+///   SSH access, desktop access, and resident-process observation requests.
+///
+/// All three are real, recorded timestamps, not guesses; taking the maximum
+/// of whichever are present is monotonic-safe (the idle clock only ever
+/// resets forward) and degrades gracefully for a sandbox that predates the
+/// `last_activity_at` column, or that has simply never been touched through
+/// SSH/desktop/resident-process surfaces: it just doesn't contribute, and
+/// the two pre-existing signals still apply exactly as before. See
+/// `docs/capabilities.md` for the full list of what does and doesn't bump
+/// `last_activity_at` today.
 async fn last_known_activity(db: &Database, sandbox: &Sandbox) -> Result<DateTime<Utc>, ApiError> {
     let sql = format!(
         "select max(created_at) as last_command_at from commands where sandbox_id = {}",
@@ -123,10 +129,15 @@ async fn last_known_activity(db: &Database, sandbox: &Sandbox) -> Result<DateTim
     let last_command_at = last_command_at
         .map(|value| parse_timestamp(&value))
         .transpose()?;
-    Ok(match last_command_at {
-        Some(value) if value > sandbox.updated_at => value,
-        _ => sandbox.updated_at,
-    })
+    Ok([
+        Some(sandbox.updated_at),
+        last_command_at,
+        sandbox.last_activity_at,
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .expect("sandbox.updated_at is always Some, so this iterator is never empty"))
 }
 
 async fn expired_deadline(
@@ -161,7 +172,7 @@ pub(crate) async fn reap_expired_active_sandboxes(
     let reapable = reapable_states();
     let sql = format!(
         "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
-                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, parent_snapshot_id
+                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, last_activity_at, parent_snapshot_id
          from sandboxes
          where state in ({}) and (max_lifetime_seconds is not null or idle_ttl_seconds is not null)
          order by created_at asc, id asc",
