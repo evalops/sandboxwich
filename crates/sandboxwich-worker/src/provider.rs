@@ -2523,7 +2523,20 @@ impl KubernetesApplyProvider {
             ProvisioningStage::NetworkPolicyReady,
             Some(network_identity),
         ))?;
-        report(stage_update(ProvisioningStage::CredentialsReady, None))?;
+        // The pod manifest below mounts the guest-token Secret whenever guest
+        // credentials exist for this sandbox, so the Secret must be applied
+        // before the pod or the kubelet mount fails until the pod times out.
+        // The unstaged `provision` path gets this ordering from
+        // `provision_manifests`; this staged path must apply it explicitly.
+        if let Some(secret) = self.dry_run.guest_token_secret_manifest(sandbox_id) {
+            let secret_identity = self.apply_or_adopt_manifest(&secret, sandbox_id, cancelled)?;
+            report(stage_update(
+                ProvisioningStage::CredentialsReady,
+                Some(secret_identity),
+            ))?;
+        } else {
+            report(stage_update(ProvisioningStage::CredentialsReady, None))?;
+        }
 
         let pod = self.dry_run.pod_manifest(sandbox_id, spec);
         let pod_identity = self.apply_or_adopt_manifest(&pod, sandbox_id, cancelled)?;

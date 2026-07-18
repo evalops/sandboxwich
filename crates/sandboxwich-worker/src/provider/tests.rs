@@ -2402,6 +2402,77 @@ fn provision_staged_applies_resources_in_durable_order_and_reports_uids() {
 }
 
 #[test]
+fn provision_staged_applies_the_guest_token_secret_before_the_pod() {
+    // Regression: the staged provisioning path used to report
+    // CredentialsReady without applying the guest-token Secret at all, so
+    // the pod (whose spec mounts that Secret whenever guest credentials
+    // exist) sat in FailedMount until the ready-wait timed out.
+    let (kubectl, log_path) = write_stateful_fake_kubectl();
+    let sandbox_id = SandboxId::new();
+    let dry_run =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_guest_credentials(
+                sandbox_id,
+                "http://sandboxwich-api.evalops.svc.cluster.local:3217",
+                "sbw_gtok_supersecret",
+            );
+    let provider = KubernetesApplyProvider::new(dry_run, kubectl.to_string_lossy().into_owned())
+        .with_kubectl_context(Some("in-cluster".to_string()))
+        .with_mutation_gate(true, true);
+    let mut reports = Vec::new();
+
+    provider
+        .provision_staged(
+            sandbox_id,
+            &SandboxProvisionSpec::default(),
+            &CancelSignal::never_cancelled(),
+            |report| {
+                reports.push(report);
+                Ok(())
+            },
+        )
+        .expect("staged provision succeeds");
+
+    let credentials_index = reports
+        .iter()
+        .position(|report| report.stage == sandboxwich_core::ProvisioningStage::CredentialsReady)
+        .expect("CredentialsReady stage is reported");
+    assert_eq!(
+        reports[credentials_index].resource_name.as_deref(),
+        Some(format!("sandboxwich-guest-token-{sandbox_id}").as_str()),
+        "CredentialsReady must carry the applied Secret's identity"
+    );
+    let pod_index = reports
+        .iter()
+        .position(|report| report.stage == sandboxwich_core::ProvisioningStage::PodReady)
+        .expect("PodReady stage is reported");
+    assert!(
+        credentials_index < pod_index,
+        "the Secret must be applied before the pod that mounts it"
+    );
+
+    // The stateful fake kubectl records every applied manifest as a
+    // `<kind>-<name>` marker file; the Secret's marker proves the staged
+    // path actually applied it rather than only reporting the stage.
+    let secret_marker = kubectl
+        .parent()
+        .expect("fake kubectl parent")
+        .join(format!("secret-sandboxwich-guest-token-{sandbox_id}"));
+    let secret_payload =
+        std::fs::read_to_string(&secret_marker).expect("guest-token Secret was applied");
+    assert!(secret_payload.contains("sbw_gtok_supersecret"));
+
+    let log = std::fs::read_to_string(&log_path).expect("read staged kubectl log");
+    assert_eq!(
+        log.matches(" apply ").count(),
+        6,
+        "workspace, secret, policy, pod, and two services: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+#[test]
 fn provision_staged_applies_gateway_policy_and_waits_for_gateway_before_runtime() {
     let (kubectl, log_path) = write_stateful_fake_kubectl();
     let dry_run =
