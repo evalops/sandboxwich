@@ -6,6 +6,7 @@ use crate::handlers::files::*;
 use crate::handlers::jobs::*;
 use crate::handlers::sandboxes::*;
 use crate::handlers::snapshots::*;
+use crate::handlers::workers::fetch_guest_health;
 use crate::reconcile::*;
 use crate::rows::*;
 use crate::state::*;
@@ -38,6 +39,11 @@ fn worker_supports_execution_class(worker: &Worker, execution_class: &ExecutionC
         || worker
             .capabilities
             .contains(&execution_capability(execution_class))
+}
+
+fn guest_supports_uid_isolated_resident_process(checks: &serde_json::Value) -> bool {
+    GuestAgentCapabilityReport::from_health_checks(checks)
+        .is_some_and(|report| report.supports_uid_isolated_resident_process())
 }
 
 pub(crate) async fn claim_lease(
@@ -107,6 +113,14 @@ pub(crate) async fn claim_lease(
             lease: Some(lease),
         }));
     }
+    let guest_has_uid_isolated_resident_process = if let Some(sandbox_id) = ctx.guest_sandbox_id() {
+        fetch_guest_health(&state.db, sandbox_id)
+            .await?
+            .as_ref()
+            .is_some_and(|health| guest_supports_uid_isolated_resident_process(&health.checks))
+    } else {
+        true
+    };
     let now = Utc::now();
     let capabilities = worker
         .capabilities
@@ -256,6 +270,9 @@ pub(crate) async fn claim_lease(
             if is_sidecar == ctx.guest_sandbox_id().is_some()
                 || !worker_owns_sandbox(&state.db, worker.id, sandbox_id).await?
             {
+                continue;
+            }
+            if !guest_has_uid_isolated_resident_process {
                 continue;
             }
             let running_sql = format!(
@@ -2409,4 +2426,67 @@ pub(crate) async fn apply_failed_job_on_connection(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::guest_supports_uid_isolated_resident_process;
+    use sandboxwich_core::{
+        GUEST_AGENT_CAPABILITY_PROTOCOL_VERSION, UID_ISOLATED_RESIDENT_PROCESS_CAPABILITY_VERSION,
+    };
+
+    fn checks(protocol_version: u32, status: &str, capability_version: u32) -> serde_json::Value {
+        serde_json::json!({
+            "agentCapabilities": {
+                "protocolVersion": protocol_version,
+                "capabilities": {
+                    "uidIsolatedResidentProcess": {
+                        "status": status,
+                        "version": capability_version
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn guest_resident_process_dispatch_accepts_only_the_exact_available_contract() {
+        assert!(guest_supports_uid_isolated_resident_process(&checks(
+            GUEST_AGENT_CAPABILITY_PROTOCOL_VERSION,
+            "ok",
+            UID_ISOLATED_RESIDENT_PROCESS_CAPABILITY_VERSION,
+        )));
+
+        for denied in [
+            serde_json::json!({}),
+            serde_json::json!({"agentCapabilities": "malformed"}),
+            checks(
+                GUEST_AGENT_CAPABILITY_PROTOCOL_VERSION,
+                "unavailable",
+                UID_ISOLATED_RESIDENT_PROCESS_CAPABILITY_VERSION,
+            ),
+            checks(
+                GUEST_AGENT_CAPABILITY_PROTOCOL_VERSION - 1,
+                "ok",
+                UID_ISOLATED_RESIDENT_PROCESS_CAPABILITY_VERSION,
+            ),
+            checks(
+                GUEST_AGENT_CAPABILITY_PROTOCOL_VERSION + 1,
+                "ok",
+                UID_ISOLATED_RESIDENT_PROCESS_CAPABILITY_VERSION,
+            ),
+            checks(
+                GUEST_AGENT_CAPABILITY_PROTOCOL_VERSION,
+                "ok",
+                UID_ISOLATED_RESIDENT_PROCESS_CAPABILITY_VERSION - 1,
+            ),
+            checks(
+                GUEST_AGENT_CAPABILITY_PROTOCOL_VERSION,
+                "ok",
+                UID_ISOLATED_RESIDENT_PROCESS_CAPABILITY_VERSION + 1,
+            ),
+        ] {
+            assert!(!guest_supports_uid_isolated_resident_process(&denied));
+        }
+    }
 }

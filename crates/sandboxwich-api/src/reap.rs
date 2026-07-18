@@ -16,6 +16,7 @@ use crate::db::*;
 use crate::error::*;
 use crate::handlers::sandboxes::*;
 use crate::rows::*;
+use crate::state::ResidentBootstrapStore;
 use chrono::{DateTime, Utc};
 use sandboxwich_core::*;
 use serde_json::json;
@@ -196,6 +197,7 @@ pub(crate) enum CandidateOutcome {
 /// [`reap_expired_active_sandboxes`]) rather than per-row here.
 pub(crate) async fn attempt_reap_candidate(
     db: &Database,
+    resident_bootstraps: &ResidentBootstrapStore,
     mut sandbox: Sandbox,
     last_command_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
@@ -206,6 +208,7 @@ pub(crate) async fn attempt_reap_candidate(
     };
     let stop = stop_sandbox_via_job(
         db,
+        resident_bootstraps,
         &sandbox,
         json!({
             "state": SandboxState::Archiving,
@@ -272,6 +275,7 @@ pub(crate) async fn attempt_reap_candidate(
 /// a correlated scalar subquery is standard SQL on both.
 pub(crate) async fn reap_expired_active_sandboxes(
     db: &Database,
+    resident_bootstraps: &ResidentBootstrapStore,
 ) -> Result<Vec<ReapedSandbox>, ApiError> {
     let reapable = reapable_states();
     let sql = format!(
@@ -298,7 +302,7 @@ pub(crate) async fn reap_expired_active_sandboxes(
             .transpose()?;
         let sandbox = row_to_sandbox(row)?;
         if let CandidateOutcome::Reaped(reaped_sandbox) =
-            attempt_reap_candidate(db, sandbox, last_command_at, now).await?
+            attempt_reap_candidate(db, resident_bootstraps, sandbox, last_command_at, now).await?
         {
             reaped.push(*reaped_sandbox);
         }

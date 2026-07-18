@@ -460,6 +460,7 @@ pub(crate) async fn get_sandbox_observed_state(
 /// belongs to the requesting tenant before this runs.
 pub(crate) async fn stop_sandbox_via_job(
     db: &Database,
+    resident_bootstraps: &ResidentBootstrapStore,
     sandbox: &Sandbox,
     lifecycle_event_data: serde_json::Value,
 ) -> Result<Option<Job>, ApiError> {
@@ -510,15 +511,80 @@ pub(crate) async fn stop_sandbox_via_job(
         tx.rollback().await?;
         return Ok(None);
     }
+    let resident_bootstraps_sql = format!(
+        "select id, generation, bootstrap_sha256,
+                bootstrap_delivered_generation, bootstrap_delivered_lease_id,
+                bootstrap_delivered_sha256
+         from resident_processes
+         where sandbox_id = {} and tenant_id = {}
+           and bootstrap_sha256 is not null",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    let resident_bootstrap_identities = sqlx::query(&resident_bootstraps_sql)
+        .bind(sandbox_id.to_string())
+        .bind(&sandbox.tenant_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|row| {
+            let id: String = row.try_get("id")?;
+            let generation: i64 = row.try_get("generation")?;
+            let sha256: String = row.try_get("bootstrap_sha256")?;
+            let delivered_generation: Option<i64> =
+                row.try_get("bootstrap_delivered_generation")?;
+            let delivered_lease_id: Option<String> = row.try_get("bootstrap_delivered_lease_id")?;
+            let delivered_sha256: Option<String> = row.try_get("bootstrap_delivered_sha256")?;
+            let fence = match (delivered_generation, delivered_lease_id, delivered_sha256) {
+                (Some(generation), Some(lease_id), Some(sha256)) => Some(ResidentBootstrapFence {
+                    generation: u64::try_from(generation).map_err(|_| {
+                        ApiError::internal(
+                            "database contains invalid delivered bootstrap generation",
+                        )
+                    })?,
+                    lease_id: Uuid::parse_str(&lease_id).map_err(|_| {
+                        ApiError::internal("database contains invalid delivered bootstrap lease")
+                    })?,
+                    sha256,
+                }),
+                (None, None, None) => None,
+                _ => {
+                    return Err(ApiError::internal(
+                        "database contains incomplete delivered bootstrap fence",
+                    ));
+                }
+            };
+            Ok::<_, ApiError>((
+                ResidentProcessId(Uuid::parse_str(&id).map_err(|_| {
+                    ApiError::internal("database contains invalid resident process id")
+                })?),
+                u64::try_from(generation).map_err(|_| {
+                    ApiError::internal("database contains invalid resident generation")
+                })?,
+                sha256,
+                fence,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let stop_residents_sql = format!(
         "update resident_processes
-         set desired_state = 'stopped', updated_at = {}
+         set desired_state = 'stopped',
+             bootstrap_acknowledged_at = case
+               when bootstrap_delivered_generation is not null
+                and bootstrap_delivered_lease_id is not null
+                and bootstrap_delivered_sha256 is not null
+               then coalesce(bootstrap_acknowledged_at, {})
+               else bootstrap_acknowledged_at
+             end,
+             updated_at = {}
          where sandbox_id = {} and tenant_id = {} and desired_state = 'running'",
         db.placeholder(1),
         db.placeholder(2),
-        db.placeholder(3)
+        db.placeholder(3),
+        db.placeholder(4)
     );
     sqlx::query(&stop_residents_sql)
+        .bind(now.to_rfc3339())
         .bind(now.to_rfc3339())
         .bind(sandbox_id.to_string())
         .bind(&sandbox.tenant_id)
@@ -539,6 +605,9 @@ pub(crate) async fn stop_sandbox_via_job(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    for (process_id, generation, sha256, fence) in resident_bootstrap_identities {
+        resident_bootstraps.reclaim(&process_id, generation, &sha256, fence.as_ref());
+    }
     Ok(Some(job))
 }
 
@@ -552,6 +621,7 @@ pub(crate) async fn stop_sandbox(
     let now = Utc::now();
     let Some(job) = stop_sandbox_via_job(
         &state.db,
+        &state.resident_bootstraps,
         &sandbox,
         json!({"state": SandboxState::Archiving, "reason": "stop_requested"}),
     )

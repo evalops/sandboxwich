@@ -1114,6 +1114,94 @@ fn provider_isolated_sidecar_distinguishes_desired_stop_from_lease_loss() {
     }
 }
 
+#[tokio::test]
+async fn panicked_resident_task_stops_renewal_and_reconciles_the_exact_lease() {
+    let lease_id = sandboxwich_core::LeaseId::new();
+    let process_id = Uuid::new_v4();
+    let generation = 7;
+    let cancellation = LeaseCancellation::new();
+    let metadata = ResidentTaskMetadata {
+        lease_id,
+        process_id,
+        generation,
+        cancellation: cancellation.clone(),
+    };
+    let renewals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let renewal_started = Arc::new(tokio::sync::Notify::new());
+    let mut tasks = tokio::task::JoinSet::new();
+    let task = tasks.spawn({
+        let renewals = renewals.clone();
+        let renewal_started = renewal_started.clone();
+        async move {
+            let renewal_notifier = renewal_started.clone();
+            let _renewal = AbortOnDropTask::new(tokio::spawn(async move {
+                loop {
+                    renewals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    renewal_notifier.notify_one();
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }));
+            renewal_started.notified().await;
+            panic!("injected resident supervisor panic");
+        }
+    });
+    let mut metadata_by_task = std::collections::HashMap::from([(task.id(), metadata)]);
+
+    let join_error = tasks
+        .join_next_with_id()
+        .await
+        .expect("resident task should finish")
+        .expect_err("injected panic should reach the supervisor");
+    let exact_metadata = metadata_by_task
+        .remove(&join_error.id())
+        .expect("panic must retain its exact lease metadata");
+    let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let failures = Arc::new(std::sync::Mutex::new(Vec::new()));
+    reconcile_panicked_resident_task_with(
+        exact_metadata,
+        {
+            let observations = observations.clone();
+            move |process_id, generation, lease_id, state| async move {
+                observations
+                    .lock()
+                    .unwrap()
+                    .push((process_id, generation, lease_id, state));
+                Ok(())
+            }
+        },
+        {
+            let failures = failures.clone();
+            move |lease_id, retry| async move {
+                failures.lock().unwrap().push((lease_id, retry));
+                Ok(())
+            }
+        },
+    )
+    .await;
+
+    assert!(cancellation.signal.is_cancelled());
+    assert_eq!(cancellation.reason(), LeaseCancellationReason::LeaseLost);
+    assert_eq!(
+        *observations.lock().unwrap(),
+        vec![(
+            process_id,
+            generation,
+            lease_id,
+            ResidentProcessObservedState::Lost
+        )]
+    );
+    assert_eq!(*failures.lock().unwrap(), vec![(lease_id, true)]);
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let renewals_after_abort = renewals.load(std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        renewals.load(std::sync::atomic::Ordering::SeqCst),
+        renewals_after_abort,
+        "dropping the panicked task must abort its detached renewal loop"
+    );
+}
+
 #[test]
 fn desired_stop_cancellation_uses_the_typed_api_error_code() {
     let stopped = anyhow::Error::new(WorkerRequestError::Status {

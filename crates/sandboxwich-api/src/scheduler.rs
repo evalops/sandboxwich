@@ -6,6 +6,7 @@ use crate::handlers::workers::*;
 use crate::idempotency::expire_idempotency_records;
 use crate::limits::expire_tenant_limit_counters;
 use crate::reap::reap_expired_active_sandboxes;
+use crate::state::ResidentBootstrapStore;
 use std::time::Duration;
 
 /// Runs the lease/snapshot/desktop-session expiry sweeps on a fixed interval in
@@ -27,6 +28,7 @@ use std::time::Duration;
 /// already behave when disabled.
 pub(crate) fn spawn_expiry_sweeper(
     db: Database,
+    resident_bootstraps: ResidentBootstrapStore,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -54,7 +56,7 @@ pub(crate) fn spawn_expiry_sweeper(
             if let Err(error) = expire_tenant_limit_counters(&db).await {
                 tracing::warn!(?error, "tenant limit counter retention sweep failed");
             }
-            match reap_expired_active_sandboxes(&db).await {
+            match reap_expired_active_sandboxes(&db, &resident_bootstraps).await {
                 Ok(reaped) => {
                     for reaped in &reaped {
                         tracing::info!(

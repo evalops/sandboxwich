@@ -2,7 +2,7 @@ use crate::activity::bump_sandbox_activity_best_effort;
 use crate::auth::{ensure_resident_lease_scope, ensure_sandbox_tenant};
 use crate::db::Database;
 use crate::error::ApiError;
-use crate::handlers::commands::insert_event;
+use crate::handlers::commands::{insert_event, insert_event_on_connection};
 use crate::handlers::jobs::{add_provision_spec_to_payload, insert_job_on_connection};
 use crate::rows::{parse_timestamp, row_to_resident_process};
 use crate::state::{
@@ -48,20 +48,41 @@ async fn block_executor_bootstrap(
     reason: SidecarBootstrapBlockReason,
     message: String,
 ) -> Result<(), ApiError> {
-    if let Err(error) = insert_event(
-        db,
-        sidecar.sandbox_id,
-        SandboxEventKind::SidecarBootstrapBlocked,
-        json!({
-            "reason": reason.as_str(),
-            "processName": ORB_SIDECAR_RESIDENT_PROCESS_NAME,
-            "generation": sidecar.generation,
-        }),
-    )
-    .await
-    {
+    let telemetry_result = async {
+        let mut tx = db.pool.begin().await?;
+        insert_event_on_connection(
+            db,
+            &mut tx,
+            sidecar.sandbox_id,
+            SandboxEventKind::SidecarBootstrapBlocked,
+            json!({
+                "reason": reason.as_str(),
+                "processName": ORB_SIDECAR_RESIDENT_PROCESS_NAME,
+                "generation": sidecar.generation,
+            }),
+        )
+        .await?;
+        let sql = format!(
+            "insert into sidecar_bootstrap_block_rollups (tenant_id, reason, total)
+             values ({})
+             on conflict (tenant_id, reason) do update
+             set total = sidecar_bootstrap_block_rollups.total + 1",
+            db.placeholders(3)
+        );
+        sqlx::query(&sql)
+            .bind(&sidecar.tenant_id)
+            .bind(reason.as_str())
+            .bind(1_i64)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok::<(), ApiError>(())
+    }
+    .await;
+    if let Err(error) = telemetry_result {
         // Telemetry cannot weaken the fail-closed boundary: preserve the
-        // original 503 even when the durable event sink is unavailable.
+        // original 503. The transaction also ensures an event and its
+        // durable metric increment either both persist or both roll back.
         tracing::warn!(
             ?error,
             reason = reason.as_str(),
@@ -110,6 +131,64 @@ async fn fetch_resident_process_by_id(
         .await?
         .ok_or_else(|| ApiError::not_found("resident process not found"))?;
     row_to_resident_process(row)
+}
+
+fn ensure_resident_owner_role(
+    process: &ResidentProcess,
+    ctx: &TenantContext,
+) -> Result<(), ApiError> {
+    let owns_role = match (&process.name, ctx.principal) {
+        (name, Principal::Worker(_)) if name == ORB_SIDECAR_RESIDENT_PROCESS_NAME => true,
+        (name, Principal::Guest { sandbox_id, .. })
+            if name == ORB_EXECUTOR_RESIDENT_PROCESS_NAME && sandbox_id == process.sandbox_id =>
+        {
+            true
+        }
+        _ => false,
+    };
+    if !owns_role {
+        return Err(ApiError::unauthorized(
+            "resident process credential does not own this process role",
+        ));
+    }
+    Ok(())
+}
+
+async fn delivered_bootstrap_fence(
+    db: &Database,
+    process_id: ResidentProcessId,
+) -> Result<Option<ResidentBootstrapFence>, ApiError> {
+    let sql = format!(
+        "select bootstrap_delivered_generation, bootstrap_delivered_lease_id,
+                bootstrap_delivered_sha256
+         from resident_processes where id = {}",
+        db.placeholder(1)
+    );
+    let Some(row) = sqlx::query(&sql)
+        .bind(process_id.to_string())
+        .fetch_optional(&db.pool)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let generation = row.try_get::<Option<i64>, _>("bootstrap_delivered_generation")?;
+    let lease_id = row.try_get::<Option<String>, _>("bootstrap_delivered_lease_id")?;
+    let sha256 = row.try_get::<Option<String>, _>("bootstrap_delivered_sha256")?;
+    match (generation, lease_id, sha256) {
+        (Some(generation), Some(lease_id), Some(sha256)) => Ok(Some(ResidentBootstrapFence {
+            generation: u64::try_from(generation).map_err(|_| {
+                ApiError::internal("database contains invalid delivered bootstrap generation")
+            })?,
+            lease_id: Uuid::parse_str(&lease_id).map_err(|_| {
+                ApiError::internal("database contains invalid delivered bootstrap lease")
+            })?,
+            sha256,
+        })),
+        (None, None, None) => Ok(None),
+        _ => Err(ApiError::internal(
+            "database contains incomplete delivered bootstrap fence",
+        )),
+    }
 }
 
 /// Fail-closed gate for issue #176's "sidecar placement primitive": if this
@@ -481,19 +560,40 @@ pub(crate) async fn stop_resident_process(
     let sandbox_id = SandboxId(sandbox_id);
     ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
     let process = fetch_named_resident_process(&state.db, sandbox_id, &name).await?;
+    let delivered_fence = delivered_bootstrap_fence(&state.db, process.id).await?;
+    let now = Utc::now();
     let sql = format!(
-        "update resident_processes set desired_state = 'stopped', updated_at = {}
+        "update resident_processes
+         set desired_state = 'stopped',
+             bootstrap_acknowledged_at = case
+               when bootstrap_delivered_generation is not null
+                and bootstrap_delivered_lease_id is not null
+                and bootstrap_delivered_sha256 is not null
+               then coalesce(bootstrap_acknowledged_at, {})
+               else bootstrap_acknowledged_at
+             end,
+             updated_at = {}
          where id = {} and tenant_id = {}",
         state.db.placeholder(1),
         state.db.placeholder(2),
-        state.db.placeholder(3)
+        state.db.placeholder(3),
+        state.db.placeholder(4)
     );
     sqlx::query(&sql)
-        .bind(Utc::now().to_rfc3339())
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
         .bind(process.id.to_string())
         .bind(&ctx.tenant_id)
         .execute(&state.db.pool)
         .await?;
+    if let Some(sha256) = process.bootstrap_sha256.as_deref() {
+        state.resident_bootstraps.reclaim(
+            &process.id,
+            process.generation,
+            sha256,
+            delivered_fence.as_ref(),
+        );
+    }
     get_resident_process(State(state), Extension(ctx), Path((sandbox_id.0, name))).await
 }
 
@@ -505,17 +605,10 @@ pub(crate) async fn read_resident_process_bootstrap(
 ) -> Result<Json<ResidentProcessBootstrapReadResponse>, ApiError> {
     let process_id = ResidentProcessId(process_id);
     let process = fetch_resident_process_by_id(&state.db, process_id).await?;
-    if !matches!(
-        ctx.principal,
-        Principal::Guest { .. } | Principal::Worker(_)
-    ) {
-        return Err(ApiError::unauthorized(
-            "resident bootstrap requires a worker or guest credential",
-        ));
-    }
     if process.tenant_id != ctx.tenant_id {
         return Err(ApiError::not_found("resident process not found"));
     }
+    ensure_resident_owner_role(&process, &ctx)?;
     ensure_resident_lease_scope(&state.db, &process, LeaseId(request.lease_id), &ctx).await?;
     let fence = ResidentBootstrapFence {
         generation: request.generation,
@@ -726,17 +819,10 @@ pub(crate) async fn observe_resident_process(
     }
     let process_id = ResidentProcessId(process_id);
     let process = fetch_resident_process_by_id(&state.db, process_id).await?;
-    if !matches!(
-        ctx.principal,
-        Principal::Guest { .. } | Principal::Worker(_)
-    ) {
-        return Err(ApiError::unauthorized(
-            "resident observations require a worker or guest credential",
-        ));
-    }
     if process.tenant_id != ctx.tenant_id {
         return Err(ApiError::not_found("resident process not found"));
     }
+    ensure_resident_owner_role(&process, &ctx)?;
     ensure_resident_lease_scope(&state.db, &process, LeaseId(request.lease_id), &ctx).await?;
     if process.generation != request.generation || process.active_lease_id != Some(request.lease_id)
     {
@@ -768,7 +854,7 @@ pub(crate) async fn observe_resident_process(
     let sql = format!(
         "update resident_processes
          set bootstrap_acknowledged_at = case
-               when {} = 'starting'
+               when {} in ('starting', 'running', 'failed', 'stopped', 'lost')
                 and bootstrap_consumed_at is not null
                 and bootstrap_delivered_generation = {}
                 and bootstrap_delivered_lease_id = {}
@@ -844,9 +930,33 @@ pub(crate) async fn observe_resident_process(
             "failed to persist resident terminal failure event"
         );
     }
-    if request.observed_state == ResidentProcessObservedState::Starting
-        && let Some(sha256) = process.bootstrap_sha256.as_ref()
+    if matches!(
+        request.observed_state,
+        ResidentProcessObservedState::Starting
+            | ResidentProcessObservedState::Running
+            | ResidentProcessObservedState::Failed
+            | ResidentProcessObservedState::Stopped
+            | ResidentProcessObservedState::Lost
+    ) && let Some(sha256) = process.bootstrap_sha256.as_ref()
     {
+        let fence = ResidentBootstrapFence {
+            generation: request.generation,
+            lease_id: request.lease_id,
+            sha256: sha256.clone(),
+        };
+        if matches!(
+            request.observed_state,
+            ResidentProcessObservedState::Failed
+                | ResidentProcessObservedState::Stopped
+                | ResidentProcessObservedState::Lost
+        ) {
+            state.resident_bootstraps.reclaim(
+                &process_id,
+                request.generation,
+                sha256,
+                Some(&fence),
+            );
+        }
         let ack_sql = format!(
             "select bootstrap_acknowledged_at from resident_processes where id = {}",
             state.db.placeholder(1)
@@ -862,14 +972,7 @@ pub(crate) async fn observe_resident_process(
             .flatten()
             .is_some();
         if acknowledged {
-            state.resident_bootstraps.acknowledge(
-                &process_id,
-                &ResidentBootstrapFence {
-                    generation: request.generation,
-                    lease_id: request.lease_id,
-                    sha256: sha256.clone(),
-                },
-            );
+            state.resident_bootstraps.acknowledge(&process_id, &fence);
         }
     }
     // The guest reports observations periodically for as long as the

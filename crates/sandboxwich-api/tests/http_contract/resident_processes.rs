@@ -386,6 +386,24 @@ pub(crate) async fn resident_process_create_is_idempotent_tenant_scoped_and_reda
         })
         .build()
         .unwrap();
+    guest_client
+        .post(format!(
+            "{}/sandboxes/{}/guest-health",
+            server.base_url, created.sandbox.id
+        ))
+        .json(&UpdateGuestHealthRequest {
+            status: GuestStatus::Ready,
+            agent_version: Some("sandboxwich-agent/test".into()),
+            checks: Some(serde_json::json!({
+                (GUEST_AGENT_CAPABILITY_REPORT_CHECK): GuestAgentCapabilityReport::current()
+            })),
+            message: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
     let claimed: ClaimLeaseResponse = guest_client
         .post(format!(
             "{}/workers/{}/leases/claim",
@@ -669,8 +687,8 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
     let executor_created: ResidentProcessResponse =
         serde_json::from_str(&executor_create_body).unwrap();
 
-    // 4. A downgraded/old guest agent may still claim orb-executor, but it
-    // cannot claim orb-sidecar and silently run it without uid isolation.
+    // 4. A downgraded/old guest agent cannot claim orb-executor: dispatch
+    // fails closed until the guest posts the exact current typed report.
     guest_client
         .post(format!(
             "{}/sandboxes/{sandbox_id}/guest-health",
@@ -717,6 +735,43 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
         .await
         .unwrap();
     assert!(worker_cannot_claim_executor.lease.is_none());
+    let unsupported_executor_claim: ClaimLeaseResponse = guest_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox_id),
+            kinds: Some(vec![JobKind::RunResidentProcess]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(unsupported_executor_claim.lease.is_none());
+    guest_client
+        .post(format!(
+            "{}/sandboxes/{sandbox_id}/guest-health",
+            server.base_url
+        ))
+        .json(&UpdateGuestHealthRequest {
+            status: GuestStatus::Ready,
+            agent_version: Some("sandboxwich-agent/current".into()),
+            checks: Some(serde_json::json!({
+                (GUEST_AGENT_CAPABILITY_REPORT_CHECK): GuestAgentCapabilityReport::current()
+            })),
+            message: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
     let executor_lease =
         claim_resident_process_lease(&server, &worker, &guest_client, sandbox_id).await;
     assert_eq!(
@@ -755,6 +810,51 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
         WorkerCapability::RunCommand
     );
 
+    let sidecar_bootstrap_request = ResidentProcessBootstrapReadRequest {
+        generation: sidecar_created.resident_process.generation,
+        lease_id: sidecar_lease.id.0,
+        expected_sha256: sidecar_created
+            .resident_process
+            .bootstrap_sha256
+            .clone()
+            .unwrap(),
+    };
+    let sidecar_starting = ResidentProcessObservationRequest {
+        generation: sidecar_created.resident_process.generation,
+        lease_id: sidecar_lease.id.0,
+        observed_state: ResidentProcessObservedState::Starting,
+        pid: None,
+        exit_code: None,
+        error_code: None,
+        error_message: None,
+    };
+    for response in [
+        guest_client
+            .post(format!(
+                "{}/resident-processes/{}/bootstrap",
+                server.base_url, sidecar_created.resident_process.id
+            ))
+            .json(&sidecar_bootstrap_request)
+            .send()
+            .await
+            .unwrap(),
+        guest_client
+            .post(format!(
+                "{}/resident-processes/{}/observations",
+                server.base_url, sidecar_created.resident_process.id
+            ))
+            .json(&sidecar_starting)
+            .send()
+            .await
+            .unwrap(),
+    ] {
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "a sandbox guest must not act as the authoritative sidecar worker"
+        );
+    }
+
     let executor_bootstrap_request = ResidentProcessBootstrapReadRequest {
         generation: executor_created.resident_process.generation,
         lease_id: executor_lease.id.0,
@@ -764,6 +864,41 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
             .clone()
             .unwrap(),
     };
+    let executor_starting = ResidentProcessObservationRequest {
+        generation: executor_created.resident_process.generation,
+        lease_id: executor_lease.id.0,
+        observed_state: ResidentProcessObservedState::Starting,
+        pid: None,
+        exit_code: None,
+        error_code: None,
+        error_message: None,
+    };
+    for response in [
+        sidecar_worker_client
+            .post(format!(
+                "{}/resident-processes/{}/bootstrap",
+                server.base_url, executor_created.resident_process.id
+            ))
+            .json(&executor_bootstrap_request)
+            .send()
+            .await
+            .unwrap(),
+        sidecar_worker_client
+            .post(format!(
+                "{}/resident-processes/{}/observations",
+                server.base_url, executor_created.resident_process.id
+            ))
+            .json(&executor_starting)
+            .send()
+            .await
+            .unwrap(),
+    ] {
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "the authoritative worker must not act as the sandbox-bound executor guest"
+        );
+    }
 
     // 5. Fail-closed: the sidecar has been claimed but never reported
     // Running, so orb-executor's one-read bootstrap credential must be
@@ -1220,7 +1355,7 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
 }
 
 #[tokio::test]
-async fn bootstrap_delivery_retries_a_lost_response_until_starting_acknowledges_it() {
+async fn bootstrap_delivery_handles_starting_before_delivery_and_first_running_ack() {
     let data_dir = tempfile::tempdir().unwrap();
     let server = TestServer::start(
         format!(
@@ -1261,6 +1396,26 @@ async fn bootstrap_delivery_retries_a_lost_response_until_starting_acknowledges_
         "{}/resident-processes/{}/bootstrap",
         server.base_url, created.resident_process.id
     );
+
+    guest_client
+        .post(format!(
+            "{}/resident-processes/{}/observations",
+            server.base_url, created.resident_process.id
+        ))
+        .json(&ResidentProcessObservationRequest {
+            generation: request.generation,
+            lease_id: request.lease_id,
+            observed_state: ResidentProcessObservedState::Starting,
+            pid: Some(90),
+            exit_code: None,
+            error_code: None,
+            error_message: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
 
     let mut wrong_hash = request.clone();
     wrong_hash.expected_sha256 = "0".repeat(64);
@@ -1354,7 +1509,7 @@ async fn bootstrap_delivery_retries_a_lost_response_until_starting_acknowledges_
         .json(&ResidentProcessObservationRequest {
             generation: request.generation,
             lease_id: request.lease_id,
-            observed_state: ResidentProcessObservedState::Starting,
+            observed_state: ResidentProcessObservedState::Running,
             pid: Some(91),
             exit_code: None,
             error_code: None,
@@ -1375,6 +1530,138 @@ async fn bootstrap_delivery_retries_a_lost_response_until_starting_acknowledges_
             .unwrap()
             .status(),
         reqwest::StatusCode::GONE,
-        "Starting must permanently acknowledge the delivered bootstrap"
+        "a first Running observation must permanently acknowledge the delivered bootstrap"
     );
+}
+
+#[tokio::test]
+async fn terminal_and_tenant_stop_paths_reclaim_exact_bootstrap_entries() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir
+                .path()
+                .join("resident-bootstrap-reclaim.db")
+                .display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+
+    for (name, deliver_first, action) in [
+        ("terminal-ready", false, "terminal"),
+        ("terminal-delivered", true, "terminal"),
+        ("resident-stop-ready", false, "resident-stop"),
+        ("sandbox-stop-ready", false, "sandbox-stop"),
+    ] {
+        let (sandbox_id, worker, guest_client) =
+            provisioned_sandbox_with_guest(&server, name, false).await;
+        let created: ResidentProcessResponse = server
+            .client()
+            .put(format!(
+                "{}/sandboxes/{sandbox_id}/resident-processes/orb-executor",
+                server.base_url
+            ))
+            .json(&resident_process_request(
+                "/usr/local/bin/orb-executor",
+                name.as_bytes(),
+                "/run/sandboxwich/bootstrap/orb-token",
+            ))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let lease = claim_resident_process_lease(&server, &worker, &guest_client, sandbox_id).await;
+        let request = ResidentProcessBootstrapReadRequest {
+            generation: created.resident_process.generation,
+            lease_id: lease.id.0,
+            expected_sha256: created.resident_process.bootstrap_sha256.clone().unwrap(),
+        };
+        let bootstrap_url = format!(
+            "{}/resident-processes/{}/bootstrap",
+            server.base_url, created.resident_process.id
+        );
+        if deliver_first {
+            guest_client
+                .post(&bootstrap_url)
+                .json(&request)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+        }
+
+        match action {
+            "terminal" => {
+                guest_client
+                    .post(format!(
+                        "{}/resident-processes/{}/observations",
+                        server.base_url, created.resident_process.id
+                    ))
+                    .json(&ResidentProcessObservationRequest {
+                        generation: request.generation,
+                        lease_id: request.lease_id,
+                        observed_state: ResidentProcessObservedState::Failed,
+                        pid: None,
+                        exit_code: Some(1),
+                        error_code: Some("test-terminal".into()),
+                        error_message: None,
+                    })
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap();
+            }
+            "resident-stop" => {
+                server
+                    .client()
+                    .post(format!(
+                        "{}/sandboxes/{sandbox_id}/resident-processes/orb-executor/stop",
+                        server.base_url
+                    ))
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap();
+            }
+            "sandbox-stop" => {
+                server
+                    .client()
+                    .post(format!("{}/sandboxes/{sandbox_id}/stop", server.base_url))
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        let expected_status = if action == "sandbox-stop" {
+            // Sandbox-wide stop atomically revokes the guest credential as
+            // well as reclaiming its resident bootstrap entries.
+            reqwest::StatusCode::UNAUTHORIZED
+        } else {
+            reqwest::StatusCode::GONE
+        };
+        assert_eq!(
+            guest_client
+                .post(&bootstrap_url)
+                .json(&request)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            expected_status,
+            "{action} must reclaim the exact {name} bootstrap entry"
+        );
+    }
 }

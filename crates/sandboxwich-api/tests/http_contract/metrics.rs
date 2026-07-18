@@ -77,7 +77,7 @@ pub(crate) async fn metrics_are_scoped_to_the_authenticated_tenant() {
         tenant_b_sandbox_ids.push(created.sandbox.id);
     }
 
-    // Seed only bounded resident state/event dimensions. The metrics query
+    // Seed only bounded resident state/rollup dimensions. The metrics query
     // must scope both families through their owning sandbox tenant.
     sqlx::any::install_default_drivers();
     let pool = AnyPool::connect(&server.database_url).await.unwrap();
@@ -103,23 +103,17 @@ pub(crate) async fn metrics_are_scoped_to_the_authenticated_tenant() {
         .await
         .unwrap();
     }
-    for (index, (sandbox_id, reason)) in [
-        (default_sandbox_ids[0], "not_running"),
-        (tenant_b_sandbox_ids[0], "inactive_lease"),
-        (tenant_b_sandbox_ids[0], "expired_lease"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    for (tenant_id, reason) in [
+        ("default", "not_running"),
+        ("tenant-b", "inactive_lease"),
+        ("tenant-b", "expired_lease"),
+    ] {
         sqlx::query(
-            "insert into sandbox_events (id, sandbox_id, kind, data, created_at)
-             values (?, ?, 'sidecar_bootstrap_blocked', ?, '2026-07-18T00:00:00Z')",
+            "insert into sidecar_bootstrap_block_rollups (tenant_id, reason, total)
+             values (?, ?, 1)",
         )
-        .bind(format!("00000000-0000-0000-0000-00000000002{index}"))
-        .bind(sandbox_id.to_string())
-        .bind(format!(
-            r#"{{"reason":"{reason}","processName":"orb-sidecar","generation":1}}"#
-        ))
+        .bind(tenant_id)
+        .bind(reason)
         .execute(&pool)
         .await
         .unwrap();
@@ -249,6 +243,160 @@ pub(crate) async fn metrics_are_scoped_to_the_authenticated_tenant() {
         planning_sandbox_gauge(&wrong_operator_metrics),
         DEFAULT_TENANT_SANDBOXES as i64,
         "a wrong operator token must not unlock the cross-tenant view:\n{wrong_operator_metrics}"
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_block_rollup_is_bounded_and_monotonic_over_sqlite() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("bootstrap-block-rollup.db").display()
+    );
+    assert_bootstrap_block_rollup_is_bounded_and_monotonic(
+        TestServer::start(database_url, Some(data_dir)).await,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn bootstrap_block_rollup_is_bounded_and_monotonic_over_postgres_when_configured() {
+    let Ok(database_url) = std::env::var("SANDBOXWICH_TEST_POSTGRES_URL") else {
+        return;
+    };
+    assert_bootstrap_block_rollup_is_bounded_and_monotonic(
+        TestServer::start(database_url, None).await,
+    )
+    .await;
+}
+
+async fn assert_bootstrap_block_rollup_is_bounded_and_monotonic(server: TestServer) {
+    const RETAINED_EVENT_ROWS: usize = 2_048;
+    const DURABLE_TOTAL: i64 = 7;
+
+    let client = server.client();
+    let created: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            execution_class: None,
+            workspace_mode: None,
+            runtime_profile: None,
+            name: Some("bootstrap-block-rollup".into()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    sqlx::any::install_default_drivers();
+    let pool = AnyPool::connect(&server.database_url).await.unwrap();
+    let postgres = server.database_url.starts_with("postgres:")
+        || server.database_url.starts_with("postgresql:");
+    let placeholders = |count: usize| {
+        (1..=count)
+            .map(|index| {
+                if postgres {
+                    format!("${index}")
+                } else {
+                    "?".to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    sqlx::query(&format!(
+        "insert into sidecar_bootstrap_block_rollups (tenant_id, reason, total) values ({})",
+        placeholders(3)
+    ))
+    .bind("default")
+    .bind("not_running")
+    .bind(DURABLE_TOTAL)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    let event_sql = format!(
+        "insert into sandbox_events (id, sandbox_id, kind, data, created_at) values ({})",
+        placeholders(5)
+    );
+    for index in 0..RETAINED_EVENT_ROWS {
+        sqlx::query(&event_sql)
+            .bind(format!("large-history-{index}"))
+            .bind(created.sandbox.id.to_string())
+            .bind("sidecar_bootstrap_blocked")
+            .bind(r#"{"reason":"not_running"}"#)
+            .bind("2026-07-18T00:00:00Z")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    let metrics = client
+        .get(format!("{}/metrics", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        labeled_metric_value(
+            &metrics,
+            "sandboxwich_sidecar_bootstrap_block_total{reason=\"not_running\"}",
+        ),
+        DURABLE_TOTAL,
+        "metric must read the bounded rollup, not scan retained event history"
+    );
+
+    sqlx::query(&format!(
+        "delete from sandbox_events where sandbox_id = {}",
+        placeholders(1)
+    ))
+    .bind(created.sandbox.id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "delete from sandboxes where id = {}",
+        placeholders(1)
+    ))
+    .bind(created.sandbox.id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let metrics_after_deletion = client
+        .get(format!("{}/metrics", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        labeled_metric_value(
+            &metrics_after_deletion,
+            "sandboxwich_sidecar_bootstrap_block_total{reason=\"not_running\"}",
+        ),
+        DURABLE_TOTAL,
+        "event and sandbox deletion must not decrease the durable counter"
     );
 }
 

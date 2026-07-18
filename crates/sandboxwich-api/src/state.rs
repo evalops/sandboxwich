@@ -286,6 +286,47 @@ impl ResidentBootstrapStore {
             _ => false,
         }
     }
+
+    pub(crate) fn reclaim(
+        &self,
+        id: &ResidentProcessId,
+        generation: u64,
+        sha256: &str,
+        fence: Option<&ResidentBootstrapFence>,
+    ) -> bool {
+        let mut inner = self.0.lock().expect("resident bootstrap mutex poisoned");
+        let should_remove = matches!(
+            inner.values.get(id),
+            Some(ResidentBootstrapEntry::Ready(bootstrap))
+                if bootstrap.generation == generation && bootstrap.sha256 == sha256
+        ) || matches!(
+            (inner.values.get(id), fence),
+            (
+                Some(ResidentBootstrapEntry::Delivered {
+                    fence: delivered_fence,
+                    ..
+                }),
+                Some(expected_fence),
+            ) if *delivered_fence == *expected_fence
+        );
+        if should_remove {
+            inner.values.remove(id);
+            return true;
+        }
+        match (inner.values.get_mut(id), fence) {
+            (
+                Some(ResidentBootstrapEntry::InFlight {
+                    fence: in_flight_fence,
+                    acknowledged,
+                }),
+                Some(expected_fence),
+            ) if in_flight_fence == expected_fence => {
+                *acknowledged = true;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -485,6 +526,17 @@ mod tests {
         ));
         assert!(store.reserve(resident_bootstrap(2)).is_err());
 
+        let replacement_fence = ResidentBootstrapFence {
+            generation: fence.generation + 1,
+            lease_id: Uuid::now_v7(),
+            sha256: fence.sha256.clone(),
+        };
+        assert!(!store.acknowledge(&id, &replacement_fence));
+        assert!(
+            store.reserve(resident_bootstrap(2)).is_err(),
+            "a stale fence must not reclaim a replacement's capacity"
+        );
+
         let retry = store.begin_delivery(&id, fence.clone()).unwrap();
         assert_eq!(retry.bootstrap().content, b"secret");
         assert!(store.acknowledge(&id, &fence));
@@ -497,6 +549,44 @@ mod tests {
             Err(ResidentBootstrapDeliveryError::Unavailable)
         ));
         assert!(store.reserve(resident_bootstrap(2)).is_ok());
+    }
+
+    #[test]
+    fn resident_bootstrap_reclaim_is_generation_digest_and_fence_scoped() {
+        let store = ResidentBootstrapStore::with_capacity(1);
+        let id = ResidentProcessId::new();
+        store.reserve(resident_bootstrap(2)).unwrap().publish(id);
+
+        assert!(!store.reclaim(&id, 1, "digest", None));
+        assert!(!store.reclaim(&id, 2, "wrong-digest", None));
+        assert!(store.reserve(resident_bootstrap(3)).is_err());
+        assert!(store.reclaim(&id, 2, "digest", None));
+        assert!(store.reserve(resident_bootstrap(3)).is_ok());
+
+        let replacement = ResidentProcessId::new();
+        let fence = ResidentBootstrapFence {
+            generation: 4,
+            lease_id: Uuid::now_v7(),
+            sha256: "digest".into(),
+        };
+        store
+            .reserve(resident_bootstrap(4))
+            .unwrap()
+            .publish(replacement);
+        store
+            .begin_delivery(&replacement, fence.clone())
+            .unwrap()
+            .mark_delivered()
+            .unwrap();
+        let stale_fence = ResidentBootstrapFence {
+            generation: 3,
+            lease_id: Uuid::now_v7(),
+            sha256: "digest".into(),
+        };
+        assert!(!store.reclaim(&replacement, 3, "digest", Some(&stale_fence)));
+        assert!(store.reserve(resident_bootstrap(5)).is_err());
+        assert!(store.reclaim(&replacement, 4, "digest", Some(&fence)));
+        assert!(store.reserve(resident_bootstrap(5)).is_ok());
     }
 
     #[test]

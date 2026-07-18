@@ -2956,7 +2956,10 @@ impl GuestAgentCapabilityReport {
     /// remain available in `checks` to generic clients but return `None` here,
     /// ensuring authorization-sensitive callers fail closed.
     pub fn from_health_checks(checks: &serde_json::Value) -> Option<Self> {
-        serde_json::from_value(checks.get(GUEST_AGENT_CAPABILITY_REPORT_CHECK)?.clone()).ok()
+        let report: Self =
+            serde_json::from_value(checks.get(GUEST_AGENT_CAPABILITY_REPORT_CHECK)?.clone())
+                .ok()?;
+        (report.protocol_version == GUEST_AGENT_CAPABILITY_PROTOCOL_VERSION).then_some(report)
     }
 
     pub fn supports_uid_isolated_resident_process(&self) -> bool {
@@ -3097,6 +3100,23 @@ mod tests {
                     .is_some_and(|report| report.supports_uid_isolated_resident_process())
             );
         }
+    }
+
+    #[test]
+    fn guest_agent_capability_report_fails_closed_when_unavailable() {
+        let checks = serde_json::json!({
+            "agentCapabilities": {
+                "protocolVersion": 1,
+                "capabilities": {
+                    "uidIsolatedResidentProcess": {"status": "unavailable", "version": 1}
+                }
+            }
+        });
+
+        assert!(
+            !GuestAgentCapabilityReport::from_health_checks(&checks)
+                .is_some_and(|report| report.supports_uid_isolated_resident_process())
+        );
     }
 
     #[test]

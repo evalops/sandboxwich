@@ -34,12 +34,32 @@ fn isolated_sidecar_manifests_are_separate_fenced_and_secret_safe() {
     let manifests = provider
         .isolated_resident_process_manifests(&spec)
         .expect("a configured isolated sidecar should render");
-    assert_eq!(manifests.len(), 2);
+    assert_eq!(manifests.len(), 3);
     let secret = &manifests[0];
-    let pod = &manifests[1];
+    let policy = &manifests[1];
+    let pod = &manifests[2];
     assert_eq!(secret["kind"], "Secret");
     assert_eq!(secret["immutable"], true);
     assert_eq!(pod["kind"], "Pod");
+    assert_eq!(policy["kind"], "NetworkPolicy");
+    assert_eq!(policy["spec"]["policyTypes"], json!(["Ingress", "Egress"]));
+    assert_eq!(policy["spec"]["ingress"], json!([]));
+    assert_eq!(policy["spec"]["egress"][0]["ports"][0]["port"], 53);
+    assert_eq!(
+        policy["spec"]["egress"][0]["to"][0]["podSelector"]["matchLabels"]["k8s-app"],
+        "kube-dns"
+    );
+    assert_eq!(policy["spec"]["egress"][1]["ports"][0]["port"], 443);
+    assert!(
+        policy["spec"]["egress"][1]["to"][0]["ipBlock"]["except"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("169.254.0.0/16"))
+    );
+    assert_eq!(
+        policy["spec"]["podSelector"]["matchLabels"],
+        pod["metadata"]["labels"]
+    );
     assert_eq!(
         pod["metadata"]["labels"]["sandboxwich.dev/sandbox-id"],
         spec.sandbox_id.to_string()
@@ -87,11 +107,33 @@ fn isolated_sidecar_manifests_are_separate_fenced_and_secret_safe() {
         secret["data"]["bootstrap"],
         general_purpose::STANDARD.encode(bootstrap)
     );
+    for manifest in &manifests {
+        let name = manifest["metadata"]["name"].as_str().unwrap();
+        assert!(name.len() <= 63);
+        assert!(name.contains("-g7-"));
+    }
+
+    let mut replacement = spec.clone();
+    replacement.generation += 1;
+    replacement.lease_id = Uuid::now_v7();
+    let replacement_manifests = provider
+        .isolated_resident_process_manifests(&replacement)
+        .expect("replacement lease should render separately fenced resources");
+    for (old, new) in manifests.iter().zip(&replacement_manifests) {
+        assert_ne!(old["metadata"]["name"], new["metadata"]["name"]);
+    }
 
     let debug = format!("{spec:?}");
     assert!(!debug.contains("isolated-bootstrap-canary"));
     assert!(!debug.contains("https://orb.invalid"));
     let cleanup = provider.isolated_resident_process_cleanup_manifests(&spec);
+    assert_eq!(cleanup.len(), manifests.len());
+    for applied in &manifests {
+        assert!(cleanup.iter().any(|deleted| {
+            applied["kind"] == deleted["kind"]
+                && applied["metadata"]["name"] == deleted["metadata"]["name"]
+        }));
+    }
     let cleanup_json = serde_json::to_string(&cleanup).unwrap();
     assert!(!cleanup_json.contains("isolated-bootstrap-canary"));
     assert!(!cleanup_json.contains(&general_purpose::STANDARD.encode(bootstrap)));
@@ -198,6 +240,49 @@ esac
     (script_path, log_path)
 }
 
+fn write_pending_isolated_sidecar_fake_kubectl() -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "sandboxwich-pending-sidecar-kubectl-{}",
+        SandboxId::new()
+    ));
+    std::fs::create_dir_all(&dir).expect("create pending sidecar fake kubectl dir");
+    let script_path = dir.join("kubectl");
+    let log_path = dir.join("kubectl.log");
+    let script = r#"#!/bin/sh
+set -eu
+dir=$(dirname "$0")
+printf 'ARGS %s\n' "$*" >> "$dir/kubectl.log"
+verb=""
+for arg in "$@"; do
+  case "$arg" in apply|get|delete) verb="$arg"; break;; esac
+done
+case "$verb" in
+  apply) cat > "$dir/apply.stdin" ;;
+  get)
+    count=0
+    if [ -f "$dir/get.count" ]; then count=$(cat "$dir/get.count"); fi
+    count=$((count + 1))
+    printf '%s' "$count" > "$dir/get.count"
+    printf '%s\n' '{"metadata":{"uid":"pending-pod-uid"},"status":{"phase":"Pending","containerStatuses":[{"ready":false,"state":{"waiting":{"reason":"ImagePullBackOff"}}}]}}'
+    ;;
+  delete) cat > "$dir/delete.stdin" ;;
+  *) exit 2 ;;
+esac
+"#;
+    std::fs::write(&script_path, script).expect("write pending sidecar fake kubectl");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("stat pending sidecar fake kubectl")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions)
+            .expect("chmod pending sidecar fake kubectl");
+    }
+    (script_path, log_path)
+}
+
 fn isolated_sidecar_apply_provider(kubectl: &std::path::Path) -> KubernetesApplyProvider {
     KubernetesApplyProvider::new(
         KubernetesDryRunProvider::with_snapshot_class("in-cluster", "sandboxwich-ci", None, None)
@@ -211,6 +296,10 @@ fn isolated_sidecar_apply_provider(kubectl: &std::path::Path) -> KubernetesApply
         "ghcr.io/evalops/orb-sidecar@sha256:{}",
         "d".repeat(64)
     )))
+    .with_isolated_resident_process_poll_intervals(
+        Duration::from_millis(5),
+        Duration::from_millis(20),
+    )
 }
 
 #[test]
@@ -264,6 +353,50 @@ fn isolated_sidecar_run_observes_terminal_state_and_always_cleans_up() {
     assert!(log.lines().any(|line| line.contains(" delete ")));
     assert!(!log.contains("sidecar-lifecycle-canary"));
     assert!(!log.contains(&encoded));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn isolated_sidecar_pending_is_not_acknowledged_and_times_out_retryably() {
+    let (kubectl, log_path) = write_pending_isolated_sidecar_fake_kubectl();
+    let provider = isolated_sidecar_apply_provider(&kubectl)
+        .with_isolated_resident_process_startup_timeout(Duration::from_millis(45));
+    let mut observations = Vec::new();
+    let error = provider
+        .run_isolated_resident_process(
+            &isolated_sidecar_spec(b"pending-deadline-canary"),
+            &CancelSignal::never_cancelled(),
+            &mut |observation| {
+                observations.push(observation);
+                Ok(())
+            },
+        )
+        .expect_err("a permanently Pending sidecar must hit its startup deadline");
+    assert!(error.to_string().contains("startup deadline"));
+    assert!(
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ProviderError>())
+            .is_some_and(|error| error.disposition() == RetryDisposition::Retryable)
+    );
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].state, IsolatedResidentProcessState::Failed);
+    assert_eq!(observations[0].pod_uid.as_deref(), Some("pending-pod-uid"));
+
+    let dir = kubectl.parent().expect("pending fake kubectl parent");
+    let get_count: usize = std::fs::read_to_string(dir.join("get.count"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        get_count <= 5,
+        "bounded backoff should cap API calls during the 45ms deadline, got {get_count}"
+    );
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(log.lines().any(|line| line.contains(" delete ")));
+    assert!(!log.contains("pending-deadline-canary"));
+    let delete_stdin = std::fs::read_to_string(dir.join("delete.stdin")).unwrap();
+    assert!(!delete_stdin.contains("pending-deadline-canary"));
     let _ = std::fs::remove_dir_all(dir);
 }
 

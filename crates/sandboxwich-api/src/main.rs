@@ -35,7 +35,7 @@ use crate::db::migrate_database;
 use crate::db::verify_database_schema;
 use crate::routes::app;
 use crate::scheduler::spawn_expiry_sweeper;
-use crate::state::AppState;
+use crate::state::{AppState, ResidentBootstrapStore};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -82,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    let resident_bootstraps = ResidentBootstrapStore::default();
     if config.disable_expiry_sweeper {
         tracing::info!(
             "SANDBOXWICH_DISABLE_EXPIRY_SWEEPER is set: not spawning the lease/snapshot/desktop-\
@@ -89,7 +90,11 @@ async fn main() -> anyhow::Result<()> {
              on this instance except explicit callers of /snapshots/cleanup."
         );
     } else {
-        spawn_expiry_sweeper(db.clone(), Duration::from_millis(config.sweep_interval_ms));
+        spawn_expiry_sweeper(
+            db.clone(),
+            resident_bootstraps.clone(),
+            Duration::from_millis(config.sweep_interval_ms),
+        );
     }
 
     let listener = tokio::net::TcpListener::bind(config.bind)
@@ -109,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
             default_tenant_id: config.default_tenant_id,
             apex_callback_base_url: config.apex_callback_base_url,
             apex_waiters: Default::default(),
-            resident_bootstraps: Default::default(),
+            resident_bootstraps,
             sandbox_lifetime: config.sandbox_lifetime,
             #[cfg(test)]
             apex_callback_test_hook: None,

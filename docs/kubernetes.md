@@ -98,8 +98,19 @@ runs `orb-sidecar` in a dedicated Pod rather than inside the guest Pod. The
 sidecar has separate mount, PID, and network namespaces, no service-account
 token, a read-only root filesystem, dropped capabilities, non-root identity,
 seccomp, and resource bounds. Its bootstrap is mounted from an immutable
-transient Secret; worker cleanup attempts to delete both resources on every
-terminal path.
+transient Secret; worker cleanup attempts to delete all three resources on every
+terminal path. Pod, Secret, and dedicated NetworkPolicy names are fenced by
+generation and lease so cleanup from an expired lease cannot delete a
+replacement. The policy denies all ingress and allows only cluster DNS plus
+public HTTPS egress, excluding configured control-plane and metadata CIDRs.
+
+Pending Pods do not report `Starting` until the container has actually
+started. `SANDBOXWICH_ISOLATED_RESIDENT_PROCESS_STARTUP_TIMEOUT_SECS` (default
+`120`) turns an unschedulable or image-pull-blocked Pod into a retryable failure
+with fenced cleanup. Kubernetes observations back off from
+`SANDBOXWICH_ISOLATED_RESIDENT_PROCESS_POLL_INTERVAL_MILLIS` (default `1000`)
+to `SANDBOXWICH_ISOLATED_RESIDENT_PROCESS_MAX_POLL_INTERVAL_MILLIS` (default
+`5000`) and remain cancellable while waiting.
 
 `SANDBOXWICH_MAX_RESIDENT_PROCESSES` (default `8`, minimum effective value `1`)
 bounds concurrent sidecar supervisors per worker. At the bound, the worker

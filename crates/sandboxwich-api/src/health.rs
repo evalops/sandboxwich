@@ -430,39 +430,33 @@ async fn fetch_resident_observability_metrics(
     }
     values.insert("resident_process".into(), resident_counts);
 
-    let event_sql = match tenant_id {
-        None => "select sandbox_events.data from sandbox_events
-                 where sandbox_events.kind = 'sidecar_bootstrap_blocked'"
+    let block_sql = match tenant_id {
+        None => "select reason as label, sum(total) as value
+                 from sidecar_bootstrap_block_rollups group by reason"
             .to_string(),
         Some(_) => format!(
-            "select sandbox_events.data from sandbox_events
-             join sandboxes on sandboxes.id = sandbox_events.sandbox_id
-             where sandbox_events.kind = 'sidecar_bootstrap_blocked'
-               and sandboxes.tenant_id = {}",
+            "select reason as label, total as value
+             from sidecar_bootstrap_block_rollups where tenant_id = {}",
             db.placeholder(1)
         ),
     };
-    let mut event_query = sqlx::query(&event_sql);
+    let mut block_query = sqlx::query(&block_sql);
     if let Some(tenant_id) = tenant_id {
-        event_query = event_query.bind(tenant_id);
+        block_query = block_query.bind(tenant_id);
     }
-    let mut block_counts = BTreeMap::<String, i64>::new();
-    for row in event_query.fetch_all(&db.pool).await? {
-        let data: String = row.try_get("data")?;
-        let reason = serde_json::from_str::<serde_json::Value>(&data)
-            .ok()
-            .and_then(|data| data.get("reason")?.as_str().map(str::to_owned));
-        if let Some(
-            reason @ ("not_running" | "no_active_lease" | "inactive_lease" | "expired_lease"),
-        ) = reason.as_deref()
-        {
-            *block_counts.entry(reason.to_string()).or_default() += 1;
+    let mut block_counts = Vec::new();
+    for row in block_query.fetch_all(&db.pool).await? {
+        let reason: String = row.try_get("label")?;
+        // The schema constrains this domain; retain a read-side guard so an
+        // operator repair cannot introduce an unbounded Prometheus label.
+        if matches!(
+            reason.as_str(),
+            "not_running" | "no_active_lease" | "inactive_lease" | "expired_lease"
+        ) {
+            block_counts.push((reason, row.try_get("value")?));
         }
     }
-    values.insert(
-        "sidecar_bootstrap_block".into(),
-        block_counts.into_iter().collect(),
-    );
+    values.insert("sidecar_bootstrap_block".into(), block_counts);
     Ok(())
 }
 

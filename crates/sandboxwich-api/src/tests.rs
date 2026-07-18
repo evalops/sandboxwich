@@ -22,7 +22,7 @@ use crate::handlers::workers::*;
 use crate::reap::*;
 use crate::reconcile::*;
 use crate::rows::*;
-use crate::state::{Principal, TenantContext};
+use crate::state::{Principal, ResidentBootstrapStore, TenantContext};
 use sandboxwich_core::*;
 use std::collections::BTreeSet;
 
@@ -1908,7 +1908,7 @@ async fn idle_ttl_sweep_query_matches_documented_semantics_across_a_seeded_fixtu
     );
     insert_sandbox(&db, &untouched).await.unwrap();
 
-    let reaped = reap_expired_active_sandboxes(&db)
+    let reaped = reap_expired_active_sandboxes(&db, &ResidentBootstrapStore::default())
         .await
         .expect("sweep must not error");
     let reaped_ids: std::collections::HashSet<SandboxId> =
@@ -2047,7 +2047,9 @@ async fn idle_ttl_reap_considers_last_activity_at_alongside_updated_at_and_comma
     let no_activity_at_all = seed(now - chrono::Duration::seconds(400));
     insert_sandbox(&db, &no_activity_at_all).await.unwrap();
 
-    let reaped = reap_expired_active_sandboxes(&db).await.unwrap();
+    let reaped = reap_expired_active_sandboxes(&db, &ResidentBootstrapStore::default())
+        .await
+        .unwrap();
     let reaped_ids: std::collections::HashSet<SandboxId> =
         reaped.iter().map(|reaped| reaped.sandbox.id).collect();
 
@@ -2107,6 +2109,7 @@ async fn reap_cas_miss_skips_instead_of_enqueuing_a_redundant_stop_job() {
     // the *only* one to enqueue a job.
     let winner = stop_sandbox_via_job(
         &db,
+        &ResidentBootstrapStore::default(),
         &sandbox,
         json!({"state": "archiving", "reason": "stop_requested"}),
     )
@@ -2123,9 +2126,15 @@ async fn reap_cas_miss_skips_instead_of_enqueuing_a_redundant_stop_job() {
     // is `Archiving` now, not `Ready`), and `attempt_reap_candidate` must
     // report `Skipped` rather than treating this as a second successful
     // reap or an error.
-    let outcome = attempt_reap_candidate(&db, sandbox.clone(), None, Utc::now())
-        .await
-        .expect("a CAS miss inside attempt_reap_candidate must not surface as an error");
+    let outcome = attempt_reap_candidate(
+        &db,
+        &ResidentBootstrapStore::default(),
+        sandbox.clone(),
+        None,
+        Utc::now(),
+    )
+    .await
+    .expect("a CAS miss inside attempt_reap_candidate must not surface as an error");
     assert!(
         matches!(outcome, CandidateOutcome::Skipped),
         "a sandbox concurrently stopped between candidate selection and this \

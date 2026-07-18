@@ -7,7 +7,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, bail};
@@ -177,6 +177,16 @@ const APEX_TASK_INSTRUCTIONS_COMMAND: &str = "/opt/apex/bin/task-instructions";
 /// `SANDBOXWICH_KUBECTL_COMMAND_TIMEOUT_SECS` for environments that need a
 /// longer bound (e.g. slow-running commands executed via `kubectl exec`).
 pub const DEFAULT_KUBECTL_COMMAND_TIMEOUT_SECS: u64 = 300;
+/// Maximum time an isolated sidecar may remain without container-start
+/// evidence. This is deliberately shorter than the resident lease lifetime so
+/// an unschedulable or image-pull-blocked Pod releases its supervisor slot and
+/// can be retried after fenced cleanup.
+pub const DEFAULT_ISOLATED_RESIDENT_PROCESS_STARTUP_TIMEOUT_SECS: u64 = 120;
+/// Initial and maximum delays for the bounded-backoff sidecar observer. The
+/// backoff avoids a full Kubernetes Pod GET four times per second for every
+/// steady-state sidecar while retaining prompt startup/terminal observations.
+pub const DEFAULT_ISOLATED_RESIDENT_PROCESS_POLL_INTERVAL_MILLIS: u64 = 1_000;
+pub const DEFAULT_ISOLATED_RESIDENT_PROCESS_MAX_POLL_INTERVAL_MILLIS: u64 = 5_000;
 
 /// Default dedicated namespace sandbox workloads are provisioned into, kept
 /// separate from the control-plane namespace (see GH-76). Not read directly
@@ -311,6 +321,30 @@ pub struct IsolatedResidentProcessObservation {
     pub pod_uid: Option<String>,
     pub ready: bool,
     pub exit_code: Option<i32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum IsolatedResidentProcessPodObservation {
+    Pending {
+        pod_name: String,
+        pod_uid: Option<String>,
+    },
+    Started(IsolatedResidentProcessObservation),
+}
+
+fn isolated_resident_process_fence_suffix(spec: &IsolatedResidentProcessSpec) -> String {
+    let process = spec.process_id.0.simple().to_string();
+    let lease = spec.lease_id.simple().to_string();
+    format!(
+        "{}-g{}-{}",
+        &process[..12],
+        spec.generation,
+        &lease[lease.len() - 12..]
+    )
+}
+
+pub(crate) fn isolated_resident_process_pod_name(spec: &IsolatedResidentProcessSpec) -> String {
+    format!("sw-sc-{}", isolated_resident_process_fence_suffix(spec))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2108,6 +2142,9 @@ pub struct KubernetesApplyProvider {
     kubectl_command_timeout: Duration,
     max_captured_output_bytes: u64,
     isolated_resident_process_image: Option<String>,
+    isolated_resident_process_startup_timeout: Duration,
+    isolated_resident_process_poll_interval: Duration,
+    isolated_resident_process_max_poll_interval: Duration,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2503,6 +2540,15 @@ impl KubernetesApplyProvider {
             kubectl_command_timeout: Duration::from_secs(DEFAULT_KUBECTL_COMMAND_TIMEOUT_SECS),
             max_captured_output_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
             isolated_resident_process_image: None,
+            isolated_resident_process_startup_timeout: Duration::from_secs(
+                DEFAULT_ISOLATED_RESIDENT_PROCESS_STARTUP_TIMEOUT_SECS,
+            ),
+            isolated_resident_process_poll_interval: Duration::from_millis(
+                DEFAULT_ISOLATED_RESIDENT_PROCESS_POLL_INTERVAL_MILLIS,
+            ),
+            isolated_resident_process_max_poll_interval: Duration::from_millis(
+                DEFAULT_ISOLATED_RESIDENT_PROCESS_MAX_POLL_INTERVAL_MILLIS,
+            ),
         }
     }
 
@@ -2564,6 +2610,22 @@ impl KubernetesApplyProvider {
             let image = image.trim();
             (!image.is_empty()).then(|| image.to_string())
         });
+        self
+    }
+
+    pub fn with_isolated_resident_process_startup_timeout(mut self, timeout: Duration) -> Self {
+        self.isolated_resident_process_startup_timeout = timeout.max(Duration::from_millis(1));
+        self
+    }
+
+    pub fn with_isolated_resident_process_poll_intervals(
+        mut self,
+        initial: Duration,
+        maximum: Duration,
+    ) -> Self {
+        self.isolated_resident_process_poll_interval = initial.max(Duration::from_millis(1));
+        self.isolated_resident_process_max_poll_interval =
+            maximum.max(self.isolated_resident_process_poll_interval);
         self
     }
 
@@ -3616,12 +3678,15 @@ impl KubernetesApplyProvider {
         Some(payload)
     }
 
-    fn isolated_resident_process_pod_name(&self, process_id: ResidentProcessId) -> String {
-        format!("sandboxwich-sidecar-{process_id}")
+    fn isolated_resident_process_secret_name(&self, spec: &IsolatedResidentProcessSpec) -> String {
+        format!("sw-scb-{}", isolated_resident_process_fence_suffix(spec))
     }
 
-    fn isolated_resident_process_secret_name(&self, process_id: ResidentProcessId) -> String {
-        format!("sw-sidecar-bootstrap-{process_id}")
+    fn isolated_resident_process_network_policy_name(
+        &self,
+        spec: &IsolatedResidentProcessSpec,
+    ) -> String {
+        format!("sw-scnp-{}", isolated_resident_process_fence_suffix(spec))
     }
 
     fn validate_isolated_resident_process_spec(
@@ -3705,8 +3770,9 @@ impl KubernetesApplyProvider {
         spec: &IsolatedResidentProcessSpec,
     ) -> anyhow::Result<Vec<Value>> {
         self.validate_isolated_resident_process_spec(spec)?;
-        let pod_name = self.isolated_resident_process_pod_name(spec.process_id);
-        let secret_name = self.isolated_resident_process_secret_name(spec.process_id);
+        let pod_name = isolated_resident_process_pod_name(spec);
+        let secret_name = self.isolated_resident_process_secret_name(spec);
+        let network_policy_name = self.isolated_resident_process_network_policy_name(spec);
         let labels = self.isolated_resident_process_labels(spec);
         let relative_target = std::path::Path::new(&spec.bootstrap.target_file)
             .strip_prefix(RESIDENT_PROCESS_BOOTSTRAP_PREFIX)
@@ -3725,6 +3791,26 @@ impl KubernetesApplyProvider {
             "immutable": true,
             "data": {
                 "bootstrap": general_purpose::STANDARD.encode(&spec.bootstrap.content),
+            },
+        });
+        let mut network_egress = self.dry_run.dns_egress_rules();
+        network_egress.push(json!({
+            "to": [{ "ipBlock": self.dry_run.ip_block("0.0.0.0/0")? }],
+            "ports": [{ "protocol": "TCP", "port": 443 }],
+        }));
+        let network_policy = json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {
+                "name": network_policy_name,
+                "namespace": self.dry_run.effective_sandbox_namespace(),
+                "labels": labels,
+            },
+            "spec": {
+                "podSelector": { "matchLabels": labels },
+                "policyTypes": ["Ingress", "Egress"],
+                "ingress": [],
+                "egress": network_egress,
             },
         });
         let env = spec
@@ -3818,7 +3904,7 @@ impl KubernetesApplyProvider {
                 ],
             },
         });
-        Ok(vec![secret, pod])
+        Ok(vec![secret, network_policy, pod])
     }
 
     fn isolated_resident_process_cleanup_manifests(
@@ -3827,10 +3913,18 @@ impl KubernetesApplyProvider {
     ) -> Vec<Value> {
         vec![
             json!({
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "NetworkPolicy",
+                "metadata": {
+                    "name": self.isolated_resident_process_network_policy_name(spec),
+                    "namespace": self.dry_run.effective_sandbox_namespace(),
+                },
+            }),
+            json!({
                 "apiVersion": "v1",
                 "kind": "Pod",
                 "metadata": {
-                    "name": self.isolated_resident_process_pod_name(spec.process_id),
+                    "name": isolated_resident_process_pod_name(spec),
                     "namespace": self.dry_run.effective_sandbox_namespace(),
                 },
             }),
@@ -3838,7 +3932,7 @@ impl KubernetesApplyProvider {
                 "apiVersion": "v1",
                 "kind": "Secret",
                 "metadata": {
-                    "name": self.isolated_resident_process_secret_name(spec.process_id),
+                    "name": self.isolated_resident_process_secret_name(spec),
                     "namespace": self.dry_run.effective_sandbox_namespace(),
                 },
             }),
@@ -3849,12 +3943,12 @@ impl KubernetesApplyProvider {
         &self,
         spec: &IsolatedResidentProcessSpec,
         cancelled: &CancelSignal,
-    ) -> anyhow::Result<IsolatedResidentProcessObservation> {
+    ) -> anyhow::Result<IsolatedResidentProcessPodObservation> {
         let mut args = self.kubectl_base_args();
         args.extend([
             "get".to_string(),
             "pod".to_string(),
-            self.isolated_resident_process_pod_name(spec.process_id),
+            isolated_resident_process_pod_name(spec),
             "-o".to_string(),
             "json".to_string(),
         ]);
@@ -3881,6 +3975,12 @@ impl KubernetesApplyProvider {
             .as_i64()
             .and_then(|code| i32::try_from(code).ok());
         let phase = pod["status"]["phase"].as_str().unwrap_or("Pending");
+        let pod_name = isolated_resident_process_pod_name(spec);
+        let container_started =
+            status["state"]["running"].is_object() || status["state"]["terminated"].is_object();
+        if !container_started && !matches!(phase, "Succeeded" | "Failed") {
+            return Ok(IsolatedResidentProcessPodObservation::Pending { pod_name, pod_uid });
+        }
         let state = if exit_code.is_some() || matches!(phase, "Succeeded" | "Failed") {
             if exit_code == Some(0) || (exit_code.is_none() && phase == "Succeeded") {
                 IsolatedResidentProcessState::Succeeded
@@ -3892,13 +3992,15 @@ impl KubernetesApplyProvider {
         } else {
             IsolatedResidentProcessState::Starting
         };
-        Ok(IsolatedResidentProcessObservation {
-            state,
-            pod_name: self.isolated_resident_process_pod_name(spec.process_id),
-            pod_uid,
-            ready,
-            exit_code,
-        })
+        Ok(IsolatedResidentProcessPodObservation::Started(
+            IsolatedResidentProcessObservation {
+                state,
+                pod_name,
+                pod_uid,
+                ready,
+                exit_code,
+            },
+        ))
     }
 }
 
@@ -3978,6 +4080,21 @@ fn run_kubectl_documents(
 /// How often a kubectl invocation polls a `CancelSignal` for cancellation
 /// while waiting on the child.
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+fn sleep_with_cancellation(duration: Duration, cancelled: &CancelSignal) -> anyhow::Result<()> {
+    let deadline = Instant::now() + duration;
+    loop {
+        anyhow::ensure!(
+            !cancelled.is_cancelled(),
+            "isolated resident-process execution cancelled after lease loss"
+        );
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+}
 
 /// Runs a `kubectl` invocation with a bounded wait, killing the child and
 /// returning a "timed out" error if it hasn't exited within `timeout`.
@@ -4762,26 +4879,68 @@ impl SandboxProvider for KubernetesApplyProvider {
                 apply.status
             );
 
+            let started_at = Instant::now();
             let mut previous = None;
+            let mut poll_interval = self.isolated_resident_process_poll_interval;
             loop {
                 anyhow::ensure!(
                     !cancelled.is_cancelled(),
                     "isolated resident-process execution cancelled after lease loss"
                 );
-                let observation = self.observe_isolated_resident_process(spec, cancelled)?;
-                if previous.as_ref() != Some(&observation) {
-                    observe(observation.clone())?;
-                    previous = Some(observation.clone());
+                let pod_observation = self.observe_isolated_resident_process(spec, cancelled)?;
+                let changed = match pod_observation {
+                    IsolatedResidentProcessPodObservation::Pending { pod_name, pod_uid } => {
+                        if started_at.elapsed() >= self.isolated_resident_process_startup_timeout {
+                            let observation = IsolatedResidentProcessObservation {
+                                state: IsolatedResidentProcessState::Failed,
+                                pod_name,
+                                pod_uid,
+                                ready: false,
+                                exit_code: None,
+                            };
+                            observe(observation)?;
+                            return Err(anyhow::Error::new(ProviderError::retryable(
+                                anyhow::anyhow!(
+                                    "isolated resident-process sidecar exceeded its startup deadline"
+                                ),
+                            )));
+                        }
+                        false
+                    }
+                    IsolatedResidentProcessPodObservation::Started(observation) => {
+                        let changed = previous.as_ref() != Some(&observation);
+                        if changed {
+                            observe(observation.clone())?;
+                            previous = Some(observation.clone());
+                        }
+                        if matches!(
+                            observation.state,
+                            IsolatedResidentProcessState::Succeeded
+                                | IsolatedResidentProcessState::Failed
+                        ) {
+                            return Ok(IsolatedResidentProcessResult {
+                                final_observation: observation,
+                            });
+                        }
+                        changed
+                    }
+                };
+                if changed {
+                    poll_interval = self.isolated_resident_process_poll_interval;
+                } else {
+                    poll_interval = poll_interval
+                        .saturating_mul(2)
+                        .min(self.isolated_resident_process_max_poll_interval);
                 }
-                if matches!(
-                    observation.state,
-                    IsolatedResidentProcessState::Succeeded | IsolatedResidentProcessState::Failed
-                ) {
-                    return Ok(IsolatedResidentProcessResult {
-                        final_observation: observation,
-                    });
-                }
-                std::thread::sleep(Duration::from_millis(250));
+                let sleep_duration = if previous.is_none() {
+                    poll_interval.min(
+                        self.isolated_resident_process_startup_timeout
+                            .saturating_sub(started_at.elapsed()),
+                    )
+                } else {
+                    poll_interval
+                };
+                sleep_with_cancellation(sleep_duration, cancelled)?;
             }
         })();
 
