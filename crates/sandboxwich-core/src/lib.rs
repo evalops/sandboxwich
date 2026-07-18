@@ -959,12 +959,22 @@ pub struct Sandbox {
     /// Rolling idle window: if no activity is observed for this many
     /// seconds, the background expiry sweeper stops the sandbox the same way
     /// `max_lifetime_seconds` does. `None` (the default) disables idle
-    /// reaping. "Activity" today means the more recent of this sandbox's own
-    /// last lifecycle-state transition and its most recently queued guest
-    /// command -- SSH sessions, desktop sessions, and resident-process
-    /// output do not yet reset this clock; see `docs/capabilities.md`.
+    /// reaping. "Activity" is the most recent of this sandbox's own last
+    /// lifecycle-state transition, its most recently queued guest command,
+    /// and `last_activity_at` (SSH access, desktop access, and resident-
+    /// process observations all bump it, throttled -- see
+    /// `docs/capabilities.md`).
     #[serde(default)]
     pub idle_ttl_seconds: Option<u64>,
+    /// Server-maintained, throttled "last seen doing something" timestamp,
+    /// separate from `updated_at` (which only moves on lifecycle-state
+    /// transitions). Bumped by SSH access, desktop access, and resident-
+    /// process observation requests -- see `docs/capabilities.md` for the
+    /// full list and the throttle window. Not caller-settable; absent from
+    /// `CreateSandboxRequest` on purpose. `None` until the first bump (or
+    /// forever, for a sandbox never touched through any of those surfaces).
+    #[serde(default)]
+    pub last_activity_at: Option<DateTime<Utc>>,
     pub parent_snapshot_id: Option<SnapshotId>,
 }
 
@@ -1731,7 +1741,7 @@ pub struct MintGuestTokenRequest {
     pub ttl_seconds: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GuestTokenResponse {
     pub ok: bool,
     pub token: String,
@@ -1739,6 +1749,20 @@ pub struct GuestTokenResponse {
     pub worker_id: WorkerId,
     pub sandbox_id: SandboxId,
     pub expires_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for GuestTokenResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuestTokenResponse")
+            .field("ok", &self.ok)
+            .field("token", &"<redacted>")
+            .field("tenant_id", &self.tenant_id)
+            .field("worker_id", &self.worker_id)
+            .field("sandbox_id", &self.sandbox_id)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2961,6 +2985,21 @@ mod tests {
         let debug = format!("{request:?}");
         assert!(!debug.contains("canary-resident-secret"));
         assert!(debug.contains("<redacted:22 bytes>"));
+    }
+
+    #[test]
+    fn guest_token_response_debug_redacts_the_live_token() {
+        let response = GuestTokenResponse {
+            ok: true,
+            token: "sbw_gtok_supersecret".into(),
+            tenant_id: "tenant-a".into(),
+            worker_id: WorkerId::new(),
+            sandbox_id: SandboxId::new(),
+            expires_at: Utc::now(),
+        };
+        let rendered = format!("{response:?}");
+        assert!(!rendered.contains("sbw_gtok_supersecret"));
+        assert!(rendered.contains("<redacted>"));
     }
 
     #[test]

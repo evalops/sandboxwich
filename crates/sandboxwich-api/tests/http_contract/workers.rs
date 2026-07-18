@@ -542,9 +542,9 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
     let sandbox_a = create_sandbox(&client, &server, "worker-scope-sandbox-a").await;
     let sandbox_b = create_sandbox(&client, &server, "worker-scope-sandbox-b").await;
 
-    // A worker only "owns" a sandbox (for guest-health purposes) once it has
-    // completed a provision lease for it, so give each worker exactly one
-    // sandbox this way before attacking across the boundary.
+    // Claiming a provision lease atomically places the sandbox on that worker.
+    // The worker must be able to mint the guest token before it creates the
+    // pod and completes the lease.
     async fn provision(
         client: &reqwest::Client,
         worker_client: &reqwest::Client,
@@ -592,6 +592,23 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
             .lease
             .expect("worker should claim its own provision job");
         assert_eq!(lease.job.id, queued.id);
+        let pre_provision_guest_token: GuestTokenResponse = worker_client
+            .post(format!(
+                "{}/workers/{}/sandboxes/{}/guest-token",
+                server.base_url, worker.worker.id, sandbox.sandbox.id
+            ))
+            .json(&MintGuestTokenRequest {
+                ttl_seconds: Some(120),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(pre_provision_guest_token.sandbox_id, sandbox.sandbox.id);
         let completed: LeaseResponse = worker_client
             .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
             .json(&CompleteLeaseRequest {
@@ -617,6 +634,19 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
 
     provision(&client, &worker_a_client, &server, &worker_a, &sandbox_a).await;
     provision(&client, &worker_b_client, &server, &worker_b, &sandbox_b).await;
+
+    let cross_worker_mint = worker_b_client
+        .post(format!(
+            "{}/workers/{}/sandboxes/{}/guest-token",
+            server.base_url, worker_b.worker.id, sandbox_a.sandbox.id
+        ))
+        .json(&MintGuestTokenRequest {
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_worker_mint.status(), StatusCode::NOT_FOUND);
 
     let guest_token: GuestTokenResponse = worker_a_client
         .post(format!(

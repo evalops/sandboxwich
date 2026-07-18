@@ -646,6 +646,7 @@ mod tests {
             ttl_seconds: None,
             max_lifetime_seconds: None,
             idle_ttl_seconds: None,
+            last_activity_at: None,
             parent_snapshot_id: None,
         };
         insert_sandbox(&db, &sandbox).await.unwrap();

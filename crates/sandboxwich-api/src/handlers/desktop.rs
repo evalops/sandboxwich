@@ -1,3 +1,4 @@
+use crate::activity::*;
 use crate::auth::*;
 use crate::db::*;
 use crate::error::*;
@@ -99,6 +100,10 @@ pub(crate) async fn create_desktop_access(
         fetch_desktop_session(&state.db, DesktopSessionId(desktop_session_id)).await?;
     ensure_sandbox_tenant(&state.db, desktop_session.sandbox_id, &ctx).await?;
     let access = mint_desktop_access(&desktop_session, request.ttl_seconds)?;
+    // Minting desktop access is the moment a caller is about to actually use
+    // the sandbox's desktop -- one of the idle-TTL activity signals.
+    // Best-effort: must not fail this request if the bump itself fails.
+    bump_sandbox_activity_best_effort(&state.db, desktop_session.sandbox_id, Utc::now()).await;
     Ok(Json(DesktopAccessResponse { ok: true, access }))
 }
 
