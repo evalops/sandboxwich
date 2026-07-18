@@ -198,9 +198,17 @@ pub const DEFAULT_INGRESS_SELECTOR_KEY: &str = "app.kubernetes.io/part-of";
 pub const DEFAULT_INGRESS_SELECTOR_VALUE: &str = "sandboxwich";
 /// Kubernetes resource kinds (as a `kubectl get/delete` type list) that carry the
 /// `sandboxwich.dev/sandbox-id` label and must be torn down when a sandbox is stopped.
-pub const SANDBOX_TEARDOWN_RESOURCE_KINDS: &str = "pod,persistentvolumeclaim,service,networkpolicy";
+pub const SANDBOX_TEARDOWN_RESOURCE_KINDS: &str =
+    "pod,persistentvolumeclaim,service,networkpolicy,secret";
 pub const SANDBOX_RECONCILIATION_RESOURCE_KINDS: &str =
     "pod,persistentvolumeclaim,service,secret,networkpolicy";
+pub const GUEST_TOKEN_REDACTED: &str = "[redacted]";
+
+/// Name prefix for the per-sandbox guest-token Secret (see
+/// `guest_token_secret_name`). Also used by the Secret adoption contract to
+/// recognize these Secrets and exempt their per-attempt-minted `api-token`
+/// value (only) from byte equality.
+pub const GUEST_TOKEN_SECRET_NAME_PREFIX: &str = "sandboxwich-guest-token-";
 const GKE_FQDN_RESOURCE_KIND: &str = "fqdnnetworkpolicy.networking.gke.io";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -365,6 +373,25 @@ pub struct KubernetesDryRunProvider {
     /// var (GH-67).
     vnc_password_secret: Option<String>,
     fqdn_egress_backend: Option<String>,
+    guest_credentials: Option<GuestCredentials>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct GuestCredentials {
+    sandbox_id: SandboxId,
+    api: String,
+    token: String,
+}
+
+impl std::fmt::Debug for GuestCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuestCredentials")
+            .field("sandbox_id", &self.sandbox_id)
+            .field("api", &self.api)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 impl KubernetesDryRunProvider {
@@ -402,6 +429,7 @@ impl KubernetesDryRunProvider {
             )]),
             vnc_password_secret: None,
             fqdn_egress_backend: None,
+            guest_credentials: None,
         }
     }
 
@@ -623,6 +651,23 @@ impl KubernetesDryRunProvider {
         self
     }
 
+    pub fn with_guest_credentials(
+        mut self,
+        sandbox_id: SandboxId,
+        api: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Self {
+        let api = api.into().trim_end_matches('/').to_string();
+        let token = token.into();
+        self.guest_credentials =
+            (!api.is_empty() && !token.trim().is_empty()).then_some(GuestCredentials {
+                sandbox_id,
+                api,
+                token,
+            });
+        self
+    }
+
     pub(crate) fn effective_sandbox_namespace(&self) -> &str {
         self.sandbox_namespace
             .as_deref()
@@ -731,6 +776,7 @@ impl KubernetesDryRunProvider {
                 "egressGatewayPod": egress_gateway_pod,
                 "egressGatewayService": egress_gateway_service,
                 "egressGatewayNetworkPolicy": egress_gateway_network_policy,
+                "guestTokenSecret": self.guest_token_secret_manifest_redacted(sandbox_id),
             }
         }))
     }
@@ -921,6 +967,43 @@ impl KubernetesDryRunProvider {
                 "value": "2222"
             }),
         ];
+        if self
+            .guest_credentials
+            .as_ref()
+            .is_some_and(|credentials| credentials.sandbox_id == sandbox_id)
+        {
+            volume_mounts.push(json!({
+                "name": "sandboxwich-guest-token",
+                "mountPath": "/run/sandboxwich/guest",
+                "readOnly": true
+            }));
+            volumes.push(json!({
+                "name": "sandboxwich-guest-token",
+                "secret": {
+                    "secretName": self.guest_token_secret_name(sandbox_id),
+                    "items": [{"key": "api-token", "path": "api-token"}]
+                }
+            }));
+            env.extend([
+                json!({
+                    "name": "SANDBOXWICH_API",
+                    "valueFrom": {
+                        "secretKeyRef": {
+                            "name": self.guest_token_secret_name(sandbox_id),
+                            "key": "api-url"
+                        }
+                    }
+                }),
+                json!({
+                    "name": "SANDBOXWICH_API_TOKEN_FILE",
+                    "value": "/run/sandboxwich/guest/api-token"
+                }),
+                json!({
+                    "name": "SANDBOXWICH_SANDBOX_ID",
+                    "value": sandbox_id.to_string()
+                }),
+            ]);
+        }
 
         if self.uses_egress_gateway(&spec.network_egress) {
             let proxy = format!("http://sandboxwich-egress-gateway-{sandbox_id}:8080");
@@ -1075,6 +1158,47 @@ impl KubernetesDryRunProvider {
         });
         manifest["metadata"]["labels"]["sandboxwich.dev/component"] = json!("runtime");
         manifest
+    }
+
+    fn guest_token_secret_name(&self, sandbox_id: SandboxId) -> String {
+        format!("{GUEST_TOKEN_SECRET_NAME_PREFIX}{sandbox_id}")
+    }
+
+    fn guest_token_secret_manifest(&self, sandbox_id: SandboxId) -> Option<serde_json::Value> {
+        let credentials = self
+            .guest_credentials
+            .as_ref()
+            .filter(|credentials| credentials.sandbox_id == sandbox_id)?;
+        Some(self.render_guest_token_secret(sandbox_id, &credentials.api, &credentials.token))
+    }
+
+    fn guest_token_secret_manifest_redacted(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Option<serde_json::Value> {
+        let credentials = self
+            .guest_credentials
+            .as_ref()
+            .filter(|credentials| credentials.sandbox_id == sandbox_id)?;
+        Some(self.render_guest_token_secret(sandbox_id, &credentials.api, GUEST_TOKEN_REDACTED))
+    }
+
+    fn render_guest_token_secret(
+        &self,
+        sandbox_id: SandboxId,
+        api: &str,
+        token: &str,
+    ) -> serde_json::Value {
+        json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "type": "Opaque",
+            "metadata": self.object_metadata(self.guest_token_secret_name(sandbox_id), Some(sandbox_id)),
+            "stringData": {
+                "api-url": api,
+                "api-token": token
+            }
+        })
     }
 
     fn pvc_manifest(
@@ -2153,6 +2277,22 @@ fn adoption_contract(resource: &Value) -> anyhow::Result<Value> {
                     );
                 }
             }
+            // The guest-token Secret's `api-token` is minted fresh for every
+            // provisioning attempt, so a replayed provision (lost-response
+            // recovery) can never byte-match the token the live Secret
+            // holds. Its adoption contract is presence, not equality: the
+            // existing token is the one the running pod already mounted and
+            // it stays valid on its own expiry/revocation schedule. Every
+            // other key -- notably `api-url` -- still must match exactly,
+            // because adopting a Secret that points the guest agent at a
+            // different control plane is precisely what this check refuses.
+            if resource["metadata"]["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with(GUEST_TOKEN_SECRET_NAME_PREFIX))
+                && let Some(token) = data.get_mut("api-token")
+            {
+                *token = json!("<present>");
+            }
             json!({
                 "type": resource["type"],
                 "immutable": resource["immutable"],
@@ -2282,6 +2422,16 @@ impl KubernetesApplyProvider {
         }
     }
 
+    pub fn with_guest_credentials(
+        mut self,
+        sandbox_id: SandboxId,
+        api: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Self {
+        self.dry_run = self.dry_run.with_guest_credentials(sandbox_id, api, token);
+        self
+    }
+
     pub fn with_kubectl_context(mut self, context: Option<String>) -> Self {
         self.kubectl_context = context.and_then(|context| {
             let context = context.trim();
@@ -2395,7 +2545,20 @@ impl KubernetesApplyProvider {
             ProvisioningStage::NetworkPolicyReady,
             Some(network_identity),
         ))?;
-        report(stage_update(ProvisioningStage::CredentialsReady, None))?;
+        // The pod manifest below mounts the guest-token Secret whenever guest
+        // credentials exist for this sandbox, so the Secret must be applied
+        // before the pod or the kubelet mount fails until the pod times out.
+        // The unstaged `provision` path gets this ordering from
+        // `provision_manifests`; this staged path must apply it explicitly.
+        if let Some(secret) = self.dry_run.guest_token_secret_manifest(sandbox_id) {
+            let secret_identity = self.apply_or_adopt_manifest(&secret, sandbox_id, cancelled)?;
+            report(stage_update(
+                ProvisioningStage::CredentialsReady,
+                Some(secret_identity),
+            ))?;
+        } else {
+            report(stage_update(ProvisioningStage::CredentialsReady, None))?;
+        }
 
         let pod = self.dry_run.pod_manifest(sandbox_id, spec);
         let pod_identity = self.apply_or_adopt_manifest(&pod, sandbox_id, cancelled)?;
@@ -3015,6 +3178,7 @@ impl KubernetesApplyProvider {
                 &spec.memory_limit,
             ));
         }
+        manifests.extend(self.dry_run.guest_token_secret_manifest(sandbox_id));
         if let Some(gateway) = self
             .dry_run
             .egress_gateway_pod_manifest(sandbox_id, &spec.network_egress)?
@@ -3055,6 +3219,7 @@ impl KubernetesApplyProvider {
                 self.dry_run
                     .fork_pvc_manifest(child_sandbox_id, snapshot_id, &spec.memory_limit),
             ];
+        manifests.extend(self.dry_run.guest_token_secret_manifest(child_sandbox_id));
         if let Some(gateway) = self
             .dry_run
             .egress_gateway_pod_manifest(child_sandbox_id, &spec.network_egress)?
@@ -3639,9 +3804,26 @@ async fn run_kubectl_command_async(
     if stdin_payload.is_some() {
         command.stdin(Stdio::piped());
     }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to spawn kubectl for {context}"))?;
+    // ETXTBSY: exec can transiently fail while another thread's fork holds a
+    // still-open write descriptor for the executable (rust-lang/cargo#7670).
+    // In production `kubectl` is never being rewritten, so retrying is free;
+    // in tests the fake kubectl scripts are written moments before use and
+    // concurrent test threads make this race real.
+    const ETXTBSY: i32 = 26;
+    let mut spawn_attempts: u64 = 0;
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(error) if error.raw_os_error() == Some(ETXTBSY) && spawn_attempts < 4 => {
+                spawn_attempts += 1;
+                tokio::time::sleep(Duration::from_millis(10 * spawn_attempts)).await;
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("failed to spawn kubectl for {context}")));
+            }
+        }
+    };
     let stdin_pipe = match stdin_payload {
         Some(_) => Some(child.stdin.take().context("failed to open kubectl stdin")?),
         None => None,
@@ -3972,6 +4154,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
                     "sshService": self.ssh_service_manifest(child_sandbox_id),
                     "desktopService": self.desktop_service_manifest(child_sandbox_id),
                     "networkPolicy": network_policy,
+                    "guestTokenSecret": self.guest_token_secret_manifest_redacted(child_sandbox_id),
                 }
             }),
         })

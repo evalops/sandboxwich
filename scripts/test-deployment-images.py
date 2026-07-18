@@ -9,6 +9,34 @@ IMAGE_RE = re.compile(r"^\s*image:\s*(ghcr\.io/evalops/sandboxwich-(?:api|worker
 
 
 class DeploymentImagesTest(unittest.TestCase):
+    def test_runtime_pins_and_installs_orb_executor_toolchain(self) -> None:
+        dockerfile = (ROOT / "deploy/runtime/ubuntu-dev/Dockerfile").read_text()
+        self.assertRegex(
+            dockerfile,
+            r"ARG ORB_EXECUTOR_IMAGE=ghcr\.io/evalops/sandboxwich-orb-executor@sha256:[0-9a-f]{64}",
+        )
+        self.assertIn(
+            "COPY --from=orb-executor /usr/local/bin/orb-executor /usr/local/bin/orb-executor",
+            dockerfile,
+        )
+        self.assertIn(
+            "COPY --from=orb-executor /usr/local/bin/codex /usr/local/bin/codex",
+            dockerfile,
+        )
+        self.assertIn(
+            "COPY --from=orb-executor /usr/local/bin/orb-deterministic-agent /usr/local/bin/orb-deterministic-agent",
+            dockerfile,
+        )
+        self.assertIn(
+            "COPY --from=orb-executor /opt/orb/agent-adapters.json /opt/orb/agent-adapters.json",
+            dockerfile,
+        )
+        self.assertIn("ENV CODEX_HOME=/home/sandbox/.codex", dockerfile)
+        self.assertIn(
+            "ENV ORB_AGENT_ADAPTERS_FILE=/opt/orb/agent-adapters.json",
+            dockerfile,
+        )
+
     def test_service_images_are_pinned_to_oci_digests(self) -> None:
         documents = {
             path: path.read_text()

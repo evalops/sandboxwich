@@ -87,6 +87,19 @@ start_docker() {
   dockerd >/tmp/sandboxwich-dockerd.log 2>&1 &
 }
 
+start_guest_agent() {
+  if [[ ! -x /usr/local/bin/sandboxwich-agent ]]; then
+    return
+  fi
+  if [[ -z "${SANDBOXWICH_API:-}" || -z "${SANDBOXWICH_SANDBOX_ID:-}" ]]; then
+    return
+  fi
+  if [[ ! -s "${SANDBOXWICH_API_TOKEN_FILE:-}" ]]; then
+    return
+  fi
+  sandboxwich-agent daemon >/tmp/sandboxwich-agent.log 2>&1 &
+}
+
 write_rootless_sshd_config() {
   install -d -m 0700 "${SSH_DIR}"
   if [[ ! -s "${SSH_DIR}/ssh_host_ed25519_key" ]]; then
@@ -115,6 +128,7 @@ fi
 install_authorized_keys
 start_docker
 start_desktop
+start_guest_agent
 
 if [[ "${EUID}" == "0" ]]; then
   exec /usr/sbin/sshd -D -e -p "${SSH_PORT}"

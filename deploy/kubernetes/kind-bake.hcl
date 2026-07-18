@@ -45,8 +45,11 @@ target "worker" {
 }
 
 target "runtime" {
-  context    = "deploy/runtime/ubuntu-dev"
-  dockerfile = "Dockerfile"
+  // Repo-root context: the ubuntu-dev Dockerfile builds sandboxwich-agent
+  // from the workspace (feat/guest-agent-runtime), so it needs Cargo.toml
+  // and crates/ in its build context, not just its own directory.
+  context    = "."
+  dockerfile = "deploy/runtime/ubuntu-dev/Dockerfile"
   tags       = ["sandboxwich-runtime:conformance"]
   cache-from = ["type=gha,scope=kind-runtime"]
   cache-to   = ["type=gha,mode=max,scope=kind-runtime"]
