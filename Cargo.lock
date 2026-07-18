@@ -1701,6 +1701,7 @@ name = "sandboxwich-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "cap-std",
  "chrono",
  "clap",
