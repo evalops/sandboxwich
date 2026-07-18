@@ -12,14 +12,7 @@ permissions:
 
 jobs:
   rust:
-    # Public repo -> Blacksmith lane (see kubernetes-conformance.yml's kind
-    # job for the ARC/Hetzner-ineligibility reasoning). Stayed at 4vcpu, not
-    # 8: step timing on a recent run showed cargo check+build compile at
-    # ~21s out of ~106s total, with cargo test (39s, not purely
-    # CPU-parallel) and container/toolchain setup (~44s, fixed regardless
-    # of vCPU) dominating -- compile doesn't dominate here, so doubling
-    # cores again wouldn't be expected to pay for itself.
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     services:
       postgres:
         # Pulled via the Docker Hub mirror to avoid docker.io's anonymous-pull
@@ -56,7 +49,7 @@ jobs:
             -p sandboxwich-bench
 
   clippy:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -66,7 +59,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   audit:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -80,7 +73,7 @@ jobs:
 
   msrv:
     name: msrv (1.95)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       # Cargo.toml declares `rust-version = "1.95"`; every other job floats
@@ -97,11 +90,6 @@ jobs:
 
   benchmark:
     name: benchmark (non-blocking)
-    # Deliberately NOT moved to Blacksmith with the rest of this workflow:
-    # its p95 budgets are calibrated against GitHub-hosted hardware, and
-    # switching the runner would change that baseline, making before/after
-    # numbers across PRs incomparable. Revisit only as a deliberate,
-    # separately-called-out change.
     runs-on: ubuntu-latest
     # Shared GitHub-hosted runners have enough CPU/IO variance that p95
     # latency budgets flake independently of the PR under test. This job
