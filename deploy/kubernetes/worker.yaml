@@ -169,6 +169,11 @@ spec:
               value: ""
             - name: SANDBOXWICH_RUNTIME_CLASS_NAME
               value: ""
+            # Optional provider-isolated orb-sidecar image. The worker advertises
+            # that capability only when this is digest-pinned and the RuntimeClass
+            # above is nonempty; the sidecar Pod uses that RuntimeClass too.
+            - name: SANDBOXWICH_ISOLATED_RESIDENT_PROCESS_IMAGE
+              value: ""
             # Required in apply mode: the worker refuses to start without an
             # explicit guest image so kind/local clusters cannot silently fall
             # back to a private ghcr.io default and ImagePullBackOff.

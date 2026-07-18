@@ -88,6 +88,32 @@ SANDBOXWICH_K8S_ENABLE_MUTATION=1 sandboxwich-worker --api http://sandboxwich-ap
 
 Apply mode uses the pod ServiceAccount and `kubectl` to create the sandbox PVC, Pod, NetworkPolicy, and Services in the dedicated sandbox namespace (`--sandbox-namespace`, falling back to `--namespace` when unset), waits for the sandbox Pod to become Ready, records the runtime resources through the API, and executes command jobs with `kubectl exec` against the sandbox container. The worker's RBAC in `deploy/kubernetes/worker.yaml` is scoped to the sandbox namespace only — it has no Role in the control-plane namespace where the API and its secrets live (GH-76).
 
+### Provider-isolated resident sidecars
+
+Set `SANDBOXWICH_ISOLATED_RESIDENT_PROCESS_IMAGE` to an immutable image digest
+and configure a nonempty `--runtime-class-name` to enable
+`provider_isolated_resident_process_v1`. The capability is never advertised in
+dry-run mode or when either setting is absent. The authoritative worker then
+runs `orb-sidecar` in a dedicated Pod rather than inside the guest Pod. The
+sidecar has separate mount, PID, and network namespaces, no service-account
+token, a read-only root filesystem, dropped capabilities, non-root identity,
+seccomp, and resource bounds. Its bootstrap is mounted from an immutable
+transient Secret; worker cleanup attempts to delete both resources on every
+terminal path.
+
+This boundary prevents a compromised guest Pod from directly reading or
+tracing the sidecar, but its host-level strength is only that of the selected
+RuntimeClass and cluster configuration. The two Pods do not share localhost,
+so integrations must provide an explicit network endpoint or relay. Bootstrap
+bytes remain API-process-local and are retryable only for the same
+generation/lease/digest fence until the exact process reports `Starting`; an
+API restart or replica failover cannot replay them. Once a sandbox has a
+sidecar record, executor bootstrap fails closed unless that sidecar is observed
+`Running` under a live lease. Operators can alert on
+`sandboxwich_sidecar_bootstrap_block_total{reason=...}` and inspect
+`sandboxwich_resident_process_count{state=...}` plus the bounded
+`sidecar_bootstrap_blocked` and `resident_process_terminal_failure` events.
+
 The double opt-in (`--confirm-apply` plus `SANDBOXWICH_K8S_ENABLE_MUTATION=1`) exists so a worker cannot mutate Kubernetes resources by accident in local runs, CI, and smoke tests. Be aware of its limits in production: the checked-in worker Deployment sets both halves unconditionally, because an apply-mode worker with the gate closed cannot process any work. In that deployment the gate is documentation, not a control — the Role scoping to the sandbox namespace is what bounds a compromised worker's blast radius. The worker logs a startup warning whenever both halves are force-enabled so the state is visible in pod logs.
 
 ### Orphan reconciliation

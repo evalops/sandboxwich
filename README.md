@@ -69,7 +69,9 @@ cargo run -p sandboxwich-cli -- events <sandbox-id>
 For a real disposable-cluster workflow, follow
 [the Kubernetes apply-mode guide](docs/kubernetes.md). It requires explicit
 mutation opt-in, a sandbox namespace, and an appropriate RuntimeClass for
-hostile workloads.
+hostile workloads. Provider-isolated `orb-sidecar` placement additionally
+requires a digest-pinned `SANDBOXWICH_ISOLATED_RESIDENT_PROCESS_IMAGE`; see the
+guide for the boundary and bootstrap-delivery limitations.
 
 By default the CLI talks to `http://127.0.0.1:3217`. Override it with `SANDBOXWICH_API`.
 
@@ -112,8 +114,9 @@ Guest agents must use a sandbox-bound token minted by the owning worker through
 `POST /v1/workers/{worker_id}/sandboxes/{sandbox_id}/guest-token`. Do not copy a
 worker token into a guest. Minting a replacement revokes the previous token;
 stopping or deleting the sandbox also revokes it. Guest tokens can claim only
-`run_command` work for their bound sandbox and cannot call worker administration
-routes.
+`run_command` and guest-owned `run_resident_process` work for their bound
+sandbox and cannot call worker administration routes. Provider-isolated
+`orb-sidecar` work is claimable only by the authoritative placed worker.
 
 ## Public API contract
 
