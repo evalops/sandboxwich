@@ -522,6 +522,7 @@ mod tests {
             },
             default_tenant_id: "default".to_string(),
             apex_callback_base_url: None,
+            placement_attestation_derivation_key: None,
             apex_waiters: Default::default(),
             resident_bootstraps: Default::default(),
             sandbox_lifetime: Default::default(),

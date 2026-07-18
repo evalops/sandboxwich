@@ -1094,6 +1094,10 @@ pub(crate) async fn try_spawn_once(
         // it fast in tests so assertions that expect prompt expiry don't
         // need long sleeps, for the tests that opt into the sweeper below.
         .env("SANDBOXWICH_SWEEP_INTERVAL_MS", "25")
+        .env(
+            "SANDBOXWICH_PLACEMENT_ATTESTATION_DERIVATION_KEY",
+            "sandboxwich-test-placement-attestation-key-32-bytes-minimum",
+        )
         // Disabled by default: most tests assert on synchronous
         // request/response behavior and don't want a background sweeper
         // mutating rows underneath them. Only `run_contract` (via

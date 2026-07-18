@@ -76,6 +76,8 @@ async fn openapi_covers_every_public_v1_operation() {
         ("GET", "/v1/sandboxes/{sandbox_id}/events"),
         ("POST", "/v1/resident-processes/{process_id}/bootstrap"),
         ("POST", "/v1/resident-processes/{process_id}/observations"),
+        ("POST", "/v1/resident-placement-attestations/redeem"),
+        ("POST", "/v1/resident-placement-attestations/validate"),
         ("GET", "/v1/desktop-sessions/{desktop_session_id}"),
         ("POST", "/v1/desktop-sessions/{desktop_session_id}/status"),
         ("POST", "/v1/desktop-sessions/{desktop_session_id}/access"),

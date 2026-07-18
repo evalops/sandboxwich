@@ -23,6 +23,7 @@ use sandboxwich_core::{
     ApexTaskInstructionsCallbackResponse, ClaimLeaseRequest, ClaimLeaseResponse,
     CompleteLeaseRequest, ErrorEnvelope, FailLeaseRequest, GuestTokenResponse, JobKind,
     LeaseResponse, MintGuestTokenRequest, ORB_SIDECAR_RESIDENT_PROCESS_NAME,
+    PROVIDER_ISOLATED_RESIDENT_PROCESS_IMAGE_LABEL,
     PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL,
     PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE, ProvisioningOperationResponse,
     ProvisioningStageUpdateRequest, RegisterWorkerRequest, RenewLeaseRequest,
@@ -360,6 +361,17 @@ struct ProviderArgs {
         env = "SANDBOXWICH_EGRESS_EXCLUDED_CIDRS_REPLACE"
     )]
     egress_excluded_cidrs_replace: bool,
+
+    /// Narrow destination CIDRs reachable only by provider-isolated sidecars
+    /// over TCP/443. Repeatable; comma-separated values are accepted through
+    /// the environment variable. Broad, link-local, loopback, multicast, and
+    /// malformed ranges are rejected at startup.
+    #[arg(
+        long = "isolated-sidecar-https-cidr",
+        env = "SANDBOXWICH_ISOLATED_SIDECAR_HTTPS_CIDRS",
+        value_delimiter = ','
+    )]
+    isolated_sidecar_https_cidrs: Vec<String>,
 
     /// Namespace containing pods allowed to reach a sandbox's ssh/desktop
     /// ports via the rendered ingress NetworkPolicy (GH-67). Defaults to
@@ -969,6 +981,13 @@ async fn main() -> anyhow::Result<()> {
                 args.provider.provider.apex_trusted_supervisor_v1,
             );
             add_provider_isolated_resident_process_label(&mut labels, provider_isolated_sidecar);
+            add_provider_isolated_resident_process_image_label(
+                &mut labels,
+                args.provider
+                    .isolated_resident_process_image
+                    .as_deref()
+                    .filter(|_| provider_isolated_sidecar),
+            );
             let response = register_worker(
                 &client,
                 &api,
@@ -1074,7 +1093,8 @@ fn provider_from_args(args: ProviderArgs) -> anyhow::Result<KubernetesDryRunProv
         provider.with_egress_excluded_cidrs_replace(args.egress_excluded_cidrs)
     } else {
         provider.with_egress_excluded_cidrs(args.egress_excluded_cidrs)
-    };
+    }
+    .with_isolated_sidecar_https_cidrs(args.isolated_sidecar_https_cidrs)?;
     Ok(provider
         .with_ingress_namespace(non_empty(args.ingress_namespace))
         .with_ingress_pod_selector(args.ingress_selector_label)
@@ -2635,6 +2655,8 @@ async fn report_resident_observation(
                     exit_code: observation.exit_code,
                     error_code: None,
                     error_message: None,
+                    provider_pod_uid: observation.pod_uid.clone(),
+                    provider_pod_name: Some(observation.pod_name.clone()),
                 })
                 .send()
                 .await?;
@@ -2734,6 +2756,8 @@ async fn report_resident_lost(
                     exit_code: None,
                     error_code: Some(error_code.to_string()),
                     error_message: Some(error_message.to_string()),
+                    provider_pod_name: None,
+                    provider_pod_uid: None,
                 })
                 .send()
                 .await?;
@@ -3229,6 +3253,9 @@ fn execute_isolated_resident_process_job(
             content: bootstrap.content,
             target_file: bootstrap.target_file,
             mode: bootstrap.mode,
+            placement_attestation: bootstrap
+                .placement_attestation
+                .map(|attestation| attestation.token.into_bytes()),
         },
     };
     let max_attempts = if restart_policy == ResidentProcessRestartPolicy::OnFailure {
@@ -3531,6 +3558,20 @@ fn add_provider_isolated_resident_process_label(
         labels.insert(
             PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL.to_string(),
             PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE.to_string(),
+        );
+    }
+}
+
+fn add_provider_isolated_resident_process_image_label(
+    labels: &mut BTreeMap<String, String>,
+    image: Option<&str>,
+) {
+    labels.remove(PROVIDER_ISOLATED_RESIDENT_PROCESS_IMAGE_LABEL);
+    if let Some(image) = image {
+        debug_assert!(image_is_digest_pinned(image));
+        labels.insert(
+            PROVIDER_ISOLATED_RESIDENT_PROCESS_IMAGE_LABEL.to_string(),
+            image.to_string(),
         );
     }
 }

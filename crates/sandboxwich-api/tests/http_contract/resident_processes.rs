@@ -54,10 +54,17 @@ async fn provisioned_sandbox_with_guest(
             // at one proves both persistent resident kinds can still be claimed.
             max_concurrent_jobs: Some(1),
             labels: if provider_isolated_sidecar {
-                BTreeMap::from([(
-                    PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL.into(),
-                    PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE.into(),
-                )])
+                BTreeMap::from([
+                    (
+                        PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL.into(),
+                        PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE.into(),
+                    ),
+                    ("provider_mode".into(), "apply".into()),
+                    (
+                        "provider_isolated_resident_process_image".into(),
+                        "ghcr.io/evalops/orb-sidecar@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                    ),
+                ])
             } else {
                 BTreeMap::new()
             },
@@ -554,6 +561,8 @@ pub(crate) async fn resident_process_create_is_idempotent_tenant_scoped_and_reda
             exit_code: None,
             error_code: None,
             error_message: None,
+            provider_pod_name: None,
+            provider_pod_uid: None,
         })
         .send()
         .await
@@ -573,6 +582,8 @@ pub(crate) async fn resident_process_create_is_idempotent_tenant_scoped_and_reda
             exit_code: None,
             error_code: None,
             error_message: None,
+            provider_pod_name: None,
+            provider_pod_uid: None,
         })
         .send()
         .await
@@ -1006,6 +1017,8 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
             exit_code: None,
             error_code: None,
             error_message: None,
+            provider_pod_name: Some("sidecar-pod-1".into()),
+            provider_pod_uid: Some("sidecar-pod-uid-1".into()),
         })
         .send()
         .await
@@ -1165,6 +1178,8 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
         exit_code: None,
         error_code: None,
         error_message: None,
+        provider_pod_name: Some("sidecar-pod-1".into()),
+        provider_pod_uid: Some("sidecar-pod-uid-1".into()),
     };
     for response in [
         guest_client
@@ -1257,6 +1272,8 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
         exit_code: None,
         error_code: None,
         error_message: None,
+        provider_pod_name: None,
+        provider_pod_uid: None,
     };
     for response in [
         sidecar_worker_client
@@ -1413,6 +1430,8 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
         exit_code: None,
         error_code: None,
         error_message: None,
+        provider_pod_name: Some("wrong-sidecar-pod".into()),
+        provider_pod_uid: Some("wrong-sidecar-pod-uid".into()),
     };
     assert_eq!(
         wrong_worker_client
@@ -1463,6 +1482,8 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
             exit_code: None,
             error_code: None,
             error_message: None,
+            provider_pod_name: Some("sidecar-pod-1".into()),
+            provider_pod_uid: Some("sidecar-pod-uid-1".into()),
         })
         .send()
         .await
@@ -1561,6 +1582,8 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
             exit_code: None,
             error_code: None,
             error_message: None,
+            provider_pod_name: Some("sidecar-pod-2".into()),
+            provider_pod_uid: Some("sidecar-pod-uid-2".into()),
         })
         .send()
         .await
@@ -1616,6 +1639,8 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
             exit_code: None,
             error_code: None,
             error_message: None,
+            provider_pod_name: None,
+            provider_pod_uid: None,
         })
         .send()
         .await
@@ -1662,6 +1687,133 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
         .await
         .unwrap();
     assert_eq!(sidecar_bootstrap.content, b"sidecar-canary-secret");
+    let placement = sidecar_bootstrap
+        .placement_attestation
+        .expect("v2 sidecar bootstrap carries a one-time placement attestation");
+    assert!(placement.token.starts_with("swpa2_"));
+    assert!(!format!("{placement:?}").contains(&placement.token));
+    let sidecar_bootstrap_retry: ResidentProcessBootstrapReadResponse = sidecar_worker_client
+        .post(format!(
+            "{}/resident-processes/{}/bootstrap",
+            server.base_url, sidecar_created.resident_process.id
+        ))
+        .json(&ResidentProcessBootstrapReadRequest {
+            generation: sidecar_created.resident_process.generation,
+            lease_id: replacement_sidecar_lease.id.0,
+            expected_sha256: sidecar_created
+                .resident_process
+                .bootstrap_sha256
+                .clone()
+                .unwrap(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        sidecar_bootstrap_retry
+            .placement_attestation
+            .expect("exact bootstrap retry carries the same proof")
+            .token,
+        placement.token
+    );
+
+    let redeem_key = Uuid::now_v7();
+    let redeem = RedeemResidentPlacementAttestationRequest {
+        token: placement.token.clone(),
+        idempotency_key: redeem_key,
+    };
+    let redeemed: ResidentPlacementAttestationResponse = client
+        .post(format!(
+            "{}/v1/resident-placement-attestations/redeem",
+            server.base_url
+        ))
+        .json(&redeem)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(redeemed.claims.version, 2);
+    assert_eq!(redeemed.claims.tenant_id, "default");
+    assert_eq!(redeemed.claims.sandbox_id, sandbox_id);
+    assert_eq!(
+        redeemed.claims.resident_process_id,
+        sidecar_created.resident_process.id
+    );
+    assert_eq!(redeemed.claims.lease_id, replacement_sidecar_lease.id.0);
+    assert_eq!(redeemed.claims.provider_pod_uid, "sidecar-pod-uid-2");
+    assert_eq!(redeemed.claims.provider_mode, "apply");
+    assert_eq!(
+        redeemed.claims.runtime_image,
+        "ghcr.io/evalops/orb-sidecar@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    assert!(redeemed.claims.attestation_expires_at <= redeemed.claims.lease_expires_at);
+
+    let retry: ResidentPlacementAttestationResponse = client
+        .post(format!(
+            "{}/v1/resident-placement-attestations/redeem",
+            server.base_url
+        ))
+        .json(&redeem)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(retry.claims.attestation_id, redeemed.claims.attestation_id);
+
+    let distinct_replay = client
+        .post(format!(
+            "{}/v1/resident-placement-attestations/redeem",
+            server.base_url
+        ))
+        .json(&RedeemResidentPlacementAttestationRequest {
+            token: placement.token.clone(),
+            idempotency_key: Uuid::now_v7(),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(distinct_replay.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let validated: ResidentPlacementAttestationResponse = client
+        .post(format!(
+            "{}/v1/resident-placement-attestations/validate",
+            server.base_url
+        ))
+        .json(&ValidateResidentPlacementAttestationRequest {
+            attestation_id: redeemed.claims.attestation_id,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(validated.claims.provider_pod_uid, "sidecar-pod-uid-2");
+
+    if let Some(database_path) = server.database_url.strip_prefix("sqlite://") {
+        let database_bytes = std::fs::read(database_path).unwrap();
+        assert!(
+            !database_bytes
+                .windows(placement.token.len())
+                .any(|window| window == placement.token.as_bytes()),
+            "raw placement proof must not be persisted"
+        );
+    }
 
     // A terminal resident transition emits one bounded durable event. A
     // duplicate terminal observation must not create success/heartbeat spam,
@@ -1674,6 +1826,8 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
         exit_code: Some(1),
         error_code: Some("terminal-error-canary".into()),
         error_message: None,
+        provider_pod_name: None,
+        provider_pod_uid: None,
     };
     for _ in 0..2 {
         guest_client
@@ -1713,6 +1867,18 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
     assert_eq!(stopped_renewal.status(), reqwest::StatusCode::CONFLICT);
     let stopped_error: ErrorEnvelope = stopped_renewal.json().await.unwrap();
     assert_eq!(stopped_error.code, "resident_process_stopped");
+    let stopped_validation = client
+        .post(format!(
+            "{}/v1/resident-placement-attestations/validate",
+            server.base_url
+        ))
+        .json(&ValidateResidentPlacementAttestationRequest {
+            attestation_id: redeemed.claims.attestation_id,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stopped_validation.status(), reqwest::StatusCode::CONFLICT);
     sqlx::any::install_default_drivers();
     let pool = sqlx::any::AnyPoolOptions::new()
         .max_connections(1)
@@ -1751,6 +1917,21 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
         })
         .build()
         .unwrap();
+    assert_eq!(
+        tenant_b
+            .post(format!(
+                "{}/v1/resident-placement-attestations/validate",
+                server.base_url
+            ))
+            .json(&ValidateResidentPlacementAttestationRequest {
+                attestation_id: redeemed.claims.attestation_id,
+            })
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
     assert_eq!(
         tenant_b.get(&sidecar_url).send().await.unwrap().status(),
         reqwest::StatusCode::NOT_FOUND
@@ -1973,6 +2154,8 @@ async fn bootstrap_delivery_handles_starting_before_delivery_and_first_running_a
             exit_code: None,
             error_code: None,
             error_message: None,
+            provider_pod_name: None,
+            provider_pod_uid: None,
         })
         .send()
         .await
@@ -2077,6 +2260,8 @@ async fn bootstrap_delivery_handles_starting_before_delivery_and_first_running_a
             exit_code: None,
             error_code: None,
             error_message: None,
+            provider_pod_name: None,
+            provider_pod_uid: None,
         })
         .send()
         .await
@@ -2175,6 +2360,8 @@ async fn terminal_and_tenant_stop_paths_reclaim_exact_bootstrap_entries() {
                         exit_code: Some(1),
                         error_code: Some("test-terminal".into()),
                         error_message: None,
+                        provider_pod_name: None,
+                        provider_pod_uid: None,
                     })
                     .send()
                     .await
@@ -2399,6 +2586,8 @@ async fn desired_stop_expiry_is_clean_and_replay_safe() {
             exit_code: Some(0),
             error_code: None,
             error_message: None,
+            provider_pod_name: None,
+            provider_pod_uid: None,
         })
         .send()
         .await
@@ -2483,6 +2672,8 @@ async fn delivered_bootstrap_cannot_be_requeued_before_first_observation() {
             exit_code: None,
             error_code: Some("injected_spawn_failure".to_string()),
             error_message: Some("injected failure before terminal lease update".to_string()),
+            provider_pod_name: None,
+            provider_pod_uid: None,
         })
         .send()
         .await

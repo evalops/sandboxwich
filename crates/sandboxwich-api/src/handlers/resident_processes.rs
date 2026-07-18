@@ -4,6 +4,9 @@ use crate::db::Database;
 use crate::error::ApiError;
 use crate::handlers::commands::{insert_event, insert_event_on_connection};
 use crate::handlers::jobs::{add_provision_spec_to_payload, insert_job_on_connection};
+use crate::handlers::resident_attestations::{
+    issue_resident_placement_attestation, record_provider_pod_identity,
+};
 use crate::rows::{parse_timestamp, row_to_job, row_to_resident_process};
 use crate::state::{
     AppState, LiveResidentBootstrap, Principal, ResidentBootstrapDeliveryError,
@@ -150,6 +153,13 @@ async fn provider_isolation_version(
         .map_err(|_| ApiError::internal("database contains invalid provider isolation version"))
 }
 
+fn supported_provider_isolation_version(version: u32) -> bool {
+    matches!(
+        version,
+        PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_V1 | PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION
+    )
+}
+
 async fn placed_worker_supports_provider_isolated_resident_process(
     db: &Database,
     sandbox_id: SandboxId,
@@ -212,7 +222,7 @@ pub(crate) async fn executor_sidecar_is_ready_for_claim(
     let lease_status: Option<String> = row.try_get("lease_status")?;
     let lease_expires_at: Option<String> = row.try_get("lease_expires_at")?;
     Ok(row_tenant_id == tenant_id
-        && isolation_version == i64::from(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION)
+        && u32::try_from(isolation_version).is_ok_and(supported_provider_isolation_version)
         && desired_state == ResidentProcessDesiredState::Running.as_db_str()
         && observed_state == ResidentProcessObservedState::Running.as_db_str()
         && lease_status.as_deref() == Some(LeaseStatus::Active.as_db_str())
@@ -327,15 +337,13 @@ async fn ensure_sidecar_ready_if_required(
         // state gate (or fail to gate) this tenant's bootstrap read.
         return Ok(());
     }
-    if provider_isolation_version(db, sidecar.id).await?
-        != PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION
-    {
+    if !supported_provider_isolation_version(provider_isolation_version(db, sidecar.id).await?) {
         return block_executor_bootstrap(
             db,
             &sidecar,
             SidecarBootstrapBlockReason::NotRunning,
             format!(
-                "sandbox {sandbox_id} has an orb-sidecar resident process that was not admitted under the provider-isolated v1 contract; refusing to hand out the orb-executor bootstrap credential"
+                "sandbox {sandbox_id} has an orb-sidecar resident process that was not admitted under a supported provider-isolation contract; refusing to hand out the orb-executor bootstrap credential"
             ),
         )
         .await;
@@ -478,7 +486,7 @@ pub(crate) async fn put_resident_process(
         return Err(ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: "resident_sidecar_worker_unsupported",
-            message: "orb-sidecar requires its placed worker to advertise provider-isolated resident-process v1 support".into(),
+            message: "orb-sidecar requires its placed worker to advertise provider-isolated resident-process v2 support".into(),
         });
     }
     let bootstrap_digest = request
@@ -488,12 +496,13 @@ pub(crate) async fn put_resident_process(
 
     if let Ok(current) = fetch_named_resident_process(&state.db, sandbox_id, &name).await {
         if name == ORB_SIDECAR_RESIDENT_PROCESS_NAME
-            && provider_isolation_version(&state.db, current.id).await?
-                != PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION
+            && !supported_provider_isolation_version(
+                provider_isolation_version(&state.db, current.id).await?,
+            )
         {
             return Err(ApiError::conflict_code(
                 "resident_sidecar_isolation_upgrade_required",
-                "the existing orb-sidecar predates provider-isolated v1 admission and cannot be reused",
+                "the existing orb-sidecar predates supported provider isolation and cannot be reused",
             ));
         }
         if request.expected_generation != current.generation {
@@ -861,7 +870,7 @@ pub(crate) async fn read_resident_process_bootstrap(
                where ready_sidecar.sandbox_id = target.sandbox_id
                  and ready_sidecar.tenant_id = target.tenant_id
                  and ready_sidecar.name = {}
-                 and ready_sidecar.provider_isolation_version = {}
+                 and ready_sidecar.provider_isolation_version in ({}, {})
                  and ready_sidecar.desired_state = 'running'
                  and ready_sidecar.observed_state = 'running'
                  and live_lease.status = 'active'
@@ -886,6 +895,7 @@ pub(crate) async fn read_resident_process_bootstrap(
         state.db.placeholder(16),
         state.db.placeholder(17),
         state.db.placeholder(18),
+        state.db.placeholder(19),
     );
     let consumed = sqlx::query(&consume_sql)
         .bind(now.to_rfc3339())
@@ -904,6 +914,7 @@ pub(crate) async fn read_resident_process_bootstrap(
         .bind(ORB_EXECUTOR_RESIDENT_PROCESS_NAME)
         .bind(ORB_SIDECAR_RESIDENT_PROCESS_NAME)
         .bind(ORB_SIDECAR_RESIDENT_PROCESS_NAME)
+        .bind(i64::from(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_V1))
         .bind(i64::from(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION))
         .bind(now.to_rfc3339())
         .execute(&state.db.pool)
@@ -975,6 +986,22 @@ pub(crate) async fn read_resident_process_bootstrap(
             message: "resident bootstrap is unavailable or already consumed".into(),
         });
     }
+    let placement_attestation = if process.name == ORB_SIDECAR_RESIDENT_PROCESS_NAME
+        && provider_isolation_version(&state.db, process.id).await?
+            == PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION
+    {
+        issue_resident_placement_attestation(
+            &state,
+            &ctx.tenant_id,
+            process.sandbox_id,
+            process.id,
+            request.generation,
+            request.lease_id,
+        )
+        .await?
+    } else {
+        None
+    };
     let bootstrap = delivery.mark_delivered().map_err(|_| ApiError {
         status: StatusCode::GONE,
         code: "resident_bootstrap_unavailable",
@@ -986,6 +1013,7 @@ pub(crate) async fn read_resident_process_bootstrap(
         sha256: bootstrap.sha256,
         target_file: bootstrap.target_file,
         mode: bootstrap.mode,
+        placement_attestation,
     }))
 }
 
@@ -1049,6 +1077,31 @@ pub(crate) async fn observe_resident_process(
             "resident_process_generation_conflict",
             "resident observation does not match the active lease",
         ));
+    }
+    if process.name == ORB_SIDECAR_RESIDENT_PROCESS_NAME
+        && provider_isolation_version(&state.db, process.id).await?
+            == PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION
+        && matches!(
+            request.observed_state,
+            ResidentProcessObservedState::Starting | ResidentProcessObservedState::Running
+        )
+    {
+        let pod_name = request.provider_pod_name.as_deref().ok_or_else(|| {
+            ApiError::bad_request("provider-isolated sidecar observation requires providerPodName")
+        })?;
+        let pod_uid = request.provider_pod_uid.as_deref().ok_or_else(|| {
+            ApiError::bad_request("provider-isolated sidecar observation requires providerPodUid")
+        })?;
+        record_provider_pod_identity(
+            &state.db,
+            &ctx.tenant_id,
+            process.id,
+            request.generation,
+            request.lease_id,
+            pod_name,
+            pod_uid,
+        )
+        .await?;
     }
     let now = Utc::now();
     let terminal_failure = matches!(

@@ -22,7 +22,7 @@ mod state;
 mod tests;
 mod util;
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Context;
 use tracing_subscriber::EnvFilter;
@@ -113,6 +113,9 @@ async fn main() -> anyhow::Result<()> {
             },
             default_tenant_id: config.default_tenant_id,
             apex_callback_base_url: config.apex_callback_base_url,
+            placement_attestation_derivation_key: config
+                .placement_attestation_derivation_key
+                .map(Arc::<str>::from),
             apex_waiters: Default::default(),
             resident_bootstraps,
             sandbox_lifetime: config.sandbox_lifetime,

@@ -8,6 +8,7 @@ use crate::handlers::files::*;
 use crate::handlers::jobs::*;
 use crate::handlers::leases::*;
 use crate::handlers::operations::*;
+use crate::handlers::resident_attestations::*;
 use crate::handlers::resident_processes::*;
 use crate::handlers::sandboxes::*;
 use crate::handlers::snapshots::*;
@@ -154,6 +155,20 @@ pub(crate) fn app(state: AppState) -> Router {
         )
         .route_layer(middleware::from_fn(require_tenant_principal));
 
+    // Placement proofs use purpose-built rotate-once idempotency and must be
+    // live-revalidated on every retry, so they deliberately bypass the
+    // generic response replay middleware.
+    let resident_attestation_routes = Router::new()
+        .route(
+            "/resident-placement-attestations/redeem",
+            post(redeem_resident_placement_attestation),
+        )
+        .route(
+            "/resident-placement-attestations/validate",
+            post(validate_resident_placement_attestation),
+        )
+        .route_layer(middleware::from_fn(require_tenant_principal));
+
     // Registration returns a one-time raw worker credential. It deliberately does not use the
     // generic response-replay middleware because raw worker tokens must never be persisted.
     let registration_routes = Router::new()
@@ -239,13 +254,17 @@ pub(crate) fn app(state: AppState) -> Router {
         state.clone(),
         enforce_tenant_limits,
     ));
+    let resident_attestation_routes = resident_attestation_routes.layer(
+        middleware::from_fn_with_state(state.clone(), enforce_tenant_limits),
+    );
 
     let versioned_routes = Router::new()
         .merge(tenant_routes.clone())
         .merge(ephemeral_tenant_routes.clone())
         .merge(worker_routes.clone())
         .merge(guest_routes.clone())
-        .merge(registration_routes.clone());
+        .merge(registration_routes.clone())
+        .merge(resident_attestation_routes.clone());
 
     let operator_routes = Router::new()
         .route(
@@ -267,6 +286,7 @@ pub(crate) fn app(state: AppState) -> Router {
         .merge(worker_routes)
         .merge(guest_routes)
         .merge(registration_routes)
+        .merge(resident_attestation_routes)
         .layer(DefaultBodyLimit::max(DEFAULT_BODY_LIMIT_BYTES))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, auth_and_tenant))

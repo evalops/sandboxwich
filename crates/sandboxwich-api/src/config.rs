@@ -41,6 +41,7 @@ pub(crate) struct ApiConfig {
     pub(crate) sweep_interval_ms: u64,
     pub(crate) disable_expiry_sweeper: bool,
     pub(crate) apex_callback_base_url: Option<String>,
+    pub(crate) placement_attestation_derivation_key: Option<String>,
     pub(crate) sandbox_lifetime: SandboxLifetimeConfig,
 }
 
@@ -114,6 +115,19 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
     let disable_expiry_sweeper = parse_env_bool("SANDBOXWICH_DISABLE_EXPIRY_SWEEPER", false)?;
     let apex_callback_base_url =
         parse_apex_callback_base_url(std::env::var("SANDBOXWICH_APEX_CALLBACK_BASE_URL").ok())?;
+    let placement_attestation_derivation_key =
+        std::env::var("SANDBOXWICH_PLACEMENT_ATTESTATION_DERIVATION_KEY")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+    if placement_attestation_derivation_key
+        .as_ref()
+        .is_some_and(|key| key.len() < 32)
+    {
+        anyhow::bail!(
+            "SANDBOXWICH_PLACEMENT_ATTESTATION_DERIVATION_KEY must contain at least 32 bytes"
+        );
+    }
     let sandbox_lifetime = SandboxLifetimeConfig {
         default_max_lifetime_seconds: parse_env_optional_u64(
             "SANDBOXWICH_DEFAULT_MAX_LIFETIME_SECONDS",
@@ -137,6 +151,7 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
         sweep_interval_ms,
         disable_expiry_sweeper,
         apex_callback_base_url,
+        placement_attestation_derivation_key,
         sandbox_lifetime,
     })
 }

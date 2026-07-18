@@ -436,6 +436,8 @@ async fn resident_process_observation_resets_the_idle_clock() {
             exit_code: None,
             error_code: None,
             error_message: None,
+            provider_pod_name: None,
+            provider_pod_uid: None,
         })
         .send()
         .await

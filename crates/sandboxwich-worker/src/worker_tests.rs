@@ -246,6 +246,7 @@ fn resident_bootstrap() -> ResidentProcessBootstrapReadResponse {
         sha256: "a".repeat(64),
         target_file: "/run/sandboxwich/bootstrap/token".to_string(),
         mode: 0o400,
+        placement_attestation: None,
     }
 }
 
@@ -1031,10 +1032,19 @@ fn provider_isolated_sidecar_label_requires_apply_digest_and_runtime_class() {
     add_provider_isolated_resident_process_label(&mut labels, true);
     assert_eq!(
         labels.get(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL),
-        Some(&"1".to_string())
+        Some(&PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE.to_string())
+    );
+    add_provider_isolated_resident_process_image_label(&mut labels, Some(digest));
+    assert_eq!(
+        labels
+            .get(PROVIDER_ISOLATED_RESIDENT_PROCESS_IMAGE_LABEL)
+            .map(String::as_str),
+        Some(digest)
     );
     add_provider_isolated_resident_process_label(&mut labels, false);
+    add_provider_isolated_resident_process_image_label(&mut labels, None);
     assert!(!labels.contains_key(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL));
+    assert!(!labels.contains_key(PROVIDER_ISOLATED_RESIDENT_PROCESS_IMAGE_LABEL));
 }
 
 #[test]
