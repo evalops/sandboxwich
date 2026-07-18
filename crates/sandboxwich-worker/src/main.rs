@@ -138,6 +138,9 @@ struct RunArgs {
     #[arg(long)]
     max_concurrent_jobs: Option<u32>,
 
+    #[arg(long, env = "SANDBOXWICH_MAX_RESIDENT_PROCESSES", default_value_t = 8)]
+    max_resident_processes: usize,
+
     #[arg(long)]
     lease_seconds: Option<u64>,
 
@@ -204,6 +207,9 @@ struct WorkLoopArgs {
 
     #[arg(long)]
     max_iterations: Option<u64>,
+
+    #[arg(long, env = "SANDBOXWICH_MAX_RESIDENT_PROCESSES", default_value_t = 8)]
+    max_resident_processes: usize,
 
     #[arg(long = "label", value_parser = parse_label)]
     label: Vec<(String, String)>,
@@ -978,6 +984,7 @@ async fn main() -> anyhow::Result<()> {
                     lease_seconds: args.lease_seconds,
                     idle_sleep_ms: args.idle_sleep_ms,
                     max_iterations: args.max_iterations,
+                    max_resident_processes: args.max_resident_processes,
                     drain_timeout_secs: args.drain_timeout_secs,
                     label: labels.into_iter().collect(),
                     provider: args.provider,
@@ -1725,7 +1732,8 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
             .ok()
             .as_deref(),
     );
-    let claim_kinds = claim_kinds_for_provider_mode(args.provider.provider_mode);
+    let provider_mode = args.provider.provider_mode;
+    let max_resident_processes = args.max_resident_processes.max(1);
     let provider = Arc::new(runtime_provider_from_args(args.provider)?);
     let labels: BTreeMap<_, _> = args.label.into_iter().collect();
     let drain_timeout = Duration::from_secs(args.drain_timeout_secs);
@@ -1832,7 +1840,10 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
             worker_id: args.worker_id,
             lease_seconds: args.lease_seconds,
             operation_id: Some(Uuid::now_v7()),
-            kinds: claim_kinds.clone(),
+            kinds: claim_kinds_for_work_loop(
+                provider_mode,
+                resident_tasks.len() < max_resident_processes,
+            ),
         };
         let response = match with_retries("claim lease", API_RETRY_ATTEMPTS, || {
             claim(client, api, claim_args.clone())
@@ -3110,6 +3121,31 @@ fn claim_kinds_for_provider_mode(provider_mode: ProviderModeArg) -> Option<Vec<J
         JobKind::StopSandbox,
         JobKind::ResumeSandbox,
         JobKind::RunCommand,
+        JobKind::ApexTaskInstructions,
+        JobKind::RunPrompt,
+        JobKind::CreateSnapshot,
+        JobKind::ForkSandbox,
+    ])
+}
+
+fn claim_kinds_for_work_loop(
+    provider_mode: ProviderModeArg,
+    include_resident_processes: bool,
+) -> Option<Vec<JobKind>> {
+    let kinds = claim_kinds_for_provider_mode(provider_mode);
+    if include_resident_processes {
+        return kinds;
+    }
+    if let Some(mut kinds) = kinds {
+        kinds.retain(|kind| *kind != JobKind::RunResidentProcess);
+        return Some(kinds);
+    }
+    Some(vec![
+        JobKind::ProvisionSandbox,
+        JobKind::StopSandbox,
+        JobKind::ResumeSandbox,
+        JobKind::RunCommand,
+        JobKind::MaterializeFile,
         JobKind::ApexTaskInstructions,
         JobKind::RunPrompt,
         JobKind::CreateSnapshot,

@@ -101,6 +101,10 @@ seccomp, and resource bounds. Its bootstrap is mounted from an immutable
 transient Secret; worker cleanup attempts to delete both resources on every
 terminal path.
 
+`SANDBOXWICH_MAX_RESIDENT_PROCESSES` (default `8`, minimum effective value `1`)
+bounds concurrent sidecar supervisors per worker. At the bound, the worker
+continues claiming non-resident work but leaves additional sidecars queued.
+
 This boundary prevents a compromised guest Pod from directly reading or
 tracing the sidecar, but its host-level strength is only that of the selected
 RuntimeClass and cluster configuration. The two Pods do not share localhost,

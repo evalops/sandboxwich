@@ -1194,6 +1194,23 @@ fn standalone_work_paths_filter_dry_run_materialization_claims() {
 }
 
 #[test]
+fn full_resident_supervisor_excludes_only_resident_claims() {
+    let dry_run = claim_kinds_for_work_loop(ProviderModeArg::DryRun, false)
+        .expect("dry-run claim is explicitly filtered");
+    assert!(!dry_run.contains(&JobKind::RunResidentProcess));
+    assert!(!dry_run.contains(&JobKind::MaterializeFile));
+    assert!(dry_run.contains(&JobKind::RunCommand));
+
+    let apply = claim_kinds_for_work_loop(ProviderModeArg::Apply, false)
+        .expect("a full apply worker must use an explicit non-resident filter");
+    assert!(!apply.contains(&JobKind::RunResidentProcess));
+    assert!(apply.contains(&JobKind::MaterializeFile));
+    assert!(apply.contains(&JobKind::RunCommand));
+
+    assert!(claim_kinds_for_work_loop(ProviderModeArg::Apply, true).is_none());
+}
+
+#[test]
 fn capabilities_from_args_report_only_the_typed_isolation_profile() {
     let gvisor = capabilities_from_args(
         Vec::new(),

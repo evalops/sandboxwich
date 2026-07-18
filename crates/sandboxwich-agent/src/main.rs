@@ -24,12 +24,11 @@ use sandboxwich_core::{
     AgentHealthResponse, AppendCommandOutputRequest, ClaimLeaseRequest, ClaimLeaseResponse,
     CommandOutputStream, CompleteLeaseRequest, DEFAULT_COMMAND_TIMEOUT_SECS, FailLeaseRequest,
     GUEST_AGENT_CAPABILITY_REPORT_CHECK, GuestAgentCapabilityReport, GuestStatus,
-    GuestTokenResponse, JobKind, LeaseId, LeaseResponse, MintGuestTokenRequest,
-    ORB_EXECUTOR_RESIDENT_PROCESS_NAME, RenewLeaseRequest, ResidentProcessBootstrapReadRequest,
-    ResidentProcessBootstrapReadResponse, ResidentProcessId, ResidentProcessObservationRequest,
-    ResidentProcessObservedState, ResidentProcessRestartPolicy, SandboxId,
-    UpdateGuestHealthRequest, WorkerJobResult, build_api_client, resident_process_run_as_uid,
-    validate_agent_command_request,
+    GuestTokenResponse, JobKind, LeaseId, LeaseResponse, MintGuestTokenRequest, RenewLeaseRequest,
+    ResidentProcessBootstrapReadRequest, ResidentProcessBootstrapReadResponse, ResidentProcessId,
+    ResidentProcessObservationRequest, ResidentProcessObservedState, ResidentProcessRestartPolicy,
+    SandboxId, UpdateGuestHealthRequest, WorkerJobResult, build_api_client,
+    resident_process_run_as_uid, validate_agent_command_request,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -376,7 +375,7 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
     // blip in either should be retried with backoff rather than tearing down the daemon.
     let mut claim_budget = HeartbeatFailureBudget::new(args.claim_failure_threshold.max(1));
     let mut claim_backoff = Backoff::new(Duration::from_millis(args.idle_sleep_ms.max(1)));
-    let mut resident_processes = ResidentProcessSupervisor::new(args.max_resident_processes.max(1));
+    let mut resident_processes = ResidentProcessSupervisor::new(args.max_resident_processes);
 
     let mut daemon_result = async {
         loop {
@@ -411,6 +410,7 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
                             worker_id,
                             sandbox_id,
                             args.lease_seconds,
+                            !resident_processes.is_full(),
                         )
                     })
                     .await?;
@@ -1155,6 +1155,7 @@ async fn claim_lease(
     worker_id: Uuid,
     sandbox_id: SandboxId,
     lease_seconds: Option<u64>,
+    include_resident_processes: bool,
 ) -> Result<ClaimLeaseResponse, AgentRequestError> {
     // Scope the claim to this daemon's own sandbox and to the only job kind it
     // knows how to execute. `client` here should be the sandbox-scoped guest
@@ -1172,11 +1173,19 @@ async fn claim_lease(
         .json(&ClaimLeaseRequest {
             lease_seconds,
             sandbox_id: Some(sandbox_id),
-            kinds: Some(vec![JobKind::RunCommand, JobKind::RunResidentProcess]),
+            kinds: Some(guest_claim_kinds(include_resident_processes)),
         })
         .send()
         .await?;
     decode_json(response).await
+}
+
+fn guest_claim_kinds(include_resident_processes: bool) -> Vec<JobKind> {
+    let mut kinds = vec![JobKind::RunCommand];
+    if include_resident_processes {
+        kinds.push(JobKind::RunResidentProcess);
+    }
+    kinds
 }
 
 async fn renew_lease(
@@ -1348,15 +1357,9 @@ async fn handle_lease(
              ({violation}); failing with retry so the intended executor can claim it instead",
             lease.id, lease.job.id
         );
-        let response = client
-            .post(format!("{api}/leases/{}/fail", lease.id))
-            .json(&FailLeaseRequest {
-                error: violation.to_string(),
-                retry: true,
-            })
-            .send()
-            .await?;
-        return decode_json(response).await.map_err(Into::into);
+        return fail_lease_retryable(client, api, lease.id, violation.to_string())
+            .await
+            .map_err(Into::into);
     }
 
     if lease.job.kind == JobKind::RunResidentProcess {
@@ -1485,31 +1488,10 @@ async fn handle_resident_process(
     api: &str,
     lease: sandboxwich_core::JobLease,
 ) -> anyhow::Result<LeaseResponse> {
-    let process_id: ResidentProcessId = serde_json::from_value(
-        lease
-            .job
-            .payload
-            .get("residentProcessId")
-            .cloned()
-            .context("residentProcessId is missing")?,
-    )
-    .context("residentProcessId is invalid")?;
-    let generation = lease
-        .job
-        .payload
-        .get("generation")
-        .and_then(serde_json::Value::as_u64)
-        .context("resident generation is missing")?;
-    // Older queued jobs (pre-#176) never wrote a "name" field; default to
-    // orb-executor, which preserves the pre-#176 behavior of inheriting the
-    // agent's own uid rather than attempting a privilege drop.
-    let name = lease
-        .job
-        .payload
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(ORB_EXECUTOR_RESIDENT_PROCESS_NAME)
-        .to_string();
+    let metadata = ResidentProcessTaskMetadata::from_lease(&lease)?;
+    let process_id = metadata.process_id;
+    let generation = metadata.generation;
+    let name = metadata.name;
     let run_as_uid = resident_process_run_as_uid(&name);
     let argv: Vec<String> = serde_json::from_value(
         lease
@@ -1681,15 +1663,14 @@ async fn handle_resident_process(
                             error_message: Some("resident process lease renewal was lost".into()),
                         },
                     ).await?;
-                    let response = client
-                        .post(format!("{api}/leases/{}/fail", lease.id))
-                        .json(&FailLeaseRequest {
-                            error: "resident process lease renewal was lost".into(),
-                            retry: true,
-                        })
-                        .send()
-                        .await?;
-                    return decode_json(response).await.map_err(Into::into);
+                    return fail_lease_retryable(
+                        client,
+                        api,
+                        lease.id,
+                        "resident process lease renewal was lost".into(),
+                    )
+                    .await
+                    .map_err(Into::into);
                 }
             };
             last_exit_code = status.code();
@@ -2761,6 +2742,15 @@ mod tests {
         );
 
         assert_eq!(lease_scope_violation(&job, sandbox_id), None);
+    }
+
+    #[test]
+    fn full_resident_supervisor_leaves_resident_work_queued() {
+        assert_eq!(guest_claim_kinds(false), vec![JobKind::RunCommand]);
+        assert_eq!(
+            guest_claim_kinds(true),
+            vec![JobKind::RunCommand, JobKind::RunResidentProcess]
+        );
     }
 
     #[test]

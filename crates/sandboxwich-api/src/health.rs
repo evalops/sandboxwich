@@ -473,6 +473,17 @@ pub(crate) fn append_count_family(
     label_name: &'static str,
     values: Vec<(String, i64)>,
 ) {
+    append_labeled_family(body, name, help, "gauge", label_name, values);
+}
+
+fn append_labeled_family(
+    body: &mut String,
+    name: &'static str,
+    help: &'static str,
+    metric_type: &'static str,
+    label_name: &'static str,
+    values: Vec<(String, i64)>,
+) {
     body.push_str("# HELP ");
     body.push_str(name);
     body.push(' ');
@@ -480,7 +491,9 @@ pub(crate) fn append_count_family(
     body.push('\n');
     body.push_str("# TYPE ");
     body.push_str(name);
-    body.push_str(" gauge\n");
+    body.push(' ');
+    body.push_str(metric_type);
+    body.push('\n');
     for (label, value) in values {
         body.push_str(name);
         body.push('{');
@@ -500,24 +513,7 @@ pub(crate) fn append_counter_family(
     label_name: &'static str,
     values: Vec<(String, i64)>,
 ) {
-    body.push_str("# HELP ");
-    body.push_str(name);
-    body.push(' ');
-    body.push_str(help);
-    body.push('\n');
-    body.push_str("# TYPE ");
-    body.push_str(name);
-    body.push_str(" counter\n");
-    for (label, value) in values {
-        body.push_str(name);
-        body.push('{');
-        body.push_str(label_name);
-        body.push_str("=\"");
-        body.push_str(&escape_prometheus_label(&label));
-        body.push_str("\"} ");
-        body.push_str(&value.to_string());
-        body.push('\n');
-    }
+    append_labeled_family(body, name, help, "counter", label_name, values);
 }
 
 pub(crate) fn append_gauge(body: &mut String, name: &'static str, help: &'static str, value: i64) {
