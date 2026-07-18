@@ -43,7 +43,7 @@ jobs:
           # rather than in a container, so it can't come from any of the
           # (glibc-mismatched, --release) image builds below.
           cargo build -p sandboxwich-worker
-# All four conformance images build concurrently from one bake
+          # All four conformance images build concurrently from one bake
           # invocation; see deploy/kubernetes/kind-bake.hcl for the shared
           # builder-stage and cache-scope rationale.
           docker buildx bake --load --file deploy/kubernetes/kind-bake.hcl
