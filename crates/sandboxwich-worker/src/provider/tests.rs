@@ -2514,10 +2514,12 @@ fn pod_disables_service_account_token_automount_and_sets_ephemeral_storage_limit
 #[test]
 fn guest_token_is_mounted_as_a_file_and_redacted_from_provider_metadata() {
     let sandbox_id = SandboxId::new();
+    let worker_id = Uuid::new_v4();
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
             .with_guest_credentials(
                 sandbox_id,
+                worker_id,
                 "http://sandboxwich-api.evalops.svc.cluster.local:3217",
                 "sbw_gtok_supersecret",
             );
@@ -2537,6 +2539,9 @@ fn guest_token_is_mounted_as_a_file_and_redacted_from_provider_metadata() {
     assert!(env.iter().any(|entry| {
         entry["name"] == "SANDBOXWICH_SANDBOX_ID" && entry["value"] == sandbox_id.to_string()
     }));
+    assert!(env.iter().any(|entry| {
+        entry["name"] == "SANDBOXWICH_WORKER_ID" && entry["value"] == worker_id.to_string()
+    }));
     let serialized = serde_json::to_string(&handle.metadata).unwrap();
     assert!(!serialized.contains("sbw_gtok_supersecret"));
     assert_eq!(
@@ -2552,6 +2557,7 @@ fn apply_manifests_carry_guest_token_only_in_the_secret_before_the_pod() {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
             .with_guest_credentials(
                 sandbox_id,
+                Uuid::nil(),
                 "http://sandboxwich-api.evalops.svc.cluster.local:3217",
                 "sbw_gtok_supersecret",
             );
@@ -3041,6 +3047,7 @@ fn provision_staged_applies_the_guest_token_secret_before_the_pod() {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
             .with_guest_credentials(
                 sandbox_id,
+                Uuid::nil(),
                 "http://sandboxwich-api.evalops.svc.cluster.local:3217",
                 "sbw_gtok_supersecret",
             );
@@ -3206,7 +3213,7 @@ fn guest_token_secret_adoption_accepts_rotated_token_but_rejects_api_url_drift()
     let sandbox_id = SandboxId::new();
     let render = |token: &str, api: &str| {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
-            .with_guest_credentials(sandbox_id, api, token)
+            .with_guest_credentials(sandbox_id, Uuid::nil(), api, token)
             .guest_token_secret_manifest(sandbox_id)
             .expect("credentials render a guest-token secret")
     };

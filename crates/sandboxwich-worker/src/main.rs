@@ -549,15 +549,16 @@ impl RuntimeProvider {
     fn with_guest_credentials(
         self,
         sandbox_id: sandboxwich_core::SandboxId,
+        worker_id: Uuid,
         api: impl Into<String>,
         token: impl Into<String>,
     ) -> Self {
         match self {
             Self::DryRun(provider) => {
-                Self::DryRun(provider.with_guest_credentials(sandbox_id, api, token))
+                Self::DryRun(provider.with_guest_credentials(sandbox_id, worker_id, api, token))
             }
             Self::Apply(provider) => {
-                Self::Apply(provider.with_guest_credentials(sandbox_id, api, token))
+                Self::Apply(provider.with_guest_credentials(sandbox_id, worker_id, api, token))
             }
         }
     }
@@ -2305,7 +2306,12 @@ where
             decode_json::<GuestTokenResponse>(response).await
         })
         .await?;
-        Arc::new(provider.with_guest_credentials(sandbox_id, api.to_string(), response.token))
+        Arc::new(provider.with_guest_credentials(
+            sandbox_id,
+            worker_id,
+            api.to_string(),
+            response.token,
+        ))
     } else {
         provider
     };
@@ -2538,6 +2544,7 @@ trait GuestCredentialProvider: Sized {
     fn with_guest_credentials(
         &self,
         sandbox_id: sandboxwich_core::SandboxId,
+        worker_id: Uuid,
         api: String,
         token: String,
     ) -> Self;
@@ -2547,10 +2554,12 @@ impl GuestCredentialProvider for RuntimeProvider {
     fn with_guest_credentials(
         &self,
         sandbox_id: sandboxwich_core::SandboxId,
+        worker_id: Uuid,
         api: String,
         token: String,
     ) -> Self {
-        self.clone().with_guest_credentials(sandbox_id, api, token)
+        self.clone()
+            .with_guest_credentials(sandbox_id, worker_id, api, token)
     }
 }
 
