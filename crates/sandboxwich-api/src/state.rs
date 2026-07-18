@@ -136,6 +136,7 @@ impl Drop for ApexWaiterGuard {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct LiveResidentBootstrap {
     pub(crate) content: Vec<u8>,
     pub(crate) sha256: String,
@@ -144,8 +145,27 @@ pub(crate) struct LiveResidentBootstrap {
     pub(crate) generation: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResidentBootstrapFence {
+    pub(crate) generation: u64,
+    pub(crate) lease_id: Uuid,
+    pub(crate) sha256: String,
+}
+
+enum ResidentBootstrapEntry {
+    Ready(LiveResidentBootstrap),
+    InFlight {
+        fence: ResidentBootstrapFence,
+        acknowledged: bool,
+    },
+    Delivered {
+        bootstrap: LiveResidentBootstrap,
+        fence: ResidentBootstrapFence,
+    },
+}
+
 struct ResidentBootstrapStoreInner {
-    values: HashMap<ResidentProcessId, LiveResidentBootstrap>,
+    values: HashMap<ResidentProcessId, ResidentBootstrapEntry>,
     reserved: usize,
     capacity: usize,
 }
@@ -183,19 +203,96 @@ impl ResidentBootstrapStore {
         })
     }
 
-    pub(crate) fn begin_consume(
+    pub(crate) fn begin_delivery(
         &self,
         id: &ResidentProcessId,
-    ) -> Option<ResidentBootstrapConsumption> {
+        fence: ResidentBootstrapFence,
+    ) -> Result<ResidentBootstrapDelivery, ResidentBootstrapDeliveryError> {
         let mut inner = self.0.lock().expect("resident bootstrap mutex poisoned");
-        let bootstrap = inner.values.remove(id)?;
-        inner.reserved += 1;
-        Some(ResidentBootstrapConsumption {
+        let entry = inner
+            .values
+            .remove(id)
+            .ok_or(ResidentBootstrapDeliveryError::Unavailable)?;
+        let (bootstrap, restore_as_delivered) = match entry {
+            ResidentBootstrapEntry::Ready(bootstrap) => (bootstrap, false),
+            ResidentBootstrapEntry::Delivered {
+                bootstrap,
+                fence: delivered_fence,
+            } if delivered_fence == fence => (bootstrap, true),
+            ResidentBootstrapEntry::Delivered {
+                bootstrap,
+                fence: delivered_fence,
+            } => {
+                inner.values.insert(
+                    *id,
+                    ResidentBootstrapEntry::Delivered {
+                        bootstrap,
+                        fence: delivered_fence,
+                    },
+                );
+                return Err(ResidentBootstrapDeliveryError::FenceMismatch);
+            }
+            ResidentBootstrapEntry::InFlight {
+                fence: in_flight_fence,
+                acknowledged,
+            } => {
+                inner.values.insert(
+                    *id,
+                    ResidentBootstrapEntry::InFlight {
+                        fence: in_flight_fence,
+                        acknowledged,
+                    },
+                );
+                return Err(ResidentBootstrapDeliveryError::InFlight);
+            }
+        };
+        inner.values.insert(
+            *id,
+            ResidentBootstrapEntry::InFlight {
+                fence: fence.clone(),
+                acknowledged: false,
+            },
+        );
+        Ok(ResidentBootstrapDelivery {
             store: self.clone(),
             id: *id,
+            fence,
             bootstrap: Some(bootstrap),
+            restore_as_delivered,
         })
     }
+
+    pub(crate) fn acknowledge(
+        &self,
+        id: &ResidentProcessId,
+        fence: &ResidentBootstrapFence,
+    ) -> bool {
+        let mut inner = self.0.lock().expect("resident bootstrap mutex poisoned");
+        match inner.values.get_mut(id) {
+            Some(ResidentBootstrapEntry::Delivered {
+                fence: delivered_fence,
+                ..
+            }) if delivered_fence == fence => {
+                inner.values.remove(id);
+                true
+            }
+            Some(ResidentBootstrapEntry::InFlight {
+                fence: in_flight_fence,
+                acknowledged,
+            }) if in_flight_fence == fence => {
+                *acknowledged = true;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResidentBootstrapDeliveryError {
+    Unavailable,
+    InFlight,
+    FenceMismatch,
 }
 
 pub(crate) struct ResidentBootstrapReservation {
@@ -215,7 +312,9 @@ impl ResidentBootstrapReservation {
             .lock()
             .expect("resident bootstrap mutex poisoned");
         inner.reserved -= 1;
-        let previous = inner.values.insert(id, bootstrap);
+        let previous = inner
+            .values
+            .insert(id, ResidentBootstrapEntry::Ready(bootstrap));
         debug_assert!(previous.is_none(), "resident bootstrap published twice");
     }
 }
@@ -233,35 +332,61 @@ impl Drop for ResidentBootstrapReservation {
     }
 }
 
-pub(crate) struct ResidentBootstrapConsumption {
+pub(crate) struct ResidentBootstrapDelivery {
     store: ResidentBootstrapStore,
     id: ResidentProcessId,
+    fence: ResidentBootstrapFence,
     bootstrap: Option<LiveResidentBootstrap>,
+    restore_as_delivered: bool,
 }
 
-impl ResidentBootstrapConsumption {
+impl ResidentBootstrapDelivery {
     pub(crate) fn bootstrap(&self) -> &LiveResidentBootstrap {
         self.bootstrap
             .as_ref()
-            .expect("resident bootstrap consumption already committed")
+            .expect("resident bootstrap delivery already completed")
     }
 
-    pub(crate) fn commit(mut self) -> LiveResidentBootstrap {
+    pub(crate) fn mark_delivered(
+        mut self,
+    ) -> Result<LiveResidentBootstrap, ResidentBootstrapDeliveryError> {
         let bootstrap = self
             .bootstrap
             .take()
-            .expect("resident bootstrap consumption already committed");
+            .expect("resident bootstrap delivery already completed");
+        let response = bootstrap.clone();
         let mut inner = self
             .store
             .0
             .lock()
             .expect("resident bootstrap mutex poisoned");
-        inner.reserved -= 1;
-        bootstrap
+        let previous = inner.values.remove(&self.id);
+        let acknowledged = matches!(
+            &previous,
+            Some(ResidentBootstrapEntry::InFlight {
+                acknowledged: true,
+                ..
+            })
+        );
+        debug_assert!(matches!(
+            &previous,
+            Some(ResidentBootstrapEntry::InFlight { .. })
+        ));
+        if !acknowledged {
+            inner.values.insert(
+                self.id,
+                ResidentBootstrapEntry::Delivered {
+                    bootstrap,
+                    fence: self.fence.clone(),
+                },
+            );
+            return Ok(response);
+        }
+        Err(ResidentBootstrapDeliveryError::Unavailable)
     }
 }
 
-impl Drop for ResidentBootstrapConsumption {
+impl Drop for ResidentBootstrapDelivery {
     fn drop(&mut self) {
         if let Some(bootstrap) = self.bootstrap.take() {
             let mut inner = self
@@ -269,9 +394,30 @@ impl Drop for ResidentBootstrapConsumption {
                 .0
                 .lock()
                 .expect("resident bootstrap mutex poisoned");
-            inner.reserved -= 1;
-            let previous = inner.values.insert(self.id, bootstrap);
-            debug_assert!(previous.is_none(), "resident bootstrap restored twice");
+            let previous = inner.values.remove(&self.id);
+            let acknowledged = matches!(
+                &previous,
+                Some(ResidentBootstrapEntry::InFlight {
+                    acknowledged: true,
+                    ..
+                })
+            );
+            debug_assert!(matches!(
+                &previous,
+                Some(ResidentBootstrapEntry::InFlight { .. })
+            ));
+            if acknowledged {
+                return;
+            }
+            let restored = if self.restore_as_delivered {
+                ResidentBootstrapEntry::Delivered {
+                    bootstrap,
+                    fence: self.fence.clone(),
+                }
+            } else {
+                ResidentBootstrapEntry::Ready(bootstrap)
+            };
+            inner.values.insert(self.id, restored);
         }
     }
 }
@@ -290,6 +436,14 @@ mod tests {
         }
     }
 
+    fn resident_bootstrap_fence(lease_id: Uuid) -> ResidentBootstrapFence {
+        ResidentBootstrapFence {
+            generation: 1,
+            lease_id,
+            sha256: "digest".into(),
+        }
+    }
+
     #[test]
     fn resident_bootstrap_reservation_holds_capacity_until_publish_or_drop() {
         let store = ResidentBootstrapStore::with_capacity(1);
@@ -301,21 +455,47 @@ mod tests {
         let id = ResidentProcessId::new();
         reservation.publish(id);
         assert!(store.reserve(resident_bootstrap(1)).is_err());
-        assert!(store.begin_consume(&id).is_some());
+        assert!(
+            store
+                .begin_delivery(&id, resident_bootstrap_fence(Uuid::now_v7()))
+                .is_ok()
+        );
     }
 
     #[test]
-    fn resident_bootstrap_consume_restores_on_drop_and_removes_on_commit() {
+    fn resident_bootstrap_delivery_retries_until_exact_fence_is_acknowledged() {
         let store = ResidentBootstrapStore::with_capacity(1);
         let id = ResidentProcessId::new();
+        let lease_id = Uuid::now_v7();
+        let fence = resident_bootstrap_fence(lease_id);
         store.reserve(resident_bootstrap(1)).unwrap().publish(id);
 
-        drop(store.begin_consume(&id).unwrap());
-        let consumption = store.begin_consume(&id).unwrap();
-        assert_eq!(consumption.bootstrap().content, b"secret");
-        consumption.commit();
+        drop(store.begin_delivery(&id, fence.clone()).unwrap());
+        let delivery = store.begin_delivery(&id, fence.clone()).unwrap();
+        assert_eq!(delivery.bootstrap().content, b"secret");
+        assert!(matches!(
+            store.begin_delivery(&id, fence.clone()),
+            Err(ResidentBootstrapDeliveryError::InFlight)
+        ));
+        delivery.mark_delivered().unwrap();
 
-        assert!(store.begin_consume(&id).is_none());
+        assert!(matches!(
+            store.begin_delivery(&id, resident_bootstrap_fence(Uuid::now_v7())),
+            Err(ResidentBootstrapDeliveryError::FenceMismatch)
+        ));
+        assert!(store.reserve(resident_bootstrap(2)).is_err());
+
+        let retry = store.begin_delivery(&id, fence.clone()).unwrap();
+        assert_eq!(retry.bootstrap().content, b"secret");
+        assert!(store.acknowledge(&id, &fence));
+        assert!(matches!(
+            retry.mark_delivered(),
+            Err(ResidentBootstrapDeliveryError::Unavailable)
+        ));
+        assert!(matches!(
+            store.begin_delivery(&id, fence),
+            Err(ResidentBootstrapDeliveryError::Unavailable)
+        ));
         assert!(store.reserve(resident_bootstrap(2)).is_ok());
     }
 

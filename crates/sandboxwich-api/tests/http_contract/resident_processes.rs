@@ -432,6 +432,25 @@ pub(crate) async fn resident_process_create_is_idempotent_tenant_scoped_and_reda
         .json(&ResidentProcessObservationRequest {
             generation: first.resident_process.generation,
             lease_id: claimed.id.0,
+            observed_state: ResidentProcessObservedState::Starting,
+            pid: Some(42),
+            exit_code: None,
+            error_code: None,
+            error_message: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    guest_client
+        .post(format!(
+            "{}/resident-processes/{}/observations",
+            server.base_url, first.resident_process.id
+        ))
+        .json(&ResidentProcessObservationRequest {
+            generation: first.resident_process.generation,
+            lease_id: claimed.id.0,
             observed_state: ResidentProcessObservedState::Running,
             pid: Some(42),
             exit_code: None,
@@ -915,9 +934,9 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
         .unwrap();
     assert_eq!(allowed.content, b"executor-canary-secret");
 
-    // 8. One-read semantics are unaffected by the new gate: a repeat read is
-    // GONE, not re-blocked as unavailable.
-    let repeat_status = guest_client
+    // 8. Delivery remains replayable by this exact lease until Starting
+    // acknowledges that the bootstrap file was written atomically.
+    let replayed: ResidentProcessBootstrapReadResponse = guest_client
         .post(format!(
             "{}/resident-processes/{}/bootstrap",
             server.base_url, executor_created.resident_process.id
@@ -926,8 +945,44 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
         .send()
         .await
         .unwrap()
-        .status();
-    assert_eq!(repeat_status, reqwest::StatusCode::GONE);
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replayed.content, b"executor-canary-secret");
+    guest_client
+        .post(format!(
+            "{}/resident-processes/{}/observations",
+            server.base_url, executor_created.resident_process.id
+        ))
+        .json(&ResidentProcessObservationRequest {
+            generation: executor_created.resident_process.generation,
+            lease_id: executor_lease.id.0,
+            observed_state: ResidentProcessObservedState::Starting,
+            pid: Some(79),
+            exit_code: None,
+            error_code: None,
+            error_message: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        guest_client
+            .post(format!(
+                "{}/resident-processes/{}/bootstrap",
+                server.base_url, executor_created.resident_process.id
+            ))
+            .json(&executor_bootstrap_request)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::GONE
+    );
 
     // 9. The sidecar's own bootstrap read is never gated by anything (it is
     // the thing being depended on, not a dependent) and delivers its own
@@ -1052,7 +1107,7 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
 }
 
 #[tokio::test]
-async fn concurrent_bootstrap_reads_have_exactly_one_winner() {
+async fn bootstrap_delivery_retries_a_lost_response_until_starting_acknowledges_it() {
     let data_dir = tempfile::tempdir().unwrap();
     let server = TestServer::start(
         format!(
@@ -1121,35 +1176,82 @@ async fn concurrent_bootstrap_reads_have_exactly_one_winner() {
         "a database fence failure must restore the bootstrap"
     );
 
-    let first = guest_client.post(&url).json(&request).send();
-    let second = guest_client.post(&url).json(&request).send();
-    let (first, second) = tokio::join!(first, second);
-    let responses = [first.unwrap(), second.unwrap()];
-    let statuses: Vec<_> = responses.iter().map(reqwest::Response::status).collect();
+    let lost_response = guest_client.post(&url).json(&request).send().await.unwrap();
+    assert!(lost_response.status().is_success());
+    drop(lost_response);
+
+    let mut delivered_wrong_hash = request.clone();
+    delivered_wrong_hash.expected_sha256 = "f".repeat(64);
     assert_eq!(
-        statuses.iter().filter(|status| status.is_success()).count(),
-        1,
-        "exactly one reader must receive the bootstrap: {statuses:?}"
+        guest_client
+            .post(&url)
+            .json(&delivered_wrong_hash)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::CONFLICT,
+        "a delivered bootstrap must not replay under another digest"
     );
+    let mut delivered_wrong_generation = request.clone();
+    delivered_wrong_generation.generation += 1;
     assert_eq!(
-        statuses
-            .iter()
-            .filter(|status| {
-                matches!(
-                    **status,
-                    reqwest::StatusCode::GONE | reqwest::StatusCode::CONFLICT
-                )
-            })
-            .count(),
-        1,
-        "the losing reader must receive a terminal fence response: {statuses:?}"
+        guest_client
+            .post(&url)
+            .json(&delivered_wrong_generation)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::CONFLICT,
+        "a delivered bootstrap must not replay under another generation"
     );
-    let winner = responses
-        .into_iter()
-        .find(|response| response.status().is_success())
+    let mut delivered_wrong_lease = request.clone();
+    delivered_wrong_lease.lease_id = Uuid::now_v7();
+    assert!(
+        !guest_client
+            .post(&url)
+            .json(&delivered_wrong_lease)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success(),
+        "a delivered bootstrap must not replay under another lease"
+    );
+
+    let bootstrap: ResidentProcessBootstrapReadResponse = guest_client
+        .post(&url)
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
         .unwrap();
-    let bootstrap: ResidentProcessBootstrapReadResponse = winner.json().await.unwrap();
     assert_eq!(bootstrap.content, b"concurrent-bootstrap-secret");
+
+    guest_client
+        .post(format!(
+            "{}/resident-processes/{}/observations",
+            server.base_url, created.resident_process.id
+        ))
+        .json(&ResidentProcessObservationRequest {
+            generation: request.generation,
+            lease_id: request.lease_id,
+            observed_state: ResidentProcessObservedState::Starting,
+            pid: Some(91),
+            exit_code: None,
+            error_code: None,
+            error_message: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
 
     assert_eq!(
         guest_client
@@ -1160,6 +1262,6 @@ async fn concurrent_bootstrap_reads_have_exactly_one_winner() {
             .unwrap()
             .status(),
         reqwest::StatusCode::GONE,
-        "the database consumption marker must keep later reads terminal"
+        "Starting must permanently acknowledge the delivered bootstrap"
     );
 }

@@ -4,7 +4,10 @@ use crate::db::Database;
 use crate::error::ApiError;
 use crate::handlers::jobs::{add_provision_spec_to_payload, insert_job_on_connection};
 use crate::rows::row_to_resident_process;
-use crate::state::{AppState, LiveResidentBootstrap, Principal, TenantContext};
+use crate::state::{
+    AppState, LiveResidentBootstrap, Principal, ResidentBootstrapDeliveryError,
+    ResidentBootstrapFence, TenantContext,
+};
 use async_stream::stream;
 use axum::Json;
 use axum::extract::{Extension, Path, State};
@@ -442,16 +445,31 @@ pub(crate) async fn read_resident_process_bootstrap(
         return Err(ApiError::not_found("resident process not found"));
     }
     ensure_resident_lease_scope(&state.db, &process, LeaseId(request.lease_id), &ctx).await?;
-    let consumption = state
+    let fence = ResidentBootstrapFence {
+        generation: request.generation,
+        lease_id: request.lease_id,
+        sha256: request.expected_sha256.clone(),
+    };
+    let delivery = state
         .resident_bootstraps
-        .begin_consume(&process_id)
-        .ok_or_else(|| ApiError {
-            status: StatusCode::GONE,
-            code: "resident_bootstrap_unavailable",
-            message: "resident bootstrap is unavailable or already consumed".into(),
+        .begin_delivery(&process_id, fence.clone())
+        .map_err(|error| match error {
+            ResidentBootstrapDeliveryError::Unavailable => ApiError {
+                status: StatusCode::GONE,
+                code: "resident_bootstrap_unavailable",
+                message: "resident bootstrap is unavailable or already acknowledged".into(),
+            },
+            ResidentBootstrapDeliveryError::InFlight => ApiError::conflict_code(
+                "resident_bootstrap_delivery_in_flight",
+                "resident bootstrap delivery is already in flight",
+            ),
+            ResidentBootstrapDeliveryError::FenceMismatch => ApiError::conflict_code(
+                "resident_bootstrap_fence_mismatch",
+                "resident bootstrap was delivered under a different lease fence",
+            ),
         })?;
-    if consumption.bootstrap().generation != request.generation
-        || consumption.bootstrap().sha256 != request.expected_sha256
+    if delivery.bootstrap().generation != request.generation
+        || delivery.bootstrap().sha256 != request.expected_sha256
     {
         return Err(ApiError::conflict_code(
             "resident_bootstrap_fence_mismatch",
@@ -461,14 +479,25 @@ pub(crate) async fn read_resident_process_bootstrap(
     let now = Utc::now();
     let consume_sql = format!(
         "update resident_processes as target
-         set bootstrap_consumed_at = {}
+         set bootstrap_consumed_at = coalesce(target.bootstrap_consumed_at, {}),
+             bootstrap_delivered_generation = {},
+             bootstrap_delivered_lease_id = {},
+             bootstrap_delivered_sha256 = {}
          where target.id = {}
            and target.tenant_id = {}
            and target.sandbox_id = {}
            and target.generation = {}
            and target.active_lease_id = {}
            and target.bootstrap_sha256 = {}
-           and target.bootstrap_consumed_at is null
+           and target.bootstrap_acknowledged_at is null
+           and (
+             target.bootstrap_consumed_at is null
+             or (
+               target.bootstrap_delivered_generation = {}
+               and target.bootstrap_delivered_lease_id = {}
+               and target.bootstrap_delivered_sha256 = {}
+             )
+           )
            and (
              target.name <> {}
              or not exists (
@@ -500,12 +529,24 @@ pub(crate) async fn read_resident_process_bootstrap(
         state.db.placeholder(9),
         state.db.placeholder(10),
         state.db.placeholder(11),
+        state.db.placeholder(12),
+        state.db.placeholder(13),
+        state.db.placeholder(14),
+        state.db.placeholder(15),
+        state.db.placeholder(16),
+        state.db.placeholder(17),
     );
     let consumed = sqlx::query(&consume_sql)
         .bind(now.to_rfc3339())
+        .bind(request.generation as i64)
+        .bind(request.lease_id.to_string())
+        .bind(&request.expected_sha256)
         .bind(process_id.to_string())
         .bind(&ctx.tenant_id)
         .bind(process.sandbox_id.to_string())
+        .bind(request.generation as i64)
+        .bind(request.lease_id.to_string())
+        .bind(&request.expected_sha256)
         .bind(request.generation as i64)
         .bind(request.lease_id.to_string())
         .bind(&request.expected_sha256)
@@ -517,23 +558,28 @@ pub(crate) async fn read_resident_process_bootstrap(
         .await?;
     if consumed.rows_affected() != 1 {
         let consumed_sql = format!(
-            "select bootstrap_consumed_at from resident_processes where id = {}",
+            "select bootstrap_consumed_at, bootstrap_delivered_generation,
+                    bootstrap_delivered_lease_id, bootstrap_delivered_sha256,
+                    bootstrap_acknowledged_at
+             from resident_processes where id = {}",
             state.db.placeholder(1)
         );
-        let consumed_at = sqlx::query(&consumed_sql)
+        let delivery_row = sqlx::query(&consumed_sql)
             .bind(process_id.to_string())
             .fetch_optional(&state.db.pool)
-            .await?
+            .await?;
+        let acknowledged_at = delivery_row
+            .as_ref()
             .and_then(|row| {
-                row.try_get::<Option<String>, _>("bootstrap_consumed_at")
+                row.try_get::<Option<String>, _>("bootstrap_acknowledged_at")
                     .ok()
             })
             .flatten();
-        if consumed_at.is_some() {
+        if acknowledged_at.is_some() {
             return Err(ApiError {
                 status: StatusCode::GONE,
                 code: "resident_bootstrap_unavailable",
-                message: "resident bootstrap is unavailable or already consumed".into(),
+                message: "resident bootstrap is unavailable or already acknowledged".into(),
             });
         }
         let current = fetch_resident_process_by_id(&state.db, process_id).await?;
@@ -545,6 +591,24 @@ pub(crate) async fn read_resident_process_bootstrap(
                 "resident_bootstrap_fence_mismatch",
                 "resident bootstrap request does not match the active lease",
             ));
+        }
+        if let Some(row) = delivery_row {
+            let delivered_generation =
+                row.try_get::<Option<i64>, _>("bootstrap_delivered_generation")?;
+            let delivered_lease_id =
+                row.try_get::<Option<String>, _>("bootstrap_delivered_lease_id")?;
+            let delivered_sha256 =
+                row.try_get::<Option<String>, _>("bootstrap_delivered_sha256")?;
+            if delivered_generation.is_some()
+                && (delivered_generation != Some(request.generation as i64)
+                    || delivered_lease_id.as_deref() != Some(request.lease_id.to_string().as_str())
+                    || delivered_sha256.as_deref() != Some(request.expected_sha256.as_str()))
+            {
+                return Err(ApiError::conflict_code(
+                    "resident_bootstrap_fence_mismatch",
+                    "resident bootstrap was delivered under a different lease fence",
+                ));
+            }
         }
         ensure_sidecar_ready_if_required(
             &state.db,
@@ -559,7 +623,11 @@ pub(crate) async fn read_resident_process_bootstrap(
             message: "resident bootstrap is unavailable or already consumed".into(),
         });
     }
-    let bootstrap = consumption.commit();
+    let bootstrap = delivery.mark_delivered().map_err(|_| ApiError {
+        status: StatusCode::GONE,
+        code: "resident_bootstrap_unavailable",
+        message: "resident bootstrap was acknowledged while delivery was in flight".into(),
+    })?;
     Ok(Json(ResidentProcessBootstrapReadResponse {
         ok: true,
         content: bootstrap.content,
@@ -623,7 +691,16 @@ pub(crate) async fn observe_resident_process(
     let last_error = request.error_message.or(request.error_code);
     let sql = format!(
         "update resident_processes
-         set observed_state = {}, pid = {}, exit_code = {}, last_error = {},
+         set bootstrap_acknowledged_at = case
+               when {} = 'starting'
+                and bootstrap_consumed_at is not null
+                and bootstrap_delivered_generation = {}
+                and bootstrap_delivered_lease_id = {}
+                and bootstrap_delivered_sha256 = bootstrap_sha256
+               then coalesce(bootstrap_acknowledged_at, {})
+               else bootstrap_acknowledged_at
+             end,
+             observed_state = {}, pid = {}, exit_code = {}, last_error = {},
              started_at = coalesce(started_at, {}), ready_at = coalesce(ready_at, {}),
              exited_at = {}, updated_at = {}
          where id = {} and generation = {} and active_lease_id = {}",
@@ -637,9 +714,17 @@ pub(crate) async fn observe_resident_process(
         state.db.placeholder(8),
         state.db.placeholder(9),
         state.db.placeholder(10),
-        state.db.placeholder(11)
+        state.db.placeholder(11),
+        state.db.placeholder(12),
+        state.db.placeholder(13),
+        state.db.placeholder(14),
+        state.db.placeholder(15)
     );
     let result = sqlx::query(&sql)
+        .bind(request.observed_state.as_db_str())
+        .bind(request.generation as i64)
+        .bind(request.lease_id.to_string())
+        .bind(now.to_rfc3339())
         .bind(request.observed_state.as_db_str())
         .bind(request.pid.map(i64::from))
         .bind(request.exit_code.map(i64::from))
@@ -658,6 +743,34 @@ pub(crate) async fn observe_resident_process(
             "resident_process_generation_conflict",
             "resident process changed while applying observation",
         ));
+    }
+    if request.observed_state == ResidentProcessObservedState::Starting
+        && let Some(sha256) = process.bootstrap_sha256.as_ref()
+    {
+        let ack_sql = format!(
+            "select bootstrap_acknowledged_at from resident_processes where id = {}",
+            state.db.placeholder(1)
+        );
+        let acknowledged = sqlx::query(&ack_sql)
+            .bind(process_id.to_string())
+            .fetch_optional(&state.db.pool)
+            .await?
+            .and_then(|row| {
+                row.try_get::<Option<String>, _>("bootstrap_acknowledged_at")
+                    .ok()
+            })
+            .flatten()
+            .is_some();
+        if acknowledged {
+            state.resident_bootstraps.acknowledge(
+                &process_id,
+                &ResidentBootstrapFence {
+                    generation: request.generation,
+                    lease_id: request.lease_id,
+                    sha256: sha256.clone(),
+                },
+            );
+        }
     }
     // The guest reports observations periodically for as long as the
     // resident process is alive -- a real, repeating heartbeat and one of
