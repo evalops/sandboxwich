@@ -1972,6 +1972,89 @@ async fn stop_returns_conflict_on_double_stop() {
     assert_eq!(error.status, StatusCode::CONFLICT);
 }
 
+/// Regression test for evalops/sandboxwich#172: a reaper sweep tick racing a
+/// manual stop (or another sweep tick) used to fall through past a
+/// compare-and-swap miss and enqueue a second, redundant `StopSandbox` job
+/// anyway. Reproduces the race deterministically -- no real concurrency or
+/// timing needed -- by calling `attempt_reap_candidate` (the exact per-row
+/// function `reap_expired_active_sandboxes`'s sweep loop calls) with a
+/// stale, pre-race `Sandbox` snapshot *after* a separate `stop_sandbox_via_job`
+/// call has already won the race for real.
+#[tokio::test]
+async fn reap_cas_miss_skips_instead_of_enqueuing_a_redundant_stop_job() {
+    let db = test_sqlite_db().await;
+    // `Ready` is a real `STOP_LEGAL_FROM` state a sweep would select as a
+    // live candidate. `max_lifetime_seconds: Some(0)` (set on the in-memory
+    // snapshot only, mirroring the existing `ttl_seconds: Some(0)`
+    // immediate-eligibility idiom) makes it immediately due; `expired_deadline`
+    // reads this field off the passed-in snapshot, not a fresh DB fetch, so
+    // this is exactly what a sweep's own candidate SELECT would have seen.
+    let mut sandbox = seed_sandbox_with_state(&db, SandboxState::Ready).await;
+    sandbox.max_lifetime_seconds = Some(0);
+
+    // The concurrent actor -- a manual stop, or another sweep tick -- wins
+    // the race first, for real: this is the call that must succeed and be
+    // the *only* one to enqueue a job.
+    let winner = stop_sandbox_via_job(
+        &db,
+        &sandbox,
+        json!({"state": "archiving", "reason": "stop_requested"}),
+    )
+    .await
+    .expect("the winning stop must not error");
+    assert!(
+        winner.is_some(),
+        "the winning stop must actually enqueue a StopSandbox job"
+    );
+
+    // Now attempt to reap the *same* sandbox using the stale `Ready`
+    // snapshot a sweep would have fetched moments before the winner above
+    // landed. `stop_sandbox_via_job`'s internal CAS must miss (the real row
+    // is `Archiving` now, not `Ready`), and `attempt_reap_candidate` must
+    // report `Skipped` rather than treating this as a second successful
+    // reap or an error.
+    let outcome = attempt_reap_candidate(&db, sandbox.clone(), None, Utc::now())
+        .await
+        .expect("a CAS miss inside attempt_reap_candidate must not surface as an error");
+    assert!(
+        matches!(outcome, CandidateOutcome::Skipped),
+        "a sandbox concurrently stopped between candidate selection and this \
+         sweep's own CAS must be skipped, not reaped again or treated as a \
+         failure; got {outcome:?}"
+    );
+    // `CandidateOutcome::Skipped` is returned from the exact match arm in
+    // `attempt_reap_candidate` that also emits the "reap skipped" info log,
+    // so asserting the returned variant is a direct, deterministic proxy for
+    // "that log line fired" without standing up a tracing-capture harness
+    // this codebase has no other use for.
+
+    // The concrete regression #172 exists for: exactly one StopSandbox job
+    // for this sandbox, not two.
+    let stop_job_count: i64 =
+        sqlx::query("select count(*) as count from jobs where kind = ? and payload like ?")
+            .bind(job_kind_to_str(&JobKind::StopSandbox))
+            .bind(format!("%{}%", sandbox.id))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+            .try_get("count")
+            .unwrap();
+    assert_eq!(
+        stop_job_count, 1,
+        "a CAS miss must not enqueue a second, redundant StopSandbox job"
+    );
+
+    let final_state = fetch_sandbox_state(&db, sandbox.id)
+        .await
+        .unwrap()
+        .expect("sandbox must still exist");
+    assert_eq!(
+        final_state,
+        SandboxState::Archiving,
+        "the skipped attempt must not have clobbered the winner's state"
+    );
+}
+
 #[tokio::test]
 async fn snapshot_restore_claim_rejects_expired_ready_source() {
     let db = test_sqlite_db().await;
