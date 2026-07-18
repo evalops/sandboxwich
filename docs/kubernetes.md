@@ -1,10 +1,13 @@
 # Kubernetes
 
 The checked-in API and worker manifests use OCI image-index digests. The API
-migration job and Deployment intentionally use the same digest. After a
+migration Job and Deployment intentionally use the same digest. The migration
+Job name contains the digest's first 12 hexadecimal characters, so each API
+image revision creates a fresh Job rather than reusing a completed Job. After a
 successful `containers` workflow, download its `*-image-digest` artifacts and
-update both API references together in a reviewed pull request. Run
-`python3 scripts/test-deployment-images.py` before applying the manifests.
+update the API Deployment image, migration Job image, and migration Job name
+together in a reviewed pull request. Run `python3 scripts/test-deployment-images.py`
+before applying the manifests.
 
 Host egress allowlists require an enforceable FQDN boundary. Set
 `SANDBOXWICH_EGRESS_GATEWAY_IMAGE` to a digest-pinned `sandboxwich-worker`
@@ -26,7 +29,7 @@ denies when an allowed hostname resolves to a protected address.
 ## Current Shape
 
 - Run `sandboxwich-api` as a Deployment.
-- Run `sandboxwich-api migrate` as a Job before or during rollouts.
+- Run `sandboxwich-api migrate` as a Job before rolling out API pods.
 - Store state in Postgres through `SANDBOXWICH_DATABASE_URL`.
 - Expose the API with a ClusterIP Service.
 - Register workers with typed provider labels such as `provider=kubernetes` and capabilities such as `k8s_pod`, `run_command`, and, when configured through an isolation profile, `sandboxed_container` or `virtual_machine`.
@@ -342,8 +345,11 @@ env:
 ```
 
 This avoids multiple replicas racing to run migrations or rewrite constraints.
-Pods that start before the Job completes fail fast until the Deployment restarts
-them against a ready schema.
+The checked-in rollout script waits for the migration Job to complete before it
+applies the Deployment, and the Deployment's `check-schema` init container
+blocks every API pod until its image validates the current schema. Together,
+these prevent a new API revision from serving against a schema that has not
+received its migrations, including when an operator bypasses the script.
 
 ## Apply The API Manifests
 
@@ -354,10 +360,27 @@ kubectl create namespace sandboxwich
 kubectl -n sandboxwich create secret generic sandboxwich-secrets \
   --from-literal=database-url='postgres://user:password@postgres.example:5432/sandboxwich' \
   --from-literal=api-token='replace-through-secret-management'
-kubectl apply -f deploy/kubernetes/
+deploy/kubernetes/apply-api.sh
 ```
 
 Do not commit the real database URL or API token. Use your existing secret-management path for shared clusters.
+
+`apply-api.sh` applies the namespace, creates the digest-versioned migration
+Job, waits for it to complete, and only then applies and waits for the API
+Deployment. Do not replace it with `kubectl apply -f deploy/kubernetes/`: that
+would apply the Job and Deployment together and can roll out an API whose
+`SANDBOXWICH_AUTO_MIGRATE=false` pods require a schema the Job has not yet
+applied. Set `SANDBOXWICH_KUBE_CONTEXT` to select a context and
+`SANDBOXWICH_MIGRATION_TIMEOUT` (default `5m`) to adjust both waits.
+
+If the migration wait fails, the script leaves the API Deployment untouched,
+prints the Job description and logs, and exits nonzero. Correct the migration
+and publish a new image/digest-versioned Job; do not delete a successful Job to
+force a rerun. Roll back an API image only to an image compatible with the
+already-applied (forward-only) schema, then use the same script and verify
+`kubectl -n sandboxwich rollout status deployment/sandboxwich-api` plus
+`/readyz`. Monitor the migration Job's failed state and API rollout status;
+neither should be treated as a successful release until both are complete.
 
 ## Benchmarking
 

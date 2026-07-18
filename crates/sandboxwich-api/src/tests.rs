@@ -987,6 +987,52 @@ async fn test_sqlite_db() -> Database {
 }
 
 #[tokio::test]
+async fn schema_verification_requires_the_latest_compiled_migration() {
+    let db = test_sqlite_db().await;
+    verify_database_schema(&db)
+        .await
+        .expect("fully migrated database verifies");
+
+    let expected = latest_compiled_migration();
+    let sql = format!(
+        "delete from _sqlx_migrations where version = {}",
+        db.placeholder(1)
+    );
+    sqlx::query(&sql)
+        .bind(expected.version)
+        .execute(&db.pool)
+        .await
+        .expect("remove latest migration ledger row");
+
+    let error = verify_database_schema(&db)
+        .await
+        .expect_err("missing latest migration must fail schema verification");
+    assert!(error.to_string().contains(&expected.version.to_string()));
+    assert!(error.to_string().contains("has not been applied"));
+}
+
+#[tokio::test]
+async fn schema_verification_rejects_an_incomplete_latest_migration() {
+    let db = test_sqlite_db().await;
+    let expected = latest_compiled_migration();
+    let sql = format!(
+        "update _sqlx_migrations set success = false where version = {}",
+        db.placeholder(1)
+    );
+    sqlx::query(&sql)
+        .bind(expected.version)
+        .execute(&db.pool)
+        .await
+        .expect("mark latest migration incomplete");
+
+    let error = verify_database_schema(&db)
+        .await
+        .expect_err("incomplete latest migration must fail schema verification");
+    assert!(error.to_string().contains(&expected.version.to_string()));
+    assert!(error.to_string().contains("did not complete successfully"));
+}
+
+#[tokio::test]
 async fn provisioning_operation_migration_has_fenced_stage_columns() {
     let db = test_sqlite_db().await;
     let columns = sqlx::query("pragma table_info(provisioning_operations)")

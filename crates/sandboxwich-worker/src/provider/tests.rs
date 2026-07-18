@@ -165,8 +165,8 @@ fn dry_run_does_not_claim_or_execute_isolated_resident_processes() {
     assert!(
         !provider
             .capability_report()
-            .capabilities
-            .contains(&WorkerCapability::ProviderIsolatedResidentProcessV1)
+            .labels
+            .contains_key("provider_isolated_resident_process_version")
     );
     let error = provider
         .run_isolated_resident_process(
@@ -309,8 +309,9 @@ fn isolated_sidecar_run_observes_terminal_state_and_always_cleans_up() {
     assert!(
         provider
             .capability_report()
-            .capabilities
-            .contains(&WorkerCapability::ProviderIsolatedResidentProcessV1)
+            .labels
+            .get("provider_isolated_resident_process_version")
+            .is_some_and(|version| version == "1")
     );
     let bootstrap = b"sidecar-lifecycle-canary";
     let spec = isolated_sidecar_spec(bootstrap);

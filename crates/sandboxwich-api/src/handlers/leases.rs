@@ -4,6 +4,7 @@ use crate::error::*;
 use crate::handlers::commands::*;
 use crate::handlers::files::*;
 use crate::handlers::jobs::*;
+use crate::handlers::resident_processes::executor_sidecar_is_ready_for_claim;
 use crate::handlers::sandboxes::*;
 use crate::handlers::snapshots::*;
 use crate::handlers::workers::fetch_guest_health;
@@ -108,6 +109,7 @@ pub(crate) async fn claim_lease(
     if let Some(operation_id) = operation_id
         && let Some(lease) = fetch_claim_operation(&state.db, worker_id, operation_id).await?
     {
+        let lease = ensure_lease_worker_scope(&state.db, lease.id, &ctx).await?;
         return Ok(Json(ClaimLeaseResponse {
             ok: true,
             lease: Some(lease),
@@ -272,7 +274,22 @@ pub(crate) async fn claim_lease(
             {
                 continue;
             }
+            if is_sidecar
+                && worker
+                    .labels
+                    .get(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL)
+                    .map(String::as_str)
+                    != Some(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE)
+            {
+                continue;
+            }
             if !guest_has_uid_isolated_resident_process {
+                continue;
+            }
+            if !is_sidecar
+                && !executor_sidecar_is_ready_for_claim(&state.db, sandbox_id, &job.tenant_id)
+                    .await?
+            {
                 continue;
             }
             let running_sql = format!(

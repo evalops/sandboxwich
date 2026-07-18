@@ -23,11 +23,13 @@ use sandboxwich_core::{
     ApexTaskInstructionsCallbackResponse, ClaimLeaseRequest, ClaimLeaseResponse,
     CompleteLeaseRequest, ErrorEnvelope, FailLeaseRequest, GuestTokenResponse, JobKind,
     LeaseResponse, MintGuestTokenRequest, ORB_SIDECAR_RESIDENT_PROCESS_NAME,
-    ProvisioningOperationResponse, ProvisioningStageUpdateRequest, RegisterWorkerRequest,
-    RenewLeaseRequest, ResidentProcessBootstrapReadRequest, ResidentProcessBootstrapReadResponse,
-    ResidentProcessId, ResidentProcessObservationRequest, ResidentProcessObservedState,
-    ResidentProcessRestartPolicy, RuntimeResourceInventoryResponse, SandboxProvisionSpec,
-    WorkerCapability, WorkerHeartbeatRequest, WorkerJobResult, WorkerResponse, build_api_client,
+    PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL,
+    PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE, ProvisioningOperationResponse,
+    ProvisioningStageUpdateRequest, RegisterWorkerRequest, RenewLeaseRequest,
+    ResidentProcessBootstrapReadRequest, ResidentProcessBootstrapReadResponse, ResidentProcessId,
+    ResidentProcessObservationRequest, ResidentProcessObservedState, ResidentProcessRestartPolicy,
+    RuntimeResourceInventoryResponse, SandboxProvisionSpec, WorkerCapability,
+    WorkerHeartbeatRequest, WorkerJobResult, WorkerResponse, build_api_client,
     validate_agent_command_request,
 };
 use serde_json::json;
@@ -35,7 +37,6 @@ use sha2::Digest;
 use uuid::Uuid;
 
 const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
-
 #[derive(Debug, Parser)]
 #[command(name = "sandboxwich-worker")]
 #[command(about = "Host-side worker for sandbox orchestration")]
@@ -861,7 +862,6 @@ async fn main() -> anyhow::Result<()> {
                     false,
                 )?,
                 args.provider_mode,
-                false,
             );
             let mut labels: BTreeMap<_, _> = args.label.into_iter().collect();
             add_placement_proof_labels(&mut labels, args.provider_mode, None, false);
@@ -960,7 +960,6 @@ async fn main() -> anyhow::Result<()> {
                     args.provider.provider.apex_trusted_supervisor_v1,
                 )?,
                 args.provider.provider_mode,
-                provider_isolated_sidecar,
             );
             let mut labels: BTreeMap<_, _> = args.label.into_iter().collect();
             add_placement_proof_labels(
@@ -969,6 +968,7 @@ async fn main() -> anyhow::Result<()> {
                 args.provider.provider.runtime_image.as_deref(),
                 args.provider.provider.apex_trusted_supervisor_v1,
             );
+            add_provider_isolated_resident_process_label(&mut labels, provider_isolated_sidecar);
             let response = register_worker(
                 &client,
                 &api,
@@ -1410,6 +1410,7 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// `expires_at`/`leased_at` pair is somehow non-positive.
 const FALLBACK_LEASE_DURATION: Duration = Duration::from_secs(30);
 const MAX_RESIDENT_PROCESS_ATTEMPTS: u32 = 3;
+const RESIDENT_OBSERVATION_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -1508,6 +1509,42 @@ fn is_retryable_worker_request(error: &anyhow::Error) -> bool {
         .chain()
         .find_map(|cause| cause.downcast_ref::<WorkerRequestError>())
         .is_some_and(WorkerRequestError::is_recoverable)
+}
+
+/// Once the bootstrap endpoint has returned bytes, the bootstrap is consumed and
+/// fenced to this lease. A transient failure to acknowledge the initial
+/// observation must therefore be retried while this lease is still renewing;
+/// failing it would requeue work that a subsequent lease can no longer bootstrap.
+async fn retry_resident_observation_until_acknowledged_with<Report, ReportFuture>(
+    cancellation: &LeaseCancellation,
+    retry_delay: Duration,
+    mut report: Report,
+) -> anyhow::Result<()>
+where
+    Report: FnMut() -> ReportFuture,
+    ReportFuture: Future<Output = anyhow::Result<()>>,
+{
+    loop {
+        anyhow::ensure!(
+            !cancellation.signal.is_cancelled(),
+            "resident-process observation cancelled while awaiting acknowledgement"
+        );
+        match report().await {
+            Ok(()) => return Ok(()),
+            Err(error) if is_resident_desired_stop(&error) => {
+                cancellation.cancel(LeaseCancellationReason::DesiredStop);
+                return Err(error);
+            }
+            Err(error) if is_retryable_worker_request(&error) => {
+                eprintln!(
+                    "warning: resident-process observation for an already-delivered bootstrap \
+                     failed transiently; retaining the current lease and retrying: {error:#}"
+                );
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Error from a control-plane HTTP call, distinguishing transient/recoverable
@@ -1824,8 +1861,12 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
                     );
                 }
                 Ok((task_id, Err(error))) => {
-                    resident_tasks_by_id.remove(&task_id);
-                    eprintln!("error: provider-isolated resident lease failed: {error:#}")
+                    eprintln!("error: provider-isolated resident lease task failed: {error:#}");
+                    if let Some(metadata) = resident_tasks_by_id.remove(&task_id) {
+                        reconcile_failed_resident_task(client, api, metadata).await;
+                    } else {
+                        eprintln!("error: failed resident lease task had no supervision metadata");
+                    }
                 }
                 Err(error) => {
                     eprintln!("error: resident lease task panicked: {error}");
@@ -2052,8 +2093,22 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
     let drain_residents = async {
         while let Some(result) = resident_tasks.join_next_with_id().await {
             match result {
-                Ok((task_id, _)) => {
+                Ok((task_id, Ok(response))) => {
                     resident_tasks_by_id.remove(&task_id);
+                    eprintln!(
+                        "worker: provider-isolated resident lease {} finished during shutdown drain",
+                        response.lease.id
+                    );
+                }
+                Ok((task_id, Err(error))) => {
+                    eprintln!(
+                        "error: provider-isolated resident lease task failed during shutdown drain: {error:#}"
+                    );
+                    if let Some(metadata) = resident_tasks_by_id.remove(&task_id) {
+                        reconcile_failed_resident_task(client, api, metadata).await;
+                    } else {
+                        eprintln!("error: failed resident lease task had no supervision metadata");
+                    }
                 }
                 Err(error) => {
                     eprintln!("error: resident lease task panicked while draining: {error}");
@@ -2267,13 +2322,19 @@ where
                 .and_then(serde_json::Value::as_u64)
                 .context("resident-process generation is missing")?;
             let mut observer = |observation: IsolatedResidentProcessObservation| {
-                observer_runtime.block_on(report_resident_observation(
-                    &observer_client,
-                    &observer_api,
-                    process_id,
-                    generation,
-                    lease_id,
-                    observation,
+                observer_runtime.block_on(retry_resident_observation_until_acknowledged_with(
+                    &cancellation,
+                    RESIDENT_OBSERVATION_RETRY_DELAY,
+                    || {
+                        report_resident_observation(
+                            &observer_client,
+                            &observer_api,
+                            process_id,
+                            generation,
+                            lease_id,
+                            observation.clone(),
+                        )
+                    },
                 ))
             };
             execute_isolated_resident_process_job(
@@ -2573,6 +2634,8 @@ async fn report_resident_lost(
     process_id: Uuid,
     generation: u64,
     lease_id: sandboxwich_core::LeaseId,
+    error_code: &str,
+    error_message: &str,
 ) -> anyhow::Result<()> {
     with_retries(
         "report lost resident process",
@@ -2588,10 +2651,8 @@ async fn report_resident_lost(
                     observed_state: ResidentProcessObservedState::Lost,
                     pid: None,
                     exit_code: None,
-                    error_code: Some("worker_task_panicked".to_string()),
-                    error_message: Some(
-                        "provider-isolated resident supervision task panicked".to_string(),
-                    ),
+                    error_code: Some(error_code.to_string()),
+                    error_message: Some(error_message.to_string()),
                 })
                 .send()
                 .await?;
@@ -2606,9 +2667,10 @@ async fn fail_panicked_resident_lease(
     client: &reqwest::Client,
     api: &str,
     lease_id: sandboxwich_core::LeaseId,
+    error: &str,
 ) -> anyhow::Result<()> {
     let payload = FailLeaseRequest {
-        error: "provider-isolated resident supervision task panicked".to_string(),
+        error: error.to_string(),
         retry: true,
     };
     with_retries(
@@ -2627,12 +2689,7 @@ async fn fail_panicked_resident_lease(
     Ok(())
 }
 
-async fn reconcile_panicked_resident_task_with<
-    ReportLost,
-    ReportLostFuture,
-    FailLease,
-    FailFuture,
->(
+async fn reconcile_lost_resident_task_with<ReportLost, ReportLostFuture, FailLease, FailFuture>(
     metadata: ResidentTaskMetadata,
     report_lost: ReportLost,
     fail_lease: FailLease,
@@ -2659,13 +2716,13 @@ async fn reconcile_panicked_resident_task_with<
     .await
     {
         eprintln!(
-            "warning: failed to publish Lost for panicked resident lease {}: {error:#}",
+            "warning: failed to publish Lost while reconciling resident lease {}: {error:#}",
             metadata.lease_id
         );
     }
     if let Err(error) = fail_lease(metadata.lease_id, true).await {
         eprintln!(
-            "error: failed to reconcile panicked resident lease {} retryably: {error:#}",
+            "error: failed to reconcile resident lease {} retryably: {error:#}",
             metadata.lease_id
         );
     }
@@ -2676,15 +2733,64 @@ async fn reconcile_panicked_resident_task(
     api: &str,
     metadata: ResidentTaskMetadata,
 ) {
-    reconcile_panicked_resident_task_with(
+    reconcile_lost_resident_task_with(
         metadata,
         |process_id, generation, lease_id, observed_state| async move {
             debug_assert_eq!(observed_state, ResidentProcessObservedState::Lost);
-            report_resident_lost(client, api, process_id, generation, lease_id).await
+            report_resident_lost(
+                client,
+                api,
+                process_id,
+                generation,
+                lease_id,
+                "worker_task_panicked",
+                "provider-isolated resident supervision task panicked",
+            )
+            .await
         },
         |lease_id, retry| async move {
             debug_assert!(retry);
-            fail_panicked_resident_lease(client, api, lease_id).await
+            fail_panicked_resident_lease(
+                client,
+                api,
+                lease_id,
+                "provider-isolated resident supervision task panicked",
+            )
+            .await
+        },
+    )
+    .await;
+}
+
+async fn reconcile_failed_resident_task(
+    client: &reqwest::Client,
+    api: &str,
+    metadata: ResidentTaskMetadata,
+) {
+    reconcile_lost_resident_task_with(
+        metadata,
+        |process_id, generation, lease_id, observed_state| async move {
+            debug_assert_eq!(observed_state, ResidentProcessObservedState::Lost);
+            report_resident_lost(
+                client,
+                api,
+                process_id,
+                generation,
+                lease_id,
+                "worker_task_failed",
+                "provider-isolated resident supervision task returned an error",
+            )
+            .await
+        },
+        |lease_id, retry| async move {
+            debug_assert!(retry);
+            fail_panicked_resident_lease(
+                client,
+                api,
+                lease_id,
+                "provider-isolated resident supervision task returned an error",
+            )
+            .await
         },
     )
     .await;
@@ -3085,7 +3191,10 @@ fn execute_isolated_resident_process_job(
                     WorkerJobOutcome::Complete(WorkerJobResult::RunResidentProcess {
                         process_id,
                         generation,
-                        exit_code: None,
+                        // The completion endpoint derives the resident state from
+                        // this exit code. A desired stop is a clean terminal exit,
+                        // not an unknown exit that the API maps to Failed.
+                        exit_code: Some(0),
                     })
                 } else {
                     WorkerJobOutcome::Fail {
@@ -3325,17 +3434,24 @@ fn capabilities_from_args(
 fn capabilities_for_provider_mode(
     mut capabilities: Vec<WorkerCapability>,
     provider_mode: ProviderModeArg,
-    provider_isolated_sidecar: bool,
 ) -> Vec<WorkerCapability> {
     if provider_mode == ProviderModeArg::DryRun {
         capabilities.retain(|capability| *capability != WorkerCapability::MaterializeFile);
     }
     capabilities
-        .retain(|capability| *capability != WorkerCapability::ProviderIsolatedResidentProcessV1);
-    if provider_isolated_sidecar {
-        capabilities.push(WorkerCapability::ProviderIsolatedResidentProcessV1);
+}
+
+fn add_provider_isolated_resident_process_label(
+    labels: &mut BTreeMap<String, String>,
+    configured: bool,
+) {
+    labels.remove(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL);
+    if configured {
+        labels.insert(
+            PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL.to_string(),
+            PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE.to_string(),
+        );
     }
-    capabilities
 }
 
 fn claim_kinds_for_provider_mode(provider_mode: ProviderModeArg) -> Option<Vec<JobKind>> {

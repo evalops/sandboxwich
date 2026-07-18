@@ -1634,8 +1634,6 @@ pub enum SandboxEventKind {
     DesktopClosed => "desktop_closed",
     DesktopExpired => "desktop_expired",
     GuestHealthFailed => "guest_health_failed",
-    SidecarBootstrapBlocked => "sidecar_bootstrap_blocked",
-    ResidentProcessTerminalFailure => "resident_process_terminal_failure",
     FileUploaded => "file_uploaded",
     FileMaterialized => "file_materialized",
     DivergenceDetected => "divergence_detected",
@@ -1675,7 +1673,6 @@ pub enum WorkerCapability {
     VirtualMachine => "virtual_machine",
     RunCommand => "run_command",
     UidIsolatedResidentProcess => "uid_isolated_resident_process",
-    ProviderIsolatedResidentProcessV1 => "provider_isolated_resident_process_v1",
     MaterializeFile => "materialize_file",
     ApexTaskInstructions => "apex_task_instructions",
     AgentPrompt => "agent_prompt",
@@ -1687,6 +1684,16 @@ pub enum WorkerCapability {
     ApexTrustedSupervisorV1 => "apex_trusted_supervisor_v1",
 }
 }
+
+/// Extensible worker-label advertisement used instead of adding a new value
+/// to the closed `WorkerCapability` wire enum. Keeping the version in labels
+/// lets new workers register with older v1 API servers during a rolling
+/// upgrade; the API requires the exact current value before placing sidecar
+/// work on a worker.
+pub const PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL: &str =
+    "provider_isolated_resident_process_version";
+pub const PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION: u32 = 1;
+pub const PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE: &str = "1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Worker {
@@ -3048,6 +3055,95 @@ pub struct SshKeyListResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Deserialize, Eq, PartialEq)]
+    #[serde(rename_all = "snake_case")]
+    enum LegacyWorkerCapability {
+        RunCommand,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LegacyRegisterWorkerRequest {
+        capabilities: Vec<LegacyWorkerCapability>,
+        labels: BTreeMap<String, String>,
+    }
+
+    #[derive(Debug, Deserialize, Eq, PartialEq)]
+    #[serde(rename_all = "snake_case")]
+    enum LegacySandboxEventKind {
+        LifecycleChanged,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LegacySandboxEvent {
+        kind: LegacySandboxEventKind,
+        data: serde_json::Value,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LegacyEventListResponse {
+        events: Vec<LegacySandboxEvent>,
+    }
+
+    #[test]
+    fn provider_isolation_advertisement_is_accepted_by_a_legacy_registration_decoder() {
+        let request = RegisterWorkerRequest {
+            name: "new-worker".into(),
+            provider: "kubernetes".into(),
+            capabilities: vec![WorkerCapability::RunCommand],
+            max_concurrent_jobs: Some(1),
+            labels: BTreeMap::from([(
+                PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL.into(),
+                PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE.into(),
+            )]),
+        };
+        let encoded = serde_json::to_value(request).unwrap();
+        let legacy: LegacyRegisterWorkerRequest = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(
+            legacy.capabilities,
+            vec![LegacyWorkerCapability::RunCommand]
+        );
+        assert_eq!(
+            legacy
+                .labels
+                .get(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL)
+                .map(String::as_str),
+            Some(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE)
+        );
+        assert!(
+            !encoded
+                .to_string()
+                .contains("provider_isolated_resident_process_v1")
+        );
+    }
+
+    #[test]
+    fn sidecar_events_are_accepted_by_a_legacy_event_decoder() {
+        let response = EventListResponse {
+            ok: true,
+            events: vec![SandboxEvent {
+                id: EventId::new(),
+                sandbox_id: SandboxId::new(),
+                kind: SandboxEventKind::LifecycleChanged,
+                data: serde_json::json!({
+                    "eventType": "sidecar_bootstrap_blocked",
+                    "reason": "not_running",
+                }),
+                created_at: Utc::now(),
+            }],
+            next_cursor: None,
+        };
+        let legacy: LegacyEventListResponse =
+            serde_json::from_value(serde_json::to_value(response).unwrap()).unwrap();
+        assert_eq!(
+            legacy.events[0].kind,
+            LegacySandboxEventKind::LifecycleChanged
+        );
+        assert_eq!(
+            legacy.events[0].data["eventType"],
+            "sidecar_bootstrap_blocked"
+        );
+    }
 
     #[test]
     fn guest_agent_capability_report_is_typed_without_consuming_generic_checks() {

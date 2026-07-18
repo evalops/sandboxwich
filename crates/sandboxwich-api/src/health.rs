@@ -430,11 +430,17 @@ async fn fetch_resident_observability_metrics(
     }
     values.insert("resident_process".into(), resident_counts);
 
-    let block_sql = match tenant_id {
-        None => "select reason as label, sum(total) as value
+    let block_sql = match (tenant_id, db.dialect) {
+        // PostgreSQL promotes sum(bigint) to numeric, while the Prometheus
+        // contract is an i64 gauge. Cast at the aggregate boundary instead
+        // of asking sqlx to decode numeric as i64.
+        (None, SqlDialect::Postgres) => "select reason as label, sum(total)::bigint as value
                  from sidecar_bootstrap_block_rollups group by reason"
             .to_string(),
-        Some(_) => format!(
+        (None, SqlDialect::Sqlite) => "select reason as label, sum(total) as value
+                 from sidecar_bootstrap_block_rollups group by reason"
+            .to_string(),
+        (Some(_), _) => format!(
             "select reason as label, total as value
              from sidecar_bootstrap_block_rollups where tenant_id = {}",
             db.placeholder(1)

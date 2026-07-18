@@ -19,9 +19,10 @@ use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, DbVariant, ExecutionClass,
     MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES, MAX_SANDBOX_FILE_BYTES, MaterializeFileDestination,
     MaterializeFileObservation, MemoryLimit, NetworkAllowRuleKind, NetworkEgress,
-    ORB_SIDECAR_RESIDENT_PROCESS_UID, ProviderCapabilityReport, ProviderForkHandle,
-    ProviderHealthReport, ProviderHealthStatus, ProviderRuntimeResource, ProviderSandboxHandle,
-    ProviderSnapshotHandle, ProvisioningErrorClass, ProvisioningStage,
+    ORB_SIDECAR_RESIDENT_PROCESS_UID, PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL,
+    PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE, ProviderCapabilityReport,
+    ProviderForkHandle, ProviderHealthReport, ProviderHealthStatus, ProviderRuntimeResource,
+    ProviderSandboxHandle, ProviderSnapshotHandle, ProvisioningErrorClass, ProvisioningStage,
     ProvisioningStageUpdateRequest, RESIDENT_PROCESS_BOOTSTRAP_PREFIX, ResidentProcessId,
     RuntimeResourceInventoryResponse, RuntimeResourceKind, RuntimeResourcePurpose,
     RuntimeResourceStatus, SandboxId, SandboxProvisionSpec, SandboxRuntimeProfile, SnapshotId,
@@ -4695,9 +4696,10 @@ impl SandboxProvider for KubernetesApplyProvider {
         let mut report = self.dry_run.capability_report();
         report.capabilities.push(WorkerCapability::MaterializeFile);
         if self.isolated_resident_process_configured() {
-            report
-                .capabilities
-                .push(WorkerCapability::ProviderIsolatedResidentProcessV1);
+            report.labels.insert(
+                PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL.to_string(),
+                PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE.to_string(),
+            );
         }
         report
             .labels

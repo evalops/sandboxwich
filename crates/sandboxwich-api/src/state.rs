@@ -138,6 +138,9 @@ impl Drop for ApexWaiterGuard {
 
 #[derive(Clone)]
 pub(crate) struct LiveResidentBootstrap {
+    /// Instance-local admission metadata; never persisted or returned with
+    /// the secret-bearing bootstrap response.
+    pub(crate) tenant_id: String,
     pub(crate) content: Vec<u8>,
     pub(crate) sha256: String,
     pub(crate) target_file: String,
@@ -155,6 +158,7 @@ pub(crate) struct ResidentBootstrapFence {
 enum ResidentBootstrapEntry {
     Ready(LiveResidentBootstrap),
     InFlight {
+        tenant_id: String,
         fence: ResidentBootstrapFence,
         acknowledged: bool,
     },
@@ -164,9 +168,19 @@ enum ResidentBootstrapEntry {
     },
 }
 
+impl ResidentBootstrapEntry {
+    fn tenant_id(&self) -> &str {
+        match self {
+            Self::Ready(bootstrap) | Self::Delivered { bootstrap, .. } => &bootstrap.tenant_id,
+            Self::InFlight { tenant_id, .. } => tenant_id,
+        }
+    }
+}
+
 struct ResidentBootstrapStoreInner {
     values: HashMap<ResidentProcessId, ResidentBootstrapEntry>,
     reserved: usize,
+    reserved_by_tenant: HashMap<String, usize>,
     capacity: usize,
 }
 
@@ -184,6 +198,7 @@ impl ResidentBootstrapStore {
         Self(Arc::new(Mutex::new(ResidentBootstrapStoreInner {
             values: HashMap::new(),
             reserved: 0,
+            reserved_by_tenant: HashMap::new(),
             capacity,
         })))
     }
@@ -196,7 +211,28 @@ impl ResidentBootstrapStore {
         if inner.values.len() + inner.reserved >= inner.capacity {
             return Err(());
         }
+        let tenant_entries = inner
+            .values
+            .values()
+            .filter(|entry| entry.tenant_id() == bootstrap.tenant_id)
+            .count();
+        let tenant_reservations = inner
+            .reserved_by_tenant
+            .get(&bootstrap.tenant_id)
+            .copied()
+            .unwrap_or_default();
+        // Reserve at least half the bounded store for other tenants. The
+        // single-slot test store remains usable; production permits 128 of
+        // the 256 slots per tenant.
+        let per_tenant_capacity = (inner.capacity / 2).max(1);
+        if tenant_entries + tenant_reservations >= per_tenant_capacity {
+            return Err(());
+        }
         inner.reserved += 1;
+        *inner
+            .reserved_by_tenant
+            .entry(bootstrap.tenant_id.clone())
+            .or_default() += 1;
         Ok(ResidentBootstrapReservation {
             store: self.clone(),
             bootstrap: Some(bootstrap),
@@ -233,12 +269,14 @@ impl ResidentBootstrapStore {
                 return Err(ResidentBootstrapDeliveryError::FenceMismatch);
             }
             ResidentBootstrapEntry::InFlight {
+                tenant_id,
                 fence: in_flight_fence,
                 acknowledged,
             } => {
                 inner.values.insert(
                     *id,
                     ResidentBootstrapEntry::InFlight {
+                        tenant_id,
                         fence: in_flight_fence,
                         acknowledged,
                     },
@@ -249,6 +287,7 @@ impl ResidentBootstrapStore {
         inner.values.insert(
             *id,
             ResidentBootstrapEntry::InFlight {
+                tenant_id: bootstrap.tenant_id.clone(),
                 fence: fence.clone(),
                 acknowledged: false,
             },
@@ -279,6 +318,7 @@ impl ResidentBootstrapStore {
             Some(ResidentBootstrapEntry::InFlight {
                 fence: in_flight_fence,
                 acknowledged,
+                ..
             }) if in_flight_fence == fence => {
                 *acknowledged = true;
                 true
@@ -318,6 +358,7 @@ impl ResidentBootstrapStore {
                 Some(ResidentBootstrapEntry::InFlight {
                     fence: in_flight_fence,
                     acknowledged,
+                    ..
                 }),
                 Some(expected_fence),
             ) if in_flight_fence == expected_fence => {
@@ -353,6 +394,14 @@ impl ResidentBootstrapReservation {
             .lock()
             .expect("resident bootstrap mutex poisoned");
         inner.reserved -= 1;
+        let reservations = inner
+            .reserved_by_tenant
+            .get_mut(&bootstrap.tenant_id)
+            .expect("resident bootstrap tenant reservation missing");
+        *reservations -= 1;
+        if *reservations == 0 {
+            inner.reserved_by_tenant.remove(&bootstrap.tenant_id);
+        }
         let previous = inner
             .values
             .insert(id, ResidentBootstrapEntry::Ready(bootstrap));
@@ -362,13 +411,22 @@ impl ResidentBootstrapReservation {
 
 impl Drop for ResidentBootstrapReservation {
     fn drop(&mut self) {
-        if self.bootstrap.is_some() {
+        if let Some(bootstrap) = self.bootstrap.as_ref() {
             let mut inner = self
                 .store
                 .0
                 .lock()
                 .expect("resident bootstrap mutex poisoned");
             inner.reserved -= 1;
+            let tenant_id = &bootstrap.tenant_id;
+            let reservations = inner
+                .reserved_by_tenant
+                .get_mut(tenant_id)
+                .expect("resident bootstrap tenant reservation missing");
+            *reservations -= 1;
+            if *reservations == 0 {
+                inner.reserved_by_tenant.remove(tenant_id);
+            }
         }
     }
 }
@@ -467,8 +525,9 @@ impl Drop for ResidentBootstrapDelivery {
 mod tests {
     use super::*;
 
-    fn resident_bootstrap(generation: u64) -> LiveResidentBootstrap {
+    fn resident_bootstrap(tenant_id: &str, generation: u64) -> LiveResidentBootstrap {
         LiveResidentBootstrap {
+            tenant_id: tenant_id.into(),
             content: b"secret".to_vec(),
             sha256: "digest".into(),
             target_file: "/run/secret".into(),
@@ -488,14 +547,14 @@ mod tests {
     #[test]
     fn resident_bootstrap_reservation_holds_capacity_until_publish_or_drop() {
         let store = ResidentBootstrapStore::with_capacity(1);
-        let reservation = store.reserve(resident_bootstrap(1)).unwrap();
-        assert!(store.reserve(resident_bootstrap(1)).is_err());
+        let reservation = store.reserve(resident_bootstrap("tenant-a", 1)).unwrap();
+        assert!(store.reserve(resident_bootstrap("tenant-a", 1)).is_err());
 
         drop(reservation);
-        let reservation = store.reserve(resident_bootstrap(1)).unwrap();
+        let reservation = store.reserve(resident_bootstrap("tenant-a", 1)).unwrap();
         let id = ResidentProcessId::new();
         reservation.publish(id);
-        assert!(store.reserve(resident_bootstrap(1)).is_err());
+        assert!(store.reserve(resident_bootstrap("tenant-a", 1)).is_err());
         assert!(
             store
                 .begin_delivery(&id, resident_bootstrap_fence(Uuid::now_v7()))
@@ -509,7 +568,10 @@ mod tests {
         let id = ResidentProcessId::new();
         let lease_id = Uuid::now_v7();
         let fence = resident_bootstrap_fence(lease_id);
-        store.reserve(resident_bootstrap(1)).unwrap().publish(id);
+        store
+            .reserve(resident_bootstrap("tenant-a", 1))
+            .unwrap()
+            .publish(id);
 
         drop(store.begin_delivery(&id, fence.clone()).unwrap());
         let delivery = store.begin_delivery(&id, fence.clone()).unwrap();
@@ -524,7 +586,7 @@ mod tests {
             store.begin_delivery(&id, resident_bootstrap_fence(Uuid::now_v7())),
             Err(ResidentBootstrapDeliveryError::FenceMismatch)
         ));
-        assert!(store.reserve(resident_bootstrap(2)).is_err());
+        assert!(store.reserve(resident_bootstrap("tenant-a", 2)).is_err());
 
         let replacement_fence = ResidentBootstrapFence {
             generation: fence.generation + 1,
@@ -533,7 +595,7 @@ mod tests {
         };
         assert!(!store.acknowledge(&id, &replacement_fence));
         assert!(
-            store.reserve(resident_bootstrap(2)).is_err(),
+            store.reserve(resident_bootstrap("tenant-a", 2)).is_err(),
             "a stale fence must not reclaim a replacement's capacity"
         );
 
@@ -548,20 +610,23 @@ mod tests {
             store.begin_delivery(&id, fence),
             Err(ResidentBootstrapDeliveryError::Unavailable)
         ));
-        assert!(store.reserve(resident_bootstrap(2)).is_ok());
+        assert!(store.reserve(resident_bootstrap("tenant-a", 2)).is_ok());
     }
 
     #[test]
     fn resident_bootstrap_reclaim_is_generation_digest_and_fence_scoped() {
         let store = ResidentBootstrapStore::with_capacity(1);
         let id = ResidentProcessId::new();
-        store.reserve(resident_bootstrap(2)).unwrap().publish(id);
+        store
+            .reserve(resident_bootstrap("tenant-a", 2))
+            .unwrap()
+            .publish(id);
 
         assert!(!store.reclaim(&id, 1, "digest", None));
         assert!(!store.reclaim(&id, 2, "wrong-digest", None));
-        assert!(store.reserve(resident_bootstrap(3)).is_err());
+        assert!(store.reserve(resident_bootstrap("tenant-a", 3)).is_err());
         assert!(store.reclaim(&id, 2, "digest", None));
-        assert!(store.reserve(resident_bootstrap(3)).is_ok());
+        assert!(store.reserve(resident_bootstrap("tenant-a", 3)).is_ok());
 
         let replacement = ResidentProcessId::new();
         let fence = ResidentBootstrapFence {
@@ -570,7 +635,7 @@ mod tests {
             sha256: "digest".into(),
         };
         store
-            .reserve(resident_bootstrap(4))
+            .reserve(resident_bootstrap("tenant-a", 4))
             .unwrap()
             .publish(replacement);
         store
@@ -584,9 +649,70 @@ mod tests {
             sha256: "digest".into(),
         };
         assert!(!store.reclaim(&replacement, 3, "digest", Some(&stale_fence)));
-        assert!(store.reserve(resident_bootstrap(5)).is_err());
+        assert!(store.reserve(resident_bootstrap("tenant-a", 5)).is_err());
         assert!(store.reclaim(&replacement, 4, "digest", Some(&fence)));
-        assert!(store.reserve(resident_bootstrap(5)).is_ok());
+        assert!(store.reserve(resident_bootstrap("tenant-a", 5)).is_ok());
+    }
+
+    #[test]
+    fn resident_bootstrap_capacity_is_fair_across_tenants_and_globally_bounded() {
+        let store = ResidentBootstrapStore::with_capacity(4);
+        let tenant_a_delivered_id = ResidentProcessId::new();
+        store
+            .reserve(resident_bootstrap("tenant-a", 1))
+            .unwrap()
+            .publish(tenant_a_delivered_id);
+        store
+            .begin_delivery(
+                &tenant_a_delivered_id,
+                resident_bootstrap_fence(Uuid::now_v7()),
+            )
+            .unwrap()
+            .mark_delivered()
+            .unwrap();
+        let tenant_a_in_flight_id = ResidentProcessId::new();
+        store
+            .reserve(resident_bootstrap("tenant-a", 2))
+            .unwrap()
+            .publish(tenant_a_in_flight_id);
+        let _in_flight = store
+            .begin_delivery(
+                &tenant_a_in_flight_id,
+                resident_bootstrap_fence(Uuid::now_v7()),
+            )
+            .unwrap();
+
+        assert!(
+            store.reserve(resident_bootstrap("tenant-a", 3)).is_err(),
+            "one tenant's unacknowledged Delivered/InFlight bootstraps must fail closed at its quota"
+        );
+        store
+            .reserve(resident_bootstrap("tenant-b", 1))
+            .expect("tenant-b keeps admission while tenant-a holds its quota")
+            .publish(ResidentProcessId::new());
+        store
+            .reserve(resident_bootstrap("tenant-b", 2))
+            .unwrap()
+            .publish(ResidentProcessId::new());
+        assert!(
+            store.reserve(resident_bootstrap("tenant-c", 1)).is_err(),
+            "the global store bound must remain enforced"
+        );
+    }
+
+    #[test]
+    fn resident_bootstrap_reservations_count_toward_each_tenant_quota() {
+        let store = ResidentBootstrapStore::with_capacity(4);
+        let first = store.reserve(resident_bootstrap("tenant-a", 1)).unwrap();
+        let second = store.reserve(resident_bootstrap("tenant-a", 2)).unwrap();
+        assert!(
+            store.reserve(resident_bootstrap("tenant-a", 3)).is_err(),
+            "unpublished concurrent reservations must not bypass the tenant quota"
+        );
+        let other_tenant = store
+            .reserve(resident_bootstrap("tenant-b", 1))
+            .expect("a separate tenant remains admissible");
+        drop((first, second, other_tenant));
     }
 
     #[test]

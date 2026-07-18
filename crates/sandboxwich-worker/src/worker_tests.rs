@@ -235,7 +235,7 @@ fn resident_job(restart_policy: ResidentProcessRestartPolicy) -> Job {
             "restartPolicy": restart_policy,
             "bootstrapSha256": "a".repeat(64),
         }),
-        WorkerCapability::ProviderIsolatedResidentProcessV1,
+        WorkerCapability::ProvisionSandbox,
     )
 }
 
@@ -979,7 +979,6 @@ fn default_registration_capabilities_cover_supported_worker_jobs() {
     assert!(!capabilities.contains(&WorkerCapability::VirtualMachine));
     assert!(!capabilities.contains(&WorkerCapability::ApexTrustedSupervisorV1));
     assert!(!capabilities.contains(&WorkerCapability::UidIsolatedResidentProcess));
-    assert!(!capabilities.contains(&WorkerCapability::ProviderIsolatedResidentProcessV1));
 }
 
 #[test]
@@ -989,16 +988,15 @@ fn dry_run_registration_does_not_advertise_materialization_attestation() {
         WorkerCapability::MaterializeFile,
     ];
 
-    let dry_run =
-        capabilities_for_provider_mode(capabilities.clone(), ProviderModeArg::DryRun, false);
+    let dry_run = capabilities_for_provider_mode(capabilities.clone(), ProviderModeArg::DryRun);
     assert!(!dry_run.contains(&WorkerCapability::MaterializeFile));
 
-    let apply = capabilities_for_provider_mode(capabilities, ProviderModeArg::Apply, false);
+    let apply = capabilities_for_provider_mode(capabilities, ProviderModeArg::Apply);
     assert!(apply.contains(&WorkerCapability::MaterializeFile));
 }
 
 #[test]
-fn provider_isolated_sidecar_capability_requires_apply_digest_and_runtime_class() {
+fn provider_isolated_sidecar_label_requires_apply_digest_and_runtime_class() {
     let digest = "registry.example/orb-sidecar@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     assert!(
         validate_provider_isolated_sidecar_config(
@@ -1029,14 +1027,14 @@ fn provider_isolated_sidecar_capability_requires_apply_digest_and_runtime_class(
         .unwrap()
     );
 
-    let capabilities = capabilities_for_provider_mode(
-        vec![WorkerCapability::ProvisionSandbox],
-        ProviderModeArg::Apply,
-        true,
+    let mut labels = BTreeMap::new();
+    add_provider_isolated_resident_process_label(&mut labels, true);
+    assert_eq!(
+        labels.get(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL),
+        Some(&"1".to_string())
     );
-    assert!(capabilities.contains(&WorkerCapability::ProviderIsolatedResidentProcessV1));
-    let unconfigured = capabilities_for_provider_mode(capabilities, ProviderModeArg::Apply, false);
-    assert!(!unconfigured.contains(&WorkerCapability::ProviderIsolatedResidentProcessV1));
+    add_provider_isolated_resident_process_label(&mut labels, false);
+    assert!(!labels.contains_key(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL));
 }
 
 #[test]
@@ -1105,7 +1103,7 @@ fn provider_isolated_sidecar_distinguishes_desired_stop_from_lease_loss() {
         );
         match outcome {
             WorkerJobOutcome::Complete(WorkerJobResult::RunResidentProcess {
-                exit_code: None,
+                exit_code: Some(0),
                 ..
             }) if expect_complete => {}
             WorkerJobOutcome::Fail { retry: true, .. } if !expect_complete => {}
@@ -1157,7 +1155,7 @@ async fn panicked_resident_task_stops_renewal_and_reconciles_the_exact_lease() {
         .expect("panic must retain its exact lease metadata");
     let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
     let failures = Arc::new(std::sync::Mutex::new(Vec::new()));
-    reconcile_panicked_resident_task_with(
+    reconcile_lost_resident_task_with(
         exact_metadata,
         {
             let observations = observations.clone();
@@ -1222,6 +1220,120 @@ fn desired_stop_cancellation_uses_the_typed_api_error_code() {
     assert!(!is_resident_desired_stop(&prose_only));
 }
 
+#[tokio::test]
+async fn resident_observation_retries_transient_failures_under_the_existing_lease() {
+    let cancellation = LeaseCancellation::new();
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    retry_resident_observation_until_acknowledged_with(&cancellation, Duration::ZERO, {
+        let attempts = attempts.clone();
+        move || {
+            let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if attempt < 2 {
+                    Err(anyhow::Error::new(WorkerRequestError::Status {
+                        status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                        body: "temporary control-plane outage".to_string(),
+                    }))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    })
+    .await
+    .expect("a transient observation failure must retry without releasing the lease");
+
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "the same renewing lease retries until its observation is acknowledged"
+    );
+    assert!(!cancellation.signal.is_cancelled());
+}
+
+#[tokio::test]
+async fn resident_observation_stops_retrying_after_confirmed_cancellation() {
+    let cancellation = LeaseCancellation::new();
+    cancellation.cancel(LeaseCancellationReason::LeaseLost);
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let result =
+        retry_resident_observation_until_acknowledged_with(&cancellation, Duration::ZERO, {
+            let attempts = attempts.clone();
+            move || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(()) }
+            }
+        })
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn failed_resident_task_retains_exact_metadata_for_reconciliation() {
+    let lease_id = sandboxwich_core::LeaseId::new();
+    let process_id = Uuid::new_v4();
+    let generation = 11;
+    let cancellation = LeaseCancellation::new();
+    let metadata = ResidentTaskMetadata {
+        lease_id,
+        process_id,
+        generation,
+        cancellation: cancellation.clone(),
+    };
+    let mut tasks = tokio::task::JoinSet::new();
+    let task = tasks.spawn(async { Err::<(), _>(anyhow::anyhow!("injected resident task error")) });
+    let mut metadata_by_task = std::collections::HashMap::from([(task.id(), metadata)]);
+
+    let (task_id, result) = tasks
+        .join_next_with_id()
+        .await
+        .expect("resident task should finish")
+        .expect("the task itself must not panic");
+    let error = result.expect_err("injected task error should reach the drain supervisor");
+    assert!(error.to_string().contains("injected resident task error"));
+    let exact_metadata = metadata_by_task
+        .remove(&task_id)
+        .expect("an erroring task must retain its own lease metadata");
+    let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let failures = Arc::new(std::sync::Mutex::new(Vec::new()));
+    reconcile_lost_resident_task_with(
+        exact_metadata,
+        {
+            let observations = observations.clone();
+            move |process_id, generation, lease_id, state| async move {
+                observations
+                    .lock()
+                    .unwrap()
+                    .push((process_id, generation, lease_id, state));
+                Ok(())
+            }
+        },
+        {
+            let failures = failures.clone();
+            move |lease_id, retry| async move {
+                failures.lock().unwrap().push((lease_id, retry));
+                Ok(())
+            }
+        },
+    )
+    .await;
+
+    assert!(cancellation.signal.is_cancelled());
+    assert_eq!(cancellation.reason(), LeaseCancellationReason::LeaseLost);
+    assert_eq!(
+        *observations.lock().unwrap(),
+        vec![(
+            process_id,
+            generation,
+            lease_id,
+            ResidentProcessObservedState::Lost
+        )]
+    );
+    assert_eq!(*failures.lock().unwrap(), vec![(lease_id, true)]);
+}
+
 #[test]
 fn standalone_register_path_defaults_safe_and_requires_explicit_apply_for_materialization() {
     let parse = |extra: &[&str]| {
@@ -1241,7 +1353,6 @@ fn standalone_register_path_defaults_safe_and_requires_explicit_apply_for_materi
             )
             .unwrap(),
             args.provider_mode,
-            false,
         )
     };
 

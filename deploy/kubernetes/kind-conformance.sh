@@ -61,6 +61,10 @@ sed \
   -e 's/imagePullPolicy: Always/imagePullPolicy: IfNotPresent/g' \
   -e 's/replicas: 2/replicas: 1/' \
   "${ROOT_DIR}/deploy/kubernetes/api.yaml" >"${TMP_DIR}/api.yaml"
+sed \
+  -e "s#ghcr.io/evalops/sandboxwich-api@sha256:[0-9a-f]\{64\}#${API_IMAGE}#g" \
+  -e 's/imagePullPolicy: Always/imagePullPolicy: IfNotPresent/g' \
+  "${ROOT_DIR}/deploy/kubernetes/api-migrate.yaml" >"${TMP_DIR}/api-migrate.yaml"
 # Pin the guest image to the digest published into the disposable registry.
 # worker.yaml ships with an explicit SANDBOXWICH_RUNTIME_IMAGE (required for
 # apply mode); rewrite it to the exact image the kind nodes pre-pulled.
@@ -78,8 +82,10 @@ grep -Fq "value: ${RUNTIME_IMAGE}" "${TMP_DIR}/worker.yaml" || \
 grep -Fq "value: ${GATEWAY_IMAGE}" "${TMP_DIR}/worker.yaml" || \
   fail "worker manifest missing gateway image value ${GATEWAY_IMAGE}"
 
+kubectl apply -f "${TMP_DIR}/api-migrate.yaml"
+kubectl -n sandboxwich wait --for=condition=complete \
+  -f "${TMP_DIR}/api-migrate.yaml" --timeout=120s
 kubectl apply -f "${TMP_DIR}/api.yaml"
-kubectl -n sandboxwich wait --for=condition=complete job/sandboxwich-api-migrate --timeout=120s
 kubectl -n sandboxwich rollout status deployment/sandboxwich-api --timeout=120s
 kubectl apply -f "${TMP_DIR}/worker.yaml"
 kubectl -n sandboxwich rollout status deployment/sandboxwich-worker --timeout=120s

@@ -270,6 +270,49 @@ async fn bootstrap_block_rollup_is_bounded_and_monotonic_over_postgres_when_conf
     .await;
 }
 
+#[tokio::test]
+async fn operator_global_rollup_decodes_postgres_bigint_sum_when_configured() {
+    let Ok(database_url) = std::env::var("SANDBOXWICH_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let server = TestServer::start(database_url, None).await;
+    sqlx::any::install_default_drivers();
+    let pool = AnyPool::connect(&server.database_url).await.unwrap();
+    for (tenant_id, total) in [("default", 40_i64), ("tenant-b", 2_i64)] {
+        sqlx::query(
+            "insert into sidecar_bootstrap_block_rollups (tenant_id, reason, total)
+             values ($1, $2, $3)",
+        )
+        .bind(tenant_id)
+        .bind("not_running")
+        .bind(total)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let metrics = server
+        .client()
+        .get(format!("{}/metrics", server.base_url))
+        .header(OPERATOR_TOKEN_HEADER, TEST_OPERATOR_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        labeled_metric_value(
+            &metrics,
+            "sandboxwich_sidecar_bootstrap_block_total{reason=\"not_running\"}",
+        ),
+        42,
+        "operator/global metrics must decode PostgreSQL sum(bigint) as an i64 gauge"
+    );
+}
+
 async fn assert_bootstrap_block_rollup_is_bounded_and_monotonic(server: TestServer) {
     const RETAINED_EVENT_ROWS: usize = 2_048;
     const DURABLE_TOTAL: i64 = 7;
@@ -335,8 +378,8 @@ async fn assert_bootstrap_block_rollup_is_bounded_and_monotonic(server: TestServ
         sqlx::query(&event_sql)
             .bind(format!("large-history-{index}"))
             .bind(created.sandbox.id.to_string())
-            .bind("sidecar_bootstrap_blocked")
-            .bind(r#"{"reason":"not_running"}"#)
+            .bind("lifecycle_changed")
+            .bind(r#"{"eventType":"sidecar_bootstrap_blocked","reason":"not_running"}"#)
             .bind("2026-07-18T00:00:00Z")
             .execute(&mut *tx)
             .await

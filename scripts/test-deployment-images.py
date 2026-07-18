@@ -52,10 +52,41 @@ class DeploymentImagesTest(unittest.TestCase):
         self.assertEqual(tagged, [])
 
     def test_migration_and_api_use_the_same_api_digest(self) -> None:
-        text = (ROOT / "deploy/kubernetes/api.yaml").read_text()
-        api_digests = [digest for image, digest in IMAGE_RE.findall(text) if image.endswith("-api")]
-        self.assertEqual(len(api_digests), 2)
-        self.assertEqual(len(set(api_digests)), 1)
+        api_text = (ROOT / "deploy/kubernetes/api.yaml").read_text()
+        migration_text = (ROOT / "deploy/kubernetes/api-migrate.yaml").read_text()
+        api_digests = [
+            digest for image, digest in IMAGE_RE.findall(api_text) if image.endswith("-api")
+        ]
+        migration_digests = [
+            digest
+            for image, digest in IMAGE_RE.findall(migration_text)
+            if image.endswith("-api")
+        ]
+        self.assertEqual(len(api_digests), 2)  # init container and API container
+        self.assertEqual(len(migration_digests), 1)
+        self.assertEqual(set(api_digests), set(migration_digests))
+
+    def test_migration_job_is_versioned_and_gates_api_rollout(self) -> None:
+        migration_text = (ROOT / "deploy/kubernetes/api-migrate.yaml").read_text()
+        api_text = (ROOT / "deploy/kubernetes/api.yaml").read_text()
+        rollout_script = (ROOT / "deploy/kubernetes/apply-api.sh").read_text()
+
+        job_name = re.search(r"name: sandboxwich-api-migrate-([0-9a-f]{12})$", migration_text, re.MULTILINE)
+        digest = re.search(r"sandboxwich-api@sha256:([0-9a-f]{64})", migration_text)
+        self.assertIsNotNone(job_name)
+        self.assertIsNotNone(digest)
+        assert job_name is not None and digest is not None
+        self.assertEqual(job_name.group(1), digest.group(1)[:12])
+        self.assertNotIn("kind: Job", api_text)
+        self.assertIn("name: check-schema", api_text)
+        self.assertIn("- check-schema", api_text)
+        self.assertIn('value: "false"', api_text)
+
+        migration_apply = rollout_script.index('apply -f "${ROOT_DIR}/api-migrate.yaml"')
+        migration_wait = rollout_script.index("wait --for=condition=complete")
+        deployment_apply = rollout_script.index('apply -f "${ROOT_DIR}/api.yaml"')
+        self.assertLess(migration_apply, migration_wait)
+        self.assertLess(migration_wait, deployment_apply)
 
     def test_kind_conformance_rewrites_pinned_images_to_local_builds(self) -> None:
         script = (ROOT / "deploy/kubernetes/kind-conformance.sh").read_text()

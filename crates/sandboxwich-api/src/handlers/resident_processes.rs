@@ -54,8 +54,9 @@ async fn block_executor_bootstrap(
             db,
             &mut tx,
             sidecar.sandbox_id,
-            SandboxEventKind::SidecarBootstrapBlocked,
+            SandboxEventKind::LifecycleChanged,
             json!({
+                "eventType": "sidecar_bootstrap_blocked",
                 "reason": reason.as_str(),
                 "processName": ORB_SIDECAR_RESIDENT_PROCESS_NAME,
                 "generation": sidecar.generation,
@@ -131,6 +132,95 @@ async fn fetch_resident_process_by_id(
         .await?
         .ok_or_else(|| ApiError::not_found("resident process not found"))?;
     row_to_resident_process(row)
+}
+
+async fn provider_isolation_version(
+    db: &Database,
+    process_id: ResidentProcessId,
+) -> Result<u32, ApiError> {
+    let sql = format!(
+        "select provider_isolation_version from resident_processes where id = {}",
+        db.placeholder(1)
+    );
+    let version: i64 = sqlx::query_scalar(&sql)
+        .bind(process_id.to_string())
+        .fetch_one(&db.pool)
+        .await?;
+    u32::try_from(version)
+        .map_err(|_| ApiError::internal("database contains invalid provider isolation version"))
+}
+
+async fn placed_worker_supports_provider_isolated_resident_process(
+    db: &Database,
+    sandbox_id: SandboxId,
+    tenant_id: &str,
+) -> Result<bool, ApiError> {
+    let sql = format!(
+        "select w.labels
+         from sandbox_placements p
+         join workers w on w.id = p.worker_id
+         where p.sandbox_id = {} and w.tenant_id = {}",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    let labels = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .bind(tenant_id)
+        .fetch_optional(&db.pool)
+        .await?
+        .and_then(|row| row.try_get::<String, _>("labels").ok())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    Ok(labels
+        .as_ref()
+        .and_then(|labels| labels.get(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL))
+        .and_then(serde_json::Value::as_str)
+        == Some(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE))
+}
+
+/// Claim-time readiness probe for an executor job. It is deliberately free
+/// of telemetry side effects because guests poll this path: a configured
+/// sidecar defers the claim until the provider-isolated row is Running under
+/// its current active, unexpired lease. Returning before `try_claim_job`
+/// preserves the executor job's attempt budget while the sidecar starts.
+pub(crate) async fn executor_sidecar_is_ready_for_claim(
+    db: &Database,
+    sandbox_id: SandboxId,
+    tenant_id: &str,
+) -> Result<bool, ApiError> {
+    let sql = format!(
+        "select rp.tenant_id, rp.provider_isolation_version, rp.desired_state,
+                rp.observed_state,
+                jl.status as lease_status, jl.expires_at as lease_expires_at
+         from resident_processes rp
+         left join job_leases jl on jl.id = rp.active_lease_id
+         where rp.sandbox_id = {} and rp.name = {}",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    let Some(row) = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .bind(ORB_SIDECAR_RESIDENT_PROCESS_NAME)
+        .fetch_optional(&db.pool)
+        .await?
+    else {
+        return Ok(true);
+    };
+    let row_tenant_id: String = row.try_get("tenant_id")?;
+    let isolation_version: i64 = row.try_get("provider_isolation_version")?;
+    let desired_state: String = row.try_get("desired_state")?;
+    let observed_state: String = row.try_get("observed_state")?;
+    let lease_status: Option<String> = row.try_get("lease_status")?;
+    let lease_expires_at: Option<String> = row.try_get("lease_expires_at")?;
+    Ok(row_tenant_id == tenant_id
+        && isolation_version == i64::from(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION)
+        && desired_state == ResidentProcessDesiredState::Running.as_db_str()
+        && observed_state == ResidentProcessObservedState::Running.as_db_str()
+        && lease_status.as_deref() == Some(LeaseStatus::Active.as_db_str())
+        && lease_expires_at
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()?
+            .is_some_and(|expires_at| expires_at > Utc::now()))
 }
 
 fn ensure_resident_owner_role(
@@ -237,6 +327,30 @@ async fn ensure_sidecar_ready_if_required(
         // state gate (or fail to gate) this tenant's bootstrap read.
         return Ok(());
     }
+    if provider_isolation_version(db, sidecar.id).await?
+        != PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION
+    {
+        return block_executor_bootstrap(
+            db,
+            &sidecar,
+            SidecarBootstrapBlockReason::NotRunning,
+            format!(
+                "sandbox {sandbox_id} has an orb-sidecar resident process that was not admitted under the provider-isolated v1 contract; refusing to hand out the orb-executor bootstrap credential"
+            ),
+        )
+        .await;
+    }
+    if sidecar.desired_state != ResidentProcessDesiredState::Running {
+        return block_executor_bootstrap(
+            db,
+            &sidecar,
+            SidecarBootstrapBlockReason::NotRunning,
+            format!(
+                "sandbox {sandbox_id} requires an orb-sidecar resident process but it no longer desires Running; refusing to hand out the orb-executor bootstrap credential"
+            ),
+        )
+        .await;
+    }
     if sidecar.observed_state != ResidentProcessObservedState::Running {
         return block_executor_bootstrap(
             db,
@@ -328,14 +442,47 @@ pub(crate) async fn put_resident_process(
             "the resident-process contract supports only orb-executor and orb-sidecar",
         ));
     }
+    if name == ORB_SIDECAR_RESIDENT_PROCESS_NAME
+        && request
+            .bootstrap
+            .as_ref()
+            .is_none_or(|bootstrap| bootstrap.content.is_empty())
+    {
+        return Err(ApiError::bad_request(
+            "orb-sidecar requires a non-empty bootstrap credential",
+        ));
+    }
     let sandbox_id = SandboxId(sandbox_id);
     let sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
+    if name == ORB_SIDECAR_RESIDENT_PROCESS_NAME
+        && !placed_worker_supports_provider_isolated_resident_process(
+            &state.db,
+            sandbox_id,
+            &sandbox.tenant_id,
+        )
+        .await?
+    {
+        return Err(ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "resident_sidecar_worker_unsupported",
+            message: "orb-sidecar requires its placed worker to advertise provider-isolated resident-process v1 support".into(),
+        });
+    }
     let bootstrap_digest = request
         .bootstrap
         .as_ref()
         .map(|bootstrap| format!("{:x}", Sha256::digest(&bootstrap.content)));
 
     if let Ok(current) = fetch_named_resident_process(&state.db, sandbox_id, &name).await {
+        if name == ORB_SIDECAR_RESIDENT_PROCESS_NAME
+            && provider_isolation_version(&state.db, current.id).await?
+                != PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION
+        {
+            return Err(ApiError::conflict_code(
+                "resident_sidecar_isolation_upgrade_required",
+                "the existing orb-sidecar predates provider-isolated v1 admission and cannot be reused",
+            ));
+        }
         if request.expected_generation != current.generation {
             return Err(ApiError::conflict_code(
                 "resident_process_generation_conflict",
@@ -363,34 +510,6 @@ pub(crate) async fn put_resident_process(
             "new resident process requires expectedGeneration=0",
         ));
     }
-    if name == ORB_SIDECAR_RESIDENT_PROCESS_NAME {
-        let placement_sql = format!(
-            "select w.capabilities
-             from sandbox_placements p
-             join workers w on w.id = p.worker_id
-             where p.sandbox_id = {} and w.tenant_id = {}",
-            state.db.placeholder(1),
-            state.db.placeholder(2)
-        );
-        let placed_worker_supports_sidecar = sqlx::query(&placement_sql)
-            .bind(sandbox_id.to_string())
-            .bind(&sandbox.tenant_id)
-            .fetch_optional(&state.db.pool)
-            .await?
-            .and_then(|row| row.try_get::<String, _>("capabilities").ok())
-            .and_then(|raw| serde_json::from_str::<Vec<WorkerCapability>>(&raw).ok())
-            .is_some_and(|capabilities| {
-                capabilities.contains(&WorkerCapability::ProviderIsolatedResidentProcessV1)
-            });
-        if !placed_worker_supports_sidecar {
-            return Err(ApiError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                code: "resident_sidecar_worker_unsupported",
-                message: "orb-sidecar requires its placed worker to advertise provider-isolated resident-process v1 support".into(),
-            });
-        }
-    }
-
     let now = Utc::now();
     let process = ResidentProcess {
         id: ResidentProcessId::new(),
@@ -444,11 +563,7 @@ pub(crate) async fn put_resident_process(
                 "resourceId": process.id.0,
             }
         }),
-        required_capability: if process.name == ORB_SIDECAR_RESIDENT_PROCESS_NAME {
-            WorkerCapability::ProviderIsolatedResidentProcessV1
-        } else {
-            WorkerCapability::RunCommand
-        },
+        required_capability: WorkerCapability::RunCommand,
         required_execution_class: sandbox.execution_class.clone(),
         priority: 0,
         attempts: 0,
@@ -464,6 +579,7 @@ pub(crate) async fn put_resident_process(
         .bootstrap
         .map(|bootstrap| {
             state.resident_bootstraps.reserve(LiveResidentBootstrap {
+                tenant_id: process.tenant_id.clone(),
                 content: bootstrap.content,
                 sha256: bootstrap_digest.clone().unwrap_or_default(),
                 target_file: bootstrap.target_file,
@@ -483,9 +599,10 @@ pub(crate) async fn put_resident_process(
             id, sandbox_id, tenant_id, name, argv, cwd, env,
             bootstrap_sha256, bootstrap_byte_count, bootstrap_target_file, bootstrap_mode,
             restart_policy, desired_state, observed_state, generation,
+            provider_isolation_version,
             created_at, updated_at
          ) values ({})",
-        state.db.placeholders(17)
+        state.db.placeholders(18)
     );
     let mut tx = state.db.pool.begin().await?;
     sqlx::query(&insert_sql)
@@ -504,6 +621,11 @@ pub(crate) async fn put_resident_process(
         .bind(process.desired_state.as_db_str())
         .bind(process.observed_state.as_db_str())
         .bind(process.generation as i64)
+        .bind(if process.name == ORB_SIDECAR_RESIDENT_PROCESS_NAME {
+            i64::from(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION)
+        } else {
+            0
+        })
         .bind(process.created_at.to_rfc3339())
         .bind(process.updated_at.to_rfc3339())
         .execute(&mut *tx)
@@ -678,6 +800,8 @@ pub(crate) async fn read_resident_process_bootstrap(
                where ready_sidecar.sandbox_id = target.sandbox_id
                  and ready_sidecar.tenant_id = target.tenant_id
                  and ready_sidecar.name = {}
+                 and ready_sidecar.provider_isolation_version = {}
+                 and ready_sidecar.desired_state = 'running'
                  and ready_sidecar.observed_state = 'running'
                  and live_lease.status = 'active'
                  and live_lease.expires_at > {}
@@ -700,6 +824,7 @@ pub(crate) async fn read_resident_process_bootstrap(
         state.db.placeholder(15),
         state.db.placeholder(16),
         state.db.placeholder(17),
+        state.db.placeholder(18),
     );
     let consumed = sqlx::query(&consume_sql)
         .bind(now.to_rfc3339())
@@ -718,6 +843,7 @@ pub(crate) async fn read_resident_process_bootstrap(
         .bind(ORB_EXECUTOR_RESIDENT_PROCESS_NAME)
         .bind(ORB_SIDECAR_RESIDENT_PROCESS_NAME)
         .bind(ORB_SIDECAR_RESIDENT_PROCESS_NAME)
+        .bind(i64::from(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION))
         .bind(now.to_rfc3339())
         .execute(&state.db.pool)
         .await?;
@@ -910,8 +1036,9 @@ pub(crate) async fn observe_resident_process(
         && let Err(error) = insert_event(
             &state.db,
             process.sandbox_id,
-            SandboxEventKind::ResidentProcessTerminalFailure,
+            SandboxEventKind::LifecycleChanged,
             json!({
+                "eventType": "resident_process_terminal_failure",
                 "processName": process.name,
                 "generation": request.generation,
                 "observedState": request.observed_state.as_db_str(),

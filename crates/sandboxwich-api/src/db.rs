@@ -11,6 +11,8 @@ use sqlx::{Any, AnyPool, Arguments, Sqlite};
 use std::fmt::{Display, Write as _};
 use std::time::Duration;
 
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
 #[derive(Clone)]
 pub(crate) struct Database {
     pub(crate) pool: AnyPool,
@@ -24,20 +26,45 @@ pub(crate) enum SqlDialect {
 }
 
 pub(crate) async fn migrate_database(db: &Database) -> anyhow::Result<()> {
-    sqlx::migrate!("./migrations").run(&db.pool).await?;
+    MIGRATOR.run(&db.pool).await?;
     ensure_database_constraints(db).await?;
     Ok(())
 }
 
 pub(crate) async fn verify_database_schema(db: &Database) -> anyhow::Result<()> {
-    let migration = sqlx::query(
-        "select version from _sqlx_migrations where success = true order by version desc limit 1",
-    )
-    .fetch_optional(&db.pool)
-    .await
-    .context("database migrations have not been applied; run `sandboxwich-api migrate`")?;
-    if migration.is_none() {
-        anyhow::bail!("database migrations have not been applied; run `sandboxwich-api migrate`");
+    let expected_migration = latest_compiled_migration();
+    let migration_sql = format!(
+        "select cast(case when success then 1 else 0 end as bigint) as success_value, checksum \
+         from _sqlx_migrations where version = {}",
+        db.placeholder(1)
+    );
+    let Some(migration) = sqlx::query(&migration_sql)
+        .bind(expected_migration.version)
+        .fetch_optional(&db.pool)
+        .await
+        .context("database migrations have not been applied; run `sandboxwich-api migrate`")?
+    else {
+        anyhow::bail!(
+            "database migration {} ({}) has not been applied; run `sandboxwich-api migrate`",
+            expected_migration.version,
+            expected_migration.description
+        );
+    };
+    let success_value: i64 = migration.try_get("success_value")?;
+    if success_value != 1 {
+        anyhow::bail!(
+            "database migration {} ({}) did not complete successfully; run `sandboxwich-api migrate`",
+            expected_migration.version,
+            expected_migration.description
+        );
+    }
+    let checksum: Vec<u8> = migration.try_get("checksum")?;
+    if checksum.as_slice() != expected_migration.checksum.as_ref() {
+        anyhow::bail!(
+            "database migration {} ({}) checksum does not match this API image; run `sandboxwich-api migrate`",
+            expected_migration.version,
+            expected_migration.description
+        );
     }
     let Some(value) = fetch_schema_metadata(db, DB_ENUM_SCHEMA_METADATA_KEY).await? else {
         anyhow::bail!(
@@ -51,6 +78,13 @@ pub(crate) async fn verify_database_schema(db: &Database) -> anyhow::Result<()> 
         );
     }
     Ok(())
+}
+
+pub(crate) fn latest_compiled_migration() -> &'static sqlx::migrate::Migration {
+    MIGRATOR
+        .iter()
+        .max_by_key(|migration| migration.version)
+        .expect("sandboxwich-api must embed at least one migration")
 }
 
 pub(crate) async fn connect_database(

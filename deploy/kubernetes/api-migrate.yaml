@@ -1,0 +1,66 @@
+# The Job identity includes the first 12 hexadecimal characters of the API
+# image digest. Update this name and image together on every API image change:
+# a completed Kubernetes Job is not rerun by `kubectl apply`.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sandboxwich-api-migrate-e722cecbe407
+  namespace: sandboxwich
+  labels:
+    app.kubernetes.io/name: sandboxwich-api-migrate
+    app.kubernetes.io/part-of: sandboxwich
+    sandboxwich.dev/migration-image: e722cecbe407
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sandboxwich-api-migrate
+        app.kubernetes.io/part-of: sandboxwich
+    spec:
+      restartPolicy: OnFailure
+      # Runs to completion once and exits; no signal handling to worry about,
+      # but it gets the same pod/container hardening as the long-running API
+      # Deployment since it uses the same image.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: ghcr.io/evalops/sandboxwich-api@sha256:e722cecbe4072efbef95e6a80bfc687e90491ceeaa97a6b2ca04c88da5066c01
+          imagePullPolicy: IfNotPresent
+          args:
+            - migrate
+          env:
+            - name: SANDBOXWICH_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sandboxwich-secrets
+                  key: database-url
+            - name: SANDBOXWICH_DATABASE_MAX_CONNECTIONS
+              value: "2"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: tmp
+          emptyDir: {}
