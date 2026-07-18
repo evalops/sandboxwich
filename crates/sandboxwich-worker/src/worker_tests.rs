@@ -1334,6 +1334,77 @@ async fn failed_resident_task_retains_exact_metadata_for_reconciliation() {
     assert_eq!(*failures.lock().unwrap(), vec![(lease_id, true)]);
 }
 
+#[tokio::test]
+async fn production_resident_task_result_dispatches_failure_and_panic_reconciliation() {
+    use axum::{
+        Router,
+        extract::{Request, State},
+        response::Json,
+    };
+
+    async fn record_request(
+        State(requests): State<Arc<std::sync::Mutex<Vec<String>>>>,
+        request: Request,
+    ) -> Json<serde_json::Value> {
+        requests
+            .lock()
+            .unwrap()
+            .push(request.uri().path().to_string());
+        // The production reconciliation deliberately continues from a failed
+        // observation to lease failure. A malformed success body keeps this
+        // fixture small while still proving both real HTTP paths are invoked.
+        Json(serde_json::json!({}))
+    }
+
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(record_request)
+                .with_state(requests.clone()),
+        )
+        .into_future(),
+    );
+
+    for should_panic in [false, true] {
+        let lease_id = sandboxwich_core::LeaseId::new();
+        let process_id = Uuid::new_v4();
+        let cancellation = LeaseCancellation::new();
+        let metadata = ResidentTaskMetadata {
+            lease_id,
+            process_id,
+            generation: 13,
+            cancellation: cancellation.clone(),
+        };
+        let mut tasks = tokio::task::JoinSet::new();
+        let task = tasks.spawn(async move {
+            assert!(!should_panic, "injected resident task panic");
+            Err::<LeaseResponse, _>(anyhow::anyhow!("injected resident task error"))
+        });
+        let mut metadata_by_task = std::collections::HashMap::from([(task.id(), metadata)]);
+        let result = tasks.join_next_with_id().await.unwrap();
+
+        reconcile_resident_task_result(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            result,
+            &mut metadata_by_task,
+            false,
+        )
+        .await;
+
+        assert!(metadata_by_task.is_empty());
+        assert_eq!(cancellation.reason(), LeaseCancellationReason::LeaseLost);
+        let recorded = requests.lock().unwrap();
+        assert!(recorded.contains(&format!("/resident-processes/{process_id}/observations")));
+        assert!(recorded.contains(&format!("/leases/{lease_id}/fail")));
+    }
+    server.abort();
+}
+
 #[test]
 fn standalone_register_path_defaults_safe_and_requires_explicit_apply_for_materialization() {
     let parse = |extra: &[&str]| {

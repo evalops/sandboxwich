@@ -1787,6 +1787,7 @@ name = "sandboxwich-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64",
  "chrono",
  "clap",

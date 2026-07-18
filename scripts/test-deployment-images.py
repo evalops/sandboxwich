@@ -87,6 +87,30 @@ class DeploymentImagesTest(unittest.TestCase):
         deployment_apply = rollout_script.index('apply -f "${ROOT_DIR}/api.yaml"')
         self.assertLess(migration_apply, migration_wait)
         self.assertLess(migration_wait, deployment_apply)
+        scale_down = rollout_script.index("scale deployment/sandboxwich-api --replicas=0")
+        api_rollout = rollout_script.index(
+            "rollout status deployment/sandboxwich-api", deployment_apply
+        )
+        worker_apply = rollout_script.index('apply -f "${ROOT_DIR}/worker.yaml"')
+        self.assertLess(scale_down, migration_apply)
+        self.assertLess(deployment_apply, api_rollout)
+        self.assertLess(api_rollout, worker_apply)
+
+    def test_process_local_bootstrap_and_guest_ingress_are_deployable(self) -> None:
+        api_text = (ROOT / "deploy/kubernetes/api.yaml").read_text()
+        self.assertRegex(api_text, r"(?m)^  replicas: 1$")
+        self.assertIn("type: Recreate", api_text)
+        self.assertIn("kubernetes.io/metadata.name: sandboxwich-sandboxes", api_text)
+        self.assertIn("port: 3217", api_text)
+
+    def test_worker_enables_fenced_orphan_cleanup(self) -> None:
+        worker_text = (ROOT / "deploy/kubernetes/worker.yaml").read_text()
+        self.assertIn("- --orphan-reconciliation-apply", worker_text)
+        self.assertIn("name: SANDBOXWICH_ORPHAN_RECONCILIATION_APPLY", worker_text)
+        self.assertIn('value: "1"', worker_text)
+        self.assertIn(
+            "value: http://sandboxwich-api.sandboxwich.svc:3217", worker_text
+        )
 
     def test_kind_conformance_rewrites_pinned_images_to_local_builds(self) -> None:
         script = (ROOT / "deploy/kubernetes/kind-conformance.sh").read_text()

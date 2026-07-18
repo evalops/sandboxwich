@@ -2212,7 +2212,7 @@ fn with_egress_excluded_cidrs_replace_drops_the_defaults() {
 }
 
 #[test]
-fn deny_all_egress_still_renders_no_egress_rules() {
+fn deny_all_egress_keeps_only_dns_and_authenticated_api_control_plane_rules() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
@@ -2226,9 +2226,21 @@ fn deny_all_egress_still_renders_no_egress_rules() {
     let provisioned = provider
         .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
         .expect("dry-run provision should succeed");
+    let egress = provisioned.metadata["manifests"]["networkPolicy"]["spec"]["egress"]
+        .as_array()
+        .expect("deny-all still needs bounded system egress");
+    assert!(egress.iter().any(|rule| rule["ports"][0]["port"] == 53));
+    let api = egress
+        .iter()
+        .find(|rule| rule["ports"][0]["port"] == 3217)
+        .expect("guest control channel must reach the API");
     assert_eq!(
-        provisioned.metadata["manifests"]["networkPolicy"]["spec"]["egress"],
-        json!([])
+        api["to"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+        "sandboxwich-ci"
+    );
+    assert_eq!(
+        api["to"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/name"],
+        "sandboxwich-api"
     );
 }
 
@@ -2959,6 +2971,8 @@ fn provision_staged_applies_gateway_policy_and_waits_for_gateway_before_runtime(
         namespace: "sandboxwich-ci".to_string(),
         name: format!("sandboxwich-fqdn-egress-{sandbox_id}"),
         uid: "uid-fqdn".to_string(),
+        resident_lease_id: None,
+        created_at: None,
     };
     assert_eq!(
         kubernetes_delete_path(&fqdn_observed).expect("GKE FQDN delete path"),
@@ -3114,7 +3128,7 @@ fn adoption_contract_rejects_immutable_or_security_drift_for_every_resource_kind
         .expect("network policy spec")
         .remove("egress");
     validate_adoption_contract(&network_policy, &api_normalized_deny_all_policy)
-        .expect("an omitted empty egress list is the API form of deny-all egress");
+        .expect_err("omitting invariant DNS and API egress must block adoption");
 
     let mut changed_pvc = pvc.clone();
     changed_pvc["spec"]["storageClassName"] = json!("wrong-storage-class");
@@ -3185,6 +3199,7 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
     let orphan_sandbox = SandboxId::new();
     let inventory = ReconciliationInventory {
         sandbox_ids: std::collections::HashSet::from([live_sandbox, expired_sandbox]),
+        active_resident_lease_ids: std::collections::HashSet::new(),
         resources: vec![ExpectedKubernetesResource {
             sandbox_id: live_sandbox,
             resource_kind: RuntimeResourceKind::Pod,
@@ -3201,6 +3216,8 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             namespace: "sandboxwich-ci".to_string(),
             name: format!("sandboxwich-{live_sandbox}"),
             uid: "uid-live".to_string(),
+            resident_lease_id: None,
+            created_at: None,
         },
         ObservedKubernetesResource {
             sandbox_id: Some(orphan_sandbox),
@@ -3208,6 +3225,8 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             namespace: "sandboxwich-ci".to_string(),
             name: format!("sandboxwich-{orphan_sandbox}"),
             uid: "uid-orphan".to_string(),
+            resident_lease_id: None,
+            created_at: None,
         },
         ObservedKubernetesResource {
             sandbox_id: Some(expired_sandbox),
@@ -3215,6 +3234,8 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             namespace: "sandboxwich-ci".to_string(),
             name: format!("sandboxwich-pvc-{expired_sandbox}"),
             uid: "uid-expired".to_string(),
+            resident_lease_id: None,
+            created_at: None,
         },
         ObservedKubernetesResource {
             sandbox_id: None,
@@ -3222,6 +3243,8 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             namespace: "sandboxwich-ci".to_string(),
             name: "foreign-pod".to_string(),
             uid: "uid-foreign".to_string(),
+            resident_lease_id: None,
+            created_at: None,
         },
         ObservedKubernetesResource {
             sandbox_id: Some(live_sandbox),
@@ -3229,6 +3252,8 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             namespace: "sandboxwich-ci".to_string(),
             name: format!("sandboxwich-{live_sandbox}"),
             uid: "replacement-uid".to_string(),
+            resident_lease_id: None,
+            created_at: None,
         },
     ];
     let expired =
@@ -3271,19 +3296,68 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
 }
 
 #[test]
-fn orphan_reconciliation_deletes_with_uid_precondition_and_fails_closed() {
+fn resident_resource_reconciliation_is_fenced_by_active_lease_not_live_sandbox() {
+    let sandbox_id = SandboxId::new();
+    let active_lease = Uuid::new_v4();
+    let stale_lease = Uuid::new_v4();
+    let newly_claimed_lease = Uuid::new_v4();
+    let inventory = ReconciliationInventory {
+        sandbox_ids: std::collections::HashSet::from([sandbox_id]),
+        resources: Vec::new(),
+        active_resident_lease_ids: std::collections::HashSet::from([active_lease]),
+    };
+    let now = Utc::now();
+    let resource = |lease_id, created_at| ObservedKubernetesResource {
+        sandbox_id: Some(sandbox_id),
+        resource_kind: RuntimeResourceKind::Pod,
+        namespace: "sandboxwich-ci".to_string(),
+        name: format!("resident-{lease_id}"),
+        uid: format!("uid-{lease_id}"),
+        resident_lease_id: Some(lease_id),
+        created_at: Some(created_at),
+    };
+    let decisions = classify_reconciliation(
+        &inventory,
+        &[
+            resource(active_lease, now),
+            resource(stale_lease, now - chrono::Duration::minutes(6)),
+            resource(newly_claimed_lease, now),
+        ],
+        &std::collections::HashMap::new(),
+        now,
+    );
+    assert_eq!(
+        decisions[0].classification,
+        ReconciliationClassification::Expected
+    );
+    assert!(!decisions[0].delete_allowed);
+    assert_eq!(
+        decisions[1].classification,
+        ReconciliationClassification::Orphaned
+    );
+    assert!(decisions[1].delete_allowed);
+    assert_eq!(
+        decisions[2].classification,
+        ReconciliationClassification::Indeterminate
+    );
+    assert!(!decisions[2].delete_allowed);
+}
+
+#[test]
+fn orphan_reconciliation_parses_lease_fences_and_plans_uid_preconditioned_deletion() {
     let dir = std::env::temp_dir().join(format!("sandboxwich-reconcile-{}", SandboxId::new()));
     std::fs::create_dir_all(&dir).expect("create reconciliation fake dir");
     let log_path = dir.join("log.txt");
     let script_path = dir.join("kubectl");
     let orphan = SandboxId::new();
+    let resident_lease = Uuid::new_v4();
     let script = format!(
         r#"#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "{log}"
 case " $* " in
   *" get "*)
-    printf '%s\n' '{{"items":[{{"kind":"Pod","metadata":{{"namespace":"sandboxwich-ci","name":"sandboxwich-{orphan}","uid":"uid-orphan","labels":{{"sandboxwich.dev/sandbox-id":"{orphan}"}}}}}}]}}'
+    printf '%s\n' '{{"items":[{{"kind":"Pod","metadata":{{"namespace":"sandboxwich-ci","name":"sandboxwich-{orphan}","uid":"uid-orphan","creationTimestamp":"2020-01-01T00:00:00Z","labels":{{"sandboxwich.dev/sandbox-id":"{orphan}","sandboxwich.dev/lease-id":"{resident_lease}"}}}}}}]}}'
     ;;
   *" delete "*)
     cat >> "{log}"
@@ -3310,6 +3384,7 @@ esac
         sandbox_ids: Vec::new(),
         complete: true,
         resources: Vec::new(),
+        active_resident_lease_ids: vec![resident_lease],
         next_cursor: None,
     };
     let limits = ReconciliationLimits {
@@ -3323,6 +3398,8 @@ esac
         namespace: "sandboxwich-ci".to_string(),
         name: format!("sandboxwich-{orphan}"),
         uid: "uid-orphan".to_string(),
+        resident_lease_id: Some(resident_lease),
+        created_at: Some(Utc::now() - chrono::Duration::minutes(6)),
     };
     assert_eq!(
         kubernetes_delete_path(&observed).expect("delete path"),
@@ -3333,15 +3410,36 @@ esac
         "uid-orphan"
     );
 
-    let dry_run = provider
+    let active = provider
         .reconcile_orphans(
-            Ok(inventory),
+            Ok(inventory.clone()),
+            limits,
+            true,
+            &CancelSignal::never_cancelled(),
+        )
+        .expect("active resident reconciliation");
+    assert_eq!(active.deleted, 0);
+    assert_eq!(
+        active.decisions[0].classification,
+        ReconciliationClassification::Expected
+    );
+
+    let mut stale_inventory = inventory;
+    stale_inventory.active_resident_lease_ids.clear();
+    let stale = provider
+        .reconcile_orphans(
+            Ok(stale_inventory),
             limits,
             false,
             &CancelSignal::never_cancelled(),
         )
-        .expect("dry-run reconciliation");
-    assert_eq!(dry_run.deleted, 0);
+        .expect("stale resident reconciliation");
+    assert_eq!(stale.deleted, 0);
+    assert!(!stale.apply);
+    assert_eq!(
+        stale.decisions[0].classification,
+        ReconciliationClassification::Orphaned
+    );
 
     let unavailable = provider
         .reconcile_orphans(

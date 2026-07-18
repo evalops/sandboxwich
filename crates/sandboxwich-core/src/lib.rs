@@ -1066,6 +1066,8 @@ pub struct RuntimeResourceInventoryResponse {
     pub sandbox_ids: Vec<SandboxId>,
     pub complete: bool,
     pub resources: Vec<RuntimeResourceInventoryItem>,
+    #[serde(default)]
+    pub active_resident_lease_ids: Vec<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
 }

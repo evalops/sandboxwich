@@ -33,37 +33,55 @@ pub(crate) async fn migrate_database(db: &Database) -> anyhow::Result<()> {
 
 pub(crate) async fn verify_database_schema(db: &Database) -> anyhow::Result<()> {
     let expected_migration = latest_compiled_migration();
-    let migration_sql = format!(
-        "select cast(case when success then 1 else 0 end as bigint) as success_value, checksum \
-         from _sqlx_migrations where version = {}",
-        db.placeholder(1)
-    );
-    let Some(migration) = sqlx::query(&migration_sql)
-        .bind(expected_migration.version)
-        .fetch_optional(&db.pool)
+    let version_sql = "select coalesce(max(version), 0) as latest_version from _sqlx_migrations";
+    let latest_version: i64 = sqlx::query(version_sql)
+        .fetch_one(&db.pool)
         .await
         .context("database migrations have not been applied; run `sandboxwich-api migrate`")?
-    else {
+        .try_get("latest_version")?;
+    if latest_version < expected_migration.version {
         anyhow::bail!(
             "database migration {} ({}) has not been applied; run `sandboxwich-api migrate`",
             expected_migration.version,
             expected_migration.description
         );
-    };
-    let success_value: i64 = migration.try_get("success_value")?;
-    if success_value != 1 {
+    }
+    if latest_version > expected_migration.version {
         anyhow::bail!(
-            "database migration {} ({}) did not complete successfully; run `sandboxwich-api migrate`",
+            "database migration version {latest_version} is newer than this API image's latest migration {} ({}); deploy the matching API image",
             expected_migration.version,
             expected_migration.description
         );
     }
-    let checksum: Vec<u8> = migration.try_get("checksum")?;
-    if checksum.as_slice() != expected_migration.checksum.as_ref() {
-        anyhow::bail!(
+    let migration_sql = format!(
+        "select cast(case when success then 1 else 0 end as bigint) as success_value, checksum \
+         from _sqlx_migrations where version = {}",
+        db.placeholder(1)
+    );
+    for expected in MIGRATOR.iter() {
+        let migration = sqlx::query(&migration_sql)
+            .bind(expected.version)
+            .fetch_optional(&db.pool)
+            .await?
+            .with_context(|| {
+                format!(
+                    "database migration {} ({}) has not been applied; run `sandboxwich-api migrate`",
+                    expected.version, expected.description
+                )
+            })?;
+        let success_value: i64 = migration.try_get("success_value")?;
+        anyhow::ensure!(
+            success_value == 1,
+            "database migration {} ({}) did not complete successfully; run `sandboxwich-api migrate`",
+            expected.version,
+            expected.description
+        );
+        let checksum: Vec<u8> = migration.try_get("checksum")?;
+        anyhow::ensure!(
+            checksum.as_slice() == expected.checksum.as_ref(),
             "database migration {} ({}) checksum does not match this API image; run `sandboxwich-api migrate`",
-            expected_migration.version,
-            expected_migration.description
+            expected.version,
+            expected.description
         );
     }
     let Some(value) = fetch_schema_metadata(db, DB_ENUM_SCHEMA_METADATA_KEY).await? else {
@@ -934,6 +952,13 @@ impl Database {
             .map(|index| self.placeholder(index))
             .collect::<Vec<_>>()
             .join(", ")
+    }
+
+    pub(crate) fn timestamp_is_future(&self, column: &str) -> String {
+        match self.dialect {
+            SqlDialect::Postgres => format!("({column})::timestamptz > clock_timestamp()"),
+            SqlDialect::Sqlite => format!("julianday({column}) > julianday('now')"),
+        }
     }
 }
 

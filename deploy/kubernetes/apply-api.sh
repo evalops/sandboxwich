@@ -12,6 +12,13 @@ fi
 MIGRATION_TIMEOUT="${SANDBOXWICH_MIGRATION_TIMEOUT:-5m}"
 
 "${KUBECTL[@]}" apply -f "${ROOT_DIR}/namespace.yaml"
+# The resident-bootstrap broker is process-local and the schema contract is
+# exact-versioned, so no old API replica may remain serving during migration.
+if "${KUBECTL[@]}" -n sandboxwich get deployment/sandboxwich-api >/dev/null 2>&1; then
+  "${KUBECTL[@]}" -n sandboxwich scale deployment/sandboxwich-api --replicas=0
+  "${KUBECTL[@]}" -n sandboxwich rollout status deployment/sandboxwich-api \
+    --timeout="${MIGRATION_TIMEOUT}"
+fi
 "${KUBECTL[@]}" apply -f "${ROOT_DIR}/api-migrate.yaml"
 MIGRATION_JOB="$("${KUBECTL[@]}" -n sandboxwich get -f "${ROOT_DIR}/api-migrate.yaml" -o name)"
 if ! "${KUBECTL[@]}" -n sandboxwich wait --for=condition=complete \
@@ -23,4 +30,7 @@ fi
 
 "${KUBECTL[@]}" apply -f "${ROOT_DIR}/api.yaml"
 "${KUBECTL[@]}" -n sandboxwich rollout status deployment/sandboxwich-api \
+  --timeout="${MIGRATION_TIMEOUT}"
+"${KUBECTL[@]}" apply -f "${ROOT_DIR}/worker.yaml"
+"${KUBECTL[@]}" -n sandboxwich rollout status deployment/sandboxwich-worker \
   --timeout="${MIGRATION_TIMEOUT}"

@@ -451,6 +451,126 @@ pub(crate) async fn runtime_resource_inventory_is_worker_scoped_and_bounded() {
             .cleanup_deadline
             .is_none()
     );
+
+    let tenant_b = reqwest::Client::builder()
+        .default_headers({
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {TEST_TENANT_B_TOKEN}").parse().unwrap(),
+            );
+            headers
+        })
+        .build()
+        .unwrap();
+    let tenant_b_worker: WorkerResponse = tenant_b
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "tenant-b-inventory-worker".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![WorkerCapability::ProvisionSandbox],
+            max_concurrent_jobs: Some(1),
+            labels: std::collections::BTreeMap::from([(
+                "cluster".to_string(),
+                "kind-inventory".to_string(),
+            )]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let tenant_b_sandbox: SandboxResponse = tenant_b
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("tenant-b-inventory-sandbox".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            workspace_mode: None,
+            runtime_profile: None,
+            execution_class: None,
+            ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let tenant_b_worker_client = worker_client(&tenant_b_worker);
+    let tenant_b_lease: ClaimLeaseResponse = tenant_b_worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, tenant_b_worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(tenant_b_sandbox.sandbox.id),
+            kinds: Some(vec![JobKind::ProvisionSandbox]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let tenant_b_lease = tenant_b_lease.lease.expect("tenant B provision lease");
+    tenant_b_worker_client
+        .put(format!(
+            "{}/leases/{}/provisioning",
+            server.base_url, tenant_b_lease.id
+        ))
+        .json(&ProvisioningStageUpdateRequest {
+            stage: ProvisioningStage::WorkspaceReady,
+            resource_kind: Some(RuntimeResourceKind::PersistentVolumeClaim),
+            resource_namespace: Some("sandboxwich-sandboxes".to_string()),
+            resource_name: Some(format!("sandboxwich-pvc-{}", tenant_b_sandbox.sandbox.id)),
+            resource_uid: Some("uid-tenant-b-live".to_string()),
+            observed_generation: None,
+            attempt_count: tenant_b_lease.attempt,
+            last_error_class: None,
+            last_error_code: None,
+            last_error: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let shared_inventory: RuntimeResourceInventoryResponse = worker_client(&replacement)
+        .get(format!(
+            "{}/workers/{}/runtime-resource-inventory?namespace=sandboxwich-sandboxes",
+            server.base_url, replacement.worker.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        shared_inventory
+            .sandbox_ids
+            .contains(&tenant_b_sandbox.sandbox.id)
+    );
+    assert!(
+        shared_inventory
+            .resources
+            .iter()
+            .any(|resource| resource.uid == "uid-tenant-b-live")
+    );
 }
 
 /// Regression test for issue #64: the guest agent running inside a sandbox

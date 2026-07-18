@@ -124,7 +124,7 @@ spec:
             - name: HOME
               value: /tmp
             - name: SANDBOXWICH_API
-              value: http://sandboxwich-api:3217
+              value: http://sandboxwich-api.sandboxwich.svc:3217
             # GH-64: this tenant-wide credential authenticates only the
             # `run` subcommand's initial `POST /workers/register` call.
             # Immediately after registering, the worker process mints and
@@ -207,6 +207,8 @@ spec:
             #     --provider-mode to dry-run.
             - name: SANDBOXWICH_K8S_ENABLE_MUTATION
               value: "1"
+            - name: SANDBOXWICH_ORPHAN_RECONCILIATION_APPLY
+              value: "1"
           args:
             - run
             - --name
@@ -255,6 +257,7 @@ spec:
             - "20"
             - --orphan-reconciliation-max-elapsed-secs
             - "10"
+            - --orphan-reconciliation-apply
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

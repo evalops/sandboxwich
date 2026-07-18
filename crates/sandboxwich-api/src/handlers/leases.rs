@@ -531,56 +531,46 @@ pub(crate) async fn renew_lease(
     let sql = format!(
         "update job_leases
          set expires_at = {}
-         where id = {} and status = 'active'
-           and ({} != 'run_resident_process' or exists (
-             select 1 from resident_processes rp
-             where rp.id = {} and rp.desired_state = 'running'
-           ))",
+         where id = {} and status = 'active' and {}",
         state.db.placeholder(1),
         state.db.placeholder(2),
-        state.db.placeholder(3),
-        state.db.placeholder(4)
+        state.db.timestamp_is_future("expires_at")
     );
     let result = sqlx::query(&sql)
         .bind(expires_at.to_rfc3339())
         .bind(lease_id.to_string())
-        .bind(lease.job.kind.as_db_str())
-        .bind(
-            lease
-                .job
-                .payload
-                .get("residentProcessId")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default(),
-        )
         .execute(&state.db.pool)
         .await?;
     if result.rows_affected() == 0 {
-        if lease.job.kind == JobKind::RunResidentProcess {
-            let stopped_sql = format!(
-                "select 1 from resident_processes where id = {} and desired_state = 'stopped'",
-                state.db.placeholder(1)
-            );
-            if sqlx::query(&stopped_sql)
-                .bind(
-                    lease
-                        .job
-                        .payload
-                        .get("residentProcessId")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default(),
-                )
-                .fetch_optional(&state.db.pool)
-                .await?
-                .is_some()
-            {
-                return Err(ApiError::conflict_code(
-                    "resident_process_stopped",
-                    "resident process no longer desires a running lease",
-                ));
-            }
-        }
         return Err(ApiError::not_found("active lease not found"));
+    }
+    if lease.job.kind == JobKind::RunResidentProcess {
+        let stopped_sql = format!(
+            "select 1 from resident_processes where id = {} and desired_state = 'stopped'",
+            state.db.placeholder(1)
+        );
+        if sqlx::query(&stopped_sql)
+            .bind(
+                lease
+                    .job
+                    .payload
+                    .get("residentProcessId")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+            )
+            .fetch_optional(&state.db.pool)
+            .await?
+            .is_some()
+        {
+            // Renew the fence before signalling the stop. The owner keeps
+            // renewing while it publishes Stopped and completes the lease,
+            // so a control-plane partition cannot turn a clean stop into an
+            // expiry failure.
+            return Err(ApiError::conflict_code(
+                "resident_process_stopped",
+                "resident process no longer desires a running lease",
+            ));
+        }
     }
 
     let lease = fetch_lease(&state.db, lease_id).await?;
@@ -1151,6 +1141,28 @@ pub(crate) async fn complete_lease_in_transaction(
                 "lease is already completed with a different result",
             ));
         }
+        if lease.status == LeaseStatus::Expired
+            && lease.job.status == JobStatus::Succeeded
+            && let WorkerJobResult::RunResidentProcess {
+                process_id,
+                generation,
+                exit_code: Some(0),
+            } = &result
+            && *process_id == resident_process_id_from_job(&lease.job)?
+            && lease
+                .job
+                .payload
+                .get("generation")
+                .and_then(serde_json::Value::as_u64)
+                == Some(*generation)
+            && resident_process_is_cleanly_stopped(db, &mut tx, &lease.job).await?
+        {
+            // The expiry sweeper owns clean desired-stop finalization during
+            // a control-plane partition. Treat the original owner's exact
+            // completion replay as acknowledged even though the lease row
+            // remains an honest record of having expired.
+            return Ok(lease);
+        }
         if lease.status != LeaseStatus::Active {
             return Err(ApiError::bad_request(
                 "lease is already terminal with a different outcome",
@@ -1255,7 +1267,9 @@ pub(crate) async fn fail_lease_in_transaction(
 
         let now = Utc::now();
         fail_active_lease_on_connection(db, &mut tx, lease_id, now, error).await?;
-        let retry = retry_requested && lease.job.attempts < lease.job.max_attempts;
+        let retry = retry_requested
+            && lease.job.attempts < lease.job.max_attempts
+            && !resident_bootstrap_was_delivered(db, &mut tx, &lease.job).await?;
         if retry {
             update_job_status_on_connection(
                 db,
@@ -1376,7 +1390,30 @@ pub(crate) async fn expire_lease_if_still_active(
 
         let lease = fetch_lease_on_connection(db, &mut tx, lease_id).await?;
         let job = lease.job.clone();
-        let next_status = if job.attempts >= job.max_attempts {
+        if resident_process_desires_stop(db, &mut tx, &job).await? {
+            let process_id = resident_process_id_from_job(&job)?;
+            let generation = job
+                .payload
+                .get("generation")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| ApiError::internal("resident process job is missing generation"))?;
+            apply_completed_job_on_connection(
+                db,
+                &mut tx,
+                &job,
+                WorkerJobResult::RunResidentProcess {
+                    process_id,
+                    generation,
+                    exit_code: Some(0),
+                },
+            )
+            .await?;
+            update_job_status_on_connection(db, &mut tx, job.id, JobStatus::Succeeded, None, now)
+                .await?;
+            return Ok(());
+        }
+        let bootstrap_was_delivered = resident_bootstrap_was_delivered(db, &mut tx, &job).await?;
+        let next_status = if job.attempts >= job.max_attempts || bootstrap_was_delivered {
             JobStatus::Dead
         } else {
             JobStatus::Queued
@@ -1390,7 +1427,7 @@ pub(crate) async fn expire_lease_if_still_active(
             now,
         )
         .await?;
-        if job.attempts >= job.max_attempts {
+        if job.attempts >= job.max_attempts || bootstrap_was_delivered {
             apply_failed_job_on_connection(db, &mut tx, &job, "lease expired").await?;
             record_terminal_slo_observation(db, &mut tx, &lease, false, now).await?;
         } else {
@@ -1412,6 +1449,94 @@ pub(crate) async fn expire_lease_if_still_active(
             Err(error)
         }
     }
+}
+
+async fn resident_process_desires_stop(
+    db: &Database,
+    connection: &mut AnyConnection,
+    job: &Job,
+) -> Result<bool, ApiError> {
+    if job.kind != JobKind::RunResidentProcess {
+        return Ok(false);
+    }
+    let process_id = resident_process_id_from_job(job)?;
+    let generation = job
+        .payload
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| ApiError::internal("resident process job is missing generation"))?;
+    let sql = format!(
+        "select 1 from resident_processes
+         where id = {} and generation = {} and desired_state = 'stopped'",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    Ok(sqlx::query(&sql)
+        .bind(process_id.to_string())
+        .bind(i64::try_from(generation).map_err(|_| {
+            ApiError::internal("resident process generation exceeds database range")
+        })?)
+        .fetch_optional(&mut *connection)
+        .await?
+        .is_some())
+}
+
+async fn resident_process_is_cleanly_stopped(
+    db: &Database,
+    connection: &mut AnyConnection,
+    job: &Job,
+) -> Result<bool, ApiError> {
+    if job.kind != JobKind::RunResidentProcess {
+        return Ok(false);
+    }
+    let process_id = resident_process_id_from_job(job)?;
+    let generation = job
+        .payload
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| ApiError::internal("resident process job is missing generation"))?;
+    let sql = format!(
+        "select 1 from resident_processes
+         where id = {} and generation = {} and desired_state = 'stopped'
+           and observed_state = 'stopped' and exit_code = 0 and active_lease_id is null",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    Ok(sqlx::query(&sql)
+        .bind(process_id.to_string())
+        .bind(i64::try_from(generation).map_err(|_| {
+            ApiError::internal("resident process generation exceeds database range")
+        })?)
+        .fetch_optional(&mut *connection)
+        .await?
+        .is_some())
+}
+
+async fn resident_bootstrap_was_delivered(
+    db: &Database,
+    connection: &mut AnyConnection,
+    job: &Job,
+) -> Result<bool, ApiError> {
+    if job.kind != JobKind::RunResidentProcess {
+        return Ok(false);
+    }
+    let Some(process_id) = job
+        .payload
+        .get("residentProcessId")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(false);
+    };
+    let sql = format!(
+        "select 1 from resident_processes
+         where id = {} and bootstrap_delivered_lease_id is not null",
+        db.placeholder(1)
+    );
+    Ok(sqlx::query(&sql)
+        .bind(process_id)
+        .fetch_optional(&mut *connection)
+        .await?
+        .is_some())
 }
 
 async fn record_terminal_slo_observation(
@@ -2415,10 +2540,39 @@ pub(crate) async fn apply_failed_job_on_connection(
             )
             .await?;
         }
-        JobKind::ProvisionSandbox
-        | JobKind::StopSandbox
-        | JobKind::ResumeSandbox
-        | JobKind::RunResidentProcess => {}
+        JobKind::RunResidentProcess => {
+            let process_id = job
+                .payload
+                .get("residentProcessId")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| ApiError::internal("resident process job is missing its id"))?;
+            let generation = job
+                .payload
+                .get("generation")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| ApiError::internal("resident process job is missing generation"))?;
+            let sql = format!(
+                "update resident_processes
+                 set observed_state = 'failed', active_lease_id = null, pid = null,
+                     exit_code = null, last_error = {}, updated_at = {}
+                 where id = {} and generation = {}
+                   and observed_state != 'stopped'",
+                db.placeholder(1),
+                db.placeholder(2),
+                db.placeholder(3),
+                db.placeholder(4)
+            );
+            sqlx::query(&sql)
+                .bind(error)
+                .bind(Utc::now().to_rfc3339())
+                .bind(process_id)
+                .bind(i64::try_from(generation).map_err(|_| {
+                    ApiError::internal("resident process generation exceeds database range")
+                })?)
+                .execute(&mut *connection)
+                .await?;
+        }
+        JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {}
         JobKind::MaterializeFile => {
             delete_sandbox_file_if_present_on_connection(
                 db,

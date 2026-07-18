@@ -258,6 +258,54 @@ async fn set_resident_desired_state(
     .unwrap();
 }
 
+async fn set_resident_active_lease(
+    server: &TestServer,
+    process_id: ResidentProcessId,
+    lease_id: Option<LeaseId>,
+) {
+    sqlx::any::install_default_drivers();
+    let pool = AnyPool::connect(&server.database_url).await.unwrap();
+    let (lease_placeholder, process_placeholder) = if server.database_url.starts_with("postgres:")
+        || server.database_url.starts_with("postgresql:")
+    {
+        ("$1", "$2")
+    } else {
+        ("?", "?")
+    };
+    sqlx::query(&format!(
+        "update resident_processes set active_lease_id = {lease_placeholder} where id = {process_placeholder}"
+    ))
+    .bind(lease_id.map(|value| value.to_string()))
+    .bind(process_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+}
+
+async fn set_lease_expiry(
+    server: &TestServer,
+    lease_id: LeaseId,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) {
+    sqlx::any::install_default_drivers();
+    let pool = AnyPool::connect(&server.database_url).await.unwrap();
+    let (expiry_placeholder, lease_placeholder) = if server.database_url.starts_with("postgres:")
+        || server.database_url.starts_with("postgresql:")
+    {
+        ("$1", "$2")
+    } else {
+        ("?", "?")
+    };
+    sqlx::query(&format!(
+        "update job_leases set expires_at = {expiry_placeholder} where id = {lease_placeholder}"
+    ))
+    .bind(expires_at.to_rfc3339())
+    .bind(lease_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 pub(crate) async fn resident_process_create_is_idempotent_tenant_scoped_and_redacted() {
     let data_dir = tempfile::tempdir().unwrap();
@@ -1422,6 +1470,52 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
         .error_for_status()
         .unwrap();
 
+    set_resident_active_lease(&server, sidecar_created.resident_process.id, None).await;
+    let no_active_lease = guest_client
+        .post(format!(
+            "{}/resident-processes/{}/bootstrap",
+            server.base_url, executor_created.resident_process.id
+        ))
+        .json(&executor_bootstrap_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        no_active_lease.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    set_resident_active_lease(
+        &server,
+        sidecar_created.resident_process.id,
+        Some(sidecar_lease.id),
+    )
+    .await;
+    set_lease_expiry(
+        &server,
+        sidecar_lease.id,
+        chrono::Utc::now() - chrono::Duration::seconds(1),
+    )
+    .await;
+    let expired_lease = guest_client
+        .post(format!(
+            "{}/resident-processes/{}/bootstrap",
+            server.base_url, executor_created.resident_process.id
+        ))
+        .json(&executor_bootstrap_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        expired_lease.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    set_lease_expiry(
+        &server,
+        sidecar_lease.id,
+        chrono::Utc::now() + chrono::Duration::seconds(60),
+    )
+    .await;
+
     // A persisted Running observation is not enough: once its lease is no
     // longer active, the fail-closed gate must close before any replacement
     // claim has a chance to overwrite the observation.
@@ -1619,6 +1713,29 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
     assert_eq!(stopped_renewal.status(), reqwest::StatusCode::CONFLICT);
     let stopped_error: ErrorEnvelope = stopped_renewal.json().await.unwrap();
     assert_eq!(stopped_error.code, "resident_process_stopped");
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&server.database_url)
+        .await
+        .unwrap();
+    let lease_lookup = if server.database_url.starts_with("postgres") {
+        "select expires_at from job_leases where id = $1"
+    } else {
+        "select expires_at from job_leases where id = ?"
+    };
+    let renewed_expires_at: String = sqlx::query_scalar(lease_lookup)
+        .bind(replacement_sidecar_lease.id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(&renewed_expires_at)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            > replacement_sidecar_lease.expires_at,
+        "typed desired-stop renewal must extend the active fence before signalling cancellation"
+    );
 
     // 10. Tenant scoping applies identically to the sidecar's own resident-
     // process record as it does to orb-executor's (see the tenant_b check
@@ -1666,7 +1783,7 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
                 && event.data["eventType"] == "sidecar_bootstrap_blocked"
         })
         .collect();
-    assert_eq!(blocked_events.len(), 4);
+    assert_eq!(blocked_events.len(), 6);
     assert!(blocked_events.iter().any(|event| {
         event.data["reason"] == "not_running"
             && event.data["processName"] == ORB_SIDECAR_RESIDENT_PROCESS_NAME
@@ -1676,6 +1793,16 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
         blocked_events
             .iter()
             .any(|event| event.data["reason"] == "inactive_lease")
+    );
+    assert!(
+        blocked_events
+            .iter()
+            .any(|event| event.data["reason"] == "no_active_lease")
+    );
+    assert!(
+        blocked_events
+            .iter()
+            .any(|event| event.data["reason"] == "expired_lease")
     );
     let terminal_events: Vec<_> = events
         .events
@@ -1723,6 +1850,12 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
     );
     assert!(
         metrics.contains("sandboxwich_sidecar_bootstrap_block_total{reason=\"inactive_lease\"} 1")
+    );
+    assert!(
+        metrics.contains("sandboxwich_sidecar_bootstrap_block_total{reason=\"no_active_lease\"} 1")
+    );
+    assert!(
+        metrics.contains("sandboxwich_sidecar_bootstrap_block_total{reason=\"expired_lease\"} 1")
     );
     for secret in [
         "sidecar-canary-secret",
@@ -2094,4 +2227,438 @@ async fn terminal_and_tenant_stop_paths_reclaim_exact_bootstrap_entries() {
             "{action} must reclaim the exact {name} bootstrap entry"
         );
     }
+}
+
+#[tokio::test]
+async fn stopping_before_first_claim_terminalizes_the_queued_resident_job() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir
+                .path()
+                .join("resident-stop-before-claim.db")
+                .display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let (sandbox_id, worker, guest_client) =
+        provisioned_sandbox_with_guest(&server, "stop-before-claim", false).await;
+    let created: ResidentProcessResponse = server
+        .client()
+        .put(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/orb-executor",
+            server.base_url
+        ))
+        .json(&resident_process_request(
+            "/usr/local/bin/orb-executor",
+            b"stop-before-claim",
+            "/run/sandboxwich/bootstrap/orb-token",
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let stopped: ResidentProcessResponse = server
+        .client()
+        .post(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/orb-executor/stop",
+            server.base_url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        stopped.resident_process.observed_state,
+        ResidentProcessObservedState::Stopped
+    );
+    assert_eq!(stopped.resident_process.exit_code, Some(0));
+    let claim: ClaimLeaseResponse = guest_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox_id),
+            kinds: Some(vec![JobKind::RunResidentProcess]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(claim.lease.is_none());
+    assert_eq!(created.resident_process.id, stopped.resident_process.id);
+}
+
+#[tokio::test]
+async fn desired_stop_expiry_is_clean_and_replay_safe() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with_expiry_sweeper(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("resident-stop-expiry.db").display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let (sandbox_id, worker, guest_client) =
+        provisioned_sandbox_with_guest(&server, "stop-expiry", false).await;
+    let created: ResidentProcessResponse = server
+        .client()
+        .put(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/orb-executor",
+            server.base_url
+        ))
+        .json(&resident_process_request(
+            "/usr/local/bin/orb-executor",
+            b"stop-expiry",
+            "/run/sandboxwich/bootstrap/orb-token",
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claim_resident_process_lease(&server, &worker, &guest_client, sandbox_id).await;
+    server
+        .client()
+        .post(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/orb-executor/stop",
+            server.base_url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&server.database_url)
+        .await
+        .unwrap();
+    sqlx::query("update job_leases set expires_at = ? where id = ?")
+        .bind((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339())
+        .bind(lease.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut swept = false;
+    for _ in 0..40 {
+        let current: ResidentProcessResponse = server
+            .client()
+            .get(format!(
+                "{}/sandboxes/{sandbox_id}/resident-processes/orb-executor",
+                server.base_url
+            ))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if current.resident_process.observed_state == ResidentProcessObservedState::Stopped
+            && current.resident_process.active_lease_id.is_none()
+        {
+            swept = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(swept, "expiry must preserve a clean desired stop");
+    guest_client
+        .post(format!(
+            "{}/resident-processes/{}/observations",
+            server.base_url, created.resident_process.id
+        ))
+        .json(&ResidentProcessObservationRequest {
+            generation: created.resident_process.generation,
+            lease_id: lease.id.0,
+            observed_state: ResidentProcessObservedState::Stopped,
+            pid: None,
+            exit_code: Some(0),
+            error_code: None,
+            error_message: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    guest_client
+        .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::RunResidentProcess {
+                process_id: created.resident_process.id,
+                generation: created.resident_process.generation,
+                exit_code: Some(0),
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn delivered_bootstrap_cannot_be_requeued_before_first_observation() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("resident-ack-terminal.db").display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let (sandbox_id, worker, guest_client) =
+        provisioned_sandbox_with_guest(&server, "ack-terminal", false).await;
+    let created: ResidentProcessResponse = server
+        .client()
+        .put(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/orb-executor",
+            server.base_url
+        ))
+        .json(&resident_process_request(
+            "/usr/local/bin/orb-executor",
+            b"ack-terminal",
+            "/run/sandboxwich/bootstrap/orb-token",
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claim_resident_process_lease(&server, &worker, &guest_client, sandbox_id).await;
+    let bootstrap_request = ResidentProcessBootstrapReadRequest {
+        generation: created.resident_process.generation,
+        lease_id: lease.id.0,
+        expected_sha256: created.resident_process.bootstrap_sha256.clone().unwrap(),
+    };
+    guest_client
+        .post(format!(
+            "{}/resident-processes/{}/bootstrap",
+            server.base_url, created.resident_process.id
+        ))
+        .json(&bootstrap_request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    guest_client
+        .post(format!(
+            "{}/resident-processes/{}/observations",
+            server.base_url, created.resident_process.id
+        ))
+        .json(&ResidentProcessObservationRequest {
+            generation: created.resident_process.generation,
+            lease_id: lease.id.0,
+            observed_state: ResidentProcessObservedState::Failed,
+            pid: None,
+            exit_code: None,
+            error_code: Some("injected_spawn_failure".to_string()),
+            error_message: Some("injected failure before terminal lease update".to_string()),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let failed: LeaseResponse = guest_client
+        .post(format!("{}/leases/{}/fail", server.base_url, lease.id))
+        .json(&FailLeaseRequest {
+            error: "injected post-bootstrap failure".to_string(),
+            retry: true,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(failed.lease.status, LeaseStatus::Failed);
+    assert_eq!(failed.lease.job.status, JobStatus::Failed);
+    let terminal: ResidentProcessResponse = server
+        .client()
+        .get(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/orb-executor",
+            server.base_url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        terminal.resident_process.observed_state,
+        ResidentProcessObservedState::Failed
+    );
+    assert!(terminal.resident_process.active_lease_id.is_none());
+    let replacement: ClaimLeaseResponse = guest_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox_id),
+            kinds: Some(vec![JobKind::RunResidentProcess]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(replacement.lease.is_none());
+}
+
+#[tokio::test]
+async fn delivered_bootstrap_lease_expiry_is_terminal_not_requeued() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with_expiry_sweeper(
+        format!(
+            "sqlite://{}",
+            data_dir
+                .path()
+                .join("resident-delivery-expiry.db")
+                .display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let (sandbox_id, worker, guest_client) =
+        provisioned_sandbox_with_guest(&server, "delivery-expiry", false).await;
+    let created: ResidentProcessResponse = server
+        .client()
+        .put(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/orb-executor",
+            server.base_url
+        ))
+        .json(&resident_process_request(
+            "/usr/local/bin/orb-executor",
+            b"delivery-expiry",
+            "/run/sandboxwich/bootstrap/orb-token",
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claim_resident_process_lease(&server, &worker, &guest_client, sandbox_id).await;
+    guest_client
+        .post(format!(
+            "{}/resident-processes/{}/bootstrap",
+            server.base_url, created.resident_process.id
+        ))
+        .json(&ResidentProcessBootstrapReadRequest {
+            generation: created.resident_process.generation,
+            lease_id: lease.id.0,
+            expected_sha256: created.resident_process.bootstrap_sha256.clone().unwrap(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    set_lease_expiry(
+        &server,
+        lease.id,
+        chrono::Utc::now() - chrono::Duration::seconds(1),
+    )
+    .await;
+    let replacement: ClaimLeaseResponse = guest_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox_id),
+            kinds: Some(vec![JobKind::RunResidentProcess]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(replacement.lease.is_none());
+    let mut job = None;
+    for _ in 0..30 {
+        let current: JobResponse = server
+            .client()
+            .get(format!("{}/jobs/{}", server.base_url, lease.job_id))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if current.job.status == JobStatus::Dead {
+            job = Some(current);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let job = job.expect("expiry sweeper must terminalize a delivered bootstrap lease");
+    assert_eq!(job.job.status, JobStatus::Dead);
+    let terminal: ResidentProcessResponse = server
+        .client()
+        .get(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/orb-executor",
+            server.base_url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        terminal.resident_process.observed_state,
+        ResidentProcessObservedState::Failed
+    );
+    assert!(terminal.resident_process.active_lease_id.is_none());
 }

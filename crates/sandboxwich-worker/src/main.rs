@@ -1768,6 +1768,7 @@ async fn fetch_runtime_resource_inventory(
     max_scanned: usize,
 ) -> anyhow::Result<RuntimeResourceInventoryResponse> {
     let mut resources = Vec::new();
+    let mut active_resident_lease_ids = std::collections::BTreeSet::new();
     let mut cursor = None;
     let mut scope = None;
     let mut sandbox_ids = std::collections::HashSet::new();
@@ -1793,6 +1794,7 @@ async fn fetch_runtime_resource_inventory(
         sandbox_ids.extend(page.sandbox_ids);
         complete &= page.complete;
         resources.extend(page.resources);
+        active_resident_lease_ids.extend(page.active_resident_lease_ids);
         cursor = page.next_cursor;
         if cursor.is_none() {
             break;
@@ -1811,6 +1813,7 @@ async fn fetch_runtime_resource_inventory(
         sandbox_ids: sandbox_ids.into_iter().collect(),
         complete,
         resources,
+        active_resident_lease_ids: active_resident_lease_ids.into_iter().collect(),
         next_cursor: cursor,
     })
 }
@@ -1852,33 +1855,8 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
 
     loop {
         while let Some(result) = resident_tasks.try_join_next_with_id() {
-            match result {
-                Ok((task_id, Ok(response))) => {
-                    resident_tasks_by_id.remove(&task_id);
-                    eprintln!(
-                        "worker: provider-isolated resident lease {} finished",
-                        response.lease.id
-                    );
-                }
-                Ok((task_id, Err(error))) => {
-                    eprintln!("error: provider-isolated resident lease task failed: {error:#}");
-                    if let Some(metadata) = resident_tasks_by_id.remove(&task_id) {
-                        reconcile_failed_resident_task(client, api, metadata).await;
-                    } else {
-                        eprintln!("error: failed resident lease task had no supervision metadata");
-                    }
-                }
-                Err(error) => {
-                    eprintln!("error: resident lease task panicked: {error}");
-                    if let Some(metadata) = resident_tasks_by_id.remove(&error.id()) {
-                        reconcile_panicked_resident_task(client, api, metadata).await;
-                    } else {
-                        eprintln!(
-                            "error: panicked resident lease task had no supervision metadata"
-                        );
-                    }
-                }
-            }
+            reconcile_resident_task_result(client, api, result, &mut resident_tasks_by_id, false)
+                .await;
         }
         if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
             eprintln!(
@@ -2092,35 +2070,8 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
     }
     let drain_residents = async {
         while let Some(result) = resident_tasks.join_next_with_id().await {
-            match result {
-                Ok((task_id, Ok(response))) => {
-                    resident_tasks_by_id.remove(&task_id);
-                    eprintln!(
-                        "worker: provider-isolated resident lease {} finished during shutdown drain",
-                        response.lease.id
-                    );
-                }
-                Ok((task_id, Err(error))) => {
-                    eprintln!(
-                        "error: provider-isolated resident lease task failed during shutdown drain: {error:#}"
-                    );
-                    if let Some(metadata) = resident_tasks_by_id.remove(&task_id) {
-                        reconcile_failed_resident_task(client, api, metadata).await;
-                    } else {
-                        eprintln!("error: failed resident lease task had no supervision metadata");
-                    }
-                }
-                Err(error) => {
-                    eprintln!("error: resident lease task panicked while draining: {error}");
-                    if let Some(metadata) = resident_tasks_by_id.remove(&error.id()) {
-                        reconcile_panicked_resident_task(client, api, metadata).await;
-                    } else {
-                        eprintln!(
-                            "error: panicked resident lease task had no supervision metadata"
-                        );
-                    }
-                }
-            }
+            reconcile_resident_task_result(client, api, result, &mut resident_tasks_by_id, true)
+                .await;
         }
     };
     if tokio::time::timeout(drain_timeout, drain_residents)
@@ -2138,6 +2089,45 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
         eprintln!("warning: failed to mark worker draining before exit: {error:#}");
     }
     Ok(())
+}
+
+async fn reconcile_resident_task_result(
+    client: &reqwest::Client,
+    api: &str,
+    result: Result<(tokio::task::Id, anyhow::Result<LeaseResponse>), tokio::task::JoinError>,
+    metadata_by_task: &mut std::collections::HashMap<tokio::task::Id, ResidentTaskMetadata>,
+    draining: bool,
+) {
+    match result {
+        Ok((task_id, Ok(response))) => {
+            metadata_by_task.remove(&task_id);
+            eprintln!(
+                "worker: provider-isolated resident lease {} finished{}",
+                response.lease.id,
+                if draining {
+                    " during shutdown drain"
+                } else {
+                    ""
+                }
+            );
+        }
+        Ok((task_id, Err(error))) => {
+            eprintln!("error: provider-isolated resident lease task failed: {error:#}");
+            if let Some(metadata) = metadata_by_task.remove(&task_id) {
+                reconcile_failed_resident_task(client, api, metadata).await;
+            } else {
+                eprintln!("error: failed resident lease task had no supervision metadata");
+            }
+        }
+        Err(error) => {
+            eprintln!("error: resident lease task panicked: {error}");
+            if let Some(metadata) = metadata_by_task.remove(&error.id()) {
+                reconcile_panicked_resident_task(client, api, metadata).await;
+            } else {
+                eprintln!("error: panicked resident lease task had no supervision metadata");
+            }
+        }
+    }
 }
 
 async fn handle_lease<P>(
@@ -2187,16 +2177,28 @@ where
             })
             .await;
             if let Err(error) = result {
+                if resident_lease && is_resident_desired_stop(&error) {
+                    renew_cancellation.cancel(LeaseCancellationReason::DesiredStop);
+                    // The API extends the active fence before returning the
+                    // typed stop conflict. Continue renewing until the
+                    // terminal observation and completion are acknowledged.
+                    continue;
+                }
+                if resident_lease
+                    && renew_cancellation.reason() == LeaseCancellationReason::DesiredStop
+                {
+                    eprintln!(
+                        "warning: renewing desired-stop lease {lease_id} failed after retries: \
+                         {error:#}; retaining terminal ownership"
+                    );
+                    continue;
+                }
                 eprintln!(
                     "warning: renewing lease {lease_id} failed after retries: {error:#}; \
                      cancelling the running job instead of letting it keep executing against \
                      a lease we can no longer prove is still ours"
                 );
-                renew_cancellation.cancel(if resident_lease && is_resident_desired_stop(&error) {
-                    LeaseCancellationReason::DesiredStop
-                } else {
-                    LeaseCancellationReason::LeaseLost
-                });
+                renew_cancellation.cancel(LeaseCancellationReason::LeaseLost);
                 return;
             }
         }
@@ -2293,6 +2295,7 @@ where
     let reporter_client = client.clone();
     let reporter_api = api.to_string();
     let reporter_runtime = tokio::runtime::Handle::current();
+    let terminal_cancellation = cancellation.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let mut reporter = |update| {
             let (method, url, request) =
@@ -2322,6 +2325,16 @@ where
                 .and_then(serde_json::Value::as_u64)
                 .context("resident-process generation is missing")?;
             let mut observer = |observation: IsolatedResidentProcessObservation| {
+                if cancellation.reason() == LeaseCancellationReason::DesiredStop {
+                    return observer_runtime.block_on(report_desired_stop_resident_observation(
+                        &observer_client,
+                        &observer_api,
+                        process_id,
+                        generation,
+                        lease_id,
+                        observation,
+                    ));
+                }
                 observer_runtime.block_on(retry_resident_observation_until_acknowledged_with(
                     &cancellation,
                     RESIDENT_OBSERVATION_RETRY_DELAY,
@@ -2363,22 +2376,24 @@ where
         ))
     });
 
-    renew_task.abort_and_reap().await;
-
-    match outcome {
+    let response = match outcome {
         Ok(WorkerJobOutcome::Complete(result)) => {
             let payload = CompleteLeaseRequest {
                 result: Some(result),
             };
-            with_retries("complete lease", API_RETRY_ATTEMPTS, || async {
-                let response = client
-                    .post(format!("{api}/leases/{lease_id}/complete"))
-                    .json(&payload)
-                    .send()
-                    .await?;
-                decode_json::<LeaseResponse>(response).await
-            })
-            .await
+            if terminal_cancellation.reason() == LeaseCancellationReason::DesiredStop {
+                complete_desired_stop_worker_lease(client, api, lease_id, &payload).await
+            } else {
+                with_retries("complete lease", API_RETRY_ATTEMPTS, || async {
+                    let response = client
+                        .post(format!("{api}/leases/{lease_id}/complete"))
+                        .json(&payload)
+                        .send()
+                        .await?;
+                    decode_json::<LeaseResponse>(response).await
+                })
+                .await
+            }
         }
         Ok(WorkerJobOutcome::ApexTaskInstructions {
             request_id,
@@ -2494,7 +2509,9 @@ where
             })
             .await
         }
-    }
+    };
+    renew_task.abort_and_reap().await;
+    response
 }
 
 trait GuestCredentialProvider: Sized {
@@ -2626,6 +2643,70 @@ async fn report_resident_observation(
     )
     .await?;
     Ok(())
+}
+
+async fn report_desired_stop_resident_observation(
+    client: &reqwest::Client,
+    api: &str,
+    process_id: Uuid,
+    generation: u64,
+    lease_id: sandboxwich_core::LeaseId,
+    observation: IsolatedResidentProcessObservation,
+) -> anyhow::Result<()> {
+    loop {
+        match report_resident_observation(
+            client,
+            api,
+            process_id,
+            generation,
+            lease_id,
+            observation.clone(),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                eprintln!(
+                    "warning: desired-stop resident observation failed; retaining the renewed \
+                     lease and retrying: {error:#}"
+                );
+                tokio::time::sleep(RESIDENT_OBSERVATION_RETRY_DELAY).await;
+            }
+        }
+    }
+}
+
+async fn complete_desired_stop_worker_lease(
+    client: &reqwest::Client,
+    api: &str,
+    lease_id: sandboxwich_core::LeaseId,
+    payload: &CompleteLeaseRequest,
+) -> anyhow::Result<LeaseResponse> {
+    loop {
+        match with_retries(
+            "complete desired-stop lease",
+            API_RETRY_ATTEMPTS,
+            || async {
+                let response = client
+                    .post(format!("{api}/leases/{lease_id}/complete"))
+                    .json(payload)
+                    .send()
+                    .await?;
+                decode_json::<LeaseResponse>(response).await
+            },
+        )
+        .await
+        {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                eprintln!(
+                    "warning: desired-stop lease completion failed; retaining the renewed \
+                     lease and retrying: {error:#}"
+                );
+                tokio::time::sleep(RESIDENT_OBSERVATION_RETRY_DELAY).await;
+            }
+        }
+    }
 }
 
 async fn report_resident_lost(

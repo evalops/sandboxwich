@@ -23,5 +23,8 @@ sha2.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+axum.workspace = true
+
 [lints]
 workspace = true

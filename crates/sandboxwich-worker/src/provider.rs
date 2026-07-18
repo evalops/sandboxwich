@@ -1437,6 +1437,24 @@ impl KubernetesDryRunProvider {
         rules
     }
 
+    fn api_egress_rule(&self) -> serde_json::Value {
+        json!({
+            "to": [{
+                "namespaceSelector": {
+                    "matchLabels": {
+                        "kubernetes.io/metadata.name": self.effective_ingress_namespace()
+                    }
+                },
+                "podSelector": {
+                    "matchLabels": {
+                        "app.kubernetes.io/name": "sandboxwich-api"
+                    }
+                }
+            }],
+            "ports": [{"protocol": "TCP", "port": 3217}]
+        })
+    }
+
     /// Ingress rule restricting the sandbox's ssh/desktop/vnc ports to
     /// control-plane pods only, closing the unauthenticated cross-tenant
     /// path where any pod on the cluster network (including other
@@ -1504,9 +1522,10 @@ impl KubernetesDryRunProvider {
                 egress
             }
         };
-        if !matches!(network_egress, NetworkEgress::DenyAll) {
-            egress.extend(self.dns_egress_rules());
-        }
+        // Control-plane DNS and the authenticated API channel are invariant
+        // system dependencies, not tenant-selected workload egress.
+        egress.extend(self.dns_egress_rules());
+        egress.push(self.api_egress_rule());
 
         Ok(json!({
             "apiVersion": "networking.k8s.io/v1",
@@ -1574,6 +1593,13 @@ impl KubernetesDryRunProvider {
         egress.push(json!({
             "toEndpoints": [{"matchLabels": {"k8s:io.kubernetes.pod.namespace": self.dns_namespace, "k8s:k8s-app": "kube-dns"}}],
             "toPorts": [{"ports": [{"port": "53", "protocol": "ANY"}]}]
+        }));
+        egress.push(json!({
+            "toEndpoints": [{"matchLabels": {
+                "k8s:io.kubernetes.pod.namespace": self.effective_ingress_namespace(),
+                "k8s:app.kubernetes.io/name": "sandboxwich-api"
+            }}],
+            "toPorts": [{"ports": [{"port": "3217", "protocol": "TCP"}]}]
         }));
         egress.extend(self.dns_service_ips.iter().map(|address| {
             let cidr = match address {
@@ -2174,12 +2200,15 @@ struct ObservedKubernetesResource {
     namespace: String,
     name: String,
     uid: String,
+    resident_lease_id: Option<Uuid>,
+    created_at: Option<chrono::DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ReconciliationInventory {
     sandbox_ids: std::collections::HashSet<SandboxId>,
     resources: Vec<ExpectedKubernetesResource>,
+    active_resident_lease_ids: std::collections::HashSet<Uuid>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2229,6 +2258,21 @@ fn classify_reconciliation(
             });
             let classification = match resource.sandbox_id {
                 None => ReconciliationClassification::Indeterminate,
+                Some(_)
+                    if resource.resident_lease_id.is_some_and(|lease_id| {
+                        inventory.active_resident_lease_ids.contains(&lease_id)
+                    }) =>
+                {
+                    ReconciliationClassification::Expected
+                }
+                Some(_) if resource.resident_lease_id.is_some() => resource
+                    .created_at
+                    .filter(|created_at| {
+                        now.signed_duration_since(*created_at) >= chrono::Duration::minutes(5)
+                    })
+                    .map_or(ReconciliationClassification::Indeterminate, |_| {
+                        ReconciliationClassification::Orphaned
+                    }),
                 Some(_)
                     if coordinate_match.is_some_and(|expected| expected.uid != resource.uid) =>
                 {
@@ -2834,6 +2878,19 @@ impl KubernetesApplyProvider {
                         .as_str()
                         .context("observed Kubernetes resource omitted uid")?
                         .to_string(),
+                    resident_lease_id: item["metadata"]["labels"]["sandboxwich.dev/lease-id"]
+                        .as_str()
+                        .and_then(|value| Uuid::parse_str(value).ok()),
+                    created_at: item["metadata"]["creationTimestamp"]
+                        .as_str()
+                        .map(|value| {
+                            chrono::DateTime::parse_from_rfc3339(value)
+                                .map(|value| value.with_timezone(&Utc))
+                                .context(
+                                    "observed Kubernetes resource has invalid creationTimestamp",
+                                )
+                        })
+                        .transpose()?,
                 })
             })
             .collect()
@@ -2944,6 +3001,7 @@ impl KubernetesApplyProvider {
             }
             Ok(ReconciliationInventory {
                 sandbox_ids: response.sandbox_ids.into_iter().collect(),
+                active_resident_lease_ids: response.active_resident_lease_ids.into_iter().collect(),
                 resources: response
                     .resources
                     .into_iter()

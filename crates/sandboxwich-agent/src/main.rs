@@ -1253,7 +1253,11 @@ fn spawn_lease_renewal_task(
                     Err(error) => {
                         if error.is_resident_desired_stop() {
                             cancellation.cancel(LeaseCancellationReason::DesiredStop);
-                            return;
+                            // The API renewed the lease before returning this
+                            // typed stop signal. Keep the renewal task alive
+                            // until terminal observation and completion finish.
+                            renewed = true;
+                            break;
                         }
                         last_error = Some(error);
                         if attempt < RENEW_ATTEMPTS {
@@ -1266,6 +1270,13 @@ fn spawn_lease_renewal_task(
                 let error = last_error
                     .map(|error| error.to_string())
                     .unwrap_or_else(|| "unknown error".to_string());
+                if cancellation.reason() == LeaseCancellationReason::DesiredStop {
+                    eprintln!(
+                        "warning: renewing desired-stop lease {lease_id} failed after \
+                         {RENEW_ATTEMPTS} attempts ({error}); retaining terminal ownership"
+                    );
+                    continue;
+                }
                 eprintln!(
                     "warning: renewing lease {lease_id} failed after {RENEW_ATTEMPTS} attempts \
                      ({error}); cancelling the running command instead of letting it keep \
@@ -1633,32 +1644,50 @@ async fn complete_desired_stop_resident_lease(
     api: &str,
     fence: ResidentLeaseFence,
 ) -> anyhow::Result<LeaseResponse> {
-    post_resident_observation(
-        client,
-        api,
-        fence.process_id,
-        ResidentProcessObservationRequest {
-            generation: fence.generation,
-            lease_id: fence.lease_id.0,
-            observed_state: ResidentProcessObservedState::Stopped,
-            pid: None,
-            // Completing with zero is intentional: the API derives the
-            // terminal resident state from this typed result too.
-            exit_code: Some(0),
-            error_code: None,
-            error_message: None,
-        },
-    )
-    .await?;
-    complete_resident_lease(
-        client,
-        api,
-        fence.lease_id,
-        fence.process_id,
-        fence.generation,
-        Some(0),
-    )
-    .await
+    let request = ResidentProcessObservationRequest {
+        generation: fence.generation,
+        lease_id: fence.lease_id.0,
+        observed_state: ResidentProcessObservedState::Stopped,
+        pid: None,
+        // Completing with zero is intentional: the API derives the terminal
+        // resident state from this typed result too.
+        exit_code: Some(0),
+        error_code: None,
+        error_message: None,
+    };
+    let mut backoff = Backoff::new(RESIDENT_OBSERVATION_RETRY_DELAY);
+    loop {
+        match post_resident_observation(client, api, fence.process_id, request.clone()).await {
+            Ok(()) => break,
+            Err(error) => eprintln!(
+                "warning: reporting desired stop for resident process {} lease {} failed; \
+                 retaining terminal ownership and retrying: {error}",
+                fence.process_id, fence.lease_id
+            ),
+        }
+        backoff.wait().await;
+    }
+    backoff.reset();
+    loop {
+        match complete_resident_lease(
+            client,
+            api,
+            fence.lease_id,
+            fence.process_id,
+            fence.generation,
+            Some(0),
+        )
+        .await
+        {
+            Ok(response) => return Ok(response),
+            Err(error) => eprintln!(
+                "warning: completing desired stop for resident process {} lease {} failed; \
+                 retaining terminal ownership and retrying: {error}",
+                fence.process_id, fence.lease_id
+            ),
+        }
+        backoff.wait().await;
+    }
 }
 
 async fn reconcile_resident_cancellation_without_child(
@@ -1809,30 +1838,43 @@ async fn handle_resident_process_with_bootstrap_root(
                 .await?,
         )
         .await?;
-        let target = Path::new(&bootstrap.target_file);
-        anyhow::ensure!(
-            target.starts_with(bootstrap_root),
-            "resident bootstrap path is outside the allowed root"
-        );
-        let parent = target
-            .parent()
-            .context("resident bootstrap has no parent")?;
-        std::fs::create_dir_all(parent)?;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(bootstrap.mode);
-        let mut file = options
-            .open(target)
-            .with_context(|| format!("failed to create {}", target.display()))?;
-        file.write_all(&bootstrap.content)?;
-        file.sync_all()?;
-        transfer_resident_bootstrap_ownership(&file, run_as_uid).with_context(|| {
-            format!(
-                "failed to transfer {} to the resident-process identity",
-                target.display()
+        let prepare = (|| -> anyhow::Result<()> {
+            let target = Path::new(&bootstrap.target_file);
+            anyhow::ensure!(
+                target.starts_with(bootstrap_root),
+                "resident bootstrap path is outside the allowed root"
+            );
+            let parent = target
+                .parent()
+                .context("resident bootstrap has no parent")?;
+            std::fs::create_dir_all(parent)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(bootstrap.mode);
+            let mut file = options
+                .open(target)
+                .with_context(|| format!("failed to create {}", target.display()))?;
+            file.write_all(&bootstrap.content)?;
+            file.sync_all()?;
+            transfer_resident_bootstrap_ownership(&file, run_as_uid).with_context(|| {
+                format!(
+                    "failed to transfer {} to the resident-process identity",
+                    target.display()
+                )
+            })?;
+            Ok(())
+        })();
+        if let Err(error) = prepare {
+            return fail_lease_terminal(
+                client,
+                api,
+                lease.id,
+                format!("resident bootstrap preparation failed after delivery: {error:#}"),
             )
-        })?;
+            .await
+            .map_err(Into::into);
+        }
     }
 
     let cancellation = LeaseCancellation::new();
@@ -2686,6 +2728,81 @@ mod tests {
             "a delivered bootstrap must be terminally acknowledged as Failed; Starting cannot be acknowledged \
              before the fallible spawn succeeds"
         );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_delivery_followed_by_file_collision_is_terminal() {
+        let bootstrap_root = TempWorkspace::new();
+        let target = bootstrap_root.path().join("existing-bootstrap");
+        std::fs::write(&target, b"must-not-be-overwritten").unwrap();
+        let worker_id = sandboxwich_core::WorkerId::new();
+        let process_id = ResidentProcessId(Uuid::now_v7());
+        let now = Utc::now();
+        let job = test_job(
+            JobKind::RunResidentProcess,
+            serde_json::json!({
+                "residentProcessId": process_id,
+                "generation": 1,
+                "name": "orb-executor",
+                "argv": ["/bin/true"],
+                "restartPolicy": ResidentProcessRestartPolicy::Never,
+                "bootstrapSha256": "test-bootstrap-sha",
+            }),
+        );
+        let lease = sandboxwich_core::JobLease {
+            id: LeaseId::new(),
+            job_id: job.id,
+            worker_id,
+            status: sandboxwich_core::LeaseStatus::Active,
+            attempt: 1,
+            leased_at: now,
+            expires_at: now + chrono::Duration::seconds(60),
+            completed_at: None,
+            error: None,
+            required_execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
+            job,
+        };
+        let state = BootstrapSpawnFailureState {
+            bootstrap: ResidentProcessBootstrapReadResponse {
+                ok: true,
+                content: b"bootstrap".to_vec(),
+                sha256: "test-bootstrap-sha".into(),
+                target_file: target.to_string_lossy().into_owned(),
+                mode: 0o600,
+            },
+            lease: lease.clone(),
+            bootstrap_read: Arc::new(AtomicBool::new(false)),
+            terminal_fail_posted: Arc::new(AtomicBool::new(false)),
+            observations: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let app = Router::new()
+            .route(
+                "/resident-processes/{process_id}/bootstrap",
+                post(test_read_bootstrap),
+            )
+            .route(
+                "/leases/{lease_id}/fail",
+                post(test_terminal_fail_bootstrap_spawn_failure),
+            )
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let response = handle_resident_process_with_bootstrap_root(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            lease,
+            bootstrap_root.path(),
+        )
+        .await
+        .expect("post-delivery file failures must terminally reconcile the current lease");
+        server.abort();
+
+        assert!(response.ok);
+        assert!(state.bootstrap_read.load(Ordering::SeqCst));
+        assert!(state.terminal_fail_posted.load(Ordering::SeqCst));
+        assert_eq!(std::fs::read(target).unwrap(), b"must-not-be-overwritten");
     }
 
     #[test]

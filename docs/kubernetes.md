@@ -94,23 +94,25 @@ Apply mode uses the pod ServiceAccount and `kubectl` to create the sandbox PVC, 
 ### Provider-isolated resident sidecars
 
 Set `SANDBOXWICH_ISOLATED_RESIDENT_PROCESS_IMAGE` to an immutable image digest
-and configure a nonempty `--runtime-class-name` to enable
-`provider_isolated_resident_process_v1`. The capability is never advertised in
+and configure a nonempty `--runtime-class-name` to advertise the versioned
+worker label `provider_isolated_resident_process_version=1`. The label is never advertised in
 dry-run mode or when either setting is absent. The authoritative worker then
 runs `orb-sidecar` in a dedicated Pod rather than inside the guest Pod. The
 sidecar has separate mount, PID, and network namespaces, no service-account
 token, a read-only root filesystem, dropped capabilities, non-root identity,
 seccomp, and resource bounds. Its bootstrap is mounted from an immutable
 transient Secret; worker cleanup attempts to delete all three resources on every
-terminal path. Pod, Secret, and dedicated NetworkPolicy names are fenced by
+terminal path, and the enabled orphan reconciler deletes any lease-fenced
+resource whose control-plane lease is no longer active after worker/node loss.
+Pod, Secret, and dedicated NetworkPolicy names are fenced by
 generation and lease so cleanup from an expired lease cannot delete a
 replacement. The policy denies all ingress and allows only cluster DNS plus
 public HTTPS egress, excluding configured control-plane and metadata CIDRs.
 
 Pending Pods do not report `Starting` until the container has actually
 started. `SANDBOXWICH_ISOLATED_RESIDENT_PROCESS_STARTUP_TIMEOUT_SECS` (default
-`120`) turns an unschedulable or image-pull-blocked Pod into a retryable failure
-with fenced cleanup. Kubernetes observations back off from
+`120`) turns an unschedulable or image-pull-blocked Pod into a terminal failure
+after the one-read bootstrap has been delivered, with fenced cleanup. Kubernetes observations back off from
 `SANDBOXWICH_ISOLATED_RESIDENT_PROCESS_POLL_INTERVAL_MILLIS` (default `1000`)
 to `SANDBOXWICH_ISOLATED_RESIDENT_PROCESS_MAX_POLL_INTERVAL_MILLIS` (default
 `5000`) and remain cancellable while waiting.
@@ -366,15 +368,18 @@ deploy/kubernetes/apply-api.sh
 Do not commit the real database URL or API token. Use your existing secret-management path for shared clusters.
 
 `apply-api.sh` applies the namespace, creates the digest-versioned migration
-Job, waits for it to complete, and only then applies and waits for the API
-Deployment. Do not replace it with `kubectl apply -f deploy/kubernetes/`: that
+Job, waits for it to complete, and only then applies and waits for the API and
+worker Deployments. It first drains old API replicas because the schema gate is
+exact-versioned and the one-read bootstrap broker is process-local. The starter
+API Deployment intentionally uses one replica until a shared bootstrap broker
+is configured. Do not replace it with `kubectl apply -f deploy/kubernetes/`: that
 would apply the Job and Deployment together and can roll out an API whose
 `SANDBOXWICH_AUTO_MIGRATE=false` pods require a schema the Job has not yet
 applied. Set `SANDBOXWICH_KUBE_CONTEXT` to select a context and
 `SANDBOXWICH_MIGRATION_TIMEOUT` (default `5m`) to adjust both waits.
 
-If the migration wait fails, the script leaves the API Deployment untouched,
-prints the Job description and logs, and exits nonzero. Correct the migration
+If the migration wait fails, the script leaves the drained API Deployment at
+zero replicas, prints the Job description and logs, and exits nonzero. Correct the migration
 and publish a new image/digest-versioned Job; do not delete a successful Job to
 force a rerun. Roll back an API image only to an image compatible with the
 already-applied (forward-only) schema, then use the same script and verify

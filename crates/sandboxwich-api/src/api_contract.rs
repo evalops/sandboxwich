@@ -28,6 +28,7 @@ use sandboxwich_core::{
         crate::handlers::snapshots::fork_snapshot,
         crate::handlers::sandboxes::fork_sandbox,
         crate::handlers::commands::queue_prompt,
+        crate::handlers::resident_processes::put_resident_process,
         crate::handlers::operations::get_operation,
         crate::handlers::operations::cancel_operation,
         crate::handlers::divergence::append_tool_call_ledger,
@@ -195,5 +196,19 @@ mod tests {
     #[test]
     fn completed_openapi_document_serializes() {
         serde_json::to_value(super::openapi_document()).unwrap();
+    }
+
+    #[test]
+    fn resident_put_documents_typed_body_and_sidecar_bootstrap_requirement() {
+        let document = serde_json::to_value(super::openapi_document()).unwrap();
+        let operation =
+            &document["paths"]["/v1/sandboxes/{sandbox_id}/resident-processes/{name}"]["put"];
+        assert!(operation["requestBody"]["content"]["application/json"]["schema"].is_object());
+        assert!(operation["responses"]["200"].is_object());
+        assert_eq!(
+            operation["responses"]["400"]["description"],
+            "Invalid request, including a missing or empty orb-sidecar bootstrap"
+        );
+        assert!(operation["responses"]["503"].is_object());
     }
 }

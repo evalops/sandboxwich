@@ -8,7 +8,12 @@ metadata:
     app.kubernetes.io/name: sandboxwich-api
     app.kubernetes.io/part-of: sandboxwich
 spec:
-  replicas: 2
+  # Bootstrap credentials are intentionally process-local and one-read. Keep
+  # the starter deployment single-replica until an external shared bootstrap
+  # broker is configured; multiple replicas would randomly split PUT/read.
+  replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: sandboxwich-api
@@ -236,6 +241,13 @@ spec:
         - podSelector:
             matchLabels:
               sandboxwich.dev/metrics-access: "true"
+      ports:
+        - protocol: TCP
+          port: 3217
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: sandboxwich-sandboxes
       ports:
         - protocol: TCP
           port: 3217

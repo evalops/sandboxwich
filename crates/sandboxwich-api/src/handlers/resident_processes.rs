@@ -1,10 +1,10 @@
 use crate::activity::bump_sandbox_activity_best_effort;
-use crate::auth::{ensure_resident_lease_scope, ensure_sandbox_tenant};
+use crate::auth::{ensure_lease_worker_scope, ensure_resident_lease_scope, ensure_sandbox_tenant};
 use crate::db::Database;
 use crate::error::ApiError;
 use crate::handlers::commands::{insert_event, insert_event_on_connection};
 use crate::handlers::jobs::{add_provision_spec_to_payload, insert_job_on_connection};
-use crate::rows::{parse_timestamp, row_to_resident_process};
+use crate::rows::{parse_timestamp, row_to_job, row_to_resident_process};
 use crate::state::{
     AppState, LiveResidentBootstrap, Principal, ResidentBootstrapDeliveryError,
     ResidentBootstrapFence, TenantContext,
@@ -429,6 +429,19 @@ fn same_spec(
         && current.bootstrap_mode == request.bootstrap.as_ref().map(|value| value.mode)
 }
 
+#[utoipa::path(
+    put,
+    path = "/v1/sandboxes/{sandbox_id}/resident-processes/{name}",
+    params(("sandbox_id" = Uuid, Path), ("name" = String, Path, description = "Typed resident name; orb-sidecar requires a non-empty bootstrap")),
+    request_body = ResidentProcessRequest,
+    responses(
+        (status = 200, description = "Existing resident process returned for an idempotent same-spec request", body = ResidentProcessResponse),
+        (status = 202, description = "Resident process accepted", body = ResidentProcessResponse),
+        (status = 400, description = "Invalid request, including a missing or empty orb-sidecar bootstrap", body = ErrorEnvelope),
+        (status = 409, body = ErrorEnvelope),
+        (status = 503, description = "Bootstrap admission capacity exhausted", body = ErrorEnvelope)
+    )
+)]
 pub(crate) async fn put_resident_process(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
@@ -684,9 +697,52 @@ pub(crate) async fn stop_resident_process(
     let process = fetch_named_resident_process(&state.db, sandbox_id, &name).await?;
     let delivered_fence = delivered_bootstrap_fence(&state.db, process.id).await?;
     let now = Utc::now();
+    let mut tx = state.db.pool.begin().await?;
+    let queued_jobs_sql = format!(
+        "select id, tenant_id, kind, status, payload, required_capability,
+                required_execution_class, priority, attempts, max_attempts, scheduled_at,
+                created_at, updated_at, last_error
+         from jobs where tenant_id = {} and kind = 'run_resident_process' and status = 'queued'",
+        state.db.placeholder(1)
+    );
+    let queued_jobs = sqlx::query(&queued_jobs_sql)
+        .bind(&ctx.tenant_id)
+        .fetch_all(&mut *tx)
+        .await?;
+    let process_id_string = process.id.to_string();
+    let queued_job = queued_jobs
+        .into_iter()
+        .map(row_to_job)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .find(|job| {
+            job.payload
+                .get("residentProcessId")
+                .and_then(serde_json::Value::as_str)
+                == Some(process_id_string.as_str())
+        });
+    let stopped_before_claim = if let Some(job) = queued_job {
+        let sql = format!(
+            "update jobs set status = 'succeeded', updated_at = {}, last_error = null
+             where id = {} and status = 'queued'",
+            state.db.placeholder(1),
+            state.db.placeholder(2)
+        );
+        sqlx::query(&sql)
+            .bind(now.to_rfc3339())
+            .bind(job.id.to_string())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+            == 1
+    } else {
+        false
+    };
     let sql = format!(
         "update resident_processes
          set desired_state = 'stopped',
+             observed_state = case when {} then 'stopped' else observed_state end,
+             exit_code = case when {} then 0 else exit_code end,
              bootstrap_acknowledged_at = case
                when bootstrap_delivered_generation is not null
                 and bootstrap_delivered_lease_id is not null
@@ -699,15 +755,20 @@ pub(crate) async fn stop_resident_process(
         state.db.placeholder(1),
         state.db.placeholder(2),
         state.db.placeholder(3),
-        state.db.placeholder(4)
+        state.db.placeholder(4),
+        state.db.placeholder(5),
+        state.db.placeholder(6)
     );
     sqlx::query(&sql)
+        .bind(stopped_before_claim)
+        .bind(stopped_before_claim)
         .bind(now.to_rfc3339())
         .bind(now.to_rfc3339())
         .bind(process.id.to_string())
         .bind(&ctx.tenant_id)
-        .execute(&state.db.pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     if let Some(sha256) = process.bootstrap_sha256.as_deref() {
         state.resident_bootstraps.reclaim(
             &process.id,
@@ -949,6 +1010,38 @@ pub(crate) async fn observe_resident_process(
         return Err(ApiError::not_found("resident process not found"));
     }
     ensure_resident_owner_role(&process, &ctx)?;
+    if request.observed_state == ResidentProcessObservedState::Stopped
+        && process.desired_state == ResidentProcessDesiredState::Stopped
+        && process.observed_state == ResidentProcessObservedState::Stopped
+        && process.generation == request.generation
+        && process.active_lease_id.is_none()
+    {
+        let lease = ensure_lease_worker_scope(&state.db, LeaseId(request.lease_id), &ctx).await?;
+        let matching_process = lease
+            .job
+            .payload
+            .get("residentProcessId")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            == Some(process.id.0);
+        let matching_generation = lease
+            .job
+            .payload
+            .get("generation")
+            .and_then(serde_json::Value::as_u64)
+            == Some(request.generation);
+        if lease.job.kind == JobKind::RunResidentProcess
+            && matching_process
+            && matching_generation
+            && lease.job.status == JobStatus::Succeeded
+        {
+            return Ok(Json(ResidentProcessResponse {
+                ok: true,
+                resident_process: process,
+                operation: None,
+            }));
+        }
+    }
     ensure_resident_lease_scope(&state.db, &process, LeaseId(request.lease_id), &ctx).await?;
     if process.generation != request.generation || process.active_lease_id != Some(request.lease_id)
     {
