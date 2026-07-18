@@ -171,6 +171,7 @@ pub(crate) async fn fork_snapshot(
             state.sandbox_lifetime.max_idle_ttl_seconds,
         ),
         parent_snapshot_id: Some(snapshot_id),
+        last_activity_at: None,
     };
     let job = Job {
         id: JobId::new(),
@@ -837,7 +838,7 @@ pub(crate) async fn queue_forks_waiting_on_snapshot_on_connection(
 ) -> Result<(), ApiError> {
     let sql = format!(
         "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
-                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, parent_snapshot_id
+                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, last_activity_at, parent_snapshot_id
          from sandboxes
          where parent_snapshot_id = {} and state = 'planning'
          order by created_at asc, id asc",
@@ -912,7 +913,7 @@ pub(crate) async fn fail_sandboxes_waiting_on_snapshot_on_connection(
 ) -> Result<(), ApiError> {
     let sql = format!(
         "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
-                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, parent_snapshot_id
+                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, last_activity_at, parent_snapshot_id
          from sandboxes
          where parent_snapshot_id = {} and state = 'planning'
          order by created_at asc, id asc",

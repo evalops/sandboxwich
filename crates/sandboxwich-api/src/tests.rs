@@ -7,6 +7,7 @@ use sqlx::any::AnyPoolOptions;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+use crate::activity::*;
 use crate::auth::*;
 use crate::cleanup::*;
 use crate::config::*;
@@ -127,6 +128,7 @@ async fn resident_process_storage_round_trips_public_metadata() {
         max_lifetime_seconds: None,
         idle_ttl_seconds: None,
         parent_snapshot_id: None,
+        last_activity_at: None,
     };
     let mut tx = db.pool.begin().await.unwrap();
     insert_sandbox_on_connection(&db, &mut tx, &sandbox)
@@ -222,6 +224,7 @@ fn authoritative_job_enrichment_overwrites_caller_placement_metadata() {
         max_lifetime_seconds: None,
         idle_ttl_seconds: None,
         parent_snapshot_id: None,
+        last_activity_at: None,
         execution_class: ExecutionClass::SandboxedContainer,
     };
     let mut job = Job {
@@ -320,6 +323,7 @@ fn apex_runtime_profile_requires_pinned_image_and_deny_by_default_egress() {
         max_lifetime_seconds: None,
         idle_ttl_seconds: None,
         parent_snapshot_id: None,
+        last_activity_at: None,
         execution_class: ExecutionClass::SandboxedContainer,
     };
     let inherited = CreateSandboxRequest {
@@ -555,6 +559,7 @@ async fn materialization_rejects_a_file_from_another_sandbox() {
         max_lifetime_seconds: None,
         idle_ttl_seconds: None,
         parent_snapshot_id: None,
+        last_activity_at: None,
         execution_class: ExecutionClass::SandboxedContainer,
     };
     let first = make("first");
@@ -1578,6 +1583,7 @@ async fn expire_due_leases_does_not_double_process_concurrent_sweeps() {
         max_lifetime_seconds: None,
         idle_ttl_seconds: None,
         parent_snapshot_id: None,
+        last_activity_at: None,
     };
     insert_sandbox(&db, &sandbox).await.expect("insert sandbox");
     let prompt_event_id = Uuid::now_v7();
@@ -1644,6 +1650,7 @@ async fn seed_sandbox_with_state(db: &Database, state: SandboxState) -> Sandbox 
         max_lifetime_seconds: None,
         idle_ttl_seconds: None,
         parent_snapshot_id: None,
+        last_activity_at: None,
     };
     insert_sandbox(db, &sandbox).await.expect("insert sandbox");
     sandbox
@@ -1706,6 +1713,7 @@ async fn idle_ttl_sweep_query_matches_documented_semantics_across_a_seeded_fixtu
         max_lifetime_seconds,
         idle_ttl_seconds,
         parent_snapshot_id: None,
+        last_activity_at: None,
     };
 
     // (a) idle_ttl_seconds=300, no commands at all: last activity falls
@@ -1825,6 +1833,124 @@ async fn idle_ttl_sweep_query_matches_documented_semantics_across_a_seeded_fixtu
         reaped_ids.len(),
         4,
         "exactly the four due sandboxes (a, c, d, e) should have been reaped, no more"
+    );
+}
+
+async fn sandbox_last_activity_at(db: &Database, sandbox_id: SandboxId) -> Option<DateTime<Utc>> {
+    let raw: Option<String> = sqlx::query("select last_activity_at from sandboxes where id = ?")
+        .bind(sandbox_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+        .try_get("last_activity_at")
+        .unwrap();
+    raw.map(|value| parse_timestamp(&value).unwrap())
+}
+
+/// `bump_sandbox_activity` must set `last_activity_at` on the first call,
+/// must **not** move it forward again while still inside the throttle
+/// window (bounding write volume for chatty callers -- see `activity.rs`'s
+/// module docs for why), and must move it forward again once the throttle
+/// window has elapsed.
+#[tokio::test]
+async fn bump_sandbox_activity_is_throttled_but_eventually_advances() {
+    let db = test_sqlite_db().await;
+    let sandbox = seed_sandbox_with_state(&db, SandboxState::Ready).await;
+    assert_eq!(sandbox_last_activity_at(&db, sandbox.id).await, None);
+
+    let first_bump = Utc::now() - chrono::Duration::seconds(200);
+    bump_sandbox_activity(&db, sandbox.id, first_bump)
+        .await
+        .unwrap();
+    assert_eq!(
+        sandbox_last_activity_at(&db, sandbox.id).await,
+        Some(first_bump),
+        "the first bump must set last_activity_at"
+    );
+
+    // Still inside the throttle window (60s): a later timestamp must NOT
+    // overwrite the first bump.
+    let still_throttled = first_bump + chrono::Duration::seconds(10);
+    bump_sandbox_activity(&db, sandbox.id, still_throttled)
+        .await
+        .unwrap();
+    assert_eq!(
+        sandbox_last_activity_at(&db, sandbox.id).await,
+        Some(first_bump),
+        "a bump inside the throttle window must be a no-op"
+    );
+
+    // Past the throttle window: must advance.
+    let past_throttle = first_bump + chrono::Duration::seconds(61);
+    bump_sandbox_activity(&db, sandbox.id, past_throttle)
+        .await
+        .unwrap();
+    assert_eq!(
+        sandbox_last_activity_at(&db, sandbox.id).await,
+        Some(past_throttle),
+        "a bump past the throttle window must advance last_activity_at"
+    );
+}
+
+/// Regression/completeness test for the idle-TTL activity signal: a
+/// sandbox with no recent command activity and a stale `updated_at` must
+/// still survive reaping if `last_activity_at` (bumped by SSH/desktop/
+/// resident-process touchpoints -- exercised live in
+/// `tests/http_contract/reap.rs`) is recent, and a sandbox with no
+/// `last_activity_at` at all (the pre-this-PR case, or one that predates
+/// the column) must fall back to the pre-existing updated_at/commands
+/// signal exactly as before.
+#[tokio::test]
+async fn idle_ttl_reap_considers_last_activity_at_alongside_updated_at_and_commands() {
+    let db = test_sqlite_db().await;
+    let now = Utc::now();
+    let seed = |updated_at: DateTime<Utc>| Sandbox {
+        execution_class: ExecutionClass::DevelopmentContainer,
+        workspace_mode: WorkspaceMode::Ephemeral,
+        runtime_profile: SandboxRuntimeProfile::Unprivileged,
+        id: SandboxId::new(),
+        tenant_id: "default".to_string(),
+        name: "activity-signal-fixture".to_string(),
+        state: SandboxState::Ready,
+        template: "default".to_string(),
+        memory_limit: MemoryLimit::default(),
+        network_egress: NetworkEgress::default(),
+        created_at: updated_at,
+        updated_at,
+        ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: Some(300),
+        last_activity_at: None,
+        parent_snapshot_id: None,
+    };
+
+    let recent_ssh_activity = seed(now - chrono::Duration::seconds(400));
+    insert_sandbox(&db, &recent_ssh_activity).await.unwrap();
+    bump_sandbox_activity(
+        &db,
+        recent_ssh_activity.id,
+        now - chrono::Duration::seconds(100),
+    )
+    .await
+    .unwrap();
+
+    let no_activity_at_all = seed(now - chrono::Duration::seconds(400));
+    insert_sandbox(&db, &no_activity_at_all).await.unwrap();
+
+    let reaped = reap_expired_active_sandboxes(&db).await.unwrap();
+    let reaped_ids: std::collections::HashSet<SandboxId> =
+        reaped.iter().map(|reaped| reaped.sandbox.id).collect();
+
+    assert!(
+        !reaped_ids.contains(&recent_ssh_activity.id),
+        "a recent last_activity_at bump must reset the idle clock and prevent reaping, \
+         even though updated_at alone is already past the deadline"
+    );
+    assert!(
+        reaped_ids.contains(&no_activity_at_all.id),
+        "with last_activity_at never set (NULL), the sweep must fall back to the \
+         pre-existing updated_at/commands signal and reap this sandbox exactly as \
+         it would have before this column existed"
     );
 }
 
@@ -2131,6 +2257,7 @@ async fn cleanup_archived_sandboxes_never_deletes_a_sandbox_with_a_live_restore_
         max_lifetime_seconds: None,
         idle_ttl_seconds: None,
         parent_snapshot_id: None,
+        last_activity_at: None,
     };
     insert_sandbox(&db, &sandbox)
         .await
@@ -2195,6 +2322,7 @@ async fn sandbox_insert_rejects_a_nonexistent_parent_snapshot_id() {
         ttl_seconds: None,
         max_lifetime_seconds: None,
         idle_ttl_seconds: None,
+        last_activity_at: None,
         parent_snapshot_id: Some(SnapshotId::new()),
     };
 
@@ -2388,6 +2516,7 @@ async fn apex_execution_class_migration_backfills_legacy_rows() {
         max_lifetime_seconds: None,
         idle_ttl_seconds: None,
         parent_snapshot_id: None,
+        last_activity_at: None,
     };
     insert_sandbox(&db, &sandbox)
         .await

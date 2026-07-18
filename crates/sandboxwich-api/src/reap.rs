@@ -102,26 +102,35 @@ fn reapable_states() -> Vec<&'static str> {
         .collect()
 }
 
-/// Best-known "last activity" signal for idle-TTL purposes: the more recent
-/// of the sandbox's own last lifecycle-state transition (`updated_at`) and
-/// its most recently *queued* guest command (`commands.created_at`, passed
-/// in as `last_command_at` -- see [`reap_expired_active_sandboxes`], which
-/// resolves it for every candidate in the same query as the candidates
-/// themselves, rather than one `select max(created_at) ...` per sandbox).
-/// This is a real, recorded timestamp, not a guess -- but it is not a
-/// complete activity signal. SSH sessions, desktop sessions, and
-/// resident-process output do not currently touch either column, so a
-/// sandbox used exclusively through those surfaces can still be reaped as
-/// idle. See `docs/capabilities.md` for this documented as a known
-/// limitation rather than silently overclaiming true idle detection.
+/// Best-known "last activity" signal for idle-TTL purposes: the most recent
+/// of --
+/// - the sandbox's own last lifecycle-state transition (`updated_at`),
+/// - its most recently *queued* guest command (`commands.created_at`, passed
+///   in as `last_command_at` -- see [`reap_expired_active_sandboxes`], which
+///   resolves it for every candidate in the same query as the candidates
+///   themselves, rather than one `select max(created_at) ...` per sandbox),
+///   and
+/// - `sandbox.last_activity_at`, bumped (throttled -- see `activity.rs`) by
+///   SSH access, desktop access, and resident-process observation requests.
+///
+/// All three are real, recorded timestamps, not guesses; taking the maximum
+/// of whichever are present is monotonic-safe (the idle clock only ever
+/// resets forward) and degrades gracefully for a sandbox that predates the
+/// `last_activity_at` column, or that has simply never been touched through
+/// SSH/desktop/resident-process surfaces: it just doesn't contribute, and
+/// the two pre-existing signals still apply exactly as before. See
+/// `docs/capabilities.md` for the full list of what does and doesn't bump
+/// `last_activity_at` today.
 fn resolve_last_activity(
     updated_at: DateTime<Utc>,
     last_command_at: Option<DateTime<Utc>>,
+    last_activity_at: Option<DateTime<Utc>>,
 ) -> DateTime<Utc> {
-    match last_command_at {
-        Some(value) if value > updated_at => value,
-        _ => updated_at,
-    }
+    [Some(updated_at), last_command_at, last_activity_at]
+        .into_iter()
+        .flatten()
+        .max()
+        .expect("updated_at is always Some, so this iterator is never empty")
 }
 
 /// Pure deadline check for one candidate, given its already-resolved
@@ -138,7 +147,11 @@ fn expired_deadline(
         return Some((ReapTrigger::MaxLifetime, deadline));
     }
     if let Some(idle_ttl_seconds) = sandbox.idle_ttl_seconds {
-        let last_activity_at = resolve_last_activity(sandbox.updated_at, last_command_at);
+        let last_activity_at = resolve_last_activity(
+            sandbox.updated_at,
+            last_command_at,
+            sandbox.last_activity_at,
+        );
         if let Some(deadline) = idle_ttl_expired(last_activity_at, idle_ttl_seconds, now) {
             return Some((ReapTrigger::IdleTtl, deadline));
         }
@@ -167,7 +180,7 @@ pub(crate) async fn reap_expired_active_sandboxes(
     let reapable = reapable_states();
     let sql = format!(
         "select s.id, s.tenant_id, s.name, s.state, s.template, s.memory_limit, s.network_egress_mode, s.workspace_mode, s.runtime_profile, s.execution_class,
-                s.created_at, s.updated_at, s.ttl_seconds, s.max_lifetime_seconds, s.idle_ttl_seconds, s.parent_snapshot_id,
+                s.created_at, s.updated_at, s.ttl_seconds, s.max_lifetime_seconds, s.idle_ttl_seconds, s.last_activity_at, s.parent_snapshot_id,
                 (select max(c.created_at) from commands c where c.sandbox_id = s.id) as last_command_at
          from sandboxes s
          where s.state in ({}) and (s.max_lifetime_seconds is not null or s.idle_ttl_seconds is not null)

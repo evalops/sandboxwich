@@ -1,3 +1,4 @@
+use crate::activity::*;
 use crate::auth::*;
 use crate::db::*;
 use crate::error::*;
@@ -76,6 +77,10 @@ pub(crate) async fn create_ssh_access(
     ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
     let guest_health = fetch_guest_health(&state.db, sandbox_id).await?;
     let ssh_access = mint_ssh_access(sandbox_id, guest_health.as_ref(), request)?;
+    // Minting SSH access is the moment a caller is about to actually use the
+    // sandbox over SSH -- one of the idle-TTL activity signals. Best-effort:
+    // must not fail this request if the bump itself fails.
+    bump_sandbox_activity_best_effort(&state.db, sandbox_id, Utc::now()).await;
     Ok(Json(SshAccessResponse {
         ok: true,
         ssh_access,

@@ -20,6 +20,8 @@ mod desktop;
 mod divergence;
 #[path = "http_contract/idempotency.rs"]
 mod idempotency;
+#[path = "http_contract/idle_activity.rs"]
+mod idle_activity;
 #[path = "http_contract/jobs.rs"]
 mod jobs;
 #[path = "http_contract/limits.rs"]

@@ -698,15 +698,18 @@ pub(crate) async fn sqlite_rebuild_sandboxes_with_parent_snapshot_fk(
             runtime_profile text not null default 'unprivileged'
                 check (runtime_profile in ('unprivileged', 'apex_trusted_supervisor_v1')),
             max_lifetime_seconds integer,
-            idle_ttl_seconds integer
+            idle_ttl_seconds integer,
+            last_activity_at text
         )",
         "insert into sandboxes_new
             (id, name, state, template, created_at, updated_at, ttl_seconds,
              parent_snapshot_id, tenant_id, memory_limit, network_egress_mode, workspace_mode,
-             execution_class, runtime_profile, max_lifetime_seconds, idle_ttl_seconds)
+             execution_class, runtime_profile, max_lifetime_seconds, idle_ttl_seconds,
+             last_activity_at)
          select id, name, state, template, created_at, updated_at, ttl_seconds,
                 parent_snapshot_id, tenant_id, memory_limit, network_egress_mode, workspace_mode,
-                execution_class, runtime_profile, max_lifetime_seconds, idle_ttl_seconds
+                execution_class, runtime_profile, max_lifetime_seconds, idle_ttl_seconds,
+                last_activity_at
          from sandboxes",
         "drop table sandboxes",
         "alter table sandboxes_new rename to sandboxes",

@@ -18,7 +18,7 @@ until its real provider path is exercised by an end-to-end conformance test.
 | Guest-agent lease claim scoping | Experimental | Workers mint opaque `sbw_gtok_` credentials bound to one tenant, worker, sandbox, and expiry. Guest claims are limited to `run_command` and `run_resident_process`; the API rejects omitted filters, cross-sandbox claims, other job kinds, worker administration, expiry, and revocation. Raw tokens are returned once and stored only as SHA-256 hashes. |
 | Resident guest processes | Experimental | A tenant may create one `orb-executor` resident process per sandbox. Bootstrap bytes are held in one API replica until a sandbox-scoped guest consumes them once; durable rows contain only digest and byte count. Production routing must keep the create and bootstrap-read requests on the same API replica until a shared ephemeral handoff is added. |
 | Active-lifetime reaping (`max_lifetime_seconds`) | Experimental | Background sweep stops a live sandbox past a hard cap measured from `created_at`, through the same path a user-initiated stop uses. Deterministic and fully tested end-to-end. Off by default (`None`); an operator must configure `SANDBOXWICH_DEFAULT_MAX_LIFETIME_SECONDS` or a caller must pass `max_lifetime_seconds` for anything to be reaped. |
-| Active-lifetime reaping (`idle_ttl_seconds`) | Experimental, coarse activity signal | Same reap path as `max_lifetime_seconds`, but the deadline resets on the more recent of the sandbox's last lifecycle-state transition and its most recently *queued* guest command. SSH sessions, desktop sessions, and resident-process output do **not** reset this clock today -- a sandbox used exclusively through those surfaces can still be reaped as idle. Treat this as "no command has run recently," not true idle detection, until a broader activity signal exists. |
+| Active-lifetime reaping (`idle_ttl_seconds`) | Experimental | Same reap path as `max_lifetime_seconds`, but the deadline resets on the most recent of: the sandbox's last lifecycle-state transition, its most recently *queued* guest command, and `last_activity_at` -- a server-maintained timestamp bumped by SSH access, desktop access, and resident-process observation requests (throttled to at most once per 60s per sandbox; see `activity.rs`). Covers every guest-interaction surface this API currently exposes. |
 | Production secret storage and billing | Unsupported | Explicit non-goals for the current milestone. |
 
 Provider capability reports must distinguish `dry_run` from `apply`; clients
@@ -38,7 +38,10 @@ three different things:
 - `max_lifetime_seconds` is what actually caps a *live* sandbox's total
   runtime and stops it once that cap passes.
 - `idle_ttl_seconds` stops a live sandbox after a period with no observed
-  activity (see the caveat above on what "activity" currently means).
+  activity: the most recent of its last lifecycle-state transition, its
+  most recently queued guest command, and `last_activity_at` (bumped by SSH
+  access, desktop access, and resident-process observation requests --
+  see `crates/sandboxwich-api/src/activity.rs`).
 
 **`create`/`fork` vs. `fork_snapshot` inheritance is intentionally
 asymmetric.** `POST /sandboxes/{id}/fork` (an in-place fork) inherits the
