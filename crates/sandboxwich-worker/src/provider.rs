@@ -1171,7 +1171,7 @@ impl KubernetesDryRunProvider {
                     }
                 }),
                 json!({
-                    "name": "SANDBOXWICH_API_TOKEN_FILE",
+                    "name": "SANDBOXWICH_GUEST_TOKEN_FILE",
                     "value": "/run/sandboxwich/guest/api-token"
                 }),
                 json!({
