@@ -48,3 +48,16 @@ pg:
       sleep 1
     done
     echo "export SANDBOXWICH_TEST_POSTGRES_URL=postgres://postgres:postgres@localhost:5432/sandboxwich"
+
+# Run the Python SDK's test suite (sdks/python), creating its venv on first use.
+# See sdks/python/README.md for the full quickstart, auth, and examples.
+py-test:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd sdks/python
+    if [ ! -d .venv ]; then
+      python3 -m venv .venv
+    fi
+    . .venv/bin/activate
+    pip install -q -e ".[dev]"
+    pytest

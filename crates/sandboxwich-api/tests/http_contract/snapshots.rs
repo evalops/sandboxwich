@@ -1,6 +1,9 @@
 use crate::common::*;
+use crate::types::placeholders;
 use reqwest::StatusCode;
 use sandboxwich_core::*;
+use sqlx::Row;
+use sqlx::any::AnyPoolOptions;
 
 #[tokio::test]
 pub(crate) async fn legacy_snapshot_reads_and_expiry_survive_missing_placement_but_restore_fails_closed()
@@ -28,6 +31,8 @@ pub(crate) async fn legacy_snapshot_reads_and_expiry_survive_missing_placement_b
             workspace_mode: Some(WorkspaceMode::Persistent),
             runtime_profile: None,
             ttl_seconds: None,
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
             execution_class: None,
         })
         .send()
@@ -124,6 +129,8 @@ pub(crate) async fn legacy_snapshot_reads_and_expiry_survive_missing_placement_b
             network_egress: created.sandbox.network_egress.clone(),
             runtime_profile: created.sandbox.runtime_profile.clone(),
             ttl_seconds: None,
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -187,6 +194,8 @@ pub(crate) async fn apex_snapshot_claim_requires_exact_profile_and_runtime_image
             workspace_mode: Some(WorkspaceMode::Persistent),
             runtime_profile: Some(SandboxRuntimeProfile::ApexTrustedSupervisorV1),
             ttl_seconds: None,
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
             execution_class: Some(ExecutionClass::SandboxedContainer),
         })
         .send()
@@ -342,7 +351,6 @@ pub(crate) async fn apex_snapshot_claim_requires_exact_profile_and_runtime_image
         serde_json::json!(runtime_image)
     );
 }
-use sqlx::Row;
 
 async fn register_snapshot_worker(
     client: &reqwest::Client,
@@ -389,6 +397,8 @@ async fn snapshot_fork_preserves_vm_execution_class_and_requires_vm_worker() {
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
             runtime_profile: None,
         })
         .send()
@@ -489,6 +499,8 @@ async fn snapshot_fork_preserves_vm_execution_class_and_requires_vm_worker() {
             memory_limit: source.sandbox.memory_limit.clone(),
             network_egress: source.sandbox.network_egress.clone(),
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
             runtime_profile: source.sandbox.runtime_profile.clone(),
         })
         .send()
@@ -1071,6 +1083,8 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(0),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -1173,6 +1187,8 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -1191,6 +1207,21 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
         .sandbox
         .parent_snapshot_id
         .expect("fork should point at a real snapshot");
+
+    // The `sandboxes.parent_snapshot_id -> snapshot_restore_sources(snapshot_id)`
+    // foreign key is `on delete restrict` (see
+    // `postgres_sandbox_parent_snapshot_fk_statements` /
+    // `sqlite_rebuild_sandboxes_with_parent_snapshot_fk` in `db.rs`; the FK
+    // targets `snapshot_restore_sources`, not `snapshots`, precisely so that
+    // deleting the `snapshots` row itself -- which legitimately happens via
+    // cascade once its owning sandbox is cleaned up, see
+    // `platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_correlated`
+    // -- keeps working). `forked.sandbox` now references `fork_snapshot_id`,
+    // so directly deleting its `snapshot_restore_sources` row -- bypassing
+    // every application-level guard, since nothing in this codebase ever
+    // does this deliberately -- must be rejected by the database itself
+    // rather than silently orphaning `forked.sandbox`'s lineage.
+    assert_deleting_referenced_snapshot_restore_source_is_rejected(server, fork_snapshot_id).await;
 
     let parent_snapshots: SnapshotListResponse = client
         .get(format!(
@@ -1428,6 +1459,8 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
             memory_limit: None,
             network_egress: None,
             ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -1514,4 +1547,58 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
     let state: String = row.try_get("state").unwrap();
     assert_eq!(state, SandboxState::Error.as_db_str());
     pool.close().await;
+}
+
+/// Connects directly to the server's database and attempts to delete the
+/// `snapshot_restore_sources` row that some sandbox's `parent_snapshot_id`
+/// still points at. The `on delete restrict` foreign key (see `db.rs`) must
+/// reject this on both backends, proving the constraint -- not just
+/// application code -- is what stops that lineage record from disappearing
+/// out from under a sandbox.
+///
+/// This deliberately does *not* test deleting the `snapshots` row itself:
+/// that delete is expected to succeed (it happens for real, via cascade, once
+/// the snapshot's owning sandbox is cleaned up -- see
+/// `platform_provider_lifecycle_contract_is_tenant_bound_idempotent_and_correlated`),
+/// which is exactly why the foreign key targets `snapshot_restore_sources`
+/// instead.
+pub(crate) async fn assert_deleting_referenced_snapshot_restore_source_is_rejected(
+    server: &TestServer,
+    referenced_snapshot_id: SnapshotId,
+) {
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&server.database_url)
+        .await
+        .unwrap();
+
+    let sql = format!(
+        "delete from snapshot_restore_sources where snapshot_id = {}",
+        placeholders(&server.database_url, 1)
+    );
+    let result = sqlx::query(&sql)
+        .bind(referenced_snapshot_id.to_string())
+        .execute(&pool)
+        .await;
+    assert!(
+        result.is_err(),
+        "deleting a snapshot_restore_sources row still referenced by a sandbox's \
+         parent_snapshot_id must be rejected by the on-delete-restrict foreign key"
+    );
+
+    let still_present_count: i64 = sqlx::query(&format!(
+        "select count(*) as count from snapshot_restore_sources where snapshot_id = {}",
+        placeholders(&server.database_url, 1)
+    ))
+    .bind(referenced_snapshot_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .try_get("count")
+    .unwrap();
+    assert_eq!(
+        still_present_count, 1,
+        "the referenced snapshot_restore_sources row must survive the rejected delete"
+    );
 }

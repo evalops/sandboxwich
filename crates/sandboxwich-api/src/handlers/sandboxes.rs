@@ -9,6 +9,7 @@ use crate::pagination::*;
 use crate::reconcile::list_runtime_resources_for_sandbox;
 use crate::rows::*;
 use crate::state::*;
+use crate::util::*;
 use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
@@ -227,7 +228,18 @@ pub(crate) async fn create_sandbox(
         created_at: now,
         updated_at: now,
         ttl_seconds: request.ttl_seconds.or(Some(3600)),
+        max_lifetime_seconds: clamp_optional_lifetime(
+            request.max_lifetime_seconds,
+            state.sandbox_lifetime.default_max_lifetime_seconds,
+            state.sandbox_lifetime.max_max_lifetime_seconds,
+        ),
+        idle_ttl_seconds: clamp_optional_lifetime(
+            request.idle_ttl_seconds,
+            state.sandbox_lifetime.default_idle_ttl_seconds,
+            state.sandbox_lifetime.max_idle_ttl_seconds,
+        ),
         parent_snapshot_id: None,
+        last_activity_at: None,
     };
 
     let mut job = Job {
@@ -300,7 +312,7 @@ pub(crate) async fn list_sandboxes(
 
     let base_sql = format!(
         "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
-                created_at, updated_at, ttl_seconds, parent_snapshot_id
+                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, last_activity_at, parent_snapshot_id
          from sandboxes
          where tenant_id = {}",
         state.db.placeholder(1)
@@ -419,14 +431,29 @@ pub(crate) async fn get_sandbox_observed_state(
     }))
 }
 
-pub(crate) async fn stop_sandbox(
-    State(state): State<AppState>,
-    Extension(ctx): Extension<TenantContext>,
-    Path(sandbox_id): Path<Uuid>,
-) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
-    let sandbox_id = SandboxId(sandbox_id);
-    let mut sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
-    let delete_gke_fqdn_policy = list_runtime_resources_for_sandbox(&state.db, sandbox_id)
+/// Drives the same stop/teardown a user-initiated `POST .../stop` performs,
+/// but parameterized over the `LifecycleChanged` event payload so callers
+/// other than the HTTP handler -- currently only the active-lifetime reaper
+/// in `reap.rs` -- can record *why* the stop happened (e.g.
+/// `"reason": "reaped_max_lifetime"`) while going through the identical
+/// state transition, resident-process-stop, guest-token-revoke, and
+/// `StopSandbox` job path. There is deliberately no second teardown path: a
+/// reaped sandbox becomes `Archiving` exactly like a manually stopped one,
+/// then flows into the pre-existing `cleanup_archived_sandboxes` retention
+/// sweep once its provider teardown completes.
+///
+/// Uses `sandbox.tenant_id` (not a caller-supplied tenant context) for every
+/// tenant-scoped write, since the reaper acts across all tenants the same
+/// way `cleanup_archived_sandboxes` does; the HTTP handler's own
+/// `ensure_sandbox_tenant` call already establishes that `sandbox` really
+/// belongs to the requesting tenant before this runs.
+pub(crate) async fn stop_sandbox_via_job(
+    db: &Database,
+    sandbox: &Sandbox,
+    lifecycle_event_data: serde_json::Value,
+) -> Result<Job, ApiError> {
+    let sandbox_id = sandbox.id;
+    let delete_gke_fqdn_policy = list_runtime_resources_for_sandbox(db, sandbox_id)
         .await?
         .iter()
         .any(|resource| {
@@ -454,46 +481,63 @@ pub(crate) async fn stop_sandbox(
         updated_at: now,
         last_error: None,
     };
-    add_provision_spec_to_payload(&mut job, &sandbox)?;
-    let mut tx = state.db.pool.begin().await?;
+    add_provision_spec_to_payload(&mut job, sandbox)?;
+    let mut tx = db.pool.begin().await?;
     set_sandbox_state_on_connection(
-        &state.db,
+        db,
         &mut tx,
         sandbox_id,
         SandboxState::STOP_LEGAL_FROM,
         SandboxState::Archiving,
-        json!({"state": SandboxState::Archiving, "reason": "stop_requested"}),
+        lifecycle_event_data,
     )
     .await?;
     let stop_residents_sql = format!(
         "update resident_processes
          set desired_state = 'stopped', updated_at = {}
          where sandbox_id = {} and tenant_id = {} and desired_state = 'running'",
-        state.db.placeholder(1),
-        state.db.placeholder(2),
-        state.db.placeholder(3)
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3)
     );
     sqlx::query(&stop_residents_sql)
         .bind(now.to_rfc3339())
         .bind(sandbox_id.to_string())
-        .bind(&ctx.tenant_id)
+        .bind(&sandbox.tenant_id)
         .execute(&mut *tx)
         .await?;
-    insert_job_on_connection(&state.db, &mut tx, &job).await?;
+    insert_job_on_connection(db, &mut tx, &job).await?;
     let revoke_sql = format!(
         "update guest_tokens set revoked_at = {}
          where tenant_id = {} and sandbox_id = {} and revoked_at is null",
-        state.db.placeholder(1),
-        state.db.placeholder(2),
-        state.db.placeholder(3)
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3)
     );
     sqlx::query(&revoke_sql)
         .bind(now.to_rfc3339())
-        .bind(&ctx.tenant_id)
+        .bind(&sandbox.tenant_id)
         .bind(sandbox_id.to_string())
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    Ok(job)
+}
+
+pub(crate) async fn stop_sandbox(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path(sandbox_id): Path<Uuid>,
+) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
+    let sandbox_id = SandboxId(sandbox_id);
+    let mut sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
+    let now = Utc::now();
+    let job = stop_sandbox_via_job(
+        &state.db,
+        &sandbox,
+        json!({"state": SandboxState::Archiving, "reason": "stop_requested"}),
+    )
+    .await?;
     sandbox.state = SandboxState::Archiving;
     sandbox.updated_at = now;
     Ok((
@@ -577,7 +621,23 @@ pub(crate) async fn fork_sandbox(
         created_at: now,
         updated_at: now,
         ttl_seconds: request.ttl_seconds.or(parent.ttl_seconds),
+        // Same default/clamp treatment as `create_sandbox`, applied to
+        // whichever of the fork request or the parent's own value wins --
+        // this keeps a fork's active-lifetime knobs subject to the
+        // operator's *current* policy rather than silently inheriting a
+        // parent value that policy may since have tightened.
+        max_lifetime_seconds: clamp_optional_lifetime(
+            request.max_lifetime_seconds.or(parent.max_lifetime_seconds),
+            state.sandbox_lifetime.default_max_lifetime_seconds,
+            state.sandbox_lifetime.max_max_lifetime_seconds,
+        ),
+        idle_ttl_seconds: clamp_optional_lifetime(
+            request.idle_ttl_seconds.or(parent.idle_ttl_seconds),
+            state.sandbox_lifetime.default_idle_ttl_seconds,
+            state.sandbox_lifetime.max_idle_ttl_seconds,
+        ),
         parent_snapshot_id: Some(snapshot.id),
+        last_activity_at: None,
     };
 
     let job = Job {
@@ -837,7 +897,7 @@ pub(crate) async fn fetch_sandbox(
 ) -> Result<Sandbox, ApiError> {
     let sql = format!(
         "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
-                created_at, updated_at, ttl_seconds, parent_snapshot_id
+                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, last_activity_at, parent_snapshot_id
          from sandboxes
          where id = {}",
         db.placeholder(1)
@@ -860,7 +920,7 @@ pub(crate) async fn fetch_sandbox_on_connection(
 ) -> Result<Sandbox, ApiError> {
     let sql = format!(
         "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
-                created_at, updated_at, ttl_seconds, parent_snapshot_id
+                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, last_activity_at, parent_snapshot_id
          from sandboxes
          where id = {}",
         db.placeholder(1)
@@ -926,9 +986,9 @@ pub(crate) async fn insert_sandbox_on_connection(
     let sql = format!(
         "insert into sandboxes
          (id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
-          created_at, updated_at, ttl_seconds, parent_snapshot_id)
+          created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, last_activity_at, parent_snapshot_id)
          values ({})",
-        db.placeholders(14)
+        db.placeholders(17)
     );
     sqlx::query(&sql)
         .bind(sandbox.id.to_string())
@@ -944,6 +1004,9 @@ pub(crate) async fn insert_sandbox_on_connection(
         .bind(sandbox.created_at.to_rfc3339())
         .bind(sandbox.updated_at.to_rfc3339())
         .bind(sandbox.ttl_seconds.map(|ttl| ttl as i64))
+        .bind(sandbox.max_lifetime_seconds.map(|ttl| ttl as i64))
+        .bind(sandbox.idle_ttl_seconds.map(|ttl| ttl as i64))
+        .bind(sandbox.last_activity_at.map(|value| value.to_rfc3339()))
         .bind(
             sandbox
                 .parent_snapshot_id

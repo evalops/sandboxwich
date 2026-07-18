@@ -19,6 +19,9 @@ pub(crate) fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
     let created_at: String = row.try_get("created_at")?;
     let updated_at: String = row.try_get("updated_at")?;
     let ttl_seconds: Option<i64> = row.try_get("ttl_seconds")?;
+    let max_lifetime_seconds: Option<i64> = row.try_get("max_lifetime_seconds")?;
+    let idle_ttl_seconds: Option<i64> = row.try_get("idle_ttl_seconds")?;
+    let last_activity_at: Option<String> = row.try_get("last_activity_at")?;
     let parent_snapshot_id: Option<String> = row.try_get("parent_snapshot_id")?;
     let network_egress = match parse_network_egress_mode(&network_egress_mode)? {
         NetworkEgressMode::DenyAll => NetworkEgress::DenyAll,
@@ -43,6 +46,11 @@ pub(crate) fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
         created_at: parse_timestamp(&created_at)?,
         updated_at: parse_timestamp(&updated_at)?,
         ttl_seconds: ttl_seconds.map(|ttl| ttl as u64),
+        max_lifetime_seconds: max_lifetime_seconds.map(|ttl| ttl as u64),
+        idle_ttl_seconds: idle_ttl_seconds.map(|ttl| ttl as u64),
+        last_activity_at: last_activity_at
+            .map(|value| parse_timestamp(&value))
+            .transpose()?,
         parent_snapshot_id: parent_snapshot_id
             .map(|snapshot| parse_uuid(&snapshot).map(SnapshotId))
             .transpose()?,

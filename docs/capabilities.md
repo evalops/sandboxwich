@@ -17,12 +17,53 @@ until its real provider path is exercised by an end-to-end conformance test.
 | True resume after teardown | Unsupported | Stop destroys resources; create or fork a replacement instead. |
 | Guest-agent lease claim scoping | Experimental | Workers mint opaque `sbw_gtok_` credentials bound to one tenant, worker, sandbox, and expiry. Guest claims are limited to `run_command` and `run_resident_process`; the API rejects omitted filters, cross-sandbox claims, other job kinds, worker administration, expiry, and revocation. Raw tokens are returned once and stored only as SHA-256 hashes. |
 | Resident guest processes | Experimental | A tenant may create one `orb-executor` resident process per sandbox. Bootstrap bytes are held in one API replica until a sandbox-scoped guest consumes them once; durable rows contain only digest and byte count. Production routing must keep the create and bootstrap-read requests on the same API replica until a shared ephemeral handoff is added. |
+| Active-lifetime reaping (`max_lifetime_seconds`) | Experimental | Background sweep stops a live sandbox past a hard cap measured from `created_at`, through the same path a user-initiated stop uses. Deterministic and fully tested end-to-end. Off by default (`None`); an operator must configure `SANDBOXWICH_DEFAULT_MAX_LIFETIME_SECONDS` or a caller must pass `max_lifetime_seconds` for anything to be reaped. |
+| Active-lifetime reaping (`idle_ttl_seconds`) | Experimental | Same reap path as `max_lifetime_seconds`, but the deadline resets on the most recent of: the sandbox's last lifecycle-state transition, its most recently *queued* guest command, and `last_activity_at` -- a server-maintained timestamp bumped by SSH access, desktop access, and resident-process observation requests (throttled to at most once per 60s per sandbox; see `activity.rs`). Covers every guest-interaction surface this API currently exposes. |
 | Production secret storage and billing | Unsupported | Explicit non-goals for the current milestone. |
 
 Provider capability reports must distinguish `dry_run` from `apply`; clients
 must not treat a simulated result as evidence that runtime work occurred.
 Only `provider_mode=apply` is real-provider execution evidence;
 `provider_mode=dry_run` is never proof that a guest process ran.
+
+## Three sandbox timing fields, not one
+
+`ttl_seconds`, `max_lifetime_seconds`, and `idle_ttl_seconds` are easy to
+conflate because they all look like "how long does this last." They govern
+three different things:
+
+- `ttl_seconds` only starts counting once a sandbox is already `archived`
+  (i.e. already stopped, by any means) and controls how long that record is
+  retained before deletion. It never causes a running sandbox to stop.
+- `max_lifetime_seconds` is what actually caps a *live* sandbox's total
+  runtime and stops it once that cap passes.
+- `idle_ttl_seconds` stops a live sandbox after a period with no observed
+  activity: the most recent of its last lifecycle-state transition, its
+  most recently queued guest command, and `last_activity_at` (bumped by SSH
+  access, desktop access, and resident-process observation requests --
+  see `crates/sandboxwich-api/src/activity.rs`).
+
+**`create`/`fork` vs. `fork_snapshot` inheritance is intentionally
+asymmetric.** `POST /sandboxes/{id}/fork` (an in-place fork) inherits the
+parent's `max_lifetime_seconds`/`idle_ttl_seconds` when the request omits
+them (`request.field.or(parent.field)`), then re-clamps under current
+operator policy. `POST /snapshots/{id}/fork` (restoring a sandbox from a
+snapshot) does **not** inherit the *source* sandbox's values at all -- only
+the fork-snapshot request's own field, defaulted/clamped by the operator
+config, applies. This means a caller-imposed cap on a sandbox can be shed by
+snapshotting it and restoring the snapshot into a fresh sandbox with no
+cap requested. It is not a loophole around *operator* policy: the
+operator-configured default/ceiling
+(`SANDBOXWICH_DEFAULT_MAX_LIFETIME_SECONDS`/`_MAX_MAX_LIFETIME_SECONDS` and
+the `idle_ttl` equivalents) still applies to every `fork_snapshot` request
+exactly as it does to `create`, regardless of what the source sandbox's
+values were. Restoring from a snapshot is a new sandbox with a new
+creation time, not a continuation of the old one, so there is no single
+"parent" whose cap would be unambiguous to inherit -- unlike an in-place
+fork, which has exactly one.
+
+See the README's "Sandbox lifetime: three separate knobs" section for the
+full config surface (env vars and CLI flags).
 
 ## Execution class ownership
 

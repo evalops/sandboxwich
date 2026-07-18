@@ -7,6 +7,7 @@ use sqlx::any::AnyPoolOptions;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+use crate::activity::*;
 use crate::auth::*;
 use crate::cleanup::*;
 use crate::config::*;
@@ -18,6 +19,7 @@ use crate::handlers::leases::*;
 use crate::handlers::sandboxes::*;
 use crate::handlers::snapshots::*;
 use crate::handlers::workers::*;
+use crate::reap::*;
 use crate::reconcile::*;
 use crate::rows::*;
 use crate::state::{Principal, TenantContext};
@@ -123,7 +125,10 @@ async fn resident_process_storage_round_trips_public_metadata() {
         created_at: now,
         updated_at: now,
         ttl_seconds: Some(3600),
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         parent_snapshot_id: None,
+        last_activity_at: None,
     };
     let mut tx = db.pool.begin().await.unwrap();
     insert_sandbox_on_connection(&db, &mut tx, &sandbox)
@@ -216,7 +221,10 @@ fn authoritative_job_enrichment_overwrites_caller_placement_metadata() {
         created_at: now,
         updated_at: now,
         ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         parent_snapshot_id: None,
+        last_activity_at: None,
         execution_class: ExecutionClass::SandboxedContainer,
     };
     let mut job = Job {
@@ -267,6 +275,8 @@ fn apex_runtime_profile_requires_pinned_image_and_deny_by_default_egress() {
         workspace_mode: None,
         runtime_profile: Some(SandboxRuntimeProfile::ApexTrustedSupervisorV1),
         ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         execution_class: Some(ExecutionClass::SandboxedContainer),
     };
     assert!(provision_spec_from_request(&request(&pinned, NetworkEgress::DenyAll), None).is_ok());
@@ -310,7 +320,10 @@ fn apex_runtime_profile_requires_pinned_image_and_deny_by_default_egress() {
         created_at: now,
         updated_at: now,
         ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         parent_snapshot_id: None,
+        last_activity_at: None,
         execution_class: ExecutionClass::SandboxedContainer,
     };
     let inherited = CreateSandboxRequest {
@@ -321,6 +334,8 @@ fn apex_runtime_profile_requires_pinned_image_and_deny_by_default_egress() {
         workspace_mode: None,
         runtime_profile: None,
         ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         execution_class: None,
     };
     assert!(provision_spec_from_request(&inherited, Some(&parent)).is_ok());
@@ -348,6 +363,8 @@ fn snapshot_fork_request_rejects_placement_mismatches() {
         network_egress: NetworkEgress::DenyAll,
         runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
         ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
     };
     validate_snapshot_fork_request(&matching, &source).expect("matching placement");
     let mut mismatch = matching.clone();
@@ -539,7 +556,10 @@ async fn materialization_rejects_a_file_from_another_sandbox() {
         created_at: now,
         updated_at: now,
         ttl_seconds: Some(600),
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         parent_snapshot_id: None,
+        last_activity_at: None,
         execution_class: ExecutionClass::SandboxedContainer,
     };
     let first = make("first");
@@ -764,7 +784,7 @@ fn looks_like_cidr_rejects_garbage_and_out_of_range_prefixes() {
 #[test]
 fn db_enum_fingerprint_is_versioned_and_stable_for_current_registry() {
     let fingerprint = db_enum_schema_fingerprint();
-    assert!(fingerprint.starts_with("db-enum-v5:"));
+    assert!(fingerprint.starts_with("db-enum-v6:"));
     assert_eq!(fingerprint, db_enum_schema_fingerprint());
 }
 
@@ -1560,7 +1580,10 @@ async fn expire_due_leases_does_not_double_process_concurrent_sweeps() {
         created_at: now,
         updated_at: now,
         ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         parent_snapshot_id: None,
+        last_activity_at: None,
     };
     insert_sandbox(&db, &sandbox).await.expect("insert sandbox");
     let prompt_event_id = Uuid::now_v7();
@@ -1624,10 +1647,131 @@ async fn seed_sandbox_with_state(db: &Database, state: SandboxState) -> Sandbox 
         created_at: now,
         updated_at: now,
         ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         parent_snapshot_id: None,
+        last_activity_at: None,
     };
     insert_sandbox(db, &sandbox).await.expect("insert sandbox");
     sandbox
+}
+
+async fn sandbox_last_activity_at(db: &Database, sandbox_id: SandboxId) -> Option<DateTime<Utc>> {
+    let raw: Option<String> = sqlx::query("select last_activity_at from sandboxes where id = ?")
+        .bind(sandbox_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+        .try_get("last_activity_at")
+        .unwrap();
+    raw.map(|value| parse_timestamp(&value).unwrap())
+}
+
+/// `bump_sandbox_activity` must set `last_activity_at` on the first call,
+/// must **not** move it forward again while still inside the throttle
+/// window (bounding write volume for chatty callers -- see `activity.rs`'s
+/// module docs for why), and must move it forward again once the throttle
+/// window has elapsed.
+#[tokio::test]
+async fn bump_sandbox_activity_is_throttled_but_eventually_advances() {
+    let db = test_sqlite_db().await;
+    let sandbox = seed_sandbox_with_state(&db, SandboxState::Ready).await;
+    assert_eq!(sandbox_last_activity_at(&db, sandbox.id).await, None);
+
+    let first_bump = Utc::now() - chrono::Duration::seconds(200);
+    bump_sandbox_activity(&db, sandbox.id, first_bump)
+        .await
+        .unwrap();
+    assert_eq!(
+        sandbox_last_activity_at(&db, sandbox.id).await,
+        Some(first_bump),
+        "the first bump must set last_activity_at"
+    );
+
+    // Still inside the throttle window (60s): a later timestamp must NOT
+    // overwrite the first bump.
+    let still_throttled = first_bump + chrono::Duration::seconds(10);
+    bump_sandbox_activity(&db, sandbox.id, still_throttled)
+        .await
+        .unwrap();
+    assert_eq!(
+        sandbox_last_activity_at(&db, sandbox.id).await,
+        Some(first_bump),
+        "a bump inside the throttle window must be a no-op"
+    );
+
+    // Past the throttle window: must advance.
+    let past_throttle = first_bump + chrono::Duration::seconds(61);
+    bump_sandbox_activity(&db, sandbox.id, past_throttle)
+        .await
+        .unwrap();
+    assert_eq!(
+        sandbox_last_activity_at(&db, sandbox.id).await,
+        Some(past_throttle),
+        "a bump past the throttle window must advance last_activity_at"
+    );
+}
+
+/// Regression/completeness test for the idle-TTL activity signal: a
+/// sandbox with no recent command activity and a stale `updated_at` must
+/// still survive reaping if `last_activity_at` (bumped by SSH/desktop/
+/// resident-process touchpoints -- exercised live in
+/// `tests/http_contract/reap.rs`) is recent, and a sandbox with no
+/// `last_activity_at` at all (the pre-this-PR case, or one that predates
+/// the column) must fall back to the pre-existing updated_at/commands
+/// signal exactly as before.
+#[tokio::test]
+async fn idle_ttl_reap_considers_last_activity_at_alongside_updated_at_and_commands() {
+    let db = test_sqlite_db().await;
+    let now = Utc::now();
+    let seed = |updated_at: DateTime<Utc>| Sandbox {
+        execution_class: ExecutionClass::DevelopmentContainer,
+        workspace_mode: WorkspaceMode::Ephemeral,
+        runtime_profile: SandboxRuntimeProfile::Unprivileged,
+        id: SandboxId::new(),
+        tenant_id: "default".to_string(),
+        name: "activity-signal-fixture".to_string(),
+        state: SandboxState::Ready,
+        template: "default".to_string(),
+        memory_limit: MemoryLimit::default(),
+        network_egress: NetworkEgress::default(),
+        created_at: updated_at,
+        updated_at,
+        ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: Some(300),
+        last_activity_at: None,
+        parent_snapshot_id: None,
+    };
+
+    let recent_ssh_activity = seed(now - chrono::Duration::seconds(400));
+    insert_sandbox(&db, &recent_ssh_activity).await.unwrap();
+    bump_sandbox_activity(
+        &db,
+        recent_ssh_activity.id,
+        now - chrono::Duration::seconds(100),
+    )
+    .await
+    .unwrap();
+
+    let no_activity_at_all = seed(now - chrono::Duration::seconds(400));
+    insert_sandbox(&db, &no_activity_at_all).await.unwrap();
+
+    let reaped = reap_expired_active_sandboxes(&db).await.unwrap();
+    let reaped_ids: std::collections::HashSet<SandboxId> =
+        reaped.iter().map(|reaped| reaped.sandbox.id).collect();
+
+    assert!(
+        !reaped_ids.contains(&recent_ssh_activity.id),
+        "a recent last_activity_at bump must reset the idle clock and prevent reaping, \
+         even though updated_at alone is already past the deadline"
+    );
+    assert!(
+        reaped_ids.contains(&no_activity_at_all.id),
+        "with last_activity_at never set (NULL), the sweep must fall back to the \
+         pre-existing updated_at/commands signal and reap this sandbox exactly as \
+         it would have before this column existed"
+    );
 }
 
 #[tokio::test]
@@ -1930,7 +2074,10 @@ async fn cleanup_archived_sandboxes_never_deletes_a_sandbox_with_a_live_restore_
         created_at: now,
         updated_at: now,
         ttl_seconds: Some(0),
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         parent_snapshot_id: None,
+        last_activity_at: None,
     };
     insert_sandbox(&db, &sandbox)
         .await
@@ -1970,6 +2117,149 @@ async fn cleanup_archived_sandboxes_never_deletes_a_sandbox_with_a_live_restore_
 }
 
 #[tokio::test]
+async fn sandbox_insert_rejects_a_nonexistent_parent_snapshot_id() {
+    // The `sandboxes.parent_snapshot_id -> snapshot_restore_sources(snapshot_id)`
+    // foreign key (see `sqlite_rebuild_sandboxes_with_parent_snapshot_fk` /
+    // `ensure_sqlite_constraints` in `db.rs`) must reject an insert that
+    // points at a snapshot that was never created, through the same
+    // `insert_sandbox` path every handler uses -- not just a raw SQL
+    // statement issued directly against the pool.
+    let db = test_sqlite_db().await;
+    let now = Utc::now();
+    let sandbox = Sandbox {
+        workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        id: SandboxId::new(),
+        tenant_id: "default".to_string(),
+        name: "dangling-parent-snapshot".to_string(),
+        state: SandboxState::Planning,
+        template: "default".to_string(),
+        memory_limit: MemoryLimit::default(),
+        network_egress: NetworkEgress::default(),
+        runtime_profile: SandboxRuntimeProfile::default(),
+        execution_class: ExecutionClass::default(),
+        created_at: now,
+        updated_at: now,
+        ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
+        last_activity_at: None,
+        parent_snapshot_id: Some(SnapshotId::new()),
+    };
+
+    let result = insert_sandbox(&db, &sandbox).await;
+    assert!(
+        result.is_err(),
+        "inserting a sandbox with a parent_snapshot_id pointing at a nonexistent snapshot must fail"
+    );
+
+    let missing = fetch_sandbox(&db, sandbox.id).await;
+    assert!(
+        missing.is_err(),
+        "the rejected insert must not leave a partial sandbox row behind"
+    );
+}
+
+#[tokio::test]
+async fn parent_snapshot_fk_migration_nulls_pre_existing_orphans_before_enforcing() {
+    // Simulates upgrading a database that predates the
+    // `sandboxes.parent_snapshot_id -> snapshot_restore_sources(snapshot_id)`
+    // foreign key and already has a row whose `parent_snapshot_id` points at
+    // nothing -- the column only ever had an index
+    // (20260704000500_snapshots.sql), so nothing ever stopped that from
+    // happening. The migration added alongside the FK
+    // (20260716000400_sandbox_parent_snapshot_fk.sql) must null those out
+    // before `ensure_sqlite_constraints` starts enforcing the constraint, or
+    // the upgrade itself would fail applying to real, already-drifted data.
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+
+    const FK_MIGRATION_VERSION: i64 = 20260716000400;
+    let mut migrations: Vec<_> = sqlx::migrate!("./migrations").iter().cloned().collect();
+    migrations.sort_by_key(|migration| migration.version);
+
+    for migration in migrations
+        .iter()
+        .filter(|m| m.version < FK_MIGRATION_VERSION)
+    {
+        sqlx::raw_sql(&migration.sql)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("apply migration {}: {error}", migration.version));
+    }
+
+    let now = Utc::now().to_rfc3339();
+    let orphan_sandbox_id = Uuid::now_v7().to_string();
+    let dangling_snapshot_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "insert into sandboxes
+            (id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id,
+             tenant_id, memory_limit, network_egress_mode, workspace_mode)
+         values (?, 'orphaned', 'ready', 'default', ?, ?, NULL, ?, 'default', '1g', 'deny_all', 'persistent')",
+    )
+    .bind(&orphan_sandbox_id)
+    .bind(&now)
+    .bind(&now)
+    .bind(&dangling_snapshot_id)
+    .execute(&pool)
+    .await
+    .expect("seed a pre-existing orphan sandbox row (no FK exists at this schema version yet)");
+
+    for migration in migrations
+        .iter()
+        .filter(|m| m.version >= FK_MIGRATION_VERSION)
+    {
+        sqlx::raw_sql(&migration.sql)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("apply migration {}: {error}", migration.version));
+    }
+
+    let db = Database {
+        pool,
+        dialect: SqlDialect::Sqlite,
+    };
+    ensure_database_constraints(&db)
+        .await
+        .expect("reconcile constraints, including the new parent_snapshot_id foreign key");
+
+    let parent_snapshot_id: Option<String> =
+        sqlx::query("select parent_snapshot_id from sandboxes where id = ?")
+            .bind(&orphan_sandbox_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("fetch orphan sandbox row")
+            .try_get("parent_snapshot_id")
+            .expect("read parent_snapshot_id");
+    assert_eq!(
+        parent_snapshot_id, None,
+        "the orphan-cleanup migration must null out a parent_snapshot_id with no matching snapshot"
+    );
+
+    // With the orphan cleaned up and the FK now enforced, a fresh insert
+    // pointing at the same nonexistent snapshot id must be rejected.
+    let result = sqlx::query(
+        "insert into sandboxes
+            (id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id,
+             tenant_id, memory_limit, network_egress_mode, workspace_mode)
+         values (?, 'still-dangling', 'ready', 'default', ?, ?, NULL, ?, 'default', '1g', 'deny_all', 'persistent')",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(&now)
+    .bind(&now)
+    .bind(&dangling_snapshot_id)
+    .execute(&db.pool)
+    .await;
+    assert!(
+        result.is_err(),
+        "the foreign key must reject the same dangling snapshot id post-upgrade"
+    );
+}
+
+#[tokio::test]
 async fn apex_execution_class_migration_backfills_legacy_rows() {
     sqlx::any::install_default_drivers();
     let pool = AnyPoolOptions::new()
@@ -1978,9 +2268,43 @@ async fn apex_execution_class_migration_backfills_legacy_rows() {
         .await
         .expect("connect upgrade database");
     let migrations = sqlx::migrate!("./migrations");
+    // This test simulates rows written *before* the corrective backfill
+    // migration below, then applies it and asserts it ran correctly.
+    //
+    // It used to build "prior_migrations" by slicing off just the literal
+    // last migration, on the assumption that the backfill migration was
+    // always the newest one -- true when this test was written, but silently
+    // stale since (several unrelated migrations, most recently the active-
+    // lifetime-reaping columns, have landed after it without breaking this
+    // test, purely because none of them touched a column the legacy inserts
+    // below depend on -- unlike the active-lifetime columns, which
+    // `insert_sandbox` now unconditionally writes).
+    //
+    // The fix excludes only the backfill migration itself (found by name,
+    // not position) rather than truncating everything after it, so
+    // `insert_sandbox`/`insert_job` below run against the *current* full
+    // schema (every column they need exists) with only this one migration's
+    // row-level fixup not yet applied -- exactly the legacy state this test
+    // means to construct, regardless of how many migrations land on either
+    // side of the backfill one in the future.
+    let backfill_index = migrations
+        .migrations
+        .iter()
+        .position(|migration| {
+            migration
+                .description
+                .contains("apex execution class backfill")
+        })
+        .expect("apex_execution_class_backfill migration must still exist");
     let prior_migrations = sqlx::migrate::Migrator {
         migrations: std::borrow::Cow::Owned(
-            migrations.migrations[..migrations.migrations.len() - 1].to_vec(),
+            migrations
+                .migrations
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != backfill_index)
+                .map(|(_, migration)| migration.clone())
+                .collect(),
         ),
         ignore_missing: false,
         locking: true,
@@ -2009,7 +2333,10 @@ async fn apex_execution_class_migration_backfills_legacy_rows() {
         created_at: now,
         updated_at: now,
         ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
         parent_snapshot_id: None,
+        last_activity_at: None,
     };
     insert_sandbox(&db, &sandbox)
         .await

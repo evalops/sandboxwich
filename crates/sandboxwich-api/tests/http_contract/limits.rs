@@ -126,6 +126,8 @@ async fn assert_limit_contract(server: TestServer) {
         memory_limit: None,
         network_egress: None,
         ttl_seconds: Some(120),
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
     };
     let first_key = uuid::Uuid::now_v7().to_string();
     let second_key = uuid::Uuid::now_v7().to_string();

@@ -34,6 +34,8 @@ pub(crate) async fn metrics_are_scoped_to_the_authenticated_tenant() {
                 memory_limit: None,
                 network_egress: None,
                 ttl_seconds: Some(120),
+                max_lifetime_seconds: None,
+                idle_ttl_seconds: None,
             })
             .send()
             .await
@@ -57,6 +59,8 @@ pub(crate) async fn metrics_are_scoped_to_the_authenticated_tenant() {
                 memory_limit: None,
                 network_egress: None,
                 ttl_seconds: Some(120),
+                max_lifetime_seconds: None,
+                idle_ttl_seconds: None,
             })
             .send()
             .await

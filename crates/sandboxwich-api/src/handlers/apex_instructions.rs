@@ -644,6 +644,9 @@ mod tests {
             created_at: now,
             updated_at: now,
             ttl_seconds: None,
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+            last_activity_at: None,
             parent_snapshot_id: None,
         };
         insert_sandbox(&db, &sandbox).await.unwrap();
@@ -763,6 +766,7 @@ mod tests {
             // the wrong API replica while durable lineage survives.
             apex_waiters: ApexInstructionWaiters::default(),
             resident_bootstraps: Default::default(),
+            sandbox_lifetime: Default::default(),
             apex_callback_test_hook: None,
         };
         let ctx = TenantContext {

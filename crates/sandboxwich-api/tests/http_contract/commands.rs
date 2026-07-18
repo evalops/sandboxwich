@@ -24,6 +24,8 @@ pub(crate) async fn apex_command_claim_requires_exact_profile_and_runtime_image(
             workspace_mode: Some(WorkspaceMode::Persistent),
             runtime_profile: Some(SandboxRuntimeProfile::ApexTrustedSupervisorV1),
             ttl_seconds: None,
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
             execution_class: Some(ExecutionClass::SandboxedContainer),
         })
         .send()
@@ -238,6 +240,8 @@ pub(crate) async fn command_stdin_is_redacted_from_tenant_jobs_but_preserved_for
             memory_limit: None,
             network_egress: None,
             ttl_seconds: None,
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
             execution_class: None,
         })
         .send()
@@ -466,6 +470,8 @@ pub(crate) async fn command_stdin_over_one_mib_is_rejected_before_job_dispatch()
             memory_limit: None,
             network_egress: None,
             ttl_seconds: None,
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
             execution_class: None,
         })
         .send()
@@ -575,6 +581,8 @@ pub(crate) async fn small_body_route_rejects_oversized_json_but_upload_route_acc
             memory_limit: None,
             network_egress: None,
             ttl_seconds: None,
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
@@ -666,6 +674,8 @@ pub(crate) async fn list_commands_respect_limit_and_paginate_with_cursor() {
             memory_limit: None,
             network_egress: None,
             ttl_seconds: None,
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
         })
         .send()
         .await
