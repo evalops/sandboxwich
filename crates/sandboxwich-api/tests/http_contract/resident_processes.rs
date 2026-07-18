@@ -1,6 +1,7 @@
 use crate::common::*;
 use sandboxwich_core::*;
 use std::collections::BTreeMap;
+use uuid::Uuid;
 
 /// Provisions a sandbox and worker, completes the `ProvisionSandbox` job, and
 /// mints a guest token bound to that sandbox -- the shared setup every
@@ -1019,4 +1020,117 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
         .await
         .unwrap();
     assert_eq!(other_bootstrap.content, b"unsidecared-executor-secret");
+}
+
+#[tokio::test]
+async fn concurrent_bootstrap_reads_have_exactly_one_winner() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("resident-bootstrap-race.db").display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let (sandbox_id, worker, guest_client) =
+        provisioned_sandbox_with_guest(&server, "resident-bootstrap-race").await;
+    let created: ResidentProcessResponse = server
+        .client()
+        .put(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/orb-executor",
+            server.base_url
+        ))
+        .json(&resident_process_request(
+            "/usr/local/bin/orb-executor",
+            b"concurrent-bootstrap-secret",
+            "/run/sandboxwich/bootstrap/orb-token",
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claim_resident_process_lease(&server, &worker, &guest_client, sandbox_id).await;
+    let request = ResidentProcessBootstrapReadRequest {
+        generation: created.resident_process.generation,
+        lease_id: lease.id.0,
+        expected_sha256: created.resident_process.bootstrap_sha256.unwrap(),
+    };
+    let url = format!(
+        "{}/resident-processes/{}/bootstrap",
+        server.base_url, created.resident_process.id
+    );
+
+    let mut wrong_hash = request.clone();
+    wrong_hash.expected_sha256 = "0".repeat(64);
+    assert_eq!(
+        guest_client
+            .post(&url)
+            .json(&wrong_hash)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::CONFLICT,
+        "a cache fence failure must restore the bootstrap"
+    );
+    let mut stale_lease = request.clone();
+    stale_lease.lease_id = Uuid::now_v7();
+    assert_eq!(
+        guest_client
+            .post(&url)
+            .json(&stale_lease)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::CONFLICT,
+        "a database fence failure must restore the bootstrap"
+    );
+
+    let first = guest_client.post(&url).json(&request).send();
+    let second = guest_client.post(&url).json(&request).send();
+    let (first, second) = tokio::join!(first, second);
+    let responses = [first.unwrap(), second.unwrap()];
+    let statuses: Vec<_> = responses.iter().map(reqwest::Response::status).collect();
+    assert_eq!(
+        statuses.iter().filter(|status| status.is_success()).count(),
+        1,
+        "exactly one reader must receive the bootstrap: {statuses:?}"
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| {
+                matches!(
+                    **status,
+                    reqwest::StatusCode::GONE | reqwest::StatusCode::CONFLICT
+                )
+            })
+            .count(),
+        1,
+        "the losing reader must receive a terminal fence response: {statuses:?}"
+    );
+    let winner = responses
+        .into_iter()
+        .find(|response| response.status().is_success())
+        .unwrap();
+    let bootstrap: ResidentProcessBootstrapReadResponse = winner.json().await.unwrap();
+    assert_eq!(bootstrap.content, b"concurrent-bootstrap-secret");
+
+    assert_eq!(
+        guest_client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::GONE,
+        "the database consumption marker must keep later reads terminal"
+    );
 }

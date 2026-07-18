@@ -14,6 +14,7 @@ use chrono::Utc;
 use sandboxwich_core::*;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use sqlx::Row;
 use std::convert::Infallible;
 use std::time::Duration;
 use uuid::Uuid;
@@ -290,25 +291,23 @@ pub(crate) async fn put_resident_process(
     };
     add_provision_spec_to_payload(&mut job, &sandbox)?;
 
-    if let Some(bootstrap) = request.bootstrap {
-        state
-            .resident_bootstraps
-            .insert(
-                process.id,
-                LiveResidentBootstrap {
-                    content: bootstrap.content,
-                    sha256: bootstrap_digest.unwrap_or_default(),
-                    target_file: bootstrap.target_file,
-                    mode: bootstrap.mode,
-                    generation: process.generation,
-                },
-            )
-            .map_err(|_| ApiError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                code: "resident_bootstrap_capacity",
-                message: "resident bootstrap capacity is exhausted".into(),
-            })?;
-    }
+    let bootstrap_reservation = request
+        .bootstrap
+        .map(|bootstrap| {
+            state.resident_bootstraps.reserve(LiveResidentBootstrap {
+                content: bootstrap.content,
+                sha256: bootstrap_digest.clone().unwrap_or_default(),
+                target_file: bootstrap.target_file,
+                mode: bootstrap.mode,
+                generation: process.generation,
+            })
+        })
+        .transpose()
+        .map_err(|_| ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "resident_bootstrap_capacity",
+            message: "resident bootstrap capacity is exhausted".into(),
+        })?;
 
     let insert_sql = format!(
         "insert into resident_processes (
@@ -342,6 +341,9 @@ pub(crate) async fn put_resident_process(
         .await?;
     insert_job_on_connection(&state.db, &mut tx, &job).await?;
     tx.commit().await?;
+    if let Some(reservation) = bootstrap_reservation {
+        reservation.publish(process.id);
+    }
 
     let process_id = process.id.0;
     Ok((
@@ -425,31 +427,119 @@ pub(crate) async fn read_resident_process_bootstrap(
     if process.tenant_id != ctx.tenant_id || process.sandbox_id != sandbox_id {
         return Err(ApiError::not_found("resident process not found"));
     }
-    if process.generation != request.generation
-        || process.active_lease_id != Some(request.lease_id)
-        || process.bootstrap_sha256.as_deref() != Some(request.expected_sha256.as_str())
-    {
-        return Err(ApiError::conflict_code(
-            "resident_bootstrap_fence_mismatch",
-            "resident bootstrap request does not match the active lease",
-        ));
-    }
-    ensure_sidecar_ready_if_required(&state.db, sandbox_id, &process.tenant_id, &process.name)
-        .await?;
-    let bootstrap = state
+    let consumption = state
         .resident_bootstraps
-        .take(&process_id)
+        .begin_consume(&process_id)
         .ok_or_else(|| ApiError {
             status: StatusCode::GONE,
             code: "resident_bootstrap_unavailable",
             message: "resident bootstrap is unavailable or already consumed".into(),
         })?;
-    if bootstrap.generation != process.generation || bootstrap.sha256 != request.expected_sha256 {
+    if consumption.bootstrap().generation != request.generation
+        || consumption.bootstrap().sha256 != request.expected_sha256
+    {
         return Err(ApiError::conflict_code(
             "resident_bootstrap_fence_mismatch",
             "resident bootstrap cache does not match the active generation",
         ));
     }
+    let now = Utc::now();
+    let consume_sql = format!(
+        "update resident_processes as target
+         set bootstrap_consumed_at = {}
+         where target.id = {}
+           and target.tenant_id = {}
+           and target.sandbox_id = {}
+           and target.generation = {}
+           and target.active_lease_id = {}
+           and target.bootstrap_sha256 = {}
+           and target.bootstrap_consumed_at is null
+           and (
+             target.name <> {}
+             or not exists (
+               select 1 from resident_processes as configured_sidecar
+               where configured_sidecar.sandbox_id = target.sandbox_id
+                 and configured_sidecar.tenant_id = target.tenant_id
+                 and configured_sidecar.name = {}
+             )
+             or exists (
+               select 1
+               from resident_processes as ready_sidecar
+               join job_leases as live_lease on live_lease.id = ready_sidecar.active_lease_id
+               where ready_sidecar.sandbox_id = target.sandbox_id
+                 and ready_sidecar.tenant_id = target.tenant_id
+                 and ready_sidecar.name = {}
+                 and ready_sidecar.observed_state = 'running'
+                 and live_lease.status = 'active'
+                 and live_lease.expires_at > {}
+             )
+           )",
+        state.db.placeholder(1),
+        state.db.placeholder(2),
+        state.db.placeholder(3),
+        state.db.placeholder(4),
+        state.db.placeholder(5),
+        state.db.placeholder(6),
+        state.db.placeholder(7),
+        state.db.placeholder(8),
+        state.db.placeholder(9),
+        state.db.placeholder(10),
+        state.db.placeholder(11),
+    );
+    let consumed = sqlx::query(&consume_sql)
+        .bind(now.to_rfc3339())
+        .bind(process_id.to_string())
+        .bind(&ctx.tenant_id)
+        .bind(sandbox_id.to_string())
+        .bind(request.generation as i64)
+        .bind(request.lease_id.to_string())
+        .bind(&request.expected_sha256)
+        .bind(ORB_EXECUTOR_RESIDENT_PROCESS_NAME)
+        .bind(ORB_SIDECAR_RESIDENT_PROCESS_NAME)
+        .bind(ORB_SIDECAR_RESIDENT_PROCESS_NAME)
+        .bind(now.to_rfc3339())
+        .execute(&state.db.pool)
+        .await?;
+    if consumed.rows_affected() != 1 {
+        let consumed_sql = format!(
+            "select bootstrap_consumed_at from resident_processes where id = {}",
+            state.db.placeholder(1)
+        );
+        let consumed_at = sqlx::query(&consumed_sql)
+            .bind(process_id.to_string())
+            .fetch_optional(&state.db.pool)
+            .await?
+            .and_then(|row| {
+                row.try_get::<Option<String>, _>("bootstrap_consumed_at")
+                    .ok()
+            })
+            .flatten();
+        if consumed_at.is_some() {
+            return Err(ApiError {
+                status: StatusCode::GONE,
+                code: "resident_bootstrap_unavailable",
+                message: "resident bootstrap is unavailable or already consumed".into(),
+            });
+        }
+        let current = fetch_resident_process_by_id(&state.db, process_id).await?;
+        if current.generation != request.generation
+            || current.active_lease_id != Some(request.lease_id)
+            || current.bootstrap_sha256.as_deref() != Some(request.expected_sha256.as_str())
+        {
+            return Err(ApiError::conflict_code(
+                "resident_bootstrap_fence_mismatch",
+                "resident bootstrap request does not match the active lease",
+            ));
+        }
+        ensure_sidecar_ready_if_required(&state.db, sandbox_id, &current.tenant_id, &current.name)
+            .await?;
+        return Err(ApiError {
+            status: StatusCode::GONE,
+            code: "resident_bootstrap_unavailable",
+            message: "resident bootstrap is unavailable or already consumed".into(),
+        });
+    }
+    let bootstrap = consumption.commit();
     Ok(Json(ResidentProcessBootstrapReadResponse {
         ok: true,
         content: bootstrap.content,

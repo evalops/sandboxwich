@@ -144,36 +144,180 @@ pub(crate) struct LiveResidentBootstrap {
     pub(crate) generation: u64,
 }
 
-#[derive(Clone, Default)]
-pub(crate) struct ResidentBootstrapStore(
-    Arc<Mutex<HashMap<ResidentProcessId, LiveResidentBootstrap>>>,
-);
+struct ResidentBootstrapStoreInner {
+    values: HashMap<ResidentProcessId, LiveResidentBootstrap>,
+    reserved: usize,
+    capacity: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct ResidentBootstrapStore(Arc<Mutex<ResidentBootstrapStoreInner>>);
+
+impl Default for ResidentBootstrapStore {
+    fn default() -> Self {
+        Self::with_capacity(MAX_RESIDENT_BOOTSTRAPS)
+    }
+}
 
 impl ResidentBootstrapStore {
-    pub(crate) fn insert(
-        &self,
-        id: ResidentProcessId,
-        bootstrap: LiveResidentBootstrap,
-    ) -> Result<(), ()> {
-        let mut values = self.0.lock().expect("resident bootstrap mutex poisoned");
-        if values.len() >= MAX_RESIDENT_BOOTSTRAPS && !values.contains_key(&id) {
-            return Err(());
-        }
-        values.insert(id, bootstrap);
-        Ok(())
+    fn with_capacity(capacity: usize) -> Self {
+        Self(Arc::new(Mutex::new(ResidentBootstrapStoreInner {
+            values: HashMap::new(),
+            reserved: 0,
+            capacity,
+        })))
     }
 
-    pub(crate) fn take(&self, id: &ResidentProcessId) -> Option<LiveResidentBootstrap> {
-        self.0
+    pub(crate) fn reserve(
+        &self,
+        bootstrap: LiveResidentBootstrap,
+    ) -> Result<ResidentBootstrapReservation, ()> {
+        let mut inner = self.0.lock().expect("resident bootstrap mutex poisoned");
+        if inner.values.len() + inner.reserved >= inner.capacity {
+            return Err(());
+        }
+        inner.reserved += 1;
+        Ok(ResidentBootstrapReservation {
+            store: self.clone(),
+            bootstrap: Some(bootstrap),
+        })
+    }
+
+    pub(crate) fn begin_consume(
+        &self,
+        id: &ResidentProcessId,
+    ) -> Option<ResidentBootstrapConsumption> {
+        let mut inner = self.0.lock().expect("resident bootstrap mutex poisoned");
+        let bootstrap = inner.values.remove(id)?;
+        inner.reserved += 1;
+        Some(ResidentBootstrapConsumption {
+            store: self.clone(),
+            id: *id,
+            bootstrap: Some(bootstrap),
+        })
+    }
+}
+
+pub(crate) struct ResidentBootstrapReservation {
+    store: ResidentBootstrapStore,
+    bootstrap: Option<LiveResidentBootstrap>,
+}
+
+impl ResidentBootstrapReservation {
+    pub(crate) fn publish(mut self, id: ResidentProcessId) {
+        let bootstrap = self
+            .bootstrap
+            .take()
+            .expect("resident bootstrap reservation already published");
+        let mut inner = self
+            .store
+            .0
             .lock()
-            .expect("resident bootstrap mutex poisoned")
-            .remove(id)
+            .expect("resident bootstrap mutex poisoned");
+        inner.reserved -= 1;
+        let previous = inner.values.insert(id, bootstrap);
+        debug_assert!(previous.is_none(), "resident bootstrap published twice");
+    }
+}
+
+impl Drop for ResidentBootstrapReservation {
+    fn drop(&mut self) {
+        if self.bootstrap.is_some() {
+            let mut inner = self
+                .store
+                .0
+                .lock()
+                .expect("resident bootstrap mutex poisoned");
+            inner.reserved -= 1;
+        }
+    }
+}
+
+pub(crate) struct ResidentBootstrapConsumption {
+    store: ResidentBootstrapStore,
+    id: ResidentProcessId,
+    bootstrap: Option<LiveResidentBootstrap>,
+}
+
+impl ResidentBootstrapConsumption {
+    pub(crate) fn bootstrap(&self) -> &LiveResidentBootstrap {
+        self.bootstrap
+            .as_ref()
+            .expect("resident bootstrap consumption already committed")
+    }
+
+    pub(crate) fn commit(mut self) -> LiveResidentBootstrap {
+        let bootstrap = self
+            .bootstrap
+            .take()
+            .expect("resident bootstrap consumption already committed");
+        let mut inner = self
+            .store
+            .0
+            .lock()
+            .expect("resident bootstrap mutex poisoned");
+        inner.reserved -= 1;
+        bootstrap
+    }
+}
+
+impl Drop for ResidentBootstrapConsumption {
+    fn drop(&mut self) {
+        if let Some(bootstrap) = self.bootstrap.take() {
+            let mut inner = self
+                .store
+                .0
+                .lock()
+                .expect("resident bootstrap mutex poisoned");
+            inner.reserved -= 1;
+            let previous = inner.values.insert(self.id, bootstrap);
+            debug_assert!(previous.is_none(), "resident bootstrap restored twice");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resident_bootstrap(generation: u64) -> LiveResidentBootstrap {
+        LiveResidentBootstrap {
+            content: b"secret".to_vec(),
+            sha256: "digest".into(),
+            target_file: "/run/secret".into(),
+            mode: 0o600,
+            generation,
+        }
+    }
+
+    #[test]
+    fn resident_bootstrap_reservation_holds_capacity_until_publish_or_drop() {
+        let store = ResidentBootstrapStore::with_capacity(1);
+        let reservation = store.reserve(resident_bootstrap(1)).unwrap();
+        assert!(store.reserve(resident_bootstrap(1)).is_err());
+
+        drop(reservation);
+        let reservation = store.reserve(resident_bootstrap(1)).unwrap();
+        let id = ResidentProcessId::new();
+        reservation.publish(id);
+        assert!(store.reserve(resident_bootstrap(1)).is_err());
+        assert!(store.begin_consume(&id).is_some());
+    }
+
+    #[test]
+    fn resident_bootstrap_consume_restores_on_drop_and_removes_on_commit() {
+        let store = ResidentBootstrapStore::with_capacity(1);
+        let id = ResidentProcessId::new();
+        store.reserve(resident_bootstrap(1)).unwrap().publish(id);
+
+        drop(store.begin_consume(&id).unwrap());
+        let consumption = store.begin_consume(&id).unwrap();
+        assert_eq!(consumption.bootstrap().content, b"secret");
+        consumption.commit();
+
+        assert!(store.begin_consume(&id).is_none());
+        assert!(store.reserve(resident_bootstrap(2)).is_ok());
+    }
 
     #[test]
     fn waiter_guard_removes_instance_local_nonce_on_disconnect() {
