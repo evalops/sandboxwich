@@ -19,11 +19,11 @@ use provider::{
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, ApexTaskInstructionsCallbackRequest,
     ApexTaskInstructionsCallbackResponse, ClaimLeaseRequest, ClaimLeaseResponse,
-    CompleteLeaseRequest, FailLeaseRequest, JobKind, LeaseResponse, ProvisioningOperationResponse,
-    ProvisioningStageUpdateRequest, RegisterWorkerRequest, RenewLeaseRequest,
-    RuntimeResourceInventoryResponse, SandboxProvisionSpec, WorkerCapability,
-    WorkerHeartbeatRequest, WorkerJobResult, WorkerResponse, build_api_client,
-    validate_agent_command_request,
+    CompleteLeaseRequest, FailLeaseRequest, GuestTokenResponse, JobKind, LeaseResponse,
+    MintGuestTokenRequest, ProvisioningOperationResponse, ProvisioningStageUpdateRequest,
+    RegisterWorkerRequest, RenewLeaseRequest, RuntimeResourceInventoryResponse,
+    SandboxProvisionSpec, WorkerCapability, WorkerHeartbeatRequest, WorkerJobResult,
+    WorkerResponse, build_api_client, validate_agent_command_request,
 };
 use serde_json::json;
 use sha2::Digest;
@@ -485,12 +485,29 @@ enum ProviderModeArg {
     Apply,
 }
 
+#[derive(Clone)]
 enum RuntimeProvider {
     DryRun(KubernetesDryRunProvider),
     Apply(KubernetesApplyProvider),
 }
 
 impl RuntimeProvider {
+    fn with_guest_credentials(
+        self,
+        sandbox_id: sandboxwich_core::SandboxId,
+        api: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Self {
+        match self {
+            Self::DryRun(provider) => {
+                Self::DryRun(provider.with_guest_credentials(sandbox_id, api, token))
+            }
+            Self::Apply(provider) => {
+                Self::Apply(provider.with_guest_credentials(sandbox_id, api, token))
+            }
+        }
+    }
+
     fn reconcile_orphans(
         &self,
         inventory: anyhow::Result<RuntimeResourceInventoryResponse>,
@@ -952,7 +969,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&response)?);
                 return Ok(());
             };
-            let response = handle_lease(&client, &api, lease, provider).await?;
+            let response = handle_lease(&client, &api, args.worker_id, lease, provider).await?;
             println!("{}", serde_json::to_string_pretty(&response)?);
         }
         Command::WorkLoop(args) => {
@@ -1703,7 +1720,7 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
         // happened, so not finishing it just delays the job until the lease
         // expires and gets reclaimed by another worker.
         let lease_id = lease.id;
-        let handle_future = handle_lease(client, api, lease, provider.clone());
+        let handle_future = handle_lease(client, api, args.worker_id, lease, provider.clone());
         let outcome = tokio::select! {
             result = handle_future => Some(result),
             _ = drain_watchdog(shutdown.clone(), drain_timeout) => None,
@@ -1749,11 +1766,12 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
 async fn handle_lease<P>(
     client: &reqwest::Client,
     api: &str,
+    worker_id: Uuid,
     lease: sandboxwich_core::JobLease,
     provider: Arc<P>,
 ) -> anyhow::Result<LeaseResponse>
 where
-    P: SandboxProvider + Send + Sync + 'static,
+    P: SandboxProvider + GuestCredentialProvider + Send + Sync + 'static,
 {
     let lease_id = lease.id;
 
@@ -1828,6 +1846,25 @@ where
     // blocking-pool thread so it can't stall the async runtime (and the heartbeat/
     // renewal tasks running alongside it).
     let job = lease.job.clone();
+    let provider = if job.kind == JobKind::ProvisionSandbox {
+        let sandbox_id = sandbox_id_from_payload(&job.payload)?;
+        let response = with_retries("mint guest token", API_RETRY_ATTEMPTS, || async {
+            let response = client
+                .post(format!(
+                    "{api}/workers/{worker_id}/sandboxes/{sandbox_id}/guest-token"
+                ))
+                .json(&MintGuestTokenRequest {
+                    ttl_seconds: Some(86_400),
+                })
+                .send()
+                .await?;
+            decode_json::<GuestTokenResponse>(response).await
+        })
+        .await?;
+        Arc::new(provider.with_guest_credentials(sandbox_id, api.to_string(), response.token))
+    } else {
+        provider
+    };
     let lease_attempt = lease.attempt;
     let exec_provider = provider.clone();
     let exec_cancelled = cancelled.clone();
@@ -1999,6 +2036,26 @@ where
             })
             .await
         }
+    }
+}
+
+trait GuestCredentialProvider: Sized {
+    fn with_guest_credentials(
+        &self,
+        sandbox_id: sandboxwich_core::SandboxId,
+        api: String,
+        token: String,
+    ) -> Self;
+}
+
+impl GuestCredentialProvider for RuntimeProvider {
+    fn with_guest_credentials(
+        &self,
+        sandbox_id: sandboxwich_core::SandboxId,
+        api: String,
+        token: String,
+    ) -> Self {
+        self.clone().with_guest_credentials(sandbox_id, api, token)
     }
 }
 

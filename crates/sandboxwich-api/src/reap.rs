@@ -46,6 +46,7 @@ impl ReapTrigger {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct ReapedSandbox {
     pub(crate) sandbox: Sandbox,
     pub(crate) trigger: ReapTrigger,
@@ -75,7 +76,8 @@ pub(crate) fn max_lifetime_expired(
 }
 
 /// Pure "is `idle_ttl_seconds` past due" check given an already-resolved
-/// last-activity timestamp; see [`last_known_activity`] for what feeds this.
+/// last-activity timestamp; see [`resolve_last_activity`] for what feeds
+/// this.
 pub(crate) fn idle_ttl_expired(
     last_activity_at: DateTime<Utc>,
     idle_ttl_seconds: u64,
@@ -101,51 +103,156 @@ fn reapable_states() -> Vec<&'static str> {
         .collect()
 }
 
-/// Best-known "last activity" signal for idle-TTL purposes: the more recent
-/// of the sandbox's own last lifecycle-state transition (`updated_at`) and
-/// its most recently *queued* guest command (`commands.created_at`). This is
-/// a real, recorded timestamp, not a guess -- but it is not a complete
-/// activity signal. SSH sessions, desktop sessions, and resident-process
-/// output do not currently touch either column, so a sandbox used
-/// exclusively through those surfaces can still be reaped as idle. See
-/// `docs/capabilities.md` for this documented as a known limitation rather
-/// than silently overclaiming true idle detection.
-async fn last_known_activity(db: &Database, sandbox: &Sandbox) -> Result<DateTime<Utc>, ApiError> {
-    let sql = format!(
-        "select max(created_at) as last_command_at from commands where sandbox_id = {}",
-        db.placeholder(1)
-    );
-    let row = sqlx::query(&sql)
-        .bind(sandbox.id.to_string())
-        .fetch_one(&db.pool)
-        .await?;
-    let last_command_at: Option<String> = row.try_get("last_command_at")?;
-    let last_command_at = last_command_at
-        .map(|value| parse_timestamp(&value))
-        .transpose()?;
-    Ok(match last_command_at {
-        Some(value) if value > sandbox.updated_at => value,
-        _ => sandbox.updated_at,
-    })
+/// Best-known "last activity" signal for idle-TTL purposes: the most recent
+/// of --
+/// - the sandbox's own last lifecycle-state transition (`updated_at`),
+/// - its most recently *queued* guest command (`commands.created_at`, passed
+///   in as `last_command_at` -- see [`reap_expired_active_sandboxes`], which
+///   resolves it for every candidate in the same query as the candidates
+///   themselves, rather than one `select max(created_at) ...` per sandbox),
+///   and
+/// - `sandbox.last_activity_at`, bumped (throttled -- see `activity.rs`) by
+///   SSH access, desktop access, and resident-process observation requests.
+///
+/// All three are real, recorded timestamps, not guesses; taking the maximum
+/// of whichever are present is monotonic-safe (the idle clock only ever
+/// resets forward) and degrades gracefully for a sandbox that predates the
+/// `last_activity_at` column, or that has simply never been touched through
+/// SSH/desktop/resident-process surfaces: it just doesn't contribute, and
+/// the two pre-existing signals still apply exactly as before. See
+/// `docs/capabilities.md` for the full list of what does and doesn't bump
+/// `last_activity_at` today.
+fn resolve_last_activity(
+    updated_at: DateTime<Utc>,
+    last_command_at: Option<DateTime<Utc>>,
+    last_activity_at: Option<DateTime<Utc>>,
+) -> DateTime<Utc> {
+    [Some(updated_at), last_command_at, last_activity_at]
+        .into_iter()
+        .flatten()
+        .max()
+        .expect("updated_at is always Some, so this iterator is never empty")
 }
 
-async fn expired_deadline(
-    db: &Database,
+/// Pure deadline check for one candidate, given its already-resolved
+/// `last_command_at` (see [`resolve_last_activity`]). No longer touches the
+/// database itself -- see [`reap_expired_active_sandboxes`] for why.
+fn expired_deadline(
     sandbox: &Sandbox,
+    last_command_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
-) -> Result<Option<(ReapTrigger, DateTime<Utc>)>, ApiError> {
+) -> Option<(ReapTrigger, DateTime<Utc>)> {
     if let Some(max_lifetime_seconds) = sandbox.max_lifetime_seconds
         && let Some(deadline) = max_lifetime_expired(sandbox.created_at, max_lifetime_seconds, now)
     {
-        return Ok(Some((ReapTrigger::MaxLifetime, deadline)));
+        return Some((ReapTrigger::MaxLifetime, deadline));
     }
     if let Some(idle_ttl_seconds) = sandbox.idle_ttl_seconds {
-        let last_activity_at = last_known_activity(db, sandbox).await?;
+        let last_activity_at = resolve_last_activity(
+            sandbox.updated_at,
+            last_command_at,
+            sandbox.last_activity_at,
+        );
         if let Some(deadline) = idle_ttl_expired(last_activity_at, idle_ttl_seconds, now) {
-            return Ok(Some((ReapTrigger::IdleTtl, deadline)));
+            return Some((ReapTrigger::IdleTtl, deadline));
         }
     }
-    Ok(None)
+    None
+}
+
+/// Outcome of attempting to reap one candidate sandbox. A distinct enum
+/// (rather than folding everything into `Option<ReapedSandbox>`) so tests
+/// can assert on exactly which branch [`attempt_reap_candidate`] took --
+/// in particular [`CandidateOutcome::Skipped`], which is returned from the
+/// *same* match arm that emits the "reap skipped" log line, making the
+/// returned variant a reliable stand-in for "that log fired" without
+/// needing a tracing-capture test harness this codebase has no other use
+/// for.
+#[derive(Debug)]
+pub(crate) enum CandidateOutcome {
+    /// Not past either deadline; nothing to do.
+    NotDue,
+    /// Past a deadline and successfully driven into `Archiving`. Boxed
+    /// because `ReapedSandbox` embeds a full `Sandbox`, which otherwise
+    /// makes this the dominant, size-setting variant of the enum for every
+    /// caller regardless of which variant they actually get back.
+    Reaped(Box<ReapedSandbox>),
+    /// Past a deadline, but a concurrent actor (a manual stop, or another
+    /// sweep tick) already moved the sandbox out of `STOP_LEGAL_FROM` by the
+    /// time `stop_sandbox_via_job`'s CAS ran.
+    Skipped,
+    /// `stop_sandbox_via_job` itself failed (already logged here).
+    Failed,
+}
+
+/// Attempts to reap one candidate sandbox (already fetched by the caller --
+/// see [`reap_expired_active_sandboxes`]), driving it through
+/// [`stop_sandbox_via_job`] if it's past a deadline. Split out from the
+/// sweep loop so a test can exercise the CAS-miss race deterministically: by
+/// calling this directly with a candidate snapshot fetched *before* a
+/// concurrent stop won the race, instead of relying on real timing.
+/// `last_command_at` is the candidate's most recently queued command, which
+/// the sweep query resolves for every candidate in the same `select` (see
+/// [`reap_expired_active_sandboxes`]) rather than per-row here.
+pub(crate) async fn attempt_reap_candidate(
+    db: &Database,
+    mut sandbox: Sandbox,
+    last_command_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Result<CandidateOutcome, ApiError> {
+    hydrate_sandbox_network_egress(db, &mut sandbox).await?;
+    let Some((trigger, deadline)) = expired_deadline(&sandbox, last_command_at, now) else {
+        return Ok(CandidateOutcome::NotDue);
+    };
+    let stop = stop_sandbox_via_job(
+        db,
+        &sandbox,
+        json!({
+            "state": SandboxState::Archiving,
+            "reason": trigger.reason(),
+            "deadline": deadline,
+            "triggeredBy": "expiry_sweeper",
+        }),
+    )
+    .await;
+    Ok(match stop {
+        Ok(Some(_job)) => {
+            sandbox.state = SandboxState::Archiving;
+            CandidateOutcome::Reaped(Box::new(ReapedSandbox {
+                sandbox,
+                trigger,
+                deadline,
+            }))
+        }
+        Ok(None) => {
+            // Selected as a candidate by the caller's query, but by the time
+            // `stop_sandbox_via_job`'s own CAS ran, a concurrent actor (a
+            // manual stop, or another sweep tick racing this one) had
+            // already moved the sandbox out of `STOP_LEGAL_FROM`. Not a
+            // failure -- the sandbox is already being (or already was)
+            // stopped, which is the outcome this sweep wants; there is just
+            // nothing left for *this* attempt to do. Logged separately from
+            // a successful reap (and from the error branch below) so
+            // "reaped" in a log search means a reap this sweep actually
+            // drove, not one it merely observed.
+            tracing::info!(
+                sandbox_id = %sandbox.id,
+                reason = trigger.reason(),
+                "reap skipped: sandbox concurrently transitioned out of a stoppable \
+                 state before this sweep's stop attempt landed"
+            );
+            CandidateOutcome::Skipped
+        }
+        Err(error) => {
+            tracing::warn!(
+                sandbox_id = %sandbox.id,
+                reason = trigger.reason(),
+                ?error,
+                "failed to reap sandbox past its active-lifetime deadline"
+            );
+            CandidateOutcome::Failed
+        }
+    })
 }
 
 /// Finds every reapable-state sandbox with a `max_lifetime_seconds` and/or
@@ -155,16 +262,25 @@ async fn expired_deadline(
 /// session sweeps; a per-sandbox failure is logged and skipped rather than
 /// aborting the rest of the sweep, matching how `cleanup_archived_sandboxes`
 /// treats per-row failures.
+///
+/// Resolves each candidate's most recently queued command via a correlated
+/// scalar subquery in this same `select`, instead of issuing a separate
+/// `select max(created_at) from commands where sandbox_id = ?` per
+/// candidate after the fact (see evalops/sandboxwich#173): one round trip
+/// per sweep tick regardless of how many sandboxes have `idle_ttl_seconds`
+/// configured, portable across both the SQLite and Postgres backends since
+/// a correlated scalar subquery is standard SQL on both.
 pub(crate) async fn reap_expired_active_sandboxes(
     db: &Database,
 ) -> Result<Vec<ReapedSandbox>, ApiError> {
     let reapable = reapable_states();
     let sql = format!(
-        "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
-                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, parent_snapshot_id
-         from sandboxes
-         where state in ({}) and (max_lifetime_seconds is not null or idle_ttl_seconds is not null)
-         order by created_at asc, id asc",
+        "select s.id, s.tenant_id, s.name, s.state, s.template, s.memory_limit, s.network_egress_mode, s.workspace_mode, s.runtime_profile, s.execution_class,
+                s.created_at, s.updated_at, s.ttl_seconds, s.max_lifetime_seconds, s.idle_ttl_seconds, s.last_activity_at, s.parent_snapshot_id,
+                (select max(c.created_at) from commands c where c.sandbox_id = s.id) as last_command_at
+         from sandboxes s
+         where s.state in ({}) and (s.max_lifetime_seconds is not null or s.idle_ttl_seconds is not null)
+         order by s.created_at asc, s.id asc",
         sql_literal_list(&reapable)
     );
     let rows = sqlx::query(&sql).fetch_all(&db.pool).await?;
@@ -172,39 +288,19 @@ pub(crate) async fn reap_expired_active_sandboxes(
     let now = Utc::now();
     let mut reaped = Vec::new();
     for row in rows {
-        let mut sandbox = row_to_sandbox(row)?;
-        hydrate_sandbox_network_egress(db, &mut sandbox).await?;
-        let Some((trigger, deadline)) = expired_deadline(db, &sandbox, now).await? else {
-            continue;
-        };
-        let stop = stop_sandbox_via_job(
-            db,
-            &sandbox,
-            json!({
-                "state": SandboxState::Archiving,
-                "reason": trigger.reason(),
-                "deadline": deadline,
-                "triggeredBy": "expiry_sweeper",
-            }),
-        )
-        .await;
-        match stop {
-            Ok(_job) => {
-                sandbox.state = SandboxState::Archiving;
-                reaped.push(ReapedSandbox {
-                    sandbox,
-                    trigger,
-                    deadline,
-                });
-            }
-            Err(error) => {
-                tracing::warn!(
-                    sandbox_id = %sandbox.id,
-                    trigger = trigger.reason(),
-                    ?error,
-                    "failed to reap sandbox past its active-lifetime deadline"
-                );
-            }
+        // Read the joined-in column before `row_to_sandbox` consumes `row`
+        // by value; `try_get` only borrows, so this ordering is safe and
+        // `row_to_sandbox` itself doesn't need to know this extra column
+        // exists (it only looks up the specific columns it needs by name).
+        let last_command_at: Option<String> = row.try_get("last_command_at")?;
+        let last_command_at = last_command_at
+            .map(|value| parse_timestamp(&value))
+            .transpose()?;
+        let sandbox = row_to_sandbox(row)?;
+        if let CandidateOutcome::Reaped(reaped_sandbox) =
+            attempt_reap_candidate(db, sandbox, last_command_at, now).await?
+        {
+            reaped.push(*reaped_sandbox);
         }
     }
     Ok(reaped)
