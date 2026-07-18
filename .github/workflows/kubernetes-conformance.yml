@@ -29,23 +29,15 @@ jobs:
           sudo install -m 0755 kind /usr/local/bin/kind
       - name: Build conformance binaries and images
         run: |
+          # This debug binary runs directly on the runner (see
+          # deploy/kubernetes/kind-conformance.sh's provider-apply-plan step)
+          # rather than in a container, so it can't come from any of the
+          # (glibc-mismatched, --release) image builds below.
           cargo build -p sandboxwich-worker
-          docker buildx build --load --build-arg BIN=sandboxwich-api \
-            --cache-from type=gha,scope=kind-api \
-            --cache-to type=gha,mode=max,scope=kind-api \
-            -t sandboxwich-api:conformance .
-          docker buildx build --load --build-arg BIN=sandboxwich-worker \
-            --cache-from type=gha,scope=kind-worker \
-            --cache-to type=gha,mode=max,scope=kind-worker \
-            -t sandboxwich-worker:conformance .
-          docker buildx build --load \
-            --cache-from type=gha,scope=kind-runtime \
-            --cache-to type=gha,mode=max,scope=kind-runtime \
-            -t sandboxwich-runtime:conformance deploy/runtime/ubuntu-dev
-          docker buildx build --load -f deploy/kubernetes/postgres.Dockerfile \
-            --cache-from type=gha,scope=kind-postgres \
-            --cache-to type=gha,mode=max,scope=kind-postgres \
-            -t postgres:conformance .
+          # All four conformance images build concurrently from one bake
+          # invocation; see deploy/kubernetes/kind-bake.hcl for the shared
+          # builder-stage and cache-scope rationale.
+          docker buildx bake --load --file deploy/kubernetes/kind-bake.hcl
           # kind imports the completed images into containerd, temporarily storing a
           # second copy of every layer. The intermediate BuildKit cache is no longer
           # needed after these builds and can exhaust the runner during that import.

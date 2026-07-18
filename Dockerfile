@@ -19,8 +19,27 @@ COPY crates ./crates
 RUN cargo build --release -p "${BIN}" \
     && cp "target/release/${BIN}" /usr/local/bin/sandboxwich
 
+# Shared multi-binary builder used ONLY by the kind conformance workflow
+# (.github/workflows/kubernetes-conformance.yml), which builds the api and
+# worker images back-to-back on a single runner. That workflow builds this
+# stage's two sibling runtime images (see `runtime-shared` below) via a
+# single `docker buildx bake` invocation; because this stage's instructions
+# never vary with BIN, BuildKit resolves it once per bake invocation and
+# shares the result between both images instead of compiling the workspace
+# twice. containers.yml does NOT use this stage -- each service image there
+# is still an independent native per-arch job built from `builder`/`runtime`
+# above, unchanged.
+FROM mirror.gcr.io/library/rust:1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS builder-shared
+
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+RUN cargo build --release -p sandboxwich-api -p sandboxwich-worker
+
 # debian:bookworm-slim, see digest-refresh instructions above.
-FROM mirror.gcr.io/library/debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df AS runtime
+FROM mirror.gcr.io/library/debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df AS runtime-base
 
 ARG KUBECTL_VERSION=v1.34.7
 ARG TARGETARCH
@@ -52,6 +71,28 @@ RUN apt-get update \
 # (slightly larger image / one more binary in the runtime image) for a working
 # container-level health signal; the sandbox guest image is the one that
 # should stay minimal, not this control-plane image.
+
+# `runtime-shared`: same runtime-base image, but its binary comes from the
+# shared multi-binary `builder-shared` stage above (kind workflow only; see
+# comment there). Selecting the file by ARG BIN out of the already-compiled
+# target/release/ directory is a plain COPY source substitution, not a
+# stage-name selection, so it needs no special Dockerfile syntax.
+FROM runtime-base AS runtime-shared
+
+COPY --from=builder-shared /src/target/release/${BIN} /usr/local/bin/sandboxwich
+
+USER 65532:65532
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["/bin/sh", "-c", "[ \"$SANDBOXWICH_BIN\" != sandboxwich-api ] || curl -fsS http://127.0.0.1:3217/healthz"]
+
+ENTRYPOINT ["/usr/local/bin/sandboxwich"]
+
+# `runtime`: containers.yml's image, byte-for-byte the same as before this
+# refactor -- it must stay the LAST stage in this file so build invocations
+# that omit --target (containers.yml's docker/build-push-action steps) keep
+# resolving to it by BuildKit's implicit default-last-stage behavior.
+FROM runtime-base AS runtime
 
 COPY --from=builder /usr/local/bin/sandboxwich /usr/local/bin/sandboxwich
 
