@@ -666,18 +666,8 @@ pub(crate) async fn fetch_guest_health(
 
 pub(crate) fn guest_supports_uid_isolated_resident_process(health: &GuestHealth) -> bool {
     health.status == GuestStatus::Ready
-        && health
-            .checks
-            .get("uidIsolatedResidentProcess")
-            .and_then(|check| check.get("status"))
-            .and_then(serde_json::Value::as_str)
-            == Some("ok")
-        && health
-            .checks
-            .get("uidIsolatedResidentProcess")
-            .and_then(|check| check.get("version"))
-            .and_then(serde_json::Value::as_u64)
-            .is_some_and(|version| version >= 1)
+        && GuestAgentCapabilityReport::from_health_checks(&health.checks)
+            .is_some_and(|report| report.supports_uid_isolated_resident_process())
 }
 
 pub(crate) async fn upsert_guest_health(

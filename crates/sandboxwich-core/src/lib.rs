@@ -2894,6 +2894,81 @@ pub enum GuestStatus {
 }
 }
 
+/// Key reserved inside the extensible guest-health `checks` object for the
+/// typed agent capability protocol. Other health checks remain unconstrained
+/// and backward compatible.
+pub const GUEST_AGENT_CAPABILITY_REPORT_CHECK: &str = "agentCapabilities";
+/// Capability-report protocol understood by this control plane.
+pub const GUEST_AGENT_CAPABILITY_PROTOCOL_VERSION: u32 = 1;
+/// Contract version understood for UID-isolated resident processes.
+pub const UID_ISOLATED_RESIDENT_PROCESS_CAPABILITY_VERSION: u32 = 1;
+
+/// Versioned capability advertisement embedded in guest-health checks.
+///
+/// Keeping this report under a reserved key preserves the existing generic
+/// health-check wire format while moving authorization-sensitive capability
+/// decisions onto a typed contract.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestAgentCapabilityReport {
+    pub protocol_version: u32,
+    pub capabilities: GuestAgentCapabilities,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestAgentCapabilities {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid_isolated_resident_process: Option<GuestAgentCapability>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestAgentCapability {
+    pub status: GuestAgentCapabilityStatus,
+    pub version: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuestAgentCapabilityStatus {
+    Ok,
+    Unavailable,
+}
+
+impl GuestAgentCapabilityReport {
+    pub fn current() -> Self {
+        Self {
+            protocol_version: GUEST_AGENT_CAPABILITY_PROTOCOL_VERSION,
+            capabilities: GuestAgentCapabilities {
+                uid_isolated_resident_process: Some(GuestAgentCapability {
+                    status: GuestAgentCapabilityStatus::Ok,
+                    version: UID_ISOLATED_RESIDENT_PROCESS_CAPABILITY_VERSION,
+                }),
+            },
+        }
+    }
+
+    /// Parses only the reserved capability report. Invalid or future reports
+    /// remain available in `checks` to generic clients but return `None` here,
+    /// ensuring authorization-sensitive callers fail closed.
+    pub fn from_health_checks(checks: &serde_json::Value) -> Option<Self> {
+        serde_json::from_value(checks.get(GUEST_AGENT_CAPABILITY_REPORT_CHECK)?.clone()).ok()
+    }
+
+    pub fn supports_uid_isolated_resident_process(&self) -> bool {
+        self.protocol_version == GUEST_AGENT_CAPABILITY_PROTOCOL_VERSION
+            && self
+                .capabilities
+                .uid_isolated_resident_process
+                .as_ref()
+                .is_some_and(|capability| {
+                    capability.status == GuestAgentCapabilityStatus::Ok
+                        && capability.version == UID_ISOLATED_RESIDENT_PROCESS_CAPABILITY_VERSION
+                })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GuestHealth {
     pub sandbox_id: SandboxId,
@@ -2967,6 +3042,59 @@ pub struct SshKeyListResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_agent_capability_report_is_typed_without_consuming_generic_checks() {
+        let checks = serde_json::json!({
+            "exec": {"status": "ok"},
+            "agentCapabilities": {
+                "protocolVersion": 1,
+                "capabilities": {
+                    "uidIsolatedResidentProcess": {"status": "ok", "version": 1}
+                }
+            }
+        });
+
+        let report = GuestAgentCapabilityReport::from_health_checks(&checks)
+            .expect("the current typed capability report should decode");
+        assert!(report.supports_uid_isolated_resident_process());
+        assert_eq!(checks["exec"]["status"], "ok");
+    }
+
+    #[test]
+    fn guest_agent_capability_report_fails_closed_for_missing_or_unknown_versions() {
+        for report in [
+            serde_json::json!({
+                "capabilities": {
+                    "uidIsolatedResidentProcess": {"status": "ok", "version": 1}
+                }
+            }),
+            serde_json::json!({
+                "protocolVersion": 2,
+                "capabilities": {
+                    "uidIsolatedResidentProcess": {"status": "ok", "version": 1}
+                }
+            }),
+            serde_json::json!({
+                "protocolVersion": 1,
+                "capabilities": {
+                    "uidIsolatedResidentProcess": {"status": "ok"}
+                }
+            }),
+            serde_json::json!({
+                "protocolVersion": 1,
+                "capabilities": {
+                    "uidIsolatedResidentProcess": {"status": "ok", "version": 2}
+                }
+            }),
+        ] {
+            let checks = serde_json::json!({"agentCapabilities": report});
+            assert!(
+                !GuestAgentCapabilityReport::from_health_checks(&checks)
+                    .is_some_and(|report| report.supports_uid_isolated_resident_process())
+            );
+        }
+    }
 
     #[test]
     fn materialization_destinations_are_closed_and_keep_grader_bundle_outside_input() {

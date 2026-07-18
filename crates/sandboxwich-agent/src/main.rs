@@ -23,7 +23,8 @@ use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, AgentFileReadResponse, AgentFileWriteRequest,
     AgentHealthResponse, AppendCommandOutputRequest, ClaimLeaseRequest, ClaimLeaseResponse,
     CommandOutputStream, CompleteLeaseRequest, DEFAULT_COMMAND_TIMEOUT_SECS, FailLeaseRequest,
-    GuestStatus, GuestTokenResponse, JobKind, LeaseId, LeaseResponse, MintGuestTokenRequest,
+    GUEST_AGENT_CAPABILITY_REPORT_CHECK, GuestAgentCapabilityReport, GuestStatus,
+    GuestTokenResponse, JobKind, LeaseId, LeaseResponse, MintGuestTokenRequest,
     ORB_EXECUTOR_RESIDENT_PROCESS_NAME, RenewLeaseRequest, ResidentProcessBootstrapReadRequest,
     ResidentProcessBootstrapReadResponse, ResidentProcessId, ResidentProcessObservationRequest,
     ResidentProcessObservedState, ResidentProcessRestartPolicy, SandboxId,
@@ -1822,16 +1823,24 @@ async fn post_guest_health(
     status: GuestStatus,
     message: Option<String>,
 ) -> Result<(), AgentRequestError> {
+    let mut checks = serde_json::json!({
+        "exec": {"status": "ok"},
+        "files": {"status": "ok"}
+    });
+    checks
+        .as_object_mut()
+        .expect("guest health checks are constructed as an object")
+        .insert(
+            GUEST_AGENT_CAPABILITY_REPORT_CHECK.to_string(),
+            serde_json::to_value(GuestAgentCapabilityReport::current())
+                .map_err(AgentRequestError::Decode)?,
+        );
     let response = client
         .post(format!("{api}/sandboxes/{sandbox_id}/guest-health"))
         .json(&UpdateGuestHealthRequest {
             status,
             agent_version: Some(agent_version()),
-            checks: Some(serde_json::json!({
-                "exec": {"status": "ok"},
-                "files": {"status": "ok"},
-                "uidIsolatedResidentProcess": {"status": "ok", "version": 1}
-            })),
+            checks: Some(checks),
             message,
         })
         .send()

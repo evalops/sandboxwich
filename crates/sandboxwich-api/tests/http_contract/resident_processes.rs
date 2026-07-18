@@ -136,7 +136,7 @@ async fn provisioned_sandbox_with_guest(
             status: GuestStatus::Ready,
             agent_version: Some("sandboxwich-agent/test".into()),
             checks: Some(serde_json::json!({
-                "uidIsolatedResidentProcess": {"status": "ok", "version": 1}
+                (GUEST_AGENT_CAPABILITY_REPORT_CHECK): GuestAgentCapabilityReport::current()
             })),
             message: None,
         })
@@ -600,6 +600,49 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
         unsupported_agent.status(),
         reqwest::StatusCode::SERVICE_UNAVAILABLE
     );
+    for unsupported_report in [
+        serde_json::json!({
+            "protocolVersion": 2,
+            "capabilities": {
+                "uidIsolatedResidentProcess": {"status": "ok", "version": 1}
+            }
+        }),
+        serde_json::json!({
+            "protocolVersion": 1,
+            "capabilities": {
+                "uidIsolatedResidentProcess": {"status": "ok", "version": 2}
+            }
+        }),
+    ] {
+        guest_client
+            .post(format!(
+                "{}/sandboxes/{sandbox_id}/guest-health",
+                server.base_url
+            ))
+            .json(&UpdateGuestHealthRequest {
+                status: GuestStatus::Ready,
+                agent_version: Some("sandboxwich-agent/future".into()),
+                checks: Some(serde_json::json!({
+                    (GUEST_AGENT_CAPABILITY_REPORT_CHECK): unsupported_report
+                })),
+                message: None,
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let unsupported_agent = client
+            .put(&sidecar_url)
+            .json(&sidecar_request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            unsupported_agent.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
     guest_client
         .post(format!(
             "{}/sandboxes/{sandbox_id}/guest-health",
@@ -609,7 +652,7 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
             status: GuestStatus::Ready,
             agent_version: Some("sandboxwich-agent/current".into()),
             checks: Some(serde_json::json!({
-                "uidIsolatedResidentProcess": {"status": "ok", "version": 1}
+                (GUEST_AGENT_CAPABILITY_REPORT_CHECK): GuestAgentCapabilityReport::current()
             })),
             message: None,
         })
@@ -730,7 +773,7 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
             status: GuestStatus::Ready,
             agent_version: Some("sandboxwich-agent/current".into()),
             checks: Some(serde_json::json!({
-                "uidIsolatedResidentProcess": {"status": "ok", "version": 1}
+                (GUEST_AGENT_CAPABILITY_REPORT_CHECK): GuestAgentCapabilityReport::current()
             })),
             message: None,
         })
