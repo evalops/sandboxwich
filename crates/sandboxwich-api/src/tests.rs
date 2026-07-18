@@ -784,7 +784,7 @@ fn looks_like_cidr_rejects_garbage_and_out_of_range_prefixes() {
 #[test]
 fn db_enum_fingerprint_is_versioned_and_stable_for_current_registry() {
     let fingerprint = db_enum_schema_fingerprint();
-    assert!(fingerprint.starts_with("db-enum-v5:"));
+    assert!(fingerprint.starts_with("db-enum-v6:"));
     assert_eq!(fingerprint, db_enum_schema_fingerprint());
 }
 
@@ -2113,6 +2113,148 @@ async fn cleanup_archived_sandboxes_never_deletes_a_sandbox_with_a_live_restore_
         still_present.is_ok(),
         "the sandbox row must survive when the reference check inside the delete transaction \
          finds a reference"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_insert_rejects_a_nonexistent_parent_snapshot_id() {
+    // The `sandboxes.parent_snapshot_id -> snapshot_restore_sources(snapshot_id)`
+    // foreign key (see `sqlite_rebuild_sandboxes_with_parent_snapshot_fk` /
+    // `ensure_sqlite_constraints` in `db.rs`) must reject an insert that
+    // points at a snapshot that was never created, through the same
+    // `insert_sandbox` path every handler uses -- not just a raw SQL
+    // statement issued directly against the pool.
+    let db = test_sqlite_db().await;
+    let now = Utc::now();
+    let sandbox = Sandbox {
+        workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
+        id: SandboxId::new(),
+        tenant_id: "default".to_string(),
+        name: "dangling-parent-snapshot".to_string(),
+        state: SandboxState::Planning,
+        template: "default".to_string(),
+        memory_limit: MemoryLimit::default(),
+        network_egress: NetworkEgress::default(),
+        runtime_profile: SandboxRuntimeProfile::default(),
+        execution_class: ExecutionClass::default(),
+        created_at: now,
+        updated_at: now,
+        ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
+        parent_snapshot_id: Some(SnapshotId::new()),
+    };
+
+    let result = insert_sandbox(&db, &sandbox).await;
+    assert!(
+        result.is_err(),
+        "inserting a sandbox with a parent_snapshot_id pointing at a nonexistent snapshot must fail"
+    );
+
+    let missing = fetch_sandbox(&db, sandbox.id).await;
+    assert!(
+        missing.is_err(),
+        "the rejected insert must not leave a partial sandbox row behind"
+    );
+}
+
+#[tokio::test]
+async fn parent_snapshot_fk_migration_nulls_pre_existing_orphans_before_enforcing() {
+    // Simulates upgrading a database that predates the
+    // `sandboxes.parent_snapshot_id -> snapshot_restore_sources(snapshot_id)`
+    // foreign key and already has a row whose `parent_snapshot_id` points at
+    // nothing -- the column only ever had an index
+    // (20260704000500_snapshots.sql), so nothing ever stopped that from
+    // happening. The migration added alongside the FK
+    // (20260716000400_sandbox_parent_snapshot_fk.sql) must null those out
+    // before `ensure_sqlite_constraints` starts enforcing the constraint, or
+    // the upgrade itself would fail applying to real, already-drifted data.
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+
+    const FK_MIGRATION_VERSION: i64 = 20260716000400;
+    let mut migrations: Vec<_> = sqlx::migrate!("./migrations").iter().cloned().collect();
+    migrations.sort_by_key(|migration| migration.version);
+
+    for migration in migrations
+        .iter()
+        .filter(|m| m.version < FK_MIGRATION_VERSION)
+    {
+        sqlx::raw_sql(&migration.sql)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("apply migration {}: {error}", migration.version));
+    }
+
+    let now = Utc::now().to_rfc3339();
+    let orphan_sandbox_id = Uuid::now_v7().to_string();
+    let dangling_snapshot_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "insert into sandboxes
+            (id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id,
+             tenant_id, memory_limit, network_egress_mode, workspace_mode)
+         values (?, 'orphaned', 'ready', 'default', ?, ?, NULL, ?, 'default', '1g', 'deny_all', 'persistent')",
+    )
+    .bind(&orphan_sandbox_id)
+    .bind(&now)
+    .bind(&now)
+    .bind(&dangling_snapshot_id)
+    .execute(&pool)
+    .await
+    .expect("seed a pre-existing orphan sandbox row (no FK exists at this schema version yet)");
+
+    for migration in migrations
+        .iter()
+        .filter(|m| m.version >= FK_MIGRATION_VERSION)
+    {
+        sqlx::raw_sql(&migration.sql)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("apply migration {}: {error}", migration.version));
+    }
+
+    let db = Database {
+        pool,
+        dialect: SqlDialect::Sqlite,
+    };
+    ensure_database_constraints(&db)
+        .await
+        .expect("reconcile constraints, including the new parent_snapshot_id foreign key");
+
+    let parent_snapshot_id: Option<String> =
+        sqlx::query("select parent_snapshot_id from sandboxes where id = ?")
+            .bind(&orphan_sandbox_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("fetch orphan sandbox row")
+            .try_get("parent_snapshot_id")
+            .expect("read parent_snapshot_id");
+    assert_eq!(
+        parent_snapshot_id, None,
+        "the orphan-cleanup migration must null out a parent_snapshot_id with no matching snapshot"
+    );
+
+    // With the orphan cleaned up and the FK now enforced, a fresh insert
+    // pointing at the same nonexistent snapshot id must be rejected.
+    let result = sqlx::query(
+        "insert into sandboxes
+            (id, name, state, template, created_at, updated_at, ttl_seconds, parent_snapshot_id,
+             tenant_id, memory_limit, network_egress_mode, workspace_mode)
+         values (?, 'still-dangling', 'ready', 'default', ?, ?, NULL, ?, 'default', '1g', 'deny_all', 'persistent')",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(&now)
+    .bind(&now)
+    .bind(&dangling_snapshot_id)
+    .execute(&db.pool)
+    .await;
+    assert!(
+        result.is_err(),
+        "the foreign key must reject the same dangling snapshot id post-upgrade"
     );
 }
 
