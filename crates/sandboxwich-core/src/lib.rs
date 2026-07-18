@@ -1634,6 +1634,8 @@ pub enum SandboxEventKind {
     DesktopClosed => "desktop_closed",
     DesktopExpired => "desktop_expired",
     GuestHealthFailed => "guest_health_failed",
+    SidecarBootstrapBlocked => "sidecar_bootstrap_blocked",
+    ResidentProcessTerminalFailure => "resident_process_terminal_failure",
     FileUploaded => "file_uploaded",
     FileMaterialized => "file_materialized",
     DivergenceDetected => "divergence_detected",

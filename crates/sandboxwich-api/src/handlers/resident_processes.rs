@@ -2,8 +2,9 @@ use crate::activity::bump_sandbox_activity_best_effort;
 use crate::auth::{ensure_resident_lease_scope, ensure_sandbox_tenant};
 use crate::db::Database;
 use crate::error::ApiError;
+use crate::handlers::commands::insert_event;
 use crate::handlers::jobs::{add_provision_spec_to_payload, insert_job_on_connection};
-use crate::rows::row_to_resident_process;
+use crate::rows::{parse_timestamp, row_to_resident_process};
 use crate::state::{
     AppState, LiveResidentBootstrap, Principal, ResidentBootstrapDeliveryError,
     ResidentBootstrapFence, TenantContext,
@@ -21,6 +22,60 @@ use sqlx::Row;
 use std::convert::Infallible;
 use std::time::Duration;
 use uuid::Uuid;
+
+#[derive(Clone, Copy)]
+enum SidecarBootstrapBlockReason {
+    NotRunning,
+    NoActiveLease,
+    InactiveLease,
+    ExpiredLease,
+}
+
+impl SidecarBootstrapBlockReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRunning => "not_running",
+            Self::NoActiveLease => "no_active_lease",
+            Self::InactiveLease => "inactive_lease",
+            Self::ExpiredLease => "expired_lease",
+        }
+    }
+}
+
+async fn block_executor_bootstrap(
+    db: &Database,
+    sidecar: &ResidentProcess,
+    reason: SidecarBootstrapBlockReason,
+    message: String,
+) -> Result<(), ApiError> {
+    if let Err(error) = insert_event(
+        db,
+        sidecar.sandbox_id,
+        SandboxEventKind::SidecarBootstrapBlocked,
+        json!({
+            "reason": reason.as_str(),
+            "processName": ORB_SIDECAR_RESIDENT_PROCESS_NAME,
+            "generation": sidecar.generation,
+        }),
+    )
+    .await
+    {
+        // Telemetry cannot weaken the fail-closed boundary: preserve the
+        // original 503 even when the durable event sink is unavailable.
+        tracing::warn!(
+            ?error,
+            reason = reason.as_str(),
+            process_name = ORB_SIDECAR_RESIDENT_PROCESS_NAME,
+            generation = sidecar.generation,
+            "failed to persist sidecar bootstrap block event"
+        );
+    }
+    Err(ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "resident_sidecar_unavailable",
+        message,
+    })
+}
 
 async fn fetch_named_resident_process(
     db: &Database,
@@ -104,44 +159,61 @@ async fn ensure_sidecar_ready_if_required(
         return Ok(());
     }
     if sidecar.observed_state != ResidentProcessObservedState::Running {
-        return Err(ApiError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "resident_sidecar_unavailable",
-            message: format!(
+        return block_executor_bootstrap(
+            db,
+            &sidecar,
+            SidecarBootstrapBlockReason::NotRunning,
+            format!(
                 "sandbox {sandbox_id} requires an orb-sidecar resident process but it is {:?}, \
                  not running; refusing to hand out the orb-executor bootstrap credential",
                 sidecar.observed_state
             ),
-        });
+        )
+        .await;
     }
     let Some(active_lease_id) = sidecar.active_lease_id else {
-        return Err(ApiError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "resident_sidecar_unavailable",
-            message: format!(
+        return block_executor_bootstrap(
+            db,
+            &sidecar,
+            SidecarBootstrapBlockReason::NoActiveLease,
+            format!(
                 "sandbox {sandbox_id} requires an orb-sidecar resident process but its running observation has no active lease; refusing to hand out the orb-executor bootstrap credential"
             ),
-        });
+        )
+        .await;
     };
     let sql = format!(
-        "select 1 from job_leases where id = {} and status = 'active' and expires_at > {}",
-        db.placeholder(1),
-        db.placeholder(2)
+        "select status, expires_at from job_leases where id = {}",
+        db.placeholder(1)
     );
-    let lease_is_live = sqlx::query(&sql)
+    let lease = sqlx::query(&sql)
         .bind(active_lease_id.to_string())
-        .bind(Utc::now().to_rfc3339())
         .fetch_optional(&db.pool)
-        .await?
-        .is_some();
-    if !lease_is_live {
-        return Err(ApiError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "resident_sidecar_unavailable",
-            message: format!(
+        .await?;
+    let reason = match lease {
+        None => Some(SidecarBootstrapBlockReason::InactiveLease),
+        Some(row) => {
+            let status: String = row.try_get("status")?;
+            let expires_at: String = row.try_get("expires_at")?;
+            if status != LeaseStatus::Active.as_db_str() {
+                Some(SidecarBootstrapBlockReason::InactiveLease)
+            } else if parse_timestamp(&expires_at)? <= Utc::now() {
+                Some(SidecarBootstrapBlockReason::ExpiredLease)
+            } else {
+                None
+            }
+        }
+    };
+    if let Some(reason) = reason {
+        return block_executor_bootstrap(
+            db,
+            &sidecar,
+            reason,
+            format!(
                 "sandbox {sandbox_id} requires an orb-sidecar resident process but its running observation is not backed by a live lease; refusing to hand out the orb-executor bootstrap credential"
             ),
-        });
+        )
+        .await;
     }
     Ok(())
 }
@@ -674,6 +746,10 @@ pub(crate) async fn observe_resident_process(
         ));
     }
     let now = Utc::now();
+    let terminal_failure = matches!(
+        request.observed_state,
+        ResidentProcessObservedState::Failed | ResidentProcessObservedState::Lost
+    ) && process.observed_state != request.observed_state;
     let started_at = matches!(
         request.observed_state,
         ResidentProcessObservedState::Starting | ResidentProcessObservedState::Running
@@ -743,6 +819,30 @@ pub(crate) async fn observe_resident_process(
             "resident_process_generation_conflict",
             "resident process changed while applying observation",
         ));
+    }
+    if terminal_failure
+        && let Err(error) = insert_event(
+            &state.db,
+            process.sandbox_id,
+            SandboxEventKind::ResidentProcessTerminalFailure,
+            json!({
+                "processName": process.name,
+                "generation": request.generation,
+                "observedState": request.observed_state.as_db_str(),
+            }),
+        )
+        .await
+    {
+        // The observation is already durable. Returning 500 would invite
+        // a retry whose identical state no longer qualifies for an event,
+        // so telemetry failure is explicitly non-disruptive.
+        tracing::warn!(
+            ?error,
+            process_name = %process.name,
+            generation = request.generation,
+            observed_state = request.observed_state.as_db_str(),
+            "failed to persist resident terminal failure event"
+        );
     }
     if request.observed_state == ResidentProcessObservedState::Starting
         && let Some(sha256) = process.bootstrap_sha256.as_ref()

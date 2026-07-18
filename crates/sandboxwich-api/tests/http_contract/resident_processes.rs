@@ -1011,6 +1011,32 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
         .unwrap();
     assert_eq!(sidecar_bootstrap.content, b"sidecar-canary-secret");
 
+    // A terminal resident transition emits one bounded durable event. A
+    // duplicate terminal observation must not create success/heartbeat spam,
+    // and the guest-provided error detail must never be copied into the event.
+    let terminal_observation = ResidentProcessObservationRequest {
+        generation: executor_created.resident_process.generation,
+        lease_id: executor_lease.id.0,
+        observed_state: ResidentProcessObservedState::Failed,
+        pid: None,
+        exit_code: Some(1),
+        error_code: Some("terminal-error-canary".into()),
+        error_message: None,
+    };
+    for _ in 0..2 {
+        guest_client
+            .post(format!(
+                "{}/resident-processes/{}/observations",
+                server.base_url, executor_created.resident_process.id
+            ))
+            .json(&terminal_observation)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+
     client
         .post(format!(
             "{}/sandboxes/{sandbox_id}/resident-processes/orb-sidecar/stop",
@@ -1054,6 +1080,93 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
         tenant_b.get(&sidecar_url).send().await.unwrap().status(),
         reqwest::StatusCode::NOT_FOUND
     );
+    assert_eq!(
+        tenant_b
+            .get(format!("{}/sandboxes/{sandbox_id}/events", server.base_url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+
+    let events: EventListResponse = client
+        .get(format!("{}/sandboxes/{sandbox_id}/events", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let blocked_events: Vec<_> = events
+        .events
+        .iter()
+        .filter(|event| event.kind == SandboxEventKind::SidecarBootstrapBlocked)
+        .collect();
+    assert_eq!(blocked_events.len(), 2);
+    assert!(blocked_events.iter().any(|event| {
+        event.data["reason"] == "not_running"
+            && event.data["processName"] == ORB_SIDECAR_RESIDENT_PROCESS_NAME
+            && event.data["generation"] == sidecar_created.resident_process.generation
+    }));
+    assert!(
+        blocked_events
+            .iter()
+            .any(|event| event.data["reason"] == "inactive_lease")
+    );
+    let terminal_events: Vec<_> = events
+        .events
+        .iter()
+        .filter(|event| event.kind == SandboxEventKind::ResidentProcessTerminalFailure)
+        .collect();
+    assert_eq!(terminal_events.len(), 1);
+    assert_eq!(
+        terminal_events[0].data,
+        serde_json::json!({
+            "processName": ORB_EXECUTOR_RESIDENT_PROCESS_NAME,
+            "generation": executor_created.resident_process.generation,
+            "observedState": "failed",
+        })
+    );
+    let event_text = serde_json::to_string(&events).unwrap();
+    for secret in [
+        "sidecar-canary-secret",
+        "executor-canary-secret",
+        "terminal-error-canary",
+        executor_bootstrap_request.expected_sha256.as_str(),
+    ] {
+        assert!(!event_text.contains(secret), "event leaked {secret}");
+    }
+
+    let metrics = client
+        .get(format!("{}/metrics", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics.contains("# TYPE sandboxwich_resident_process_count gauge"));
+    assert!(metrics.contains("sandboxwich_resident_process_count{state=\"failed\"}"));
+    assert!(metrics.contains("# TYPE sandboxwich_sidecar_bootstrap_block_total counter"));
+    assert!(
+        metrics.contains("sandboxwich_sidecar_bootstrap_block_total{reason=\"not_running\"} 1")
+    );
+    assert!(
+        metrics.contains("sandboxwich_sidecar_bootstrap_block_total{reason=\"inactive_lease\"} 1")
+    );
+    for secret in [
+        "sidecar-canary-secret",
+        "executor-canary-secret",
+        executor_bootstrap_request.expected_sha256.as_str(),
+    ] {
+        assert!(!metrics.contains(secret), "metrics leaked {secret}");
+    }
+    assert!(!metrics.contains(&sandbox_id.to_string()));
 
     // 11. Regression guard: a sandbox that never configures a sidecar at
     // all sees no change in orb-executor's bootstrap behavior -- the gate

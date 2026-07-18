@@ -171,6 +171,20 @@ pub(crate) async fn collect_prometheus_metrics(
         "status",
         metrics.counts("cleanup_run"),
     );
+    append_count_family(
+        &mut body,
+        "sandboxwich_resident_process_count",
+        "Resident processes by observed state.",
+        "state",
+        metrics.counts("resident_process"),
+    );
+    append_counter_family(
+        &mut body,
+        "sandboxwich_sidecar_bootstrap_block_total",
+        "Fail-closed orb-executor bootstrap denials by bounded sidecar readiness reason.",
+        "reason",
+        metrics.counts("sidecar_bootstrap_block"),
+    );
     append_gauge(
         &mut body,
         "sandboxwich_job_queue_oldest_seconds",
@@ -347,6 +361,7 @@ pub(crate) async fn fetch_prometheus_metrics(
             .or_insert_with(Vec::new)
             .push((label, value));
     }
+    fetch_resident_observability_metrics(db, tenant_id, &mut values).await?;
     let queued_sql = match tenant_id {
         None => {
             "select min(scheduled_at) as observed_at from jobs where status = 'queued'".to_string()
@@ -385,6 +400,72 @@ pub(crate) async fn fetch_prometheus_metrics(
     Ok(PrometheusMetrics { values })
 }
 
+async fn fetch_resident_observability_metrics(
+    db: &Database,
+    tenant_id: Option<&str>,
+    values: &mut BTreeMap<String, Vec<(String, i64)>>,
+) -> Result<(), ApiError> {
+    let resident_sql = match tenant_id {
+        None => "select observed_state as label, count(*) as value
+                 from resident_processes group by observed_state"
+            .to_string(),
+        Some(_) => format!(
+            "select observed_state as label, count(*) as value
+             from resident_processes where tenant_id = {} group by observed_state",
+            db.placeholder(1)
+        ),
+    };
+    let mut resident_query = sqlx::query(&resident_sql);
+    if let Some(tenant_id) = tenant_id {
+        resident_query = resident_query.bind(tenant_id);
+    }
+    let mut resident_counts = Vec::new();
+    for row in resident_query.fetch_all(&db.pool).await? {
+        let state: String = row.try_get("label")?;
+        // Keep the label domain bounded even if a database constraint is
+        // bypassed during an operator repair.
+        if ResidentProcessObservedState::parse_db_str(&state).is_ok() {
+            resident_counts.push((state, row.try_get("value")?));
+        }
+    }
+    values.insert("resident_process".into(), resident_counts);
+
+    let event_sql = match tenant_id {
+        None => "select sandbox_events.data from sandbox_events
+                 where sandbox_events.kind = 'sidecar_bootstrap_blocked'"
+            .to_string(),
+        Some(_) => format!(
+            "select sandbox_events.data from sandbox_events
+             join sandboxes on sandboxes.id = sandbox_events.sandbox_id
+             where sandbox_events.kind = 'sidecar_bootstrap_blocked'
+               and sandboxes.tenant_id = {}",
+            db.placeholder(1)
+        ),
+    };
+    let mut event_query = sqlx::query(&event_sql);
+    if let Some(tenant_id) = tenant_id {
+        event_query = event_query.bind(tenant_id);
+    }
+    let mut block_counts = BTreeMap::<String, i64>::new();
+    for row in event_query.fetch_all(&db.pool).await? {
+        let data: String = row.try_get("data")?;
+        let reason = serde_json::from_str::<serde_json::Value>(&data)
+            .ok()
+            .and_then(|data| data.get("reason")?.as_str().map(str::to_owned));
+        if let Some(
+            reason @ ("not_running" | "no_active_lease" | "inactive_lease" | "expired_lease"),
+        ) = reason.as_deref()
+        {
+            *block_counts.entry(reason.to_string()).or_default() += 1;
+        }
+    }
+    values.insert(
+        "sidecar_bootstrap_block".into(),
+        block_counts.into_iter().collect(),
+    );
+    Ok(())
+}
+
 pub(crate) fn append_count_family(
     body: &mut String,
     name: &'static str,
@@ -400,6 +481,33 @@ pub(crate) fn append_count_family(
     body.push_str("# TYPE ");
     body.push_str(name);
     body.push_str(" gauge\n");
+    for (label, value) in values {
+        body.push_str(name);
+        body.push('{');
+        body.push_str(label_name);
+        body.push_str("=\"");
+        body.push_str(&escape_prometheus_label(&label));
+        body.push_str("\"} ");
+        body.push_str(&value.to_string());
+        body.push('\n');
+    }
+}
+
+pub(crate) fn append_counter_family(
+    body: &mut String,
+    name: &'static str,
+    help: &'static str,
+    label_name: &'static str,
+    values: Vec<(String, i64)>,
+) {
+    body.push_str("# HELP ");
+    body.push_str(name);
+    body.push(' ');
+    body.push_str(help);
+    body.push('\n');
+    body.push_str("# TYPE ");
+    body.push_str(name);
+    body.push_str(" counter\n");
     for (label, value) in values {
         body.push_str(name);
         body.push('{');
