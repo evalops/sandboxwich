@@ -178,6 +178,115 @@ async fn resident_process_storage_round_trips_public_metadata() {
     );
 }
 
+/// Inserts a minimal resident-process row for `name`, mirroring the fixture
+/// shape `resident_process_storage_round_trips_public_metadata` uses.
+async fn insert_resident_process_row(db: &Database, sandbox: &Sandbox, name: &str) -> Uuid {
+    let id = ResidentProcessId::new();
+    let now = Utc::now();
+    sqlx::query(
+        "insert into resident_processes (
+            id, sandbox_id, tenant_id, name, argv, cwd, env,
+            restart_policy, desired_state, observed_state, generation,
+            created_at, updated_at
+         ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(sandbox.id.to_string())
+    .bind(&sandbox.tenant_id)
+    .bind(name)
+    .bind(format!(r#"["/usr/local/bin/{name}"]"#))
+    .bind(Option::<String>::None)
+    .bind("{}")
+    .bind("never")
+    .bind("running")
+    .bind("pending")
+    .bind(1_i64)
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    id.0
+}
+
+#[tokio::test]
+async fn orb_sidecar_and_orb_executor_are_independent_one_per_sandbox_slots() {
+    // issue #176: orb-sidecar must be a distinct resident-process kind from
+    // orb-executor -- a sandbox can hold one row of each -- while each
+    // individual name is still limited to one row per sandbox via the
+    // storage layer's `unique(sandbox_id, name)` constraint (see the
+    // resident_processes migration).
+    let db = test_sqlite_db().await;
+    let now = Utc::now();
+    let sandbox = Sandbox {
+        id: SandboxId::new(),
+        tenant_id: "tenant-a".into(),
+        name: "resident-sidecar-test".into(),
+        state: SandboxState::Ready,
+        template: "ubuntu-dev".into(),
+        memory_limit: MemoryLimit::default(),
+        network_egress: NetworkEgress::DenyAll,
+        workspace_mode: WorkspaceMode::default(),
+        runtime_profile: SandboxRuntimeProfile::default(),
+        execution_class: ExecutionClass::default(),
+        created_at: now,
+        updated_at: now,
+        ttl_seconds: Some(3600),
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
+        parent_snapshot_id: None,
+    };
+    let mut tx = db.pool.begin().await.unwrap();
+    insert_sandbox_on_connection(&db, &mut tx, &sandbox)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    insert_resident_process_row(&db, &sandbox, "orb-executor").await;
+    insert_resident_process_row(&db, &sandbox, "orb-sidecar").await;
+    let count: i64 =
+        sqlx::query("select count(*) as c from resident_processes where sandbox_id = ?")
+            .bind(sandbox.id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+            .get("c");
+    assert_eq!(
+        count, 2,
+        "orb-executor and orb-sidecar must coexist as independent rows"
+    );
+
+    // A second orb-sidecar row for the *same* sandbox must be rejected by
+    // storage -- this is the one-per-sandbox enforcement for the sidecar
+    // slot, identical in mechanism to orb-executor's.
+    let second_sidecar = sqlx::query(
+        "insert into resident_processes (
+            id, sandbox_id, tenant_id, name, argv, cwd, env,
+            restart_policy, desired_state, observed_state, generation,
+            created_at, updated_at
+         ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(ResidentProcessId::new().to_string())
+    .bind(sandbox.id.to_string())
+    .bind(&sandbox.tenant_id)
+    .bind("orb-sidecar")
+    .bind(r#"["/usr/local/bin/orb-sidecar"]"#)
+    .bind(Option::<String>::None)
+    .bind("{}")
+    .bind("never")
+    .bind("running")
+    .bind("pending")
+    .bind(1_i64)
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&db.pool)
+    .await;
+    assert!(
+        second_sidecar.is_err(),
+        "a second orb-sidecar row for the same sandbox must violate the unique(sandbox_id, name) constraint"
+    );
+}
+
 #[test]
 fn lease_completion_fingerprint_is_versioned_and_canonicalizes_object_order() {
     let sandbox_id = SandboxId::new();

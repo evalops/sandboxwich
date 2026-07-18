@@ -1770,6 +1770,56 @@ pub struct CapacityResponse {
 pub const MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES: usize = 64 * 1024;
 pub const RESIDENT_PROCESS_BOOTSTRAP_PREFIX: &str = "/run/sandboxwich/bootstrap";
 
+/// The agent workload's resident process: the sandboxed agent itself. Runs
+/// under whatever uid the guest container/agent process already has -- no
+/// explicit privilege drop is applied for this name (see
+/// [`resident_process_run_as_uid`]).
+pub const ORB_EXECUTOR_RESIDENT_PROCESS_NAME: &str = "orb-executor";
+
+/// The v1 credential sidecar (evalops/orb#296, evalops/sandboxwich#176): a
+/// second resident process, one per sandbox, that is spawned under
+/// [`ORB_SIDECAR_RESIDENT_PROCESS_UID`] rather than the agent workload's own
+/// uid. This is a uid-separation primitive INSIDE the same sandbox/container
+/// -- not a separate trust domain. A root (or otherwise sufficiently
+/// privileged) agent process in the same sandbox can still read the
+/// sidecar's files, trace/ptrace it, or otherwise defeat the separation. See
+/// docs/capabilities.md for the full disclosure; the worker-level primitive
+/// that places the sidecar outside the sandbox's namespaces entirely is
+/// tracked as separate future work.
+pub const ORB_SIDECAR_RESIDENT_PROCESS_NAME: &str = "orb-sidecar";
+
+/// Fixed v1 uid the guest agent attempts to drop privilege to when spawning
+/// an `orb-sidecar` resident process. Chosen distinct from the default guest
+/// container uid (`10001`, see `sandboxwich-worker`'s pod security context)
+/// so the two resident processes are attributable to different uids in
+/// process listings, file ownership, and audit logs. The guest agent applies
+/// this via `setuid`/`setgid` (see `sandboxwich-agent::handle_resident_process`);
+/// if the calling process lacks the privilege to change uid (the common case
+/// for a default, non-apex sandbox pod today), the spawn fails outright
+/// rather than silently running the sidecar under the workload's own uid --
+/// see [`is_supported_resident_process_name`] and the fail-closed bootstrap
+/// gate in `sandboxwich-api`.
+pub const ORB_SIDECAR_RESIDENT_PROCESS_UID: u32 = 10111;
+
+/// Whether `name` is a resident-process kind the API accepts. v1 supports
+/// exactly two: the agent workload (`orb-executor`) and the credential
+/// sidecar (`orb-sidecar`), each limited to one live instance per sandbox by
+/// the `unique(sandbox_id, name)` storage constraint.
+pub fn is_supported_resident_process_name(name: &str) -> bool {
+    matches!(
+        name,
+        ORB_EXECUTOR_RESIDENT_PROCESS_NAME | ORB_SIDECAR_RESIDENT_PROCESS_NAME
+    )
+}
+
+/// The uid the guest agent should attempt to run `name`'s process under, or
+/// `None` to inherit the agent's own uid (today's behavior for
+/// `orb-executor` and any unrecognized name). Only `orb-sidecar` gets an
+/// explicit, distinct uid in v1.
+pub fn resident_process_run_as_uid(name: &str) -> Option<u32> {
+    (name == ORB_SIDECAR_RESIDENT_PROCESS_NAME).then_some(ORB_SIDECAR_RESIDENT_PROCESS_UID)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(transparent)]
 pub struct ResidentProcessId(pub Uuid);
@@ -3016,6 +3066,36 @@ mod tests {
             validate_resident_process_request(&oversized),
             Err(ResidentProcessRequestError::BootstrapTooLarge)
         );
+    }
+
+    #[test]
+    fn orb_sidecar_is_a_supported_resident_process_name_distinct_from_orb_executor() {
+        assert!(is_supported_resident_process_name(
+            ORB_EXECUTOR_RESIDENT_PROCESS_NAME
+        ));
+        assert!(is_supported_resident_process_name(
+            ORB_SIDECAR_RESIDENT_PROCESS_NAME
+        ));
+        assert!(!is_supported_resident_process_name("something-else"));
+        assert!(!is_supported_resident_process_name(""));
+    }
+
+    #[test]
+    fn only_orb_sidecar_gets_an_explicit_run_as_uid() {
+        assert_eq!(
+            resident_process_run_as_uid(ORB_SIDECAR_RESIDENT_PROCESS_NAME),
+            Some(ORB_SIDECAR_RESIDENT_PROCESS_UID)
+        );
+        // orb-executor inherits the agent's own uid -- no explicit switch.
+        assert_eq!(
+            resident_process_run_as_uid(ORB_EXECUTOR_RESIDENT_PROCESS_NAME),
+            None
+        );
+        assert_eq!(resident_process_run_as_uid("unknown"), None);
+        // The sidecar's uid must never collide with the default guest
+        // container uid (10001, see sandboxwich-worker's pod security
+        // context) -- otherwise "distinct uid" would be a no-op.
+        assert_ne!(ORB_SIDECAR_RESIDENT_PROCESS_UID, 10001);
     }
     use serde::{Serialize, de::DeserializeOwned};
     use std::{collections::BTreeSet, fmt::Debug};
