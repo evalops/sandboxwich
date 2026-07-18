@@ -509,6 +509,7 @@ pub struct KubernetesDryRunProvider {
 #[derive(Clone, Eq, PartialEq)]
 struct GuestCredentials {
     sandbox_id: SandboxId,
+    worker_id: Uuid,
     api: String,
     token: String,
 }
@@ -518,6 +519,7 @@ impl std::fmt::Debug for GuestCredentials {
         formatter
             .debug_struct("GuestCredentials")
             .field("sandbox_id", &self.sandbox_id)
+            .field("worker_id", &self.worker_id)
             .field("api", &self.api)
             .field("token", &"<redacted>")
             .finish()
@@ -826,6 +828,7 @@ impl KubernetesDryRunProvider {
     pub fn with_guest_credentials(
         mut self,
         sandbox_id: SandboxId,
+        worker_id: Uuid,
         api: impl Into<String>,
         token: impl Into<String>,
     ) -> Self {
@@ -834,6 +837,7 @@ impl KubernetesDryRunProvider {
         self.guest_credentials =
             (!api.is_empty() && !token.trim().is_empty()).then_some(GuestCredentials {
                 sandbox_id,
+                worker_id,
                 api,
                 token,
             });
@@ -1173,6 +1177,10 @@ impl KubernetesDryRunProvider {
                 json!({
                     "name": "SANDBOXWICH_SANDBOX_ID",
                     "value": sandbox_id.to_string()
+                }),
+                json!({
+                    "name": "SANDBOXWICH_WORKER_ID",
+                    "value": self.guest_credentials.as_ref().unwrap().worker_id.to_string()
                 }),
             ]);
         }
@@ -2655,10 +2663,13 @@ impl KubernetesApplyProvider {
     pub fn with_guest_credentials(
         mut self,
         sandbox_id: SandboxId,
+        worker_id: Uuid,
         api: impl Into<String>,
         token: impl Into<String>,
     ) -> Self {
-        self.dry_run = self.dry_run.with_guest_credentials(sandbox_id, api, token);
+        self.dry_run = self
+            .dry_run
+            .with_guest_credentials(sandbox_id, worker_id, api, token);
         self
     }
 
