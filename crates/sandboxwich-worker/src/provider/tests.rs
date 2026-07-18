@@ -1884,6 +1884,81 @@ fn pod_disables_service_account_token_automount_and_sets_ephemeral_storage_limit
 }
 
 #[test]
+fn guest_token_is_mounted_as_a_file_and_redacted_from_provider_metadata() {
+    let sandbox_id = SandboxId::new();
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_guest_credentials(
+                sandbox_id,
+                "http://sandboxwich-api.evalops.svc.cluster.local:3217",
+                "sbw_gtok_supersecret",
+            );
+    let handle = provider
+        .provision(
+            sandbox_id,
+            &SandboxProvisionSpec::default(),
+            &CancelSignal::never_cancelled(),
+        )
+        .unwrap();
+    let pod = &handle.metadata["manifests"]["pod"];
+    let env = pod["spec"]["containers"][0]["env"].as_array().unwrap();
+    assert!(env.iter().any(|entry| {
+        entry["name"] == "SANDBOXWICH_API_TOKEN_FILE"
+            && entry["value"] == "/run/sandboxwich/guest/api-token"
+    }));
+    assert!(env.iter().any(|entry| {
+        entry["name"] == "SANDBOXWICH_SANDBOX_ID" && entry["value"] == sandbox_id.to_string()
+    }));
+    let serialized = serde_json::to_string(&handle.metadata).unwrap();
+    assert!(!serialized.contains("sbw_gtok_supersecret"));
+    assert_eq!(
+        handle.metadata["manifests"]["guestTokenSecret"]["stringData"]["api-token"],
+        GUEST_TOKEN_REDACTED
+    );
+}
+
+#[test]
+fn apply_manifests_carry_guest_token_only_in_the_secret_before_the_pod() {
+    let sandbox_id = SandboxId::new();
+    let dry_run =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_guest_credentials(
+                sandbox_id,
+                "http://sandboxwich-api.evalops.svc.cluster.local:3217",
+                "sbw_gtok_supersecret",
+            );
+    let provider = KubernetesApplyProvider::new(dry_run, "kubectl");
+    let manifests = provider
+        .provision_manifests(sandbox_id, &SandboxProvisionSpec::default())
+        .unwrap();
+    let secret_index = manifests
+        .iter()
+        .position(|manifest| manifest["kind"] == "Secret")
+        .unwrap();
+    let pod_index = manifests
+        .iter()
+        .position(|manifest| manifest["kind"] == "Pod")
+        .unwrap();
+    assert!(secret_index < pod_index);
+    assert_eq!(
+        manifests[secret_index]["stringData"]["api-token"],
+        "sbw_gtok_supersecret"
+    );
+    assert_eq!(
+        manifests
+            .iter()
+            .filter(|manifest| {
+                serde_json::to_string(manifest)
+                    .unwrap()
+                    .contains("sbw_gtok_supersecret")
+            })
+            .count(),
+        1
+    );
+    assert!(SANDBOX_TEARDOWN_RESOURCE_KINDS.contains("secret"));
+}
+
+#[test]
 fn vnc_password_secret_is_mounted_as_a_read_only_file_not_an_env_var() {
     // The VNC password must be mounted as a file (mirroring the SSH
     // authorized-keys handling) rather than injected via
@@ -2327,6 +2402,77 @@ fn provision_staged_applies_resources_in_durable_order_and_reports_uids() {
 }
 
 #[test]
+fn provision_staged_applies_the_guest_token_secret_before_the_pod() {
+    // Regression: the staged provisioning path used to report
+    // CredentialsReady without applying the guest-token Secret at all, so
+    // the pod (whose spec mounts that Secret whenever guest credentials
+    // exist) sat in FailedMount until the ready-wait timed out.
+    let (kubectl, log_path) = write_stateful_fake_kubectl();
+    let sandbox_id = SandboxId::new();
+    let dry_run =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_guest_credentials(
+                sandbox_id,
+                "http://sandboxwich-api.evalops.svc.cluster.local:3217",
+                "sbw_gtok_supersecret",
+            );
+    let provider = KubernetesApplyProvider::new(dry_run, kubectl.to_string_lossy().into_owned())
+        .with_kubectl_context(Some("in-cluster".to_string()))
+        .with_mutation_gate(true, true);
+    let mut reports = Vec::new();
+
+    provider
+        .provision_staged(
+            sandbox_id,
+            &SandboxProvisionSpec::default(),
+            &CancelSignal::never_cancelled(),
+            |report| {
+                reports.push(report);
+                Ok(())
+            },
+        )
+        .expect("staged provision succeeds");
+
+    let credentials_index = reports
+        .iter()
+        .position(|report| report.stage == sandboxwich_core::ProvisioningStage::CredentialsReady)
+        .expect("CredentialsReady stage is reported");
+    assert_eq!(
+        reports[credentials_index].resource_name.as_deref(),
+        Some(format!("sandboxwich-guest-token-{sandbox_id}").as_str()),
+        "CredentialsReady must carry the applied Secret's identity"
+    );
+    let pod_index = reports
+        .iter()
+        .position(|report| report.stage == sandboxwich_core::ProvisioningStage::PodReady)
+        .expect("PodReady stage is reported");
+    assert!(
+        credentials_index < pod_index,
+        "the Secret must be applied before the pod that mounts it"
+    );
+
+    // The stateful fake kubectl records every applied manifest as a
+    // `<kind>-<name>` marker file; the Secret's marker proves the staged
+    // path actually applied it rather than only reporting the stage.
+    let secret_marker = kubectl
+        .parent()
+        .expect("fake kubectl parent")
+        .join(format!("secret-sandboxwich-guest-token-{sandbox_id}"));
+    let secret_payload =
+        std::fs::read_to_string(&secret_marker).expect("guest-token Secret was applied");
+    assert!(secret_payload.contains("sbw_gtok_supersecret"));
+
+    let log = std::fs::read_to_string(&log_path).expect("read staged kubectl log");
+    assert_eq!(
+        log.matches(" apply ").count(),
+        6,
+        "workspace, secret, policy, pod, and two services: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+#[test]
 fn provision_staged_applies_gateway_policy_and_waits_for_gateway_before_runtime() {
     let (kubectl, log_path) = write_stateful_fake_kubectl();
     let dry_run =
@@ -2417,6 +2563,41 @@ fn provision_staged_stops_before_the_next_resource_when_reporting_fails() {
     );
     assert!(!log.contains(" wait "), "pod stage must not start: {log}");
     let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+#[test]
+fn guest_token_secret_adoption_accepts_rotated_token_but_rejects_api_url_drift() {
+    // Regression for the chaos lost-response replay: every provisioning
+    // attempt mints a fresh guest token, so a replayed provision's desired
+    // Secret can never byte-match the token the live Secret holds. Adoption
+    // must accept that rotation (presence of `api-token`, not equality) but
+    // still refuse a Secret whose `api-url` points somewhere else, and still
+    // require the token key to exist at all.
+    let sandbox_id = SandboxId::new();
+    let render = |token: &str, api: &str| {
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_guest_credentials(sandbox_id, api, token)
+            .guest_token_secret_manifest(sandbox_id)
+            .expect("credentials render a guest-token secret")
+    };
+    let api = "http://sandboxwich-api.evalops.svc.cluster.local:3217";
+    let desired = render("sbw_gtok_attempt_two", api);
+
+    let existing_with_rotated_token = render("sbw_gtok_attempt_one", api);
+    validate_adoption_contract(&desired, &existing_with_rotated_token)
+        .expect("a rotated api-token value must not block adoption");
+
+    let existing_with_hostile_api = render("sbw_gtok_attempt_one", "http://attacker.example:3217");
+    validate_adoption_contract(&desired, &existing_with_hostile_api)
+        .expect_err("an api-url pointing at a different control plane must block adoption");
+
+    let mut existing_without_token = render("sbw_gtok_attempt_one", api);
+    existing_without_token["stringData"]
+        .as_object_mut()
+        .expect("stringData object")
+        .remove("api-token");
+    validate_adoption_contract(&desired, &existing_without_token)
+        .expect_err("a guest-token Secret without an api-token key must block adoption");
 }
 
 #[test]
