@@ -2142,6 +2142,7 @@ async fn sandbox_insert_rejects_a_nonexistent_parent_snapshot_id() {
         ttl_seconds: None,
         max_lifetime_seconds: None,
         idle_ttl_seconds: None,
+        last_activity_at: None,
         parent_snapshot_id: Some(SnapshotId::new()),
     };
 
