@@ -1,10 +1,10 @@
 # ubuntu:24.04 multi-architecture index, refreshed 2026-07-09.
 # Pulled via the Docker Hub mirror (mirror.gcr.io) to avoid docker.io's
 # anonymous-pull rate limit on shared self-hosted runners.
-# Orb publishes this idle Sandboxwich target with the executor and agent
-# toolchain for the exact control-plane protocol revision. Sandboxwich layers
-# its guest daemon and desktop entrypoint on top of those binaries below.
-ARG ORB_EXECUTOR_IMAGE=ghcr.io/evalops/orb-sandboxwich-runtime@sha256:42326731c8ea005923b7dd22c460231e44ee0cedc8c49f02069e82f1f92d9ce3
+# This org-local mirror carries Orb's executor and agent toolchain for the
+# exact control-plane protocol revision. Sandboxwich layers its guest daemon
+# and desktop entrypoint on top of those binaries below.
+ARG ORB_EXECUTOR_IMAGE=ghcr.io/evalops/sandboxwich-orb-executor@sha256:42326731c8ea005923b7dd22c460231e44ee0cedc8c49f02069e82f1f92d9ce3
 FROM mirror.gcr.io/library/rust:1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS agent-builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
