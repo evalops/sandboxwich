@@ -245,6 +245,27 @@ pub(crate) async fn claim_lease(
         {
             continue;
         }
+        if job.kind == JobKind::RunResidentProcess
+            && job.payload.get("name").and_then(serde_json::Value::as_str)
+                == Some(ORB_SIDECAR_RESIDENT_PROCESS_NAME)
+        {
+            let Some(sandbox_id) = job
+                .payload
+                .get("sandboxId")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<SandboxId>(value).ok())
+            else {
+                continue;
+            };
+            let supported = crate::handlers::workers::fetch_guest_health(&state.db, sandbox_id)
+                .await?
+                .is_some_and(|health| {
+                    crate::handlers::workers::guest_supports_uid_isolated_resident_process(&health)
+                });
+            if !supported {
+                continue;
+            }
+        }
         if let Some(lease) = try_claim_job(
             &state.db,
             &worker,

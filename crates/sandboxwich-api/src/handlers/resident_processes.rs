@@ -110,6 +110,35 @@ async fn ensure_sidecar_ready_if_required(
             ),
         });
     }
+    let Some(active_lease_id) = sidecar.active_lease_id else {
+        return Err(ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "resident_sidecar_unavailable",
+            message: format!(
+                "sandbox {sandbox_id} requires an orb-sidecar resident process but its running observation has no active lease; refusing to hand out the orb-executor bootstrap credential"
+            ),
+        });
+    };
+    let sql = format!(
+        "select 1 from job_leases where id = {} and status = 'active' and expires_at > {}",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    let lease_is_live = sqlx::query(&sql)
+        .bind(active_lease_id.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .fetch_optional(&db.pool)
+        .await?
+        .is_some();
+    if !lease_is_live {
+        return Err(ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "resident_sidecar_unavailable",
+            message: format!(
+                "sandbox {sandbox_id} requires an orb-sidecar resident process but its running observation is not backed by a live lease; refusing to hand out the orb-executor bootstrap credential"
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -179,6 +208,18 @@ pub(crate) async fn put_resident_process(
             "new resident process requires expectedGeneration=0",
         ));
     }
+    if name == ORB_SIDECAR_RESIDENT_PROCESS_NAME {
+        let guest_health = crate::handlers::workers::fetch_guest_health(&state.db, sandbox_id)
+            .await?
+            .filter(crate::handlers::workers::guest_supports_uid_isolated_resident_process);
+        if guest_health.is_none() {
+            return Err(ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "resident_sidecar_agent_unsupported",
+                message: "orb-sidecar requires a ready guest agent advertising uid-isolated resident-process v1 support".into(),
+            });
+        }
+    }
 
     let now = Utc::now();
     let process = ResidentProcess {
@@ -233,7 +274,11 @@ pub(crate) async fn put_resident_process(
                 "resourceId": process.id.0,
             }
         }),
-        required_capability: WorkerCapability::RunCommand,
+        required_capability: if process.name == ORB_SIDECAR_RESIDENT_PROCESS_NAME {
+            WorkerCapability::UidIsolatedResidentProcess
+        } else {
+            WorkerCapability::RunCommand
+        },
         required_execution_class: sandbox.execution_class.clone(),
         priority: 0,
         attempts: 0,

@@ -44,8 +44,12 @@ async fn provisioned_sandbox_with_guest(
             capabilities: vec![
                 WorkerCapability::ProvisionSandbox,
                 WorkerCapability::RunCommand,
+                WorkerCapability::UidIsolatedResidentProcess,
             ],
-            max_concurrent_jobs: Some(4),
+            // Resident leases run inside the sandbox and therefore must not
+            // consume the worker's ordinary job-execution slots. Keeping this
+            // at one proves both persistent resident kinds can still be claimed.
+            max_concurrent_jobs: Some(1),
             labels: Default::default(),
         })
         .send()
@@ -122,6 +126,24 @@ async fn provisioned_sandbox_with_guest(
             headers
         })
         .build()
+        .unwrap();
+    guest_client
+        .post(format!(
+            "{}/sandboxes/{sandbox_id}/guest-health",
+            server.base_url
+        ))
+        .json(&UpdateGuestHealthRequest {
+            status: GuestStatus::Ready,
+            agent_version: Some("sandboxwich-agent/test".into()),
+            checks: Some(serde_json::json!({
+                "uidIsolatedResidentProcess": {"status": "ok", "version": 1}
+            })),
+            message: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
         .unwrap();
 
     (sandbox_id, worker, guest_client)
@@ -549,6 +571,53 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
         b"sidecar-canary-secret",
         "/run/sandboxwich/bootstrap/sidecar-token",
     );
+    guest_client
+        .post(format!(
+            "{}/sandboxes/{sandbox_id}/guest-health",
+            server.base_url
+        ))
+        .json(&UpdateGuestHealthRequest {
+            status: GuestStatus::Ready,
+            agent_version: Some("sandboxwich-agent/old".into()),
+            checks: Some(serde_json::json!({
+                "exec": {"status": "ok"},
+                "files": {"status": "ok"}
+            })),
+            message: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let unsupported_agent = client
+        .put(&sidecar_url)
+        .json(&sidecar_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unsupported_agent.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    guest_client
+        .post(format!(
+            "{}/sandboxes/{sandbox_id}/guest-health",
+            server.base_url
+        ))
+        .json(&UpdateGuestHealthRequest {
+            status: GuestStatus::Ready,
+            agent_version: Some("sandboxwich-agent/current".into()),
+            checks: Some(serde_json::json!({
+                "uidIsolatedResidentProcess": {"status": "ok", "version": 1}
+            })),
+            message: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
     let sidecar_create_response = client
         .put(&sidecar_url)
         .header("Idempotency-Key", "orb-sidecar-create")
@@ -605,17 +674,81 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
     let executor_created: ResidentProcessResponse =
         serde_json::from_str(&executor_create_body).unwrap();
 
-    // 4. Claim both queued run_resident_process leases and sort out which is
-    // which by residentProcessId -- queue order is not part of the contract.
-    let first = claim_resident_process_lease(&server, &worker, &guest_client, sandbox_id).await;
-    let second = claim_resident_process_lease(&server, &worker, &guest_client, sandbox_id).await;
-    let executor_id_value = serde_json::to_value(executor_created.resident_process.id).unwrap();
-    let (executor_lease, sidecar_lease) =
-        if first.job.payload.get("residentProcessId") == Some(&executor_id_value) {
-            (first, second)
-        } else {
-            (second, first)
-        };
+    // 4. A downgraded/old guest agent may still claim orb-executor, but it
+    // cannot claim orb-sidecar and silently run it without uid isolation.
+    guest_client
+        .post(format!(
+            "{}/sandboxes/{sandbox_id}/guest-health",
+            server.base_url
+        ))
+        .json(&UpdateGuestHealthRequest {
+            status: GuestStatus::Ready,
+            agent_version: Some("sandboxwich-agent/old".into()),
+            checks: Some(serde_json::json!({})),
+            message: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let executor_lease =
+        claim_resident_process_lease(&server, &worker, &guest_client, sandbox_id).await;
+    assert_eq!(
+        executor_lease
+            .job
+            .payload
+            .get("name")
+            .and_then(serde_json::Value::as_str),
+        Some(ORB_EXECUTOR_RESIDENT_PROCESS_NAME)
+    );
+    let unsupported_claim: ClaimLeaseResponse = guest_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox_id),
+            kinds: Some(vec![JobKind::RunResidentProcess]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(unsupported_claim.lease.is_none());
+    guest_client
+        .post(format!(
+            "{}/sandboxes/{sandbox_id}/guest-health",
+            server.base_url
+        ))
+        .json(&UpdateGuestHealthRequest {
+            status: GuestStatus::Ready,
+            agent_version: Some("sandboxwich-agent/current".into()),
+            checks: Some(serde_json::json!({
+                "uidIsolatedResidentProcess": {"status": "ok", "version": 1}
+            })),
+            message: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let sidecar_lease =
+        claim_resident_process_lease(&server, &worker, &guest_client, sandbox_id).await;
+    assert_eq!(
+        sidecar_lease.job.required_capability,
+        WorkerCapability::UidIsolatedResidentProcess
+    );
+    assert_eq!(
+        executor_lease.job.required_capability,
+        WorkerCapability::RunCommand
+    );
 
     let executor_bootstrap_request = ResidentProcessBootstrapReadRequest {
         generation: executor_created.resident_process.generation,
@@ -654,6 +787,58 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
             lease_id: sidecar_lease.id.0,
             observed_state: ResidentProcessObservedState::Running,
             pid: Some(77),
+            exit_code: None,
+            error_code: None,
+            error_message: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    // A persisted Running observation is not enough: once its lease is no
+    // longer active, the fail-closed gate must close before any replacement
+    // claim has a chance to overwrite the observation.
+    guest_client
+        .post(format!(
+            "{}/leases/{}/fail",
+            server.base_url, sidecar_lease.id
+        ))
+        .json(&FailLeaseRequest {
+            error: "sidecar agent disconnected".into(),
+            retry: true,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let stale_running = guest_client
+        .post(format!(
+            "{}/resident-processes/{}/bootstrap",
+            server.base_url, executor_created.resident_process.id
+        ))
+        .json(&executor_bootstrap_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        stale_running.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let replacement_sidecar_lease =
+        claim_resident_process_lease(&server, &worker, &guest_client, sandbox_id).await;
+    guest_client
+        .post(format!(
+            "{}/resident-processes/{}/observations",
+            server.base_url, sidecar_created.resident_process.id
+        ))
+        .json(&ResidentProcessObservationRequest {
+            generation: sidecar_created.resident_process.generation,
+            lease_id: replacement_sidecar_lease.id.0,
+            observed_state: ResidentProcessObservedState::Running,
+            pid: Some(78),
             exit_code: None,
             error_code: None,
             error_message: None,
@@ -706,7 +891,7 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
         ))
         .json(&ResidentProcessBootstrapReadRequest {
             generation: sidecar_created.resident_process.generation,
-            lease_id: sidecar_lease.id.0,
+            lease_id: replacement_sidecar_lease.id.0,
             expected_sha256: sidecar_created
                 .resident_process
                 .bootstrap_sha256

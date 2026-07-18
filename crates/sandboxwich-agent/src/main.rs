@@ -365,9 +365,32 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
     // blip in either should be retried with backoff rather than tearing down the daemon.
     let mut claim_budget = HeartbeatFailureBudget::new(args.claim_failure_threshold.max(1));
     let mut claim_backoff = Backoff::new(Duration::from_millis(args.idle_sleep_ms.max(1)));
+    let mut resident_tasks = tokio::task::JoinSet::new();
 
     let daemon_result = async {
         loop {
+            while let Some(result) = resident_tasks.try_join_next() {
+                let error = match result {
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(error)) => error,
+                    Err(error) => anyhow::anyhow!("resident-process task failed: {error}"),
+                };
+                with_retry(
+                    &mut claim_budget,
+                    &mut claim_backoff,
+                    "post_guest_health",
+                    || {
+                        post_guest_health(
+                            &guest_client,
+                            &api,
+                            sandbox_id,
+                            GuestStatus::Unhealthy,
+                            Some(error.to_string()),
+                        )
+                    },
+                )
+                .await?;
+            }
             if heartbeat_task.is_finished() {
                 bail!("heartbeat loop stopped");
             }
@@ -392,8 +415,22 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
                     })
                     .await?;
 
-                if let Some(lease) = claim_response.lease
-                    && let Err(error) = handle_lease(
+                if let Some(lease) = claim_response.lease {
+                    if lease.job.kind == JobKind::RunResidentProcess {
+                        let client = guest_client.clone();
+                        let api = api.clone();
+                        let max_captured_output_bytes = args.max_captured_output_bytes;
+                        resident_tasks.spawn(async move {
+                            handle_lease(
+                                &client,
+                                &api,
+                                sandbox_id,
+                                lease,
+                                max_captured_output_bytes,
+                            )
+                            .await
+                        });
+                    } else if let Err(error) = handle_lease(
                         &guest_client,
                         &api,
                         sandbox_id,
@@ -401,22 +438,23 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
                         args.max_captured_output_bytes,
                     )
                     .await
-                {
-                    with_retry(
-                        &mut claim_budget,
-                        &mut claim_backoff,
-                        "post_guest_health",
-                        || {
-                            post_guest_health(
-                                &guest_client,
-                                &api,
-                                sandbox_id,
-                                GuestStatus::Unhealthy,
-                                Some(error.to_string()),
-                            )
-                        },
-                    )
-                    .await?;
+                    {
+                        with_retry(
+                            &mut claim_budget,
+                            &mut claim_backoff,
+                            "post_guest_health",
+                            || {
+                                post_guest_health(
+                                    &guest_client,
+                                    &api,
+                                    sandbox_id,
+                                    GuestStatus::Unhealthy,
+                                    Some(error.to_string()),
+                                )
+                            },
+                        )
+                        .await?;
+                    }
                 }
             }
 
@@ -432,6 +470,9 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
         Ok(())
     }
     .await;
+
+    resident_tasks.abort_all();
+    while resident_tasks.join_next().await.is_some() {}
 
     if heartbeat_task.is_finished() {
         heartbeat_task.await.context("heartbeat task failed")??;
@@ -1235,6 +1276,25 @@ fn apply_resident_process_run_as_uid(command: &mut ProcessCommand, run_as_uid: O
     let _ = (command, run_as_uid);
 }
 
+#[cfg(unix)]
+fn transfer_resident_bootstrap_ownership(
+    file: &std::fs::File,
+    run_as_uid: Option<u32>,
+) -> std::io::Result<()> {
+    if let Some(uid) = run_as_uid {
+        std::os::unix::fs::fchown(file, Some(uid), Some(uid))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn transfer_resident_bootstrap_ownership(
+    _file: &std::fs::File,
+    _run_as_uid: Option<u32>,
+) -> std::io::Result<()> {
+    Ok(())
+}
+
 async fn handle_resident_process(
     client: &reqwest::Client,
     api: &str,
@@ -1342,6 +1402,12 @@ async fn handle_resident_process(
             .with_context(|| format!("failed to create {}", target.display()))?;
         file.write_all(&bootstrap.content)?;
         file.sync_all()?;
+        transfer_resident_bootstrap_ownership(&file, run_as_uid).with_context(|| {
+            format!(
+                "failed to transfer {} to the resident-process identity",
+                target.display()
+            )
+        })?;
     }
 
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -1763,7 +1829,8 @@ async fn post_guest_health(
             agent_version: Some(agent_version()),
             checks: Some(serde_json::json!({
                 "exec": {"status": "ok"},
-                "files": {"status": "ok"}
+                "files": {"status": "ok"},
+                "uidIsolatedResidentProcess": {"status": "ok", "version": 1}
             })),
             message,
         })
@@ -2647,5 +2714,43 @@ mod tests {
                 "unexpected error kind for an unprivileged uid switch: {error:?}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn orb_sidecar_can_read_its_private_bootstrap_after_uid_transfer() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        if current_uid() != 0 {
+            return;
+        }
+        let sidecar_uid = sandboxwich_core::ORB_SIDECAR_RESIDENT_PROCESS_UID;
+        let target = std::env::temp_dir().join(format!(
+            "sandboxwich-sidecar-bootstrap-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&target)
+            .expect("create private sidecar bootstrap");
+        file.write_all(b"sidecar-bootstrap-canary")
+            .expect("write sidecar bootstrap");
+        file.sync_all().expect("sync sidecar bootstrap");
+        transfer_resident_bootstrap_ownership(&file, Some(sidecar_uid))
+            .expect("transfer bootstrap to sidecar uid");
+        drop(file);
+
+        let mut command = ProcessCommand::new("cat");
+        command.arg(&target);
+        apply_resident_process_run_as_uid(&mut command, Some(sidecar_uid));
+        let output = command
+            .output()
+            .await
+            .expect("uid-isolated sidecar reads its bootstrap");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"sidecar-bootstrap-canary");
+        std::fs::remove_file(target).expect("remove sidecar bootstrap fixture");
     }
 }

@@ -1672,6 +1672,7 @@ pub enum WorkerCapability {
     SandboxedContainer => "sandboxed_container",
     VirtualMachine => "virtual_machine",
     RunCommand => "run_command",
+    UidIsolatedResidentProcess => "uid_isolated_resident_process",
     MaterializeFile => "materialize_file",
     ApexTaskInstructions => "apex_task_instructions",
     AgentPrompt => "agent_prompt",

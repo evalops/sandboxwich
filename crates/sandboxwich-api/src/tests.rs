@@ -238,6 +238,7 @@ async fn orb_sidecar_and_orb_executor_are_independent_one_per_sandbox_slots() {
         max_lifetime_seconds: None,
         idle_ttl_seconds: None,
         parent_snapshot_id: None,
+        last_activity_at: None,
     };
     let mut tx = db.pool.begin().await.unwrap();
     insert_sandbox_on_connection(&db, &mut tx, &sandbox)

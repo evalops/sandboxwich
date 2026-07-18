@@ -159,6 +159,7 @@ fn validate_functional_required_capability(capability: &WorkerCapability) -> Res
         }
         WorkerCapability::ProvisionSandbox
         | WorkerCapability::RunCommand
+        | WorkerCapability::UidIsolatedResidentProcess
         | WorkerCapability::MaterializeFile
         | WorkerCapability::ApexTaskInstructions
         | WorkerCapability::AgentPrompt
