@@ -2533,9 +2533,13 @@ fn guest_token_is_mounted_as_a_file_and_redacted_from_provider_metadata() {
     let pod = &handle.metadata["manifests"]["pod"];
     let env = pod["spec"]["containers"][0]["env"].as_array().unwrap();
     assert!(env.iter().any(|entry| {
-        entry["name"] == "SANDBOXWICH_API_TOKEN_FILE"
+        entry["name"] == "SANDBOXWICH_GUEST_TOKEN_FILE"
             && entry["value"] == "/run/sandboxwich/guest/api-token"
     }));
+    assert!(
+        !env.iter()
+            .any(|entry| entry["name"] == "SANDBOXWICH_API_TOKEN_FILE")
+    );
     assert!(env.iter().any(|entry| {
         entry["name"] == "SANDBOXWICH_SANDBOX_ID" && entry["value"] == sandbox_id.to_string()
     }));
