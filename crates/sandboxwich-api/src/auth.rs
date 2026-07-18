@@ -299,6 +299,16 @@ pub(crate) async fn ensure_lease_tenant(
 /// worker-scoped token can only touch its own leases, and a tenant-wide token
 /// is rejected outright rather than being allowed to act on any worker's
 /// lease.
+///
+/// When the caller authenticated with a per-sandbox guest token
+/// (`ctx.guest_sandbox_id()` is `Some`), this is where that credential's
+/// binding is actually enforced (see the doc comment on
+/// `ClaimLeaseRequest::sandbox_id`): the lease must belong to a `run_command`
+/// job whose sandbox -- own, fork parent, or fork child, via
+/// [`job_matches_sandbox`] -- matches the token's bound sandbox, or the
+/// route behaves as if the lease doesn't exist. A guest token can never
+/// renew, complete, fail, or append output to a lease outside its own
+/// sandbox, regardless of what a compromised guest process asks for.
 pub(crate) async fn ensure_lease_worker_scope(
     db: &Database,
     lease_id: LeaseId,
@@ -310,7 +320,7 @@ pub(crate) async fn ensure_lease_worker_scope(
         && (!matches!(
             lease.job.kind,
             JobKind::RunCommand | JobKind::RunResidentProcess
-        ) || sandbox_id_from_job(&lease.job)? != sandbox_id)
+        ) || !job_matches_sandbox(&lease.job, sandbox_id))
     {
         return Err(ApiError::not_found("resource not found"));
     }
