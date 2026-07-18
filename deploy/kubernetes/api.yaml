@@ -96,6 +96,15 @@ spec:
                   name: sandboxwich-secrets
                   key: api-token
                   optional: true
+            # Stable server-only derivation key for v2 resident placement
+            # attestations. Keep this value across API restarts; rotating it
+            # invalidates unredeemed proofs, while no raw proof is persisted.
+            - name: SANDBOXWICH_PLACEMENT_ATTESTATION_DERIVATION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sandboxwich-secrets
+                  key: placement-attestation-derivation-key
+                  optional: true
             - name: SANDBOXWICH_DEFAULT_TENANT
               value: default
           ports:

@@ -1694,8 +1694,11 @@ pub enum WorkerCapability {
 /// work on a worker.
 pub const PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL: &str =
     "provider_isolated_resident_process_version";
-pub const PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION: u32 = 1;
-pub const PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE: &str = "1";
+pub const PROVIDER_ISOLATED_RESIDENT_PROCESS_IMAGE_LABEL: &str =
+    "provider_isolated_resident_process_image";
+pub const PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_V1: u32 = 1;
+pub const PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION: u32 = 2;
+pub const PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE: &str = "2";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Worker {
@@ -1806,6 +1809,8 @@ pub struct CapacityResponse {
 
 pub const MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES: usize = 64 * 1024;
 pub const RESIDENT_PROCESS_BOOTSTRAP_PREFIX: &str = "/run/sandboxwich/bootstrap";
+pub const RESIDENT_PLACEMENT_ATTESTATION_FILE: &str =
+    "/run/sandboxwich/bootstrap/placement-attestation";
 
 /// The agent workload's resident process: the sandboxed agent itself. Runs
 /// under whatever uid the guest container/agent process already has -- no
@@ -1988,6 +1993,10 @@ pub struct ResidentProcessObservationRequest {
     pub exit_code: Option<i32>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_pod_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_pod_uid: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -2000,6 +2009,21 @@ pub struct ResidentProcessBootstrapReadRequest {
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct ResidentPlacementAttestationBootstrap {
+    pub token: String,
+}
+
+impl fmt::Debug for ResidentPlacementAttestationBootstrap {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResidentPlacementAttestationBootstrap")
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ResidentProcessBootstrapReadResponse {
     pub ok: bool,
     #[serde(with = "serde_base64_bytes")]
@@ -2008,6 +2032,8 @@ pub struct ResidentProcessBootstrapReadResponse {
     pub sha256: String,
     pub target_file: String,
     pub mode: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_attestation: Option<ResidentPlacementAttestationBootstrap>,
 }
 
 impl fmt::Debug for ResidentProcessBootstrapReadResponse {
@@ -2022,8 +2048,63 @@ impl fmt::Debug for ResidentProcessBootstrapReadResponse {
             .field("sha256", &self.sha256)
             .field("target_file", &self.target_file)
             .field("mode", &format_args!("{:#o}", self.mode))
+            .field("placement_attestation", &self.placement_attestation)
             .finish()
     }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RedeemResidentPlacementAttestationRequest {
+    pub token: String,
+    pub idempotency_key: Uuid,
+}
+
+impl fmt::Debug for RedeemResidentPlacementAttestationRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RedeemResidentPlacementAttestationRequest")
+            .field("token", &"<redacted>")
+            .field("idempotency_key", &self.idempotency_key)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ValidateResidentPlacementAttestationRequest {
+    pub attestation_id: Uuid,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentPlacementClaims {
+    pub version: u32,
+    pub attestation_id: Uuid,
+    pub tenant_id: String,
+    pub sandbox_id: SandboxId,
+    pub resident_process_id: ResidentProcessId,
+    pub resident_process_generation: u64,
+    pub lease_id: Uuid,
+    pub lease_attempt: u64,
+    pub job_id: JobId,
+    #[schema(value_type = Uuid)]
+    pub worker_id: WorkerId,
+    pub placement_generation: u64,
+    pub provider_pod_uid: String,
+    pub provider_mode: String,
+    pub runtime_image: String,
+    pub provider_isolation_version: u32,
+    pub issued_at: DateTime<Utc>,
+    pub attestation_expires_at: DateTime<Utc>,
+    pub lease_expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentPlacementAttestationResponse {
+    pub ok: bool,
+    pub claims: ResidentPlacementClaims,
 }
 
 impl fmt::Debug for ResidentProcessRequest {
@@ -3057,6 +3138,37 @@ pub struct SshKeyListResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resident_placement_attestation_is_additive_and_debug_redacted() {
+        let response = ResidentProcessBootstrapReadResponse {
+            ok: true,
+            content: b"bootstrap".to_vec(),
+            sha256: "digest".into(),
+            target_file: "/run/bootstrap".into(),
+            mode: 0o400,
+            placement_attestation: Some(ResidentPlacementAttestationBootstrap {
+                token: "placement-secret-canary".into(),
+            }),
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            encoded["placementAttestation"]["token"],
+            "placement-secret-canary"
+        );
+        assert!(!format!("{response:?}").contains("placement-secret-canary"));
+
+        let legacy: ResidentProcessBootstrapReadResponse =
+            serde_json::from_value(serde_json::json!({
+                "ok": true,
+                "content": "Ym9vdHN0cmFw",
+                "sha256": "digest",
+                "targetFile": "/run/bootstrap",
+                "mode": 256
+            }))
+            .unwrap();
+        assert!(legacy.placement_attestation.is_none());
+    }
 
     #[derive(Debug, Deserialize, Eq, PartialEq)]
     #[serde(rename_all = "snake_case")]

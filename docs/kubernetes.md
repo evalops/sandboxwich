@@ -95,7 +95,7 @@ Apply mode uses the pod ServiceAccount and `kubectl` to create the sandbox PVC, 
 
 Set `SANDBOXWICH_ISOLATED_RESIDENT_PROCESS_IMAGE` to an immutable image digest
 and configure a nonempty `--runtime-class-name` to advertise the versioned
-worker label `provider_isolated_resident_process_version=1`. The label is never advertised in
+worker label `provider_isolated_resident_process_version=2`. The label is never advertised in
 dry-run mode or when either setting is absent. The authoritative worker then
 runs `orb-sidecar` in a dedicated Pod rather than inside the guest Pod. The
 sidecar has separate mount, PID, and network namespaces, no service-account
@@ -108,6 +108,33 @@ Pod, Secret, and dedicated NetworkPolicy names are fenced by
 generation and lease so cleanup from an expired lease cannot delete a
 replacement. The policy denies all ingress and allows only cluster DNS plus
 public HTTPS egress, excluding configured control-plane and metadata CIDRs.
+
+V2 adds a second immutable Secret key mounted only in the sidecar at
+`/run/sandboxwich/bootstrap/placement-attestation` with mode `0400`. The API
+stores only its SHA-256 digest and derives the opaque value from the exact
+process/generation/lease/worker/placement/image fence using the stable
+server-only `SANDBOXWICH_PLACEMENT_ATTESTATION_DERIVATION_KEY` (minimum 32
+bytes). Orb redeems it once through the ordinary tenant-authenticated backend
+API, using `POST /v1/resident-placement-attestations/redeem`; an exact
+idempotency retry is recoverable, while a distinct replay fails. Renewals use
+`POST /v1/resident-placement-attestations/validate`, which rechecks the live
+lease, placement generation, worker, digest-pinned sidecar image, and
+Kubernetes-assigned Pod UID without accepting the raw proof. The sidecar never
+receives a Sandboxwich API credential.
+
+Kubernetes Secret volumes remain read-only and are mounted only into a
+non-root init container. That container copies the bootstrap files into a
+memory-backed, sidecar-only `emptyDir`; the main sidecar mounts only that
+writable handoff and unlinks each credential after reading it. The immutable
+source Secret is never mounted into the running sidecar container.
+
+For a private Orb endpoint, set the repeatable
+`--isolated-sidecar-https-cidr` option or comma-separated
+`SANDBOXWICH_ISOLATED_SIDECAR_HTTPS_CIDRS`. Only the isolated sidecar receives
+these exact TCP/443 egress rules. IPv4 ranges must be `/24` or narrower and
+IPv6 `/64` or narrower; all-address, loopback, link-local/metadata, multicast,
+and other hard-forbidden destinations are rejected. Use a stable narrow
+private endpoint rather than a changing DNS address.
 
 Pending Pods do not report `Starting` until the container has actually
 started. `SANDBOXWICH_ISOLATED_RESIDENT_PROCESS_STARTUP_TIMEOUT_SECS` (default
@@ -355,13 +382,14 @@ received its migrations, including when an operator bypasses the script.
 
 ## Apply The API Manifests
 
-The starter manifests in `deploy/kubernetes/` expect a Secret named `sandboxwich-secrets` with `database-url`. Add `api-token` through your existing secret-management path when the API should require bearer auth.
+The starter manifests in `deploy/kubernetes/` expect a Secret named `sandboxwich-secrets` with `database-url`. Add `api-token` through your existing secret-management path when the API should require bearer auth. Add a stable random `placement-attestation-derivation-key` of at least 32 bytes before enabling provider-isolation v2.
 
 ```sh
 kubectl create namespace sandboxwich
 kubectl -n sandboxwich create secret generic sandboxwich-secrets \
   --from-literal=database-url='postgres://user:password@postgres.example:5432/sandboxwich' \
-  --from-literal=api-token='replace-through-secret-management'
+  --from-literal=api-token='replace-through-secret-management' \
+  --from-literal=placement-attestation-derivation-key='replace-with-at-least-32-random-bytes'
 deploy/kubernetes/apply-api.sh
 ```
 

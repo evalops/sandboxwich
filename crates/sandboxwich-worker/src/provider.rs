@@ -23,10 +23,11 @@ use sandboxwich_core::{
     PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE, ProviderCapabilityReport,
     ProviderForkHandle, ProviderHealthReport, ProviderHealthStatus, ProviderRuntimeResource,
     ProviderSandboxHandle, ProviderSnapshotHandle, ProvisioningErrorClass, ProvisioningStage,
-    ProvisioningStageUpdateRequest, RESIDENT_PROCESS_BOOTSTRAP_PREFIX, ResidentProcessId,
-    RuntimeResourceInventoryResponse, RuntimeResourceKind, RuntimeResourcePurpose,
-    RuntimeResourceStatus, SandboxId, SandboxProvisionSpec, SandboxRuntimeProfile, SnapshotId,
-    WorkerCapability, WorkspaceMode, validate_agent_command_request,
+    ProvisioningStageUpdateRequest, RESIDENT_PLACEMENT_ATTESTATION_FILE,
+    RESIDENT_PROCESS_BOOTSTRAP_PREFIX, ResidentProcessId, RuntimeResourceInventoryResponse,
+    RuntimeResourceKind, RuntimeResourcePurpose, RuntimeResourceStatus, SandboxId,
+    SandboxProvisionSpec, SandboxRuntimeProfile, SnapshotId, WorkerCapability, WorkspaceMode,
+    validate_agent_command_request,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -263,6 +264,7 @@ pub struct IsolatedResidentProcessBootstrap {
     pub content: Vec<u8>,
     pub target_file: String,
     pub mode: u32,
+    pub placement_attestation: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for IsolatedResidentProcessBootstrap {
@@ -275,6 +277,13 @@ impl std::fmt::Debug for IsolatedResidentProcessBootstrap {
             )
             .field("target_file", &self.target_file)
             .field("mode", &format_args!("{:#o}", self.mode))
+            .field(
+                "placement_attestation",
+                &self
+                    .placement_attestation
+                    .as_ref()
+                    .map(|value| format!("<redacted:{} bytes>", value.len())),
+            )
             .finish()
     }
 }
@@ -476,6 +485,10 @@ pub struct KubernetesDryRunProvider {
     /// metadata carve-out can't be silently dropped by an override; use
     /// `with_egress_excluded_cidrs_replace` to opt out of that merge.
     egress_excluded_cidrs: Vec<String>,
+    /// Narrow CIDRs that only provider-isolated sidecars may reach over
+    /// TCP/443. These bypass the ordinary private-range carve-outs by design;
+    /// startup validation rejects broad and hard-forbidden destinations.
+    isolated_sidecar_https_cidrs: Vec<String>,
     /// Namespace containing pods allowed to reach a sandbox's ssh/desktop
     /// ports via the rendered ingress NetworkPolicy. Falls back to
     /// `namespace` (the control-plane namespace) when unset (GH-67).
@@ -539,6 +552,7 @@ impl KubernetesDryRunProvider {
                 .iter()
                 .map(|cidr| cidr.to_string())
                 .collect(),
+            isolated_sidecar_https_cidrs: Vec::new(),
             ingress_namespace: None,
             ingress_pod_selector: BTreeMap::from([(
                 DEFAULT_INGRESS_SELECTOR_KEY.to_string(),
@@ -735,6 +749,47 @@ impl KubernetesDryRunProvider {
             .map(|cidr| cidr.trim().to_string())
             .filter(|cidr| !cidr.is_empty() && seen.insert(cidr.clone()))
             .collect()
+    }
+
+    pub fn with_isolated_sidecar_https_cidrs(mut self, cidrs: Vec<String>) -> anyhow::Result<Self> {
+        let mut normalized = std::collections::BTreeSet::new();
+        for value in cidrs {
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            let network = IpNet::from_str(value)
+                .with_context(|| format!("invalid isolated sidecar HTTPS CIDR {value}"))?;
+            let minimum_prefix = if network.addr().is_ipv4() { 24 } else { 64 };
+            anyhow::ensure!(
+                network.prefix_len() >= minimum_prefix,
+                "isolated sidecar HTTPS CIDR {network} is broader than /{minimum_prefix}"
+            );
+            let address = network.network();
+            let hard_forbidden = match address {
+                IpAddr::V4(address) => {
+                    address.is_unspecified()
+                        || address.is_loopback()
+                        || address.is_link_local()
+                        || address.is_multicast()
+                        || address.is_broadcast()
+                }
+                IpAddr::V6(address) => {
+                    address.is_unspecified()
+                        || address.is_loopback()
+                        || address.is_unicast_link_local()
+                        || address.is_multicast()
+                        || address.to_ipv4_mapped().is_some()
+                }
+            };
+            anyhow::ensure!(
+                !hard_forbidden,
+                "isolated sidecar HTTPS CIDR {network} targets a hard-forbidden destination"
+            );
+            normalized.insert(network.to_string());
+        }
+        self.isolated_sidecar_https_cidrs = normalized.into_iter().collect();
+        Ok(self)
     }
 
     pub fn with_ingress_namespace(mut self, ingress_namespace: Option<String>) -> Self {
@@ -3810,6 +3865,17 @@ impl KubernetesApplyProvider {
                     .all(|component| { matches!(component, std::path::Component::Normal(_)) }),
             "isolated resident-process bootstrap target is invalid"
         );
+        if let Some(attestation) = &spec.bootstrap.placement_attestation {
+            anyhow::ensure!(
+                !attestation.is_empty()
+                    && attestation.len() <= MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES,
+                "isolated resident-process placement attestation must be between 1 byte and 64 KiB"
+            );
+            anyhow::ensure!(
+                spec.bootstrap.target_file != RESIDENT_PLACEMENT_ATTESTATION_FILE,
+                "isolated resident-process bootstrap target collides with the placement attestation path"
+            );
+        }
         Ok(())
     }
 
@@ -3838,6 +3904,31 @@ impl KubernetesApplyProvider {
             .expect("validated bootstrap target")
             .to_string_lossy()
             .into_owned();
+        let mut secret_data = Map::from_iter([(
+            "bootstrap".to_string(),
+            json!(general_purpose::STANDARD.encode(&spec.bootstrap.content)),
+        )]);
+        let mut secret_items = vec![json!({
+            "key": "bootstrap",
+            "path": relative_target,
+            "mode": spec.bootstrap.mode,
+        })];
+        if let Some(attestation) = &spec.bootstrap.placement_attestation {
+            secret_data.insert(
+                "placement-attestation".to_string(),
+                json!(general_purpose::STANDARD.encode(attestation)),
+            );
+            let attestation_path = std::path::Path::new(RESIDENT_PLACEMENT_ATTESTATION_FILE)
+                .strip_prefix(RESIDENT_PROCESS_BOOTSTRAP_PREFIX)
+                .expect("placement attestation path is under the bootstrap root")
+                .to_string_lossy()
+                .into_owned();
+            secret_items.push(json!({
+                "key": "placement-attestation",
+                "path": attestation_path,
+                "mode": 0o400,
+            }));
+        }
         let secret = json!({
             "apiVersion": "v1",
             "kind": "Secret",
@@ -3848,11 +3939,20 @@ impl KubernetesApplyProvider {
             },
             "type": "Opaque",
             "immutable": true,
-            "data": {
-                "bootstrap": general_purpose::STANDARD.encode(&spec.bootstrap.content),
-            },
+            "data": secret_data,
         });
         let mut network_egress = self.dry_run.dns_egress_rules();
+        network_egress.extend(
+            self.dry_run
+                .isolated_sidecar_https_cidrs
+                .iter()
+                .map(|cidr| {
+                    json!({
+                        "to": [{ "ipBlock": { "cidr": cidr } }],
+                        "ports": [{ "protocol": "TCP", "port": 443 }],
+                    })
+                }),
+        );
         network_egress.push(json!({
             "to": [{ "ipBlock": self.dry_run.ip_block("0.0.0.0/0")? }],
             "ports": [{ "protocol": "TCP", "port": 443 }],
@@ -3902,7 +4002,6 @@ impl KubernetesApplyProvider {
                 {
                     "name": "bootstrap",
                     "mountPath": RESIDENT_PROCESS_BOOTSTRAP_PREFIX,
-                    "readOnly": true,
                 },
                 {
                     "name": "tmp",
@@ -3940,18 +4039,57 @@ impl KubernetesApplyProvider {
                     "fsGroup": ORB_SIDECAR_RESIDENT_PROCESS_UID,
                     "seccompProfile": { "type": "RuntimeDefault" },
                 },
+                "initContainers": [{
+                    "name": "bootstrap-handoff",
+                    "image": self
+                        .isolated_resident_process_image()
+                        .expect("validated sidecar image"),
+                    "imagePullPolicy": "IfNotPresent",
+                    "command": [
+                        "/bin/sh",
+                        "-c",
+                        "set -eu; cp -R /source/. /run/sandboxwich/bootstrap/; chmod -R go-rwx /run/sandboxwich/bootstrap",
+                    ],
+                    "securityContext": {
+                        "allowPrivilegeEscalation": false,
+                        "readOnlyRootFilesystem": true,
+                        "runAsNonRoot": true,
+                        "runAsUser": ORB_SIDECAR_RESIDENT_PROCESS_UID,
+                        "runAsGroup": ORB_SIDECAR_RESIDENT_PROCESS_UID,
+                        "capabilities": { "drop": ["ALL"] },
+                        "seccompProfile": { "type": "RuntimeDefault" },
+                    },
+                    "resources": {
+                        "requests": { "cpu": "10m", "memory": "16Mi" },
+                        "limits": { "cpu": "100m", "memory": "32Mi" },
+                    },
+                    "volumeMounts": [
+                        {
+                            "name": "bootstrap-source",
+                            "mountPath": "/source",
+                            "readOnly": true,
+                        },
+                        {
+                            "name": "bootstrap",
+                            "mountPath": RESIDENT_PROCESS_BOOTSTRAP_PREFIX,
+                        },
+                    ],
+                }],
                 "containers": [container],
                 "volumes": [
                     {
-                        "name": "bootstrap",
+                        "name": "bootstrap-source",
                         "secret": {
                             "secretName": secret_name,
                             "defaultMode": spec.bootstrap.mode,
-                            "items": [{
-                                "key": "bootstrap",
-                                "path": relative_target,
-                                "mode": spec.bootstrap.mode,
-                            }],
+                            "items": secret_items,
+                        },
+                    },
+                    {
+                        "name": "bootstrap",
+                        "emptyDir": {
+                            "medium": "Memory",
+                            "sizeLimit": "1Mi",
                         },
                     },
                     {

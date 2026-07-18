@@ -770,6 +770,7 @@ pub(crate) struct AppState {
     pub(crate) auth: AuthConfig,
     pub(crate) default_tenant_id: String,
     pub(crate) apex_callback_base_url: Option<String>,
+    pub(crate) placement_attestation_derivation_key: Option<Arc<str>>,
     pub(crate) apex_waiters: ApexInstructionWaiters,
     pub(crate) resident_bootstraps: ResidentBootstrapStore,
     pub(crate) sandbox_lifetime: SandboxLifetimeConfig,

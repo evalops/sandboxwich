@@ -14,7 +14,176 @@ fn isolated_sidecar_spec(bootstrap: &[u8]) -> IsolatedResidentProcessSpec {
             content: bootstrap.to_vec(),
             target_file: "/run/sandboxwich/bootstrap/orb-token".to_string(),
             mode: 0o400,
+            placement_attestation: None,
         },
+    }
+}
+
+#[test]
+fn isolated_sidecar_v2_mounts_attestation_as_a_separate_secret_file() {
+    let image = format!("ghcr.io/evalops/orb-sidecar@sha256:{}", "d".repeat(64));
+    let provider = KubernetesApplyProvider::new(
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Gvisor)
+            .with_runtime_class_name(Some("gvisor".to_string())),
+        "kubectl",
+    )
+    .with_isolated_resident_process_image(Some(image));
+    let mut spec = isolated_sidecar_spec(b"orb-bootstrap-canary");
+    spec.bootstrap.placement_attestation = Some(b"placement-attestation-canary".to_vec());
+
+    let manifests = provider
+        .isolated_resident_process_manifests(&spec)
+        .expect("a v2 isolated sidecar should render");
+    let secret = &manifests[0];
+    let pod = &manifests[2];
+    assert_eq!(
+        secret["data"]["placement-attestation"],
+        general_purpose::STANDARD.encode(b"placement-attestation-canary")
+    );
+    let items = pod["spec"]["volumes"][0]["secret"]["items"]
+        .as_array()
+        .expect("secret items");
+    assert!(items.iter().any(|item| {
+        item["key"] == "placement-attestation"
+            && item["path"] == "placement-attestation"
+            && item["mode"] == 0o400
+    }));
+    let init = &pod["spec"]["initContainers"][0];
+    assert_eq!(init["name"], "bootstrap-handoff");
+    assert_eq!(init["volumeMounts"][0]["name"], "bootstrap-source");
+    assert_eq!(init["volumeMounts"][0]["readOnly"], true);
+    assert_eq!(init["volumeMounts"][1]["name"], "bootstrap");
+    assert_eq!(pod["spec"]["volumes"][1]["emptyDir"]["medium"], "Memory");
+    let main_mounts = pod["spec"]["containers"][0]["volumeMounts"]
+        .as_array()
+        .unwrap();
+    assert!(main_mounts.iter().any(|mount| {
+        mount["name"] == "bootstrap"
+            && mount["mountPath"] == RESIDENT_PROCESS_BOOTSTRAP_PREFIX
+            && mount.get("readOnly").is_none()
+    }));
+    assert!(
+        !main_mounts
+            .iter()
+            .any(|mount| mount["name"] == "bootstrap-source")
+    );
+    let rendered = serde_json::to_string(&manifests).unwrap();
+    assert!(!rendered.contains("placement-attestation-canary"));
+    let encoded_attestation = general_purpose::STANDARD.encode(b"placement-attestation-canary");
+    assert!(
+        !serde_json::to_string(&manifests[1])
+            .unwrap()
+            .contains(&encoded_attestation)
+    );
+    assert!(
+        !serde_json::to_string(&manifests[2])
+            .unwrap()
+            .contains(&encoded_attestation)
+    );
+    let debug = format!("{spec:?}");
+    assert!(!debug.contains("placement-attestation-canary"));
+    assert!(!debug.contains(&encoded_attestation));
+}
+
+#[test]
+fn isolated_sidecar_v2_rejects_bootstrap_attestation_path_collision() {
+    let image = format!("ghcr.io/evalops/orb-sidecar@sha256:{}", "f".repeat(64));
+    let provider = KubernetesApplyProvider::new(
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Gvisor)
+            .with_runtime_class_name(Some("gvisor".to_string())),
+        "kubectl",
+    )
+    .with_isolated_resident_process_image(Some(image));
+    let mut spec = isolated_sidecar_spec(b"bootstrap");
+    spec.bootstrap.target_file = RESIDENT_PLACEMENT_ATTESTATION_FILE.to_string();
+    spec.bootstrap.placement_attestation = Some(b"attestation".to_vec());
+    let error = provider
+        .isolated_resident_process_manifests(&spec)
+        .expect_err("the two secret keys must never target the same file");
+    assert!(error.to_string().contains("collides"));
+}
+
+#[test]
+fn isolated_sidecar_private_https_cidrs_are_exact_deduplicated_and_sidecar_only() {
+    let image = format!("ghcr.io/evalops/orb-sidecar@sha256:{}", "e".repeat(64));
+    let dry_run =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Gvisor)
+            .with_runtime_class_name(Some("gvisor".to_string()))
+            .with_isolated_sidecar_https_cidrs(vec![
+                " 10.20.30.0/24 ".to_string(),
+                "10.20.30.0/24".to_string(),
+                "fd12:3456:789a::/64".to_string(),
+            ])
+            .expect("narrow private issuer CIDRs should be accepted");
+    let provider = KubernetesApplyProvider::new(dry_run.clone(), "kubectl")
+        .with_isolated_resident_process_image(Some(image));
+    let manifests = provider
+        .isolated_resident_process_manifests(&isolated_sidecar_spec(b"bootstrap"))
+        .expect("isolated sidecar should render");
+    let egress = manifests[1]["spec"]["egress"].as_array().unwrap();
+    let exact_https = egress
+        .iter()
+        .filter(|rule| {
+            rule["ports"] == json!([{ "protocol": "TCP", "port": 443 }])
+                && matches!(
+                    rule["to"][0]["ipBlock"]["cidr"].as_str(),
+                    Some("10.20.30.0/24" | "fd12:3456:789a::/64")
+                )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(exact_https.len(), 2);
+    assert!(
+        exact_https
+            .iter()
+            .all(|rule| { rule["to"][0]["ipBlock"].get("except").is_none() })
+    );
+    assert_eq!(egress[0]["ports"][0]["port"], 53);
+    assert!(egress.iter().any(|rule| {
+        rule["to"][0]["ipBlock"]["cidr"] == "0.0.0.0/0" && rule["ports"][0]["port"] == 443
+    }));
+    assert_eq!(manifests[1]["spec"]["ingress"], json!([]));
+
+    let ordinary = dry_run
+        .provision(
+            SandboxId::new(),
+            &SandboxProvisionSpec {
+                network_egress: NetworkEgress::DenyAll,
+                ..SandboxProvisionSpec::default()
+            },
+            &CancelSignal::never_cancelled(),
+        )
+        .expect("ordinary sandbox plan");
+    let ordinary_json = serde_json::to_string(&ordinary).unwrap();
+    assert!(!ordinary_json.contains("10.20.30.0/24"));
+    assert!(!ordinary_json.contains("fd12:3456:789a::/64"));
+}
+
+#[test]
+fn isolated_sidecar_private_https_cidrs_reject_unsafe_destinations() {
+    for cidr in [
+        "not-a-cidr",
+        "0.0.0.0/0",
+        "::/0",
+        "10.0.0.0/23",
+        "fd12:3456::/63",
+        "169.254.169.254/32",
+        "fe80::/64",
+        "127.0.0.1/32",
+        "::1/128",
+        "224.0.0.0/24",
+        "ff00::/64",
+        "::ffff:169.254.169.254/128",
+    ] {
+        let result =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_isolated_sidecar_https_cidrs(vec![cidr.to_string()]);
+        assert!(
+            result.is_err(),
+            "unsafe destination {cidr} must be rejected"
+        );
     }
 }
 
@@ -106,6 +275,14 @@ fn isolated_sidecar_manifests_are_separate_fenced_and_secret_safe() {
     assert_eq!(
         secret["data"]["bootstrap"],
         general_purpose::STANDARD.encode(bootstrap)
+    );
+    assert!(secret["data"].get("placement-attestation").is_none());
+    assert_eq!(
+        pod["spec"]["volumes"][0]["secret"]["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
     );
     for manifest in &manifests {
         let name = manifest["metadata"]["name"].as_str().unwrap();
@@ -311,7 +488,9 @@ fn isolated_sidecar_run_observes_terminal_state_and_always_cleans_up() {
             .capability_report()
             .labels
             .get("provider_isolated_resident_process_version")
-            .is_some_and(|version| version == "1")
+            .is_some_and(|version| {
+                version == PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE
+            })
     );
     let bootstrap = b"sidecar-lifecycle-canary";
     let spec = isolated_sidecar_spec(bootstrap);

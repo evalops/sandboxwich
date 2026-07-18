@@ -622,6 +622,8 @@ async fn reconcile_resident_completion(
                 exit_code: None,
                 error_code: Some("daemon_shutdown".into()),
                 error_message: Some("resident process was stopped during daemon shutdown".into()),
+                provider_pod_name: None,
+                provider_pod_uid: None,
             },
         )
         .await
@@ -1654,6 +1656,8 @@ async fn complete_desired_stop_resident_lease(
         exit_code: Some(0),
         error_code: None,
         error_message: None,
+        provider_pod_name: None,
+        provider_pod_uid: None,
     };
     let mut backoff = Backoff::new(RESIDENT_OBSERVATION_RETRY_DELAY);
     loop {
@@ -1737,6 +1741,8 @@ async fn reconcile_resident_cancellation(
             exit_code: None,
             error_code: Some("lease_lost".into()),
             error_message: Some("resident process lease renewal was lost".into()),
+            provider_pod_name: None,
+            provider_pod_uid: None,
         },
     )
     .await?;
@@ -1931,6 +1937,8 @@ async fn handle_resident_process_with_bootstrap_root(
                             exit_code: None,
                             error_code: Some("resident_process_spawn_failed".into()),
                             error_message: Some(error_message.clone()),
+                            provider_pod_name: None,
+                            provider_pod_uid: None,
                         },
                         &cancellation,
                     )
@@ -1959,6 +1967,8 @@ async fn handle_resident_process_with_bootstrap_root(
                     exit_code: None,
                     error_code: None,
                     error_message: None,
+                    provider_pod_name: None,
+                    provider_pod_uid: None,
                 },
                 &cancellation,
             )
@@ -1981,6 +1991,8 @@ async fn handle_resident_process_with_bootstrap_root(
                     exit_code: None,
                     error_code: None,
                     error_message: None,
+                    provider_pod_name: None,
+                    provider_pod_uid: None,
                 },
                 &cancellation,
             )
@@ -2028,6 +2040,8 @@ async fn handle_resident_process_with_bootstrap_root(
                 exit_code: last_exit_code,
                 error_code: (last_exit_code != Some(0)).then(|| "resident_process_exit".into()),
                 error_message: None,
+                provider_pod_name: None,
+                provider_pod_uid: None,
             },
             &cancellation,
         )
@@ -2680,6 +2694,7 @@ mod tests {
                 sha256: "test-bootstrap-sha".into(),
                 target_file: target.to_string_lossy().into_owned(),
                 mode: 0o600,
+                placement_attestation: None,
             },
             lease: lease.clone(),
             bootstrap_read: Arc::new(AtomicBool::new(false)),
@@ -2769,6 +2784,7 @@ mod tests {
                 sha256: "test-bootstrap-sha".into(),
                 target_file: target.to_string_lossy().into_owned(),
                 mode: 0o600,
+                placement_attestation: None,
             },
             lease: lease.clone(),
             bootstrap_read: Arc::new(AtomicBool::new(false)),

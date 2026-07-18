@@ -762,6 +762,7 @@ mod tests {
             },
             default_tenant_id: sandbox.tenant_id.clone(),
             apex_callback_base_url: Some("http://127.0.0.1:3217".into()),
+            placement_attestation_derivation_key: None,
             // An empty fresh registry models restart or a callback routed to
             // the wrong API replica while durable lineage survives.
             apex_waiters: ApexInstructionWaiters::default(),
