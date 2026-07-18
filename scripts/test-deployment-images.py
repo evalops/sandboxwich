@@ -105,11 +105,19 @@ class DeploymentImagesTest(unittest.TestCase):
 
     def test_worker_enables_fenced_orphan_cleanup(self) -> None:
         worker_text = (ROOT / "deploy/kubernetes/worker.yaml").read_text()
-        self.assertIn("- --orphan-reconciliation-apply", worker_text)
-        self.assertIn("name: SANDBOXWICH_ORPHAN_RECONCILIATION_APPLY", worker_text)
+        self.assertEqual(worker_text.count("- --orphan-reconciliation-apply"), 1)
+        self.assertEqual(
+            worker_text.count("name: SANDBOXWICH_ORPHAN_RECONCILIATION_APPLY"), 1
+        )
         self.assertIn('value: "1"', worker_text)
         self.assertIn(
             "value: http://sandboxwich-api.sandboxwich.svc:3217", worker_text
+        )
+
+        conformance = (ROOT / "deploy/kubernetes/kind-conformance.sh").read_text()
+        self.assertNotIn("kubectl -n sandboxwich set env", conformance)
+        self.assertNotIn(
+            '"value":"--orphan-reconciliation-apply"', conformance
         )
 
     def test_kind_conformance_rewrites_pinned_images_to_local_builds(self) -> None:

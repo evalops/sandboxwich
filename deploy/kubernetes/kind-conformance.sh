@@ -329,10 +329,10 @@ runtimeclass_resources="$(kubectl -n sandboxwich-sandboxes get pod,pvc,service,n
   fail "unexpected resources exist in isolated RuntimeClass case: ${runtimeclass_resources}"
 kubectl delete -f "${TMP_DIR}/runtimeclass-pvc.json" --wait=true
 
-# Product-owned orphan reconciliation is dry-run by default and requires both
-# its CLI flag and environment opt-in before it may delete. Exercise the real
-# UID-preconditioned in-cluster DELETE path in this disposable namespace while
-# proving that an unlabeled foreign Secret survives.
+# The production worker manifest enables both orphan-reconciliation gates.
+# Exercise the real UID-preconditioned in-cluster DELETE path on worker startup
+# in this disposable namespace while proving that an unlabeled foreign Secret
+# survives.
 orphan_id="00000000-0000-7000-8000-000000000147"
 kubectl -n sandboxwich-sandboxes create secret generic "sandboxwich-orphan-${orphan_id}" \
   --from-literal=value=orphan >/dev/null
@@ -340,11 +340,7 @@ kubectl -n sandboxwich-sandboxes label secret "sandboxwich-orphan-${orphan_id}" 
   "sandboxwich.dev/sandbox-id=${orphan_id}" >/dev/null
 kubectl -n sandboxwich-sandboxes create secret generic sandboxwich-foreign-secret \
   --from-literal=value=foreign >/dev/null
-kubectl -n sandboxwich set env deployment/sandboxwich-worker \
-  SANDBOXWICH_ORPHAN_RECONCILIATION_APPLY=1 >/dev/null
-kubectl -n sandboxwich patch deployment sandboxwich-worker --type=json \
-  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--orphan-reconciliation-apply"}]' \
-  >/dev/null
+kubectl -n sandboxwich delete pod -l app.kubernetes.io/name=sandboxwich-worker --wait=true
 kubectl -n sandboxwich rollout status deployment/sandboxwich-worker --timeout=120s
 for _ in $(seq 1 60); do
   if ! kubectl -n sandboxwich-sandboxes get secret "sandboxwich-orphan-${orphan_id}" \
