@@ -75,9 +75,16 @@ RUN apt-get update \
 # `runtime-shared`: same runtime-base image, but its binary comes from the
 # shared multi-binary `builder-shared` stage above (kind workflow only; see
 # comment there). Selecting the file by ARG BIN out of the already-compiled
-# target/release/ directory is a plain COPY source substitution, not a
-# stage-name selection, so it needs no special Dockerfile syntax.
+# target/release/ directory is a plain COPY source substitution.
 FROM runtime-base AS runtime-shared
+
+# ARG scope is per-stage: without this redeclaration, whether ${BIN} expands
+# in the COPY below is BuildKit-frontend-version-dependent (some versions
+# expand it, others leave it empty -- which silently copies the ENTIRE
+# target/release tree to /usr/local/bin/sandboxwich as a directory and
+# breaks the entrypoint). Verified empirically across builders; never
+# remove this line.
+ARG BIN
 
 COPY --from=builder-shared /src/target/release/${BIN} /usr/local/bin/sandboxwich
 
