@@ -2477,16 +2477,43 @@ fn adoption_contract(resource: &Value) -> anyhow::Result<Value> {
             spec
         }
         "FQDNNetworkPolicy" => resource["spec"].clone(),
-        "Pod" => json!({
-            "runtimeClassName": resource["spec"]["runtimeClassName"],
-            "automountServiceAccountToken": resource["spec"]["automountServiceAccountToken"],
-            "hostNetwork": resource["spec"]["hostNetwork"].as_bool().unwrap_or(false),
-            "hostPID": resource["spec"]["hostPID"].as_bool().unwrap_or(false),
-            "hostIPC": resource["spec"]["hostIPC"].as_bool().unwrap_or(false),
-            "securityContext": resource["spec"]["securityContext"],
-            "containers": resource["spec"]["containers"],
-            "volumes": resource["spec"]["volumes"],
-        }),
+        "Pod" => {
+            let mut containers = resource["spec"]["containers"].clone();
+            if let Some(containers) = containers.as_array_mut() {
+                for container in containers {
+                    let Some(env) = container["env"].as_array_mut() else {
+                        continue;
+                    };
+                    let has_guest_token = env
+                        .iter()
+                        .any(|entry| entry["name"] == "SANDBOXWICH_GUEST_TOKEN_FILE");
+                    if has_guest_token {
+                        // A lost-response replay may be leased by a replacement
+                        // worker. Preserve the running pod's original guest-token
+                        // binding instead of treating the replacement worker id
+                        // as immutable pod drift. The id is routing metadata, not
+                        // authority; the mounted guest token remains the scoped
+                        // credential and every other env field must still match.
+                        for entry in env
+                            .iter_mut()
+                            .filter(|entry| entry["name"] == "SANDBOXWICH_WORKER_ID")
+                        {
+                            entry["value"] = json!("<placement-worker>");
+                        }
+                    }
+                }
+            }
+            json!({
+                "runtimeClassName": resource["spec"]["runtimeClassName"],
+                "automountServiceAccountToken": resource["spec"]["automountServiceAccountToken"],
+                "hostNetwork": resource["spec"]["hostNetwork"].as_bool().unwrap_or(false),
+                "hostPID": resource["spec"]["hostPID"].as_bool().unwrap_or(false),
+                "hostIPC": resource["spec"]["hostIPC"].as_bool().unwrap_or(false),
+                "securityContext": resource["spec"]["securityContext"],
+                "containers": containers,
+                "volumes": resource["spec"]["volumes"],
+            })
+        }
         "Service" => json!({
             "type": resource["spec"]["type"],
             "selector": resource["spec"]["selector"],
