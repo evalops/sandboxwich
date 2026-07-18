@@ -213,9 +213,15 @@ command_response="$(run_command "${deny_id}" '["sh","-c","printf sandboxwich-liv
 kubectl -n sandboxwich-sandboxes exec "sandboxwich-${deny_id}" -- \
   sh -c 'test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token'
 api_service_ip="$(kubectl -n sandboxwich get service sandboxwich-api -o jsonpath='{.spec.clusterIP}')"
-if kubectl -n sandboxwich-sandboxes exec "sandboxwich-${deny_id}" -- nc -z -w 3 "${api_service_ip}" 3217; then
-  fail "deny-all sandbox reached the API service"
+if ! unauthenticated_api_status="$(
+  kubectl -n sandboxwich-sandboxes exec "sandboxwich-${deny_id}" -- \
+    curl -sS -o /dev/null -w '%{http_code}' --max-time 5 \
+      "http://${api_service_ip}:3217/jobs"
+)"; then
+  fail "deny-all sandbox could not reach its authenticated API control channel"
 fi
+[[ "${unauthenticated_api_status}" == "401" ]] || \
+  fail "deny-all sandbox bypassed API authentication (status ${unauthenticated_api_status})"
 stop_sandbox "${deny_id}"
 
 source_id="$(create_sandbox conformance-source allow_all)"
