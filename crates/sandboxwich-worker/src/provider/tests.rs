@@ -1,6 +1,309 @@
 use super::*;
 use sandboxwich_core::{MAX_COMMAND_STDIN_BYTES, NetworkAllowRule};
 
+fn isolated_sidecar_spec(bootstrap: &[u8]) -> IsolatedResidentProcessSpec {
+    IsolatedResidentProcessSpec {
+        sandbox_id: SandboxId::new(),
+        process_id: sandboxwich_core::ResidentProcessId::new(),
+        generation: 7,
+        lease_id: Uuid::now_v7(),
+        argv: vec!["/opt/orb/bin/orb-sidecar".to_string()],
+        cwd: Some("/workspace".to_string()),
+        env: BTreeMap::from([("ORB_API".to_string(), "https://orb.invalid".to_string())]),
+        bootstrap: IsolatedResidentProcessBootstrap {
+            content: bootstrap.to_vec(),
+            target_file: "/run/sandboxwich/bootstrap/orb-token".to_string(),
+            mode: 0o400,
+        },
+    }
+}
+
+#[test]
+fn isolated_sidecar_manifests_are_separate_fenced_and_secret_safe() {
+    let image = format!("ghcr.io/evalops/orb-sidecar@sha256:{}", "b".repeat(64));
+    let provider = KubernetesApplyProvider::new(
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Gvisor)
+            .with_runtime_class_name(Some("gvisor".to_string())),
+        "kubectl",
+    )
+    .with_isolated_resident_process_image(Some(image.clone()));
+    let bootstrap = b"isolated-bootstrap-canary";
+    let spec = isolated_sidecar_spec(bootstrap);
+
+    let manifests = provider
+        .isolated_resident_process_manifests(&spec)
+        .expect("a configured isolated sidecar should render");
+    assert_eq!(manifests.len(), 2);
+    let secret = &manifests[0];
+    let pod = &manifests[1];
+    assert_eq!(secret["kind"], "Secret");
+    assert_eq!(secret["immutable"], true);
+    assert_eq!(pod["kind"], "Pod");
+    assert_eq!(
+        pod["metadata"]["labels"]["sandboxwich.dev/sandbox-id"],
+        spec.sandbox_id.to_string()
+    );
+    assert_eq!(
+        pod["metadata"]["labels"]["sandboxwich.dev/resident-process-id"],
+        spec.process_id.to_string()
+    );
+    assert_eq!(pod["metadata"]["labels"]["sandboxwich.dev/generation"], "7");
+    assert_eq!(
+        pod["metadata"]["labels"]["sandboxwich.dev/lease-id"],
+        spec.lease_id.to_string()
+    );
+    assert_eq!(pod["spec"]["runtimeClassName"], "gvisor");
+    assert_eq!(pod["spec"]["automountServiceAccountToken"], false);
+    assert_eq!(pod["spec"]["hostNetwork"], false);
+    assert_eq!(pod["spec"]["hostPID"], false);
+    assert_eq!(pod["spec"]["hostIPC"], false);
+    assert_eq!(pod["spec"]["containers"][0]["image"], image);
+    assert_eq!(
+        pod["spec"]["containers"][0]["securityContext"]["runAsNonRoot"],
+        true
+    );
+    assert_eq!(
+        pod["spec"]["containers"][0]["securityContext"]["allowPrivilegeEscalation"],
+        false
+    );
+    assert_eq!(
+        pod["spec"]["containers"][0]["securityContext"]["readOnlyRootFilesystem"],
+        true
+    );
+    assert_eq!(
+        pod["spec"]["containers"][0]["securityContext"]["capabilities"]["drop"],
+        json!(["ALL"])
+    );
+    assert_eq!(
+        pod["spec"]["containers"][0]["resources"]["requests"]["memory"],
+        "64Mi"
+    );
+    assert_eq!(
+        pod["spec"]["containers"][0]["resources"]["limits"]["memory"],
+        "256Mi"
+    );
+    assert_eq!(
+        secret["data"]["bootstrap"],
+        general_purpose::STANDARD.encode(bootstrap)
+    );
+
+    let debug = format!("{spec:?}");
+    assert!(!debug.contains("isolated-bootstrap-canary"));
+    assert!(!debug.contains("https://orb.invalid"));
+    let cleanup = provider.isolated_resident_process_cleanup_manifests(&spec);
+    let cleanup_json = serde_json::to_string(&cleanup).unwrap();
+    assert!(!cleanup_json.contains("isolated-bootstrap-canary"));
+    assert!(!cleanup_json.contains(&general_purpose::STANDARD.encode(bootstrap)));
+}
+
+#[test]
+fn isolated_sidecar_requires_digest_image_and_runtime_class() {
+    let base =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+    let spec = isolated_sidecar_spec(b"secret");
+    let unpinned = KubernetesApplyProvider::new(base.clone(), "kubectl")
+        .with_isolated_resident_process_image(Some("ghcr.io/evalops/orb-sidecar:latest".into()));
+    assert!(unpinned.isolated_resident_process_manifests(&spec).is_err());
+    let no_runtime_class =
+        KubernetesApplyProvider::new(base, "kubectl").with_isolated_resident_process_image(Some(
+            format!("ghcr.io/evalops/orb-sidecar@sha256:{}", "c".repeat(64)),
+        ));
+    assert!(
+        no_runtime_class
+            .isolated_resident_process_manifests(&spec)
+            .is_err()
+    );
+}
+
+#[test]
+fn dry_run_does_not_claim_or_execute_isolated_resident_processes() {
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+    assert!(
+        !provider
+            .capability_report()
+            .capabilities
+            .contains(&WorkerCapability::UidIsolatedResidentProcess)
+    );
+    let error = provider
+        .run_isolated_resident_process(
+            &isolated_sidecar_spec(b"secret"),
+            &CancelSignal::never_cancelled(),
+            &mut |_| Ok(()),
+        )
+        .expect_err("dry-run cannot provide a real process isolation boundary");
+    assert!(error.to_string().contains("unavailable in dry-run mode"));
+}
+
+fn write_isolated_sidecar_fake_kubectl(
+    fail_apply: bool,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "sandboxwich-isolated-sidecar-kubectl-{}",
+        SandboxId::new()
+    ));
+    std::fs::create_dir_all(&dir).expect("create isolated sidecar fake kubectl dir");
+    let script_path = dir.join("kubectl");
+    let log_path = dir.join("kubectl.log");
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+dir=$(dirname "$0")
+printf 'ARGS %s\n' "$*" >> "$dir/kubectl.log"
+verb=""
+for arg in "$@"; do
+  case "$arg" in apply|get|delete) verb="$arg"; break;; esac
+done
+case "$verb" in
+  apply)
+    cat > "$dir/apply.stdin"
+    if [ "{fail_apply}" = "true" ]; then
+      echo "synthetic apply failure" >&2
+      exit 1
+    fi
+    ;;
+  get)
+    count=0
+    if [ -f "$dir/get.count" ]; then count=$(cat "$dir/get.count"); fi
+    count=$((count + 1))
+    printf '%s' "$count" > "$dir/get.count"
+    if [ "$count" -eq 1 ]; then
+      printf '%s\n' '{{"metadata":{{"uid":"pod-uid-1"}},"status":{{"phase":"Running","containerStatuses":[{{"ready":true,"state":{{"running":{{}}}}}}]}}}}'
+    else
+      printf '%s\n' '{{"metadata":{{"uid":"pod-uid-1"}},"status":{{"phase":"Succeeded","containerStatuses":[{{"ready":false,"state":{{"terminated":{{"exitCode":0}}}}}}]}}}}'
+    fi
+    ;;
+  delete)
+    cat > "$dir/delete.stdin"
+    ;;
+  *)
+    echo "unsupported fake kubectl invocation: $*" >&2
+    exit 2
+    ;;
+esac
+"#
+    );
+    std::fs::write(&script_path, script).expect("write isolated sidecar fake kubectl");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("stat isolated sidecar fake kubectl")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions)
+            .expect("chmod isolated sidecar fake kubectl");
+    }
+    (script_path, log_path)
+}
+
+fn isolated_sidecar_apply_provider(kubectl: &std::path::Path) -> KubernetesApplyProvider {
+    KubernetesApplyProvider::new(
+        KubernetesDryRunProvider::with_snapshot_class("in-cluster", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Gvisor)
+            .with_runtime_class_name(Some("gvisor".to_string())),
+        kubectl.to_string_lossy().into_owned(),
+    )
+    .with_kubectl_context(Some("in-cluster".to_string()))
+    .with_mutation_gate(true, true)
+    .with_isolated_resident_process_image(Some(format!(
+        "ghcr.io/evalops/orb-sidecar@sha256:{}",
+        "d".repeat(64)
+    )))
+}
+
+#[test]
+fn isolated_sidecar_run_observes_terminal_state_and_always_cleans_up() {
+    let (kubectl, log_path) = write_isolated_sidecar_fake_kubectl(false);
+    let provider = isolated_sidecar_apply_provider(&kubectl);
+    assert!(
+        provider
+            .capability_report()
+            .capabilities
+            .contains(&WorkerCapability::UidIsolatedResidentProcess)
+    );
+    let bootstrap = b"sidecar-lifecycle-canary";
+    let spec = isolated_sidecar_spec(bootstrap);
+    let mut observations = Vec::new();
+    let result = provider
+        .run_isolated_resident_process(
+            &spec,
+            &CancelSignal::never_cancelled(),
+            &mut |observation| {
+                observations.push(observation);
+                Ok(())
+            },
+        )
+        .expect("fake isolated sidecar should complete");
+    assert_eq!(
+        observations
+            .iter()
+            .map(|observation| observation.state)
+            .collect::<Vec<_>>(),
+        vec![
+            IsolatedResidentProcessState::Running,
+            IsolatedResidentProcessState::Succeeded
+        ]
+    );
+    assert_eq!(
+        result.final_observation.state,
+        IsolatedResidentProcessState::Succeeded
+    );
+    assert_eq!(result.final_observation.exit_code, Some(0));
+
+    let dir = kubectl.parent().expect("fake kubectl parent");
+    let apply_stdin = std::fs::read_to_string(dir.join("apply.stdin")).unwrap();
+    let delete_stdin = std::fs::read_to_string(dir.join("delete.stdin")).unwrap();
+    let encoded = general_purpose::STANDARD.encode(bootstrap);
+    assert!(apply_stdin.contains(&encoded));
+    assert!(!delete_stdin.contains(&encoded));
+    assert!(!delete_stdin.contains("sidecar-lifecycle-canary"));
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(log.lines().any(|line| line.contains(" apply ")));
+    assert!(log.lines().any(|line| line.contains(" delete ")));
+    assert!(!log.contains("sidecar-lifecycle-canary"));
+    assert!(!log.contains(&encoded));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn isolated_sidecar_apply_failure_and_cancellation_attempt_cleanup() {
+    let (failing_kubectl, failing_log) = write_isolated_sidecar_fake_kubectl(true);
+    let provider = isolated_sidecar_apply_provider(&failing_kubectl);
+    let error = provider
+        .run_isolated_resident_process(
+            &isolated_sidecar_spec(b"apply-failure-canary"),
+            &CancelSignal::never_cancelled(),
+            &mut |_| Ok(()),
+        )
+        .expect_err("apply failure must fail closed");
+    assert!(error.to_string().contains("kubectl apply"));
+    let log = std::fs::read_to_string(&failing_log).unwrap();
+    assert!(log.lines().any(|line| line.contains(" delete ")));
+    let _ = std::fs::remove_dir_all(
+        failing_kubectl
+            .parent()
+            .expect("failing fake kubectl parent"),
+    );
+
+    let (cancel_kubectl, cancel_log) = write_isolated_sidecar_fake_kubectl(false);
+    let provider = isolated_sidecar_apply_provider(&cancel_kubectl);
+    let cancelled = CancelSignal::new();
+    cancelled.cancel();
+    let error = provider
+        .run_isolated_resident_process(
+            &isolated_sidecar_spec(b"cancel-canary"),
+            &cancelled,
+            &mut |_| Ok(()),
+        )
+        .expect_err("cancelled isolated sidecar must fail closed");
+    assert!(error.to_string().contains("cancel"));
+    let log = std::fs::read_to_string(&cancel_log).unwrap();
+    assert!(log.lines().any(|line| line.contains(" delete ")));
+    let _ = std::fs::remove_dir_all(cancel_kubectl.parent().expect("cancel fake kubectl parent"));
+}
+
 #[tokio::test]
 async fn run_kubectl_command_async_succeeds_within_timeout() {
     let output = run_kubectl_command_async(

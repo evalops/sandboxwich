@@ -16,11 +16,13 @@ use chrono::Utc;
 use clap::ValueEnum;
 use ipnet::IpNet;
 use sandboxwich_core::{
-    AgentCommandRequest, AgentCommandResult, DbVariant, ExecutionClass, MAX_SANDBOX_FILE_BYTES,
-    MaterializeFileDestination, MaterializeFileObservation, MemoryLimit, NetworkAllowRuleKind,
-    NetworkEgress, ProviderCapabilityReport, ProviderForkHandle, ProviderHealthReport,
-    ProviderHealthStatus, ProviderRuntimeResource, ProviderSandboxHandle, ProviderSnapshotHandle,
-    ProvisioningErrorClass, ProvisioningStage, ProvisioningStageUpdateRequest,
+    AgentCommandRequest, AgentCommandResult, DbVariant, ExecutionClass,
+    MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES, MAX_SANDBOX_FILE_BYTES, MaterializeFileDestination,
+    MaterializeFileObservation, MemoryLimit, NetworkAllowRuleKind, NetworkEgress,
+    ORB_SIDECAR_RESIDENT_PROCESS_UID, ProviderCapabilityReport, ProviderForkHandle,
+    ProviderHealthReport, ProviderHealthStatus, ProviderRuntimeResource, ProviderSandboxHandle,
+    ProviderSnapshotHandle, ProvisioningErrorClass, ProvisioningStage,
+    ProvisioningStageUpdateRequest, RESIDENT_PROCESS_BOOTSTRAP_PREFIX, ResidentProcessId,
     RuntimeResourceInventoryResponse, RuntimeResourceKind, RuntimeResourcePurpose,
     RuntimeResourceStatus, SandboxId, SandboxProvisionSpec, SandboxRuntimeProfile, SnapshotId,
     WorkerCapability, WorkspaceMode, validate_agent_command_request,
@@ -245,6 +247,77 @@ impl CancelSignal {
     }
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub struct IsolatedResidentProcessBootstrap {
+    pub content: Vec<u8>,
+    pub target_file: String,
+    pub mode: u32,
+}
+
+impl std::fmt::Debug for IsolatedResidentProcessBootstrap {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IsolatedResidentProcessBootstrap")
+            .field(
+                "content",
+                &format_args!("<redacted:{} bytes>", self.content.len()),
+            )
+            .field("target_file", &self.target_file)
+            .field("mode", &format_args!("{:#o}", self.mode))
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct IsolatedResidentProcessSpec {
+    pub sandbox_id: SandboxId,
+    pub process_id: ResidentProcessId,
+    pub generation: u64,
+    pub lease_id: Uuid,
+    pub argv: Vec<String>,
+    pub cwd: Option<String>,
+    pub env: BTreeMap<String, String>,
+    pub bootstrap: IsolatedResidentProcessBootstrap,
+}
+
+impl std::fmt::Debug for IsolatedResidentProcessSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IsolatedResidentProcessSpec")
+            .field("sandbox_id", &self.sandbox_id)
+            .field("process_id", &self.process_id)
+            .field("generation", &self.generation)
+            .field("lease_id", &self.lease_id)
+            .field("argv", &self.argv)
+            .field("cwd", &self.cwd)
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .field("bootstrap", &self.bootstrap)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IsolatedResidentProcessState {
+    Starting,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IsolatedResidentProcessObservation {
+    pub state: IsolatedResidentProcessState,
+    pub pod_name: String,
+    pub pod_uid: Option<String>,
+    pub ready: bool,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IsolatedResidentProcessResult {
+    pub final_observation: IsolatedResidentProcessObservation,
+}
+
 pub trait SandboxProvider {
     fn capability_report(&self) -> ProviderCapabilityReport;
     fn health_report(&self) -> ProviderHealthReport;
@@ -272,6 +345,15 @@ pub trait SandboxProvider {
         request: AgentCommandRequest,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<AgentCommandResult>;
+    fn run_isolated_resident_process(
+        &self,
+        spec: &IsolatedResidentProcessSpec,
+        cancelled: &CancelSignal,
+        observe: &mut dyn FnMut(IsolatedResidentProcessObservation) -> anyhow::Result<()>,
+    ) -> anyhow::Result<IsolatedResidentProcessResult> {
+        let _ = (spec, cancelled, observe);
+        anyhow::bail!("provider does not support isolated resident processes")
+    }
     /// Reads the APEX task instruction stream from a live sandbox through one
     /// fixed executable. There is intentionally no request object: callers
     /// cannot supply argv, cwd, environment, or stdin.
@@ -2025,6 +2107,7 @@ pub struct KubernetesApplyProvider {
     mutation_enabled: bool,
     kubectl_command_timeout: Duration,
     max_captured_output_bytes: u64,
+    isolated_resident_process_image: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2419,6 +2502,7 @@ impl KubernetesApplyProvider {
             mutation_enabled: false,
             kubectl_command_timeout: Duration::from_secs(DEFAULT_KUBECTL_COMMAND_TIMEOUT_SECS),
             max_captured_output_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
+            isolated_resident_process_image: None,
         }
     }
 
@@ -2473,6 +2557,29 @@ impl KubernetesApplyProvider {
     pub fn with_max_captured_output_bytes(mut self, max_captured_output_bytes: u64) -> Self {
         self.max_captured_output_bytes = max_captured_output_bytes;
         self
+    }
+
+    pub fn with_isolated_resident_process_image(mut self, image: Option<String>) -> Self {
+        self.isolated_resident_process_image = image.and_then(|image| {
+            let image = image.trim();
+            (!image.is_empty()).then(|| image.to_string())
+        });
+        self
+    }
+
+    pub fn isolated_resident_process_image(&self) -> Option<&str> {
+        self.isolated_resident_process_image.as_deref()
+    }
+
+    fn isolated_resident_process_configured(&self) -> bool {
+        self.isolated_resident_process_image
+            .as_deref()
+            .is_some_and(image_is_digest_pinned)
+            && self
+                .dry_run
+                .runtime_class_name
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty())
     }
 
     pub fn provision_staged<F>(
@@ -3508,6 +3615,291 @@ impl KubernetesApplyProvider {
         }
         Some(payload)
     }
+
+    fn isolated_resident_process_pod_name(&self, process_id: ResidentProcessId) -> String {
+        format!("sandboxwich-sidecar-{process_id}")
+    }
+
+    fn isolated_resident_process_secret_name(&self, process_id: ResidentProcessId) -> String {
+        format!("sw-sidecar-bootstrap-{process_id}")
+    }
+
+    fn validate_isolated_resident_process_spec(
+        &self,
+        spec: &IsolatedResidentProcessSpec,
+    ) -> anyhow::Result<()> {
+        let image = self
+            .isolated_resident_process_image()
+            .context("isolated resident-process sidecar image is not configured")?;
+        anyhow::ensure!(
+            image_is_digest_pinned(image),
+            "isolated resident-process sidecar image must be digest-pinned"
+        );
+        anyhow::ensure!(
+            self.dry_run
+                .runtime_class_name
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty()),
+            "isolated resident-process sidecar requires a RuntimeClass"
+        );
+        anyhow::ensure!(
+            !spec.argv.is_empty()
+                && spec
+                    .argv
+                    .iter()
+                    .all(|argument| !argument.as_bytes().contains(&0)),
+            "isolated resident-process argv is invalid"
+        );
+        if let Some(cwd) = &spec.cwd {
+            anyhow::ensure!(
+                std::path::Path::new(cwd).is_absolute() && !cwd.as_bytes().contains(&0),
+                "isolated resident-process cwd must be an absolute path"
+            );
+        }
+        anyhow::ensure!(
+            spec.env.iter().all(|(key, value)| {
+                !key.is_empty()
+                    && !key.contains('=')
+                    && !key.as_bytes().contains(&0)
+                    && !value.as_bytes().contains(&0)
+            }),
+            "isolated resident-process environment is invalid"
+        );
+        anyhow::ensure!(
+            !spec.bootstrap.content.is_empty()
+                && spec.bootstrap.content.len() <= MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES,
+            "isolated resident-process bootstrap must be between 1 byte and 64 KiB"
+        );
+        anyhow::ensure!(
+            (0o400..=0o700).contains(&spec.bootstrap.mode),
+            "isolated resident-process bootstrap mode must be between 0400 and 0700"
+        );
+        let prefix = std::path::Path::new(RESIDENT_PROCESS_BOOTSTRAP_PREFIX);
+        let target = std::path::Path::new(&spec.bootstrap.target_file);
+        let relative = target
+            .strip_prefix(prefix)
+            .context("isolated resident-process bootstrap path is outside the allowed root")?;
+        anyhow::ensure!(
+            !relative.as_os_str().is_empty()
+                && relative
+                    .components()
+                    .all(|component| { matches!(component, std::path::Component::Normal(_)) }),
+            "isolated resident-process bootstrap target is invalid"
+        );
+        Ok(())
+    }
+
+    fn isolated_resident_process_labels(&self, spec: &IsolatedResidentProcessSpec) -> Value {
+        json!({
+            "app.kubernetes.io/name": "orb-sidecar",
+            "app.kubernetes.io/component": "isolated-resident-process",
+            "sandboxwich.dev/sandbox-id": spec.sandbox_id.to_string(),
+            "sandboxwich.dev/resident-process-id": spec.process_id.to_string(),
+            "sandboxwich.dev/generation": spec.generation.to_string(),
+            "sandboxwich.dev/lease-id": spec.lease_id.to_string(),
+        })
+    }
+
+    fn isolated_resident_process_manifests(
+        &self,
+        spec: &IsolatedResidentProcessSpec,
+    ) -> anyhow::Result<Vec<Value>> {
+        self.validate_isolated_resident_process_spec(spec)?;
+        let pod_name = self.isolated_resident_process_pod_name(spec.process_id);
+        let secret_name = self.isolated_resident_process_secret_name(spec.process_id);
+        let labels = self.isolated_resident_process_labels(spec);
+        let relative_target = std::path::Path::new(&spec.bootstrap.target_file)
+            .strip_prefix(RESIDENT_PROCESS_BOOTSTRAP_PREFIX)
+            .expect("validated bootstrap target")
+            .to_string_lossy()
+            .into_owned();
+        let secret = json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": secret_name,
+                "namespace": self.dry_run.effective_sandbox_namespace(),
+                "labels": labels,
+            },
+            "type": "Opaque",
+            "immutable": true,
+            "data": {
+                "bootstrap": general_purpose::STANDARD.encode(&spec.bootstrap.content),
+            },
+        });
+        let env = spec
+            .env
+            .iter()
+            .map(|(name, value)| json!({ "name": name, "value": value }))
+            .collect::<Vec<_>>();
+        let mut container = json!({
+            "name": "orb-sidecar",
+            "image": self
+                .isolated_resident_process_image()
+                .expect("validated sidecar image"),
+            "imagePullPolicy": "IfNotPresent",
+            "command": spec.argv,
+            "env": env,
+            "securityContext": {
+                "allowPrivilegeEscalation": false,
+                "readOnlyRootFilesystem": true,
+                "runAsNonRoot": true,
+                "runAsUser": ORB_SIDECAR_RESIDENT_PROCESS_UID,
+                "runAsGroup": ORB_SIDECAR_RESIDENT_PROCESS_UID,
+                "capabilities": { "drop": ["ALL"] },
+                "seccompProfile": { "type": "RuntimeDefault" },
+            },
+            "resources": {
+                "requests": { "cpu": "50m", "memory": "64Mi" },
+                "limits": { "cpu": "500m", "memory": "256Mi" },
+            },
+            "volumeMounts": [
+                {
+                    "name": "bootstrap",
+                    "mountPath": RESIDENT_PROCESS_BOOTSTRAP_PREFIX,
+                    "readOnly": true,
+                },
+                {
+                    "name": "tmp",
+                    "mountPath": "/tmp",
+                },
+            ],
+        });
+        if let Some(cwd) = &spec.cwd {
+            container
+                .as_object_mut()
+                .expect("container is an object")
+                .insert("workingDir".to_string(), json!(cwd));
+        }
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": pod_name,
+                "namespace": self.dry_run.effective_sandbox_namespace(),
+                "labels": labels,
+            },
+            "spec": {
+                "runtimeClassName": self.dry_run.runtime_class_name,
+                "automountServiceAccountToken": false,
+                "enableServiceLinks": false,
+                "hostNetwork": false,
+                "hostPID": false,
+                "hostIPC": false,
+                "restartPolicy": "Never",
+                "terminationGracePeriodSeconds": 30,
+                "securityContext": {
+                    "runAsNonRoot": true,
+                    "runAsUser": ORB_SIDECAR_RESIDENT_PROCESS_UID,
+                    "runAsGroup": ORB_SIDECAR_RESIDENT_PROCESS_UID,
+                    "fsGroup": ORB_SIDECAR_RESIDENT_PROCESS_UID,
+                    "seccompProfile": { "type": "RuntimeDefault" },
+                },
+                "containers": [container],
+                "volumes": [
+                    {
+                        "name": "bootstrap",
+                        "secret": {
+                            "secretName": secret_name,
+                            "defaultMode": spec.bootstrap.mode,
+                            "items": [{
+                                "key": "bootstrap",
+                                "path": relative_target,
+                                "mode": spec.bootstrap.mode,
+                            }],
+                        },
+                    },
+                    {
+                        "name": "tmp",
+                        "emptyDir": {
+                            "sizeLimit": "64Mi",
+                        },
+                    },
+                ],
+            },
+        });
+        Ok(vec![secret, pod])
+    }
+
+    fn isolated_resident_process_cleanup_manifests(
+        &self,
+        spec: &IsolatedResidentProcessSpec,
+    ) -> Vec<Value> {
+        vec![
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": self.isolated_resident_process_pod_name(spec.process_id),
+                    "namespace": self.dry_run.effective_sandbox_namespace(),
+                },
+            }),
+            json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {
+                    "name": self.isolated_resident_process_secret_name(spec.process_id),
+                    "namespace": self.dry_run.effective_sandbox_namespace(),
+                },
+            }),
+        ]
+    }
+
+    fn observe_isolated_resident_process(
+        &self,
+        spec: &IsolatedResidentProcessSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<IsolatedResidentProcessObservation> {
+        let mut args = self.kubectl_base_args();
+        args.extend([
+            "get".to_string(),
+            "pod".to_string(),
+            self.isolated_resident_process_pod_name(spec.process_id),
+            "-o".to_string(),
+            "json".to_string(),
+        ]);
+        let output = run_kubectl_command(
+            &self.kubectl,
+            &args,
+            "observe isolated resident-process pod",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        anyhow::ensure!(
+            output.success,
+            "kubectl get isolated resident-process pod failed with {}: {}",
+            output.status,
+            output.stderr
+        );
+        let pod: Value = serde_json::from_str(&output.stdout)
+            .context("isolated resident-process pod observation was invalid JSON")?;
+        let pod_uid = pod["metadata"]["uid"].as_str().map(str::to_string);
+        let status = &pod["status"]["containerStatuses"][0];
+        let ready = status["ready"].as_bool().unwrap_or(false);
+        let exit_code = status["state"]["terminated"]["exitCode"]
+            .as_i64()
+            .and_then(|code| i32::try_from(code).ok());
+        let phase = pod["status"]["phase"].as_str().unwrap_or("Pending");
+        let state = if exit_code.is_some() || matches!(phase, "Succeeded" | "Failed") {
+            if exit_code == Some(0) || (exit_code.is_none() && phase == "Succeeded") {
+                IsolatedResidentProcessState::Succeeded
+            } else {
+                IsolatedResidentProcessState::Failed
+            }
+        } else if phase == "Running" && ready {
+            IsolatedResidentProcessState::Running
+        } else {
+            IsolatedResidentProcessState::Starting
+        };
+        Ok(IsolatedResidentProcessObservation {
+            state,
+            pod_name: self.isolated_resident_process_pod_name(spec.process_id),
+            pod_uid,
+            ready,
+            exit_code,
+        })
+    }
 }
 
 /// Guest-side wrapper invoked via `bash -c` by `exec_args` when the request
@@ -3966,7 +4358,6 @@ impl SandboxProvider for KubernetesDryRunProvider {
             WorkerCapability::K8sPod,
             WorkerCapability::ProvisionSandbox,
             WorkerCapability::RunCommand,
-            WorkerCapability::UidIsolatedResidentProcess,
             WorkerCapability::Snapshot,
             WorkerCapability::DesktopStream,
         ];
@@ -4062,6 +4453,15 @@ impl SandboxProvider for KubernetesDryRunProvider {
             started_at,
             finished_at,
         })
+    }
+
+    fn run_isolated_resident_process(
+        &self,
+        _spec: &IsolatedResidentProcessSpec,
+        _cancelled: &CancelSignal,
+        _observe: &mut dyn FnMut(IsolatedResidentProcessObservation) -> anyhow::Result<()>,
+    ) -> anyhow::Result<IsolatedResidentProcessResult> {
+        anyhow::bail!("isolated resident-process execution is unavailable in dry-run mode")
     }
 
     fn materialize_file(
@@ -4177,6 +4577,11 @@ impl SandboxProvider for KubernetesApplyProvider {
     fn capability_report(&self) -> ProviderCapabilityReport {
         let mut report = self.dry_run.capability_report();
         report.capabilities.push(WorkerCapability::MaterializeFile);
+        if self.isolated_resident_process_configured() {
+            report
+                .capabilities
+                .push(WorkerCapability::UidIsolatedResidentProcess);
+        }
         report
             .labels
             .insert("provider_mode".to_string(), "apply".to_string());
@@ -4330,6 +4735,92 @@ impl SandboxProvider for KubernetesApplyProvider {
             started_at,
             finished_at,
         })
+    }
+
+    fn run_isolated_resident_process(
+        &self,
+        spec: &IsolatedResidentProcessSpec,
+        cancelled: &CancelSignal,
+        observe: &mut dyn FnMut(IsolatedResidentProcessObservation) -> anyhow::Result<()>,
+    ) -> anyhow::Result<IsolatedResidentProcessResult> {
+        Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
+        let manifests = self.isolated_resident_process_manifests(spec)?;
+        let cleanup_manifests = self.isolated_resident_process_cleanup_manifests(spec);
+        let run_result = (|| {
+            let apply = run_kubectl_documents(
+                &self.kubectl,
+                &self.kubectl_args("apply"),
+                &manifests,
+                "apply isolated resident-process manifests",
+                self.kubectl_command_timeout,
+                Some(cancelled),
+                self.max_captured_output_bytes,
+            )?;
+            anyhow::ensure!(
+                apply.success,
+                "kubectl apply isolated resident-process manifests failed with {}",
+                apply.status
+            );
+
+            let mut previous = None;
+            loop {
+                anyhow::ensure!(
+                    !cancelled.is_cancelled(),
+                    "isolated resident-process execution cancelled after lease loss"
+                );
+                let observation = self.observe_isolated_resident_process(spec, cancelled)?;
+                if previous.as_ref() != Some(&observation) {
+                    observe(observation.clone())?;
+                    previous = Some(observation.clone());
+                }
+                if matches!(
+                    observation.state,
+                    IsolatedResidentProcessState::Succeeded | IsolatedResidentProcessState::Failed
+                ) {
+                    return Ok(IsolatedResidentProcessResult {
+                        final_observation: observation,
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        })();
+
+        // Cleanup manifests contain names only. In particular, the raw/base64
+        // bootstrap bytes are never replayed through cleanup, persisted in a
+        // provider handle, or included in diagnostics.
+        let cleanup = run_kubectl_documents(
+            &self.kubectl,
+            &self.kubectl_delete_args(),
+            &cleanup_manifests,
+            "cleanup isolated resident-process manifests",
+            self.kubectl_command_timeout,
+            None,
+            self.max_captured_output_bytes,
+        );
+        match (run_result, cleanup) {
+            (Ok(result), Ok(output)) if output.success => Ok(result),
+            (Ok(_), Ok(output)) => anyhow::bail!(
+                "kubectl cleanup isolated resident-process manifests failed with {}: {}",
+                output.status,
+                output.stderr
+            ),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Ok(output)) => {
+                if !output.success {
+                    eprintln!(
+                        "warning: isolated resident-process cleanup failed with {}: {}",
+                        output.status, output.stderr
+                    );
+                }
+                Err(error)
+            }
+            (Err(error), Err(cleanup_error)) => {
+                eprintln!(
+                    "warning: isolated resident-process cleanup could not run: {cleanup_error:#}"
+                );
+                Err(error)
+            }
+        }
     }
 
     fn read_apex_task_instructions(
