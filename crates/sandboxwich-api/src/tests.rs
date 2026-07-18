@@ -1656,6 +1656,186 @@ async fn seed_sandbox_with_state(db: &Database, state: SandboxState) -> Sandbox 
     sandbox
 }
 
+async fn insert_test_command(db: &Database, sandbox_id: SandboxId, created_at: DateTime<Utc>) {
+    let mut tx = db.pool.begin().await.expect("begin command insert");
+    insert_command_on_connection(
+        db,
+        &mut tx,
+        &CommandRun {
+            id: CommandId::new(),
+            sandbox_id,
+            status: CommandStatus::Finished,
+            argv: vec!["true".to_string()],
+            cwd: None,
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            created_at,
+            finished_at: Some(created_at),
+        },
+    )
+    .await
+    .expect("insert test command");
+    tx.commit().await.expect("commit command insert");
+}
+
+/// Regression/equivalence test for evalops/sandboxwich#173: folding the
+/// per-candidate `select max(created_at) from commands` into
+/// `reap_expired_active_sandboxes`'s own candidate query (a correlated
+/// scalar subquery) must produce the exact same reap decisions the old
+/// per-row Rust computation did. Exercises the real query end to end
+/// (not just the pure `expired_deadline`/`resolve_last_activity` functions,
+/// which the unit tests below already cover in isolation) against a fixture
+/// covering every case the "more recent of updated_at or last queued
+/// command" rule has to get right, plus a `max_lifetime_seconds` sandbox
+/// that doesn't depend on `commands` at all and a boundary-exact idle case.
+#[tokio::test]
+async fn idle_ttl_sweep_query_matches_documented_semantics_across_a_seeded_fixture() {
+    let db = test_sqlite_db().await;
+    let now = Utc::now();
+    let seed = |updated_at: DateTime<Utc>,
+                created_at: DateTime<Utc>,
+                max_lifetime_seconds: Option<u64>,
+                idle_ttl_seconds: Option<u64>| Sandbox {
+        execution_class: ExecutionClass::DevelopmentContainer,
+        workspace_mode: WorkspaceMode::Ephemeral,
+        runtime_profile: SandboxRuntimeProfile::Unprivileged,
+        id: SandboxId::new(),
+        tenant_id: "default".to_string(),
+        name: "idle-sweep-fixture".to_string(),
+        state: SandboxState::Ready,
+        template: "default".to_string(),
+        memory_limit: MemoryLimit::default(),
+        network_egress: NetworkEgress::default(),
+        created_at,
+        updated_at,
+        ttl_seconds: None,
+        max_lifetime_seconds,
+        idle_ttl_seconds,
+        parent_snapshot_id: None,
+        last_activity_at: None,
+    };
+
+    // (a) idle_ttl_seconds=300, no commands at all: last activity falls
+    // back to `updated_at` (400s ago), which is past the 300s deadline.
+    // Must be reaped.
+    let no_commands_idle = seed(
+        now - chrono::Duration::seconds(400),
+        now - chrono::Duration::seconds(400),
+        None,
+        Some(300),
+    );
+    insert_sandbox(&db, &no_commands_idle).await.unwrap();
+
+    // (b) idle_ttl_seconds=300, `updated_at` 400s ago, but a command queued
+    // only 100s ago: the command is the *more recent* signal, so the idle
+    // clock resets to 100s ago -- well inside the 300s window. Must survive.
+    let recent_command_active = seed(
+        now - chrono::Duration::seconds(400),
+        now - chrono::Duration::seconds(400),
+        None,
+        Some(300),
+    );
+    insert_sandbox(&db, &recent_command_active).await.unwrap();
+    insert_test_command(
+        &db,
+        recent_command_active.id,
+        now - chrono::Duration::seconds(100),
+    )
+    .await;
+
+    // (c) idle_ttl_seconds=300, `updated_at` 400s ago, with a command that
+    // is *older* than `updated_at` (500s ago). The more-recent-of-the-two
+    // rule must still use `updated_at` (400s ago), not the stale command --
+    // proving a sandbox can't dodge reaping by having only ancient command
+    // history. Must be reaped.
+    let stale_command_still_idle = seed(
+        now - chrono::Duration::seconds(400),
+        now - chrono::Duration::seconds(400),
+        None,
+        Some(300),
+    );
+    insert_sandbox(&db, &stale_command_still_idle)
+        .await
+        .unwrap();
+    insert_test_command(
+        &db,
+        stale_command_still_idle.id,
+        now - chrono::Duration::seconds(500),
+    )
+    .await;
+
+    // (d) idle boundary exactly at the deadline: `updated_at` is exactly
+    // `idle_ttl_seconds` in the past relative to `now` captured just above.
+    // `idle_ttl_expired` treats `deadline <= now` as due, and wall-clock
+    // time only moves forward between this line and the sweep's own
+    // `Utc::now()` call, so this is deterministically past due, not a race.
+    // No commands, to isolate the boundary case from the activity-signal
+    // cases above.
+    let exactly_at_idle_boundary = seed(
+        now - chrono::Duration::seconds(300),
+        now - chrono::Duration::seconds(300),
+        None,
+        Some(300),
+    );
+    insert_sandbox(&db, &exactly_at_idle_boundary)
+        .await
+        .unwrap();
+
+    // (e) max_lifetime_seconds only (no idle_ttl_seconds at all): must be
+    // reaped without ever consulting `commands`, proving the join doesn't
+    // interfere with the max-lifetime trigger.
+    let max_lifetime_only = seed(now, now - chrono::Duration::seconds(999_999), Some(0), None);
+    insert_sandbox(&db, &max_lifetime_only).await.unwrap();
+
+    // (f) control: no lifetime knobs at all. Must never be selected as a
+    // candidate in the first place, regardless of age.
+    let untouched = seed(
+        now - chrono::Duration::seconds(999_999),
+        now - chrono::Duration::seconds(999_999),
+        None,
+        None,
+    );
+    insert_sandbox(&db, &untouched).await.unwrap();
+
+    let reaped = reap_expired_active_sandboxes(&db)
+        .await
+        .expect("sweep must not error");
+    let reaped_ids: std::collections::HashSet<SandboxId> =
+        reaped.iter().map(|reaped| reaped.sandbox.id).collect();
+
+    assert!(
+        reaped_ids.contains(&no_commands_idle.id),
+        "(a) idle with no commands, past the updated_at-based deadline, must be reaped"
+    );
+    assert!(
+        !reaped_ids.contains(&recent_command_active.id),
+        "(b) a recent command must reset the idle clock and prevent reaping"
+    );
+    assert!(
+        reaped_ids.contains(&stale_command_still_idle.id),
+        "(c) a command *older* than updated_at must not override the more-recent \
+         updated_at signal -- this sandbox must still be reaped"
+    );
+    assert!(
+        reaped_ids.contains(&exactly_at_idle_boundary.id),
+        "(d) exactly-at-deadline must count as due, not one tick short"
+    );
+    assert!(
+        reaped_ids.contains(&max_lifetime_only.id),
+        "(e) max_lifetime_seconds alone must reap independently of any commands join"
+    );
+    assert!(
+        !reaped_ids.contains(&untouched.id),
+        "(f) a sandbox with no lifetime knobs set must never be a candidate"
+    );
+    assert_eq!(
+        reaped_ids.len(),
+        4,
+        "exactly the four due sandboxes (a, c, d, e) should have been reaped, no more"
+    );
+}
+
 async fn sandbox_last_activity_at(db: &Database, sandbox_id: SandboxId) -> Option<DateTime<Utc>> {
     let raw: Option<String> = sqlx::query("select last_activity_at from sandboxes where id = ?")
         .bind(sandbox_id.to_string())
@@ -1833,7 +2013,7 @@ async fn reap_cas_miss_skips_instead_of_enqueuing_a_redundant_stop_job() {
     // is `Archiving` now, not `Ready`), and `attempt_reap_candidate` must
     // report `Skipped` rather than treating this as a second successful
     // reap or an error.
-    let outcome = attempt_reap_candidate(&db, sandbox.clone(), Utc::now())
+    let outcome = attempt_reap_candidate(&db, sandbox.clone(), None, Utc::now())
         .await
         .expect("a CAS miss inside attempt_reap_candidate must not surface as an error");
     assert!(
