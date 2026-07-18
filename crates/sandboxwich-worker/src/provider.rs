@@ -3782,9 +3782,26 @@ async fn run_kubectl_command_async(
     if stdin_payload.is_some() {
         command.stdin(Stdio::piped());
     }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to spawn kubectl for {context}"))?;
+    // ETXTBSY: exec can transiently fail while another thread's fork holds a
+    // still-open write descriptor for the executable (rust-lang/cargo#7670).
+    // In production `kubectl` is never being rewritten, so retrying is free;
+    // in tests the fake kubectl scripts are written moments before use and
+    // concurrent test threads make this race real.
+    const ETXTBSY: i32 = 26;
+    let mut spawn_attempts: u64 = 0;
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(error) if error.raw_os_error() == Some(ETXTBSY) && spawn_attempts < 4 => {
+                spawn_attempts += 1;
+                tokio::time::sleep(Duration::from_millis(10 * spawn_attempts)).await;
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("failed to spawn kubectl for {context}")));
+            }
+        }
+    };
     let stdin_pipe = match stdin_payload {
         Some(_) => Some(child.stdin.take().context("failed to open kubectl stdin")?),
         None => None,
