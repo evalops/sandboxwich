@@ -2555,6 +2555,56 @@ fn guest_token_is_mounted_as_a_file_and_redacted_from_provider_metadata() {
 }
 
 #[test]
+fn runtime_entrypoint_starts_agent_with_guest_token_file() {
+    let entrypoint =
+        include_str!("../../../../deploy/runtime/ubuntu-dev/sandboxwich-entrypoint.sh");
+
+    assert!(entrypoint.contains(
+        "[[ ! -s \"${SANDBOXWICH_GUEST_TOKEN_FILE:-}\" && ! -s \"${SANDBOXWICH_API_TOKEN_FILE:-}\" ]]"
+    ));
+    assert!(entrypoint.contains("sandboxwich-agent daemon"));
+}
+
+#[test]
+fn pod_adoption_preserves_original_guest_worker_binding_after_worker_restart() {
+    let sandbox_id = SandboxId::new();
+    let render = |worker_id| {
+        let provider =
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_guest_credentials(
+                    sandbox_id,
+                    worker_id,
+                    "http://sandboxwich-api.evalops.svc.cluster.local:3217",
+                    "sbw_gtok_scoped",
+                );
+        provider
+            .provision(
+                sandbox_id,
+                &SandboxProvisionSpec::default(),
+                &CancelSignal::never_cancelled(),
+            )
+            .expect("dry-run provision should succeed")
+            .metadata["manifests"]["pod"]
+            .clone()
+    };
+    let desired = render(Uuid::new_v4());
+    let observed = render(Uuid::new_v4());
+
+    validate_adoption_contract(&desired, &observed)
+        .expect("a replacement worker must adopt the original guest binding");
+
+    let mut hostile = observed;
+    let env = hostile["spec"]["containers"][0]["env"]
+        .as_array_mut()
+        .expect("pod env");
+    env.iter_mut()
+        .find(|entry| entry["name"] == "SANDBOXWICH_API")
+        .expect("API env")["valueFrom"]["secretKeyRef"]["name"] = json!("attacker-secret");
+    validate_adoption_contract(&desired, &hostile)
+        .expect_err("unrelated guest environment drift must still block adoption");
+}
+
+#[test]
 fn apply_manifests_carry_guest_token_only_in_the_secret_before_the_pod() {
     let sandbox_id = SandboxId::new();
     let dry_run =

@@ -94,7 +94,10 @@ start_guest_agent() {
   if [[ -z "${SANDBOXWICH_API:-}" || -z "${SANDBOXWICH_SANDBOX_ID:-}" ]]; then
     return
   fi
-  if [[ ! -s "${SANDBOXWICH_API_TOKEN_FILE:-}" ]]; then
+  # Kubernetes guests receive a sandbox-scoped credential, not the worker's
+  # API token. Keep the legacy API-token path for non-Kubernetes runtimes, but
+  # start whenever either supported credential file is present.
+  if [[ ! -s "${SANDBOXWICH_GUEST_TOKEN_FILE:-}" && ! -s "${SANDBOXWICH_API_TOKEN_FILE:-}" ]]; then
     return
   fi
   sandboxwich-agent daemon >/tmp/sandboxwich-agent.log 2>&1 &
