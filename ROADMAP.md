@@ -54,6 +54,7 @@ These capabilities remain Experimental until every gate below passes for a named
 2. Add a microVM provider and compare its lifecycle and recovery behavior with RuntimeClass-backed Kubernetes.
 3. Add a brokered desktop transport; current desktop records do not create an ingress tunnel.
 4. Add production secret storage before accepting long-lived user or model credentials.
+5. Add a worker-level sidecar placement primitive that runs `orb-sidecar` outside the sandbox's mount/net namespaces (a genuine separate trust domain), superseding the v1 same-container, uid-separated-only placement disclosed in docs/capabilities.md (evalops/sandboxwich#176, evalops/orb#296).
 
 ## Non-goals for 0.1
 

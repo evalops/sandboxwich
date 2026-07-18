@@ -24,10 +24,11 @@ use sandboxwich_core::{
     AgentHealthResponse, AppendCommandOutputRequest, ClaimLeaseRequest, ClaimLeaseResponse,
     CommandOutputStream, CompleteLeaseRequest, DEFAULT_COMMAND_TIMEOUT_SECS, FailLeaseRequest,
     GuestStatus, GuestTokenResponse, JobKind, LeaseId, LeaseResponse, MintGuestTokenRequest,
-    RenewLeaseRequest, ResidentProcessBootstrapReadRequest, ResidentProcessBootstrapReadResponse,
-    ResidentProcessId, ResidentProcessObservationRequest, ResidentProcessObservedState,
-    ResidentProcessRestartPolicy, SandboxId, UpdateGuestHealthRequest, WorkerJobResult,
-    build_api_client, validate_agent_command_request,
+    ORB_EXECUTOR_RESIDENT_PROCESS_NAME, RenewLeaseRequest, ResidentProcessBootstrapReadRequest,
+    ResidentProcessBootstrapReadResponse, ResidentProcessId, ResidentProcessObservationRequest,
+    ResidentProcessObservedState, ResidentProcessRestartPolicy, SandboxId,
+    UpdateGuestHealthRequest, WorkerJobResult, build_api_client, resident_process_run_as_uid,
+    validate_agent_command_request,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -364,9 +365,32 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
     // blip in either should be retried with backoff rather than tearing down the daemon.
     let mut claim_budget = HeartbeatFailureBudget::new(args.claim_failure_threshold.max(1));
     let mut claim_backoff = Backoff::new(Duration::from_millis(args.idle_sleep_ms.max(1)));
+    let mut resident_tasks = tokio::task::JoinSet::new();
 
     let daemon_result = async {
         loop {
+            while let Some(result) = resident_tasks.try_join_next() {
+                let error = match result {
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(error)) => error,
+                    Err(error) => anyhow::anyhow!("resident-process task failed: {error}"),
+                };
+                with_retry(
+                    &mut claim_budget,
+                    &mut claim_backoff,
+                    "post_guest_health",
+                    || {
+                        post_guest_health(
+                            &guest_client,
+                            &api,
+                            sandbox_id,
+                            GuestStatus::Unhealthy,
+                            Some(error.to_string()),
+                        )
+                    },
+                )
+                .await?;
+            }
             if heartbeat_task.is_finished() {
                 bail!("heartbeat loop stopped");
             }
@@ -391,8 +415,22 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
                     })
                     .await?;
 
-                if let Some(lease) = claim_response.lease
-                    && let Err(error) = handle_lease(
+                if let Some(lease) = claim_response.lease {
+                    if lease.job.kind == JobKind::RunResidentProcess {
+                        let client = guest_client.clone();
+                        let api = api.clone();
+                        let max_captured_output_bytes = args.max_captured_output_bytes;
+                        resident_tasks.spawn(async move {
+                            handle_lease(
+                                &client,
+                                &api,
+                                sandbox_id,
+                                lease,
+                                max_captured_output_bytes,
+                            )
+                            .await
+                        });
+                    } else if let Err(error) = handle_lease(
                         &guest_client,
                         &api,
                         sandbox_id,
@@ -400,22 +438,23 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
                         args.max_captured_output_bytes,
                     )
                     .await
-                {
-                    with_retry(
-                        &mut claim_budget,
-                        &mut claim_backoff,
-                        "post_guest_health",
-                        || {
-                            post_guest_health(
-                                &guest_client,
-                                &api,
-                                sandbox_id,
-                                GuestStatus::Unhealthy,
-                                Some(error.to_string()),
-                            )
-                        },
-                    )
-                    .await?;
+                    {
+                        with_retry(
+                            &mut claim_budget,
+                            &mut claim_backoff,
+                            "post_guest_health",
+                            || {
+                                post_guest_health(
+                                    &guest_client,
+                                    &api,
+                                    sandbox_id,
+                                    GuestStatus::Unhealthy,
+                                    Some(error.to_string()),
+                                )
+                            },
+                        )
+                        .await?;
+                    }
                 }
             }
 
@@ -431,6 +470,9 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
         Ok(())
     }
     .await;
+
+    resident_tasks.abort_all();
+    while resident_tasks.join_next().await.is_some() {}
 
     if heartbeat_task.is_finished() {
         heartbeat_task.await.context("heartbeat task failed")??;
@@ -1207,6 +1249,52 @@ async fn post_resident_observation(
     Ok(())
 }
 
+/// v1 sidecar placement primitive (evalops/sandboxwich#176): if `run_as_uid`
+/// is `Some` (only `orb-sidecar` gets one -- see
+/// [`sandboxwich_core::resident_process_run_as_uid`]), configure `command`
+/// to `setuid`/`setgid` to it before exec, giving the sidecar a uid distinct
+/// from this agent's own uid (which is what `orb-executor` and every other
+/// resident process inherit by leaving `run_as_uid` at `None`).
+///
+/// This is a uid-separation boundary WITHIN the same sandbox/container, not
+/// a separate trust domain -- a sufficiently privileged process elsewhere in
+/// the same sandbox (e.g. a root agent workload) can still read the
+/// sidecar's files, ptrace it, or otherwise defeat the separation; see
+/// docs/capabilities.md for the full disclosure. If the agent process itself
+/// lacks the privilege to change uid (true for the default, non-apex
+/// sandbox pod today, which is not granted `SETUID`/`SETGID`), the spawn
+/// fails outright with a permission error rather than silently running the
+/// sidecar under the workload's own uid -- callers must treat that as the
+/// sidecar being unavailable, not as a degraded-but-working sidecar.
+fn apply_resident_process_run_as_uid(command: &mut ProcessCommand, run_as_uid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(uid) = run_as_uid {
+        command.uid(uid);
+        command.gid(uid);
+    }
+    #[cfg(not(unix))]
+    let _ = (command, run_as_uid);
+}
+
+#[cfg(unix)]
+fn transfer_resident_bootstrap_ownership(
+    file: &std::fs::File,
+    run_as_uid: Option<u32>,
+) -> std::io::Result<()> {
+    if let Some(uid) = run_as_uid {
+        std::os::unix::fs::fchown(file, Some(uid), Some(uid))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn transfer_resident_bootstrap_ownership(
+    _file: &std::fs::File,
+    _run_as_uid: Option<u32>,
+) -> std::io::Result<()> {
+    Ok(())
+}
+
 async fn handle_resident_process(
     client: &reqwest::Client,
     api: &str,
@@ -1227,6 +1315,17 @@ async fn handle_resident_process(
         .get("generation")
         .and_then(serde_json::Value::as_u64)
         .context("resident generation is missing")?;
+    // Older queued jobs (pre-#176) never wrote a "name" field; default to
+    // orb-executor, which preserves the pre-#176 behavior of inheriting the
+    // agent's own uid rather than attempting a privilege drop.
+    let name = lease
+        .job
+        .payload
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(ORB_EXECUTOR_RESIDENT_PROCESS_NAME)
+        .to_string();
+    let run_as_uid = resident_process_run_as_uid(&name);
     let argv: Vec<String> = serde_json::from_value(
         lease
             .job
@@ -1303,6 +1402,12 @@ async fn handle_resident_process(
             .with_context(|| format!("failed to create {}", target.display()))?;
         file.write_all(&bootstrap.content)?;
         file.sync_all()?;
+        transfer_resident_bootstrap_ownership(&file, run_as_uid).with_context(|| {
+            format!(
+                "failed to transfer {} to the resident-process identity",
+                target.display()
+            )
+        })?;
     }
 
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -1340,6 +1445,7 @@ async fn handle_resident_process(
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        apply_resident_process_run_as_uid(&mut command, run_as_uid);
         let mut child = command
             .spawn()
             .context("failed to spawn resident process")?;
@@ -1723,7 +1829,8 @@ async fn post_guest_health(
             agent_version: Some(agent_version()),
             checks: Some(serde_json::json!({
                 "exec": {"status": "ok"},
-                "files": {"status": "ok"}
+                "files": {"status": "ok"},
+                "uidIsolatedResidentProcess": {"status": "ok", "version": 1}
             })),
             message,
         })
@@ -2501,5 +2608,149 @@ mod tests {
             };
             assert!(request.retry, "lease scope violations must always retry");
         }
+    }
+
+    /// Runs `id -u` and returns the reported uid. Used instead of a `libc`
+    /// dependency just for `geteuid()`; `id` is present on every platform
+    /// this daemon targets (Linux sandbox images and macOS dev machines).
+    fn current_uid() -> u32 {
+        let output = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .expect("run `id -u`");
+        assert!(output.status.success(), "`id -u` must succeed");
+        String::from_utf8(output.stdout)
+            .expect("id -u output is utf8")
+            .trim()
+            .parse()
+            .expect("id -u output is a uid")
+    }
+
+    #[tokio::test]
+    async fn orb_executor_run_as_uid_is_none_and_never_shifts_identity() {
+        // orb-executor (and every unrecognized resident-process name) must
+        // resolve to `None` -- no privilege drop attempt, inheriting
+        // whatever uid the agent process itself runs as. This is the
+        // pre-#176 behavior and must not regress.
+        assert_eq!(
+            sandboxwich_core::resident_process_run_as_uid(
+                sandboxwich_core::ORB_EXECUTOR_RESIDENT_PROCESS_NAME
+            ),
+            None
+        );
+        let mut command = ProcessCommand::new("id");
+        command.arg("-u");
+        apply_resident_process_run_as_uid(&mut command, None);
+        let output = command.output().await.expect("spawn `id -u` unmodified");
+        assert!(output.status.success());
+        let reported: u32 = String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            reported,
+            current_uid(),
+            "orb-executor must inherit the agent's own uid, not shift identity"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn orb_sidecar_run_as_uid_actually_attempts_privilege_separation() {
+        // The uid #176 assigns orb-sidecar must be a fixed value, distinct
+        // from every resident process that leaves `run_as_uid` at `None`.
+        let sidecar_uid = sandboxwich_core::resident_process_run_as_uid(
+            sandboxwich_core::ORB_SIDECAR_RESIDENT_PROCESS_NAME,
+        )
+        .expect("orb-sidecar must get an explicit run-as uid");
+        assert_eq!(
+            sidecar_uid,
+            sandboxwich_core::ORB_SIDECAR_RESIDENT_PROCESS_UID
+        );
+
+        let euid = current_uid();
+        let mut command = ProcessCommand::new("id");
+        command.arg("-u");
+        apply_resident_process_run_as_uid(&mut command, Some(sidecar_uid));
+        let result = command.output().await;
+
+        if euid == 0 {
+            // Running as root: setuid must actually succeed and the child
+            // must observe the sidecar's uid, not root's -- proving uid
+            // separation genuinely takes effect when the agent has the
+            // privilege to apply it (mirrors what an apex-supervisor-style
+            // pod, granted SETUID/SETGID, would experience in production).
+            let output = result.expect("root can spawn under an arbitrary uid");
+            assert!(output.status.success());
+            let reported: u32 = String::from_utf8(output.stdout)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(
+                reported, sidecar_uid,
+                "sidecar child must run as the sidecar uid, not root's"
+            );
+        } else {
+            // The common case: an unprivileged agent (no SETUID/SETGID
+            // capability, e.g. today's default non-apex sandbox pod running
+            // as uid 10001) cannot drop to an arbitrary different uid.
+            // Fail-closed proof: the spawn must fail outright -- it must
+            // NEVER silently fall back to running the sidecar under the
+            // agent's own uid, which would make v1's uid-separation claim a
+            // lie for anyone who forgot to grant the capability.
+            assert_ne!(
+                sidecar_uid, euid,
+                "test fixture requires a target uid distinct from the current uid"
+            );
+            let error = result.expect_err(
+                "spawning under a different uid without SETUID/SETGID must fail, not silently \
+                 run the sidecar under the caller's own uid",
+            );
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "unexpected error kind for an unprivileged uid switch: {error:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn orb_sidecar_can_read_its_private_bootstrap_after_uid_transfer() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        if current_uid() != 0 {
+            return;
+        }
+        let sidecar_uid = sandboxwich_core::ORB_SIDECAR_RESIDENT_PROCESS_UID;
+        let target = std::env::temp_dir().join(format!(
+            "sandboxwich-sidecar-bootstrap-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&target)
+            .expect("create private sidecar bootstrap");
+        file.write_all(b"sidecar-bootstrap-canary")
+            .expect("write sidecar bootstrap");
+        file.sync_all().expect("sync sidecar bootstrap");
+        transfer_resident_bootstrap_ownership(&file, Some(sidecar_uid))
+            .expect("transfer bootstrap to sidecar uid");
+        drop(file);
+
+        let mut command = ProcessCommand::new("cat");
+        command.arg(&target);
+        apply_resident_process_run_as_uid(&mut command, Some(sidecar_uid));
+        let output = command
+            .output()
+            .await
+            .expect("uid-isolated sidecar reads its bootstrap");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"sidecar-bootstrap-canary");
+        std::fs::remove_file(target).expect("remove sidecar bootstrap fixture");
     }
 }

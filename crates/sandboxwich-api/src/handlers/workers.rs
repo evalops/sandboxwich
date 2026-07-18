@@ -586,7 +586,9 @@ pub(crate) async fn active_lease_count_for_worker_on_connection(
     let sql = format!(
         "select count(*) as active_leases
          from job_leases
-         where worker_id = {} and status = 'active'",
+         join jobs on jobs.id = job_leases.job_id
+         where job_leases.worker_id = {} and job_leases.status = 'active'
+           and jobs.kind != 'run_resident_process'",
         db.placeholder(1)
     );
     let row = sqlx::query(&sql)
@@ -606,9 +608,10 @@ pub(crate) async fn list_worker_capacities(
         "select workers.id, workers.tenant_id, workers.name, workers.status, workers.provider,
                 workers.capabilities, workers.max_concurrent_jobs, workers.labels,
                 workers.registered_at, workers.last_heartbeat_at,
-                coalesce(count(job_leases.id), 0) as active_leases
+                coalesce(sum(case when jobs.kind != 'run_resident_process' then 1 else 0 end), 0) as active_leases
          from workers
          left join job_leases on job_leases.worker_id = workers.id and job_leases.status = 'active'
+         left join jobs on jobs.id = job_leases.job_id
          where workers.tenant_id = {}
          group by workers.id, workers.tenant_id, workers.name, workers.status, workers.provider,
                   workers.capabilities, workers.max_concurrent_jobs, workers.labels,
@@ -659,6 +662,22 @@ pub(crate) async fn fetch_guest_health(
         .fetch_optional(&db.pool)
         .await?;
     row.map(row_to_guest_health).transpose()
+}
+
+pub(crate) fn guest_supports_uid_isolated_resident_process(health: &GuestHealth) -> bool {
+    health.status == GuestStatus::Ready
+        && health
+            .checks
+            .get("uidIsolatedResidentProcess")
+            .and_then(|check| check.get("status"))
+            .and_then(serde_json::Value::as_str)
+            == Some("ok")
+        && health
+            .checks
+            .get("uidIsolatedResidentProcess")
+            .and_then(|check| check.get("version"))
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|version| version >= 1)
 }
 
 pub(crate) async fn upsert_guest_health(

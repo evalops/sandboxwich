@@ -53,6 +53,95 @@ async fn fetch_resident_process_by_id(
     row_to_resident_process(row)
 }
 
+/// Fail-closed gate for issue #176's "sidecar placement primitive": if this
+/// sandbox has ever had an `orb-sidecar` resident process configured (a row
+/// exists for `(sandbox_id, "orb-sidecar")` -- once configured, this is
+/// sticky for the sandbox's lifetime, since a compromised or merely stopped
+/// sidecar must not silently lift the requirement it was created to
+/// enforce), then reading the *`orb-executor`* workload's one-read bootstrap
+/// credential requires that sidecar to be currently observed `Running`.
+///
+/// This is the one dependent operation v1 gates: sandboxwich's role per
+/// evalops/orb#296 is placement plus reusing the one-read bootstrap
+/// mechanism to deliver the sidecar's own claim credential, not the
+/// egress-proxy/credential-broker tiers (those live in the `orb` repo). The
+/// bootstrap read is the single sandboxwich-owned moment where a workload's
+/// credential handoff could otherwise proceed silently without its sidecar,
+/// so it is what fails loudly here. Other resident-process operations
+/// (spawn, observations, stop) for either name are unaffected.
+///
+/// A missing sidecar row (the sandbox never asked for one) is not a
+/// violation -- v1 sidecars are opt-in per sandbox -- so this only returns
+/// an error once a sidecar has actually been configured and is not
+/// currently healthy.
+async fn ensure_sidecar_ready_if_required(
+    db: &Database,
+    sandbox_id: SandboxId,
+    tenant_id: &str,
+    process_name: &str,
+) -> Result<(), ApiError> {
+    if process_name != ORB_EXECUTOR_RESIDENT_PROCESS_NAME {
+        return Ok(());
+    }
+    let sidecar =
+        match fetch_named_resident_process(db, sandbox_id, ORB_SIDECAR_RESIDENT_PROCESS_NAME).await
+        {
+            Ok(sidecar) => sidecar,
+            Err(ApiError {
+                status: StatusCode::NOT_FOUND,
+                ..
+            }) => return Ok(()),
+            Err(other) => return Err(other),
+        };
+    if sidecar.tenant_id != tenant_id {
+        // Cross-tenant rows should be unreachable given sandbox_id is
+        // already tenant-scoped upstream, but never let a foreign row's
+        // state gate (or fail to gate) this tenant's bootstrap read.
+        return Ok(());
+    }
+    if sidecar.observed_state != ResidentProcessObservedState::Running {
+        return Err(ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "resident_sidecar_unavailable",
+            message: format!(
+                "sandbox {sandbox_id} requires an orb-sidecar resident process but it is {:?}, \
+                 not running; refusing to hand out the orb-executor bootstrap credential",
+                sidecar.observed_state
+            ),
+        });
+    }
+    let Some(active_lease_id) = sidecar.active_lease_id else {
+        return Err(ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "resident_sidecar_unavailable",
+            message: format!(
+                "sandbox {sandbox_id} requires an orb-sidecar resident process but its running observation has no active lease; refusing to hand out the orb-executor bootstrap credential"
+            ),
+        });
+    };
+    let sql = format!(
+        "select 1 from job_leases where id = {} and status = 'active' and expires_at > {}",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    let lease_is_live = sqlx::query(&sql)
+        .bind(active_lease_id.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .fetch_optional(&db.pool)
+        .await?
+        .is_some();
+    if !lease_is_live {
+        return Err(ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "resident_sidecar_unavailable",
+            message: format!(
+                "sandbox {sandbox_id} requires an orb-sidecar resident process but its running observation is not backed by a live lease; refusing to hand out the orb-executor bootstrap credential"
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn same_spec(
     current: &ResidentProcess,
     request: &ResidentProcessRequest,
@@ -79,9 +168,9 @@ pub(crate) async fn put_resident_process(
 ) -> Result<(StatusCode, Json<ResidentProcessResponse>), ApiError> {
     validate_resident_process_request(&request)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    if name != "orb-executor" {
+    if !is_supported_resident_process_name(&name) {
         return Err(ApiError::bad_request(
-            "the first resident-process contract supports only orb-executor",
+            "the resident-process contract supports only orb-executor and orb-sidecar",
         ));
     }
     let sandbox_id = SandboxId(sandbox_id);
@@ -118,6 +207,18 @@ pub(crate) async fn put_resident_process(
             "resident_process_generation_conflict",
             "new resident process requires expectedGeneration=0",
         ));
+    }
+    if name == ORB_SIDECAR_RESIDENT_PROCESS_NAME {
+        let guest_health = crate::handlers::workers::fetch_guest_health(&state.db, sandbox_id)
+            .await?
+            .filter(crate::handlers::workers::guest_supports_uid_isolated_resident_process);
+        if guest_health.is_none() {
+            return Err(ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "resident_sidecar_agent_unsupported",
+                message: "orb-sidecar requires a ready guest agent advertising uid-isolated resident-process v1 support".into(),
+            });
+        }
     }
 
     let now = Utc::now();
@@ -161,6 +262,7 @@ pub(crate) async fn put_resident_process(
         payload: json!({
             "sandboxId": sandbox_id,
             "residentProcessId": process.id,
+            "name": process.name,
             "generation": process.generation,
             "argv": process.argv,
             "cwd": process.cwd,
@@ -172,7 +274,11 @@ pub(crate) async fn put_resident_process(
                 "resourceId": process.id.0,
             }
         }),
-        required_capability: WorkerCapability::RunCommand,
+        required_capability: if process.name == ORB_SIDECAR_RESIDENT_PROCESS_NAME {
+            WorkerCapability::UidIsolatedResidentProcess
+        } else {
+            WorkerCapability::RunCommand
+        },
         required_execution_class: sandbox.execution_class.clone(),
         priority: 0,
         attempts: 0,
@@ -328,6 +434,8 @@ pub(crate) async fn read_resident_process_bootstrap(
             "resident bootstrap request does not match the active lease",
         ));
     }
+    ensure_sidecar_ready_if_required(&state.db, sandbox_id, &process.tenant_id, &process.name)
+        .await?;
     let bootstrap = state
         .resident_bootstraps
         .take(&process_id)

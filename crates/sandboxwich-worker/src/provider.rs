@@ -3966,6 +3966,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
             WorkerCapability::K8sPod,
             WorkerCapability::ProvisionSandbox,
             WorkerCapability::RunCommand,
+            WorkerCapability::UidIsolatedResidentProcess,
             WorkerCapability::Snapshot,
             WorkerCapability::DesktopStream,
         ];

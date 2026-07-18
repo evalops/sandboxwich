@@ -468,6 +468,7 @@ struct ProviderApplyArgs {
 enum CapabilityArg {
     ProvisionSandbox,
     RunCommand,
+    UidIsolatedResidentProcess,
     MaterializeFile,
     ApexTaskInstructions,
     Snapshot,
@@ -2576,6 +2577,7 @@ fn capabilities_from_args(
             WorkerCapability::K8sPod,
             WorkerCapability::ProvisionSandbox,
             WorkerCapability::RunCommand,
+            WorkerCapability::UidIsolatedResidentProcess,
             WorkerCapability::MaterializeFile,
             WorkerCapability::Snapshot,
             WorkerCapability::DesktopStream,
@@ -2677,6 +2679,7 @@ fn to_capability(value: CapabilityArg) -> WorkerCapability {
     match value {
         CapabilityArg::ProvisionSandbox => WorkerCapability::ProvisionSandbox,
         CapabilityArg::RunCommand => WorkerCapability::RunCommand,
+        CapabilityArg::UidIsolatedResidentProcess => WorkerCapability::UidIsolatedResidentProcess,
         CapabilityArg::MaterializeFile => WorkerCapability::MaterializeFile,
         CapabilityArg::ApexTaskInstructions => WorkerCapability::ApexTaskInstructions,
         CapabilityArg::Snapshot => WorkerCapability::Snapshot,
