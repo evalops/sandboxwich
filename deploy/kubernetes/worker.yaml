@@ -124,7 +124,7 @@ spec:
             - name: HOME
               value: /tmp
             - name: SANDBOXWICH_API
-              value: http://sandboxwich-api:3217
+              value: http://sandboxwich-api.sandboxwich.svc:3217
             # GH-64: this tenant-wide credential authenticates only the
             # `run` subcommand's initial `POST /workers/register` call.
             # Immediately after registering, the worker process mints and
@@ -169,6 +169,13 @@ spec:
               value: ""
             - name: SANDBOXWICH_RUNTIME_CLASS_NAME
               value: ""
+            # Optional provider-isolated orb-sidecar image. The worker advertises
+            # that capability only when this is digest-pinned and the RuntimeClass
+            # above is nonempty; the sidecar Pod uses that RuntimeClass too.
+            - name: SANDBOXWICH_ISOLATED_RESIDENT_PROCESS_IMAGE
+              value: ""
+            - name: SANDBOXWICH_MAX_RESIDENT_PROCESSES
+              value: "8"
             # Required in apply mode: the worker refuses to start without an
             # explicit guest image so kind/local clusters cannot silently fall
             # back to a private ghcr.io default and ImagePullBackOff.
@@ -199,6 +206,8 @@ spec:
             #     this env var (or --confirm-apply) and switch
             #     --provider-mode to dry-run.
             - name: SANDBOXWICH_K8S_ENABLE_MUTATION
+              value: "1"
+            - name: SANDBOXWICH_ORPHAN_RECONCILIATION_APPLY
               value: "1"
           args:
             - run
@@ -248,6 +257,7 @@ spec:
             - "20"
             - --orphan-reconciliation-max-elapsed-secs
             - "10"
+            - --orphan-reconciliation-apply
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

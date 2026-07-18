@@ -171,6 +171,20 @@ pub(crate) async fn collect_prometheus_metrics(
         "status",
         metrics.counts("cleanup_run"),
     );
+    append_count_family(
+        &mut body,
+        "sandboxwich_resident_process_count",
+        "Resident processes by observed state.",
+        "state",
+        metrics.counts("resident_process"),
+    );
+    append_counter_family(
+        &mut body,
+        "sandboxwich_sidecar_bootstrap_block_total",
+        "Fail-closed orb-executor bootstrap denials by bounded sidecar readiness reason.",
+        "reason",
+        metrics.counts("sidecar_bootstrap_block"),
+    );
     append_gauge(
         &mut body,
         "sandboxwich_job_queue_oldest_seconds",
@@ -347,6 +361,7 @@ pub(crate) async fn fetch_prometheus_metrics(
             .or_insert_with(Vec::new)
             .push((label, value));
     }
+    fetch_resident_observability_metrics(db, tenant_id, &mut values).await?;
     let queued_sql = match tenant_id {
         None => {
             "select min(scheduled_at) as observed_at from jobs where status = 'queued'".to_string()
@@ -385,10 +400,87 @@ pub(crate) async fn fetch_prometheus_metrics(
     Ok(PrometheusMetrics { values })
 }
 
+async fn fetch_resident_observability_metrics(
+    db: &Database,
+    tenant_id: Option<&str>,
+    values: &mut BTreeMap<String, Vec<(String, i64)>>,
+) -> Result<(), ApiError> {
+    let resident_sql = match tenant_id {
+        None => "select observed_state as label, count(*) as value
+                 from resident_processes group by observed_state"
+            .to_string(),
+        Some(_) => format!(
+            "select observed_state as label, count(*) as value
+             from resident_processes where tenant_id = {} group by observed_state",
+            db.placeholder(1)
+        ),
+    };
+    let mut resident_query = sqlx::query(&resident_sql);
+    if let Some(tenant_id) = tenant_id {
+        resident_query = resident_query.bind(tenant_id);
+    }
+    let mut resident_counts = Vec::new();
+    for row in resident_query.fetch_all(&db.pool).await? {
+        let state: String = row.try_get("label")?;
+        // Keep the label domain bounded even if a database constraint is
+        // bypassed during an operator repair.
+        if ResidentProcessObservedState::parse_db_str(&state).is_ok() {
+            resident_counts.push((state, row.try_get("value")?));
+        }
+    }
+    values.insert("resident_process".into(), resident_counts);
+
+    let block_sql = match (tenant_id, db.dialect) {
+        // PostgreSQL promotes sum(bigint) to numeric, while the Prometheus
+        // contract is an i64 gauge. Cast at the aggregate boundary instead
+        // of asking sqlx to decode numeric as i64.
+        (None, SqlDialect::Postgres) => "select reason as label, sum(total)::bigint as value
+                 from sidecar_bootstrap_block_rollups group by reason"
+            .to_string(),
+        (None, SqlDialect::Sqlite) => "select reason as label, sum(total) as value
+                 from sidecar_bootstrap_block_rollups group by reason"
+            .to_string(),
+        (Some(_), _) => format!(
+            "select reason as label, total as value
+             from sidecar_bootstrap_block_rollups where tenant_id = {}",
+            db.placeholder(1)
+        ),
+    };
+    let mut block_query = sqlx::query(&block_sql);
+    if let Some(tenant_id) = tenant_id {
+        block_query = block_query.bind(tenant_id);
+    }
+    let mut block_counts = Vec::new();
+    for row in block_query.fetch_all(&db.pool).await? {
+        let reason: String = row.try_get("label")?;
+        // The schema constrains this domain; retain a read-side guard so an
+        // operator repair cannot introduce an unbounded Prometheus label.
+        if matches!(
+            reason.as_str(),
+            "not_running" | "no_active_lease" | "inactive_lease" | "expired_lease"
+        ) {
+            block_counts.push((reason, row.try_get("value")?));
+        }
+    }
+    values.insert("sidecar_bootstrap_block".into(), block_counts);
+    Ok(())
+}
+
 pub(crate) fn append_count_family(
     body: &mut String,
     name: &'static str,
     help: &'static str,
+    label_name: &'static str,
+    values: Vec<(String, i64)>,
+) {
+    append_labeled_family(body, name, help, "gauge", label_name, values);
+}
+
+fn append_labeled_family(
+    body: &mut String,
+    name: &'static str,
+    help: &'static str,
+    metric_type: &'static str,
     label_name: &'static str,
     values: Vec<(String, i64)>,
 ) {
@@ -399,7 +491,9 @@ pub(crate) fn append_count_family(
     body.push('\n');
     body.push_str("# TYPE ");
     body.push_str(name);
-    body.push_str(" gauge\n");
+    body.push(' ');
+    body.push_str(metric_type);
+    body.push('\n');
     for (label, value) in values {
         body.push_str(name);
         body.push('{');
@@ -410,6 +504,16 @@ pub(crate) fn append_count_family(
         body.push_str(&value.to_string());
         body.push('\n');
     }
+}
+
+pub(crate) fn append_counter_family(
+    body: &mut String,
+    name: &'static str,
+    help: &'static str,
+    label_name: &'static str,
+    values: Vec<(String, i64)>,
+) {
+    append_labeled_family(body, name, help, "counter", label_name, values);
 }
 
 pub(crate) fn append_gauge(body: &mut String, name: &'static str, help: &'static str, value: i64) {

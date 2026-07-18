@@ -1,6 +1,443 @@
 use super::*;
 use sandboxwich_core::{MAX_COMMAND_STDIN_BYTES, NetworkAllowRule};
 
+fn isolated_sidecar_spec(bootstrap: &[u8]) -> IsolatedResidentProcessSpec {
+    IsolatedResidentProcessSpec {
+        sandbox_id: SandboxId::new(),
+        process_id: sandboxwich_core::ResidentProcessId::new(),
+        generation: 7,
+        lease_id: Uuid::now_v7(),
+        argv: vec!["/opt/orb/bin/orb-sidecar".to_string()],
+        cwd: Some("/workspace".to_string()),
+        env: BTreeMap::from([("ORB_API".to_string(), "https://orb.invalid".to_string())]),
+        bootstrap: IsolatedResidentProcessBootstrap {
+            content: bootstrap.to_vec(),
+            target_file: "/run/sandboxwich/bootstrap/orb-token".to_string(),
+            mode: 0o400,
+        },
+    }
+}
+
+#[test]
+fn isolated_sidecar_manifests_are_separate_fenced_and_secret_safe() {
+    let image = format!("ghcr.io/evalops/orb-sidecar@sha256:{}", "b".repeat(64));
+    let provider = KubernetesApplyProvider::new(
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Gvisor)
+            .with_runtime_class_name(Some("gvisor".to_string())),
+        "kubectl",
+    )
+    .with_isolated_resident_process_image(Some(image.clone()));
+    let bootstrap = b"isolated-bootstrap-canary";
+    let spec = isolated_sidecar_spec(bootstrap);
+
+    let manifests = provider
+        .isolated_resident_process_manifests(&spec)
+        .expect("a configured isolated sidecar should render");
+    assert_eq!(manifests.len(), 3);
+    let secret = &manifests[0];
+    let policy = &manifests[1];
+    let pod = &manifests[2];
+    assert_eq!(secret["kind"], "Secret");
+    assert_eq!(secret["immutable"], true);
+    assert_eq!(pod["kind"], "Pod");
+    assert_eq!(policy["kind"], "NetworkPolicy");
+    assert_eq!(policy["spec"]["policyTypes"], json!(["Ingress", "Egress"]));
+    assert_eq!(policy["spec"]["ingress"], json!([]));
+    assert_eq!(policy["spec"]["egress"][0]["ports"][0]["port"], 53);
+    assert_eq!(
+        policy["spec"]["egress"][0]["to"][0]["podSelector"]["matchLabels"]["k8s-app"],
+        "kube-dns"
+    );
+    assert_eq!(policy["spec"]["egress"][1]["ports"][0]["port"], 443);
+    assert!(
+        policy["spec"]["egress"][1]["to"][0]["ipBlock"]["except"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("169.254.0.0/16"))
+    );
+    assert_eq!(
+        policy["spec"]["podSelector"]["matchLabels"],
+        pod["metadata"]["labels"]
+    );
+    assert_eq!(
+        pod["metadata"]["labels"]["sandboxwich.dev/sandbox-id"],
+        spec.sandbox_id.to_string()
+    );
+    assert_eq!(
+        pod["metadata"]["labels"]["sandboxwich.dev/resident-process-id"],
+        spec.process_id.to_string()
+    );
+    assert_eq!(pod["metadata"]["labels"]["sandboxwich.dev/generation"], "7");
+    assert_eq!(
+        pod["metadata"]["labels"]["sandboxwich.dev/lease-id"],
+        spec.lease_id.to_string()
+    );
+    assert_eq!(pod["spec"]["runtimeClassName"], "gvisor");
+    assert_eq!(pod["spec"]["automountServiceAccountToken"], false);
+    assert_eq!(pod["spec"]["hostNetwork"], false);
+    assert_eq!(pod["spec"]["hostPID"], false);
+    assert_eq!(pod["spec"]["hostIPC"], false);
+    assert_eq!(pod["spec"]["containers"][0]["image"], image);
+    assert_eq!(
+        pod["spec"]["containers"][0]["securityContext"]["runAsNonRoot"],
+        true
+    );
+    assert_eq!(
+        pod["spec"]["containers"][0]["securityContext"]["allowPrivilegeEscalation"],
+        false
+    );
+    assert_eq!(
+        pod["spec"]["containers"][0]["securityContext"]["readOnlyRootFilesystem"],
+        true
+    );
+    assert_eq!(
+        pod["spec"]["containers"][0]["securityContext"]["capabilities"]["drop"],
+        json!(["ALL"])
+    );
+    assert_eq!(
+        pod["spec"]["containers"][0]["resources"]["requests"]["memory"],
+        "64Mi"
+    );
+    assert_eq!(
+        pod["spec"]["containers"][0]["resources"]["limits"]["memory"],
+        "256Mi"
+    );
+    assert_eq!(
+        secret["data"]["bootstrap"],
+        general_purpose::STANDARD.encode(bootstrap)
+    );
+    for manifest in &manifests {
+        let name = manifest["metadata"]["name"].as_str().unwrap();
+        assert!(name.len() <= 63);
+        assert!(name.contains("-g7-"));
+    }
+
+    let mut replacement = spec.clone();
+    replacement.generation += 1;
+    replacement.lease_id = Uuid::now_v7();
+    let replacement_manifests = provider
+        .isolated_resident_process_manifests(&replacement)
+        .expect("replacement lease should render separately fenced resources");
+    for (old, new) in manifests.iter().zip(&replacement_manifests) {
+        assert_ne!(old["metadata"]["name"], new["metadata"]["name"]);
+    }
+
+    let debug = format!("{spec:?}");
+    assert!(!debug.contains("isolated-bootstrap-canary"));
+    assert!(!debug.contains("https://orb.invalid"));
+    let cleanup = provider.isolated_resident_process_cleanup_manifests(&spec);
+    assert_eq!(cleanup.len(), manifests.len());
+    for applied in &manifests {
+        assert!(cleanup.iter().any(|deleted| {
+            applied["kind"] == deleted["kind"]
+                && applied["metadata"]["name"] == deleted["metadata"]["name"]
+        }));
+    }
+    let cleanup_json = serde_json::to_string(&cleanup).unwrap();
+    assert!(!cleanup_json.contains("isolated-bootstrap-canary"));
+    assert!(!cleanup_json.contains(&general_purpose::STANDARD.encode(bootstrap)));
+}
+
+#[test]
+fn isolated_sidecar_requires_digest_image_and_runtime_class() {
+    let base =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+    let spec = isolated_sidecar_spec(b"secret");
+    let unpinned = KubernetesApplyProvider::new(base.clone(), "kubectl")
+        .with_isolated_resident_process_image(Some("ghcr.io/evalops/orb-sidecar:latest".into()));
+    assert!(unpinned.isolated_resident_process_manifests(&spec).is_err());
+    let no_runtime_class =
+        KubernetesApplyProvider::new(base, "kubectl").with_isolated_resident_process_image(Some(
+            format!("ghcr.io/evalops/orb-sidecar@sha256:{}", "c".repeat(64)),
+        ));
+    assert!(
+        no_runtime_class
+            .isolated_resident_process_manifests(&spec)
+            .is_err()
+    );
+}
+
+#[test]
+fn dry_run_does_not_claim_or_execute_isolated_resident_processes() {
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+    assert!(
+        !provider
+            .capability_report()
+            .labels
+            .contains_key("provider_isolated_resident_process_version")
+    );
+    let error = provider
+        .run_isolated_resident_process(
+            &isolated_sidecar_spec(b"secret"),
+            &CancelSignal::never_cancelled(),
+            &mut |_| Ok(()),
+        )
+        .expect_err("dry-run cannot provide a real process isolation boundary");
+    assert!(error.to_string().contains("unavailable in dry-run mode"));
+}
+
+fn write_isolated_sidecar_fake_kubectl(
+    fail_apply: bool,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "sandboxwich-isolated-sidecar-kubectl-{}",
+        SandboxId::new()
+    ));
+    std::fs::create_dir_all(&dir).expect("create isolated sidecar fake kubectl dir");
+    let script_path = dir.join("kubectl");
+    let log_path = dir.join("kubectl.log");
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+dir=$(dirname "$0")
+printf 'ARGS %s\n' "$*" >> "$dir/kubectl.log"
+verb=""
+for arg in "$@"; do
+  case "$arg" in apply|get|delete) verb="$arg"; break;; esac
+done
+case "$verb" in
+  apply)
+    cat > "$dir/apply.stdin"
+    if [ "{fail_apply}" = "true" ]; then
+      echo "synthetic apply failure" >&2
+      exit 1
+    fi
+    ;;
+  get)
+    count=0
+    if [ -f "$dir/get.count" ]; then count=$(cat "$dir/get.count"); fi
+    count=$((count + 1))
+    printf '%s' "$count" > "$dir/get.count"
+    if [ "$count" -eq 1 ]; then
+      printf '%s\n' '{{"metadata":{{"uid":"pod-uid-1"}},"status":{{"phase":"Running","containerStatuses":[{{"ready":true,"state":{{"running":{{}}}}}}]}}}}'
+    else
+      printf '%s\n' '{{"metadata":{{"uid":"pod-uid-1"}},"status":{{"phase":"Succeeded","containerStatuses":[{{"ready":false,"state":{{"terminated":{{"exitCode":0}}}}}}]}}}}'
+    fi
+    ;;
+  delete)
+    cat > "$dir/delete.stdin"
+    ;;
+  *)
+    echo "unsupported fake kubectl invocation: $*" >&2
+    exit 2
+    ;;
+esac
+"#
+    );
+    std::fs::write(&script_path, script).expect("write isolated sidecar fake kubectl");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("stat isolated sidecar fake kubectl")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions)
+            .expect("chmod isolated sidecar fake kubectl");
+    }
+    (script_path, log_path)
+}
+
+fn write_pending_isolated_sidecar_fake_kubectl() -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "sandboxwich-pending-sidecar-kubectl-{}",
+        SandboxId::new()
+    ));
+    std::fs::create_dir_all(&dir).expect("create pending sidecar fake kubectl dir");
+    let script_path = dir.join("kubectl");
+    let log_path = dir.join("kubectl.log");
+    let script = r#"#!/bin/sh
+set -eu
+dir=$(dirname "$0")
+printf 'ARGS %s\n' "$*" >> "$dir/kubectl.log"
+verb=""
+for arg in "$@"; do
+  case "$arg" in apply|get|delete) verb="$arg"; break;; esac
+done
+case "$verb" in
+  apply) cat > "$dir/apply.stdin" ;;
+  get)
+    count=0
+    if [ -f "$dir/get.count" ]; then count=$(cat "$dir/get.count"); fi
+    count=$((count + 1))
+    printf '%s' "$count" > "$dir/get.count"
+    printf '%s\n' '{"metadata":{"uid":"pending-pod-uid"},"status":{"phase":"Pending","containerStatuses":[{"ready":false,"state":{"waiting":{"reason":"ImagePullBackOff"}}}]}}'
+    ;;
+  delete) cat > "$dir/delete.stdin" ;;
+  *) exit 2 ;;
+esac
+"#;
+    std::fs::write(&script_path, script).expect("write pending sidecar fake kubectl");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("stat pending sidecar fake kubectl")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions)
+            .expect("chmod pending sidecar fake kubectl");
+    }
+    (script_path, log_path)
+}
+
+fn isolated_sidecar_apply_provider(kubectl: &std::path::Path) -> KubernetesApplyProvider {
+    KubernetesApplyProvider::new(
+        KubernetesDryRunProvider::with_snapshot_class("in-cluster", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Gvisor)
+            .with_runtime_class_name(Some("gvisor".to_string())),
+        kubectl.to_string_lossy().into_owned(),
+    )
+    .with_kubectl_context(Some("in-cluster".to_string()))
+    .with_mutation_gate(true, true)
+    .with_isolated_resident_process_image(Some(format!(
+        "ghcr.io/evalops/orb-sidecar@sha256:{}",
+        "d".repeat(64)
+    )))
+    .with_isolated_resident_process_poll_intervals(
+        Duration::from_millis(5),
+        Duration::from_millis(20),
+    )
+}
+
+#[test]
+fn isolated_sidecar_run_observes_terminal_state_and_always_cleans_up() {
+    let (kubectl, log_path) = write_isolated_sidecar_fake_kubectl(false);
+    let provider = isolated_sidecar_apply_provider(&kubectl);
+    assert!(
+        provider
+            .capability_report()
+            .labels
+            .get("provider_isolated_resident_process_version")
+            .is_some_and(|version| version == "1")
+    );
+    let bootstrap = b"sidecar-lifecycle-canary";
+    let spec = isolated_sidecar_spec(bootstrap);
+    let mut observations = Vec::new();
+    let result = provider
+        .run_isolated_resident_process(
+            &spec,
+            &CancelSignal::never_cancelled(),
+            &mut |observation| {
+                observations.push(observation);
+                Ok(())
+            },
+        )
+        .expect("fake isolated sidecar should complete");
+    assert_eq!(
+        observations
+            .iter()
+            .map(|observation| observation.state)
+            .collect::<Vec<_>>(),
+        vec![
+            IsolatedResidentProcessState::Running,
+            IsolatedResidentProcessState::Succeeded
+        ]
+    );
+    assert_eq!(
+        result.final_observation.state,
+        IsolatedResidentProcessState::Succeeded
+    );
+    assert_eq!(result.final_observation.exit_code, Some(0));
+
+    let dir = kubectl.parent().expect("fake kubectl parent");
+    let apply_stdin = std::fs::read_to_string(dir.join("apply.stdin")).unwrap();
+    let delete_stdin = std::fs::read_to_string(dir.join("delete.stdin")).unwrap();
+    let encoded = general_purpose::STANDARD.encode(bootstrap);
+    assert!(apply_stdin.contains(&encoded));
+    assert!(!delete_stdin.contains(&encoded));
+    assert!(!delete_stdin.contains("sidecar-lifecycle-canary"));
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(log.lines().any(|line| line.contains(" apply ")));
+    assert!(log.lines().any(|line| line.contains(" delete ")));
+    assert!(!log.contains("sidecar-lifecycle-canary"));
+    assert!(!log.contains(&encoded));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn isolated_sidecar_pending_is_not_acknowledged_and_times_out_retryably() {
+    let (kubectl, log_path) = write_pending_isolated_sidecar_fake_kubectl();
+    let provider = isolated_sidecar_apply_provider(&kubectl)
+        .with_isolated_resident_process_startup_timeout(Duration::from_millis(45));
+    let mut observations = Vec::new();
+    let error = provider
+        .run_isolated_resident_process(
+            &isolated_sidecar_spec(b"pending-deadline-canary"),
+            &CancelSignal::never_cancelled(),
+            &mut |observation| {
+                observations.push(observation);
+                Ok(())
+            },
+        )
+        .expect_err("a permanently Pending sidecar must hit its startup deadline");
+    assert!(error.to_string().contains("startup deadline"));
+    assert!(
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ProviderError>())
+            .is_some_and(|error| error.disposition() == RetryDisposition::Retryable)
+    );
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].state, IsolatedResidentProcessState::Failed);
+    assert_eq!(observations[0].pod_uid.as_deref(), Some("pending-pod-uid"));
+
+    let dir = kubectl.parent().expect("pending fake kubectl parent");
+    let get_count: usize = std::fs::read_to_string(dir.join("get.count"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        get_count <= 5,
+        "bounded backoff should cap API calls during the 45ms deadline, got {get_count}"
+    );
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(log.lines().any(|line| line.contains(" delete ")));
+    assert!(!log.contains("pending-deadline-canary"));
+    let delete_stdin = std::fs::read_to_string(dir.join("delete.stdin")).unwrap();
+    assert!(!delete_stdin.contains("pending-deadline-canary"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn isolated_sidecar_apply_failure_and_cancellation_attempt_cleanup() {
+    let (failing_kubectl, failing_log) = write_isolated_sidecar_fake_kubectl(true);
+    let provider = isolated_sidecar_apply_provider(&failing_kubectl);
+    let error = provider
+        .run_isolated_resident_process(
+            &isolated_sidecar_spec(b"apply-failure-canary"),
+            &CancelSignal::never_cancelled(),
+            &mut |_| Ok(()),
+        )
+        .expect_err("apply failure must fail closed");
+    assert!(error.to_string().contains("kubectl apply"));
+    let log = std::fs::read_to_string(&failing_log).unwrap();
+    assert!(log.lines().any(|line| line.contains(" delete ")));
+    let _ = std::fs::remove_dir_all(
+        failing_kubectl
+            .parent()
+            .expect("failing fake kubectl parent"),
+    );
+
+    let (cancel_kubectl, cancel_log) = write_isolated_sidecar_fake_kubectl(false);
+    let provider = isolated_sidecar_apply_provider(&cancel_kubectl);
+    let cancelled = CancelSignal::new();
+    cancelled.cancel();
+    let error = provider
+        .run_isolated_resident_process(
+            &isolated_sidecar_spec(b"cancel-canary"),
+            &cancelled,
+            &mut |_| Ok(()),
+        )
+        .expect_err("cancelled isolated sidecar must fail closed");
+    assert!(error.to_string().contains("cancel"));
+    let log = std::fs::read_to_string(&cancel_log).unwrap();
+    assert!(log.lines().any(|line| line.contains(" delete ")));
+    let _ = std::fs::remove_dir_all(cancel_kubectl.parent().expect("cancel fake kubectl parent"));
+}
+
 #[tokio::test]
 async fn run_kubectl_command_async_succeeds_within_timeout() {
     let output = run_kubectl_command_async(
@@ -1775,7 +2212,7 @@ fn with_egress_excluded_cidrs_replace_drops_the_defaults() {
 }
 
 #[test]
-fn deny_all_egress_still_renders_no_egress_rules() {
+fn deny_all_egress_keeps_only_dns_and_authenticated_api_control_plane_rules() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
@@ -1789,9 +2226,21 @@ fn deny_all_egress_still_renders_no_egress_rules() {
     let provisioned = provider
         .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
         .expect("dry-run provision should succeed");
+    let egress = provisioned.metadata["manifests"]["networkPolicy"]["spec"]["egress"]
+        .as_array()
+        .expect("deny-all still needs bounded system egress");
+    assert!(egress.iter().any(|rule| rule["ports"][0]["port"] == 53));
+    let api = egress
+        .iter()
+        .find(|rule| rule["ports"][0]["port"] == 3217)
+        .expect("guest control channel must reach the API");
     assert_eq!(
-        provisioned.metadata["manifests"]["networkPolicy"]["spec"]["egress"],
-        json!([])
+        api["to"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+        "sandboxwich-ci"
+    );
+    assert_eq!(
+        api["to"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/name"],
+        "sandboxwich-api"
     );
 }
 
@@ -2522,6 +2971,8 @@ fn provision_staged_applies_gateway_policy_and_waits_for_gateway_before_runtime(
         namespace: "sandboxwich-ci".to_string(),
         name: format!("sandboxwich-fqdn-egress-{sandbox_id}"),
         uid: "uid-fqdn".to_string(),
+        resident_lease_id: None,
+        created_at: None,
     };
     assert_eq!(
         kubernetes_delete_path(&fqdn_observed).expect("GKE FQDN delete path"),
@@ -2677,7 +3128,7 @@ fn adoption_contract_rejects_immutable_or_security_drift_for_every_resource_kind
         .expect("network policy spec")
         .remove("egress");
     validate_adoption_contract(&network_policy, &api_normalized_deny_all_policy)
-        .expect("an omitted empty egress list is the API form of deny-all egress");
+        .expect_err("omitting invariant DNS and API egress must block adoption");
 
     let mut changed_pvc = pvc.clone();
     changed_pvc["spec"]["storageClassName"] = json!("wrong-storage-class");
@@ -2748,6 +3199,7 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
     let orphan_sandbox = SandboxId::new();
     let inventory = ReconciliationInventory {
         sandbox_ids: std::collections::HashSet::from([live_sandbox, expired_sandbox]),
+        active_resident_lease_ids: std::collections::HashSet::new(),
         resources: vec![ExpectedKubernetesResource {
             sandbox_id: live_sandbox,
             resource_kind: RuntimeResourceKind::Pod,
@@ -2764,6 +3216,8 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             namespace: "sandboxwich-ci".to_string(),
             name: format!("sandboxwich-{live_sandbox}"),
             uid: "uid-live".to_string(),
+            resident_lease_id: None,
+            created_at: None,
         },
         ObservedKubernetesResource {
             sandbox_id: Some(orphan_sandbox),
@@ -2771,6 +3225,8 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             namespace: "sandboxwich-ci".to_string(),
             name: format!("sandboxwich-{orphan_sandbox}"),
             uid: "uid-orphan".to_string(),
+            resident_lease_id: None,
+            created_at: None,
         },
         ObservedKubernetesResource {
             sandbox_id: Some(expired_sandbox),
@@ -2778,6 +3234,8 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             namespace: "sandboxwich-ci".to_string(),
             name: format!("sandboxwich-pvc-{expired_sandbox}"),
             uid: "uid-expired".to_string(),
+            resident_lease_id: None,
+            created_at: None,
         },
         ObservedKubernetesResource {
             sandbox_id: None,
@@ -2785,6 +3243,8 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             namespace: "sandboxwich-ci".to_string(),
             name: "foreign-pod".to_string(),
             uid: "uid-foreign".to_string(),
+            resident_lease_id: None,
+            created_at: None,
         },
         ObservedKubernetesResource {
             sandbox_id: Some(live_sandbox),
@@ -2792,6 +3252,8 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             namespace: "sandboxwich-ci".to_string(),
             name: format!("sandboxwich-{live_sandbox}"),
             uid: "replacement-uid".to_string(),
+            resident_lease_id: None,
+            created_at: None,
         },
     ];
     let expired =
@@ -2834,19 +3296,68 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
 }
 
 #[test]
-fn orphan_reconciliation_deletes_with_uid_precondition_and_fails_closed() {
+fn resident_resource_reconciliation_is_fenced_by_active_lease_not_live_sandbox() {
+    let sandbox_id = SandboxId::new();
+    let active_lease = Uuid::new_v4();
+    let stale_lease = Uuid::new_v4();
+    let newly_claimed_lease = Uuid::new_v4();
+    let inventory = ReconciliationInventory {
+        sandbox_ids: std::collections::HashSet::from([sandbox_id]),
+        resources: Vec::new(),
+        active_resident_lease_ids: std::collections::HashSet::from([active_lease]),
+    };
+    let now = Utc::now();
+    let resource = |lease_id, created_at| ObservedKubernetesResource {
+        sandbox_id: Some(sandbox_id),
+        resource_kind: RuntimeResourceKind::Pod,
+        namespace: "sandboxwich-ci".to_string(),
+        name: format!("resident-{lease_id}"),
+        uid: format!("uid-{lease_id}"),
+        resident_lease_id: Some(lease_id),
+        created_at: Some(created_at),
+    };
+    let decisions = classify_reconciliation(
+        &inventory,
+        &[
+            resource(active_lease, now),
+            resource(stale_lease, now - chrono::Duration::minutes(6)),
+            resource(newly_claimed_lease, now),
+        ],
+        &std::collections::HashMap::new(),
+        now,
+    );
+    assert_eq!(
+        decisions[0].classification,
+        ReconciliationClassification::Expected
+    );
+    assert!(!decisions[0].delete_allowed);
+    assert_eq!(
+        decisions[1].classification,
+        ReconciliationClassification::Orphaned
+    );
+    assert!(decisions[1].delete_allowed);
+    assert_eq!(
+        decisions[2].classification,
+        ReconciliationClassification::Indeterminate
+    );
+    assert!(!decisions[2].delete_allowed);
+}
+
+#[test]
+fn orphan_reconciliation_parses_lease_fences_and_plans_uid_preconditioned_deletion() {
     let dir = std::env::temp_dir().join(format!("sandboxwich-reconcile-{}", SandboxId::new()));
     std::fs::create_dir_all(&dir).expect("create reconciliation fake dir");
     let log_path = dir.join("log.txt");
     let script_path = dir.join("kubectl");
     let orphan = SandboxId::new();
+    let resident_lease = Uuid::new_v4();
     let script = format!(
         r#"#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "{log}"
 case " $* " in
   *" get "*)
-    printf '%s\n' '{{"items":[{{"kind":"Pod","metadata":{{"namespace":"sandboxwich-ci","name":"sandboxwich-{orphan}","uid":"uid-orphan","labels":{{"sandboxwich.dev/sandbox-id":"{orphan}"}}}}}}]}}'
+    printf '%s\n' '{{"items":[{{"kind":"Pod","metadata":{{"namespace":"sandboxwich-ci","name":"sandboxwich-{orphan}","uid":"uid-orphan","creationTimestamp":"2020-01-01T00:00:00Z","labels":{{"sandboxwich.dev/sandbox-id":"{orphan}","sandboxwich.dev/lease-id":"{resident_lease}"}}}}}}]}}'
     ;;
   *" delete "*)
     cat >> "{log}"
@@ -2873,6 +3384,7 @@ esac
         sandbox_ids: Vec::new(),
         complete: true,
         resources: Vec::new(),
+        active_resident_lease_ids: vec![resident_lease],
         next_cursor: None,
     };
     let limits = ReconciliationLimits {
@@ -2886,6 +3398,8 @@ esac
         namespace: "sandboxwich-ci".to_string(),
         name: format!("sandboxwich-{orphan}"),
         uid: "uid-orphan".to_string(),
+        resident_lease_id: Some(resident_lease),
+        created_at: Some(Utc::now() - chrono::Duration::minutes(6)),
     };
     assert_eq!(
         kubernetes_delete_path(&observed).expect("delete path"),
@@ -2896,15 +3410,36 @@ esac
         "uid-orphan"
     );
 
-    let dry_run = provider
+    let active = provider
         .reconcile_orphans(
-            Ok(inventory),
+            Ok(inventory.clone()),
+            limits,
+            true,
+            &CancelSignal::never_cancelled(),
+        )
+        .expect("active resident reconciliation");
+    assert_eq!(active.deleted, 0);
+    assert_eq!(
+        active.decisions[0].classification,
+        ReconciliationClassification::Expected
+    );
+
+    let mut stale_inventory = inventory;
+    stale_inventory.active_resident_lease_ids.clear();
+    let stale = provider
+        .reconcile_orphans(
+            Ok(stale_inventory),
             limits,
             false,
             &CancelSignal::never_cancelled(),
         )
-        .expect("dry-run reconciliation");
-    assert_eq!(dry_run.deleted, 0);
+        .expect("stale resident reconciliation");
+    assert_eq!(stale.deleted, 0);
+    assert!(!stale.apply);
+    assert_eq!(
+        stale.decisions[0].classification,
+        ReconciliationClassification::Orphaned
+    );
 
     let unavailable = provider
         .reconcile_orphans(

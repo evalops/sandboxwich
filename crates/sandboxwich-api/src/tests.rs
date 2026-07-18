@@ -22,7 +22,7 @@ use crate::handlers::workers::*;
 use crate::reap::*;
 use crate::reconcile::*;
 use crate::rows::*;
-use crate::state::{Principal, TenantContext};
+use crate::state::{Principal, ResidentBootstrapStore, TenantContext};
 use sandboxwich_core::*;
 use std::collections::BTreeSet;
 
@@ -987,6 +987,77 @@ async fn test_sqlite_db() -> Database {
 }
 
 #[tokio::test]
+async fn schema_verification_requires_the_latest_compiled_migration() {
+    let db = test_sqlite_db().await;
+    verify_database_schema(&db)
+        .await
+        .expect("fully migrated database verifies");
+
+    let expected = latest_compiled_migration();
+    let sql = format!(
+        "delete from _sqlx_migrations where version = {}",
+        db.placeholder(1)
+    );
+    sqlx::query(&sql)
+        .bind(expected.version)
+        .execute(&db.pool)
+        .await
+        .expect("remove latest migration ledger row");
+
+    let error = verify_database_schema(&db)
+        .await
+        .expect_err("missing latest migration must fail schema verification");
+    assert!(error.to_string().contains(&expected.version.to_string()));
+    assert!(error.to_string().contains("has not been applied"));
+}
+
+#[tokio::test]
+async fn schema_verification_rejects_an_incomplete_latest_migration() {
+    let db = test_sqlite_db().await;
+    let expected = latest_compiled_migration();
+    let sql = format!(
+        "update _sqlx_migrations set success = false where version = {}",
+        db.placeholder(1)
+    );
+    sqlx::query(&sql)
+        .bind(expected.version)
+        .execute(&db.pool)
+        .await
+        .expect("mark latest migration incomplete");
+
+    let error = verify_database_schema(&db)
+        .await
+        .expect_err("incomplete latest migration must fail schema verification");
+    assert!(error.to_string().contains(&expected.version.to_string()));
+    assert!(error.to_string().contains("did not complete successfully"));
+}
+
+#[tokio::test]
+async fn schema_verification_rejects_a_database_newer_than_the_api_image() {
+    let db = test_sqlite_db().await;
+    let newer_version = latest_compiled_migration().version + 1;
+    sqlx::query(
+        "insert into _sqlx_migrations
+         (version, description, installed_on, success, checksum, execution_time)
+         values (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(newer_version)
+    .bind("future migration")
+    .bind(Utc::now().to_rfc3339())
+    .bind(true)
+    .bind(Vec::<u8>::new())
+    .bind(0_i64)
+    .execute(&db.pool)
+    .await
+    .expect("insert future migration ledger row");
+
+    let error = verify_database_schema(&db)
+        .await
+        .expect_err("older API image must reject a newer database");
+    assert!(error.to_string().contains("newer than this API image"));
+}
+
+#[tokio::test]
 async fn provisioning_operation_migration_has_fenced_stage_columns() {
     let db = test_sqlite_db().await;
     let columns = sqlx::query("pragma table_info(provisioning_operations)")
@@ -1908,7 +1979,7 @@ async fn idle_ttl_sweep_query_matches_documented_semantics_across_a_seeded_fixtu
     );
     insert_sandbox(&db, &untouched).await.unwrap();
 
-    let reaped = reap_expired_active_sandboxes(&db)
+    let reaped = reap_expired_active_sandboxes(&db, &ResidentBootstrapStore::default())
         .await
         .expect("sweep must not error");
     let reaped_ids: std::collections::HashSet<SandboxId> =
@@ -2047,7 +2118,9 @@ async fn idle_ttl_reap_considers_last_activity_at_alongside_updated_at_and_comma
     let no_activity_at_all = seed(now - chrono::Duration::seconds(400));
     insert_sandbox(&db, &no_activity_at_all).await.unwrap();
 
-    let reaped = reap_expired_active_sandboxes(&db).await.unwrap();
+    let reaped = reap_expired_active_sandboxes(&db, &ResidentBootstrapStore::default())
+        .await
+        .unwrap();
     let reaped_ids: std::collections::HashSet<SandboxId> =
         reaped.iter().map(|reaped| reaped.sandbox.id).collect();
 
@@ -2107,6 +2180,7 @@ async fn reap_cas_miss_skips_instead_of_enqueuing_a_redundant_stop_job() {
     // the *only* one to enqueue a job.
     let winner = stop_sandbox_via_job(
         &db,
+        &ResidentBootstrapStore::default(),
         &sandbox,
         json!({"state": "archiving", "reason": "stop_requested"}),
     )
@@ -2123,9 +2197,15 @@ async fn reap_cas_miss_skips_instead_of_enqueuing_a_redundant_stop_job() {
     // is `Archiving` now, not `Ready`), and `attempt_reap_candidate` must
     // report `Skipped` rather than treating this as a second successful
     // reap or an error.
-    let outcome = attempt_reap_candidate(&db, sandbox.clone(), None, Utc::now())
-        .await
-        .expect("a CAS miss inside attempt_reap_candidate must not surface as an error");
+    let outcome = attempt_reap_candidate(
+        &db,
+        &ResidentBootstrapStore::default(),
+        sandbox.clone(),
+        None,
+        Utc::now(),
+    )
+    .await
+    .expect("a CAS miss inside attempt_reap_candidate must not surface as an error");
     assert!(
         matches!(outcome, CandidateOutcome::Skipped),
         "a sandbox concurrently stopped between candidate selection and this \

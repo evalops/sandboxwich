@@ -61,6 +61,10 @@ sed \
   -e 's/imagePullPolicy: Always/imagePullPolicy: IfNotPresent/g' \
   -e 's/replicas: 2/replicas: 1/' \
   "${ROOT_DIR}/deploy/kubernetes/api.yaml" >"${TMP_DIR}/api.yaml"
+sed \
+  -e "s#ghcr.io/evalops/sandboxwich-api@sha256:[0-9a-f]\{64\}#${API_IMAGE}#g" \
+  -e 's/imagePullPolicy: Always/imagePullPolicy: IfNotPresent/g' \
+  "${ROOT_DIR}/deploy/kubernetes/api-migrate.yaml" >"${TMP_DIR}/api-migrate.yaml"
 # Pin the guest image to the digest published into the disposable registry.
 # worker.yaml ships with an explicit SANDBOXWICH_RUNTIME_IMAGE (required for
 # apply mode); rewrite it to the exact image the kind nodes pre-pulled.
@@ -78,8 +82,10 @@ grep -Fq "value: ${RUNTIME_IMAGE}" "${TMP_DIR}/worker.yaml" || \
 grep -Fq "value: ${GATEWAY_IMAGE}" "${TMP_DIR}/worker.yaml" || \
   fail "worker manifest missing gateway image value ${GATEWAY_IMAGE}"
 
+kubectl apply -f "${TMP_DIR}/api-migrate.yaml"
+kubectl -n sandboxwich wait --for=condition=complete \
+  -f "${TMP_DIR}/api-migrate.yaml" --timeout=120s
 kubectl apply -f "${TMP_DIR}/api.yaml"
-kubectl -n sandboxwich wait --for=condition=complete job/sandboxwich-api-migrate --timeout=120s
 kubectl -n sandboxwich rollout status deployment/sandboxwich-api --timeout=120s
 kubectl apply -f "${TMP_DIR}/worker.yaml"
 kubectl -n sandboxwich rollout status deployment/sandboxwich-worker --timeout=120s
@@ -207,9 +213,15 @@ command_response="$(run_command "${deny_id}" '["sh","-c","printf sandboxwich-liv
 kubectl -n sandboxwich-sandboxes exec "sandboxwich-${deny_id}" -- \
   sh -c 'test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token'
 api_service_ip="$(kubectl -n sandboxwich get service sandboxwich-api -o jsonpath='{.spec.clusterIP}')"
-if kubectl -n sandboxwich-sandboxes exec "sandboxwich-${deny_id}" -- nc -z -w 3 "${api_service_ip}" 3217; then
-  fail "deny-all sandbox reached the API service"
+if ! unauthenticated_api_status="$(
+  kubectl -n sandboxwich-sandboxes exec "sandboxwich-${deny_id}" -- \
+    curl -sS -o /dev/null -w '%{http_code}' --max-time 5 \
+      "http://${api_service_ip}:3217/jobs"
+)"; then
+  fail "deny-all sandbox could not reach its authenticated API control channel"
 fi
+[[ "${unauthenticated_api_status}" == "401" ]] || \
+  fail "deny-all sandbox bypassed API authentication (status ${unauthenticated_api_status})"
 stop_sandbox "${deny_id}"
 
 source_id="$(create_sandbox conformance-source allow_all)"
@@ -317,10 +329,10 @@ runtimeclass_resources="$(kubectl -n sandboxwich-sandboxes get pod,pvc,service,n
   fail "unexpected resources exist in isolated RuntimeClass case: ${runtimeclass_resources}"
 kubectl delete -f "${TMP_DIR}/runtimeclass-pvc.json" --wait=true
 
-# Product-owned orphan reconciliation is dry-run by default and requires both
-# its CLI flag and environment opt-in before it may delete. Exercise the real
-# UID-preconditioned in-cluster DELETE path in this disposable namespace while
-# proving that an unlabeled foreign Secret survives.
+# The production worker manifest enables both orphan-reconciliation gates.
+# Exercise the real UID-preconditioned in-cluster DELETE path on worker startup
+# in this disposable namespace while proving that an unlabeled foreign Secret
+# survives.
 orphan_id="00000000-0000-7000-8000-000000000147"
 kubectl -n sandboxwich-sandboxes create secret generic "sandboxwich-orphan-${orphan_id}" \
   --from-literal=value=orphan >/dev/null
@@ -328,11 +340,7 @@ kubectl -n sandboxwich-sandboxes label secret "sandboxwich-orphan-${orphan_id}" 
   "sandboxwich.dev/sandbox-id=${orphan_id}" >/dev/null
 kubectl -n sandboxwich-sandboxes create secret generic sandboxwich-foreign-secret \
   --from-literal=value=foreign >/dev/null
-kubectl -n sandboxwich set env deployment/sandboxwich-worker \
-  SANDBOXWICH_ORPHAN_RECONCILIATION_APPLY=1 >/dev/null
-kubectl -n sandboxwich patch deployment sandboxwich-worker --type=json \
-  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--orphan-reconciliation-apply"}]' \
-  >/dev/null
+kubectl -n sandboxwich delete pod -l app.kubernetes.io/name=sandboxwich-worker --wait=true
 kubectl -n sandboxwich rollout status deployment/sandboxwich-worker --timeout=120s
 for _ in $(seq 1 60); do
   if ! kubectl -n sandboxwich-sandboxes get secret "sandboxwich-orphan-${orphan_id}" \

@@ -1,10 +1,13 @@
 # Kubernetes
 
 The checked-in API and worker manifests use OCI image-index digests. The API
-migration job and Deployment intentionally use the same digest. After a
+migration Job and Deployment intentionally use the same digest. The migration
+Job name contains the digest's first 12 hexadecimal characters, so each API
+image revision creates a fresh Job rather than reusing a completed Job. After a
 successful `containers` workflow, download its `*-image-digest` artifacts and
-update both API references together in a reviewed pull request. Run
-`python3 scripts/test-deployment-images.py` before applying the manifests.
+update the API Deployment image, migration Job image, and migration Job name
+together in a reviewed pull request. Run `python3 scripts/test-deployment-images.py`
+before applying the manifests.
 
 Host egress allowlists require an enforceable FQDN boundary. Set
 `SANDBOXWICH_EGRESS_GATEWAY_IMAGE` to a digest-pinned `sandboxwich-worker`
@@ -26,7 +29,7 @@ denies when an allowed hostname resolves to a protected address.
 ## Current Shape
 
 - Run `sandboxwich-api` as a Deployment.
-- Run `sandboxwich-api migrate` as a Job before or during rollouts.
+- Run `sandboxwich-api migrate` as a Job before rolling out API pods.
 - Store state in Postgres through `SANDBOXWICH_DATABASE_URL`.
 - Expose the API with a ClusterIP Service.
 - Register workers with typed provider labels such as `provider=kubernetes` and capabilities such as `k8s_pod`, `run_command`, and, when configured through an isolation profile, `sandboxed_container` or `virtual_machine`.
@@ -87,6 +90,49 @@ SANDBOXWICH_K8S_ENABLE_MUTATION=1 sandboxwich-worker --api http://sandboxwich-ap
 ```
 
 Apply mode uses the pod ServiceAccount and `kubectl` to create the sandbox PVC, Pod, NetworkPolicy, and Services in the dedicated sandbox namespace (`--sandbox-namespace`, falling back to `--namespace` when unset), waits for the sandbox Pod to become Ready, records the runtime resources through the API, and executes command jobs with `kubectl exec` against the sandbox container. The worker's RBAC in `deploy/kubernetes/worker.yaml` is scoped to the sandbox namespace only — it has no Role in the control-plane namespace where the API and its secrets live (GH-76).
+
+### Provider-isolated resident sidecars
+
+Set `SANDBOXWICH_ISOLATED_RESIDENT_PROCESS_IMAGE` to an immutable image digest
+and configure a nonempty `--runtime-class-name` to advertise the versioned
+worker label `provider_isolated_resident_process_version=1`. The label is never advertised in
+dry-run mode or when either setting is absent. The authoritative worker then
+runs `orb-sidecar` in a dedicated Pod rather than inside the guest Pod. The
+sidecar has separate mount, PID, and network namespaces, no service-account
+token, a read-only root filesystem, dropped capabilities, non-root identity,
+seccomp, and resource bounds. Its bootstrap is mounted from an immutable
+transient Secret; worker cleanup attempts to delete all three resources on every
+terminal path, and the enabled orphan reconciler deletes any lease-fenced
+resource whose control-plane lease is no longer active after worker/node loss.
+Pod, Secret, and dedicated NetworkPolicy names are fenced by
+generation and lease so cleanup from an expired lease cannot delete a
+replacement. The policy denies all ingress and allows only cluster DNS plus
+public HTTPS egress, excluding configured control-plane and metadata CIDRs.
+
+Pending Pods do not report `Starting` until the container has actually
+started. `SANDBOXWICH_ISOLATED_RESIDENT_PROCESS_STARTUP_TIMEOUT_SECS` (default
+`120`) turns an unschedulable or image-pull-blocked Pod into a terminal failure
+after the one-read bootstrap has been delivered, with fenced cleanup. Kubernetes observations back off from
+`SANDBOXWICH_ISOLATED_RESIDENT_PROCESS_POLL_INTERVAL_MILLIS` (default `1000`)
+to `SANDBOXWICH_ISOLATED_RESIDENT_PROCESS_MAX_POLL_INTERVAL_MILLIS` (default
+`5000`) and remain cancellable while waiting.
+
+`SANDBOXWICH_MAX_RESIDENT_PROCESSES` (default `8`, minimum effective value `1`)
+bounds concurrent sidecar supervisors per worker. At the bound, the worker
+continues claiming non-resident work but leaves additional sidecars queued.
+
+This boundary prevents a compromised guest Pod from directly reading or
+tracing the sidecar, but its host-level strength is only that of the selected
+RuntimeClass and cluster configuration. The two Pods do not share localhost,
+so integrations must provide an explicit network endpoint or relay. Bootstrap
+bytes remain API-process-local and are retryable only for the same
+generation/lease/digest fence until the exact process reports `Starting`; an
+API restart or replica failover cannot replay them. Once a sandbox has a
+sidecar record, executor bootstrap fails closed unless that sidecar is observed
+`Running` under a live lease. Operators can alert on
+`sandboxwich_sidecar_bootstrap_block_total{reason=...}` and inspect
+`sandboxwich_resident_process_count{state=...}` plus the bounded
+`sidecar_bootstrap_blocked` and `resident_process_terminal_failure` events.
 
 The double opt-in (`--confirm-apply` plus `SANDBOXWICH_K8S_ENABLE_MUTATION=1`) exists so a worker cannot mutate Kubernetes resources by accident in local runs, CI, and smoke tests. Be aware of its limits in production: the checked-in worker Deployment sets both halves unconditionally, because an apply-mode worker with the gate closed cannot process any work. In that deployment the gate is documentation, not a control — the Role scoping to the sandbox namespace is what bounds a compromised worker's blast radius. The worker logs a startup warning whenever both halves are force-enabled so the state is visible in pod logs.
 
@@ -301,8 +347,11 @@ env:
 ```
 
 This avoids multiple replicas racing to run migrations or rewrite constraints.
-Pods that start before the Job completes fail fast until the Deployment restarts
-them against a ready schema.
+The checked-in rollout script waits for the migration Job to complete before it
+applies the Deployment, and the Deployment's `check-schema` init container
+blocks every API pod until its image validates the current schema. Together,
+these prevent a new API revision from serving against a schema that has not
+received its migrations, including when an operator bypasses the script.
 
 ## Apply The API Manifests
 
@@ -313,10 +362,30 @@ kubectl create namespace sandboxwich
 kubectl -n sandboxwich create secret generic sandboxwich-secrets \
   --from-literal=database-url='postgres://user:password@postgres.example:5432/sandboxwich' \
   --from-literal=api-token='replace-through-secret-management'
-kubectl apply -f deploy/kubernetes/
+deploy/kubernetes/apply-api.sh
 ```
 
 Do not commit the real database URL or API token. Use your existing secret-management path for shared clusters.
+
+`apply-api.sh` applies the namespace, creates the digest-versioned migration
+Job, waits for it to complete, and only then applies and waits for the API and
+worker Deployments. It first drains old API replicas because the schema gate is
+exact-versioned and the one-read bootstrap broker is process-local. The starter
+API Deployment intentionally uses one replica until a shared bootstrap broker
+is configured. Do not replace it with `kubectl apply -f deploy/kubernetes/`: that
+would apply the Job and Deployment together and can roll out an API whose
+`SANDBOXWICH_AUTO_MIGRATE=false` pods require a schema the Job has not yet
+applied. Set `SANDBOXWICH_KUBE_CONTEXT` to select a context and
+`SANDBOXWICH_MIGRATION_TIMEOUT` (default `5m`) to adjust both waits.
+
+If the migration wait fails, the script leaves the drained API Deployment at
+zero replicas, prints the Job description and logs, and exits nonzero. Correct the migration
+and publish a new image/digest-versioned Job; do not delete a successful Job to
+force a rerun. Roll back an API image only to an image compatible with the
+already-applied (forward-only) schema, then use the same script and verify
+`kubectl -n sandboxwich rollout status deployment/sandboxwich-api` plus
+`/readyz`. Monitor the migration Job's failed state and API rollout status;
+neither should be treated as a successful release until both are complete.
 
 ## Benchmarking
 

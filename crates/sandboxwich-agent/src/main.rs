@@ -7,7 +7,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
     time::Duration,
 };
@@ -22,19 +22,25 @@ use clap::{Args, Parser, Subcommand};
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, AgentFileReadResponse, AgentFileWriteRequest,
     AgentHealthResponse, AppendCommandOutputRequest, ClaimLeaseRequest, ClaimLeaseResponse,
-    CommandOutputStream, CompleteLeaseRequest, DEFAULT_COMMAND_TIMEOUT_SECS, FailLeaseRequest,
-    GuestStatus, GuestTokenResponse, JobKind, LeaseId, LeaseResponse, MintGuestTokenRequest,
-    ORB_EXECUTOR_RESIDENT_PROCESS_NAME, RenewLeaseRequest, ResidentProcessBootstrapReadRequest,
-    ResidentProcessBootstrapReadResponse, ResidentProcessId, ResidentProcessObservationRequest,
-    ResidentProcessObservedState, ResidentProcessRestartPolicy, SandboxId,
-    UpdateGuestHealthRequest, WorkerJobResult, build_api_client, resident_process_run_as_uid,
-    validate_agent_command_request,
+    CommandOutputStream, CompleteLeaseRequest, DEFAULT_COMMAND_TIMEOUT_SECS, ErrorEnvelope,
+    FailLeaseRequest, GUEST_AGENT_CAPABILITY_REPORT_CHECK, GuestAgentCapabilityReport, GuestStatus,
+    GuestTokenResponse, JobKind, LeaseId, LeaseResponse, MintGuestTokenRequest, RenewLeaseRequest,
+    ResidentProcessBootstrapReadRequest, ResidentProcessBootstrapReadResponse, ResidentProcessId,
+    ResidentProcessObservationRequest, ResidentProcessObservedState, ResidentProcessRestartPolicy,
+    SandboxId, UpdateGuestHealthRequest, WorkerJobResult, build_api_client,
+    resident_process_run_as_uid, validate_agent_command_request,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command as ProcessCommand,
 };
 use uuid::Uuid;
+
+mod resident_process_supervisor;
+
+use resident_process_supervisor::{
+    ResidentProcessSupervisor, ResidentProcessTaskCompletion, ResidentProcessTaskMetadata,
+};
 
 const DEFAULT_HEARTBEAT_FAILURE_THRESHOLD: u32 = 12;
 /// Consecutive failures of the daemon's control-plane calls (lease claim, and the
@@ -70,6 +76,10 @@ const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// (`mint_guest_token`'s `ttl_seconds.unwrap_or(3600)`) so leaving both sides
 /// at their defaults produces one consistent lifetime.
 const DEFAULT_GUEST_TOKEN_TTL_SECS: u64 = 3600;
+/// Initial delay for retrying a resident observation after a bootstrap has
+/// been delivered. The delay uses [`Backoff`], so it remains bounded even
+/// during a long control-plane outage.
+const RESIDENT_OBSERVATION_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Parser)]
 #[command(name = "sandboxwich-agent")]
@@ -195,6 +205,10 @@ struct DaemonArgs {
         default_value_t = DEFAULT_MAX_CAPTURED_OUTPUT_BYTES
     )]
     max_captured_output_bytes: u64,
+
+    /// Maximum number of resident processes this daemon supervises concurrently.
+    #[arg(long, env = "SANDBOXWICH_MAX_RESIDENT_PROCESSES", default_value_t = 8)]
+    max_resident_processes: usize,
 }
 
 #[derive(Debug, Args)]
@@ -327,27 +341,33 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
     let client = build_api_client(api_token.as_deref(), args.tenant.as_deref())?;
     let sandbox_id = SandboxId(args.sandbox_id);
 
-    // The real fix for the advisory sandbox/kind filter on `ClaimLeaseRequest`
-    // (see its doc comment): rather than reusing the worker-wide `client` for
-    // every guest-facing call, prefer a credential the API itself has bound to
-    // exactly this `(worker_id, sandbox_id)`, so a compromised guest process
-    // cannot claim, renew, complete, or fail a lease outside its own sandbox
-    // regardless of what it puts in the request body. Falls back to `client`
-    // (the pre-fix behavior) when no worker id is configured or minting/using a
-    // guest token doesn't pan out.
-    let guest_client = resolve_guest_client(
-        &client,
-        &api,
-        GuestCredentialConfig {
-            tenant: args.tenant,
-            worker_id: args.worker_id,
-            sandbox_id,
-            guest_token_file: args.guest_token_file,
-            guest_token: args.guest_token,
-            guest_token_ttl_seconds: args.guest_token_ttl_seconds,
+    // A daemon with a worker id is an executor. It must not claim work until
+    // it has a credential bound to this exact sandbox: falling back to the
+    // worker-wide client after one transient mint failure would both strand
+    // guest-token recovery and widen the authority of subsequent claims.
+    let guest_credential = guest_credential_source(
+        resolve_api_token(args.guest_token_file, args.guest_token)?,
+        args.worker_id,
+        args.guest_token_ttl_seconds,
+    );
+    let mut claim_budget = HeartbeatFailureBudget::new(args.claim_failure_threshold.max(1));
+    let mut claim_backoff = Backoff::new(Duration::from_millis(args.idle_sleep_ms.max(1)));
+
+    let guest_client = with_retry(
+        &mut claim_budget,
+        &mut claim_backoff,
+        "resolve_guest_client",
+        || {
+            resolve_guest_client(
+                &client,
+                &api,
+                args.tenant.as_deref(),
+                sandbox_id,
+                guest_credential.clone(),
+            )
         },
     )
-    .await;
+    .await?;
 
     let mut iterations = 0_u64;
     let heartbeat_interval = Duration::from_millis(args.heartbeat_interval_ms.max(1));
@@ -360,34 +380,21 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
         args.heartbeat_failure_threshold.max(1),
     ));
 
-    // Tracks consecutive failures across both claim_lease and the guest-health report posted
-    // after a failed lease: both represent reachability of the control plane, and a transient
-    // blip in either should be retried with backoff rather than tearing down the daemon.
-    let mut claim_budget = HeartbeatFailureBudget::new(args.claim_failure_threshold.max(1));
-    let mut claim_backoff = Backoff::new(Duration::from_millis(args.idle_sleep_ms.max(1)));
-    let mut resident_tasks = tokio::task::JoinSet::new();
+    // Tracks consecutive failures across guest authentication, claim_lease,
+    // and the guest-health report posted after a failed lease: all require
+    // reachability of the control plane and use the same bounded backoff.
+    let mut resident_processes = ResidentProcessSupervisor::new(args.max_resident_processes);
 
-    let daemon_result = async {
+    let mut daemon_result = async {
         loop {
-            while let Some(result) = resident_tasks.try_join_next() {
-                let error = match result {
-                    Ok(Ok(_)) => continue,
-                    Ok(Err(error)) => error,
-                    Err(error) => anyhow::anyhow!("resident-process task failed: {error}"),
-                };
-                with_retry(
+            while let Some(completion) = resident_processes.try_reap() {
+                reconcile_resident_completion(
+                    &guest_client,
+                    &api,
+                    sandbox_id,
+                    completion,
                     &mut claim_budget,
                     &mut claim_backoff,
-                    "post_guest_health",
-                    || {
-                        post_guest_health(
-                            &guest_client,
-                            &api,
-                            sandbox_id,
-                            GuestStatus::Unhealthy,
-                            Some(error.to_string()),
-                        )
-                    },
                 )
                 .await?;
             }
@@ -411,25 +418,61 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
                             worker_id,
                             sandbox_id,
                             args.lease_seconds,
+                            !resident_processes.is_full(),
                         )
                     })
                     .await?;
 
                 if let Some(lease) = claim_response.lease {
                     if lease.job.kind == JobKind::RunResidentProcess {
+                        let metadata = match ResidentProcessTaskMetadata::from_lease(&lease) {
+                            Ok(metadata) => metadata,
+                            Err(error) => {
+                                fail_resident_lease_and_report(
+                                    &guest_client,
+                                    &api,
+                                    sandbox_id,
+                                    lease.id,
+                                    format!(
+                                        "resident job {} has invalid supervision metadata: {error}",
+                                        lease.job_id
+                                    ),
+                                    &mut claim_budget,
+                                    &mut claim_backoff,
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        if resident_processes.is_full() {
+                            fail_resident_lease_and_report(
+                                &guest_client,
+                                &api,
+                                sandbox_id,
+                                lease.id,
+                                format!(
+                                    "resident-process supervisor capacity exhausted while claiming \
+                                     job {} process {} generation {}",
+                                    metadata.job_id, metadata.process_id, metadata.generation
+                                ),
+                                &mut claim_budget,
+                                &mut claim_backoff,
+                            )
+                            .await?;
+                            continue;
+                        }
                         let client = guest_client.clone();
                         let api = api.clone();
-                        let max_captured_output_bytes = args.max_captured_output_bytes;
-                        resident_tasks.spawn(async move {
+                        resident_processes.spawn(metadata, async move {
                             handle_lease(
                                 &client,
                                 &api,
                                 sandbox_id,
                                 lease,
-                                max_captured_output_bytes,
+                                args.max_captured_output_bytes,
                             )
                             .await
-                        });
+                        })?;
                     } else if let Err(error) = handle_lease(
                         &guest_client,
                         &api,
@@ -471,8 +514,27 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
     }
     .await;
 
-    resident_tasks.abort_all();
-    while resident_tasks.join_next().await.is_some() {}
+    for completion in resident_processes.shutdown().await {
+        if let Err(shutdown_error) = reconcile_resident_completion(
+            &guest_client,
+            &api,
+            sandbox_id,
+            completion,
+            &mut claim_budget,
+            &mut claim_backoff,
+        )
+        .await
+        {
+            if daemon_result.is_ok() {
+                daemon_result = Err(shutdown_error);
+            } else {
+                eprintln!(
+                    "sandboxwich-agent: resident-process shutdown reconciliation also failed: \
+                     {shutdown_error}"
+                );
+            }
+        }
+    }
 
     if heartbeat_task.is_finished() {
         heartbeat_task.await.context("heartbeat task failed")??;
@@ -482,6 +544,104 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
     }
 
     daemon_result
+}
+
+async fn fail_lease_retryable(
+    client: &reqwest::Client,
+    api: &str,
+    lease_id: LeaseId,
+    error: String,
+) -> Result<LeaseResponse, AgentRequestError> {
+    let response = client
+        .post(format!("{api}/leases/{lease_id}/fail"))
+        .json(&FailLeaseRequest { error, retry: true })
+        .send()
+        .await?;
+    decode_json(response).await
+}
+
+async fn fail_resident_lease_and_report(
+    client: &reqwest::Client,
+    api: &str,
+    sandbox_id: SandboxId,
+    lease_id: LeaseId,
+    error: String,
+    claim_budget: &mut HeartbeatFailureBudget,
+    claim_backoff: &mut Backoff,
+) -> anyhow::Result<()> {
+    // Use an independent retry budget for terminal lease reconciliation. A
+    // resident failure must not merely consume the daemon's claim budget and
+    // leave its exact lease active until expiry.
+    let mut fail_budget = HeartbeatFailureBudget::new(3);
+    let mut fail_backoff = Backoff::new(Duration::from_millis(100));
+    with_retry(
+        &mut fail_budget,
+        &mut fail_backoff,
+        "fail_resident_lease",
+        || fail_lease_retryable(client, api, lease_id, error.clone()),
+    )
+    .await?;
+    with_retry(claim_budget, claim_backoff, "post_guest_health", || {
+        post_guest_health(
+            client,
+            api,
+            sandbox_id,
+            GuestStatus::Unhealthy,
+            Some(error.clone()),
+        )
+    })
+    .await
+}
+
+async fn reconcile_resident_completion(
+    client: &reqwest::Client,
+    api: &str,
+    sandbox_id: SandboxId,
+    completion: ResidentProcessTaskCompletion,
+    claim_budget: &mut HeartbeatFailureBudget,
+    claim_backoff: &mut Backoff,
+) -> anyhow::Result<()> {
+    let Some((metadata, cause, cancelled_during_shutdown)) = completion.into_failure() else {
+        return Ok(());
+    };
+    let error = format!(
+        "resident process {} ({}) generation {} for job {} lease {} failed: {cause}",
+        metadata.process_id, metadata.name, metadata.generation, metadata.job_id, metadata.lease_id,
+    );
+    eprintln!("sandboxwich-agent: {error}");
+    if cancelled_during_shutdown
+        && let Err(observation_error) = post_resident_observation(
+            client,
+            api,
+            metadata.process_id,
+            ResidentProcessObservationRequest {
+                generation: metadata.generation,
+                lease_id: metadata.lease_id.0,
+                observed_state: ResidentProcessObservedState::Lost,
+                pid: None,
+                exit_code: None,
+                error_code: Some("daemon_shutdown".into()),
+                error_message: Some("resident process was stopped during daemon shutdown".into()),
+            },
+        )
+        .await
+    {
+        eprintln!(
+            "sandboxwich-agent: failed to post Lost observation for resident process {} during \
+             shutdown: {observation_error}",
+            metadata.process_id
+        );
+    }
+    fail_resident_lease_and_report(
+        client,
+        api,
+        sandbox_id,
+        metadata.lease_id,
+        error,
+        claim_budget,
+        claim_backoff,
+    )
+    .await
 }
 
 async fn heartbeat_loop(
@@ -577,6 +737,7 @@ impl Backoff {
 #[derive(Debug)]
 enum AgentRequestError {
     Transport(reqwest::Error),
+    Configuration(String),
     Status {
         status: reqwest::StatusCode,
         body: String,
@@ -588,6 +749,9 @@ impl std::fmt::Display for AgentRequestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AgentRequestError::Transport(error) => write!(f, "request failed: {error}"),
+            AgentRequestError::Configuration(error) => {
+                write!(f, "request configuration failed: {error}")
+            }
             AgentRequestError::Status { status, body } => {
                 write!(f, "request failed with {status}: {body}")
             }
@@ -602,6 +766,7 @@ impl std::error::Error for AgentRequestError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             AgentRequestError::Transport(error) => Some(error),
+            AgentRequestError::Configuration(_) => None,
             AgentRequestError::Status { .. } => None,
             AgentRequestError::Decode(error) => Some(error),
         }
@@ -627,7 +792,16 @@ impl AgentRequestError {
                     || *status == reqwest::StatusCode::REQUEST_TIMEOUT
             }
             AgentRequestError::Decode(_) => false,
+            AgentRequestError::Configuration(_) => false,
         }
+    }
+
+    fn is_resident_desired_stop(&self) -> bool {
+        let Self::Status { body, .. } = self else {
+            return false;
+        };
+        serde_json::from_str::<ErrorEnvelope>(body)
+            .is_ok_and(|envelope| envelope.code == "resident_process_stopped")
     }
 }
 
@@ -851,7 +1025,7 @@ fn open_workspace(
 /// use, decided purely from already-resolved inputs (no I/O), so the
 /// precedence rule itself is unit-testable without a live server or
 /// filesystem.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum GuestCredentialSource {
     /// A guest token was supplied directly (via `--guest-token[-file]`); use it
     /// as-is and never call the mint endpoint.
@@ -881,18 +1055,6 @@ fn guest_credential_source(
     }
 }
 
-/// Inputs `resolve_guest_client` needs beyond the worker-scoped client and API
-/// base URL, grouped into one struct so the function stays under clippy's
-/// argument-count lint.
-struct GuestCredentialConfig {
-    tenant: Option<String>,
-    worker_id: Option<Uuid>,
-    sandbox_id: SandboxId,
-    guest_token_file: Option<PathBuf>,
-    guest_token: Option<String>,
-    guest_token_ttl_seconds: u64,
-}
-
 /// Resolves the credential this daemon uses for every guest-facing call
 /// (claim/renew/complete/fail/output, guest-health): a pre-provisioned,
 /// sandbox-scoped guest token if one was supplied (`--guest-token`/
@@ -902,77 +1064,39 @@ struct GuestCredentialConfig {
 /// `--api-token`/`--api-token-file` -- and bound to exactly this
 /// `(worker_id, sandbox_id)`.
 ///
-/// Falls back to `worker_client` itself, unchanged, whenever there's nothing
-/// better to use: no worker id configured (nothing to mint against, and
-/// nothing to claim leases with either), or minting fails (e.g. an older API
-/// without the guest-token endpoint, or a deployment that hasn't wired
-/// guest-token delivery into this sandbox yet). That fallback is the pre-fix
-/// behavior -- the guest and its worker sharing one worker-scoped token (see
-/// the doc comment on `ClaimLeaseRequest`) -- so this function only ever
-/// narrows an existing deployment's blast radius; it never makes the daemon
-/// fail to start.
+/// A daemon which has a worker id must obtain a guest credential before it
+/// can claim executor work. Recoverable mint failures are deliberately
+/// returned to the daemon's bounded retry loop instead of falling back to the
+/// worker credential, which would permanently pin the daemon to broader
+/// authority after one transient outage.
 async fn resolve_guest_client(
     worker_client: &reqwest::Client,
     api: &str,
-    config: GuestCredentialConfig,
-) -> reqwest::Client {
-    let resolved_guest_token = match resolve_api_token(config.guest_token_file, config.guest_token)
-    {
-        Ok(token) => token,
-        Err(error) => {
-            eprintln!(
-                "warning: sandboxwich-agent could not read --guest-token-file ({error}); \
-                     falling back to the worker-scoped credential for guest-facing calls"
-            );
-            None
-        }
-    };
-
-    let token = match guest_credential_source(
-        resolved_guest_token,
-        config.worker_id,
-        config.guest_token_ttl_seconds,
-    ) {
+    tenant: Option<&str>,
+    sandbox_id: SandboxId,
+    credential: GuestCredentialSource,
+) -> Result<reqwest::Client, AgentRequestError> {
+    let token = match credential {
         GuestCredentialSource::Provided(token) => Some(token),
         GuestCredentialSource::SelfMint {
             worker_id,
             ttl_seconds,
-        } => match mint_guest_token(
-            worker_client,
-            api,
-            worker_id,
-            config.sandbox_id,
-            ttl_seconds,
-        )
-        .await
-        {
-            Ok(minted) => Some(minted.token),
-            Err(error) => {
-                eprintln!(
-                    "warning: sandboxwich-agent could not mint a sandbox-scoped guest token \
-                     ({error}); falling back to the worker-scoped credential for guest-facing \
-                     calls"
-                );
-                None
-            }
-        },
+        } => Some(
+            mint_guest_token(worker_client, api, worker_id, sandbox_id, ttl_seconds)
+                .await?
+                .token,
+        ),
         GuestCredentialSource::None => None,
     };
 
     let Some(token) = token else {
-        return worker_client.clone();
+        // Without a worker id there is no claim loop, so this preserves the
+        // heartbeat/one-shot command behavior without granting executor work.
+        return Ok(worker_client.clone());
     };
 
-    match build_api_client(Some(&token), config.tenant.as_deref()) {
-        Ok(client) => client,
-        Err(error) => {
-            eprintln!(
-                "warning: sandboxwich-agent could not build a client from its guest token \
-                 ({error}); falling back to the worker-scoped credential for guest-facing calls"
-            );
-            worker_client.clone()
-        }
-    }
+    build_api_client(Some(&token), tenant)
+        .map_err(|error| AgentRequestError::Configuration(error.to_string()))
 }
 
 /// Mints a sandbox-scoped guest token (`sbw_gtok_...`) bound to exactly
@@ -1003,6 +1127,7 @@ async fn claim_lease(
     worker_id: Uuid,
     sandbox_id: SandboxId,
     lease_seconds: Option<u64>,
+    include_resident_processes: bool,
 ) -> Result<ClaimLeaseResponse, AgentRequestError> {
     // Scope the claim to this daemon's own sandbox and to the only job kind it
     // knows how to execute. `client` here should be the sandbox-scoped guest
@@ -1020,11 +1145,19 @@ async fn claim_lease(
         .json(&ClaimLeaseRequest {
             lease_seconds,
             sandbox_id: Some(sandbox_id),
-            kinds: Some(vec![JobKind::RunCommand, JobKind::RunResidentProcess]),
+            kinds: Some(guest_claim_kinds(include_resident_processes)),
         })
         .send()
         .await?;
     decode_json(response).await
+}
+
+fn guest_claim_kinds(include_resident_processes: bool) -> Vec<JobKind> {
+    let mut kinds = vec![JobKind::RunCommand];
+    if include_resident_processes {
+        kinds.push(JobKind::RunResidentProcess);
+    }
+    kinds
 }
 
 async fn renew_lease(
@@ -1048,16 +1181,58 @@ async fn renew_lease(
 /// worker, running the same job twice) mid-flight. Mirrors
 /// `sandboxwich-worker`'s `handle_lease` renewal task.
 ///
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum LeaseCancellationReason {
+    None = 0,
+    DesiredStop = 1,
+    LeaseLost = 2,
+}
+
+#[derive(Clone)]
+struct LeaseCancellation {
+    reason: Arc<AtomicU8>,
+}
+
+impl LeaseCancellation {
+    fn new() -> Self {
+        Self {
+            reason: Arc::new(AtomicU8::new(LeaseCancellationReason::None as u8)),
+        }
+    }
+
+    fn cancel(&self, reason: LeaseCancellationReason) {
+        let _ = self.reason.compare_exchange(
+            LeaseCancellationReason::None as u8,
+            reason as u8,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    fn reason(&self) -> LeaseCancellationReason {
+        match self.reason.load(Ordering::SeqCst) {
+            1 => LeaseCancellationReason::DesiredStop,
+            2 => LeaseCancellationReason::LeaseLost,
+            _ => LeaseCancellationReason::None,
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.reason() != LeaseCancellationReason::None
+    }
+}
+
 /// If renewal is lost -- `RENEW_ATTEMPTS` consecutive calls fail -- this
 /// stops renewing (retrying a lease that's plausibly already gone forever
-/// would just hammer the API) and flips `cancelled`, which `execute_streaming`
-/// polls to kill the still-running command instead of letting it keep
-/// executing against a lease we can no longer prove is still ours.
+/// would just hammer the API) and records why the running child was cancelled.
+/// A confirmed resident desired-stop is not a lost lease: it must complete as
+/// `Stopped`, whereas every other renewal failure is a retryable loss.
 fn spawn_lease_renewal_task(
     client: reqwest::Client,
     api: String,
     lease: &sandboxwich_core::JobLease,
-    cancelled: Arc<AtomicBool>,
+    cancellation: LeaseCancellation,
 ) -> tokio::task::JoinHandle<()> {
     let lease_id = lease.id;
     let renew_interval = (lease.expires_at - lease.leased_at)
@@ -1076,6 +1251,14 @@ fn spawn_lease_renewal_task(
                         break;
                     }
                     Err(error) => {
+                        if error.is_resident_desired_stop() {
+                            cancellation.cancel(LeaseCancellationReason::DesiredStop);
+                            // The API renewed the lease before returning this
+                            // typed stop signal. Keep the renewal task alive
+                            // until terminal observation and completion finish.
+                            renewed = true;
+                            break;
+                        }
                         last_error = Some(error);
                         if attempt < RENEW_ATTEMPTS {
                             tokio::time::sleep(RENEW_RETRY_DELAY).await;
@@ -1087,16 +1270,53 @@ fn spawn_lease_renewal_task(
                 let error = last_error
                     .map(|error| error.to_string())
                     .unwrap_or_else(|| "unknown error".to_string());
+                if cancellation.reason() == LeaseCancellationReason::DesiredStop {
+                    eprintln!(
+                        "warning: renewing desired-stop lease {lease_id} failed after \
+                         {RENEW_ATTEMPTS} attempts ({error}); retaining terminal ownership"
+                    );
+                    continue;
+                }
                 eprintln!(
                     "warning: renewing lease {lease_id} failed after {RENEW_ATTEMPTS} attempts \
                      ({error}); cancelling the running command instead of letting it keep \
                      executing against a lease we can no longer prove is still ours"
                 );
-                cancelled.store(true, Ordering::SeqCst);
+                cancellation.cancel(LeaseCancellationReason::LeaseLost);
                 return;
             }
         }
     })
+}
+
+/// Aborts renewal immediately if its owning lease future is itself cancelled.
+/// Dropping a bare Tokio `JoinHandle` detaches the task, which would let it
+/// keep renewing a lease after its resident child had been killed.
+struct LeaseRenewalTask {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl LeaseRenewalTask {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn abort_and_wait(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for LeaseRenewalTask {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
 }
 
 /// Why a claimed lease must be handed back rather than executed. Both variants
@@ -1166,15 +1386,9 @@ async fn handle_lease(
              ({violation}); failing with retry so the intended executor can claim it instead",
             lease.id, lease.job.id
         );
-        let response = client
-            .post(format!("{api}/leases/{}/fail", lease.id))
-            .json(&FailLeaseRequest {
-                error: violation.to_string(),
-                retry: true,
-            })
-            .send()
-            .await?;
-        return decode_json(response).await.map_err(Into::into);
+        return fail_lease_retryable(client, api, lease.id, violation.to_string())
+            .await
+            .map_err(Into::into);
     }
 
     if lease.job.kind == JobKind::RunResidentProcess {
@@ -1182,9 +1396,13 @@ async fn handle_lease(
     }
 
     let request = agent_request_from_payload(&lease.job.payload)?;
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let renew_task =
-        spawn_lease_renewal_task(client.clone(), api.to_string(), &lease, cancelled.clone());
+    let cancellation = LeaseCancellation::new();
+    let renew_task = LeaseRenewalTask::new(spawn_lease_renewal_task(
+        client.clone(),
+        api.to_string(),
+        &lease,
+        cancellation.clone(),
+    ));
 
     let result = execute_streaming(
         request,
@@ -1192,12 +1410,11 @@ async fn handle_lease(
         Some(api),
         Some(lease.id),
         max_captured_output_bytes,
-        Some(cancelled),
+        Some(cancellation),
     )
     .await;
 
-    renew_task.abort();
-    let _ = renew_task.await;
+    renew_task.abort_and_wait().await;
 
     match result {
         // A non-zero exit code means the command actually ran to completion in the
@@ -1295,36 +1512,273 @@ fn transfer_resident_bootstrap_ownership(
     Ok(())
 }
 
+async fn wait_for_lease_cancellation(cancellation: &LeaseCancellation) {
+    while !cancellation.is_cancelled() {
+        tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
+    }
+}
+
+/// A bootstrap delivery is fenced to the active lease and can only be replayed
+/// after a terminal observation consumes it. Once an observation can
+/// acknowledge that delivery, every subsequent observation must stay on this
+/// same lease and retry until it succeeds or renewal confirms cancellation.
+async fn post_resident_observation_until_resolved(
+    client: &reqwest::Client,
+    api: &str,
+    process_id: ResidentProcessId,
+    request: ResidentProcessObservationRequest,
+    cancellation: &LeaseCancellation,
+) -> Result<(), LeaseCancellationReason> {
+    let mut backoff = Backoff::new(RESIDENT_OBSERVATION_RETRY_DELAY);
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(cancellation.reason());
+        }
+        match post_resident_observation(client, api, process_id, request.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                eprintln!(
+                    "warning: posting {:?} for resident process {process_id} lease {} failed; \
+                     retrying under the same lease: {error}",
+                    request.observed_state, request.lease_id,
+                );
+                tokio::select! {
+                    () = backoff.wait() => {}
+                    () = wait_for_lease_cancellation(cancellation) => {
+                        return Err(cancellation.reason());
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn fail_lease_terminal(
+    client: &reqwest::Client,
+    api: &str,
+    lease_id: LeaseId,
+    error: String,
+) -> Result<LeaseResponse, AgentRequestError> {
+    let response = client
+        .post(format!("{api}/leases/{lease_id}/fail"))
+        .json(&FailLeaseRequest {
+            error,
+            retry: false,
+        })
+        .send()
+        .await?;
+    decode_json(response).await
+}
+
+async fn complete_resident_lease(
+    client: &reqwest::Client,
+    api: &str,
+    lease_id: LeaseId,
+    process_id: ResidentProcessId,
+    generation: u64,
+    exit_code: Option<i32>,
+) -> anyhow::Result<LeaseResponse> {
+    let response = client
+        .post(format!("{api}/leases/{lease_id}/complete"))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::RunResidentProcess {
+                process_id,
+                generation,
+                exit_code,
+            }),
+        })
+        .send()
+        .await?;
+    decode_json(response).await.map_err(Into::into)
+}
+
+async fn complete_resident_lease_until_resolved(
+    client: &reqwest::Client,
+    api: &str,
+    fence: ResidentLeaseFence,
+    exit_code: Option<i32>,
+    cancellation: &LeaseCancellation,
+) -> Result<LeaseResponse, LeaseCancellationReason> {
+    let mut backoff = Backoff::new(RESIDENT_OBSERVATION_RETRY_DELAY);
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(cancellation.reason());
+        }
+        match complete_resident_lease(
+            client,
+            api,
+            fence.lease_id,
+            fence.process_id,
+            fence.generation,
+            exit_code,
+        )
+        .await
+        {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                eprintln!(
+                    "warning: completing resident process {} lease {} failed; retrying under \
+                     the same lease: {error}",
+                    fence.process_id, fence.lease_id
+                );
+                tokio::select! {
+                    () = backoff.wait() => {}
+                    () = wait_for_lease_cancellation(cancellation) => {
+                        return Err(cancellation.reason());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ResidentLeaseFence {
+    lease_id: LeaseId,
+    process_id: ResidentProcessId,
+    generation: u64,
+}
+
+async fn complete_desired_stop_resident_lease(
+    client: &reqwest::Client,
+    api: &str,
+    fence: ResidentLeaseFence,
+) -> anyhow::Result<LeaseResponse> {
+    let request = ResidentProcessObservationRequest {
+        generation: fence.generation,
+        lease_id: fence.lease_id.0,
+        observed_state: ResidentProcessObservedState::Stopped,
+        pid: None,
+        // Completing with zero is intentional: the API derives the terminal
+        // resident state from this typed result too.
+        exit_code: Some(0),
+        error_code: None,
+        error_message: None,
+    };
+    let mut backoff = Backoff::new(RESIDENT_OBSERVATION_RETRY_DELAY);
+    loop {
+        match post_resident_observation(client, api, fence.process_id, request.clone()).await {
+            Ok(()) => break,
+            Err(error) => eprintln!(
+                "warning: reporting desired stop for resident process {} lease {} failed; \
+                 retaining terminal ownership and retrying: {error}",
+                fence.process_id, fence.lease_id
+            ),
+        }
+        backoff.wait().await;
+    }
+    backoff.reset();
+    loop {
+        match complete_resident_lease(
+            client,
+            api,
+            fence.lease_id,
+            fence.process_id,
+            fence.generation,
+            Some(0),
+        )
+        .await
+        {
+            Ok(response) => return Ok(response),
+            Err(error) => eprintln!(
+                "warning: completing desired stop for resident process {} lease {} failed; \
+                 retaining terminal ownership and retrying: {error}",
+                fence.process_id, fence.lease_id
+            ),
+        }
+        backoff.wait().await;
+    }
+}
+
+async fn reconcile_resident_cancellation_without_child(
+    client: &reqwest::Client,
+    api: &str,
+    fence: ResidentLeaseFence,
+    reason: LeaseCancellationReason,
+) -> anyhow::Result<LeaseResponse> {
+    if reason == LeaseCancellationReason::DesiredStop {
+        return complete_desired_stop_resident_lease(client, api, fence).await;
+    }
+    fail_lease_terminal(
+        client,
+        api,
+        fence.lease_id,
+        format!(
+            "resident process lease was cancelled as {reason:?}; bootstrap delivery cannot be retried"
+        ),
+    )
+    .await
+    .map_err(Into::into)
+}
+
+async fn reconcile_resident_cancellation(
+    client: &reqwest::Client,
+    api: &str,
+    fence: ResidentLeaseFence,
+    pid: Option<u32>,
+    child: &mut tokio::process::Child,
+    reason: LeaseCancellationReason,
+) -> anyhow::Result<LeaseResponse> {
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    if reason == LeaseCancellationReason::DesiredStop {
+        return complete_desired_stop_resident_lease(client, api, fence).await;
+    }
+
+    post_resident_observation(
+        client,
+        api,
+        fence.process_id,
+        ResidentProcessObservationRequest {
+            generation: fence.generation,
+            lease_id: fence.lease_id.0,
+            observed_state: ResidentProcessObservedState::Lost,
+            pid,
+            exit_code: None,
+            error_code: Some("lease_lost".into()),
+            error_message: Some("resident process lease renewal was lost".into()),
+        },
+    )
+    .await?;
+    fail_lease_retryable(
+        client,
+        api,
+        fence.lease_id,
+        "resident process lease renewal was lost".into(),
+    )
+    .await
+    .map_err(Into::into)
+}
+
 async fn handle_resident_process(
     client: &reqwest::Client,
     api: &str,
     lease: sandboxwich_core::JobLease,
 ) -> anyhow::Result<LeaseResponse> {
-    let process_id: ResidentProcessId = serde_json::from_value(
-        lease
-            .job
-            .payload
-            .get("residentProcessId")
-            .cloned()
-            .context("residentProcessId is missing")?,
+    handle_resident_process_with_bootstrap_root(
+        client,
+        api,
+        lease,
+        Path::new("/run/sandboxwich/bootstrap"),
     )
-    .context("residentProcessId is invalid")?;
-    let generation = lease
-        .job
-        .payload
-        .get("generation")
-        .and_then(serde_json::Value::as_u64)
-        .context("resident generation is missing")?;
-    // Older queued jobs (pre-#176) never wrote a "name" field; default to
-    // orb-executor, which preserves the pre-#176 behavior of inheriting the
-    // agent's own uid rather than attempting a privilege drop.
-    let name = lease
-        .job
-        .payload
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(ORB_EXECUTOR_RESIDENT_PROCESS_NAME)
-        .to_string();
+    .await
+}
+
+async fn handle_resident_process_with_bootstrap_root(
+    client: &reqwest::Client,
+    api: &str,
+    lease: sandboxwich_core::JobLease,
+    bootstrap_root: &Path,
+) -> anyhow::Result<LeaseResponse> {
+    let metadata = ResidentProcessTaskMetadata::from_lease(&lease)?;
+    let process_id = metadata.process_id;
+    let generation = metadata.generation;
+    let fence = ResidentLeaseFence {
+        lease_id: lease.id,
+        process_id,
+        generation,
+    };
+    let name = metadata.name;
     let run_as_uid = resident_process_run_as_uid(&name);
     let argv: Vec<String> = serde_json::from_value(
         lease
@@ -1384,162 +1838,221 @@ async fn handle_resident_process(
                 .await?,
         )
         .await?;
-        let target = Path::new(&bootstrap.target_file);
-        anyhow::ensure!(
-            target.starts_with("/run/sandboxwich/bootstrap"),
-            "resident bootstrap path is outside the allowed root"
-        );
-        let parent = target
-            .parent()
-            .context("resident bootstrap has no parent")?;
-        std::fs::create_dir_all(parent)?;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(bootstrap.mode);
-        let mut file = options
-            .open(target)
-            .with_context(|| format!("failed to create {}", target.display()))?;
-        file.write_all(&bootstrap.content)?;
-        file.sync_all()?;
-        transfer_resident_bootstrap_ownership(&file, run_as_uid).with_context(|| {
-            format!(
-                "failed to transfer {} to the resident-process identity",
-                target.display()
+        let prepare = (|| -> anyhow::Result<()> {
+            let target = Path::new(&bootstrap.target_file);
+            anyhow::ensure!(
+                target.starts_with(bootstrap_root),
+                "resident bootstrap path is outside the allowed root"
+            );
+            let parent = target
+                .parent()
+                .context("resident bootstrap has no parent")?;
+            std::fs::create_dir_all(parent)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(bootstrap.mode);
+            let mut file = options
+                .open(target)
+                .with_context(|| format!("failed to create {}", target.display()))?;
+            file.write_all(&bootstrap.content)?;
+            file.sync_all()?;
+            transfer_resident_bootstrap_ownership(&file, run_as_uid).with_context(|| {
+                format!(
+                    "failed to transfer {} to the resident-process identity",
+                    target.display()
+                )
+            })?;
+            Ok(())
+        })();
+        if let Err(error) = prepare {
+            return fail_lease_terminal(
+                client,
+                api,
+                lease.id,
+                format!("resident bootstrap preparation failed after delivery: {error:#}"),
             )
-        })?;
+            .await
+            .map_err(Into::into);
+        }
     }
 
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let renew_task =
-        spawn_lease_renewal_task(client.clone(), api.to_string(), &lease, cancelled.clone());
-    let max_attempts = if restart_policy == ResidentProcessRestartPolicy::OnFailure {
-        3
-    } else {
-        1
-    };
-    let mut last_exit_code = None;
-    for attempt in 1..=max_attempts {
-        post_resident_observation(
-            client,
-            api,
-            process_id,
-            ResidentProcessObservationRequest {
-                generation,
-                lease_id: lease.id.0,
-                observed_state: ResidentProcessObservedState::Starting,
-                pid: None,
-                exit_code: None,
-                error_code: None,
-                error_message: None,
-            },
-        )
-        .await?;
-        let mut command = ProcessCommand::new(program);
-        command.args(args).envs(&env);
-        if let Some(cwd) = &cwd {
-            command.current_dir(cwd);
-        }
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
-        apply_resident_process_run_as_uid(&mut command, run_as_uid);
-        let mut child = command
-            .spawn()
-            .context("failed to spawn resident process")?;
-        let pid = child.id();
-        post_resident_observation(
-            client,
-            api,
-            process_id,
-            ResidentProcessObservationRequest {
-                generation,
-                lease_id: lease.id.0,
-                observed_state: ResidentProcessObservedState::Running,
-                pid,
-                exit_code: None,
-                error_code: None,
-                error_message: None,
-            },
-        )
-        .await?;
-        let status = tokio::select! {
-            result = child.wait() => result.context("failed to wait for resident process")?,
-            () = async {
-                while !cancelled.load(Ordering::SeqCst) {
-                    tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
-                }
-            } => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                post_resident_observation(
-                    client,
-                    api,
-                    process_id,
-                    ResidentProcessObservationRequest {
-                        generation,
-                        lease_id: lease.id.0,
-                        observed_state: ResidentProcessObservedState::Lost,
-                        pid,
-                        exit_code: None,
-                        error_code: Some("lease_lost".into()),
-                        error_message: Some("resident process lease renewal was lost".into()),
-                    },
-                ).await?;
-                renew_task.abort();
-                let response = client
-                    .post(format!("{api}/leases/{}/fail", lease.id))
-                    .json(&FailLeaseRequest {
-                        error: "resident process lease renewal was lost".into(),
-                        retry: true,
-                    })
-                    .send()
-                    .await?;
-                return decode_json(response).await.map_err(Into::into);
-            }
+    let cancellation = LeaseCancellation::new();
+    let renew_task = LeaseRenewalTask::new(spawn_lease_renewal_task(
+        client.clone(),
+        api.to_string(),
+        &lease,
+        cancellation.clone(),
+    ));
+    // Keep every fallible observation/spawn/wait/terminal API call inside one
+    // result boundary. Regardless of which `?` exits this block, the renewal
+    // handle below is always aborted and awaited before this task is reaped.
+    let result = async {
+        let max_attempts = if restart_policy == ResidentProcessRestartPolicy::OnFailure {
+            3
+        } else {
+            1
         };
-        last_exit_code = status.code();
-        if status.success() || attempt == max_attempts {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
-    }
-    renew_task.abort();
-    let _ = renew_task.await;
-    let observed_state = if last_exit_code == Some(0) {
-        ResidentProcessObservedState::Stopped
-    } else {
-        ResidentProcessObservedState::Failed
-    };
-    post_resident_observation(
-        client,
-        api,
-        process_id,
-        ResidentProcessObservationRequest {
-            generation,
-            lease_id: lease.id.0,
-            observed_state,
-            pid: None,
-            exit_code: last_exit_code,
-            error_code: (last_exit_code != Some(0)).then(|| "resident_process_exit".into()),
-            error_message: None,
-        },
-    )
-    .await?;
-    let response = client
-        .post(format!("{api}/leases/{}/complete", lease.id))
-        .json(&CompleteLeaseRequest {
-            result: Some(WorkerJobResult::RunResidentProcess {
+        let mut last_exit_code = None;
+        for attempt in 1..=max_attempts {
+            let mut command = ProcessCommand::new(program);
+            command.args(args).envs(&env);
+            if let Some(cwd) = &cwd {
+                command.current_dir(cwd);
+            }
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .kill_on_drop(true);
+            apply_resident_process_run_as_uid(&mut command, run_as_uid);
+            let mut child = match command.spawn().context("failed to spawn resident process") {
+                Ok(child) => child,
+                Err(error) => {
+                    if attempt < max_attempts {
+                        tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
+                        continue;
+                    }
+                    // Bootstrap bytes are consumed when this terminal
+                    // observation is acknowledged. A subsequent lease cannot
+                    // fetch them again, so this final spawn failure must be
+                    // terminal rather than advertising a retry that cannot
+                    // make progress.
+                    let error_message = error.to_string();
+                    if let Err(reason) = post_resident_observation_until_resolved(
+                        client,
+                        api,
+                        process_id,
+                        ResidentProcessObservationRequest {
+                            generation,
+                            lease_id: lease.id.0,
+                            observed_state: ResidentProcessObservedState::Failed,
+                            pid: None,
+                            exit_code: None,
+                            error_code: Some("resident_process_spawn_failed".into()),
+                            error_message: Some(error_message.clone()),
+                        },
+                        &cancellation,
+                    )
+                    .await
+                    {
+                        return reconcile_resident_cancellation_without_child(
+                            client, api, fence, reason,
+                        )
+                        .await;
+                    }
+                    return fail_lease_terminal(client, api, lease.id, error_message)
+                        .await
+                        .map_err(Into::into);
+                }
+            };
+            let pid = child.id();
+            if let Err(reason) = post_resident_observation_until_resolved(
+                client,
+                api,
                 process_id,
+                ResidentProcessObservationRequest {
+                    generation,
+                    lease_id: lease.id.0,
+                    observed_state: ResidentProcessObservedState::Starting,
+                    pid,
+                    exit_code: None,
+                    error_code: None,
+                    error_message: None,
+                },
+                &cancellation,
+            )
+            .await
+            {
+                return reconcile_resident_cancellation(
+                    client, api, fence, pid, &mut child, reason,
+                )
+                .await;
+            }
+            if let Err(reason) = post_resident_observation_until_resolved(
+                client,
+                api,
+                process_id,
+                ResidentProcessObservationRequest {
+                    generation,
+                    lease_id: lease.id.0,
+                    observed_state: ResidentProcessObservedState::Running,
+                    pid,
+                    exit_code: None,
+                    error_code: None,
+                    error_message: None,
+                },
+                &cancellation,
+            )
+            .await
+            {
+                return reconcile_resident_cancellation(
+                    client, api, fence, pid, &mut child, reason,
+                )
+                .await;
+            }
+            let status = tokio::select! {
+                result = child.wait() => result.context("failed to wait for resident process")?,
+                () = wait_for_lease_cancellation(&cancellation) => {
+                    return reconcile_resident_cancellation(
+                        client,
+                        api,
+                        fence,
+                        pid,
+                        &mut child,
+                        cancellation.reason(),
+                    )
+                    .await;
+                }
+            };
+            last_exit_code = status.code();
+            if status.success() || attempt == max_attempts {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
+        }
+        let observed_state = if last_exit_code == Some(0) {
+            ResidentProcessObservedState::Stopped
+        } else {
+            ResidentProcessObservedState::Failed
+        };
+        if let Err(reason) = post_resident_observation_until_resolved(
+            client,
+            api,
+            process_id,
+            ResidentProcessObservationRequest {
                 generation,
+                lease_id: lease.id.0,
+                observed_state,
+                pid: None,
                 exit_code: last_exit_code,
-            }),
-        })
-        .send()
-        .await?;
-    decode_json(response).await.map_err(Into::into)
+                error_code: (last_exit_code != Some(0)).then(|| "resident_process_exit".into()),
+                error_message: None,
+            },
+            &cancellation,
+        )
+        .await
+        {
+            return reconcile_resident_cancellation_without_child(client, api, fence, reason).await;
+        }
+        match complete_resident_lease_until_resolved(
+            client,
+            api,
+            fence,
+            last_exit_code,
+            &cancellation,
+        )
+        .await
+        {
+            Ok(response) => Ok(response),
+            Err(reason) => {
+                reconcile_resident_cancellation_without_child(client, api, fence, reason).await
+            }
+        }
+    }
+    .await;
+    renew_task.abort_and_wait().await;
+    result
 }
 
 async fn execute_streaming(
@@ -1548,7 +2061,7 @@ async fn execute_streaming(
     api: Option<&str>,
     lease_id: Option<LeaseId>,
     max_captured_output_bytes: u64,
-    cancelled: Option<Arc<AtomicBool>>,
+    cancellation: Option<LeaseCancellation>,
 ) -> anyhow::Result<AgentCommandResult> {
     validate_agent_command_request(&request)?;
     let AgentCommandRequest {
@@ -1609,19 +2122,14 @@ async fn execute_streaming(
     // Before this bound existed, a wedged command (or one that simply runs
     // longer than the caller expects) left `child.wait()` waiting forever,
     // wedging this worker/agent slot for good. Racing in a poll for
-    // `cancelled` alongside it means a command also gets killed promptly if
+    // `cancellation` alongside it means a command also gets killed promptly if
     // `handle_lease`'s background renewal task loses the lease, instead of
     // continuing to run to completion (and possibly being re-queued and
     // executed a second time elsewhere) against a lease we can no longer
     // prove is still ours.
     let wait_for_cancellation = async {
-        match &cancelled {
-            Some(cancelled) => loop {
-                if cancelled.load(Ordering::SeqCst) {
-                    return;
-                }
-                tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
-            },
+        match &cancellation {
+            Some(cancellation) => wait_for_lease_cancellation(cancellation).await,
             None => std::future::pending().await,
         }
     };
@@ -1822,16 +2330,24 @@ async fn post_guest_health(
     status: GuestStatus,
     message: Option<String>,
 ) -> Result<(), AgentRequestError> {
+    let mut checks = serde_json::json!({
+        "exec": {"status": "ok"},
+        "files": {"status": "ok"}
+    });
+    checks
+        .as_object_mut()
+        .expect("guest health checks are constructed as an object")
+        .insert(
+            GUEST_AGENT_CAPABILITY_REPORT_CHECK.to_string(),
+            serde_json::to_value(GuestAgentCapabilityReport::current())
+                .map_err(AgentRequestError::Decode)?,
+        );
     let response = client
         .post(format!("{api}/sandboxes/{sandbox_id}/guest-health"))
         .json(&UpdateGuestHealthRequest {
             status,
             agent_version: Some(agent_version()),
-            checks: Some(serde_json::json!({
-                "exec": {"status": "ok"},
-                "files": {"status": "ok"},
-                "uidIsolatedResidentProcess": {"status": "ok", "version": 1}
-            })),
+            checks: Some(checks),
             message,
         })
         .send()
@@ -1962,6 +2478,10 @@ fn parse_env(value: &str) -> Result<(String, String), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+    use tokio::net::TcpListener;
 
     /// Writes `contents` to a fresh, uniquely-named temp file and returns its
     /// path. Mirrors the temp-file-per-test pattern `sandboxwich-worker`'s
@@ -2059,6 +2579,230 @@ mod tests {
         // falls back to the worker-wide client unchanged.
         let source = guest_credential_source(None, None, 3600);
         assert_eq!(source, GuestCredentialSource::None);
+    }
+
+    #[test]
+    fn renewal_conflict_preserves_the_resident_desired_stop_reason() {
+        let error = AgentRequestError::Status {
+            status: reqwest::StatusCode::CONFLICT,
+            body: serde_json::to_string(&ErrorEnvelope::new(
+                "resident_process_stopped",
+                "resident process no longer desires a running lease",
+            ))
+            .unwrap(),
+        };
+
+        assert!(error.is_resident_desired_stop());
+        let cancellation = LeaseCancellation::new();
+        cancellation.cancel(if error.is_resident_desired_stop() {
+            LeaseCancellationReason::DesiredStop
+        } else {
+            LeaseCancellationReason::LeaseLost
+        });
+        assert_eq!(cancellation.reason(), LeaseCancellationReason::DesiredStop);
+    }
+
+    #[derive(Clone)]
+    struct BootstrapSpawnFailureState {
+        bootstrap: ResidentProcessBootstrapReadResponse,
+        lease: sandboxwich_core::JobLease,
+        bootstrap_read: Arc<AtomicBool>,
+        terminal_fail_posted: Arc<AtomicBool>,
+        observations: Arc<std::sync::Mutex<Vec<ResidentProcessObservedState>>>,
+    }
+
+    async fn test_read_bootstrap(
+        State(state): State<BootstrapSpawnFailureState>,
+    ) -> Json<ResidentProcessBootstrapReadResponse> {
+        state.bootstrap_read.store(true, Ordering::SeqCst);
+        Json(state.bootstrap)
+    }
+
+    async fn test_observe_bootstrap_spawn_failure(
+        State(state): State<BootstrapSpawnFailureState>,
+        Json(request): Json<ResidentProcessObservationRequest>,
+    ) -> StatusCode {
+        state
+            .observations
+            .lock()
+            .expect("observations lock")
+            .push(request.observed_state);
+        StatusCode::NO_CONTENT
+    }
+
+    async fn test_terminal_fail_bootstrap_spawn_failure(
+        State(state): State<BootstrapSpawnFailureState>,
+        Json(request): Json<FailLeaseRequest>,
+    ) -> Json<LeaseResponse> {
+        assert!(!request.retry, "consumed bootstrap must not be retried");
+        state.terminal_fail_posted.store(true, Ordering::SeqCst);
+        Json(LeaseResponse {
+            ok: true,
+            lease: state.lease,
+        })
+    }
+
+    #[tokio::test]
+    async fn bootstrap_delivery_followed_by_spawn_failure_reports_failed_without_starting() {
+        let bootstrap_root = TempWorkspace::new();
+        let target = bootstrap_root.path().join("orb-sidecar-bootstrap");
+        let worker_id = sandboxwich_core::WorkerId::new();
+        let process_id = ResidentProcessId(Uuid::now_v7());
+        let now = Utc::now();
+        let job = test_job(
+            JobKind::RunResidentProcess,
+            serde_json::json!({
+                "residentProcessId": process_id,
+                "generation": 1,
+                "name": "orb-executor",
+                "argv": ["/definitely/missing/sandboxwich-resident"],
+                "restartPolicy": ResidentProcessRestartPolicy::Never,
+                "bootstrapSha256": "test-bootstrap-sha",
+            }),
+        );
+        let lease = sandboxwich_core::JobLease {
+            id: LeaseId::new(),
+            job_id: job.id,
+            worker_id,
+            status: sandboxwich_core::LeaseStatus::Active,
+            attempt: 1,
+            leased_at: now,
+            expires_at: now + chrono::Duration::seconds(60),
+            completed_at: None,
+            error: None,
+            required_execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
+            job,
+        };
+        let state = BootstrapSpawnFailureState {
+            bootstrap: ResidentProcessBootstrapReadResponse {
+                ok: true,
+                content: b"bootstrap".to_vec(),
+                sha256: "test-bootstrap-sha".into(),
+                target_file: target.to_string_lossy().into_owned(),
+                mode: 0o600,
+            },
+            lease: lease.clone(),
+            bootstrap_read: Arc::new(AtomicBool::new(false)),
+            terminal_fail_posted: Arc::new(AtomicBool::new(false)),
+            observations: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let app = Router::new()
+            .route(
+                "/resident-processes/{process_id}/bootstrap",
+                post(test_read_bootstrap),
+            )
+            .route(
+                "/resident-processes/{process_id}/observations",
+                post(test_observe_bootstrap_spawn_failure),
+            )
+            .route(
+                "/leases/{lease_id}/fail",
+                post(test_terminal_fail_bootstrap_spawn_failure),
+            )
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = reqwest::Client::new();
+        let response = handle_resident_process_with_bootstrap_root(
+            &client,
+            &format!("http://{address}"),
+            lease,
+            bootstrap_root.path(),
+        )
+        .await
+        .expect("the acknowledged terminal spawn failure must reconcile its current lease");
+        server.abort();
+
+        assert!(response.ok);
+        assert!(state.bootstrap_read.load(Ordering::SeqCst));
+        assert!(state.terminal_fail_posted.load(Ordering::SeqCst));
+        assert_eq!(
+            state
+                .observations
+                .lock()
+                .expect("observations lock")
+                .as_slice(),
+            [ResidentProcessObservedState::Failed],
+            "a delivered bootstrap must be terminally acknowledged as Failed; Starting cannot be acknowledged \
+             before the fallible spawn succeeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_delivery_followed_by_file_collision_is_terminal() {
+        let bootstrap_root = TempWorkspace::new();
+        let target = bootstrap_root.path().join("existing-bootstrap");
+        std::fs::write(&target, b"must-not-be-overwritten").unwrap();
+        let worker_id = sandboxwich_core::WorkerId::new();
+        let process_id = ResidentProcessId(Uuid::now_v7());
+        let now = Utc::now();
+        let job = test_job(
+            JobKind::RunResidentProcess,
+            serde_json::json!({
+                "residentProcessId": process_id,
+                "generation": 1,
+                "name": "orb-executor",
+                "argv": ["/bin/true"],
+                "restartPolicy": ResidentProcessRestartPolicy::Never,
+                "bootstrapSha256": "test-bootstrap-sha",
+            }),
+        );
+        let lease = sandboxwich_core::JobLease {
+            id: LeaseId::new(),
+            job_id: job.id,
+            worker_id,
+            status: sandboxwich_core::LeaseStatus::Active,
+            attempt: 1,
+            leased_at: now,
+            expires_at: now + chrono::Duration::seconds(60),
+            completed_at: None,
+            error: None,
+            required_execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
+            job,
+        };
+        let state = BootstrapSpawnFailureState {
+            bootstrap: ResidentProcessBootstrapReadResponse {
+                ok: true,
+                content: b"bootstrap".to_vec(),
+                sha256: "test-bootstrap-sha".into(),
+                target_file: target.to_string_lossy().into_owned(),
+                mode: 0o600,
+            },
+            lease: lease.clone(),
+            bootstrap_read: Arc::new(AtomicBool::new(false)),
+            terminal_fail_posted: Arc::new(AtomicBool::new(false)),
+            observations: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let app = Router::new()
+            .route(
+                "/resident-processes/{process_id}/bootstrap",
+                post(test_read_bootstrap),
+            )
+            .route(
+                "/leases/{lease_id}/fail",
+                post(test_terminal_fail_bootstrap_spawn_failure),
+            )
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let response = handle_resident_process_with_bootstrap_root(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            lease,
+            bootstrap_root.path(),
+        )
+        .await
+        .expect("post-delivery file failures must terminally reconcile the current lease");
+        server.abort();
+
+        assert!(response.ok);
+        assert!(state.bootstrap_read.load(Ordering::SeqCst));
+        assert!(state.terminal_fail_posted.load(Ordering::SeqCst));
+        assert_eq!(std::fs::read(target).unwrap(), b"must-not-be-overwritten");
     }
 
     #[test]
@@ -2427,11 +3171,11 @@ mod tests {
             stdin: None,
             timeout_secs: Some(60), // Long enough that the timeout branch can't win the race.
         };
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let flip_cancelled = cancelled.clone();
+        let cancellation = LeaseCancellation::new();
+        let flip_cancellation = cancellation.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            flip_cancelled.store(true, Ordering::SeqCst);
+            flip_cancellation.cancel(LeaseCancellationReason::LeaseLost);
         });
 
         let started = std::time::Instant::now();
@@ -2441,7 +3185,7 @@ mod tests {
             None,
             None,
             DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
-            Some(cancelled),
+            Some(cancellation),
         )
         .await
         .expect_err("a cancelled command must be treated as a failure, not left running");
@@ -2457,6 +3201,32 @@ mod tests {
              the caller waiting anywhere near its full 30s sleep or 60s timeout; \
              elapsed = {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_lease_owner_aborts_detached_renewal_task() {
+        let reached_after_drop = Arc::new(AtomicBool::new(false));
+        let reached = reached_after_drop.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            reached.store(true, Ordering::SeqCst);
+        });
+        let abort_handle = handle.abort_handle();
+        let renewal = LeaseRenewalTask::new(handle);
+
+        drop(renewal);
+        for _ in 0..10 {
+            if abort_handle.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            abort_handle.is_finished(),
+            "dropping the lease owner must not detach its renewal task"
+        );
+        assert!(!reached_after_drop.load(Ordering::SeqCst));
     }
 
     fn test_job(kind: JobKind, payload: serde_json::Value) -> sandboxwich_core::Job {
@@ -2533,6 +3303,15 @@ mod tests {
         );
 
         assert_eq!(lease_scope_violation(&job, sandbox_id), None);
+    }
+
+    #[test]
+    fn full_resident_supervisor_leaves_resident_work_queued() {
+        assert_eq!(guest_claim_kinds(false), vec![JobKind::RunCommand]);
+        assert_eq!(
+            guest_claim_kinds(true),
+            vec![JobKind::RunCommand, JobKind::RunResidentProcess]
+        );
     }
 
     #[test]

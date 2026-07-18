@@ -303,7 +303,7 @@ pub(crate) async fn ensure_lease_tenant(
 /// When the caller authenticated with a per-sandbox guest token
 /// (`ctx.guest_sandbox_id()` is `Some`), this is where that credential's
 /// binding is actually enforced (see the doc comment on
-/// `ClaimLeaseRequest::sandbox_id`): the lease must belong to a `run_command`
+/// `ClaimLeaseRequest::sandbox_id`): the lease must belong to a guest-executable
 /// job whose sandbox -- own, fork parent, or fork child, via
 /// [`job_matches_sandbox`] -- matches the token's bound sandbox, or the
 /// route behaves as if the lease doesn't exist. A guest token can never
@@ -323,6 +323,83 @@ pub(crate) async fn ensure_lease_worker_scope(
         ) || !job_matches_sandbox(&lease.job, sandbox_id))
     {
         return Err(ApiError::not_found("resource not found"));
+    }
+    if lease.job.kind == JobKind::RunResidentProcess {
+        let Some(process_id) = lease
+            .job
+            .payload
+            .get("residentProcessId")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Err(ApiError::not_found("resource not found"));
+        };
+        let sql = format!(
+            "select tenant_id, sandbox_id, name from resident_processes where id = {}",
+            db.placeholder(1)
+        );
+        let Some(process) = sqlx::query(&sql)
+            .bind(process_id)
+            .fetch_optional(&db.pool)
+            .await?
+        else {
+            return Err(ApiError::not_found("resource not found"));
+        };
+        let process_tenant_id: String = process.try_get("tenant_id")?;
+        let process_sandbox_id: String = process.try_get("sandbox_id")?;
+        let process_name: String = process.try_get("name")?;
+        let process_sandbox_id = SandboxId(parse_uuid(&process_sandbox_id)?);
+        if process_tenant_id != lease.job.tenant_id
+            || !job_matches_sandbox(&lease.job, process_sandbox_id)
+        {
+            return Err(ApiError::not_found("resource not found"));
+        }
+        let owns_role = matches!(
+            (process_name.as_str(), ctx.principal),
+            (ORB_SIDECAR_RESIDENT_PROCESS_NAME, Principal::Worker(_))
+                | (ORB_EXECUTOR_RESIDENT_PROCESS_NAME, Principal::Guest { .. })
+        ) && ctx
+            .guest_sandbox_id()
+            .is_none_or(|sandbox_id| sandbox_id == process_sandbox_id);
+        if !owns_role {
+            return Err(ApiError::not_found("resource not found"));
+        }
+    }
+    Ok(lease)
+}
+
+/// Requires the caller to own the exact active lease fencing a resident
+/// process. Both worker and guest credentials are accepted, but a guest is
+/// additionally bound to its sandbox by `ensure_lease_worker_scope`.
+pub(crate) async fn ensure_resident_lease_scope(
+    db: &Database,
+    process: &ResidentProcess,
+    lease_id: LeaseId,
+    ctx: &TenantContext,
+) -> Result<JobLease, ApiError> {
+    if process.active_lease_id != Some(lease_id.0) {
+        return Err(ApiError::conflict_code(
+            "resident_process_generation_conflict",
+            "resident request does not match the active lease",
+        ));
+    }
+    let lease = ensure_lease_worker_scope(db, lease_id, ctx).await?;
+    let process_id = lease
+        .job
+        .payload
+        .get("residentProcessId")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .map(ResidentProcessId);
+    if lease.status != LeaseStatus::Active
+        || lease.expires_at <= chrono::Utc::now()
+        || lease.job.kind != JobKind::RunResidentProcess
+        || process_id != Some(process.id)
+        || !job_matches_sandbox(&lease.job, process.sandbox_id)
+        || !worker_owns_sandbox(db, lease.worker_id, process.sandbox_id).await?
+    {
+        return Err(ApiError::not_found(
+            "active resident-process lease not found",
+        ));
     }
     Ok(lease)
 }

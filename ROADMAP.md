@@ -7,6 +7,7 @@
 - Guest command streaming, file operations, health, SSH metadata, and sandbox-bound tokens.
 - Snapshot, fork, retention, cleanup, desktop-session, and runtime-resource records.
 - Kubernetes dry-run and guarded apply providers with RuntimeClass, ingress, CIDR egress, and optional Cilium FQDN policy.
+- Provider-isolated resident sidecars with atomic bootstrap acknowledgment, typed capability negotiation, fail-closed gating, and bounded telemetry.
 - Signed API, worker, and Ubuntu runtime images plus attested CLI archives.
 
 These capabilities remain Experimental until every gate below passes for a named provider and release.
@@ -54,7 +55,7 @@ These capabilities remain Experimental until every gate below passes for a named
 2. Add a microVM provider and compare its lifecycle and recovery behavior with RuntimeClass-backed Kubernetes.
 3. Add a brokered desktop transport; current desktop records do not create an ingress tunnel.
 4. Add production secret storage before accepting long-lived user or model credentials.
-5. Add a worker-level sidecar placement primitive that runs `orb-sidecar` outside the sandbox's mount/net namespaces (a genuine separate trust domain), superseding the v1 same-container, uid-separated-only placement disclosed in docs/capabilities.md (evalops/sandboxwich#176, evalops/orb#296).
+5. Add live sidecar conformance across worker restart, API replica failover, and an explicit guest-to-sidecar network relay; bootstrap handoff is currently process-local and the isolated Pod does not share guest localhost.
 
 ## Non-goals for 0.1
 

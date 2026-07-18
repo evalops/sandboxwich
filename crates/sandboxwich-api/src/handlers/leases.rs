@@ -4,8 +4,10 @@ use crate::error::*;
 use crate::handlers::commands::*;
 use crate::handlers::files::*;
 use crate::handlers::jobs::*;
+use crate::handlers::resident_processes::executor_sidecar_is_ready_for_claim;
 use crate::handlers::sandboxes::*;
 use crate::handlers::snapshots::*;
+use crate::handlers::workers::fetch_guest_health;
 use crate::reconcile::*;
 use crate::rows::*;
 use crate::state::*;
@@ -38,6 +40,11 @@ fn worker_supports_execution_class(worker: &Worker, execution_class: &ExecutionC
         || worker
             .capabilities
             .contains(&execution_capability(execution_class))
+}
+
+fn guest_supports_uid_isolated_resident_process(checks: &serde_json::Value) -> bool {
+    GuestAgentCapabilityReport::from_health_checks(checks)
+        .is_some_and(|report| report.supports_uid_isolated_resident_process())
 }
 
 pub(crate) async fn claim_lease(
@@ -102,11 +109,20 @@ pub(crate) async fn claim_lease(
     if let Some(operation_id) = operation_id
         && let Some(lease) = fetch_claim_operation(&state.db, worker_id, operation_id).await?
     {
+        let lease = ensure_lease_worker_scope(&state.db, lease.id, &ctx).await?;
         return Ok(Json(ClaimLeaseResponse {
             ok: true,
             lease: Some(lease),
         }));
     }
+    let guest_has_uid_isolated_resident_process = if let Some(sandbox_id) = ctx.guest_sandbox_id() {
+        fetch_guest_health(&state.db, sandbox_id)
+            .await?
+            .as_ref()
+            .is_some_and(|health| guest_supports_uid_isolated_resident_process(&health.checks))
+    } else {
+        true
+    };
     let now = Utc::now();
     let capabilities = worker
         .capabilities
@@ -166,9 +182,6 @@ pub(crate) async fn claim_lease(
         );
     if let Some(job_id) = requested_job_id {
         query.push(" and id = ").push_bind(job_id.to_string());
-    }
-    if ctx.guest_sandbox_id().is_none() {
-        query.push(" and kind != 'run_resident_process'");
     }
     // Sandbox/kind scoping (see the doc comment on `ClaimLeaseRequest::sandbox_id`):
     // a caller such as `sandboxwich-agent`'s daemon loop can narrow claims to the
@@ -245,10 +258,7 @@ pub(crate) async fn claim_lease(
         {
             continue;
         }
-        if job.kind == JobKind::RunResidentProcess
-            && job.payload.get("name").and_then(serde_json::Value::as_str)
-                == Some(ORB_SIDECAR_RESIDENT_PROCESS_NAME)
-        {
+        if job.kind == JobKind::RunResidentProcess {
             let Some(sandbox_id) = job
                 .payload
                 .get("sandboxId")
@@ -257,12 +267,48 @@ pub(crate) async fn claim_lease(
             else {
                 continue;
             };
-            let supported = crate::handlers::workers::fetch_guest_health(&state.db, sandbox_id)
+            let is_sidecar = job.payload.get("name").and_then(serde_json::Value::as_str)
+                == Some(ORB_SIDECAR_RESIDENT_PROCESS_NAME);
+            if is_sidecar == ctx.guest_sandbox_id().is_some()
+                || !worker_owns_sandbox(&state.db, worker.id, sandbox_id).await?
+            {
+                continue;
+            }
+            if is_sidecar
+                && worker
+                    .labels
+                    .get(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL)
+                    .map(String::as_str)
+                    != Some(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE)
+            {
+                continue;
+            }
+            if !guest_has_uid_isolated_resident_process {
+                continue;
+            }
+            if !is_sidecar
+                && !executor_sidecar_is_ready_for_claim(&state.db, sandbox_id, &job.tenant_id)
+                    .await?
+            {
+                continue;
+            }
+            let running_sql = format!(
+                "select 1 from resident_processes where id = {} and desired_state = 'running'",
+                state.db.placeholder(1)
+            );
+            let Some(process_id) = job
+                .payload
+                .get("residentProcessId")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            if sqlx::query(&running_sql)
+                .bind(process_id)
+                .fetch_optional(&state.db.pool)
                 .await?
-                .is_some_and(|health| {
-                    crate::handlers::workers::guest_supports_uid_isolated_resident_process(&health)
-                });
-            if !supported {
+                .is_none()
+            {
                 continue;
             }
         }
@@ -478,16 +524,17 @@ pub(crate) async fn renew_lease(
     let lease_id = LeaseId(lease_id);
     // GH-64: guest-facing route -- only the worker holding this lease may
     // renew it; tenant-wide tokens are rejected.
-    ensure_lease_worker_scope(&state.db, lease_id, &ctx).await?;
+    let lease = ensure_lease_worker_scope(&state.db, lease_id, &ctx).await?;
     let now = Utc::now();
     let expires_at =
         now + chrono::Duration::seconds(effective_lease_seconds(request.lease_seconds) as i64);
     let sql = format!(
         "update job_leases
          set expires_at = {}
-         where id = {} and status = 'active'",
+         where id = {} and status = 'active' and {}",
         state.db.placeholder(1),
-        state.db.placeholder(2)
+        state.db.placeholder(2),
+        state.db.timestamp_is_future("expires_at")
     );
     let result = sqlx::query(&sql)
         .bind(expires_at.to_rfc3339())
@@ -496,6 +543,34 @@ pub(crate) async fn renew_lease(
         .await?;
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found("active lease not found"));
+    }
+    if lease.job.kind == JobKind::RunResidentProcess {
+        let stopped_sql = format!(
+            "select 1 from resident_processes where id = {} and desired_state = 'stopped'",
+            state.db.placeholder(1)
+        );
+        if sqlx::query(&stopped_sql)
+            .bind(
+                lease
+                    .job
+                    .payload
+                    .get("residentProcessId")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+            )
+            .fetch_optional(&state.db.pool)
+            .await?
+            .is_some()
+        {
+            // Renew the fence before signalling the stop. The owner keeps
+            // renewing while it publishes Stopped and completes the lease,
+            // so a control-plane partition cannot turn a clean stop into an
+            // expiry failure.
+            return Err(ApiError::conflict_code(
+                "resident_process_stopped",
+                "resident process no longer desires a running lease",
+            ));
+        }
     }
 
     let lease = fetch_lease(&state.db, lease_id).await?;
@@ -1066,6 +1141,28 @@ pub(crate) async fn complete_lease_in_transaction(
                 "lease is already completed with a different result",
             ));
         }
+        if lease.status == LeaseStatus::Expired
+            && lease.job.status == JobStatus::Succeeded
+            && let WorkerJobResult::RunResidentProcess {
+                process_id,
+                generation,
+                exit_code: Some(0),
+            } = &result
+            && *process_id == resident_process_id_from_job(&lease.job)?
+            && lease
+                .job
+                .payload
+                .get("generation")
+                .and_then(serde_json::Value::as_u64)
+                == Some(*generation)
+            && resident_process_is_cleanly_stopped(db, &mut tx, &lease.job).await?
+        {
+            // The expiry sweeper owns clean desired-stop finalization during
+            // a control-plane partition. Treat the original owner's exact
+            // completion replay as acknowledged even though the lease row
+            // remains an honest record of having expired.
+            return Ok(lease);
+        }
         if lease.status != LeaseStatus::Active {
             return Err(ApiError::bad_request(
                 "lease is already terminal with a different outcome",
@@ -1170,7 +1267,9 @@ pub(crate) async fn fail_lease_in_transaction(
 
         let now = Utc::now();
         fail_active_lease_on_connection(db, &mut tx, lease_id, now, error).await?;
-        let retry = retry_requested && lease.job.attempts < lease.job.max_attempts;
+        let retry = retry_requested
+            && lease.job.attempts < lease.job.max_attempts
+            && !resident_bootstrap_was_delivered(db, &mut tx, &lease.job).await?;
         if retry {
             update_job_status_on_connection(
                 db,
@@ -1291,7 +1390,30 @@ pub(crate) async fn expire_lease_if_still_active(
 
         let lease = fetch_lease_on_connection(db, &mut tx, lease_id).await?;
         let job = lease.job.clone();
-        let next_status = if job.attempts >= job.max_attempts {
+        if resident_process_desires_stop(db, &mut tx, &job).await? {
+            let process_id = resident_process_id_from_job(&job)?;
+            let generation = job
+                .payload
+                .get("generation")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| ApiError::internal("resident process job is missing generation"))?;
+            apply_completed_job_on_connection(
+                db,
+                &mut tx,
+                &job,
+                WorkerJobResult::RunResidentProcess {
+                    process_id,
+                    generation,
+                    exit_code: Some(0),
+                },
+            )
+            .await?;
+            update_job_status_on_connection(db, &mut tx, job.id, JobStatus::Succeeded, None, now)
+                .await?;
+            return Ok(());
+        }
+        let bootstrap_was_delivered = resident_bootstrap_was_delivered(db, &mut tx, &job).await?;
+        let next_status = if job.attempts >= job.max_attempts || bootstrap_was_delivered {
             JobStatus::Dead
         } else {
             JobStatus::Queued
@@ -1305,7 +1427,7 @@ pub(crate) async fn expire_lease_if_still_active(
             now,
         )
         .await?;
-        if job.attempts >= job.max_attempts {
+        if job.attempts >= job.max_attempts || bootstrap_was_delivered {
             apply_failed_job_on_connection(db, &mut tx, &job, "lease expired").await?;
             record_terminal_slo_observation(db, &mut tx, &lease, false, now).await?;
         } else {
@@ -1327,6 +1449,94 @@ pub(crate) async fn expire_lease_if_still_active(
             Err(error)
         }
     }
+}
+
+async fn resident_process_desires_stop(
+    db: &Database,
+    connection: &mut AnyConnection,
+    job: &Job,
+) -> Result<bool, ApiError> {
+    if job.kind != JobKind::RunResidentProcess {
+        return Ok(false);
+    }
+    let process_id = resident_process_id_from_job(job)?;
+    let generation = job
+        .payload
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| ApiError::internal("resident process job is missing generation"))?;
+    let sql = format!(
+        "select 1 from resident_processes
+         where id = {} and generation = {} and desired_state = 'stopped'",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    Ok(sqlx::query(&sql)
+        .bind(process_id.to_string())
+        .bind(i64::try_from(generation).map_err(|_| {
+            ApiError::internal("resident process generation exceeds database range")
+        })?)
+        .fetch_optional(&mut *connection)
+        .await?
+        .is_some())
+}
+
+async fn resident_process_is_cleanly_stopped(
+    db: &Database,
+    connection: &mut AnyConnection,
+    job: &Job,
+) -> Result<bool, ApiError> {
+    if job.kind != JobKind::RunResidentProcess {
+        return Ok(false);
+    }
+    let process_id = resident_process_id_from_job(job)?;
+    let generation = job
+        .payload
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| ApiError::internal("resident process job is missing generation"))?;
+    let sql = format!(
+        "select 1 from resident_processes
+         where id = {} and generation = {} and desired_state = 'stopped'
+           and observed_state = 'stopped' and exit_code = 0 and active_lease_id is null",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    Ok(sqlx::query(&sql)
+        .bind(process_id.to_string())
+        .bind(i64::try_from(generation).map_err(|_| {
+            ApiError::internal("resident process generation exceeds database range")
+        })?)
+        .fetch_optional(&mut *connection)
+        .await?
+        .is_some())
+}
+
+async fn resident_bootstrap_was_delivered(
+    db: &Database,
+    connection: &mut AnyConnection,
+    job: &Job,
+) -> Result<bool, ApiError> {
+    if job.kind != JobKind::RunResidentProcess {
+        return Ok(false);
+    }
+    let Some(process_id) = job
+        .payload
+        .get("residentProcessId")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(false);
+    };
+    let sql = format!(
+        "select 1 from resident_processes
+         where id = {} and bootstrap_delivered_lease_id is not null",
+        db.placeholder(1)
+    );
+    Ok(sqlx::query(&sql)
+        .bind(process_id)
+        .fetch_optional(&mut *connection)
+        .await?
+        .is_some())
 }
 
 async fn record_terminal_slo_observation(
@@ -2330,10 +2540,39 @@ pub(crate) async fn apply_failed_job_on_connection(
             )
             .await?;
         }
-        JobKind::ProvisionSandbox
-        | JobKind::StopSandbox
-        | JobKind::ResumeSandbox
-        | JobKind::RunResidentProcess => {}
+        JobKind::RunResidentProcess => {
+            let process_id = job
+                .payload
+                .get("residentProcessId")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| ApiError::internal("resident process job is missing its id"))?;
+            let generation = job
+                .payload
+                .get("generation")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| ApiError::internal("resident process job is missing generation"))?;
+            let sql = format!(
+                "update resident_processes
+                 set observed_state = 'failed', active_lease_id = null, pid = null,
+                     exit_code = null, last_error = {}, updated_at = {}
+                 where id = {} and generation = {}
+                   and observed_state != 'stopped'",
+                db.placeholder(1),
+                db.placeholder(2),
+                db.placeholder(3),
+                db.placeholder(4)
+            );
+            sqlx::query(&sql)
+                .bind(error)
+                .bind(Utc::now().to_rfc3339())
+                .bind(process_id)
+                .bind(i64::try_from(generation).map_err(|_| {
+                    ApiError::internal("resident process generation exceeds database range")
+                })?)
+                .execute(&mut *connection)
+                .await?;
+        }
+        JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {}
         JobKind::MaterializeFile => {
             delete_sandbox_file_if_present_on_connection(
                 db,
@@ -2358,4 +2597,67 @@ pub(crate) async fn apply_failed_job_on_connection(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::guest_supports_uid_isolated_resident_process;
+    use sandboxwich_core::{
+        GUEST_AGENT_CAPABILITY_PROTOCOL_VERSION, UID_ISOLATED_RESIDENT_PROCESS_CAPABILITY_VERSION,
+    };
+
+    fn checks(protocol_version: u32, status: &str, capability_version: u32) -> serde_json::Value {
+        serde_json::json!({
+            "agentCapabilities": {
+                "protocolVersion": protocol_version,
+                "capabilities": {
+                    "uidIsolatedResidentProcess": {
+                        "status": status,
+                        "version": capability_version
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn guest_resident_process_dispatch_accepts_only_the_exact_available_contract() {
+        assert!(guest_supports_uid_isolated_resident_process(&checks(
+            GUEST_AGENT_CAPABILITY_PROTOCOL_VERSION,
+            "ok",
+            UID_ISOLATED_RESIDENT_PROCESS_CAPABILITY_VERSION,
+        )));
+
+        for denied in [
+            serde_json::json!({}),
+            serde_json::json!({"agentCapabilities": "malformed"}),
+            checks(
+                GUEST_AGENT_CAPABILITY_PROTOCOL_VERSION,
+                "unavailable",
+                UID_ISOLATED_RESIDENT_PROCESS_CAPABILITY_VERSION,
+            ),
+            checks(
+                GUEST_AGENT_CAPABILITY_PROTOCOL_VERSION - 1,
+                "ok",
+                UID_ISOLATED_RESIDENT_PROCESS_CAPABILITY_VERSION,
+            ),
+            checks(
+                GUEST_AGENT_CAPABILITY_PROTOCOL_VERSION + 1,
+                "ok",
+                UID_ISOLATED_RESIDENT_PROCESS_CAPABILITY_VERSION,
+            ),
+            checks(
+                GUEST_AGENT_CAPABILITY_PROTOCOL_VERSION,
+                "ok",
+                UID_ISOLATED_RESIDENT_PROCESS_CAPABILITY_VERSION - 1,
+            ),
+            checks(
+                GUEST_AGENT_CAPABILITY_PROTOCOL_VERSION,
+                "ok",
+                UID_ISOLATED_RESIDENT_PROCESS_CAPABILITY_VERSION + 1,
+            ),
+        ] {
+            assert!(!guest_supports_uid_isolated_resident_process(&denied));
+        }
+    }
 }

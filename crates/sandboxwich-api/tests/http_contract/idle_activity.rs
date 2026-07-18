@@ -361,6 +361,24 @@ async fn resident_process_observation_resets_the_idle_clock() {
             .build()
             .unwrap()
     };
+    guest_client
+        .post(format!(
+            "{}/sandboxes/{}/guest-health",
+            server.base_url, kept_alive_by_resident.sandbox.id
+        ))
+        .json(&UpdateGuestHealthRequest {
+            status: GuestStatus::Ready,
+            agent_version: Some("sandboxwich-agent/test".into()),
+            checks: Some(serde_json::json!({
+                (GUEST_AGENT_CAPABILITY_REPORT_CHECK): GuestAgentCapabilityReport::current()
+            })),
+            message: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
 
     let resident: ResidentProcessResponse = client
         .put(format!(

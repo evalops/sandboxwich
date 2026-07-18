@@ -44,17 +44,20 @@ pub(crate) async fn runtime_resource_inventory(
     };
     let limit = resolve_page_limit(page.limit)?;
     let cursor = resolve_page_cursor(&page)?;
+    // Reconciliation is a cluster/namespace authority boundary, not a tenant
+    // boundary: this worker can already list and delete every resource in the
+    // shared Kubernetes namespace. Its expected inventory must therefore span
+    // every tenant using that provider+cluster, or one tenant's worker would
+    // misclassify another tenant's live resources as orphans.
     let scope_sql = format!(
         "select id, labels from workers
-         where tenant_id = {} and provider = {}
+         where provider = {}
          order by id asc limit 201",
         state.db.placeholder(1),
-        state.db.placeholder(2),
     );
     let worker_cluster = worker.labels.get("cluster");
     let mut scope_worker_ids = Vec::new();
     let scope_rows = sqlx::query(&scope_sql)
-        .bind(&ctx.tenant_id)
         .bind(&worker.provider)
         .fetch_all(&state.db.pool)
         .await?;
@@ -74,15 +77,11 @@ pub(crate) async fn runtime_resource_inventory(
         .map(|index| state.db.placeholder(index))
         .collect::<Vec<_>>()
         .join(", ");
-    let sandbox_sql = format!(
-        "select id as sandbox_id
+    let sandbox_sql = "select id as sandbox_id
          from sandboxes
-         where tenant_id = {} and state != 'archived'
-         order by id asc limit 201",
-        state.db.placeholder(1),
-    );
-    let mut sandbox_ids = sqlx::query(&sandbox_sql)
-        .bind(&ctx.tenant_id)
+         where state != 'archived'
+         order by id asc limit 201";
+    let mut sandbox_ids = sqlx::query(sandbox_sql)
         .fetch_all(&state.db.pool)
         .await?
         .into_iter()
@@ -108,6 +107,28 @@ pub(crate) async fn runtime_resource_inventory(
          ) inventory where 1 = 1",
         state.db.placeholder(scope_worker_ids.len() + 1),
     );
+    let resident_lease_sql = format!(
+        "select jl.id from job_leases jl join jobs j on j.id = jl.job_id
+         where jl.worker_id in ({scope_placeholders})
+           and jl.status = 'active'
+           and j.kind = 'run_resident_process'
+         order by jl.id asc limit 201"
+    );
+    let mut resident_lease_query = sqlx::query(&resident_lease_sql);
+    for worker_id in &scope_worker_ids {
+        resident_lease_query = resident_lease_query.bind(worker_id);
+    }
+    let mut active_resident_lease_ids = resident_lease_query
+        .fetch_all(&state.db.pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            let value: String = row.try_get("id")?;
+            Uuid::parse_str(&value).map_err(|_| ApiError::internal("invalid resident lease"))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    let complete = complete && active_resident_lease_ids.len() <= 200;
+    active_resident_lease_ids.truncate(200);
     let mut fixed_binds = scope_worker_ids;
     fixed_binds.push(query.namespace.clone());
     let (resources, next_cursor) =
@@ -148,6 +169,7 @@ pub(crate) async fn runtime_resource_inventory(
         sandbox_ids,
         complete,
         resources,
+        active_resident_lease_ids,
         next_cursor,
     }))
 }
@@ -662,22 +684,6 @@ pub(crate) async fn fetch_guest_health(
         .fetch_optional(&db.pool)
         .await?;
     row.map(row_to_guest_health).transpose()
-}
-
-pub(crate) fn guest_supports_uid_isolated_resident_process(health: &GuestHealth) -> bool {
-    health.status == GuestStatus::Ready
-        && health
-            .checks
-            .get("uidIsolatedResidentProcess")
-            .and_then(|check| check.get("status"))
-            .and_then(serde_json::Value::as_str)
-            == Some("ok")
-        && health
-            .checks
-            .get("uidIsolatedResidentProcess")
-            .and_then(|check| check.get("version"))
-            .and_then(serde_json::Value::as_u64)
-            .is_some_and(|version| version >= 1)
 }
 
 pub(crate) async fn upsert_guest_health(

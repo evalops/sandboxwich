@@ -52,10 +52,73 @@ class DeploymentImagesTest(unittest.TestCase):
         self.assertEqual(tagged, [])
 
     def test_migration_and_api_use_the_same_api_digest(self) -> None:
-        text = (ROOT / "deploy/kubernetes/api.yaml").read_text()
-        api_digests = [digest for image, digest in IMAGE_RE.findall(text) if image.endswith("-api")]
-        self.assertEqual(len(api_digests), 2)
-        self.assertEqual(len(set(api_digests)), 1)
+        api_text = (ROOT / "deploy/kubernetes/api.yaml").read_text()
+        migration_text = (ROOT / "deploy/kubernetes/api-migrate.yaml").read_text()
+        api_digests = [
+            digest for image, digest in IMAGE_RE.findall(api_text) if image.endswith("-api")
+        ]
+        migration_digests = [
+            digest
+            for image, digest in IMAGE_RE.findall(migration_text)
+            if image.endswith("-api")
+        ]
+        self.assertEqual(len(api_digests), 2)  # init container and API container
+        self.assertEqual(len(migration_digests), 1)
+        self.assertEqual(set(api_digests), set(migration_digests))
+
+    def test_migration_job_is_versioned_and_gates_api_rollout(self) -> None:
+        migration_text = (ROOT / "deploy/kubernetes/api-migrate.yaml").read_text()
+        api_text = (ROOT / "deploy/kubernetes/api.yaml").read_text()
+        rollout_script = (ROOT / "deploy/kubernetes/apply-api.sh").read_text()
+
+        job_name = re.search(r"name: sandboxwich-api-migrate-([0-9a-f]{12})$", migration_text, re.MULTILINE)
+        digest = re.search(r"sandboxwich-api@sha256:([0-9a-f]{64})", migration_text)
+        self.assertIsNotNone(job_name)
+        self.assertIsNotNone(digest)
+        assert job_name is not None and digest is not None
+        self.assertEqual(job_name.group(1), digest.group(1)[:12])
+        self.assertNotIn("kind: Job", api_text)
+        self.assertIn("name: check-schema", api_text)
+        self.assertIn("- check-schema", api_text)
+        self.assertIn('value: "false"', api_text)
+
+        migration_apply = rollout_script.index('apply -f "${ROOT_DIR}/api-migrate.yaml"')
+        migration_wait = rollout_script.index("wait --for=condition=complete")
+        deployment_apply = rollout_script.index('apply -f "${ROOT_DIR}/api.yaml"')
+        self.assertLess(migration_apply, migration_wait)
+        self.assertLess(migration_wait, deployment_apply)
+        scale_down = rollout_script.index("scale deployment/sandboxwich-api --replicas=0")
+        api_rollout = rollout_script.index(
+            "rollout status deployment/sandboxwich-api", deployment_apply
+        )
+        worker_apply = rollout_script.index('apply -f "${ROOT_DIR}/worker.yaml"')
+        self.assertLess(scale_down, migration_apply)
+        self.assertLess(deployment_apply, api_rollout)
+        self.assertLess(api_rollout, worker_apply)
+
+    def test_process_local_bootstrap_and_guest_ingress_are_deployable(self) -> None:
+        api_text = (ROOT / "deploy/kubernetes/api.yaml").read_text()
+        self.assertRegex(api_text, r"(?m)^  replicas: 1$")
+        self.assertIn("type: Recreate", api_text)
+        self.assertIn("kubernetes.io/metadata.name: sandboxwich-sandboxes", api_text)
+        self.assertIn("port: 3217", api_text)
+
+    def test_worker_enables_fenced_orphan_cleanup(self) -> None:
+        worker_text = (ROOT / "deploy/kubernetes/worker.yaml").read_text()
+        self.assertEqual(worker_text.count("- --orphan-reconciliation-apply"), 1)
+        self.assertEqual(
+            worker_text.count("name: SANDBOXWICH_ORPHAN_RECONCILIATION_APPLY"), 1
+        )
+        self.assertIn('value: "1"', worker_text)
+        self.assertIn(
+            "value: http://sandboxwich-api.sandboxwich.svc:3217", worker_text
+        )
+
+        conformance = (ROOT / "deploy/kubernetes/kind-conformance.sh").read_text()
+        self.assertNotIn("kubectl -n sandboxwich set env", conformance)
+        self.assertNotIn(
+            '"value":"--orphan-reconciliation-apply"', conformance
+        )
 
     def test_kind_conformance_rewrites_pinned_images_to_local_builds(self) -> None:
         script = (ROOT / "deploy/kubernetes/kind-conformance.sh").read_text()
