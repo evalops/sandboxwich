@@ -1,6 +1,6 @@
 [package]
 name = "sandboxwich-worker"
-version = "0.1.1"
+version.workspace = true
 description = "Provider worker for the sandboxwich control plane"
 edition.workspace = true
 license.workspace = true

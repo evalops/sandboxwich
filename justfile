@@ -13,14 +13,15 @@ gate:
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
 
-# Bump the workspace version, update CHANGELOG.md, commit, and push a tag.
-# Run `just release patch`, `just release minor`, `just release 0.2.0`, etc.
-release bump="patch":
-    cargo release {{ bump }} --execute --no-publish --no-verify --no-confirm
-
-# Dry-run a version bump to see what cargo-release would change.
-release-dry-run bump="patch":
-    cargo release {{ bump }} --no-publish --no-verify --no-confirm
+# Preview the next release: the version bump and changelog entries
+# release-plz would put in the release PR. The edits are shown as a diff and
+# then reverted, so run this on a clean tree. See RELEASING.md.
+release-preview:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    release-plz update
+    git --no-pager diff
+    git checkout -- .
 
 # Run the API and a dry-run worker together, using the same flags as the
 # README quick start's first two shells and a local-only dev token. Ctrl-C

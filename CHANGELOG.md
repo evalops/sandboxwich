@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.1.2 - 2026-07-19
+
+- Release automation moved from the cargo-release bump/tag workflow pair to
+  release-plz: a standing release PR now carries the version bump and
+  generated changelog, and merging it pushes the release tag. All crates
+  inherit the workspace version, workflow files are linted in CI, and the
+  release build gained a manual dispatch fallback.
+
 ## 0.1.1 - 2026-07-19
 - APEX trusted-supervisor sandboxes now require the typed
   sandboxed_container execution class end to end. Worker registration,

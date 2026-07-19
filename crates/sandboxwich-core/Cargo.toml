@@ -1,6 +1,6 @@
 [package]
 name = "sandboxwich-core"
-version = "0.1.1"
+version.workspace = true
 description = "Typed contracts for the sandboxwich control plane"
 edition.workspace = true
 license.workspace = true

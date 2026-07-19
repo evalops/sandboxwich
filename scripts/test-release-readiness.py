@@ -2,7 +2,10 @@
 import pathlib
 import re
 import subprocess
+import tomllib
 import unittest
+
+import yaml
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -29,26 +32,62 @@ class ReleaseReadinessTest(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
         self.assertIn("sandboxwich-openapi.json", workflow)
         self.assertIn("sandboxwich-image-digests.txt", workflow)
+        # Manual escape hatch for when a tag exists but the tag-push trigger
+        # never fired (e.g., tag pushed with GITHUB_TOKEN).
+        self.assertIn("workflow_dispatch", workflow)
 
-    def test_bump_version_workflow_exists_and_is_gated(self) -> None:
-        workflow = (ROOT / ".github/workflows/bump-version.yml").read_text()
-        self.assertIn("workflow_dispatch:", workflow)
-        self.assertIn("cargo-release", workflow)
-        self.assertIn("cargo release", workflow)
-        self.assertIn("--no-publish", workflow)
-        self.assertIn("--no-verify", workflow)
-        self.assertIn("--no-push", workflow)
-        self.assertIn("--no-tag", workflow)
-        self.assertIn("gh pr create", workflow)
+    def test_all_workflow_files_parse_as_yaml(self) -> None:
+        # A workflow file that does not parse only fails when it next runs,
+        # which is how an invalid release workflow once shipped to main.
+        workflows = sorted((ROOT / ".github/workflows").glob("*.yml"))
+        self.assertTrue(workflows)
+        for path in workflows:
+            with path.open() as fh:
+                yaml.safe_load(fh)
 
-    def test_tag_release_workflow_follows_release_pr(self) -> None:
-        workflow = (ROOT / ".github/workflows/tag-release.yml").read_text()
-        self.assertIn("push:", workflow)
-        self.assertIn("branches:", workflow)
-        self.assertIn("- main", workflow)
-        self.assertIn("chore(release): prepare for ", workflow)
-        self.assertIn("git tag", workflow)
-        self.assertIn("git push origin", workflow)
+    def test_cargo_release_machinery_removed(self) -> None:
+        # Releases are driven by release-plz now; the cargo-release workflow,
+        # tag-after-merge workflow, and changelog hook must not come back.
+        self.assertFalse((ROOT / ".github/workflows/bump-version.yml").exists())
+        self.assertFalse((ROOT / ".github/workflows/tag-release.yml").exists())
+        self.assertFalse((ROOT / "scripts/bump-changelog.sh").exists())
+        self.assertNotIn("workspace.metadata.release]", (ROOT / "Cargo.toml").read_text())
+
+    def test_release_plz_workflow_and_config(self) -> None:
+        workflow = (ROOT / ".github/workflows/release-plz.yml").read_text()
+        self.assertIn("release-plz/action@", workflow)
+        self.assertIn("command: release", workflow)
+        self.assertIn("command: release-pr", workflow)
+        # The release PR and the tag push must trigger downstream workflows;
+        # GITHUB_TOKEN-created events do not, so a PAT takes precedence.
+        self.assertIn("secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN", workflow)
+
+        with (ROOT / "release-plz.toml").open("rb") as fh:
+            config = tomllib.load(fh)
+        workspace = config["workspace"]
+        # Unpublished crates: git tags are the release source of truth.
+        self.assertTrue(workspace["git_only"])
+        self.assertFalse(workspace["publish"])
+        # release.yml owns the GitHub release; release-plz only tags.
+        self.assertFalse(workspace["git_release_enable"])
+        self.assertEqual(workspace["git_tag_name"], "v{{ version }}")
+        owners = [
+            package["name"]
+            for package in config.get("package", [])
+            if package.get("changelog_path") == "CHANGELOG.md"
+        ]
+        self.assertEqual(owners, ["sandboxwich-core"])
+
+    def test_workspace_crates_share_one_version(self) -> None:
+        # Lockstep versioning is what makes the single vX.Y.Z tag and the
+        # release.yml artifact naming coherent; every crate must inherit.
+        root = tomllib.loads((ROOT / "Cargo.toml").read_text())
+        self.assertIn("version", root["workspace"]["package"])
+        for manifest in sorted((ROOT / "crates").glob("*/Cargo.toml")):
+            crate = tomllib.loads(manifest.read_text())
+            self.assertEqual(
+                crate["package"]["version"], {"workspace": True}, str(manifest)
+            )
 
     def test_release_inventory_contains_every_pinned_service_image(self) -> None:
         manifests = "\n".join(

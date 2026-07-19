@@ -1,6 +1,6 @@
 [package]
 name = "sandboxwich-cli"
-version = "0.1.1"
+version.workspace = true
 description = "Command-line client for the sandboxwich disposable sandbox control plane"
 edition.workspace = true
 license.workspace = true

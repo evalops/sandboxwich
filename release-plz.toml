@@ -1,0 +1,85 @@
+# Release automation for this workspace. See RELEASING.md for the full flow.
+#
+# Nothing here is published to crates.io: git_only mode makes git tags the
+# source of truth for what has been released (the registry is never queried),
+# and cargo publish is always skipped.
+[workspace]
+repo_url = "https://github.com/evalops/sandboxwich"
+git_only = true
+publish = false
+# release.yml builds the CLI binaries, OpenAPI contract, and image digest
+# inventory and creates the GitHub release when the tag lands, so release-plz
+# must not create a GitHub release of its own.
+git_release_enable = false
+# All crates share one version via `version.workspace = true`, so every
+# package renders this same tag. release-plz skips tag creation when the tag
+# already exists, which collapses the six packages to a single vX.Y.Z tag
+# per release.
+git_tag_name = "v{{ version }}"
+# Semver checks compare against the crates.io baseline, which does not exist
+# for these unpublished crates.
+semver_check = false
+# Keep the version requirement of the sandboxwich-core path dependency in
+# sync with the workspace version on every bump.
+dependencies_update = true
+
+# Keep the single root CHANGELOG.md instead of per-crate changelogs.
+# sandboxwich-core owns it and absorbs commits touching every other crate so
+# workspace-wide changes all land in one place.
+[[package]]
+name = "sandboxwich-core"
+changelog_path = "CHANGELOG.md"
+changelog_include = [
+    "sandboxwich-agent",
+    "sandboxwich-api",
+    "sandboxwich-bench",
+    "sandboxwich-cli",
+    "sandboxwich-worker",
+]
+
+[[package]]
+name = "sandboxwich-agent"
+changelog_update = false
+
+[[package]]
+name = "sandboxwich-api"
+changelog_update = false
+
+[[package]]
+name = "sandboxwich-bench"
+changelog_update = false
+
+[[package]]
+name = "sandboxwich-cli"
+changelog_update = false
+
+[[package]]
+name = "sandboxwich-worker"
+changelog_update = false
+
+# Match the existing changelog's heading style (`## X.Y.Z - YYYY-MM-DD`
+# under `## Unreleased`). The trailing blank line in the header keeps one
+# empty line between `## Unreleased` and the newest release section.
+[changelog]
+header = """
+# Changelog
+
+## Unreleased
+
+"""
+body = """
+{% if version %}\
+    ## {{ version | trim_start_matches(pat="v") }} - {{ timestamp | date(format="%Y-%m-%d") }}\
+{% else %}\
+    ## Unreleased\
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+    ### {{ group | striptags | trim | upper_first }}
+    {% for commit in commits %}
+        - {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
+            {% if commit.breaking %}[**breaking**] {% endif %}\
+            {{ commit.message | upper_first }}\
+    {% endfor %}
+{% endfor %}
+"""
+trim = true
