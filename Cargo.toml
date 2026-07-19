@@ -30,6 +30,26 @@ authors = ["EvalOps contributors"]
 warnings = "deny"
 unsafe_code = "forbid"
 
+[workspace.metadata.release]
+# Keep every crate in the workspace on the same version.
+shared-version = true
+# Only cut releases from the default branch.
+allow-branch = ["main"]
+# Tag format used by the existing release workflow.
+tag-name = "v{{version}}"
+tag-message = "release {{version}}"
+# The existing release workflow builds and publishes artifacts; don't also
+# publish to crates.io from cargo-release.
+publish = false
+# CI already validates the workspace build; skip the cargo publish dry-run.
+verify = false
+# Commit the version bumps and changelog update before tagging.
+pre-release-commit-message = "chore(release): prepare for {{version}}"
+# shared-version above keeps all crates on one version; cargo-release produces
+# a single workspace commit and tag by default for shared-version workspaces.
+# Update the root CHANGELOG from each crate's hook; the script is idempotent.
+pre-release-hook = ["../../scripts/bump-changelog.sh", "{{version}}"]
+
 [workspace.dependencies]
 anyhow = "1.0"
 async-stream = "0.3"
