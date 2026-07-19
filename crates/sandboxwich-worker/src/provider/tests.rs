@@ -3135,6 +3135,68 @@ fn provision_staged_applies_resources_in_durable_order_and_reports_uids() {
 }
 
 #[test]
+fn managed_home_is_adopted_by_replacement_runtime_and_survives_runtime_stop() {
+    let (kubectl, log_path) = write_stateful_fake_kubectl();
+    let provider = apply_provider_with_fake_kubectl(&kubectl);
+    let home_id = HomeId::new();
+    let first_sandbox_id = SandboxId::new();
+    let replacement_sandbox_id = SandboxId::new();
+    let spec = SandboxProvisionSpec::default();
+    let cancelled = CancelSignal::never_cancelled();
+    let mut report = |_| Ok(());
+
+    provider
+        .provision_home_staged(first_sandbox_id, home_id, &spec, &cancelled, &mut report)
+        .expect("first runtime provisions its managed home");
+    provider
+        .stop(
+            first_sandbox_id,
+            &SandboxTeardownSpec::default(),
+            &cancelled,
+        )
+        .expect("runtime stop succeeds without deleting the home");
+    provider
+        .provision_home_staged(
+            replacement_sandbox_id,
+            home_id,
+            &spec,
+            &cancelled,
+            &mut report,
+        )
+        .expect("replacement runtime adopts the existing managed home");
+
+    let log = std::fs::read_to_string(&log_path).expect("read managed-home kubectl log");
+    assert_eq!(
+        log.matches(" apply ").count(),
+        9,
+        "the replacement must adopt the home PVC and apply only its four runtime resources: {log}"
+    );
+    assert!(
+        log.contains(&format!(
+            "delete pod,persistentvolumeclaim,service,networkpolicy,secret -l sandboxwich.dev/sandbox-id={first_sandbox_id}"
+        )),
+        "runtime cleanup must remain scoped to the sandbox identity: {log}"
+    );
+    assert!(
+        !log.contains(&format!(
+            "delete persistentvolumeclaim sandboxwich-home-{home_id}"
+        )),
+        "ordinary runtime cleanup must never delete the managed home: {log}"
+    );
+
+    let home_marker = kubectl
+        .parent()
+        .expect("fake kubectl parent")
+        .join(format!("persistentvolumeclaim-sandboxwich-home-{home_id}"));
+    let home_manifest =
+        std::fs::read_to_string(home_marker).expect("managed home PVC remains present");
+    assert!(home_manifest.contains(&format!(r#""sandboxwich.dev/home-id": "{home_id}""#)));
+    assert!(!home_manifest.contains("sandboxwich.dev/sandbox-id"));
+
+    let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+#[test]
 fn provision_staged_applies_the_guest_token_secret_before_the_pod() {
     // Regression: the staged provisioning path used to report
     // CredentialsReady without applying the guest-token Secret at all, so

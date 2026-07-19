@@ -2879,8 +2879,12 @@ impl KubernetesApplyProvider {
                 },
                 |home_id| self.dry_run.home_pvc_manifest(home_id, &spec.memory_limit),
             );
-            let workspace_identity =
-                self.apply_or_adopt_manifest(&workspace, sandbox_id, cancelled)?;
+            let workspace_identity = match home_id {
+                Some(home_id) => {
+                    self.apply_or_adopt_home_manifest(&workspace, home_id, cancelled)?
+                }
+                None => self.apply_or_adopt_manifest(&workspace, sandbox_id, cancelled)?,
+            };
             report(stage_update(
                 ProvisioningStage::WorkspaceReady,
                 Some(workspace_identity),
@@ -3243,14 +3247,51 @@ impl KubernetesApplyProvider {
         sandbox_id: SandboxId,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<KubernetesResourceIdentity> {
+        self.apply_or_adopt_manifest_with_identity(
+            manifest,
+            "sandboxwich.dev/sandbox-id",
+            &sandbox_id.to_string(),
+            "sandbox",
+            cancelled,
+        )
+    }
+
+    fn apply_or_adopt_home_manifest(
+        &self,
+        manifest: &Value,
+        home_id: HomeId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<KubernetesResourceIdentity> {
+        self.apply_or_adopt_manifest_with_identity(
+            manifest,
+            "sandboxwich.dev/home-id",
+            &home_id.to_string(),
+            "home",
+            cancelled,
+        )
+    }
+
+    fn apply_or_adopt_manifest_with_identity(
+        &self,
+        manifest: &Value,
+        identity_label: &str,
+        identity_value: &str,
+        identity_name: &str,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<KubernetesResourceIdentity> {
         let kind = manifest["kind"]
             .as_str()
             .context("Kubernetes manifest kind is required")?;
         let resource_kind = runtime_resource_kind_for_kubernetes_kind(kind)?;
 
-        if let Some(identity) =
-            self.read_resource_identity(manifest, sandbox_id, resource_kind.clone(), cancelled)?
-        {
+        if let Some(identity) = self.read_resource_identity(
+            manifest,
+            identity_label,
+            identity_value,
+            identity_name,
+            resource_kind.clone(),
+            cancelled,
+        )? {
             return Ok(identity);
         }
 
@@ -3269,20 +3310,29 @@ impl KubernetesApplyProvider {
                 &apply.stderr,
             )));
         }
-        self.read_resource_identity(manifest, sandbox_id, resource_kind, cancelled)?
-            .ok_or_else(|| {
-                anyhow::Error::new(ProviderError::classified(
-                    ProvisioningErrorClass::RetryableProvider,
-                    "resource_observation_missing",
-                    anyhow::anyhow!("staged Kubernetes resource was not observable after apply"),
-                ))
-            })
+        self.read_resource_identity(
+            manifest,
+            identity_label,
+            identity_value,
+            identity_name,
+            resource_kind,
+            cancelled,
+        )?
+        .ok_or_else(|| {
+            anyhow::Error::new(ProviderError::classified(
+                ProvisioningErrorClass::RetryableProvider,
+                "resource_observation_missing",
+                anyhow::anyhow!("staged Kubernetes resource was not observable after apply"),
+            ))
+        })
     }
 
     fn read_resource_identity(
         &self,
         desired: &Value,
-        sandbox_id: SandboxId,
+        identity_label: &str,
+        identity_value: &str,
+        identity_name: &str,
         resource_kind: RuntimeResourceKind,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<Option<KubernetesResourceIdentity>> {
@@ -3328,13 +3378,13 @@ impl KubernetesApplyProvider {
                 anyhow::Error::new(error).context("kubectl returned invalid resource JSON"),
             ))
         })?;
-        if observed["metadata"]["labels"]["sandboxwich.dev/sandbox-id"]
-            != json!(sandbox_id.to_string())
-        {
+        if observed["metadata"]["labels"][identity_label] != json!(identity_value) {
             return Err(anyhow::Error::new(ProviderError::classified(
                 ProvisioningErrorClass::TerminalContract,
                 "resource_identity_conflict",
-                anyhow::anyhow!("existing Kubernetes resource has a conflicting sandbox identity"),
+                anyhow::anyhow!(
+                    "existing Kubernetes resource has a conflicting {identity_name} identity"
+                ),
             )));
         }
         validate_adoption_contract(desired, &observed)?;
