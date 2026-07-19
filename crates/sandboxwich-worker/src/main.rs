@@ -630,6 +630,24 @@ impl SandboxProvider for RuntimeProvider {
         }
     }
 
+    fn provision_home_staged(
+        &self,
+        sandbox_id: sandboxwich_core::SandboxId,
+        home_id: HomeId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+        report: &mut dyn FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
+    ) -> anyhow::Result<sandboxwich_core::ProviderSandboxHandle> {
+        match self {
+            Self::DryRun(provider) => {
+                provider.provision_home_staged(sandbox_id, home_id, spec, cancelled, report)
+            }
+            Self::Apply(provider) => {
+                provider.provision_home_staged(sandbox_id, home_id, spec, cancelled, report)
+            }
+        }
+    }
+
     fn exec_handoff(
         &self,
         sandbox_id: sandboxwich_core::SandboxId,
@@ -744,6 +762,13 @@ impl SandboxProvider for RuntimeProvider {
         match self {
             Self::DryRun(provider) => provider.stop(sandbox_id, spec, cancelled),
             Self::Apply(provider) => provider.stop(sandbox_id, spec, cancelled),
+        }
+    }
+
+    fn delete_home(&self, home_id: HomeId, cancelled: &CancelSignal) -> anyhow::Result<()> {
+        match self {
+            Self::DryRun(provider) => provider.delete_home(home_id, cancelled),
+            Self::Apply(provider) => provider.delete_home(home_id, cancelled),
         }
     }
 }
