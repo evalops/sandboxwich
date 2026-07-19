@@ -17,6 +17,33 @@ fn provider() -> KubernetesDryRunProvider {
     )
 }
 
+#[test]
+fn runtime_provider_forwards_managed_home_lifecycle() {
+    let provider = RuntimeProvider::DryRun(provider());
+    let sandbox_id = SandboxId::new();
+    let home_id = HomeId::new();
+    let mut stages = Vec::new();
+
+    let handle = provider
+        .provision_home_staged(
+            sandbox_id,
+            home_id,
+            &SandboxProvisionSpec::default(),
+            &CancelSignal::never_cancelled(),
+            &mut |update| {
+                stages.push(update.stage);
+                Ok(())
+            },
+        )
+        .expect("runtime provider delegates managed-home provisioning");
+
+    assert_eq!(handle.sandbox_id, sandbox_id);
+    assert!(!stages.is_empty());
+    provider
+        .delete_home(home_id, &CancelSignal::never_cancelled())
+        .expect("runtime provider delegates managed-home deletion");
+}
+
 struct AttestingMaterializationProvider {
     inner: KubernetesDryRunProvider,
 }
