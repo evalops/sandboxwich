@@ -37,12 +37,18 @@ class ReleaseReadinessTest(unittest.TestCase):
         self.assertIn("cargo release", workflow)
         self.assertIn("--no-publish", workflow)
         self.assertIn("--no-verify", workflow)
+        self.assertIn("--no-push", workflow)
+        self.assertIn("--no-tag", workflow)
+        self.assertIn("gh pr create", workflow)
 
-    def test_cargo_release_configured_for_workspace(self) -> None:
-        cargo_toml = (ROOT / "Cargo.toml").read_text()
-        self.assertIn("[workspace.metadata.release]", cargo_toml)
-        self.assertIn("shared-version = true", cargo_toml)
-        self.assertIn('tag-name = "v{{version}}"', cargo_toml)
+    def test_tag_release_workflow_follows_release_pr(self) -> None:
+        workflow = (ROOT / ".github/workflows/tag-release.yml").read_text()
+        self.assertIn("push:", workflow)
+        self.assertIn("branches:", workflow)
+        self.assertIn("- main", workflow)
+        self.assertIn("chore(release): prepare for ", workflow)
+        self.assertIn("git tag", workflow)
+        self.assertIn("git push origin", workflow)
 
     def test_release_inventory_contains_every_pinned_service_image(self) -> None:
         manifests = "\n".join(

@@ -1,0 +1,36 @@
+name: tag-release
+
+"on":
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    name: Push release tag
+    runs-on: ubuntu-latest
+    if: startsWith(github.event.head_commit.message, 'chore(release): prepare for ')
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version
+        id: version
+        run: |
+          version="$(grep -m1 '^version = ' crates/sandboxwich-core/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create and push tag
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          tag="v${version}"
+          git tag -a "${tag}" -m "release ${version}"
+          git push origin "${tag}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
