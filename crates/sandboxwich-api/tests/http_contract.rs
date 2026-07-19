@@ -18,6 +18,8 @@ mod common;
 mod desktop;
 #[path = "http_contract/divergence.rs"]
 mod divergence;
+#[path = "http_contract/homes.rs"]
+mod homes;
 #[path = "http_contract/idempotency.rs"]
 mod idempotency;
 #[path = "http_contract/idle_activity.rs"]

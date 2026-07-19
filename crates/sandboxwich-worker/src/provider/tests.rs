@@ -1110,6 +1110,51 @@ fn kubernetes_workspace_modes_render_distinct_bounded_storage_contracts() {
 }
 
 #[test]
+fn managed_home_pvc_is_stable_and_not_owned_by_runtime_teardown() {
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("cluster-a", "sandboxwich", None, None);
+    let home_id = HomeId::new();
+    let first_runtime = SandboxId::new();
+    let second_runtime = SandboxId::new();
+    let spec = SandboxProvisionSpec {
+        workspace_mode: WorkspaceMode::Persistent,
+        ..Default::default()
+    };
+
+    let first = provider
+        .provision_home_handle(
+            first_runtime,
+            home_id,
+            &spec,
+            RuntimeResourceStatus::Planned,
+        )
+        .unwrap();
+    let second = provider
+        .provision_home_handle(
+            second_runtime,
+            home_id,
+            &spec,
+            RuntimeResourceStatus::Planned,
+        )
+        .unwrap();
+    for handle in [first, second] {
+        let pvc = &handle.metadata["manifests"]["pvc"];
+        assert_eq!(
+            pvc["metadata"]["name"],
+            format!("sandboxwich-home-{home_id}")
+        );
+        assert_eq!(
+            pvc["metadata"]["labels"]["sandboxwich.dev/home-id"],
+            home_id.to_string()
+        );
+        assert!(pvc["metadata"]["labels"]["sandboxwich.dev/sandbox-id"].is_null());
+        assert!(handle.resources.iter().all(|resource| {
+            resource.resource_kind != RuntimeResourceKind::PersistentVolumeClaim
+        }));
+    }
+}
+
+#[test]
 fn configured_workspace_storage_overrides_non_default_tier_disk_size() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)

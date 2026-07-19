@@ -208,6 +208,7 @@ pub(crate) async fn enrich_job_payload_with_provision_spec(
             job.required_execution_class = child.execution_class.clone();
             add_provision_spec_to_payload(job, &child)?;
         }
+        JobKind::DeleteHome => {}
     }
     Ok(())
 }
@@ -296,6 +297,14 @@ pub(crate) async fn validate_job_payload_tenant(
             ensure_sandbox_tenant(db, child_sandbox_id_from_job(job)?, ctx).await?;
             let snapshot = fetch_snapshot(db, snapshot_id_from_job(job)?).await?;
             ensure_sandbox_tenant(db, snapshot.sandbox_id, ctx).await?;
+        }
+        JobKind::DeleteHome => {
+            crate::handlers::homes::fetch_home(
+                db,
+                crate::handlers::homes::home_id_from_job(job)?,
+                &ctx.tenant_id,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -496,6 +505,7 @@ pub(crate) fn job_references(job: &Job) -> Result<JobReferences, ApiError> {
             references.child_sandbox_id = Some(child_sandbox_id_from_job(job)?);
             references.snapshot_id = Some(snapshot_id_from_job(job)?);
         }
+        JobKind::DeleteHome => {}
     }
     Ok(references)
 }

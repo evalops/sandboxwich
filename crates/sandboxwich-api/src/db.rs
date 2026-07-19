@@ -183,11 +183,11 @@ pub(crate) async fn ensure_database_constraints(db: &Database) -> anyhow::Result
 }
 
 pub(crate) const DB_ENUM_SCHEMA_METADATA_KEY: &str = "db_enum_constraints_fingerprint";
-// v6 combines execution-class constraints with the
+// v7 adds the managed-home lifecycle constraint. v6 combined execution-class constraints with the
 // sandboxes.parent_snapshot_id -> snapshot_restore_sources(snapshot_id)
 // foreign key. Bumping the version forces existing installations to install
 // the new guards on upgrade.
-pub(crate) const DB_ENUM_SCHEMA_FINGERPRINT_VERSION: &str = "db-enum-v6";
+pub(crate) const DB_ENUM_SCHEMA_FINGERPRINT_VERSION: &str = "db-enum-v7";
 pub(crate) const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 pub(crate) const FNV_PRIME: u64 = 0x00000100000001b3;
 
@@ -286,6 +286,13 @@ pub(crate) struct DbEnumColumn {
 }
 
 pub(crate) const DB_ENUM_COLUMNS: &[DbEnumColumn] = &[
+    DbEnumColumn::new(
+        "homes",
+        "state",
+        "homes_state_check",
+        <HomeState as DbVariant>::VALUES,
+        "invalid home state",
+    ),
     DbEnumColumn::new(
         "sandboxes",
         "state",

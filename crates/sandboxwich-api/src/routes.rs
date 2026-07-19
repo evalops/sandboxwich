@@ -5,6 +5,7 @@ use crate::handlers::commands::*;
 use crate::handlers::desktop::*;
 use crate::handlers::divergence::*;
 use crate::handlers::files::*;
+use crate::handlers::homes::*;
 use crate::handlers::jobs::*;
 use crate::handlers::leases::*;
 use crate::handlers::operations::*;
@@ -40,6 +41,9 @@ pub(crate) fn app(state: AppState) -> Router {
 
     let tenant_routes = Router::new()
         .route("/metrics", get(metrics))
+        .route("/homes", post(create_home))
+        .route("/homes/{home_id}", get(get_home).delete(delete_home))
+        .route("/homes/{home_id}/sandboxes", post(create_home_sandbox))
         .route("/sandboxes", get(list_sandboxes).post(create_sandbox))
         .route("/sandboxes/{sandbox_id}", get(get_sandbox))
         .route(
