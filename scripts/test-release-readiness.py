@@ -30,6 +30,20 @@ class ReleaseReadinessTest(unittest.TestCase):
         self.assertIn("sandboxwich-openapi.json", workflow)
         self.assertIn("sandboxwich-image-digests.txt", workflow)
 
+    def test_bump_version_workflow_exists_and_is_gated(self) -> None:
+        workflow = (ROOT / ".github/workflows/bump-version.yml").read_text()
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("cargo-release", workflow)
+        self.assertIn("cargo release", workflow)
+        self.assertIn("--no-publish", workflow)
+        self.assertIn("--no-verify", workflow)
+
+    def test_cargo_release_configured_for_workspace(self) -> None:
+        cargo_toml = (ROOT / "Cargo.toml").read_text()
+        self.assertIn("[workspace.metadata.release]", cargo_toml)
+        self.assertIn("shared-version = true", cargo_toml)
+        self.assertIn('tag-name = "v{{version}}"', cargo_toml)
+
     def test_release_inventory_contains_every_pinned_service_image(self) -> None:
         manifests = "\n".join(
             path.read_text() for path in (ROOT / "deploy/kubernetes").glob("*.yaml")
