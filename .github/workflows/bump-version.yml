@@ -18,9 +18,12 @@ jobs:
     name: Create release PR
     runs-on: ubuntu-latest
     steps:
+      # RELEASE_BOT_TOKEN is optional. If provided, the created release PR will
+      # trigger normal CI workflows; with only GITHUB_TOKEN, CI on the release
+      # PR must be triggered separately (e.g., by pushing an empty commit).
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
 
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
@@ -62,4 +65,4 @@ jobs:
           # can be merged manually.
           gh pr merge "${url}" --auto --merge || true
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
