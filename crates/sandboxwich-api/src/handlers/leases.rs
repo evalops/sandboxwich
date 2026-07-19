@@ -165,7 +165,7 @@ pub(crate) async fn claim_lease(
         .push(
             ")
            and (
-             kind in ('provision_sandbox', 'run_prompt', 'stop_sandbox')
+             kind in ('provision_sandbox', 'run_prompt', 'stop_sandbox', 'delete_home')
              or exists (
                select 1 from sandbox_placements p
                where p.sandbox_id = coalesce(jobs.sandbox_id, jobs.parent_sandbox_id)
