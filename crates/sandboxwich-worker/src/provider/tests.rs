@@ -1110,6 +1110,51 @@ fn kubernetes_workspace_modes_render_distinct_bounded_storage_contracts() {
 }
 
 #[test]
+fn managed_home_pvc_is_stable_and_not_owned_by_runtime_teardown() {
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("cluster-a", "sandboxwich", None, None);
+    let home_id = HomeId::new();
+    let first_runtime = SandboxId::new();
+    let second_runtime = SandboxId::new();
+    let spec = SandboxProvisionSpec {
+        workspace_mode: WorkspaceMode::Persistent,
+        ..Default::default()
+    };
+
+    let first = provider
+        .provision_home_handle(
+            first_runtime,
+            home_id,
+            &spec,
+            RuntimeResourceStatus::Planned,
+        )
+        .unwrap();
+    let second = provider
+        .provision_home_handle(
+            second_runtime,
+            home_id,
+            &spec,
+            RuntimeResourceStatus::Planned,
+        )
+        .unwrap();
+    for handle in [first, second] {
+        let pvc = &handle.metadata["manifests"]["pvc"];
+        assert_eq!(
+            pvc["metadata"]["name"],
+            format!("sandboxwich-home-{home_id}")
+        );
+        assert_eq!(
+            pvc["metadata"]["labels"]["sandboxwich.dev/home-id"],
+            home_id.to_string()
+        );
+        assert!(pvc["metadata"]["labels"]["sandboxwich.dev/sandbox-id"].is_null());
+        assert!(handle.resources.iter().all(|resource| {
+            resource.resource_kind != RuntimeResourceKind::PersistentVolumeClaim
+        }));
+    }
+}
+
+#[test]
 fn configured_workspace_storage_overrides_non_default_tier_disk_size() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
@@ -3085,6 +3130,68 @@ fn provision_staged_applies_resources_in_durable_order_and_reports_uids() {
         "replay must adopt the five existing resources: {replay_log}"
     );
     assert_eq!(replay_reports.len(), 8);
+
+    let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+#[test]
+fn managed_home_is_adopted_by_replacement_runtime_and_survives_runtime_stop() {
+    let (kubectl, log_path) = write_stateful_fake_kubectl();
+    let provider = apply_provider_with_fake_kubectl(&kubectl);
+    let home_id = HomeId::new();
+    let first_sandbox_id = SandboxId::new();
+    let replacement_sandbox_id = SandboxId::new();
+    let spec = SandboxProvisionSpec::default();
+    let cancelled = CancelSignal::never_cancelled();
+    let mut report = |_| Ok(());
+
+    provider
+        .provision_home_staged(first_sandbox_id, home_id, &spec, &cancelled, &mut report)
+        .expect("first runtime provisions its managed home");
+    provider
+        .stop(
+            first_sandbox_id,
+            &SandboxTeardownSpec::default(),
+            &cancelled,
+        )
+        .expect("runtime stop succeeds without deleting the home");
+    provider
+        .provision_home_staged(
+            replacement_sandbox_id,
+            home_id,
+            &spec,
+            &cancelled,
+            &mut report,
+        )
+        .expect("replacement runtime adopts the existing managed home");
+
+    let log = std::fs::read_to_string(&log_path).expect("read managed-home kubectl log");
+    assert_eq!(
+        log.matches(" apply ").count(),
+        9,
+        "the replacement must adopt the home PVC and apply only its four runtime resources: {log}"
+    );
+    assert!(
+        log.contains(&format!(
+            "delete pod,persistentvolumeclaim,service,networkpolicy,secret -l sandboxwich.dev/sandbox-id={first_sandbox_id}"
+        )),
+        "runtime cleanup must remain scoped to the sandbox identity: {log}"
+    );
+    assert!(
+        !log.contains(&format!(
+            "delete persistentvolumeclaim sandboxwich-home-{home_id}"
+        )),
+        "ordinary runtime cleanup must never delete the managed home: {log}"
+    );
+
+    let home_marker = kubectl
+        .parent()
+        .expect("fake kubectl parent")
+        .join(format!("persistentvolumeclaim-sandboxwich-home-{home_id}"));
+    let home_manifest =
+        std::fs::read_to_string(home_marker).expect("managed home PVC remains present");
+    assert!(home_manifest.contains(&format!(r#""sandboxwich.dev/home-id": "{home_id}""#)));
+    assert!(!home_manifest.contains("sandboxwich.dev/sandbox-id"));
 
     let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
 }

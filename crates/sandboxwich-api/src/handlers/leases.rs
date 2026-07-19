@@ -3,6 +3,7 @@ use crate::db::*;
 use crate::error::*;
 use crate::handlers::commands::*;
 use crate::handlers::files::*;
+use crate::handlers::homes::{home_id_from_job, mark_home_delete_failed_on_connection};
 use crate::handlers::jobs::*;
 use crate::handlers::resident_processes::executor_sidecar_is_ready_for_claim;
 use crate::handlers::sandboxes::*;
@@ -370,6 +371,9 @@ pub(crate) async fn authoritatively_refresh_job_placement(
     db: &Database,
     job: &mut Job,
 ) -> Result<bool, ApiError> {
+    if job.kind == JobKind::DeleteHome {
+        return Ok(true);
+    }
     let reference_error = validate_authoritative_placement_reference(job).err();
     let enrichment_error = match reference_error {
         Some(error) => Some(error),
@@ -433,6 +437,9 @@ fn validate_authoritative_placement_reference(job: &Job) -> Result<(), ApiError>
 }
 
 pub(crate) fn worker_supports_runtime_profile(worker: &Worker, job: &Job) -> bool {
+    if job.kind == JobKind::DeleteHome {
+        return true;
+    }
     let Some((spec, requested_image)) = authoritative_placement(job) else {
         return false;
     };
@@ -2266,11 +2273,42 @@ pub(crate) async fn apply_completed_job_on_connection(
                 json!({"state": SandboxState::Archived, "reason": "stop_completed"}),
             )
             .await?;
+            let release_sql = format!(
+                "delete from sandbox_home_mounts where sandbox_id = {}",
+                db.placeholder(1)
+            );
+            sqlx::query(&release_sql)
+                .bind(sandbox_id.to_string())
+                .execute(&mut *connection)
+                .await?;
         }
         (JobKind::ResumeSandbox, WorkerJobResult::ResumeSandbox { sandbox_id, .. }) => {
             if sandbox_id != sandbox_id_from_job(job)? {
                 return Err(ApiError::bad_request(
                     "resume completion result does not match job sandbox",
+                ));
+            }
+        }
+        (JobKind::DeleteHome, WorkerJobResult::DeleteHome { home_id, .. }) => {
+            if home_id != home_id_from_job(job)? {
+                return Err(ApiError::bad_request(
+                    "delete-home completion result does not match job home",
+                ));
+            }
+            let sql = format!(
+                "delete from homes where id = {} and tenant_id = {} and state = 'deleting'",
+                db.placeholder(1),
+                db.placeholder(2)
+            );
+            let deleted = sqlx::query(&sql)
+                .bind(home_id.to_string())
+                .bind(&job.tenant_id)
+                .execute(&mut *connection)
+                .await?;
+            if deleted.rows_affected() != 1 {
+                return Err(ApiError::conflict_code(
+                    "home_delete_conflict",
+                    "managed home changed before deletion completed",
                 ));
             }
         }
@@ -2362,7 +2400,8 @@ pub(crate) async fn apply_claimed_job_on_connection(
         | JobKind::ResumeSandbox
         | JobKind::RunResidentProcess
         | JobKind::MaterializeFile
-        | JobKind::ApexTaskInstructions => {}
+        | JobKind::ApexTaskInstructions
+        | JobKind::DeleteHome => {}
     }
     Ok(())
 }
@@ -2441,7 +2480,8 @@ pub(crate) async fn apply_retryable_job_on_connection(
         | JobKind::ResumeSandbox
         | JobKind::RunResidentProcess
         | JobKind::MaterializeFile
-        | JobKind::ApexTaskInstructions => {}
+        | JobKind::ApexTaskInstructions
+        | JobKind::DeleteHome => {}
     }
     Ok(())
 }
@@ -2573,6 +2613,10 @@ pub(crate) async fn apply_failed_job_on_connection(
                 .await?;
         }
         JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {}
+        JobKind::DeleteHome => {
+            mark_home_delete_failed_on_connection(db, connection, home_id_from_job(job)?, error)
+                .await?;
+        }
         JobKind::MaterializeFile => {
             delete_sandbox_file_if_present_on_connection(
                 db,

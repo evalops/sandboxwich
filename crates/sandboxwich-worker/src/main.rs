@@ -21,7 +21,7 @@ use provider::{
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, ApexTaskInstructionsCallbackRequest,
     ApexTaskInstructionsCallbackResponse, ClaimLeaseRequest, ClaimLeaseResponse,
-    CompleteLeaseRequest, ErrorEnvelope, FailLeaseRequest, GuestTokenResponse, JobKind,
+    CompleteLeaseRequest, ErrorEnvelope, FailLeaseRequest, GuestTokenResponse, HomeId, JobKind,
     LeaseResponse, MintGuestTokenRequest, ORB_SIDECAR_RESIDENT_PROCESS_NAME,
     PROVIDER_ISOLATED_RESIDENT_PROCESS_IMAGE_LABEL,
     PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL,
@@ -2999,12 +2999,29 @@ fn execute_job_with_reporter(
                 last_stage = update.stage.clone();
                 report(update)
             };
-            let handle = match provider.provision_staged(
-                sandbox_id,
-                &spec,
-                cancelled,
-                &mut tracking_reporter,
-            ) {
+            let home_id = job
+                .payload
+                .get("homeId")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| {
+                    uuid::Uuid::parse_str(value)
+                        .map(HomeId)
+                        .context("provision homeId is invalid")
+                })
+                .transpose()?;
+            let provisioned = match home_id {
+                Some(home_id) => provider.provision_home_staged(
+                    sandbox_id,
+                    home_id,
+                    &spec,
+                    cancelled,
+                    &mut tracking_reporter,
+                ),
+                None => {
+                    provider.provision_staged(sandbox_id, &spec, cancelled, &mut tracking_reporter)
+                }
+            };
+            let handle = match provisioned {
                 Ok(handle) => handle,
                 Err(error) => {
                     if let Some(provider_error) = error
@@ -3202,6 +3219,23 @@ fn execute_job_with_reporter(
                 ),
                 retry: false,
             })
+        }
+        JobKind::DeleteHome => {
+            let home_id = job
+                .payload
+                .get("homeId")
+                .and_then(serde_json::Value::as_str)
+                .context("delete-home job is missing homeId")
+                .and_then(|value| {
+                    Uuid::parse_str(value)
+                        .map(HomeId)
+                        .context("delete-home homeId is invalid")
+                })?;
+            provider.delete_home(home_id, cancelled)?;
+            Ok(WorkerJobOutcome::Complete(WorkerJobResult::DeleteHome {
+                provider: "kubernetes".to_string(),
+                home_id,
+            }))
         }
     }
 }

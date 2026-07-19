@@ -196,6 +196,30 @@ impl fmt::Display for SandboxId {
     }
 }
 
+/// Tenant-scoped durable workspace identity. A home outlives every sandbox
+/// that mounts it and is deleted only through the explicit home lifecycle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(transparent)]
+pub struct HomeId(pub Uuid);
+
+impl HomeId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for HomeId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for HomeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(transparent)]
 pub struct CommandId(pub Uuid);
@@ -1000,6 +1024,36 @@ pub struct CreateSandboxRequest {
     /// exceeds the operator-configured ceiling.
     #[serde(default)]
     pub idle_ttl_seconds: Option<u64>,
+}
+
+db_variant_enum! {
+pub enum HomeState {
+    Ready => "ready",
+    Deleting => "deleting",
+    DeleteFailed => "delete_failed",
+}
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct Home {
+    pub id: HomeId,
+    pub tenant_id: String,
+    pub state: HomeState,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CreateHomeRequest {}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct HomeResponse {
+    pub ok: bool,
+    pub home: Home,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<Operation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -2195,6 +2249,7 @@ pub enum JobKind {
     RunPrompt => "run_prompt",
     CreateSnapshot => "create_snapshot",
     ForkSandbox => "fork_sandbox",
+    DeleteHome => "delete_home",
 }
 }
 
@@ -2639,6 +2694,7 @@ pub enum OperationKind {
     MaterializeFile,
     CreateSnapshot,
     ForkSandbox,
+    DeleteHome,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -2919,6 +2975,10 @@ pub enum WorkerJobResult {
     ResumeSandbox {
         provider: String,
         sandbox_id: SandboxId,
+    },
+    DeleteHome {
+        provider: String,
+        home_id: HomeId,
     },
 }
 

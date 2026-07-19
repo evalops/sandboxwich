@@ -46,6 +46,7 @@ pub(crate) fn operation_from_job(job: &Job) -> Result<Operation, ApiError> {
             }
             JobKind::CreateSnapshot => OperationKind::CreateSnapshot,
             JobKind::ForkSandbox => OperationKind::ForkSandbox,
+            JobKind::DeleteHome => OperationKind::DeleteHome,
             JobKind::RunPrompt => {
                 return Err(ApiError::not_implemented(
                     "agent_prompt_unavailable",

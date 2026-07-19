@@ -2,6 +2,7 @@ use crate::auth::*;
 use crate::db::*;
 use crate::error::*;
 use crate::handlers::commands::*;
+use crate::handlers::homes::claim_home_mount_on_connection;
 use crate::handlers::jobs::*;
 use crate::handlers::operations::operation_from_job;
 use crate::handlers::snapshots::*;
@@ -212,8 +213,22 @@ pub(crate) async fn create_sandbox(
     Extension(ctx): Extension<TenantContext>,
     Json(request): Json<CreateSandboxRequest>,
 ) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
+    create_sandbox_with_home(state, ctx, request, None).await
+}
+
+pub(crate) async fn create_sandbox_with_home(
+    state: AppState,
+    ctx: TenantContext,
+    request: CreateSandboxRequest,
+    home_id: Option<HomeId>,
+) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
     let now = Utc::now();
     let provision_spec = provision_spec_from_request(&request, None)?;
+    if home_id.is_some() && provision_spec.workspace_mode != WorkspaceMode::Persistent {
+        return Err(ApiError::bad_request(
+            "managed homes require workspace_mode=persistent",
+        ));
+    }
     let sandbox = Sandbox {
         execution_class: provision_spec.execution_class.clone(),
         id: SandboxId::new(),
@@ -249,6 +264,7 @@ pub(crate) async fn create_sandbox(
         status: JobStatus::Queued,
         payload: json!({
             "sandboxId": sandbox.id,
+            "homeId": home_id,
             "runtimeImage": sandbox.template,
             "provisionSpec": provision_spec
         }),
@@ -268,6 +284,10 @@ pub(crate) async fn create_sandbox(
     add_provision_spec_to_payload(&mut job, &sandbox)?;
     let mut tx = state.db.pool.begin().await?;
     insert_sandbox_on_connection(&state.db, &mut tx, &sandbox).await?;
+    if let Some(home_id) = home_id {
+        claim_home_mount_on_connection(&state.db, &mut tx, home_id, &ctx.tenant_id, sandbox.id)
+            .await?;
+    }
     replace_sandbox_network_rules_on_connection(
         &state.db,
         &mut tx,

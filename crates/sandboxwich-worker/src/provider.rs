@@ -16,7 +16,7 @@ use chrono::Utc;
 use clap::ValueEnum;
 use ipnet::IpNet;
 use sandboxwich_core::{
-    AgentCommandRequest, AgentCommandResult, DbVariant, ExecutionClass,
+    AgentCommandRequest, AgentCommandResult, DbVariant, ExecutionClass, HomeId,
     MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES, MAX_SANDBOX_FILE_BYTES, MaterializeFileDestination,
     MaterializeFileObservation, MemoryLimit, NetworkAllowRuleKind, NetworkEgress,
     ORB_SIDECAR_RESIDENT_PROCESS_UID, PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL,
@@ -382,6 +382,17 @@ pub trait SandboxProvider {
         report(stage_update(ProvisioningStage::SandboxReady, None))?;
         Ok(handle)
     }
+    fn provision_home_staged(
+        &self,
+        sandbox_id: SandboxId,
+        home_id: HomeId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+        report: &mut dyn FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
+    ) -> anyhow::Result<ProviderSandboxHandle> {
+        let _ = (sandbox_id, home_id, spec, cancelled, report);
+        anyhow::bail!("provider does not support managed homes")
+    }
     fn exec_handoff(
         &self,
         sandbox_id: SandboxId,
@@ -442,6 +453,10 @@ pub trait SandboxProvider {
         spec: &SandboxTeardownSpec,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<()>;
+    fn delete_home(&self, home_id: HomeId, cancelled: &CancelSignal) -> anyhow::Result<()> {
+        let _ = (home_id, cancelled);
+        anyhow::bail!("provider does not support managed home deletion")
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1340,6 +1355,18 @@ impl KubernetesDryRunProvider {
         manifest
     }
 
+    fn pod_manifest_with_home(
+        &self,
+        sandbox_id: SandboxId,
+        home_id: HomeId,
+        spec: &SandboxProvisionSpec,
+    ) -> serde_json::Value {
+        let mut manifest = self.pod_manifest(sandbox_id, spec);
+        manifest["spec"]["volumes"][0]["persistentVolumeClaim"]["claimName"] =
+            json!(format!("sandboxwich-home-{home_id}"));
+        manifest
+    }
+
     fn guest_token_secret_name(&self, sandbox_id: SandboxId) -> String {
         format!("{GUEST_TOKEN_SECRET_NAME_PREFIX}{sandbox_id}")
     }
@@ -1408,6 +1435,13 @@ impl KubernetesDryRunProvider {
             "metadata": self.object_metadata(name, sandbox_id),
             "spec": spec
         })
+    }
+
+    fn home_pvc_manifest(&self, home_id: HomeId, memory_limit: &MemoryLimit) -> serde_json::Value {
+        let mut manifest =
+            self.pvc_manifest(format!("sandboxwich-home-{home_id}"), None, memory_limit);
+        manifest["metadata"]["labels"]["sandboxwich.dev/home-id"] = json!(home_id);
+        manifest
     }
 
     /// Builds an `ipBlock` for `cidr`, carving the configured
@@ -1985,6 +2019,29 @@ impl KubernetesDryRunProvider {
             status.clone(),
         ));
         resources
+    }
+
+    fn provision_home_handle(
+        &self,
+        sandbox_id: SandboxId,
+        home_id: HomeId,
+        spec: &SandboxProvisionSpec,
+        status: RuntimeResourceStatus,
+    ) -> anyhow::Result<ProviderSandboxHandle> {
+        let mut handle = ProviderSandboxHandle {
+            provider: "kubernetes".to_string(),
+            sandbox_id,
+            resources: self.sandbox_resources(sandbox_id, spec, status),
+            metadata: self.metadata(sandbox_id, "provision", spec)?,
+        };
+        handle.resources.retain(|resource| {
+            resource.resource_kind != RuntimeResourceKind::PersistentVolumeClaim
+        });
+        handle.metadata["homeId"] = json!(home_id);
+        handle.metadata["manifests"]["pvc"] = self.home_pvc_manifest(home_id, &spec.memory_limit);
+        handle.metadata["manifests"]["pod"] =
+            self.pod_manifest_with_home(sandbox_id, home_id, spec);
+        Ok(handle)
     }
 
     fn fork_resources(
@@ -2787,6 +2844,20 @@ impl KubernetesApplyProvider {
         sandbox_id: SandboxId,
         spec: &SandboxProvisionSpec,
         cancelled: &CancelSignal,
+        report: F,
+    ) -> anyhow::Result<ProviderSandboxHandle>
+    where
+        F: FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
+    {
+        self.provision_staged_with_home(sandbox_id, None, spec, cancelled, report)
+    }
+
+    fn provision_staged_with_home<F>(
+        &self,
+        sandbox_id: SandboxId,
+        home_id: Option<HomeId>,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
         mut report: F,
     ) -> anyhow::Result<ProviderSandboxHandle>
     where
@@ -2798,13 +2869,22 @@ impl KubernetesApplyProvider {
         report(stage_update(ProvisioningStage::WorkspacePlanned, None))?;
 
         if spec.workspace_mode == WorkspaceMode::Persistent {
-            let workspace = self.dry_run.pvc_manifest(
-                format!("sandboxwich-pvc-{sandbox_id}"),
-                Some(sandbox_id),
-                &spec.memory_limit,
+            let workspace = home_id.map_or_else(
+                || {
+                    self.dry_run.pvc_manifest(
+                        format!("sandboxwich-pvc-{sandbox_id}"),
+                        Some(sandbox_id),
+                        &spec.memory_limit,
+                    )
+                },
+                |home_id| self.dry_run.home_pvc_manifest(home_id, &spec.memory_limit),
             );
-            let workspace_identity =
-                self.apply_or_adopt_manifest(&workspace, sandbox_id, cancelled)?;
+            let workspace_identity = match home_id {
+                Some(home_id) => {
+                    self.apply_or_adopt_home_manifest(&workspace, home_id, cancelled)?
+                }
+                None => self.apply_or_adopt_manifest(&workspace, sandbox_id, cancelled)?,
+            };
             report(stage_update(
                 ProvisioningStage::WorkspaceReady,
                 Some(workspace_identity),
@@ -2867,7 +2947,13 @@ impl KubernetesApplyProvider {
             report(stage_update(ProvisioningStage::CredentialsReady, None))?;
         }
 
-        let pod = self.dry_run.pod_manifest(sandbox_id, spec);
+        let pod = home_id.map_or_else(
+            || self.dry_run.pod_manifest(sandbox_id, spec),
+            |home_id| {
+                self.dry_run
+                    .pod_manifest_with_home(sandbox_id, home_id, spec)
+            },
+        );
         let pod_identity = self.apply_or_adopt_manifest(&pod, sandbox_id, cancelled)?;
         let wait = self.wait_for_pod_ready(sandbox_id, cancelled)?;
         if !wait.success {
@@ -2897,7 +2983,15 @@ impl KubernetesApplyProvider {
         ))?;
         report(stage_update(ProvisioningStage::SandboxReady, None))?;
 
-        let mut handle = self.dry_run.provision(sandbox_id, spec, cancelled)?;
+        let mut handle = match home_id {
+            Some(home_id) => self.dry_run.provision_home_handle(
+                sandbox_id,
+                home_id,
+                spec,
+                RuntimeResourceStatus::Ready,
+            )?,
+            None => self.dry_run.provision(sandbox_id, spec, cancelled)?,
+        };
         mark_resources(
             &mut handle.resources,
             RuntimeResourceStatus::Ready,
@@ -3153,14 +3247,51 @@ impl KubernetesApplyProvider {
         sandbox_id: SandboxId,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<KubernetesResourceIdentity> {
+        self.apply_or_adopt_manifest_with_identity(
+            manifest,
+            "sandboxwich.dev/sandbox-id",
+            &sandbox_id.to_string(),
+            "sandbox",
+            cancelled,
+        )
+    }
+
+    fn apply_or_adopt_home_manifest(
+        &self,
+        manifest: &Value,
+        home_id: HomeId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<KubernetesResourceIdentity> {
+        self.apply_or_adopt_manifest_with_identity(
+            manifest,
+            "sandboxwich.dev/home-id",
+            &home_id.to_string(),
+            "home",
+            cancelled,
+        )
+    }
+
+    fn apply_or_adopt_manifest_with_identity(
+        &self,
+        manifest: &Value,
+        identity_label: &str,
+        identity_value: &str,
+        identity_name: &str,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<KubernetesResourceIdentity> {
         let kind = manifest["kind"]
             .as_str()
             .context("Kubernetes manifest kind is required")?;
         let resource_kind = runtime_resource_kind_for_kubernetes_kind(kind)?;
 
-        if let Some(identity) =
-            self.read_resource_identity(manifest, sandbox_id, resource_kind.clone(), cancelled)?
-        {
+        if let Some(identity) = self.read_resource_identity(
+            manifest,
+            identity_label,
+            identity_value,
+            identity_name,
+            resource_kind.clone(),
+            cancelled,
+        )? {
             return Ok(identity);
         }
 
@@ -3179,20 +3310,29 @@ impl KubernetesApplyProvider {
                 &apply.stderr,
             )));
         }
-        self.read_resource_identity(manifest, sandbox_id, resource_kind, cancelled)?
-            .ok_or_else(|| {
-                anyhow::Error::new(ProviderError::classified(
-                    ProvisioningErrorClass::RetryableProvider,
-                    "resource_observation_missing",
-                    anyhow::anyhow!("staged Kubernetes resource was not observable after apply"),
-                ))
-            })
+        self.read_resource_identity(
+            manifest,
+            identity_label,
+            identity_value,
+            identity_name,
+            resource_kind,
+            cancelled,
+        )?
+        .ok_or_else(|| {
+            anyhow::Error::new(ProviderError::classified(
+                ProvisioningErrorClass::RetryableProvider,
+                "resource_observation_missing",
+                anyhow::anyhow!("staged Kubernetes resource was not observable after apply"),
+            ))
+        })
     }
 
     fn read_resource_identity(
         &self,
         desired: &Value,
-        sandbox_id: SandboxId,
+        identity_label: &str,
+        identity_value: &str,
+        identity_name: &str,
         resource_kind: RuntimeResourceKind,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<Option<KubernetesResourceIdentity>> {
@@ -3238,13 +3378,13 @@ impl KubernetesApplyProvider {
                 anyhow::Error::new(error).context("kubectl returned invalid resource JSON"),
             ))
         })?;
-        if observed["metadata"]["labels"]["sandboxwich.dev/sandbox-id"]
-            != json!(sandbox_id.to_string())
-        {
+        if observed["metadata"]["labels"][identity_label] != json!(identity_value) {
             return Err(anyhow::Error::new(ProviderError::classified(
                 ProvisioningErrorClass::TerminalContract,
                 "resource_identity_conflict",
-                anyhow::anyhow!("existing Kubernetes resource has a conflicting sandbox identity"),
+                anyhow::anyhow!(
+                    "existing Kubernetes resource has a conflicting {identity_name} identity"
+                ),
             )));
         }
         validate_adoption_contract(desired, &observed)?;
@@ -4777,6 +4917,20 @@ impl SandboxProvider for KubernetesDryRunProvider {
         })
     }
 
+    fn provision_home_staged(
+        &self,
+        sandbox_id: SandboxId,
+        home_id: HomeId,
+        spec: &SandboxProvisionSpec,
+        _cancelled: &CancelSignal,
+        report: &mut dyn FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
+    ) -> anyhow::Result<ProviderSandboxHandle> {
+        report(stage_update(ProvisioningStage::WorkspacePlanned, None))?;
+        report(stage_update(ProvisioningStage::WorkspaceReady, None))?;
+        report(stage_update(ProvisioningStage::SandboxReady, None))?;
+        self.provision_home_handle(sandbox_id, home_id, spec, RuntimeResourceStatus::Planned)
+    }
+
     fn exec_handoff(
         &self,
         sandbox_id: SandboxId,
@@ -4923,6 +5077,10 @@ impl SandboxProvider for KubernetesDryRunProvider {
         // to tear down; treat it as a successful (planned) no-op.
         Ok(())
     }
+
+    fn delete_home(&self, _home_id: HomeId, _cancelled: &CancelSignal) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 impl SandboxProvider for KubernetesApplyProvider {
@@ -5034,6 +5192,19 @@ impl SandboxProvider for KubernetesApplyProvider {
             metadata.insert("waitStdout".to_string(), json!(wait.stdout));
         }
         Ok(handle)
+    }
+
+    fn provision_home_staged(
+        &self,
+        sandbox_id: SandboxId,
+        home_id: HomeId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+        report: &mut dyn FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
+    ) -> anyhow::Result<ProviderSandboxHandle> {
+        self.provision_staged_with_home(sandbox_id, Some(home_id), spec, cancelled, |update| {
+            report(update)
+        })
     }
 
     fn provision_staged(
@@ -5469,6 +5640,33 @@ impl SandboxProvider for KubernetesApplyProvider {
         if !output.success {
             bail!(
                 "kubectl delete sandbox resources failed with {}: {}",
+                output.status,
+                output.stderr
+            );
+        }
+        Ok(())
+    }
+
+    fn delete_home(&self, home_id: HomeId, cancelled: &CancelSignal) -> anyhow::Result<()> {
+        Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
+        let mut args = self.kubectl_base_args();
+        args.extend([
+            "delete".to_string(),
+            "persistentvolumeclaim".to_string(),
+            format!("sandboxwich-home-{home_id}"),
+            "--ignore-not-found=true".to_string(),
+        ]);
+        let output = run_kubectl_command(
+            &self.kubectl,
+            &args,
+            "delete managed home",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        if !output.success {
+            bail!(
+                "kubectl delete managed home failed with {}: {}",
                 output.status,
                 output.stderr
             );
