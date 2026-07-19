@@ -12,7 +12,10 @@ jobs:
   tag:
     name: Push release tag
     runs-on: ubuntu-latest
-    if: startsWith(github.event.head_commit.message, 'chore(release): prepare for ')
+    # Trigger when any commit in the push is a release commit. The head commit
+    # may be a merge commit ("Merge pull request #N..."), so we scan the whole
+    # commit list instead of inspecting only github.event.head_commit.message.
+    if: contains(github.event.commits.*.message, 'chore(release): prepare for ')
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:

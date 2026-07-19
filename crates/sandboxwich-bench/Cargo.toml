@@ -1,6 +1,6 @@
 [package]
 name = "sandboxwich-bench"
-version = "0.1.0"
+version = "0.1.1"
 description = "Benchmark and regression harness for sandboxwich"
 edition.workspace = true
 license.workspace = true

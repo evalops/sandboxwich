@@ -1,6 +1,6 @@
 [package]
 name = "sandboxwich-api"
-version = "0.1.0"
+version = "0.1.1"
 description = "HTTP control plane for disposable development sandboxes"
 edition.workspace = true
 license.workspace = true

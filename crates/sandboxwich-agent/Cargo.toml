@@ -1,6 +1,6 @@
 [package]
 name = "sandboxwich-agent"
-version = "0.1.0"
+version = "0.1.1"
 description = "Guest-side execution agent for sandboxwich sandboxes"
 edition.workspace = true
 license.workspace = true
