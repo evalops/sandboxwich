@@ -16,11 +16,11 @@ gate:
 # Bump the workspace version, update CHANGELOG.md, commit, and push a tag.
 # Run `just release patch`, `just release minor`, `just release 0.2.0`, etc.
 release bump="patch":
-    cargo release {{ bump }} --execute --no-publish --no-verify
+    cargo release {{ bump }} --execute --no-publish --no-verify --no-confirm
 
 # Dry-run a version bump to see what cargo-release would change.
 release-dry-run bump="patch":
-    cargo release {{ bump }} --no-publish --no-verify
+    cargo release {{ bump }} --no-publish --no-verify --no-confirm
 
 # Run the API and a dry-run worker together, using the same flags as the
 # README quick start's first two shells and a local-only dev token. Ctrl-C
