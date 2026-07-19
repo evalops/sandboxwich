@@ -169,6 +169,53 @@ async fn managed_home_delete_is_explicit_and_asynchronous() {
         .unwrap();
     assert_eq!(deleting.home.state, HomeState::Deleting);
     assert_eq!(deleting.operation.unwrap().kind, OperationKind::DeleteHome);
+
+    let registered: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "managed-home-delete-worker".into(),
+            provider: "kubernetes".into(),
+            capabilities: vec![
+                WorkerCapability::ProvisionSandbox,
+                WorkerCapability::SandboxedContainer,
+            ],
+            max_concurrent_jobs: Some(1),
+            labels: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let claimed: ClaimLeaseResponse = worker_client(&registered)
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, registered.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: Some(vec![JobKind::DeleteHome]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        claimed
+            .lease
+            .expect("home delete must be claimable")
+            .job
+            .kind,
+        JobKind::DeleteHome
+    );
     assert_eq!(
         client
             .delete(format!("{}/homes/{}", server.base_url, created.home.id))
