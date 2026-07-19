@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+
+## 0.1.1 - 2026-07-19
 - APEX trusted-supervisor sandboxes now require the typed
   sandboxed_container execution class end to end. Worker registration,
   provider dispatch, snapshot restore, materialization, and lease claims all
