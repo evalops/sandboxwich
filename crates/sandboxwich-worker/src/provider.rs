@@ -617,6 +617,16 @@ impl KubernetesDryRunProvider {
                 "apex_trusted_supervisor_v1 requires deny-by-default egress"
             );
         }
+        if spec.execution_class == ExecutionClass::VirtualMachine {
+            anyhow::ensure!(
+                self.isolation_profile == IsolationProfile::Kata
+                    && self
+                        .runtime_class_name
+                        .as_deref()
+                        .is_some_and(|name| !name.trim().is_empty()),
+                "virtual_machine execution_class requires the kata isolation profile and a RuntimeClass"
+            );
+        }
         Ok(())
     }
 
