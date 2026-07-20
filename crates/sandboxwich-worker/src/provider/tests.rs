@@ -992,6 +992,46 @@ fn apex_trusted_supervisor_profile_is_closed_and_minimally_privileged() {
 }
 
 #[test]
+fn virtual_machine_execution_class_requires_kata_and_runtime_class() {
+    let spec = SandboxProvisionSpec {
+        execution_class: ExecutionClass::VirtualMachine,
+        network_egress: NetworkEgress::DenyAll,
+        ..SandboxProvisionSpec::default()
+    };
+
+    let kata =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Kata)
+            .with_runtime_class_name(Some("kata-qemu".to_string()));
+    let provisioned = kata
+        .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+        .expect("kata worker with a RuntimeClass renders VM-class work");
+    assert_eq!(
+        provisioned.metadata["manifests"]["pod"]["spec"]["runtimeClassName"],
+        "kata-qemu"
+    );
+
+    let development =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+    assert!(
+        development
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+            .is_err(),
+        "the provider boundary must reject VM-class work on development isolation"
+    );
+
+    let kata_without_runtime_class =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Kata);
+    assert!(
+        kata_without_runtime_class
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+            .is_err(),
+        "VM-class work must fail closed without a RuntimeClass"
+    );
+}
+
+#[test]
 fn image_pull_policy_tracks_tag_mutability() {
     assert_eq!(
         image_pull_policy_for("ghcr.io/evalops/sandboxwich-ubuntu-dev:latest"),
