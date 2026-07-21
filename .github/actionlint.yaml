@@ -1,0 +1,6 @@
+# Custom runner labels used by this repository's workflows so actionlint's
+# runner-label check recognizes them.
+self-hosted-runner:
+  labels:
+    - blacksmith-8vcpu-ubuntu-2404
+    - blacksmith-4vcpu-ubuntu-2404-arm

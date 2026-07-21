@@ -61,6 +61,25 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  actionlint:
+    # Workflow files only fail when they run, which is how syntax errors
+    # reach main (see the tag-release YAML incident). Lint them in CI.
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      # install-action doesn't support actionlint (it's a Go tool, not a
+      # crate), so install the release binary directly: version-pinned URL,
+      # sha256 pinned from rhysd/actionlint's published checksums.txt.
+      - name: Install actionlint
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/actionlint.tar.gz" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint.tar.gz" \
+            | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - run: actionlint
+
   audit:
     runs-on: ubuntu-latest
     steps:
