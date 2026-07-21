@@ -19,10 +19,10 @@ env:
 jobs:
   service-build:
     name: service build (${{ matrix.bin }}, ${{ matrix.arch }})
-    # amd64 legs run on Blacksmith (public-repo-eligible, see
-    # kubernetes-conformance.yml's kind job for the ARC/Hetzner reasoning).
-    # arm64 legs are probing blacksmith-4vcpu-ubuntu-2404-arm; if that label
-    # sits queued rather than served, these revert to ubuntu-24.04-arm.
+    # GitHub-hosted (Blacksmith dropped org-wide 2026-07-20): amd64 legs run
+    # on ubuntu-latest, arm64 legs run on the native-arm ubuntu-24.04-arm
+    # hosted label so both legs build natively, with no cross-architecture
+    # emulation.
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
@@ -33,22 +33,22 @@ jobs:
             image: sandboxwich-api
             arch: amd64
             platform: linux/amd64
-            runner: blacksmith-8vcpu-ubuntu-2404
+            runner: ubuntu-latest
           - bin: sandboxwich-api
             image: sandboxwich-api
             arch: arm64
             platform: linux/arm64
-            runner: blacksmith-4vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
           - bin: sandboxwich-worker
             image: sandboxwich-worker
             arch: amd64
             platform: linux/amd64
-            runner: blacksmith-8vcpu-ubuntu-2404
+            runner: ubuntu-latest
           - bin: sandboxwich-worker
             image: sandboxwich-worker
             arch: arm64
             platform: linux/arm64
-            runner: blacksmith-4vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Record service build definition
@@ -89,7 +89,7 @@ jobs:
     name: service image (${{ matrix.bin }})
     needs: service-build
     if: always()
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -179,7 +179,7 @@ jobs:
 
   runtime-build:
     name: runtime build (ubuntu-dev, ${{ matrix.arch }})
-    # Same Blacksmith placement rationale as service-build above.
+    # Same GitHub-hosted placement rationale as service-build above.
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -188,10 +188,10 @@ jobs:
         include:
           - arch: amd64
             platform: linux/amd64
-            runner: blacksmith-8vcpu-ubuntu-2404
+            runner: ubuntu-latest
           - arch: arm64
             platform: linux/arm64
-            runner: blacksmith-4vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Record runtime build definition
@@ -232,7 +232,7 @@ jobs:
     name: runtime image (ubuntu-dev)
     needs: runtime-build
     if: always()
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
       - name: Require native builds
         env:
