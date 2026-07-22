@@ -36,6 +36,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
+mod compiler_cache_archive;
 mod resident_process_supervisor;
 
 use resident_process_supervisor::{
@@ -96,6 +97,39 @@ enum Command {
     Exec(ExecArgs),
     WriteFile(FileWriteArgs),
     ReadFile(FileReadArgs),
+    /// Create a bounded, deterministic snapshot of the local sccache directory.
+    CompilerCacheCapture(CompilerCacheCaptureArgs),
+    /// Validate and atomically activate a staged compiler-cache snapshot.
+    CompilerCacheRestore(CompilerCacheRestoreArgs),
+}
+
+#[derive(Debug, Args)]
+struct CompilerCacheCaptureArgs {
+    #[arg(long, default_value = compiler_cache_archive::DEFAULT_CACHE_ROOT)]
+    cache_root: PathBuf,
+
+    #[arg(long, default_value = compiler_cache_archive::DEFAULT_CAPTURE_ARCHIVE)]
+    archive: PathBuf,
+
+    /// Canonical Foam identity JSON. Reads bounded bytes from stdin when omitted.
+    #[arg(long)]
+    identity_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct CompilerCacheRestoreArgs {
+    #[arg(long, default_value = compiler_cache_archive::DEFAULT_CACHE_ROOT)]
+    cache_root: PathBuf,
+
+    #[arg(long, default_value = compiler_cache_archive::DEFAULT_RESTORE_ARCHIVE)]
+    archive: PathBuf,
+
+    #[arg(long)]
+    expected_sha256: String,
+
+    /// Canonical Foam identity JSON. Reads bounded bytes from stdin when omitted.
+    #[arg(long)]
+    identity_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -310,7 +344,28 @@ async fn main() -> anyhow::Result<()> {
         Command::Exec(args) => exec(args).await,
         Command::WriteFile(args) => write_file(args).await,
         Command::ReadFile(args) => read_file(args).await,
+        Command::CompilerCacheCapture(args) => compiler_cache_capture(args),
+        Command::CompilerCacheRestore(args) => compiler_cache_restore(args),
     }
+}
+
+fn compiler_cache_capture(args: CompilerCacheCaptureArgs) -> anyhow::Result<()> {
+    let identity = compiler_cache_archive::read_identity(args.identity_file.as_deref())?;
+    let summary = compiler_cache_archive::capture(&args.cache_root, &identity, &args.archive)?;
+    println!("{}", serde_json::to_string(&summary)?);
+    Ok(())
+}
+
+fn compiler_cache_restore(args: CompilerCacheRestoreArgs) -> anyhow::Result<()> {
+    let identity = compiler_cache_archive::read_identity(args.identity_file.as_deref())?;
+    let summary = compiler_cache_archive::restore(
+        &args.archive,
+        &args.expected_sha256,
+        &identity,
+        &args.cache_root,
+    )?;
+    println!("{}", serde_json::to_string(&summary)?);
+    Ok(())
 }
 
 async fn heartbeat(args: HeartbeatArgs) -> anyhow::Result<()> {
