@@ -427,9 +427,17 @@ pub trait SandboxProvider {
         destination: MaterializeFileDestination,
         expected_sha256: &str,
         content: &[u8],
+        compiler_cache_identity: Option<&[u8]>,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<MaterializeFileObservation> {
-        let _ = (sandbox_id, destination, expected_sha256, content, cancelled);
+        let _ = (
+            sandbox_id,
+            destination,
+            expected_sha256,
+            content,
+            compiler_cache_identity,
+            cancelled,
+        );
         anyhow::bail!("provider does not support file materialization")
     }
     fn create_snapshot(
@@ -5036,9 +5044,17 @@ impl SandboxProvider for KubernetesDryRunProvider {
         destination: MaterializeFileDestination,
         expected_sha256: &str,
         content: &[u8],
+        compiler_cache_identity: Option<&[u8]>,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<MaterializeFileObservation> {
-        let _ = (sandbox_id, destination, expected_sha256, content, cancelled);
+        let _ = (
+            sandbox_id,
+            destination,
+            expected_sha256,
+            content,
+            compiler_cache_identity,
+            cancelled,
+        );
         anyhow::bail!("materialization attestation is unavailable in dry-run mode")
     }
 
@@ -5474,6 +5490,7 @@ impl SandboxProvider for KubernetesApplyProvider {
         destination: MaterializeFileDestination,
         expected_sha256: &str,
         content: &[u8],
+        compiler_cache_identity: Option<&[u8]>,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<MaterializeFileObservation> {
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
@@ -5491,6 +5508,20 @@ impl SandboxProvider for KubernetesApplyProvider {
         );
         let materialize_container = Self::materialize_container(&destination);
         let compiler_cache = materialize_container.is_some();
+        if compiler_cache {
+            anyhow::ensure!(
+                compiler_cache_identity.is_some_and(|identity| {
+                    !identity.is_empty()
+                        && identity.len() <= sandboxwich_core::MAX_COMPILER_CACHE_IDENTITY_BYTES
+                }),
+                "compiler-cache materialization requires a bounded expected identity"
+            );
+        } else {
+            anyhow::ensure!(
+                compiler_cache_identity.is_none(),
+                "compiler-cache identity is invalid for this materialization destination"
+            );
+        }
         let argv = if compiler_cache {
             vec![
                 "/usr/local/bin/sandboxwich-agent".to_string(),
@@ -5569,6 +5600,34 @@ impl SandboxProvider for KubernetesApplyProvider {
             destination_sha256 == expected_sha256,
             "materialized destination digest mismatch"
         );
+        if let Some(identity) = compiler_cache_identity {
+            let restore_request = AgentCommandRequest {
+                argv: vec![
+                    "/usr/local/bin/sandboxwich-agent".to_string(),
+                    "compiler-cache-restore".to_string(),
+                    "--expected-sha256".to_string(),
+                    expected_sha256.to_string(),
+                ],
+                cwd: None,
+                env: Default::default(),
+                stdin: Some(Vec::new()),
+                timeout_secs: Some(300),
+            };
+            let restore = run_kubectl_command_with_stdin(
+                &self.kubectl,
+                &self.exec_args_in_container(
+                    sandbox_id,
+                    &restore_request,
+                    Some(COMPILER_CACHE_HELPER_CONTAINER),
+                ),
+                Some(identity),
+                "activate compiler cache",
+                Duration::from_secs(300),
+                Some(cancelled),
+                self.max_captured_output_bytes,
+            )?;
+            anyhow::ensure!(restore.success, "compiler-cache activation failed");
+        }
         Ok(MaterializeFileObservation {
             destination_sha256: destination_sha256.to_string(),
             size_bytes: content.len() as u64,

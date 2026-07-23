@@ -59,6 +59,125 @@ fn materialization_job_input_is_ref_only_and_exact() {
     }))
     .unwrap_err();
     assert_eq!(traversal.status, StatusCode::BAD_REQUEST);
+
+    let cache_without_identity = validate_materialize_file_job_input(&json!({
+        "sandboxId": sandbox_id,
+        "fileId": file_id,
+        "destination": "compiler_cache_archive",
+        "expectedSha256": "a".repeat(64),
+    }))
+    .unwrap_err();
+    assert_eq!(cache_without_identity.status, StatusCode::BAD_REQUEST);
+
+    validate_materialize_file_job_input(&json!({
+        "sandboxId": sandbox_id,
+        "fileId": file_id,
+        "destination": "compiler_cache_archive",
+        "expectedSha256": "a".repeat(64),
+        "compilerCacheIdentity": "{\"schemaVersion\":1}",
+    }))
+    .expect("compiler-cache materialization carries its expected identity separately");
+
+    let apex_with_identity = validate_materialize_file_job_input(&json!({
+        "sandboxId": sandbox_id,
+        "fileId": file_id,
+        "destination": "apex_task",
+        "expectedSha256": "a".repeat(64),
+        "compilerCacheIdentity": "{\"schemaVersion\":1}",
+    }))
+    .unwrap_err();
+    assert_eq!(apex_with_identity.status, StatusCode::BAD_REQUEST);
+
+    let oversized_identity = validate_materialize_file_job_input(&json!({
+        "sandboxId": sandbox_id,
+        "fileId": file_id,
+        "destination": "compiler_cache_archive",
+        "expectedSha256": "a".repeat(64),
+        "compilerCacheIdentity": "x".repeat(MAX_COMPILER_CACHE_IDENTITY_BYTES + 1),
+    }))
+    .unwrap_err();
+    assert_eq!(oversized_identity.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn compiler_cache_materialization_is_unprivileged_only_while_apex_destinations_remain_apex_only()
+ {
+    let db = test_sqlite_db().await;
+    let sandbox = seed_sandbox_with_state(&db, SandboxState::Ready).await;
+    let bytes = b"archive";
+    let file = upsert_sandbox_file(
+        &db,
+        sandbox.id,
+        "cache.tar.gz",
+        Some("application/octet-stream"),
+        bytes,
+    )
+    .await
+    .unwrap();
+    let digest = format!("{:x}", sha2::Sha256::digest(bytes));
+    let ctx = TenantContext {
+        tenant_id: sandbox.tenant_id.clone(),
+        principal: Principal::Tenant,
+    };
+    let job = |destination: &str, identity: Option<&str>| {
+        let mut payload = json!({
+            "sandboxId": sandbox.id,
+            "fileId": file.id,
+            "destination": destination,
+            "expectedSha256": digest,
+        });
+        if let Some(identity) = identity {
+            payload["compilerCacheIdentity"] = json!(identity);
+        }
+        Job {
+            id: JobId::new(),
+            tenant_id: sandbox.tenant_id.clone(),
+            kind: JobKind::MaterializeFile,
+            status: JobStatus::Queued,
+            payload,
+            required_capability: WorkerCapability::MaterializeFile,
+            required_execution_class: ExecutionClass::DevelopmentContainer,
+            priority: 0,
+            attempts: 0,
+            max_attempts: 1,
+            scheduled_at: Utc::now(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_error: None,
+        }
+    };
+
+    validate_job_payload_tenant(
+        &db,
+        &job("compiler_cache_archive", Some("{\"schemaVersion\":1}")),
+        &ctx,
+    )
+    .await
+    .expect("unprivileged compiler-cache materialization must be reachable");
+    assert!(
+        validate_job_payload_tenant(&db, &job("apex_task", None), &ctx)
+            .await
+            .is_err()
+    );
+
+    sqlx::query("update sandboxes set runtime_profile = ? where id = ?")
+        .bind(SandboxRuntimeProfile::ApexTrustedSupervisorV1.as_db_str())
+        .bind(sandbox.id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        validate_job_payload_tenant(
+            &db,
+            &job("compiler_cache_archive", Some("{\"schemaVersion\":1}")),
+            &ctx,
+        )
+        .await
+        .is_err()
+    );
+    validate_job_payload_tenant(&db, &job("apex_task", None), &ctx)
+        .await
+        .expect("existing APEX materialization destinations must remain reachable");
 }
 
 #[tokio::test]

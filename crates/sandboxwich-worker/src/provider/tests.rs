@@ -2,6 +2,67 @@ use super::*;
 use sandboxwich_core::{MAX_COMMAND_STDIN_BYTES, NetworkAllowRule};
 
 #[test]
+fn compiler_cache_materialization_stages_then_restores_before_success() {
+    let dir = std::env::temp_dir().join(format!(
+        "sandboxwich-cache-materialize-kubectl-{}",
+        SandboxId::new()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script_path = dir.join("kubectl");
+    let log_path = dir.join("log");
+    let content = b"archive";
+    let digest = sha256_hex(content);
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "{log}"
+case " $* " in
+  *" get pod "*) printf '%s\n' 'pod/sandboxwich-test' ;;
+  *" /usr/bin/sha256sum "*) printf '%s  %s\n' '{digest}' '{path}' ;;
+  *" compiler-cache-restore "*) bytes=$(wc -c); printf 'restore-stdin-bytes=%s\n' "$bytes" >> "{log}" ;;
+  *" exec "*) cat >/dev/null 2>&1 || true ;;
+esac
+"#,
+        log = log_path.display(),
+        path = MaterializeFileDestination::CompilerCacheArchive.guest_path(),
+    );
+    std::fs::write(&script_path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).unwrap();
+    }
+    let provider = apply_provider_with_fake_kubectl(&script_path);
+    provider
+        .materialize_file(
+            SandboxId::new(),
+            MaterializeFileDestination::CompilerCacheArchive,
+            &digest,
+            content,
+            Some(br#"{"schemaVersion":1}"#),
+            &CancelSignal::never_cancelled(),
+        )
+        .unwrap();
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    let stage = log.find(" compiler-cache-stage-archive ").unwrap();
+    let restore_line = log
+        .lines()
+        .find(|line| line.contains(" compiler-cache-restore "))
+        .expect("provider acknowledged success without activating the staged cache");
+    let restore = log.find(restore_line).unwrap();
+    assert!(stage < restore);
+    assert!(log[stage..restore].contains(COMPILER_CACHE_HELPER_CONTAINER));
+    assert!(restore_line.contains(COMPILER_CACHE_HELPER_CONTAINER));
+    assert!(
+        log.lines()
+            .any(|line| line.starts_with("restore-stdin-bytes=") && line.ends_with("19"))
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn compiler_cache_helper_has_a_distinct_minimal_root_boundary() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
@@ -31,6 +92,8 @@ fn compiler_cache_helper_has_a_distinct_minimal_root_boundary() {
         .find(|container| container["name"] == COMPILER_CACHE_HELPER_CONTAINER)
         .unwrap();
     assert_eq!(workload["securityContext"]["runAsNonRoot"], true);
+    assert_eq!(pod["spec"]["securityContext"]["runAsUser"], 10001);
+    assert_eq!(pod["spec"]["securityContext"]["runAsGroup"], 10001);
     assert_eq!(helper["securityContext"]["runAsUser"], 0);
     assert_eq!(helper["securityContext"]["allowPrivilegeEscalation"], false);
     assert_eq!(helper["securityContext"]["readOnlyRootFilesystem"], true);

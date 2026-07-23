@@ -2995,6 +2995,8 @@ pub enum MaterializeFileDestination {
     ApexGradingBundle,
 }
 
+pub const MAX_COMPILER_CACHE_IDENTITY_BYTES: usize = 1024 * 1024;
+
 impl MaterializeFileDestination {
     pub fn guest_path(&self) -> &'static str {
         match self {

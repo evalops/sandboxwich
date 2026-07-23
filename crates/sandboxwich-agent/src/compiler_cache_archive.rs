@@ -349,7 +349,7 @@ fn prepare_workspace_boundary_at(workspace: &Path, owner_uid: u32, owner_gid: u3
     let root = open_directory(workspace)?;
     fchown(&root, Some(owner_uid), Some(owner_gid))?;
     root.set_permissions(fs::Permissions::from_mode(0o1777))?;
-    for (name, mode) in [(".cache", 0o755), (".sandboxwich-private", 0o700)] {
+    for (name, mode) in [(".cache", 0o1777), (".sandboxwich-private", 0o700)] {
         let path = Path::new(name);
         match mkdirat(&root, path, Mode::RWXU) {
             Ok(()) | Err(Errno::EXIST) => {}
@@ -382,7 +382,11 @@ fn prepare_workspace_boundary_at(
 fn verify_workspace_boundary(workspace: &Path, cache_parent: &Path, private: &Path) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    for (path, mode) in [(workspace, 0o1777), (cache_parent, 0o755), (private, 0o700)] {
+    for (path, mode) in [
+        (workspace, 0o1777),
+        (cache_parent, 0o1777),
+        (private, 0o700),
+    ] {
         let metadata = fs::symlink_metadata(path)?;
         if !metadata.is_dir()
             || metadata.uid() != 0
@@ -1459,8 +1463,10 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o7777,
-            0o755
+            0o1777
         );
+        fs::create_dir(workspace.path().join(".cache/sccache"))
+            .expect("a cold UID-10001 workload must be able to initialize SCCACHE_DIR");
         assert_eq!(
             workspace
                 .path()
@@ -1503,18 +1509,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "requires root to spawn the hostile UID-10001 workload"]
     fn distinct_workload_uid_cannot_overwrite_or_swap_root_staging() {
         use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 
-        if std::process::Command::new("id")
-            .arg("-u")
-            .output()
-            .ok()
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .is_none_or(|uid| uid.trim() != "0")
-        {
-            return;
-        }
         let workspace = tempfile::tempdir().unwrap();
         prepare_workspace_boundary_at(workspace.path(), 0, 0).unwrap();
         let staging = workspace.path().join(".cache/.compiler-cache-restore-test");
