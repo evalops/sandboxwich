@@ -2982,21 +2982,27 @@ pub enum WorkerJobResult {
     },
 }
 
-/// A closed set of roots writable by the APEX materialization job. The grader
-/// destination is deliberately distinct so callers can gate it on frozen
-/// mission authority before creating the job.
+/// A closed set of roots writable by file-materialization jobs. Every variant
+/// maps to a fixed guest path; callers apply the authority required by that
+/// destination before creating the job.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MaterializeFileDestination {
+    CompilerCacheArchive,
     ApexWorld,
     ApexTask,
     ApexTaskInstructions,
     ApexGradingBundle,
 }
 
+pub const MAX_COMPILER_CACHE_IDENTITY_BYTES: usize = 1024 * 1024;
+
 impl MaterializeFileDestination {
     pub fn guest_path(&self) -> &'static str {
         match self {
+            Self::CompilerCacheArchive => {
+                "/workspace/.sandboxwich-private/compiler-cache-restore.tar.gz"
+            }
             Self::ApexWorld => "/workspace/.apex/input/world",
             Self::ApexTask => "/workspace/.apex/input/task",
             Self::ApexTaskInstructions => "/workspace/.apex/input/task-instructions",
@@ -3391,6 +3397,10 @@ mod tests {
 
     #[test]
     fn materialization_destinations_are_closed_and_keep_grader_bundle_outside_input() {
+        assert_eq!(
+            MaterializeFileDestination::CompilerCacheArchive.guest_path(),
+            "/workspace/.sandboxwich-private/compiler-cache-restore.tar.gz"
+        );
         assert_eq!(
             MaterializeFileDestination::ApexWorld.guest_path(),
             "/workspace/.apex/input/world"

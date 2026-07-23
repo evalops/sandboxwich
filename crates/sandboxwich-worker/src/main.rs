@@ -684,6 +684,7 @@ impl SandboxProvider for RuntimeProvider {
         destination: sandboxwich_core::MaterializeFileDestination,
         expected_sha256: &str,
         content: &[u8],
+        compiler_cache_identity: Option<&[u8]>,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<sandboxwich_core::MaterializeFileObservation> {
         match self {
@@ -692,6 +693,7 @@ impl SandboxProvider for RuntimeProvider {
                 destination,
                 expected_sha256,
                 content,
+                compiler_cache_identity,
                 cancelled,
             ),
             Self::Apply(provider) => provider.materialize_file(
@@ -699,6 +701,7 @@ impl SandboxProvider for RuntimeProvider {
                 destination,
                 expected_sha256,
                 content,
+                compiler_cache_identity,
                 cancelled,
             ),
         }
@@ -3119,6 +3122,11 @@ fn execute_job_with_reporter(
                 .and_then(serde_json::Value::as_str)
                 .context("materialization digest is missing")?;
             let content = materialization.context("materialization content was not fetched")?;
+            let compiler_cache_identity = job
+                .payload
+                .get("compilerCacheIdentity")
+                .and_then(serde_json::Value::as_str)
+                .map(str::as_bytes);
             anyhow::ensure!(
                 content.len() as u64 <= sandboxwich_core::MAX_SANDBOX_FILE_BYTES,
                 "materialization exceeds 64 MiB"
@@ -3128,6 +3136,7 @@ fn execute_job_with_reporter(
                 destination.clone(),
                 expected_sha256,
                 content,
+                compiler_cache_identity,
                 cancelled,
             )?;
             Ok(WorkerJobOutcome::Complete(
