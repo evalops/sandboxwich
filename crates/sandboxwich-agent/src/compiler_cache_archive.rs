@@ -1,13 +1,14 @@
 use anyhow::{Context, Result, bail};
 use flate2::{Compression, GzBuilder, read::MultiGzDecoder};
-use rustix::fs::{CWD, Mode, OFlags, RenameFlags, open, renameat_with};
-#[cfg(target_os = "linux")]
-use rustix::fs::{ResolveFlags, openat2};
-use serde::Serialize;
+use rustix::{
+    fs::{CWD, Mode, OFlags, RenameFlags, mkdirat, open, openat, renameat_with},
+    io::Errno,
+};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
-    fs::{self, File, OpenOptions},
+    collections::{BTreeSet, HashSet},
+    fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     time::SystemTime,
@@ -24,6 +25,21 @@ const MAX_ENTRIES: usize = 100_000;
 const MAX_ENTRY_BYTES: u64 = 48 * 1024 * 1024;
 const MAX_IDENTITY_BYTES: u64 = 1024 * 1024;
 const MAX_TAR_BYTES: u64 = MAX_UNCOMPRESSED_BYTES + (MAX_ENTRIES as u64 + 1) * 1024 + 1024;
+const IDENTITY_FIELDS: [&str; 13] = [
+    "schemaVersion",
+    "host",
+    "repository",
+    "sourceTreeSha",
+    "patchDigest",
+    "lockfileDigests",
+    "compilerIdentity",
+    "targetTriple",
+    "buildProfile",
+    "cargoFeatures",
+    "executionClass",
+    "environmentPolicyDigest",
+    "namespace",
+];
 
 #[derive(Clone, Copy)]
 struct ArchiveLimits {
@@ -64,6 +80,47 @@ struct ValidatedEntry {
     size: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CacheTrustLane {
+    Trusted,
+    Bulk,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum CacheVisibility {
+    RepositoryShared,
+    TenantRepositoryPrivate { tenant: String },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CompilerCacheNamespace {
+    host: String,
+    repository: String,
+    trust_lane: CacheTrustLane,
+    visibility: CacheVisibility,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CompilerCacheIdentityV1 {
+    schema_version: u32,
+    host: String,
+    repository: String,
+    source_tree_sha: String,
+    patch_digest: Option<String>,
+    lockfile_digests: BTreeSet<String>,
+    compiler_identity: String,
+    target_triple: String,
+    build_profile: String,
+    cargo_features: BTreeSet<String>,
+    execution_class: String,
+    environment_policy_digest: String,
+    namespace: CompilerCacheNamespace,
+}
+
 pub(crate) fn capture(
     cache_root: &Path,
     identity: &[u8],
@@ -96,9 +153,10 @@ fn capture_with_limits(
     let root = cache_root
         .canonicalize()
         .with_context(|| format!("resolve compiler cache root {}", cache_root.display()))?;
-    if !fs::metadata(&root)?.is_dir() {
+    if !fs::symlink_metadata(cache_root)?.is_dir() {
         bail!("compiler cache root is not a directory");
     }
+    let root_handle = open_directory(&root)?;
     let destination_absolute = absolute_path(destination)?;
     if destination_absolute.starts_with(&root) {
         bail!("compiler cache archive destination must be outside the cache root");
@@ -140,7 +198,6 @@ fn capture_with_limits(
     {
         let mut builder = tar::Builder::new(&mut gzip);
         builder.mode(tar::HeaderMode::Deterministic);
-        let root_handle = File::open(&root)?;
         let mut source_index = 0usize;
         let mut identity_written = false;
         while source_index < sources.len() || !identity_written {
@@ -213,6 +270,30 @@ fn restore_with_limits(
     cache_root: &Path,
     limits: ArchiveLimits,
 ) -> Result<ArchiveSummary> {
+    restore_with_hooks(
+        archive,
+        expected_sha256,
+        expected_identity,
+        cache_root,
+        limits,
+        || {},
+        |_, _| {},
+    )
+}
+
+fn restore_with_hooks<SnapshotHook, ExtractionHook>(
+    archive: &Path,
+    expected_sha256: &str,
+    expected_identity: &[u8],
+    cache_root: &Path,
+    limits: ArchiveLimits,
+    snapshot_hook: SnapshotHook,
+    mut extraction_hook: ExtractionHook,
+) -> Result<ArchiveSummary>
+where
+    SnapshotHook: FnOnce(),
+    ExtractionHook: FnMut(&Path, &Path),
+{
     validate_digest(expected_sha256)?;
     validate_identity(expected_identity, limits)?;
     if cache_root.exists() {
@@ -224,18 +305,32 @@ fn restore_with_limits(
     fs::create_dir_all(parent)?;
 
     let mut source = open_regular(archive)?;
-    let compressed = source.metadata()?.len();
-    if compressed > limits.max_compressed_bytes {
+    let source_before = source.metadata()?;
+    if source_before.len() > limits.max_compressed_bytes {
         bail!("compiler cache archive exceeds its compressed size bound");
     }
-    let actual_sha256 = digest_file(&source, limits.max_compressed_bytes)?;
+    let mut compressed_snapshot = tempfile::tempfile_in(parent)?;
+    let (actual_sha256, compressed) = copy_hash_bounded(
+        &mut source,
+        &mut compressed_snapshot,
+        limits.max_compressed_bytes,
+    )?;
+    let source_after = source.metadata()?;
+    if compressed != source_before.len()
+        || source_after.len() != source_before.len()
+        || source_after.modified().ok() != source_before.modified().ok()
+    {
+        bail!("compiler cache archive changed while snapshotting");
+    }
     if actual_sha256 != expected_sha256 {
         bail!("compiler cache archive digest mismatch");
     }
-    source.seek(SeekFrom::Start(0))?;
+    compressed_snapshot.sync_all()?;
+    compressed_snapshot.seek(SeekFrom::Start(0))?;
+    snapshot_hook();
 
     let mut tar_snapshot = tempfile::tempfile_in(parent)?;
-    let mut decoder = MultiGzDecoder::new(source);
+    let mut decoder = MultiGzDecoder::new(compressed_snapshot);
     let tar_limit = limits
         .max_uncompressed_bytes
         .checked_add((limits.max_entries as u64 + 1) * 1024 + 1024)
@@ -249,8 +344,13 @@ fn restore_with_limits(
     let staging = tempfile::Builder::new()
         .prefix(".compiler-cache-restore-")
         .tempdir_in(parent)?;
-    extract_entries(&mut tar_snapshot, &entries, staging.path())?;
-    sync_tree(staging.path())?;
+    extract_entries(
+        &mut tar_snapshot,
+        &entries,
+        staging.path(),
+        &mut extraction_hook,
+    )?;
+    validate_extracted_tree(staging.path(), &entries)?;
     let staging_path = staging.keep();
     if let Err(error) = renameat_with(CWD, &staging_path, CWD, cache_root, RenameFlags::NOREPLACE) {
         let _ = fs::remove_dir_all(&staging_path);
@@ -265,12 +365,187 @@ fn restore_with_limits(
     })
 }
 
+#[cfg(test)]
+fn restore_with_snapshot_hook<Hook>(
+    archive: &Path,
+    expected_sha256: &str,
+    expected_identity: &[u8],
+    cache_root: &Path,
+    hook: Hook,
+) -> Result<ArchiveSummary>
+where
+    Hook: FnOnce(),
+{
+    restore_with_hooks(
+        archive,
+        expected_sha256,
+        expected_identity,
+        cache_root,
+        LIMITS,
+        hook,
+        |_, _| {},
+    )
+}
+
+#[cfg(test)]
+fn restore_with_extraction_hook<Hook>(
+    archive: &Path,
+    expected_sha256: &str,
+    expected_identity: &[u8],
+    cache_root: &Path,
+    hook: Hook,
+) -> Result<ArchiveSummary>
+where
+    Hook: FnMut(&Path, &Path),
+{
+    restore_with_hooks(
+        archive,
+        expected_sha256,
+        expected_identity,
+        cache_root,
+        LIMITS,
+        || {},
+        hook,
+    )
+}
+
 fn validate_identity(identity: &[u8], limits: ArchiveLimits) -> Result<()> {
     if identity.is_empty() || identity.len() as u64 > limits.max_identity_bytes {
         bail!("compiler cache identity exceeds its size bound");
     }
-    let _: serde_json::Value =
+    let raw: serde_json::Value =
         serde_json::from_slice(identity).context("compiler cache identity must be valid JSON")?;
+    let object = raw
+        .as_object()
+        .context("compiler cache identity must be a JSON object")?;
+    if object.len() != IDENTITY_FIELDS.len()
+        || IDENTITY_FIELDS
+            .iter()
+            .any(|field| !object.contains_key(*field))
+    {
+        bail!("compiler cache identity fields do not match the v1 schema");
+    }
+    let parsed: CompilerCacheIdentityV1 = serde_json::from_value(raw)
+        .context("compiler cache identity does not match the v1 schema")?;
+    parsed.validate()?;
+    if serde_json::to_vec(&parsed)? != identity {
+        bail!("compiler cache identity is not in canonical Foam encoding");
+    }
+    Ok(())
+}
+
+impl CompilerCacheIdentityV1 {
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != 1 {
+            bail!("compiler cache schema version must be 1");
+        }
+        validate_git_host("host", &self.host)?;
+        validate_repository("repository", &self.repository)?;
+        validate_git_tree(&self.source_tree_sha)?;
+        if let Some(digest) = &self.patch_digest {
+            validate_sha256("patch digest", digest)?;
+        }
+        for digest in &self.lockfile_digests {
+            validate_sha256("lockfile digest", digest)?;
+        }
+        validate_compiler_identity(&self.compiler_identity)?;
+        validate_text("target triple", &self.target_triple)?;
+        validate_text("build profile", &self.build_profile)?;
+        for feature in &self.cargo_features {
+            validate_text("cargo feature", feature)?;
+        }
+        validate_text("execution class", &self.execution_class)?;
+        validate_sha256("environment policy digest", &self.environment_policy_digest)?;
+        validate_git_host("namespace host", &self.namespace.host)?;
+        validate_repository("namespace repository", &self.namespace.repository)?;
+        if self.host != self.namespace.host || self.repository != self.namespace.repository {
+            bail!("compiler cache identity host and repository must match its namespace");
+        }
+        if let CacheVisibility::TenantRepositoryPrivate { tenant } = &self.namespace.visibility {
+            validate_text("namespace tenant", tenant)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_git_host(field: &str, value: &str) -> Result<()> {
+    let valid = !value.is_empty()
+        && value.len() <= 253
+        && value == value.to_ascii_lowercase()
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        });
+    if !valid {
+        bail!("compiler cache {field} must be a normalized lowercase DNS-style hostname");
+    }
+    Ok(())
+}
+
+fn validate_repository(field: &str, value: &str) -> Result<()> {
+    let mut components = value.split('/');
+    let valid = components.next().is_some_and(valid_repository_component)
+        && components.next().is_some_and(valid_repository_component)
+        && components.next().is_none();
+    if !valid {
+        bail!(
+            "compiler cache {field} must have exactly two non-empty URL-safe owner/name components"
+        );
+    }
+    Ok(())
+}
+
+fn valid_repository_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 100
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn validate_git_tree(value: &str) -> Result<()> {
+    if !matches!(value.len(), 40 | 64)
+        || !value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        bail!("compiler cache source tree must be 40 or 64 lowercase hexadecimal characters");
+    }
+    Ok(())
+}
+
+fn validate_sha256(field: &str, value: &str) -> Result<()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        bail!("compiler cache {field} must be 64 lowercase hexadecimal characters");
+    }
+    Ok(())
+}
+
+fn validate_text(field: &str, value: &str) -> Result<()> {
+    if value.is_empty() || value.chars().count() > 256 || value.chars().any(char::is_control) {
+        bail!("compiler cache {field} must be non-empty bounded text without control characters");
+    }
+    Ok(())
+}
+
+fn validate_compiler_identity(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.chars().count() > 4096
+        || value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+    {
+        bail!("compiler cache compiler identity is invalid");
+    }
     Ok(())
 }
 
@@ -322,24 +597,56 @@ impl SourceFile {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn open_source(root: &File, source: &SourceFile) -> Result<File> {
-    let file = File::from(openat2(
+    open_confined(
         root,
-        source.relative.as_str(),
+        Path::new(&source.relative),
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+    )
+}
+
+fn open_confined(root: &File, path: &Path, final_flags: OFlags, mode: Mode) -> Result<File> {
+    let components = normal_components(path)?;
+    let mut directory = root.try_clone()?;
+    for component in &components[..components.len() - 1] {
+        directory = File::from(openat(
+            &directory,
+            Path::new(component),
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+            Mode::empty(),
+        )?);
+        if !directory.metadata()?.is_dir() {
+            bail!("compiler cache path parent is not a directory");
+        }
+    }
+    let file = File::from(openat(
+        &directory,
+        Path::new(components.last().context("compiler cache path is empty")?),
+        final_flags,
+        mode,
     )?);
-    if !file.metadata()?.is_file() {
+    if final_flags.contains(OFlags::DIRECTORY) && !file.metadata()?.is_dir() {
+        bail!("compiler cache path is not a directory");
+    }
+    if !final_flags.contains(OFlags::DIRECTORY) && !file.metadata()?.is_file() {
         bail!("compiler cache entry is not a regular file");
     }
     Ok(file)
 }
 
-#[cfg(not(target_os = "linux"))]
-fn open_source(_root: &File, source: &SourceFile) -> Result<File> {
-    open_regular(&source.absolute)
+fn normal_components(path: &Path) -> Result<Vec<&std::ffi::OsStr>> {
+    let components: Vec<_> = path
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => Ok(value),
+            _ => bail!("compiler cache path is not normalized"),
+        })
+        .collect::<Result<_>>()?;
+    if components.is_empty() {
+        bail!("compiler cache path is empty");
+    }
+    Ok(components)
 }
 
 fn normalized_relative(root: &Path, path: &Path) -> Result<String> {
@@ -500,26 +807,110 @@ fn extract_entries(
     snapshot: &mut File,
     entries: &[ValidatedEntry],
     destination: &Path,
+    hook: &mut impl FnMut(&Path, &Path),
 ) -> Result<()> {
+    let root = open_directory(destination)?;
     for entry in entries {
-        let output = destination.join(&entry.path);
-        if let Some(parent) = output.parent() {
-            fs::create_dir_all(parent)?;
+        let (parent, file_name) = create_parent_confined(&root, &entry.path)?;
+        hook(destination, &entry.path);
+        let mut file = File::from(openat(
+            &parent,
+            Path::new(file_name),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )?);
+        if !file.metadata()?.is_file() {
+            bail!("compiler cache extraction target is not a regular file");
         }
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&output)?;
         snapshot.seek(SeekFrom::Start(entry.data_offset))?;
         let copied = std::io::copy(&mut Read::by_ref(snapshot).take(entry.size), &mut file)?;
         if copied != entry.size {
             bail!("compiler cache archive entry was truncated during extraction");
         }
         file.sync_all()?;
+        parent.sync_all()?;
+    }
+    root.sync_all()?;
+    Ok(())
+}
+
+fn create_parent_confined<'a>(root: &File, path: &'a Path) -> Result<(File, &'a std::ffi::OsStr)> {
+    let components = normal_components(path)?;
+    let (file_name, parents) = components
+        .split_last()
+        .context("compiler cache path is empty")?;
+    let mut directory = root.try_clone()?;
+    for component in parents {
+        let next = match openat(
+            &directory,
+            Path::new(component),
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+            Mode::empty(),
+        ) {
+            Ok(file) => File::from(file),
+            Err(Errno::NOENT) => {
+                mkdirat(&directory, Path::new(component), Mode::RWXU)?;
+                File::from(openat(
+                    &directory,
+                    Path::new(component),
+                    OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+                    Mode::empty(),
+                )?)
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !next.metadata()?.is_dir() {
+            bail!("compiler cache extraction parent is not a directory");
+        }
+        directory = next;
+    }
+    Ok((directory, file_name))
+}
+
+fn validate_extracted_tree(root: &Path, entries: &[ValidatedEntry]) -> Result<()> {
+    let expected_files: BTreeSet<_> = entries
+        .iter()
+        .map(|entry| (entry.path.clone(), entry.size))
+        .collect();
+    let mut expected_directories = BTreeSet::new();
+    for entry in entries {
+        let mut parent = entry.path.parent();
+        while let Some(path) = parent {
+            if path.as_os_str().is_empty() {
+                break;
+            }
+            expected_directories.insert(path.to_path_buf());
+            parent = path.parent();
+        }
+    }
+    let mut actual_files = BTreeSet::new();
+    let mut actual_directories = BTreeSet::new();
+    collect_extracted_tree(root, root, &mut actual_files, &mut actual_directories)?;
+    if actual_files != expected_files || actual_directories != expected_directories {
+        bail!("compiler cache staging tree changed before activation");
+    }
+    Ok(())
+}
+
+fn collect_extracted_tree(
+    root: &Path,
+    directory: &Path,
+    files: &mut BTreeSet<(PathBuf, u64)>,
+    directories: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        let relative = path.strip_prefix(root)?.to_path_buf();
+        if metadata.file_type().is_dir() {
+            directories.insert(relative);
+            collect_extracted_tree(root, &path, files, directories)?;
+        } else if metadata.file_type().is_file() {
+            files.insert((relative, metadata.len()));
+        } else {
+            bail!("compiler cache staging tree contains a link or special file");
+        }
     }
     Ok(())
 }
@@ -553,6 +944,27 @@ fn copy_bounded(reader: &mut impl Read, writer: &mut File, max: u64) -> Result<u
     }
     writer.sync_all()?;
     Ok(copied)
+}
+
+fn copy_hash_bounded(reader: &mut File, writer: &mut File, max: u64) -> Result<(String, u64)> {
+    let mut copied = 0u64;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(read as u64)
+            .context("archive size overflow")?;
+        if copied > max {
+            bail!("compiler cache archive exceeds its compressed size bound");
+        }
+        writer.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
+    }
+    Ok((format!("{:x}", hasher.finalize()), copied))
 }
 
 fn digest_file(file: &File, max: u64) -> Result<String> {
@@ -589,25 +1001,16 @@ fn open_regular(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn sync_tree(root: &Path) -> Result<()> {
-    let mut directories = vec![root.to_path_buf()];
-    collect_directories(root, &mut directories)?;
-    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    for directory in directories {
-        sync_directory(&directory)?;
+fn open_directory(path: &Path) -> Result<File> {
+    let directory = File::from(open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+        Mode::empty(),
+    )?);
+    if !directory.metadata()?.is_dir() {
+        bail!("compiler cache path is not a directory");
     }
-    Ok(())
-}
-
-fn collect_directories(root: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            output.push(entry.path());
-            collect_directories(&entry.path(), output)?;
-        }
-    }
-    Ok(())
+    Ok(directory)
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
@@ -631,11 +1034,20 @@ mod tests {
     use std::{fs, io::Write, path::Path};
 
     const FOAM_IDENTITY: &[u8] = br#"{"schemaVersion":1,"host":"github.com","repository":"evalops/foam","sourceTreeSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","patchDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","lockfileDigests":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"compilerIdentity":"rustc 1.95.0 (abc123 2026-07-22)","targetTriple":"x86_64-unknown-linux-gnu","buildProfile":"release","cargoFeatures":["cache"],"executionClass":"trusted-linux","environmentPolicyDigest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","namespace":{"host":"github.com","repository":"evalops/foam","trustLane":"trusted","visibility":{"kind":"repository_shared"}}}"#;
+    const FOAM_IDENTITY_DIGEST: &str =
+        "25df318da989c83fd5e2a401d278fda5908c21a7bad1fdfff98c55a9ec5a045d";
     type TestEntry<'a> = (&'a str, tar::EntryType, &'a [u8]);
     type RestoreCase<'a> = (&'a str, Vec<TestEntry<'a>>, &'a [u8]);
 
     fn digest(path: &Path) -> String {
         format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
+    }
+
+    fn identity_replacing(from: &str, to: &str) -> Vec<u8> {
+        String::from_utf8(FOAM_IDENTITY.to_vec())
+            .unwrap()
+            .replacen(from, to, 1)
+            .into_bytes()
     }
 
     fn append(
@@ -690,6 +1102,124 @@ mod tests {
         assert_eq!(fs::read(restored.join("nested/a")).unwrap(), b"first");
         assert_eq!(fs::read(restored.join("z")).unwrap(), b"last");
         assert!(!restored.join(IDENTITY_ENTRY).exists());
+    }
+
+    #[test]
+    fn foam_identity_contract_is_closed_canonical_and_digest_compatible() {
+        validate_identity(FOAM_IDENTITY, LIMITS).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(FOAM_IDENTITY)),
+            FOAM_IDENTITY_DIGEST
+        );
+
+        let invalid = [
+            identity_replacing("\"schemaVersion\":1", "\"schemaVersion\":2"),
+            identity_replacing("\"host\":\"github.com\"", "\"host\":\"GitHub.com\""),
+            identity_replacing("\"repository\":\"evalops/foam\"", "\"repository\":\"foam\""),
+            identity_replacing(
+                "\"sourceTreeSha\":\"aaaaaaaa",
+                "\"sourceTreeSha\":\"AAAAAAAA",
+            ),
+            identity_replacing("\"patchDigest\":\"aaaaaaaa", "\"patchDigest\":\"AAAAAAAA"),
+            identity_replacing(
+                "\"lockfileDigests\":[\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]",
+                "\"lockfileDigests\":[\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]",
+            ),
+            identity_replacing(
+                "\"cargoFeatures\":[\"cache\"]",
+                "\"cargoFeatures\":[\"z\",\"a\",\"a\"]",
+            ),
+            identity_replacing("\"trustLane\":\"trusted\"", "\"trustLane\":\"root\""),
+            identity_replacing("\"kind\":\"repository_shared\"", "\"kind\":\"public\""),
+            identity_replacing("\"namespace\":{", "\"unknown\":true,\"namespace\":{"),
+            identity_replacing(
+                "\"patchDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
+                "",
+            ),
+            identity_replacing(
+                "\"namespace\":{\"host\":\"github.com\"",
+                "\"namespace\":{\"host\":\"gitlab.com\"",
+            ),
+        ];
+        for identity in invalid {
+            assert!(
+                validate_identity(&identity, LIMITS).is_err(),
+                "accepted {}",
+                String::from_utf8_lossy(&identity)
+            );
+        }
+    }
+
+    #[test]
+    fn restore_uses_one_immutable_archive_snapshot_after_hashing() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        fs::write(cache.join("object"), b"immutable").unwrap();
+        let archive = root.path().join("cache.tar.gz");
+        capture(&cache, FOAM_IDENTITY, &archive).unwrap();
+        let expected_digest = digest(&archive);
+        let restored = root.path().join("restored");
+
+        restore_with_snapshot_hook(&archive, &expected_digest, FOAM_IDENTITY, &restored, || {
+            fs::write(&archive, b"mutated after snapshot").unwrap()
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(restored.join("object")).unwrap(), b"immutable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_rejects_staging_parent_symlink_swap_without_outside_write() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        fs::create_dir_all(cache.join("nested")).unwrap();
+        fs::write(cache.join("nested/object"), b"private").unwrap();
+        let archive = root.path().join("cache.tar.gz");
+        capture(&cache, FOAM_IDENTITY, &archive).unwrap();
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let restored = root.path().join("restored");
+
+        let result = restore_with_extraction_hook(
+            &archive,
+            &digest(&archive),
+            FOAM_IDENTITY,
+            &restored,
+            |staging, entry| {
+                if entry == Path::new("nested/object") {
+                    fs::remove_dir(staging.join("nested")).unwrap();
+                    std::os::unix::fs::symlink(&outside, staging.join("nested")).unwrap();
+                }
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!restored.exists());
+        assert!(!outside.join("object").exists());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn non_linux_capture_dirfd_walk_rejects_parent_swapped_to_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        fs::create_dir_all(cache.join("nested")).unwrap();
+        fs::write(cache.join("nested/object"), b"inside").unwrap();
+        let canonical = cache.canonicalize().unwrap();
+        let mut sources = Vec::new();
+        collect_sources(&canonical, &canonical, &mut sources).unwrap();
+        let root_handle = File::open(&canonical).unwrap();
+
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("object"), b"outside").unwrap();
+        fs::remove_file(cache.join("nested/object")).unwrap();
+        fs::remove_dir(cache.join("nested")).unwrap();
+        std::os::unix::fs::symlink(&outside, cache.join("nested")).unwrap();
+
+        assert!(open_source(&root_handle, &sources[0]).is_err());
     }
 
     #[test]
