@@ -101,6 +101,12 @@ enum Command {
     CompilerCacheCapture(CompilerCacheCaptureArgs),
     /// Validate and atomically activate a staged compiler-cache snapshot.
     CompilerCacheRestore(CompilerCacheRestoreArgs),
+    /// Establish the root-owned workspace boundary before the workload starts.
+    CompilerCachePrepareWorkspace,
+    /// Hold the dedicated compiler-cache helper container open after verifying its boundary.
+    CompilerCacheHelper,
+    /// Stage a bounded archive at the helper's fixed private path.
+    CompilerCacheStageArchive(CompilerCacheStageArchiveArgs),
 }
 
 #[derive(Debug, Args)]
@@ -130,6 +136,12 @@ struct CompilerCacheRestoreArgs {
     /// Canonical Foam identity JSON. Reads bounded bytes from stdin when omitted.
     #[arg(long)]
     identity_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct CompilerCacheStageArchiveArgs {
+    #[arg(long)]
+    expected_sha256: String,
 }
 
 #[derive(Debug, Args)]
@@ -346,6 +358,15 @@ async fn main() -> anyhow::Result<()> {
         Command::ReadFile(args) => read_file(args).await,
         Command::CompilerCacheCapture(args) => compiler_cache_capture(args),
         Command::CompilerCacheRestore(args) => compiler_cache_restore(args),
+        Command::CompilerCachePrepareWorkspace => {
+            compiler_cache_archive::prepare_workspace_boundary()
+        }
+        Command::CompilerCacheHelper => compiler_cache_archive::run_helper(),
+        Command::CompilerCacheStageArchive(args) => {
+            let summary = compiler_cache_archive::stage_restore_archive(&args.expected_sha256)?;
+            println!("{}", serde_json::to_string(&summary)?);
+            Ok(())
+        }
     }
 }
 
@@ -358,7 +379,7 @@ fn compiler_cache_capture(args: CompilerCacheCaptureArgs) -> anyhow::Result<()> 
 
 fn compiler_cache_restore(args: CompilerCacheRestoreArgs) -> anyhow::Result<()> {
     let identity = compiler_cache_archive::read_identity(args.identity_file.as_deref())?;
-    let summary = compiler_cache_archive::restore(
+    let summary = compiler_cache_archive::restore_for_workload(
         &args.archive,
         &args.expected_sha256,
         &identity,

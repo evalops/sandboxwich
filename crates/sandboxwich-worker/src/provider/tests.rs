@@ -1,6 +1,102 @@
 use super::*;
 use sandboxwich_core::{MAX_COMMAND_STDIN_BYTES, NetworkAllowRule};
 
+#[test]
+fn compiler_cache_helper_has_a_distinct_minimal_root_boundary() {
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+    let pod = provider.pod_manifest(SandboxId::new(), &SandboxProvisionSpec::default());
+    let init = &pod["spec"]["initContainers"][0];
+    assert_eq!(init["name"], "compiler-cache-init");
+    assert_eq!(
+        init["command"],
+        json!([
+            "/usr/local/bin/sandboxwich-agent",
+            "compiler-cache-prepare-workspace"
+        ])
+    );
+    assert_eq!(init["securityContext"]["runAsUser"], 0);
+    assert_eq!(
+        init["securityContext"]["capabilities"],
+        json!({"drop": ["ALL"], "add": ["CHOWN"]})
+    );
+
+    let containers = pod["spec"]["containers"].as_array().unwrap();
+    let workload = containers
+        .iter()
+        .find(|container| container["name"] == "sandbox")
+        .unwrap();
+    let helper = containers
+        .iter()
+        .find(|container| container["name"] == COMPILER_CACHE_HELPER_CONTAINER)
+        .unwrap();
+    assert_eq!(workload["securityContext"]["runAsNonRoot"], true);
+    assert_eq!(helper["securityContext"]["runAsUser"], 0);
+    assert_eq!(helper["securityContext"]["allowPrivilegeEscalation"], false);
+    assert_eq!(helper["securityContext"]["readOnlyRootFilesystem"], true);
+    assert_eq!(
+        helper["securityContext"]["capabilities"],
+        json!({"drop": ["ALL"], "add": ["CHOWN"]})
+    );
+    assert!(helper.get("env").is_none());
+    assert!(helper.get("ports").is_none());
+    assert_eq!(helper["volumeMounts"].as_array().unwrap().len(), 1);
+    assert_eq!(helper["volumeMounts"][0]["name"], "workspace");
+    assert_eq!(pod["spec"]["automountServiceAccountToken"], false);
+}
+
+#[test]
+fn only_compiler_cache_provider_operations_can_target_root_helper() {
+    let provider = KubernetesApplyProvider::new(
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None),
+        "kubectl",
+    );
+    let sandbox_id = SandboxId::new();
+    let request = AgentCommandRequest {
+        argv: vec!["true".to_string()],
+        cwd: None,
+        env: BTreeMap::new(),
+        stdin: None,
+        timeout_secs: None,
+    };
+    let generic = provider.exec_args(sandbox_id, &request);
+    assert!(!generic.iter().any(|arg| arg == "-c"));
+    let cache = provider.exec_args_in_container(
+        sandbox_id,
+        &request,
+        Some(COMPILER_CACHE_HELPER_CONTAINER),
+    );
+    assert!(cache.windows(2).any(|args| {
+        args == [
+            "-c".to_string(),
+            COMPILER_CACHE_HELPER_CONTAINER.to_string(),
+        ]
+    }));
+    let normal = provider.exec_args_in_container(sandbox_id, &request, None);
+    assert!(
+        !normal
+            .iter()
+            .any(|arg| arg == COMPILER_CACHE_HELPER_CONTAINER)
+    );
+    assert_eq!(
+        KubernetesApplyProvider::materialize_container(
+            &MaterializeFileDestination::CompilerCacheArchive
+        ),
+        Some(COMPILER_CACHE_HELPER_CONTAINER)
+    );
+    for destination in [
+        MaterializeFileDestination::ApexWorld,
+        MaterializeFileDestination::ApexTask,
+        MaterializeFileDestination::ApexTaskInstructions,
+        MaterializeFileDestination::ApexGradingBundle,
+    ] {
+        assert_eq!(
+            KubernetesApplyProvider::materialize_container(&destination),
+            None
+        );
+    }
+}
+
 fn isolated_sidecar_spec(bootstrap: &[u8]) -> IsolatedResidentProcessSpec {
     IsolatedResidentProcessSpec {
         sandbox_id: SandboxId::new(),

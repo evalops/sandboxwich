@@ -170,6 +170,7 @@ pub const DEFAULT_MAX_CAPTURED_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
 /// ordinary command/job output storage.
 pub const APEX_TASK_INSTRUCTIONS_MAX_BYTES: usize = 1024 * 1024;
 const APEX_TASK_INSTRUCTIONS_COMMAND: &str = "/opt/apex/bin/task-instructions";
+const COMPILER_CACHE_HELPER_CONTAINER: &str = "compiler-cache-helper";
 
 /// Default bound applied to every `kubectl` invocation made by
 /// [`KubernetesApplyProvider`] (see [`run_kubectl_command`]). Pod readiness
@@ -1307,9 +1308,40 @@ impl KubernetesDryRunProvider {
                 "seccompProfile": { "type": "RuntimeDefault" }
             })
         };
+        let compiler_cache_security_context = json!({
+            "allowPrivilegeEscalation": false,
+            "readOnlyRootFilesystem": true,
+            "runAsNonRoot": false,
+            "runAsUser": 0,
+            "runAsGroup": 0,
+            "capabilities": { "drop": ["ALL"], "add": ["CHOWN"] },
+            "seccompProfile": { "type": "RuntimeDefault" }
+        });
+        let compiler_cache_mounts = json!([{
+            "name": "workspace",
+            "mountPath": "/workspace"
+        }]);
         let mut pod_spec = Map::from_iter([
             ("automountServiceAccountToken".to_string(), json!(false)),
             ("securityContext".to_string(), pod_security_context),
+            (
+                "initContainers".to_string(),
+                json!([{
+                    "name": "compiler-cache-init",
+                    "image": self.runtime_image,
+                    "imagePullPolicy": image_pull_policy_for(&self.runtime_image),
+                    "command": [
+                        "/usr/local/bin/sandboxwich-agent",
+                        "compiler-cache-prepare-workspace"
+                    ],
+                    "resources": {
+                        "requests": { "cpu": "5m", "memory": "16Mi" },
+                        "limits": { "cpu": "50m", "memory": "64Mi" }
+                    },
+                    "securityContext": compiler_cache_security_context,
+                    "volumeMounts": compiler_cache_mounts
+                }]),
+            ),
             (
                 "containers".to_string(),
                 json!([{
@@ -1337,6 +1369,20 @@ impl KubernetesDryRunProvider {
                     },
                     "securityContext": container_security_context,
                     "volumeMounts": volume_mounts
+                }, {
+                    "name": COMPILER_CACHE_HELPER_CONTAINER,
+                    "image": self.runtime_image,
+                    "imagePullPolicy": image_pull_policy_for(&self.runtime_image),
+                    "command": [
+                        "/usr/local/bin/sandboxwich-agent",
+                        "compiler-cache-helper"
+                    ],
+                    "resources": {
+                        "requests": { "cpu": "5m", "memory": "16Mi" },
+                        "limits": { "cpu": "50m", "memory": "64Mi" }
+                    },
+                    "securityContext": compiler_cache_security_context,
+                    "volumeMounts": compiler_cache_mounts
                 }]),
             ),
             ("volumes".to_string(), json!(volumes)),
@@ -3894,16 +3940,25 @@ impl KubernetesApplyProvider {
     /// stdin. NUL is a safe delimiter because POSIX environment variable
     /// values can never contain an embedded NUL byte, unlike newlines.
     fn exec_args(&self, sandbox_id: SandboxId, request: &AgentCommandRequest) -> Vec<String> {
+        self.exec_args_in_container(sandbox_id, request, None)
+    }
+
+    fn exec_args_in_container(
+        &self,
+        sandbox_id: SandboxId,
+        request: &AgentCommandRequest,
+        container: Option<&str>,
+    ) -> Vec<String> {
         let mut args = self.kubectl_base_args();
         let needs_env = !request.env.is_empty();
         if needs_env || request.stdin.is_some() {
             args.push("-i".to_string());
         }
-        args.extend([
-            "exec".to_string(),
-            self.pod_name(sandbox_id),
-            "--".to_string(),
-        ]);
+        args.extend(["exec".to_string(), self.pod_name(sandbox_id)]);
+        if let Some(container) = container {
+            args.extend(["-c".to_string(), container.to_string()]);
+        }
+        args.push("--".to_string());
 
         if needs_env {
             args.extend([
@@ -3937,6 +3992,11 @@ impl KubernetesApplyProvider {
 
         args.extend(request.argv.clone());
         args
+    }
+
+    fn materialize_container(destination: &MaterializeFileDestination) -> Option<&'static str> {
+        (destination == &MaterializeFileDestination::CompilerCacheArchive)
+            .then_some(COMPILER_CACHE_HELPER_CONTAINER)
     }
 
     fn apex_task_instructions_args(&self, sandbox_id: SandboxId) -> Vec<String> {
@@ -5429,14 +5489,26 @@ impl SandboxProvider for KubernetesApplyProvider {
             self.pod_exists(sandbox_id, cancelled)?,
             "sandbox pod is unavailable"
         );
-        let request = AgentCommandRequest {
-            argv: vec![
+        let materialize_container = Self::materialize_container(&destination);
+        let compiler_cache = materialize_container.is_some();
+        let argv = if compiler_cache {
+            vec![
+                "/usr/local/bin/sandboxwich-agent".to_string(),
+                "compiler-cache-stage-archive".to_string(),
+                "--expected-sha256".to_string(),
+                expected_sha256.to_string(),
+            ]
+        } else {
+            vec![
                 "/opt/apex/bin/import-file".to_string(),
                 "--destination".to_string(),
                 destination.guest_path().to_string(),
                 "--sha256".to_string(),
                 expected_sha256.to_string(),
-            ],
+            ]
+        };
+        let request = AgentCommandRequest {
+            argv,
             cwd: None,
             env: Default::default(),
             // An empty marker causes `exec_args` to add `-i`; the content
@@ -5446,7 +5518,7 @@ impl SandboxProvider for KubernetesApplyProvider {
         };
         let output = run_kubectl_command_with_stdin(
             &self.kubectl,
-            &self.exec_args(sandbox_id, &request),
+            &self.exec_args_in_container(sandbox_id, &request, materialize_container),
             Some(content),
             "materialize sandbox file",
             Duration::from_secs(300),
@@ -5466,7 +5538,7 @@ impl SandboxProvider for KubernetesApplyProvider {
         };
         let observation = run_kubectl_command_with_stdin(
             &self.kubectl,
-            &self.exec_args(sandbox_id, &observation_request),
+            &self.exec_args_in_container(sandbox_id, &observation_request, materialize_container),
             None,
             "observe materialized sandbox file",
             Duration::from_secs(30),

@@ -16,8 +16,14 @@ use std::{
 
 pub(crate) const IDENTITY_ENTRY: &str = "foam-compiler-cache-identity-v1.json";
 pub(crate) const DEFAULT_CACHE_ROOT: &str = "/workspace/.cache/sccache";
-pub(crate) const DEFAULT_RESTORE_ARCHIVE: &str = "/workspace/.foam/compiler-cache-restore.tar.gz";
+pub(crate) const DEFAULT_RESTORE_ARCHIVE: &str =
+    "/workspace/.sandboxwich-private/compiler-cache-restore.tar.gz";
 pub(crate) const DEFAULT_CAPTURE_ARCHIVE: &str = "/workspace/.foam/compiler-cache-capture.tar.gz";
+const WORKSPACE_ROOT: &str = "/workspace";
+const PRIVATE_ROOT: &str = "/workspace/.sandboxwich-private";
+const CACHE_PARENT: &str = "/workspace/.cache";
+const WORKLOAD_UID: u32 = 10001;
+const WORKLOAD_GID: u32 = 10001;
 
 const MAX_COMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_UNCOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
@@ -65,6 +71,13 @@ pub(crate) struct ArchiveSummary {
     pub(crate) compressed_bytes: u64,
     pub(crate) uncompressed_bytes: u64,
     pub(crate) entries: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StagedArchiveSummary {
+    sha256: String,
+    bytes: u64,
 }
 
 struct SourceFile {
@@ -263,6 +276,187 @@ pub(crate) fn restore(
     )
 }
 
+pub(crate) fn prepare_workspace_boundary() -> Result<()> {
+    prepare_workspace_boundary_at(Path::new(WORKSPACE_ROOT), 0, 0)
+}
+
+pub(crate) fn run_helper() -> Result<()> {
+    verify_workspace_boundary(
+        Path::new(WORKSPACE_ROOT),
+        Path::new(CACHE_PARENT),
+        Path::new(PRIVATE_ROOT),
+    )?;
+    loop {
+        std::thread::park();
+    }
+}
+
+pub(crate) fn stage_restore_archive(expected_sha256: &str) -> Result<StagedArchiveSummary> {
+    verify_workspace_boundary(
+        Path::new(WORKSPACE_ROOT),
+        Path::new(CACHE_PARENT),
+        Path::new(PRIVATE_ROOT),
+    )?;
+    let destination = Path::new(DEFAULT_RESTORE_ARCHIVE);
+    let mut staged = tempfile::Builder::new()
+        .prefix(".compiler-cache-upload-")
+        .tempfile_in(Path::new(PRIVATE_ROOT))?;
+    let (actual_sha256, bytes) = copy_hash_bounded(
+        &mut std::io::stdin().lock(),
+        staged.as_file_mut(),
+        MAX_COMPRESSED_BYTES,
+    )?;
+    if actual_sha256 != expected_sha256 {
+        bail!("compiler cache archive digest mismatch while staging");
+    }
+    staged.as_file().sync_all()?;
+    match staged.persist_noclobber(destination) {
+        Ok(_) => {}
+        Err(error) => return Err(error.error).context("publish staged compiler cache archive"),
+    }
+    sync_directory(Path::new(PRIVATE_ROOT))?;
+    Ok(StagedArchiveSummary {
+        sha256: actual_sha256,
+        bytes,
+    })
+}
+
+pub(crate) fn restore_for_workload(
+    archive: &Path,
+    expected_sha256: &str,
+    expected_identity: &[u8],
+    cache_root: &Path,
+) -> Result<ArchiveSummary> {
+    if archive != Path::new(DEFAULT_RESTORE_ARCHIVE) || cache_root != Path::new(DEFAULT_CACHE_ROOT)
+    {
+        bail!("root compiler-cache restore is confined to its fixed workspace paths");
+    }
+    verify_workspace_boundary(
+        Path::new(WORKSPACE_ROOT),
+        Path::new(CACHE_PARENT),
+        Path::new(PRIVATE_ROOT),
+    )?;
+    let summary = restore(archive, expected_sha256, expected_identity, cache_root)?;
+    chown_activated_tree(cache_root, WORKLOAD_UID, WORKLOAD_GID)?;
+    sync_directory(Path::new(CACHE_PARENT))?;
+    Ok(summary)
+}
+
+#[cfg(unix)]
+fn prepare_workspace_boundary_at(workspace: &Path, owner_uid: u32, owner_gid: u32) -> Result<()> {
+    use std::os::unix::fs::{PermissionsExt, fchown};
+
+    let root = open_directory(workspace)?;
+    fchown(&root, Some(owner_uid), Some(owner_gid))?;
+    root.set_permissions(fs::Permissions::from_mode(0o1777))?;
+    for (name, mode) in [(".cache", 0o755), (".sandboxwich-private", 0o700)] {
+        let path = Path::new(name);
+        match mkdirat(&root, path, Mode::RWXU) {
+            Ok(()) | Err(Errno::EXIST) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let directory = File::from(openat(
+            &root,
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+            Mode::empty(),
+        )?);
+        fchown(&directory, Some(owner_uid), Some(owner_gid))?;
+        directory.set_permissions(fs::Permissions::from_mode(mode))?;
+        directory.sync_all()?;
+    }
+    root.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn prepare_workspace_boundary_at(
+    _workspace: &Path,
+    _owner_uid: u32,
+    _owner_gid: u32,
+) -> Result<()> {
+    bail!("compiler-cache helper boundary requires Unix ownership semantics")
+}
+
+#[cfg(unix)]
+fn verify_workspace_boundary(workspace: &Path, cache_parent: &Path, private: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    for (path, mode) in [(workspace, 0o1777), (cache_parent, 0o755), (private, 0o700)] {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_dir()
+            || metadata.uid() != 0
+            || metadata.gid() != 0
+            || metadata.permissions().mode() & 0o7777 != mode
+        {
+            bail!("compiler-cache helper ownership boundary is not intact");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_workspace_boundary(
+    _workspace: &Path,
+    _cache_parent: &Path,
+    _private: &Path,
+) -> Result<()> {
+    bail!("compiler-cache helper boundary requires Unix ownership semantics")
+}
+
+#[cfg(unix)]
+fn chown_activated_tree(root: &Path, uid: u32, gid: u32) -> Result<()> {
+    chown_activated_tree_with(root, uid, gid, |_| {})
+}
+
+#[cfg(unix)]
+fn chown_activated_tree_with(
+    root: &Path,
+    uid: u32,
+    gid: u32,
+    mut before_chown: impl FnMut(&Path),
+) -> Result<()> {
+    use std::os::unix::fs::fchown;
+
+    let root_handle = open_directory(root)?;
+    let mut files = BTreeSet::new();
+    let mut directories = BTreeSet::new();
+    collect_extracted_tree(root, root, &mut files, &mut directories)?;
+    for (path, _) in files {
+        let file = open_confined(
+            &root_handle,
+            &path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )?;
+        before_chown(&path);
+        fchown(&file, Some(uid), Some(gid))?;
+        file.sync_all()?;
+    }
+    let mut directories: Vec<_> = directories.into_iter().collect();
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for path in directories {
+        let directory = open_confined(
+            &root_handle,
+            &path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+            Mode::empty(),
+        )?;
+        before_chown(&path);
+        fchown(&directory, Some(uid), Some(gid))?;
+        directory.sync_all()?;
+    }
+    before_chown(Path::new(""));
+    fchown(&root_handle, Some(uid), Some(gid))?;
+    root_handle.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn chown_activated_tree(_root: &Path, _uid: u32, _gid: u32) -> Result<()> {
+    bail!("compiler-cache ownership handoff requires Unix ownership semantics")
+}
+
 fn restore_with_limits(
     archive: &Path,
     expected_sha256: &str,
@@ -351,6 +545,8 @@ where
         &mut extraction_hook,
     )?;
     validate_extracted_tree(staging.path(), &entries)?;
+    let staging_handle = open_directory(staging.path())?;
+    sync_staging_directories_with(&staging_handle, &entries, |_| Ok(()))?;
     let staging_path = staging.keep();
     if let Err(error) = renameat_with(CWD, &staging_path, CWD, cache_root, RenameFlags::NOREPLACE) {
         let _ = fs::remove_dir_all(&staging_path);
@@ -828,8 +1024,45 @@ fn extract_entries(
             bail!("compiler cache archive entry was truncated during extraction");
         }
         file.sync_all()?;
-        parent.sync_all()?;
     }
+    Ok(())
+}
+
+fn sync_staging_directories_with(
+    root: &File,
+    entries: &[ValidatedEntry],
+    mut before_sync: impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
+    let mut directories = BTreeSet::new();
+    for entry in entries {
+        let mut parent = entry.path.parent();
+        while let Some(path) = parent {
+            if path.as_os_str().is_empty() {
+                break;
+            }
+            directories.insert(path.to_path_buf());
+            parent = path.parent();
+        }
+    }
+    let mut directories: Vec<_> = directories.into_iter().collect();
+    directories.sort_by(|left, right| {
+        right
+            .components()
+            .count()
+            .cmp(&left.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    for path in directories {
+        let directory = open_confined(
+            root,
+            &path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+            Mode::empty(),
+        )?;
+        before_sync(&path)?;
+        directory.sync_all()?;
+    }
+    before_sync(Path::new(""))?;
     root.sync_all()?;
     Ok(())
 }
@@ -946,7 +1179,7 @@ fn copy_bounded(reader: &mut impl Read, writer: &mut File, max: u64) -> Result<u
     Ok(copied)
 }
 
-fn copy_hash_bounded(reader: &mut File, writer: &mut File, max: u64) -> Result<(String, u64)> {
+fn copy_hash_bounded(reader: &mut impl Read, writer: &mut File, max: u64) -> Result<(String, u64)> {
     let mut copied = 0u64;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -1167,6 +1400,148 @@ mod tests {
         .unwrap();
 
         assert_eq!(fs::read(restored.join("object")).unwrap(), b"immutable");
+    }
+
+    #[test]
+    fn nested_staging_directories_are_synced_bottom_up_and_fail_closed() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("a/b")).unwrap();
+        fs::write(root.path().join("a/b/object"), b"object").unwrap();
+        let handle = open_directory(root.path()).unwrap();
+        let entries = vec![ValidatedEntry {
+            path: PathBuf::from("a/b/object"),
+            data_offset: 0,
+            size: 6,
+        }];
+        let mut synced = Vec::new();
+        sync_staging_directories_with(&handle, &entries, |path| {
+            synced.push(path.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            synced,
+            [PathBuf::from("a/b"), PathBuf::from("a"), PathBuf::new()]
+        );
+
+        let error = sync_staging_directories_with(&handle, &entries, |path| {
+            if path == Path::new("a") {
+                anyhow::bail!("injected directory fsync failure");
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected directory fsync failure")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_boundary_is_sticky_and_private_roots_are_not_workload_writable() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let metadata = workspace.path().metadata().unwrap();
+        prepare_workspace_boundary_at(workspace.path(), metadata.uid(), metadata.gid()).unwrap();
+        assert_eq!(
+            workspace.path().metadata().unwrap().permissions().mode() & 0o7777,
+            0o1777
+        );
+        assert_eq!(
+            workspace
+                .path()
+                .join(".cache")
+                .metadata()
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755
+        );
+        assert_eq!(
+            workspace
+                .path()
+                .join(".sandboxwich-private")
+                .metadata()
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_handoff_visits_files_and_directories_before_root() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("a/b")).unwrap();
+        fs::write(root.path().join("a/b/object"), b"object").unwrap();
+        let metadata = root.path().metadata().unwrap();
+        let mut visited = Vec::new();
+        chown_activated_tree_with(root.path(), metadata.uid(), metadata.gid(), |path| {
+            visited.push(path.to_path_buf());
+        })
+        .unwrap();
+        assert_eq!(visited.last(), Some(&PathBuf::new()));
+        assert!(
+            visited
+                .iter()
+                .position(|path| path == Path::new("a/b/object"))
+                < visited.iter().position(|path| path == Path::new("a/b"))
+        );
+        assert!(
+            visited.iter().position(|path| path == Path::new("a/b"))
+                < visited.iter().position(|path| path == Path::new("a"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn distinct_workload_uid_cannot_overwrite_or_swap_root_staging() {
+        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+
+        if std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .is_none_or(|uid| uid.trim() != "0")
+        {
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        prepare_workspace_boundary_at(workspace.path(), 0, 0).unwrap();
+        let staging = workspace.path().join(".cache/.compiler-cache-restore-test");
+        fs::create_dir_all(staging.join("a/b")).unwrap();
+        fs::write(staging.join("a/b/object"), b"original").unwrap();
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let overwrite = std::process::Command::new("sh")
+            .args(["-c", "printf 'mutated!' > \"$1/a/b/object\"", "sh"])
+            .arg(&staging)
+            .uid(WORKLOAD_UID)
+            .gid(WORKLOAD_GID)
+            .status()
+            .unwrap();
+        assert!(!overwrite.success());
+        assert_eq!(fs::read(staging.join("a/b/object")).unwrap(), b"original");
+
+        let swap = std::process::Command::new("sh")
+            .args(["-c", "mv \"$1/a\" \"$2/swapped-a\"", "sh"])
+            .arg(&staging)
+            .arg(workspace.path())
+            .uid(WORKLOAD_UID)
+            .gid(WORKLOAD_GID)
+            .status()
+            .unwrap();
+        assert!(!swap.success());
+        assert!(staging.join("a/b/object").is_file());
     }
 
     #[cfg(unix)]

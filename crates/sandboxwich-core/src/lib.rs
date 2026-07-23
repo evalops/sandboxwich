@@ -2998,7 +2998,9 @@ pub enum MaterializeFileDestination {
 impl MaterializeFileDestination {
     pub fn guest_path(&self) -> &'static str {
         match self {
-            Self::CompilerCacheArchive => "/workspace/.foam/compiler-cache-restore.tar.gz",
+            Self::CompilerCacheArchive => {
+                "/workspace/.sandboxwich-private/compiler-cache-restore.tar.gz"
+            }
             Self::ApexWorld => "/workspace/.apex/input/world",
             Self::ApexTask => "/workspace/.apex/input/task",
             Self::ApexTaskInstructions => "/workspace/.apex/input/task-instructions",
@@ -3395,7 +3397,7 @@ mod tests {
     fn materialization_destinations_are_closed_and_keep_grader_bundle_outside_input() {
         assert_eq!(
             MaterializeFileDestination::CompilerCacheArchive.guest_path(),
-            "/workspace/.foam/compiler-cache-restore.tar.gz"
+            "/workspace/.sandboxwich-private/compiler-cache-restore.tar.gz"
         );
         assert_eq!(
             MaterializeFileDestination::ApexWorld.guest_path(),
