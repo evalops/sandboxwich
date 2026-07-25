@@ -10,6 +10,10 @@ name: ci
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust:
     # GitHub-hosted: Blacksmith was dropped org-wide 2026-07-20. Public repo
