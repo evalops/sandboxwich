@@ -2873,6 +2873,11 @@ impl KubernetesApplyProvider {
     where
         F: FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
     {
+        // Runs before any manifest is applied. `pod_manifest` only renders JSON,
+        // and the staged path reaches `dry_run.provision` -- the other route to
+        // this check -- only after the Pod is already Ready, so without this a
+        // rejected execution class would still have run the workload.
+        self.dry_run.validate_runtime_profile(spec)?;
         self.dry_run
             .validate_network_policy_egress(&spec.network_egress)?;
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;

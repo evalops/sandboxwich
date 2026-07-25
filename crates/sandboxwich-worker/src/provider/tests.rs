@@ -1032,6 +1032,51 @@ fn virtual_machine_execution_class_requires_kata_and_runtime_class() {
 }
 
 #[test]
+fn provision_staged_rejects_vm_class_before_applying_anything() {
+    // provision_staged is the path the job runner uses (main.rs), and it builds
+    // the Pod with `pod_manifest`, which renders JSON without validating. The
+    // other route to validate_runtime_profile -- dry_run.provision -- is reached
+    // only after the Pod is Ready, so a check that ran there would reject the
+    // workload after it had already executed. This asserts nothing is applied.
+    let (kubectl, log_path) = write_stateful_fake_kubectl();
+    let provider = apply_provider_with_fake_kubectl(&kubectl);
+    let spec = SandboxProvisionSpec {
+        execution_class: ExecutionClass::VirtualMachine,
+        network_egress: NetworkEgress::DenyAll,
+        ..SandboxProvisionSpec::default()
+    };
+
+    let mut reports = Vec::new();
+    let error = provider
+        .provision_staged(
+            SandboxId::new(),
+            &spec,
+            &CancelSignal::never_cancelled(),
+            |report| {
+                reports.push(report);
+                Ok(())
+            },
+        )
+        .expect_err("VM-class work must be rejected on a development-isolation provider");
+    assert!(
+        format!("{error:#}")
+            .contains("virtual_machine execution_class requires the kata isolation profile"),
+        "rejected for the wrong reason: {error:#}"
+    );
+
+    // Fail closed: the rejection must precede every mutation and every stage.
+    assert!(
+        reports.is_empty(),
+        "no provisioning stage may be reported before the execution class is accepted: {reports:?}"
+    );
+    let invocations = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        invocations.trim().is_empty(),
+        "no kubectl invocation expected, got: {invocations}"
+    );
+}
+
+#[test]
 fn image_pull_policy_tracks_tag_mutability() {
     assert_eq!(
         image_pull_policy_for("ghcr.io/evalops/sandboxwich-ubuntu-dev:latest"),
