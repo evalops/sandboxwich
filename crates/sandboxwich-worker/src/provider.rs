@@ -2756,6 +2756,44 @@ fn classified_kubectl_failure(context: &str, stderr: &str) -> ProviderError {
     )
 }
 
+/// Classifies a Pod that failed its readiness wait using the scheduler's own
+/// verdict rather than the readiness timeout.
+///
+/// `kubectl wait --for=condition=Ready` reports only "timed out waiting for the
+/// condition", which matches none of the patterns in
+/// [`classified_kubectl_failure`] and so degrades to
+/// `kubernetes_provider_transient` -- a retryable class. A Pod that cannot be
+/// scheduled is then retried indefinitely against the same cluster, and because
+/// the sandbox Pod carries no owner reference nothing reaps the Pod left behind.
+/// Three sandboxes sat `Pending` for five days, three days and fifteen hours
+/// that way on 2026-07-25, each asking for more memory than any node in its pool
+/// can offer.
+///
+/// The `PodScheduled` condition carries the scheduler's reason and its full
+/// per-node breakdown, so a Pod still unschedulable after the whole readiness
+/// window is reported as terminal with that text attached.
+fn unschedulable_pod_failure(context: &str, pod: &Value) -> Option<ProviderError> {
+    let conditions = pod["status"]["conditions"].as_array()?;
+    let scheduled = conditions.iter().find(|condition| {
+        condition["type"].as_str() == Some("PodScheduled")
+            && condition["status"].as_str() == Some("False")
+    })?;
+    if scheduled["reason"].as_str() != Some("Unschedulable") {
+        return None;
+    }
+    let detail = scheduled["message"]
+        .as_str()
+        .unwrap_or("scheduler reported no matching node");
+    Some(ProviderError::classified(
+        ProvisioningErrorClass::TerminalContract,
+        "pod_unschedulable",
+        anyhow::anyhow!(
+            "{context}: pod is still unschedulable after the readiness window, so \
+             retrying the same spec will not place it: {detail}"
+        ),
+    ))
+}
+
 fn stage_update(
     stage: ProvisioningStage,
     identity: Option<KubernetesResourceIdentity>,
@@ -3011,8 +3049,14 @@ impl KubernetesApplyProvider {
         let pod_identity = self.apply_or_adopt_manifest(&pod, sandbox_id, cancelled)?;
         let wait = self.wait_for_pod_ready(sandbox_id, cancelled)?;
         if !wait.success {
+            let context = "sandbox pod did not become ready";
+            if let Some(error) =
+                self.scheduling_failure(&self.pod_name(sandbox_id), context, cancelled)
+            {
+                return Err(anyhow::Error::new(error));
+            }
             return Err(anyhow::Error::new(classified_kubectl_failure(
-                "sandbox pod did not become ready",
+                context,
                 &wait.stderr,
             )));
         }
@@ -3775,6 +3819,41 @@ impl KubernetesApplyProvider {
         cancelled: &CancelSignal,
     ) -> anyhow::Result<KubectlOutput> {
         self.wait_for_named_pod_ready(&self.pod_name(sandbox_id), cancelled)
+    }
+
+    /// Reads the scheduler's verdict for a Pod whose readiness wait failed.
+    ///
+    /// Returns `None` when the Pod is unreadable or is not blocked on
+    /// scheduling, so diagnosis never turns into a new failure mode -- the
+    /// caller falls back to classifying the kubectl stderr as before.
+    fn scheduling_failure(
+        &self,
+        pod_name: &str,
+        context: &str,
+        cancelled: &CancelSignal,
+    ) -> Option<ProviderError> {
+        let mut args = self.kubectl_base_args();
+        args.extend([
+            "get".to_string(),
+            "pod".to_string(),
+            pod_name.to_string(),
+            "-o".to_string(),
+            "json".to_string(),
+        ]);
+        let output = run_kubectl_command(
+            &self.kubectl,
+            &args,
+            "read sandbox pod scheduling status",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )
+        .ok()?;
+        if !output.success {
+            return None;
+        }
+        let pod: Value = serde_json::from_str(&output.stdout).ok()?;
+        unschedulable_pod_failure(context, &pod)
     }
 
     fn wait_for_named_pod_ready(
