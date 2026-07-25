@@ -3594,6 +3594,111 @@ fn pods_not_blocked_on_scheduling_fall_back_to_stderr_classification() {
     assert!(unschedulable_pod_failure("ctx", &serde_json::json!({})).is_none());
 }
 
+/// Fake kubectl for the scheduling-diagnosis path. `mode` selects what
+/// `kubectl get pod -o json` does, so the caller can exercise the unschedulable
+/// verdict and both fallback routes.
+fn write_scheduling_fake_kubectl(mode: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "sandboxwich-scheduling-kubectl-{}",
+        SandboxId::new()
+    ));
+    std::fs::create_dir_all(&dir).expect("create scheduling fake kubectl dir");
+    let script_path = dir.join("kubectl");
+    let body = match mode {
+        "unschedulable" => {
+            r#"printf '%s\n' '{"status":{"conditions":[{"type":"PodScheduled","status":"False","reason":"Unschedulable","message":"0/15 nodes are available: 3 Insufficient cpu, 3 Insufficient memory, 4 node(s) had untolerated taint(s)."}]}}'"#
+        }
+        "scheduled" => {
+            r#"printf '%s\n' '{"status":{"conditions":[{"type":"PodScheduled","status":"True"}]}}'"#
+        }
+        "invalid_json" => r#"printf '%s\n' 'not json at all'"#,
+        "get_fails" => r#"echo 'Error from server (NotFound): pods "x" not found' >&2; exit 1"#,
+        other => panic!("unknown scheduling fake kubectl mode {other}"),
+    };
+    let script = format!("#!/bin/sh\n{body}\n");
+    std::fs::write(&script_path, script).expect("write scheduling fake kubectl");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("stat scheduling fake kubectl")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).expect("chmod scheduling fake kubectl");
+    }
+    script_path
+}
+
+fn scheduling_provider(kubectl: &std::path::Path) -> KubernetesApplyProvider {
+    KubernetesApplyProvider::new(
+        KubernetesDryRunProvider::with_snapshot_class("in-cluster", "sandboxwich-ci", None, None),
+        kubectl.to_string_lossy().into_owned(),
+    )
+}
+
+#[test]
+fn scheduling_failure_reports_the_scheduler_verdict_through_kubectl() {
+    // The wiring, not just the classifier: shells out to kubectl, parses the
+    // Pod, and returns the terminal error with the scheduler's breakdown.
+    let kubectl = write_scheduling_fake_kubectl("unschedulable");
+    let provider = scheduling_provider(&kubectl);
+
+    let error = provider
+        .scheduling_failure(
+            "sandbox-pod",
+            "sandbox pod did not become ready",
+            &CancelSignal::never_cancelled(),
+        )
+        .expect("an unschedulable pod is diagnosed through kubectl");
+
+    assert_eq!(
+        error.error_class(),
+        sandboxwich_core::ProvisioningErrorClass::TerminalContract
+    );
+    assert_eq!(error.reason_code(), "pod_unschedulable");
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("Insufficient memory"), "{rendered}");
+    assert!(
+        rendered.contains("sandbox pod did not become ready"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn scheduling_diagnosis_never_becomes_a_new_failure_mode() {
+    // Every route that cannot produce a confident verdict must return None so
+    // the caller falls back to classifying the kubectl stderr as before. A
+    // diagnosis step that could itself fail would be worse than the bug.
+    for mode in ["scheduled", "invalid_json", "get_fails"] {
+        let kubectl = write_scheduling_fake_kubectl(mode);
+        let provider = scheduling_provider(&kubectl);
+        assert!(
+            provider
+                .scheduling_failure(
+                    "sandbox-pod",
+                    "sandbox pod did not become ready",
+                    &CancelSignal::never_cancelled(),
+                )
+                .is_none(),
+            "mode {mode} must fall back rather than classify"
+        );
+    }
+}
+
+#[test]
+fn unschedulable_classification_is_terminal_so_the_retry_loop_stops() {
+    // The whole point of the fix: this class must not be retryable, or the
+    // sandbox goes back round the loop against a cluster that cannot place it.
+    let pod = serde_json::json!({
+        "status": {"conditions": [
+            {"type": "PodScheduled", "status": "False", "reason": "Unschedulable",
+             "message": "0/3 nodes are available: 3 Insufficient memory."}
+        ]}
+    });
+    let error = unschedulable_pod_failure("ctx", &pod).expect("classified");
+    assert_eq!(error.disposition(), RetryDisposition::Permanent);
+}
+
 #[test]
 fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate() {
     let now = Utc::now();
