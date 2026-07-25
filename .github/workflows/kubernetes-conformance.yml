@@ -16,13 +16,14 @@ concurrency:
 
 jobs:
   kind:
-    # Public repo: the evalops-internal-arc scale set is workflow-restricted
-    # to deploy+platform and evalops-private-ci (Hetzner) doesn't allow
-    # public repos either, so neither is available here. Blacksmith
-    # (visibility=all, allows_public=true) is the only faster-than-GitHub-
-    # hosted lane sandboxwich can use; it's VM-backed so kind/dind still
-    # work. Label naming: blacksmith-{N}vcpu-ubuntu-2404.
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    # GitHub-hosted: Blacksmith was dropped org-wide 2026-07-20. Public
+    # repo -> the evalops-internal-arc scale set is workflow-restricted to
+    # deploy+platform and evalops-private-ci (Hetzner) doesn't allow public
+    # repos either, so ubuntu-latest is the only lane available to fork
+    # PRs here. Expect this job to run slower than the prior Blacksmith
+    # 8vcpu lane (kind went 14m24s -> 6m26s on Blacksmith; reverting to
+    # GitHub-hosted is expected to land back in the ~9-14m range).
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -146,8 +147,8 @@ jobs:
 
   cilium-fqdn:
     name: cilium-fqdn
-    # See the `kind` job above for the public-repo Blacksmith-lane reasoning.
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    # See the `kind` job above for the public-repo GitHub-hosted-lane reasoning.
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
