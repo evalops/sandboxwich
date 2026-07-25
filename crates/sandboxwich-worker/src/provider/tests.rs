@@ -3539,6 +3539,62 @@ fn kubectl_failures_map_to_typed_provisioning_error_classes() {
 }
 
 #[test]
+fn unschedulable_pod_is_terminal_rather_than_a_readiness_timeout() {
+    // The scheduler text a 4Gi sandbox gets against a pool whose nodes cannot
+    // offer 4Gi. `kubectl wait` reports only "timed out waiting for the
+    // condition" for this, which classifies as retryable and is retried forever.
+    let pod = serde_json::json!({
+        "status": {
+            "conditions": [
+                {"type": "PodScheduled", "status": "False", "reason": "Unschedulable",
+                 "message": "0/15 nodes are available: 3 Insufficient cpu, 3 Insufficient memory, 4 node(s) had untolerated taint(s)."}
+            ]
+        }
+    });
+
+    let error = unschedulable_pod_failure("sandbox pod did not become ready", &pod)
+        .expect("an unschedulable pod is classified");
+    assert_eq!(
+        error.error_class(),
+        sandboxwich_core::ProvisioningErrorClass::TerminalContract
+    );
+    assert_eq!(error.reason_code(), "pod_unschedulable");
+    // The scheduler's per-node breakdown has to survive into the message, since
+    // it is the only place the reason is recorded.
+    assert!(
+        format!("{error:#}").contains("Insufficient memory"),
+        "scheduler detail must reach the operator: {error:#}"
+    );
+}
+
+#[test]
+fn pods_not_blocked_on_scheduling_fall_back_to_stderr_classification() {
+    // A Pod that scheduled and is merely slow to start must not be reported as
+    // unschedulable; the caller falls back to classifying the kubectl stderr.
+    let scheduled = serde_json::json!({
+        "status": {
+            "conditions": [{"type": "PodScheduled", "status": "True"}]
+        }
+    });
+    assert!(unschedulable_pod_failure("ctx", &scheduled).is_none());
+
+    // Blocked on scheduling, but for a reason the scheduler does not call
+    // Unschedulable -- left to the existing classifier rather than guessed at.
+    let other_reason = serde_json::json!({
+        "status": {
+            "conditions": [
+                {"type": "PodScheduled", "status": "False", "reason": "SchedulerError",
+                 "message": "internal error"}
+            ]
+        }
+    });
+    assert!(unschedulable_pod_failure("ctx", &other_reason).is_none());
+
+    // No status at all, e.g. a Pod object read mid-creation.
+    assert!(unschedulable_pod_failure("ctx", &serde_json::json!({})).is_none());
+}
+
+#[test]
 fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate() {
     let now = Utc::now();
     let live_sandbox = SandboxId::new();
