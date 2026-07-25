@@ -1,6 +1,12 @@
 # Changelog
 
 ## Unreleased
+- The Kubernetes provider now independently rejects `virtual_machine`
+  execution-class provisioning unless it is configured with the `kata`
+  isolation profile and a nonempty RuntimeClass. This mirrors the existing
+  APEX/gVisor provider-boundary check so VM-class (hostile-workload) work
+  fails closed at provision time rather than relying only on placement-time
+  capability matching.
 
 ## 0.1.1 - 2026-07-19
 - APEX trusted-supervisor sandboxes now require the typed
