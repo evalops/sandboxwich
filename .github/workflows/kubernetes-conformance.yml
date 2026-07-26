@@ -11,18 +11,49 @@ permissions:
   packages: read
 
 concurrency:
-  group: kubernetes-conformance-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  conformance-scope:
+    runs-on: ubuntu-latest
+    outputs:
+      required: ${{ steps.scope.outputs.required }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+      - name: Detect conformance-relevant changes
+        id: scope
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" != "pull_request" ]]; then
+            echo "required=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" > "${RUNNER_TEMP}/changed-files"
+          if grep -Eq '^(\.cargo/|Cargo\.(toml|lock)$|Dockerfile$|crates/|deploy/kubernetes/|migrations/|proto/|scripts/test-(cilium|deployment-images|recovery-conformance)\.py$|\.github/workflows/kubernetes-conformance\.yml$)' "${RUNNER_TEMP}/changed-files"; then
+            echo "required=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "required=false" >> "${GITHUB_OUTPUT}"
+          fi
+
   kind:
-    # Public repo: the evalops-internal-arc scale set is workflow-restricted
-    # to deploy+platform and evalops-private-ci (Hetzner) doesn't allow
-    # public repos either, so neither is available here. Blacksmith
-    # (visibility=all, allows_public=true) is the only faster-than-GitHub-
-    # hosted lane sandboxwich can use; it's VM-backed so kind/dind still
-    # work. Label naming: blacksmith-{N}vcpu-ubuntu-2404.
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    needs: conformance-scope
+    if: needs.conformance-scope.outputs.required == 'true'
+    # GitHub-hosted: Blacksmith was dropped org-wide 2026-07-20. Public
+    # repo -> the evalops-internal-arc scale set is workflow-restricted to
+    # deploy+platform and evalops-private-ci (Hetzner) doesn't allow public
+    # repos either, so ubuntu-latest is the only lane available to fork
+    # PRs here. Expect this job to run slower than the prior Blacksmith
+    # 8vcpu lane (kind went 14m24s -> 6m26s on Blacksmith; reverting to
+    # GitHub-hosted is expected to land back in the ~9-14m range).
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -146,8 +177,10 @@ jobs:
 
   cilium-fqdn:
     name: cilium-fqdn
-    # See the `kind` job above for the public-repo Blacksmith-lane reasoning.
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    needs: conformance-scope
+    if: needs.conformance-scope.outputs.required == 'true'
+    # See the `kind` job above for the public-repo GitHub-hosted-lane reasoning.
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
