@@ -68,7 +68,7 @@ jobs:
   actionlint:
     # Workflow files only fail when they run, which is how syntax errors
     # reach main (see the tag-release YAML incident). Lint them in CI.
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       # install-action doesn't support actionlint (it's a Go tool, not a
