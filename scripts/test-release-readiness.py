@@ -58,9 +58,24 @@ class ReleaseReadinessTest(unittest.TestCase):
         self.assertIn("release-plz/action@", workflow)
         self.assertIn("command: release", workflow)
         self.assertIn("command: release-pr", workflow)
-        # The release PR and the tag push must trigger downstream workflows;
-        # GITHUB_TOKEN-created events do not, so a PAT takes precedence.
-        self.assertIn("secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN", workflow)
+        # The release PR and the tag push must trigger downstream workflows
+        # and the org disallows Actions-created PRs; GITHUB_TOKEN can do
+        # neither, so both jobs must mint a scoped GitHub App token and hand
+        # it to release-plz.
+        self.assertEqual(workflow.count("uses: actions/create-github-app-token@"), 2)
+        self.assertEqual(
+            workflow.count("app-id: ${{ secrets.RELEASE_BOT_APP_ID }}"), 2
+        )
+        self.assertEqual(
+            workflow.count(
+                "private-key: ${{ secrets.RELEASE_BOT_APP_PRIVATE_KEY }}"
+            ),
+            2,
+        )
+        self.assertEqual(
+            workflow.count("GITHUB_TOKEN: ${{ steps.bot-token.outputs.token }}"), 2
+        )
+        self.assertNotIn("GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}", workflow)
 
         with (ROOT / "release-plz.toml").open("rb") as fh:
             config = tomllib.load(fh)
