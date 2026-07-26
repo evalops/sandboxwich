@@ -1,6 +1,21 @@
 # Changelog
 
 ## Unreleased
+
+## 0.1.3 - 2026-07-26
+### Added
+
+- Stage bounded compiler cache archives
+
+### Fixed
+
+- Complete compiler cache materialization
+- Isolate compiler cache activation
+- Harden compiler cache archive boundaries
+
+### Other
+
+- Merge branch 'main' into agent/compiler-cache-staging
 - The Kubernetes provider now independently rejects `virtual_machine`
   execution-class provisioning unless it is configured with the `kata`
   isolation profile and a nonempty RuntimeClass. This mirrors the existing
