@@ -41,6 +41,31 @@ class RepositoryRulesTest(unittest.TestCase):
             pull_request = text.split("pull_request:", 1)[1].split("push:", 1)[0]
             self.assertNotIn("paths:", pull_request, relative)
 
+    def test_protected_workflows_cancel_superseded_runs(self) -> None:
+        for relative in (
+            ".github/workflows/ci.yml",
+            ".github/workflows/containers.yml",
+            ".github/workflows/kubernetes-conformance.yml",
+        ):
+            text = (ROOT / relative).read_text()
+            self.assertIn("concurrency:", text, relative)
+            self.assertIn("cancel-in-progress: true", text, relative)
+            self.assertIn("github.event.pull_request.number || github.ref", text, relative)
+
+    def test_kind_required_context_reports_without_running_for_unrelated_changes(
+        self,
+    ) -> None:
+        workflow = (
+            ROOT / ".github/workflows/kubernetes-conformance.yml"
+        ).read_text()
+        self.assertIn("conformance-scope:", workflow)
+        self.assertIn("needs: conformance-scope", workflow)
+        self.assertIn(
+            "needs.conformance-scope.outputs.required == 'true'", workflow
+        )
+        self.assertIn("deploy/kubernetes/", workflow)
+        self.assertIn("crates/", workflow)
+
     def test_ruleset_requires_pull_requests_and_blocks_force_pushes(self) -> None:
         ruleset = json.loads((ROOT / ".github/rulesets/main.json").read_text())
         types = {rule["type"] for rule in ruleset["rules"]}
