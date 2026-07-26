@@ -24,16 +24,22 @@ The version bump level comes from conventional commits since the last tag:
 `feat` → minor, `fix` and everything else → patch, `!`/`BREAKING CHANGE` →
 major. If nothing releasable changed, no release PR is opened.
 
-## `RELEASE_BOT_TOKEN` secret
+## Release bot credentials
 
-Events caused by the default `GITHUB_TOKEN` do not trigger other workflows.
-Without a PAT, the release PR gets no CI runs and the tag push does not start
-`release.yml`. For the fully automated flow, add a `RELEASE_BOT_TOKEN`
-repository secret: a PAT with `repo` scope (or a fine-grained PAT with
-contents + pull-requests read/write on this repo). The workflow falls back to
-`GITHUB_TOKEN`, so everything still works with two manual kicks: push an
-empty commit to the release PR to start CI, and re-run the release build as
-below after the tag lands.
+The workflow authenticates release-plz with a short-lived GitHub App
+installation token minted at run time from two repository secrets:
+`RELEASE_BOT_APP_ID` and `RELEASE_BOT_APP_PRIVATE_KEY`. The mint is scoped
+to this repository with only contents + pull-requests permissions.
+
+The default `GITHUB_TOKEN` cannot run this flow for two independent
+reasons: the org disallows Actions-created pull requests (`release-pr`
+fails with 403), and events caused by `GITHUB_TOKEN` trigger no workflows,
+so the release PR would get no CI and the tag push would not start
+`release.yml`. App-caused events have neither problem.
+
+To rotate or swap the bot, replace the two secrets with another GitHub App
+installed on this repo that has contents + pull-requests write. No
+workflow change is needed.
 
 ## Manual recovery
 
