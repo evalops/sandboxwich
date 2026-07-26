@@ -37,6 +37,31 @@ class DeploymentImagesTest(unittest.TestCase):
             dockerfile,
         )
 
+    def test_runtime_pins_sccache_and_fixes_workspace_cache_environment(self) -> None:
+        dockerfile = (ROOT / "deploy/runtime/ubuntu-dev/Dockerfile").read_text()
+        self.assertIn("ARG SCCACHE_VERSION=v0.16.0", dockerfile)
+        self.assertIn(
+            "ARG SCCACHE_SHA256_AMD64=aec995a83ad3dff3d14b6314e08858b7b73d35ca85a5bcf3d3a9ec07dee35588",
+            dockerfile,
+        )
+        self.assertIn(
+            "ARG SCCACHE_SHA256_ARM64=f73a5c39f96bb6ebb89cc7915cf182260d4cbf30765322c5e793d0fe8bd80784",
+            dockerfile,
+        )
+        self.assertIn("amd64) sccache_arch=x86_64", dockerfile)
+        self.assertIn("arm64) sccache_arch=aarch64", dockerfile)
+        self.assertIn('sha256sum -c -', dockerfile)
+        self.assertIn('sccache --version | grep -Fx "sccache 0.16.0"', dockerfile)
+        for setting in (
+            "RUSTC_WRAPPER=/usr/local/bin/sccache",
+            "CARGO_INCREMENTAL=0",
+            "SCCACHE_DIR=/workspace/.cache/sccache",
+            "SCCACHE_BASEDIRS=/workspace",
+            "SCCACHE_CACHE_SIZE=48M",
+            "SCCACHE_IGNORE_SERVER_IO_ERROR=1",
+        ):
+            self.assertIn(f"ENV {setting}", dockerfile)
+
     def test_service_images_are_pinned_to_oci_digests(self) -> None:
         documents = {
             path: path.read_text()

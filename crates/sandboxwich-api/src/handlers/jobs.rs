@@ -75,12 +75,10 @@ pub(crate) fn validate_materialize_file_job_input(
     let object = payload
         .as_object()
         .ok_or_else(|| ApiError::bad_request("materialization payload must be an object"))?;
-    const REQUIRED_KEYS: [&str; 4] = ["sandboxId", "fileId", "destination", "expectedSha256"];
-    if object.len() != REQUIRED_KEYS.len()
-        || REQUIRED_KEYS.iter().any(|key| !object.contains_key(*key))
-    {
+    const BASE_KEYS: [&str; 4] = ["sandboxId", "fileId", "destination", "expectedSha256"];
+    if BASE_KEYS.iter().any(|key| !object.contains_key(*key)) {
         return Err(ApiError::bad_request(
-            "materialization payload must contain only sandboxId, fileId, destination, and expectedSha256",
+            "materialization payload is missing a required field",
         ));
     }
     let probe = Job {
@@ -101,8 +99,22 @@ pub(crate) fn validate_materialize_file_job_input(
     };
     sandbox_id_from_job(&probe)?;
     file_id_from_job(&probe)?;
-    materialization_destination_from_job(&probe)?;
+    let destination = materialization_destination_from_job(&probe)?;
     materialization_digest_from_job(&probe)?;
+    let expected_len = if destination == MaterializeFileDestination::CompilerCacheArchive {
+        compiler_cache_identity_from_job(&probe)?;
+        BASE_KEYS.len() + 1
+    } else {
+        BASE_KEYS.len()
+    };
+    if object.len() != expected_len
+        || (destination != MaterializeFileDestination::CompilerCacheArchive
+            && object.contains_key("compilerCacheIdentity"))
+    {
+        return Err(ApiError::bad_request(
+            "materialization payload contains fields outside its destination contract",
+        ));
+    }
     Ok(())
 }
 
@@ -256,10 +268,23 @@ pub(crate) async fn validate_job_payload_tenant(
         }
         JobKind::MaterializeFile => {
             let sandbox = ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
-            if sandbox.runtime_profile != SandboxRuntimeProfile::ApexTrustedSupervisorV1 {
-                return Err(ApiError::bad_request(
-                    "materialize_file requires apex_trusted_supervisor_v1",
-                ));
+            let destination = materialization_destination_from_job(job)?;
+            match destination {
+                MaterializeFileDestination::CompilerCacheArchive => {
+                    if sandbox.runtime_profile != SandboxRuntimeProfile::Unprivileged {
+                        return Err(ApiError::bad_request(
+                            "compiler-cache materialization requires the unprivileged runtime profile",
+                        ));
+                    }
+                    compiler_cache_identity_from_job(job)?;
+                }
+                _ => {
+                    if sandbox.runtime_profile != SandboxRuntimeProfile::ApexTrustedSupervisorV1 {
+                        return Err(ApiError::bad_request(
+                            "APEX materialization requires apex_trusted_supervisor_v1",
+                        ));
+                    }
+                }
             }
             let file_id = file_id_from_job(job)?;
             let stored = fetch_sandbox_file(db, sandbox.id, file_id).await?;
@@ -270,7 +295,6 @@ pub(crate) async fn validate_job_payload_tenant(
                     "materialization digest does not match file",
                 ));
             }
-            materialization_destination_from_job(job)?;
         }
         JobKind::ApexTaskInstructions => {
             let sandbox = ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
@@ -360,6 +384,20 @@ pub(crate) fn materialization_destination_from_job(
             .ok_or_else(|| ApiError::bad_request("materialization destination is required"))?,
     )
     .map_err(|_| ApiError::bad_request("materialization destination is invalid"))
+}
+
+pub(crate) fn compiler_cache_identity_from_job(job: &Job) -> Result<&str, ApiError> {
+    let identity = job
+        .payload
+        .get("compilerCacheIdentity")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ApiError::bad_request("compilerCacheIdentity is required"))?;
+    if identity.is_empty() || identity.len() > MAX_COMPILER_CACHE_IDENTITY_BYTES {
+        return Err(ApiError::bad_request(
+            "compilerCacheIdentity is empty or exceeds its size bound",
+        ));
+    }
+    Ok(identity)
 }
 
 pub(crate) async fn list_jobs(

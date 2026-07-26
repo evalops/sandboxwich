@@ -83,6 +83,7 @@ impl SandboxProvider for AttestingMaterializationProvider {
         _destination: sandboxwich_core::MaterializeFileDestination,
         expected_sha256: &str,
         content: &[u8],
+        _compiler_cache_identity: Option<&[u8]>,
         _cancelled: &CancelSignal,
     ) -> anyhow::Result<sandboxwich_core::MaterializeFileObservation> {
         let destination_sha256 = format!("{:x}", sha2::Sha256::digest(content));
@@ -690,6 +691,7 @@ fn dry_run_provider_cannot_produce_materialization_attestation() {
             sandboxwich_core::MaterializeFileDestination::ApexTask,
             &digest,
             content,
+            None,
             &CancelSignal::never_cancelled(),
         )
         .expect_err("dry-run does not observe a destination");

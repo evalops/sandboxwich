@@ -18,6 +18,10 @@ FROM mirror.gcr.io/library/ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2ba
 ARG SANDBOX_USER=sandbox
 ARG SANDBOX_UID=10001
 ARG SANDBOX_GID=10001
+ARG TARGETARCH
+ARG SCCACHE_VERSION=v0.16.0
+ARG SCCACHE_SHA256_AMD64=aec995a83ad3dff3d14b6314e08858b7b73d35ca85a5bcf3d3a9ec07dee35588
+ARG SCCACHE_SHA256_ARM64=f73a5c39f96bb6ebb89cc7915cf182260d4cbf30765322c5e793d0fe8bd80784
 
 LABEL org.opencontainers.image.title="sandboxwich ubuntu development runtime"
 LABEL org.opencontainers.image.description="SSH and browser-desktop guest runtime for disposable development sandboxes"
@@ -32,6 +36,12 @@ ENV SANDBOXWICH_SSH_PORT=2222
 ENV HOME=/home/sandbox
 ENV CODEX_HOME=/home/sandbox/.codex
 ENV ORB_AGENT_ADAPTERS_FILE=/opt/orb/agent-adapters.json
+ENV RUSTC_WRAPPER=/usr/local/bin/sccache
+ENV CARGO_INCREMENTAL=0
+ENV SCCACHE_DIR=/workspace/.cache/sccache
+ENV SCCACHE_BASEDIRS=/workspace
+ENV SCCACHE_CACHE_SIZE=48M
+ENV SCCACHE_IGNORE_SERVER_IO_ERROR=1
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -74,6 +84,21 @@ RUN apt-get update \
         xz-utils \
         zsh \
     && rm -rf /var/lib/apt/lists/*
+
+RUN case "${TARGETARCH}" in \
+        amd64) sccache_arch=x86_64; sccache_sha256="${SCCACHE_SHA256_AMD64}" ;; \
+        arm64) sccache_arch=aarch64; sccache_sha256="${SCCACHE_SHA256_ARM64}" ;; \
+        *) echo "unsupported sccache architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && archive="sccache-${SCCACHE_VERSION}-${sccache_arch}-unknown-linux-musl.tar.gz" \
+    && curl -fsSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/${archive}" \
+        -o "/tmp/${archive}" \
+    && printf '%s  %s\n' "${sccache_sha256}" "/tmp/${archive}" | sha256sum -c - \
+    && tar -xzf "/tmp/${archive}" -C /tmp \
+    && install -m 0755 "/tmp/sccache-${SCCACHE_VERSION}-${sccache_arch}-unknown-linux-musl/sccache" \
+        /usr/local/bin/sccache \
+    && sccache --version | grep -Fx "sccache 0.16.0" \
+    && rm -rf "/tmp/${archive}" "/tmp/sccache-${SCCACHE_VERSION}-${sccache_arch}-unknown-linux-musl"
 
 # Firefox: Ubuntu 24.04's own `firefox` apt package is a transitional stub
 # that shells out to snapd, which this container never runs (no systemd,

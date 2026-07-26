@@ -3,6 +3,87 @@ use reqwest::StatusCode;
 use sandboxwich_core::*;
 use sha2::{Digest, Sha256};
 
+#[tokio::test]
+async fn unprivileged_compiler_cache_job_is_reachable_with_separate_identity() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("compiler-cache-job.db").display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let client = server.client();
+    let sandbox: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("compiler-cache-job".into()),
+            template: None,
+            memory_limit: None,
+            network_egress: Some(NetworkEgress::DenyAll),
+            workspace_mode: None,
+            runtime_profile: None,
+            ttl_seconds: None,
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+            execution_class: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let archive = b"compiler-cache-archive".to_vec();
+    let file: FileResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/files",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .multipart(
+            reqwest::multipart::Form::new()
+                .text("path", "cache.tar.gz")
+                .part("file", reqwest::multipart::Part::bytes(archive.clone())),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let identity = "{\"schemaVersion\":1}";
+    let response = client
+        .post(format!("{}/jobs", server.base_url))
+        .json(&CreateJobRequest {
+            kind: JobKind::MaterializeFile,
+            payload: serde_json::json!({
+                "sandboxId": sandbox.sandbox.id,
+                "fileId": file.file.id,
+                "destination": "compiler_cache_archive",
+                "expectedSha256": format!("{:x}", Sha256::digest(&archive)),
+                "compilerCacheIdentity": identity,
+            }),
+            required_capability: WorkerCapability::MaterializeFile,
+            priority: None,
+            max_attempts: Some(1),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let job: JobResponse = response.json().await.unwrap();
+    assert_eq!(job.job.payload["compilerCacheIdentity"], identity);
+    assert_eq!(
+        job.job.payload["provisionSpec"]["runtime_profile"],
+        "unprivileged"
+    );
+}
+
 async fn legacy_provision_fixture(name: &str) -> (TestServer, SandboxResponse, WorkerResponse) {
     let data_dir = tempfile::tempdir().unwrap();
     let server = TestServer::start(
