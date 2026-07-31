@@ -203,6 +203,10 @@ fn maestro_hosted_runner_spec() -> IsolatedResidentProcessSpec {
                 "MAESTRO_IDENTITY_EXCHANGE_URL".to_string(),
                 sandboxwich_core::MAESTRO_HOSTED_RUNNER_IDENTITY_EXCHANGE_URL.to_string(),
             ),
+            (
+                "MAESTRO_IDENTITY_TLS_CA_FILE".to_string(),
+                sandboxwich_core::MAESTRO_HOSTED_RUNNER_IDENTITY_CA_FILE.to_string(),
+            ),
             ("MAESTRO_ORGANIZATION_ID".to_string(), "org-1".to_string()),
             (
                 "MAESTRO_WORKSPACE_ID".to_string(),
@@ -263,6 +267,10 @@ fn maestro_hosted_runner_uses_only_projected_identity_in_an_isolated_pod() {
         600
     );
     assert_eq!(
+        pod["spec"]["volumes"][1]["projected"]["sources"][1]["secret"]["name"],
+        sandboxwich_core::MAESTRO_HOSTED_RUNNER_IDENTITY_CA_SECRET
+    );
+    assert_eq!(
         pod["spec"]["containers"][0]["volumeMounts"][1]["mountPath"],
         sandboxwich_core::MAESTRO_HOSTED_RUNNER_TOKEN_DIRECTORY
     );
@@ -279,6 +287,16 @@ fn maestro_hosted_runner_uses_only_projected_identity_in_an_isolated_pod() {
     assert_eq!(
         policy["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"]["app"],
         "runner-host"
+    );
+    assert!(
+        policy["spec"]["egress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| {
+                rule["to"][0]["podSelector"]["matchLabels"]["app"] == "identity"
+                    && rule["ports"][0]["port"] == 8080
+            })
     );
     let rendered = serde_json::to_string(&manifests).expect("render manifests");
     assert!(!rendered.contains("\"kind\":\"Secret\""));

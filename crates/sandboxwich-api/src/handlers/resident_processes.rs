@@ -513,6 +513,7 @@ pub(crate) async fn put_resident_process(
         const ALLOWED_ENV: &[&str] = &[
             "MAESTRO_KUBERNETES_TOKEN_FILE",
             "MAESTRO_IDENTITY_EXCHANGE_URL",
+            "MAESTRO_IDENTITY_TLS_CA_FILE",
             "MAESTRO_ORGANIZATION_ID",
             "MAESTRO_WORKSPACE_ID",
             "MAESTRO_SANDBOX_ID",
@@ -536,6 +537,11 @@ pub(crate) async fn put_resident_process(
                 .get("MAESTRO_IDENTITY_EXCHANGE_URL")
                 .map(String::as_str)
                 != Some(MAESTRO_HOSTED_RUNNER_IDENTITY_EXCHANGE_URL)
+            || request
+                .env
+                .get("MAESTRO_IDENTITY_TLS_CA_FILE")
+                .map(String::as_str)
+                != Some(MAESTRO_HOSTED_RUNNER_IDENTITY_CA_FILE)
             || request
                 .env
                 .get("MAESTRO_SANDBOX_ID")

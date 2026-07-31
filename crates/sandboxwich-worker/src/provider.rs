@@ -17,7 +17,8 @@ use clap::ValueEnum;
 use ipnet::IpNet;
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, DbVariant, ExecutionClass, HomeId,
-    MAESTRO_HOSTED_RUNNER_CONTAINER_PORT, MAESTRO_HOSTED_RUNNER_IDENTITY_EXCHANGE_URL,
+    MAESTRO_HOSTED_RUNNER_CONTAINER_PORT, MAESTRO_HOSTED_RUNNER_IDENTITY_CA_FILE,
+    MAESTRO_HOSTED_RUNNER_IDENTITY_CA_SECRET, MAESTRO_HOSTED_RUNNER_IDENTITY_EXCHANGE_URL,
     MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME, MAESTRO_HOSTED_RUNNER_SERVICE_ACCOUNT,
     MAESTRO_HOSTED_RUNNER_TOKEN_AUDIENCE, MAESTRO_HOSTED_RUNNER_TOKEN_DIRECTORY,
     MAESTRO_HOSTED_RUNNER_TOKEN_FILE, MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES, MAX_SANDBOX_FILE_BYTES,
@@ -4250,6 +4251,13 @@ impl KubernetesApplyProvider {
                     == Some(MAESTRO_HOSTED_RUNNER_IDENTITY_EXCHANGE_URL),
                 "Maestro hosted runner requires the canonical Identity exchange URL"
             );
+            anyhow::ensure!(
+                spec.env
+                    .get("MAESTRO_IDENTITY_TLS_CA_FILE")
+                    .map(String::as_str)
+                    == Some(MAESTRO_HOSTED_RUNNER_IDENTITY_CA_FILE),
+                "Maestro hosted runner requires the canonical Identity CA path"
+            );
         } else {
             let bootstrap = spec
                 .bootstrap
@@ -4336,6 +4344,25 @@ impl KubernetesApplyProvider {
             network_egress.push(json!({
                 "to": [{ "ipBlock": self.dry_run.ip_block("0.0.0.0/0")? }],
                 "ports": [{ "protocol": "TCP", "port": 443 }],
+            }));
+        } else {
+            network_egress.push(json!({
+                "to": [{
+                    "namespaceSelector": {
+                        "matchLabels": {
+                            "kubernetes.io/metadata.name": self.dry_run.effective_ingress_namespace()
+                        }
+                    },
+                    "podSelector": {
+                        "matchLabels": {
+                            "app": "identity"
+                        }
+                    }
+                }],
+                "ports": [{
+                    "protocol": "TCP",
+                    "port": 8080
+                }]
             }));
         }
         let ingress = if maestro {
@@ -4452,13 +4479,22 @@ impl KubernetesApplyProvider {
                     "projected": {
                         "defaultMode": 0o400,
                         "sources": [{
-                            "serviceAccountToken": {
-                                "audience": MAESTRO_HOSTED_RUNNER_TOKEN_AUDIENCE,
-                                "expirationSeconds": 600,
-                                "path": "token",
-                            }
-                        }]
-                    }
+                        "serviceAccountToken": {
+                            "audience": MAESTRO_HOSTED_RUNNER_TOKEN_AUDIENCE,
+                            "expirationSeconds": 600,
+                            "path": "token",
+                        }
+                    }, {
+                        "secret": {
+                            "name": MAESTRO_HOSTED_RUNNER_IDENTITY_CA_SECRET,
+                            "items": [{
+                                "key": "ca.crt",
+                                "path": "ca.crt",
+                                "mode": 0o400
+                            }]
+                        }
+                    }]
+                }
                 }),
             ]);
         } else {

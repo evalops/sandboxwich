@@ -253,6 +253,10 @@ async fn maestro_workload_identity_requires_the_live_exact_provider_fence() {
                 "MAESTRO_IDENTITY_EXCHANGE_URL".into(),
                 MAESTRO_HOSTED_RUNNER_IDENTITY_EXCHANGE_URL.into(),
             ),
+            (
+                "MAESTRO_IDENTITY_TLS_CA_FILE".into(),
+                MAESTRO_HOSTED_RUNNER_IDENTITY_CA_FILE.into(),
+            ),
             ("MAESTRO_ORGANIZATION_ID".into(), "default".into()),
             ("MAESTRO_WORKSPACE_ID".into(), "workspace-1".into()),
             ("MAESTRO_SANDBOX_ID".into(), sandbox_id.to_string()),

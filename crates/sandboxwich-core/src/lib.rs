@@ -1883,6 +1883,9 @@ pub const MAESTRO_HOSTED_RUNNER_TOKEN_AUDIENCE: &str =
     "https://identity.evalops.dev/v1/workload-certificates";
 pub const MAESTRO_HOSTED_RUNNER_TOKEN_DIRECTORY: &str = "/var/run/secrets/evalops.dev/identity";
 pub const MAESTRO_HOSTED_RUNNER_TOKEN_FILE: &str = "/var/run/secrets/evalops.dev/identity/token";
+pub const MAESTRO_HOSTED_RUNNER_IDENTITY_CA_FILE: &str =
+    "/var/run/secrets/evalops.dev/identity/ca.crt";
+pub const MAESTRO_HOSTED_RUNNER_IDENTITY_CA_SECRET: &str = "maestro-identity-server-ca";
 pub const MAESTRO_HOSTED_RUNNER_IDENTITY_EXCHANGE_URL: &str = "https://identity-service.evalops.svc.cluster.local:8080/internal/v1/kubernetes-workload-certificates/exchange";
 pub const MAESTRO_HOSTED_RUNNER_IMAGE_LABEL: &str = "maestro_hosted_runner_image";
 
