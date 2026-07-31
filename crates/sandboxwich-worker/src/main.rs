@@ -22,7 +22,8 @@ use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, ApexTaskInstructionsCallbackRequest,
     ApexTaskInstructionsCallbackResponse, ClaimLeaseRequest, ClaimLeaseResponse,
     CompleteLeaseRequest, ErrorEnvelope, FailLeaseRequest, GuestTokenResponse, HomeId, JobKind,
-    LeaseResponse, MintGuestTokenRequest, ORB_SIDECAR_RESIDENT_PROCESS_NAME,
+    LeaseResponse, MAESTRO_HOSTED_RUNNER_IMAGE_LABEL, MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME,
+    MintGuestTokenRequest, ORB_SIDECAR_RESIDENT_PROCESS_NAME,
     PROVIDER_ISOLATED_RESIDENT_PROCESS_IMAGE_LABEL,
     PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL,
     PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE, ProvisioningOperationResponse,
@@ -434,6 +435,12 @@ struct RuntimeProviderArgs {
     /// also configured.
     #[arg(long, env = "SANDBOXWICH_ISOLATED_RESIDENT_PROCESS_IMAGE")]
     isolated_resident_process_image: Option<String>,
+
+    /// Digest-pinned Maestro image used only for provider-isolated hosted
+    /// runner Pods. The projected workload token is mounted into that Pod,
+    /// never into the sandbox guest.
+    #[arg(long, env = "SANDBOXWICH_MAESTRO_HOSTED_RUNNER_IMAGE")]
+    maestro_hosted_runner_image: Option<String>,
 
     /// Maximum time a sidecar Pod may remain Pending before fenced cleanup
     /// and retry.
@@ -992,6 +999,11 @@ async fn main() -> anyhow::Result<()> {
                 args.provider.provider.runtime_class_name.as_deref(),
                 args.provider.isolated_resident_process_image.as_deref(),
             )?;
+            let maestro_hosted_runner = validate_provider_isolated_sidecar_config(
+                args.provider.provider_mode,
+                args.provider.provider.runtime_class_name.as_deref(),
+                args.provider.maestro_hosted_runner_image.as_deref(),
+            )?;
             let capabilities = capabilities_for_provider_mode(
                 capabilities_from_args(
                     args.capability,
@@ -1003,6 +1015,14 @@ async fn main() -> anyhow::Result<()> {
                 args.provider.provider_mode,
             );
             let mut labels: BTreeMap<_, _> = args.label.into_iter().collect();
+            labels.insert(
+                "sandbox_namespace".into(),
+                args.provider
+                    .provider
+                    .sandbox_namespace
+                    .clone()
+                    .unwrap_or_else(|| args.provider.provider.namespace.clone()),
+            );
             add_placement_proof_labels(
                 &mut labels,
                 args.provider.provider_mode,
@@ -1017,6 +1037,14 @@ async fn main() -> anyhow::Result<()> {
                     .as_deref()
                     .filter(|_| provider_isolated_sidecar),
             );
+            if let Some(image) = args
+                .provider
+                .maestro_hosted_runner_image
+                .as_deref()
+                .filter(|_| maestro_hosted_runner)
+            {
+                labels.insert(MAESTRO_HOSTED_RUNNER_IMAGE_LABEL.into(), image.into());
+            }
             let response = register_worker(
                 &client,
                 &api,
@@ -1260,10 +1288,16 @@ fn runtime_provider_from_args(args: RuntimeProviderArgs) -> anyhow::Result<Runti
         require_explicit_runtime_image_for_apply(&args.provider)?;
     }
     let isolated_resident_process_image = non_empty(args.isolated_resident_process_image.clone());
+    let maestro_hosted_runner_image = non_empty(args.maestro_hosted_runner_image.clone());
     validate_provider_isolated_sidecar_config(
         args.provider_mode,
         args.provider.runtime_class_name.as_deref(),
         isolated_resident_process_image.as_deref(),
+    )?;
+    validate_provider_isolated_sidecar_config(
+        args.provider_mode,
+        args.provider.runtime_class_name.as_deref(),
+        maestro_hosted_runner_image.as_deref(),
     )?;
     let provider = provider_from_args(args.provider)?;
     Ok(match args.provider_mode {
@@ -1286,6 +1320,7 @@ fn runtime_provider_from_args(args: RuntimeProviderArgs) -> anyhow::Result<Runti
                     ))
                     .with_max_captured_output_bytes(args.max_captured_output_bytes)
                     .with_isolated_resident_process_image(isolated_resident_process_image)
+                    .with_maestro_hosted_runner_image(maestro_hosted_runner_image)
                     .with_isolated_resident_process_startup_timeout(Duration::from_secs(
                         args.isolated_resident_process_startup_timeout_secs,
                     ))
@@ -2027,12 +2062,16 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
         // expires and gets reclaimed by another worker.
         let lease_id = lease.id;
         if lease.job.kind == JobKind::RunResidentProcess
-            && lease
-                .job
-                .payload
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                == Some(ORB_SIDECAR_RESIDENT_PROCESS_NAME)
+            && matches!(
+                lease
+                    .job
+                    .payload
+                    .get("name")
+                    .and_then(serde_json::Value::as_str),
+                Some(
+                    ORB_SIDECAR_RESIDENT_PROCESS_NAME | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
+                )
+            )
         {
             let resident_identity = uuid_from_payload(&lease.job.payload, "residentProcessId")
                 .and_then(|process_id| {
@@ -2275,7 +2314,17 @@ where
     } else {
         None
     };
-    let resident_bootstrap = if lease.job.kind == JobKind::RunResidentProcess {
+    let resident_process_name = lease
+        .job
+        .payload
+        .get("name")
+        .and_then(serde_json::Value::as_str);
+    let provider_isolated_resident = lease.job.kind == JobKind::RunResidentProcess
+        && matches!(
+            resident_process_name,
+            Some(ORB_SIDECAR_RESIDENT_PROCESS_NAME | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME)
+        );
+    let resident_bootstrap = if resident_process_name == Some(ORB_SIDECAR_RESIDENT_PROCESS_NAME) {
         match fetch_resident_bootstrap(client, api, &lease).await {
             Ok(bootstrap) if !cancelled.is_cancelled() => Some(bootstrap),
             Ok(_) => {
@@ -2368,7 +2417,7 @@ where
             ))?;
             Ok(())
         };
-        if let Some(bootstrap) = resident_bootstrap {
+        if provider_isolated_resident {
             let observer_runtime = reporter_runtime.clone();
             let observer_client = reporter_client.clone();
             let observer_api = reporter_api.clone();
@@ -2407,7 +2456,7 @@ where
             execute_isolated_resident_process_job(
                 &job,
                 lease_id,
-                bootstrap,
+                resident_bootstrap,
                 exec_provider.as_ref(),
                 &exec_cancelled,
                 &cancellation,
@@ -3277,16 +3326,27 @@ fn execute_job_with_reporter(
 fn execute_isolated_resident_process_job(
     job: &sandboxwich_core::Job,
     lease_id: sandboxwich_core::LeaseId,
-    bootstrap: ResidentProcessBootstrapReadResponse,
+    bootstrap: Option<ResidentProcessBootstrapReadResponse>,
     provider: &impl SandboxProvider,
     cancelled: &CancelSignal,
     cancellation: &LeaseCancellation,
     observe: &mut dyn FnMut(IsolatedResidentProcessObservation) -> anyhow::Result<()>,
 ) -> anyhow::Result<WorkerJobOutcome> {
+    let process_name = job
+        .payload
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .context("resident-process name is missing")?;
     anyhow::ensure!(
-        job.payload.get("name").and_then(serde_json::Value::as_str)
-            == Some(ORB_SIDECAR_RESIDENT_PROCESS_NAME),
-        "only orb-sidecar may use provider-isolated resident-process execution"
+        matches!(
+            process_name,
+            ORB_SIDECAR_RESIDENT_PROCESS_NAME | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
+        ),
+        "only explicit provider-isolated process kinds may use this execution path"
+    );
+    anyhow::ensure!(
+        (process_name == ORB_SIDECAR_RESIDENT_PROCESS_NAME) == bootstrap.is_some(),
+        "static bootstrap material is required only for orb-sidecar"
     );
     let sandbox_id = sandbox_id_from_payload(&job.payload)?;
     let process_id = ResidentProcessId(uuid_from_payload(&job.payload, "residentProcessId")?);
@@ -3319,6 +3379,7 @@ fn execute_isolated_resident_process_job(
     )
     .context("resident-process restart policy is invalid")?;
     let spec = IsolatedResidentProcessSpec {
+        process_name: process_name.to_string(),
         sandbox_id,
         process_id,
         generation,
@@ -3326,14 +3387,14 @@ fn execute_isolated_resident_process_job(
         argv,
         cwd,
         env,
-        bootstrap: IsolatedResidentProcessBootstrap {
+        bootstrap: bootstrap.map(|bootstrap| IsolatedResidentProcessBootstrap {
             content: bootstrap.content,
             target_file: bootstrap.target_file,
             mode: bootstrap.mode,
             placement_attestation: bootstrap
                 .placement_attestation
                 .map(|attestation| attestation.token.into_bytes()),
-        },
+        }),
     };
     let max_attempts = if restart_policy == ResidentProcessRestartPolicy::OnFailure {
         MAX_RESIDENT_PROCESS_ATTEMPTS

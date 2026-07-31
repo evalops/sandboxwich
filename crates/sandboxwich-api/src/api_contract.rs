@@ -31,6 +31,7 @@ use sandboxwich_core::{
         crate::handlers::resident_processes::put_resident_process,
         crate::handlers::resident_attestations::redeem_resident_placement_attestation,
         crate::handlers::resident_attestations::validate_resident_placement_attestation,
+        crate::handlers::resident_attestations::validate_maestro_workload_identity,
         crate::handlers::operations::get_operation,
         crate::handlers::operations::cancel_operation,
         crate::handlers::divergence::append_tool_call_ledger,
@@ -72,6 +73,8 @@ use sandboxwich_core::{
         ,sandboxwich_core::ValidateResidentPlacementAttestationRequest
         ,sandboxwich_core::ResidentPlacementClaims
         ,sandboxwich_core::ResidentPlacementAttestationResponse
+        ,sandboxwich_core::ValidateMaestroWorkloadIdentityRequest
+        ,sandboxwich_core::MaestroWorkloadIdentityResponse
     )),
     tags((name = "operations", description = "Asynchronous operation lifecycle"))
 )]
@@ -156,6 +159,7 @@ const PUBLIC_V1_OPERATIONS: &[(&str, &str)] = &[
     ("post", "/v1/resident-processes/{process_id}/observations"),
     ("post", "/v1/resident-placement-attestations/redeem"),
     ("post", "/v1/resident-placement-attestations/validate"),
+    ("post", "/v1/maestro-workload-identities/validate"),
     ("post", "/v1/leases/{lease_id}/renew"),
     ("get", "/v1/leases/{lease_id}/materialization"),
     ("post", "/v1/leases/{lease_id}/output"),

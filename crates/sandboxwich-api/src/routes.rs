@@ -171,6 +171,10 @@ pub(crate) fn app(state: AppState) -> Router {
             "/resident-placement-attestations/validate",
             post(validate_resident_placement_attestation),
         )
+        .route(
+            "/maestro-workload-identities/validate",
+            post(validate_maestro_workload_identity),
+        )
         .route_layer(middleware::from_fn(require_tenant_principal));
 
     // Registration returns a one-time raw worker credential. It deliberately does not use the

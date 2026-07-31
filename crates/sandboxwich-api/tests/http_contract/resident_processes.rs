@@ -64,6 +64,11 @@ async fn provisioned_sandbox_with_guest(
                         "provider_isolated_resident_process_image".into(),
                         "ghcr.io/evalops/orb-sidecar@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
                     ),
+                    (
+                        MAESTRO_HOSTED_RUNNER_IMAGE_LABEL.into(),
+                        "ghcr.io/evalops/maestro@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                    ),
+                    ("sandbox_namespace".into(), "sandboxwich-sandboxes".into()),
                 ])
             } else {
                 BTreeMap::new()
@@ -214,6 +219,188 @@ fn resident_process_request(
             mode: 0o600,
         }),
     }
+}
+
+#[tokio::test]
+async fn maestro_workload_identity_requires_the_live_exact_provider_fence() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("maestro-workload.db").display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let (sandbox_id, worker, _) =
+        provisioned_sandbox_with_guest(&server, "maestro-wif", true).await;
+    let client = server.client();
+    let runner_session_id = "runner-session-1";
+    let request = ResidentProcessRequest {
+        argv: vec![
+            "/usr/local/bin/maestro".into(),
+            "hosted-runner".into(),
+            "--listen".into(),
+            "0.0.0.0:8443".into(),
+        ],
+        cwd: None,
+        env: BTreeMap::from([
+            (
+                "MAESTRO_KUBERNETES_TOKEN_FILE".into(),
+                MAESTRO_HOSTED_RUNNER_TOKEN_FILE.into(),
+            ),
+            (
+                "MAESTRO_IDENTITY_EXCHANGE_URL".into(),
+                MAESTRO_HOSTED_RUNNER_IDENTITY_EXCHANGE_URL.into(),
+            ),
+            (
+                "MAESTRO_IDENTITY_TLS_CA_FILE".into(),
+                MAESTRO_HOSTED_RUNNER_IDENTITY_CA_FILE.into(),
+            ),
+            ("MAESTRO_ORGANIZATION_ID".into(), "default".into()),
+            ("MAESTRO_WORKSPACE_ID".into(), "workspace-1".into()),
+            ("MAESTRO_SANDBOX_ID".into(), sandbox_id.to_string()),
+            ("MAESTRO_PLACEMENT_GENERATION".into(), "1".into()),
+            ("MAESTRO_RUNNER_SESSION_ID".into(), runner_session_id.into()),
+        ]),
+        restart_policy: ResidentProcessRestartPolicy::OnFailure,
+        expected_generation: 0,
+        bootstrap: None,
+    };
+    let mut redirected_exchange = request.clone();
+    redirected_exchange.env.insert(
+        "MAESTRO_IDENTITY_EXCHANGE_URL".into(),
+        "https://attacker.internal.example/exchange".into(),
+    );
+    let redirected = client
+        .put(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url
+        ))
+        .json(&redirected_exchange)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(redirected.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let created: ResidentProcessResponse = client
+        .put(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url
+        ))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(created.resident_process.bootstrap_sha256.is_none());
+
+    let worker_http = worker_client(&worker);
+    let claimed: ClaimLeaseResponse = worker_http
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox_id),
+            kinds: Some(vec![JobKind::RunResidentProcess]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claimed.lease.expect("Maestro lease");
+    assert_eq!(
+        lease.job.payload["name"],
+        MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
+    );
+    let pod_uid = Uuid::now_v7();
+    worker_http
+        .post(format!(
+            "{}/resident-processes/{}/observations",
+            server.base_url, created.resident_process.id
+        ))
+        .json(&ResidentProcessObservationRequest {
+            generation: created.resident_process.generation,
+            lease_id: lease.id.0,
+            observed_state: ResidentProcessObservedState::Running,
+            pid: None,
+            exit_code: None,
+            error_code: None,
+            error_message: None,
+            provider_pod_name: Some("maestro-hosted-runner-pod".into()),
+            provider_pod_uid: Some(pod_uid.to_string()),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let binding = ValidateMaestroWorkloadIdentityRequest {
+        organization_id: "default".into(),
+        workspace_id: "workspace-1".into(),
+        sandbox_id,
+        pod_uid,
+        generation: 1,
+        runner_session_id: runner_session_id.into(),
+    };
+    let validated_response = client
+        .post(format!(
+            "{}/v1/maestro-workload-identities/validate",
+            server.base_url
+        ))
+        .json(&binding)
+        .send()
+        .await
+        .unwrap();
+    let validation_status = validated_response.status();
+    let validation_body = validated_response.text().await.unwrap();
+    assert_eq!(
+        validation_status,
+        reqwest::StatusCode::OK,
+        "{validation_body}"
+    );
+    let validated: MaestroWorkloadIdentityResponse =
+        serde_json::from_str(&validation_body).unwrap();
+    assert!(validated.active);
+    assert_eq!(validated.pod_uid, pod_uid);
+    assert_eq!(validated.generation, 1);
+    assert_eq!(validated.lease_id, lease.id.0);
+    assert_eq!(validated.worker_id, worker.worker.id);
+    assert_eq!(validated.service_port, MAESTRO_HOSTED_RUNNER_CONTAINER_PORT);
+    assert_eq!(
+        validated.runtime_image,
+        "ghcr.io/evalops/maestro@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    );
+    assert_eq!(
+        validated.service_account_name,
+        MAESTRO_HOSTED_RUNNER_SERVICE_ACCOUNT
+    );
+    assert!(validated.lease_expires_at_epoch_seconds > chrono::Utc::now().timestamp());
+
+    let stale = client
+        .post(format!(
+            "{}/v1/maestro-workload-identities/validate",
+            server.base_url
+        ))
+        .json(&ValidateMaestroWorkloadIdentityRequest {
+            generation: 2,
+            ..binding
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), reqwest::StatusCode::CONFLICT);
 }
 
 async fn set_provider_isolation_version(

@@ -268,14 +268,19 @@ pub(crate) async fn claim_lease(
             else {
                 continue;
             };
-            let is_sidecar = job.payload.get("name").and_then(serde_json::Value::as_str)
-                == Some(ORB_SIDECAR_RESIDENT_PROCESS_NAME);
-            if is_sidecar == ctx.guest_sandbox_id().is_some()
+            let process_name = job.payload.get("name").and_then(serde_json::Value::as_str);
+            let is_provider_isolated = matches!(
+                process_name,
+                Some(
+                    ORB_SIDECAR_RESIDENT_PROCESS_NAME | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
+                )
+            );
+            if is_provider_isolated == ctx.guest_sandbox_id().is_some()
                 || !worker_owns_sandbox(&state.db, worker.id, sandbox_id).await?
             {
                 continue;
             }
-            if is_sidecar
+            if is_provider_isolated
                 && worker
                     .labels
                     .get(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL)
@@ -284,10 +289,18 @@ pub(crate) async fn claim_lease(
             {
                 continue;
             }
+            if process_name == Some(MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME)
+                && worker
+                    .labels
+                    .get(MAESTRO_HOSTED_RUNNER_IMAGE_LABEL)
+                    .is_none_or(|image| !image.contains("@sha256:"))
+            {
+                continue;
+            }
             if !guest_has_uid_isolated_resident_process {
                 continue;
             }
-            if !is_sidecar
+            if !is_provider_isolated
                 && !executor_sidecar_is_ready_for_claim(&state.db, sandbox_id, &job.tenant_id)
                     .await?
             {

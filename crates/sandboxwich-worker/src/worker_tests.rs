@@ -1084,7 +1084,7 @@ fn provider_isolated_sidecar_restart_policy_is_bounded_like_the_guest_supervisor
     let outcome = execute_isolated_resident_process_job(
         &resident_job(ResidentProcessRestartPolicy::OnFailure),
         sandboxwich_core::LeaseId::new(),
-        resident_bootstrap(),
+        Some(resident_bootstrap()),
         &provider,
         &cancellation.signal,
         &cancellation,
@@ -1122,7 +1122,7 @@ fn provider_isolated_sidecar_distinguishes_desired_stop_from_lease_loss() {
         let outcome = execute_isolated_resident_process_job(
             &resident_job(ResidentProcessRestartPolicy::Never),
             sandboxwich_core::LeaseId::new(),
-            resident_bootstrap(),
+            Some(resident_bootstrap()),
             &provider,
             &cancellation.signal,
             &cancellation,

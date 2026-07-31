@@ -1872,6 +1872,38 @@ pub const RESIDENT_PLACEMENT_ATTESTATION_FILE: &str =
 /// [`resident_process_run_as_uid`]).
 pub const ORB_EXECUTOR_RESIDENT_PROCESS_NAME: &str = "orb-executor";
 
+/// The generation-fenced Maestro control plane for a sandbox. This process is
+/// never executed by the guest agent: Kubernetes apply workers must place it
+/// in its own Pod with a dedicated service account and projected, short-lived
+/// workload identity.
+pub const MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME: &str = "maestro-hosted-runner";
+pub const MAESTRO_HOSTED_RUNNER_CONTAINER_PORT: u16 = 8443;
+pub const MAESTRO_HOSTED_RUNNER_SERVICE_ACCOUNT: &str = "maestro-workload";
+pub const MAESTRO_HOSTED_RUNNER_TOKEN_AUDIENCE: &str =
+    "https://identity.evalops.dev/v1/workload-certificates";
+pub const MAESTRO_HOSTED_RUNNER_TOKEN_DIRECTORY: &str = "/var/run/secrets/evalops.dev/identity";
+pub const MAESTRO_HOSTED_RUNNER_TOKEN_FILE: &str = "/var/run/secrets/evalops.dev/identity/token";
+pub const MAESTRO_HOSTED_RUNNER_IDENTITY_CA_FILE: &str =
+    "/var/run/secrets/evalops.dev/identity/ca.crt";
+pub const MAESTRO_HOSTED_RUNNER_IDENTITY_CA_SECRET: &str = "maestro-identity-server-ca";
+pub const MAESTRO_HOSTED_RUNNER_IDENTITY_EXCHANGE_URL: &str = "https://identity-service.evalops.svc.cluster.local:8080/internal/v1/kubernetes-workload-certificates/exchange";
+pub const MAESTRO_HOSTED_RUNNER_IMAGE_LABEL: &str = "maestro_hosted_runner_image";
+
+pub fn maestro_hosted_runner_service_name(
+    process_id: ResidentProcessId,
+    generation: u64,
+    lease_id: Uuid,
+) -> String {
+    let process = process_id.0.simple().to_string();
+    let lease = lease_id.simple().to_string();
+    format!(
+        "sw-msvc-{}-g{}-{}",
+        &process[..12],
+        generation,
+        &lease[lease.len() - 12..]
+    )
+}
+
 /// The v1 credential sidecar (evalops/orb#296, evalops/sandboxwich#176): a
 /// second resident process, one per sandbox, that is spawned under
 /// [`ORB_SIDECAR_RESIDENT_PROCESS_UID`] rather than the agent workload's own
@@ -1898,13 +1930,16 @@ pub const ORB_SIDECAR_RESIDENT_PROCESS_NAME: &str = "orb-sidecar";
 pub const ORB_SIDECAR_RESIDENT_PROCESS_UID: u32 = 10111;
 
 /// Whether `name` is a resident-process kind the API accepts. v1 supports
-/// exactly two: the agent workload (`orb-executor`) and the credential
-/// sidecar (`orb-sidecar`), each limited to one live instance per sandbox by
-/// the `unique(sandbox_id, name)` storage constraint.
+/// exactly three: the agent workload (`orb-executor`), the credential
+/// sidecar (`orb-sidecar`), and the provider-isolated Maestro control plane.
+/// Each is limited to one live instance per sandbox by the
+/// `unique(sandbox_id, name)` storage constraint.
 pub fn is_supported_resident_process_name(name: &str) -> bool {
     matches!(
         name,
-        ORB_EXECUTOR_RESIDENT_PROCESS_NAME | ORB_SIDECAR_RESIDENT_PROCESS_NAME
+        ORB_EXECUTOR_RESIDENT_PROCESS_NAME
+            | ORB_SIDECAR_RESIDENT_PROCESS_NAME
+            | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
     )
 }
 
@@ -2159,6 +2194,45 @@ pub struct ResidentPlacementClaims {
 pub struct ResidentPlacementAttestationResponse {
     pub ok: bool,
     pub claims: ResidentPlacementClaims,
+}
+
+/// Internal Identity-to-Sandboxwich live placement validation. This is not a
+/// bearer exchange: the caller must already be the authenticated Identity
+/// service, and every field is compared with Sandboxwich's authoritative
+/// resident-process, lease, placement, and observed Pod state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ValidateMaestroWorkloadIdentityRequest {
+    pub organization_id: String,
+    pub workspace_id: String,
+    pub sandbox_id: SandboxId,
+    pub pod_uid: Uuid,
+    pub generation: u64,
+    pub runner_session_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct MaestroWorkloadIdentityResponse {
+    pub active: bool,
+    pub organization_id: String,
+    pub workspace_id: String,
+    pub sandbox_id: SandboxId,
+    pub pod_name: String,
+    pub pod_uid: Uuid,
+    pub generation: u64,
+    pub runner_session_id: String,
+    pub runtime_image: String,
+    pub service_account_namespace: String,
+    pub service_account_name: String,
+    pub service_name: String,
+    pub service_port: u16,
+    pub resident_process_generation: u64,
+    pub lease_id: Uuid,
+    pub lease_attempt: u64,
+    pub lease_expires_at_epoch_seconds: i64,
+    #[schema(value_type = Uuid)]
+    pub worker_id: WorkerId,
 }
 
 impl fmt::Debug for ResidentProcessRequest {
