@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 0.1.6 - 2026-07-31
+### Added
+
+- *(kubernetes)* Host WIF-bound Maestro runners
+- *(kubernetes)* Host generation-fenced Maestro runners
+
+### Fixed
+
+- *(identity)* Pin Maestro exchange trust
+- *(identity)* Preserve projected-token rotation
+
+### Other
+
+- Revert "feat(kubernetes): host generation-fenced Maestro runners"
+
 ## 0.1.5 - 2026-07-28
 ### Other
 
