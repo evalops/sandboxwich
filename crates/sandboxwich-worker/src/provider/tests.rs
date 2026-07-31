@@ -201,7 +201,7 @@ fn maestro_hosted_runner_spec() -> IsolatedResidentProcessSpec {
             ),
             (
                 "MAESTRO_IDENTITY_EXCHANGE_URL".to_string(),
-                "https://identity.evalops.svc/v1/workload-certificates".to_string(),
+                sandboxwich_core::MAESTRO_HOSTED_RUNNER_IDENTITY_EXCHANGE_URL.to_string(),
             ),
             ("MAESTRO_ORGANIZATION_ID".to_string(), "org-1".to_string()),
             (
@@ -264,14 +264,20 @@ fn maestro_hosted_runner_uses_only_projected_identity_in_an_isolated_pod() {
     );
     assert_eq!(
         pod["spec"]["containers"][0]["volumeMounts"][1]["mountPath"],
-        sandboxwich_core::MAESTRO_HOSTED_RUNNER_TOKEN_FILE
+        sandboxwich_core::MAESTRO_HOSTED_RUNNER_TOKEN_DIRECTORY
+    );
+    assert!(
+        pod["spec"]["containers"][0]["volumeMounts"][1]
+            .get("subPath")
+            .is_none(),
+        "projected-token rotation requires mounting the containing directory"
     );
     assert_eq!(
         service["spec"]["ports"][0]["port"],
         sandboxwich_core::MAESTRO_HOSTED_RUNNER_CONTAINER_PORT
     );
     assert_eq!(
-        policy["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/name"],
+        policy["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"]["app"],
         "runner-host"
     );
     let rendered = serde_json::to_string(&manifests).expect("render manifests");
@@ -305,6 +311,32 @@ fn maestro_hosted_runner_rejects_static_bootstrap_material() {
             .expect_err("static Maestro bootstrap must fail closed")
             .to_string()
             .contains("forbids static bootstrap")
+    );
+}
+
+#[test]
+fn maestro_hosted_runner_rejects_redirected_identity_exchange() {
+    let provider = KubernetesApplyProvider::new(
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Gvisor)
+            .with_runtime_class_name(Some("gvisor".to_string())),
+        "kubectl",
+    )
+    .with_maestro_hosted_runner_image(Some(format!(
+        "ghcr.io/evalops/maestro@sha256:{}",
+        "a".repeat(64)
+    )));
+    let mut spec = maestro_hosted_runner_spec();
+    spec.env.insert(
+        "MAESTRO_IDENTITY_EXCHANGE_URL".into(),
+        "https://attacker.internal.example/exchange".into(),
+    );
+    assert!(
+        provider
+            .isolated_resident_process_manifests(&spec)
+            .expect_err("redirected Identity exchange must fail closed")
+            .to_string()
+            .contains("canonical Identity exchange URL")
     );
 }
 

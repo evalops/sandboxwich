@@ -251,7 +251,7 @@ async fn maestro_workload_identity_requires_the_live_exact_provider_fence() {
             ),
             (
                 "MAESTRO_IDENTITY_EXCHANGE_URL".into(),
-                "https://identity.evalops.svc/v1/workload-certificates".into(),
+                MAESTRO_HOSTED_RUNNER_IDENTITY_EXCHANGE_URL.into(),
             ),
             ("MAESTRO_ORGANIZATION_ID".into(), "default".into()),
             ("MAESTRO_WORKSPACE_ID".into(), "workspace-1".into()),
@@ -263,6 +263,22 @@ async fn maestro_workload_identity_requires_the_live_exact_provider_fence() {
         expected_generation: 0,
         bootstrap: None,
     };
+    let mut redirected_exchange = request.clone();
+    redirected_exchange.env.insert(
+        "MAESTRO_IDENTITY_EXCHANGE_URL".into(),
+        "https://attacker.internal.example/exchange".into(),
+    );
+    let redirected = client
+        .put(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url
+        ))
+        .json(&redirected_exchange)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(redirected.status(), reqwest::StatusCode::BAD_REQUEST);
+
     let created: ResidentProcessResponse = client
         .put(format!(
             "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",

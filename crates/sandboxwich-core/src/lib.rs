@@ -1881,7 +1881,9 @@ pub const MAESTRO_HOSTED_RUNNER_CONTAINER_PORT: u16 = 8443;
 pub const MAESTRO_HOSTED_RUNNER_SERVICE_ACCOUNT: &str = "maestro-workload";
 pub const MAESTRO_HOSTED_RUNNER_TOKEN_AUDIENCE: &str =
     "https://identity.evalops.dev/v1/workload-certificates";
+pub const MAESTRO_HOSTED_RUNNER_TOKEN_DIRECTORY: &str = "/var/run/secrets/evalops.dev/identity";
 pub const MAESTRO_HOSTED_RUNNER_TOKEN_FILE: &str = "/var/run/secrets/evalops.dev/identity/token";
+pub const MAESTRO_HOSTED_RUNNER_IDENTITY_EXCHANGE_URL: &str = "https://identity-service.evalops.svc.cluster.local:8080/internal/v1/kubernetes-workload-certificates/exchange";
 pub const MAESTRO_HOSTED_RUNNER_IMAGE_LABEL: &str = "maestro_hosted_runner_image";
 
 pub fn maestro_hosted_runner_service_name(

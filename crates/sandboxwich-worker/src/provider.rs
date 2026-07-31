@@ -17,8 +17,9 @@ use clap::ValueEnum;
 use ipnet::IpNet;
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, DbVariant, ExecutionClass, HomeId,
-    MAESTRO_HOSTED_RUNNER_CONTAINER_PORT, MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME,
-    MAESTRO_HOSTED_RUNNER_SERVICE_ACCOUNT, MAESTRO_HOSTED_RUNNER_TOKEN_AUDIENCE,
+    MAESTRO_HOSTED_RUNNER_CONTAINER_PORT, MAESTRO_HOSTED_RUNNER_IDENTITY_EXCHANGE_URL,
+    MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME, MAESTRO_HOSTED_RUNNER_SERVICE_ACCOUNT,
+    MAESTRO_HOSTED_RUNNER_TOKEN_AUDIENCE, MAESTRO_HOSTED_RUNNER_TOKEN_DIRECTORY,
     MAESTRO_HOSTED_RUNNER_TOKEN_FILE, MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES, MAX_SANDBOX_FILE_BYTES,
     MaterializeFileDestination, MaterializeFileObservation, MemoryLimit, NetworkAllowRuleKind,
     NetworkEgress, ORB_SIDECAR_RESIDENT_PROCESS_UID,
@@ -4242,6 +4243,13 @@ impl KubernetesApplyProvider {
                     == Some(MAESTRO_HOSTED_RUNNER_TOKEN_FILE),
                 "Maestro hosted runner requires the projected workload token path"
             );
+            anyhow::ensure!(
+                spec.env
+                    .get("MAESTRO_IDENTITY_EXCHANGE_URL")
+                    .map(String::as_str)
+                    == Some(MAESTRO_HOSTED_RUNNER_IDENTITY_EXCHANGE_URL),
+                "Maestro hosted runner requires the canonical Identity exchange URL"
+            );
         } else {
             let bootstrap = spec
                 .bootstrap
@@ -4340,7 +4348,7 @@ impl KubernetesApplyProvider {
                     },
                     "podSelector": {
                         "matchLabels": {
-                            "app.kubernetes.io/name": "runner-host"
+                            "app": "runner-host"
                         }
                     }
                 }],
@@ -4410,8 +4418,7 @@ impl KubernetesApplyProvider {
                 .expect("volumeMounts is an array")
                 .push(json!({
                     "name": "workload-identity",
-                    "mountPath": MAESTRO_HOSTED_RUNNER_TOKEN_FILE,
-                    "subPath": "token",
+                    "mountPath": MAESTRO_HOSTED_RUNNER_TOKEN_DIRECTORY,
                     "readOnly": true,
                 }));
         } else {

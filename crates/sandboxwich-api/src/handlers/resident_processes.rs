@@ -534,7 +534,8 @@ pub(crate) async fn put_resident_process(
             || request
                 .env
                 .get("MAESTRO_IDENTITY_EXCHANGE_URL")
-                .is_none_or(|url| !url.starts_with("https://"))
+                .map(String::as_str)
+                != Some(MAESTRO_HOSTED_RUNNER_IDENTITY_EXCHANGE_URL)
             || request
                 .env
                 .get("MAESTRO_SANDBOX_ID")
