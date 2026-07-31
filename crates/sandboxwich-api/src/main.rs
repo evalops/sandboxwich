@@ -8,6 +8,7 @@ mod error;
 mod handlers;
 mod health;
 mod idempotency;
+mod identity_mtls;
 mod limits;
 mod pagination;
 mod reap;
@@ -33,6 +34,7 @@ use crate::config::{ApiCommand, load_api_config};
 use crate::db::connect_database;
 use crate::db::migrate_database;
 use crate::db::verify_database_schema;
+use crate::identity_mtls::{identity_app, identity_tls_config};
 use crate::routes::app;
 use crate::scheduler::spawn_expiry_sweeper;
 use crate::state::{AppState, ResidentBootstrapStore};
@@ -101,31 +103,74 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("failed to bind SANDBOXWICH_BIND={}", config.bind))?;
     tracing::info!(addr = %config.bind, database_url = %config.database_url, "sandboxwich-api listening");
-    axum::serve(
-        listener,
-        app(AppState {
-            db,
-            auth: AuthConfig {
-                shared_token: config.shared_token,
-                tenant_tokens: config.tenant_tokens,
-                operator_token: config.operator_token,
-                allow_insecure_no_auth: config.allow_insecure_no_auth,
-            },
-            default_tenant_id: config.default_tenant_id,
-            apex_callback_base_url: config.apex_callback_base_url,
-            placement_attestation_derivation_key: config
-                .placement_attestation_derivation_key
-                .map(Arc::<str>::from),
-            apex_waiters: Default::default(),
-            resident_bootstraps,
-            sandbox_lifetime: config.sandbox_lifetime,
-            #[cfg(test)]
-            apex_callback_test_hook: None,
-        }),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    let state = AppState {
+        db,
+        auth: AuthConfig {
+            shared_token: config.shared_token,
+            tenant_tokens: config.tenant_tokens,
+            operator_token: config.operator_token,
+            allow_insecure_no_auth: config.allow_insecure_no_auth,
+        },
+        default_tenant_id: config.default_tenant_id,
+        apex_callback_base_url: config.apex_callback_base_url,
+        placement_attestation_derivation_key: config
+            .placement_attestation_derivation_key
+            .map(Arc::<str>::from),
+        apex_waiters: Default::default(),
+        resident_bootstraps,
+        sandbox_lifetime: config.sandbox_lifetime,
+        #[cfg(test)]
+        apex_callback_test_hook: None,
+    };
+
+    if let Some(identity_mtls) = config.identity_mtls {
+        let tls = identity_tls_config(&identity_mtls)?;
+        let identity_listener =
+            std::net::TcpListener::bind(identity_mtls.bind).with_context(|| {
+                format!(
+                    "failed to bind SANDBOXWICH_IDENTITY_MTLS_BIND={}",
+                    identity_mtls.bind
+                )
+            })?;
+        let identity_address = identity_listener
+            .local_addr()
+            .context("failed to inspect Identity mTLS listener address")?;
+        tracing::info!(addr = %identity_address, "sandboxwich-api Identity mTLS fence listening");
+
+        let (shutdown_tx, tenant_shutdown) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            let _ = shutdown_tx.send(true);
+        });
+
+        let identity_handle = axum_server::Handle::new();
+        let identity_shutdown_handle = identity_handle.clone();
+        let identity_shutdown = tenant_shutdown.clone();
+        tokio::spawn(async move {
+            wait_for_shutdown(identity_shutdown).await;
+            identity_shutdown_handle.graceful_shutdown(Some(Duration::from_secs(30)));
+        });
+
+        let tenant_server = axum::serve(listener, app(state.clone()))
+            .with_graceful_shutdown(wait_for_shutdown(tenant_shutdown));
+        let identity_server = axum_server::from_tcp_rustls(identity_listener, tls)
+            .handle(identity_handle)
+            .serve(identity_app(state).into_make_service());
+        tokio::try_join!(tenant_server, identity_server)?;
+    } else {
+        axum::serve(listener, app(state))
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+    }
     Ok(())
+}
+
+async fn wait_for_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            break;
+        }
+    }
 }
 
 /// Waits for whichever shutdown signal the runtime environment sends first.

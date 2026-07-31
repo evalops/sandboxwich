@@ -1,5 +1,6 @@
 use crate::db::Database;
 use crate::error::ApiError;
+use crate::identity_mtls::IdentityServiceContext;
 use crate::rows::{parse_timestamp, parse_uuid};
 use crate::state::{AppState, TenantContext};
 use axum::Json;
@@ -14,6 +15,7 @@ use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::collections::BTreeMap;
 use subtle::ConstantTimeEq;
+use url::Url;
 use uuid::Uuid;
 
 const ATTESTATION_VERSION: u32 = 2;
@@ -86,11 +88,12 @@ async fn placement_fence(
 ) -> Result<PlacementFence, ApiError> {
     let sql = format!(
         "select rp.name, rp.provider_isolation_version, rp.provider_pod_name, rp.provider_pod_uid,
-                jl.attempt, jl.job_id, jl.worker_id,
+                jl.attempt, jl.job_id, jl.worker_id, j.kind as job_kind, j.payload as job_payload,
                 jl.status, jl.expires_at, sp.worker_id as placement_worker_id,
                 sp.generation as placement_generation, w.labels
          from resident_processes rp
          join job_leases jl on jl.id = rp.active_lease_id
+         join jobs j on j.id = jl.job_id
          join sandbox_placements sp on sp.sandbox_id = rp.sandbox_id
          join workers w on w.id = jl.worker_id
          where rp.id = {} and rp.tenant_id = {} and rp.generation = {}
@@ -124,6 +127,17 @@ async fn placement_fence(
         || lease_expires_at <= Utc::now()
     {
         return Err(not_live("resident placement lease is no longer active"));
+    }
+    let job_payload: Value = serde_json::from_str(&row.try_get::<String, _>("job_payload")?)
+        .map_err(|_| ApiError::internal("resident placement job payload is invalid"))?;
+    if row.try_get::<String, _>("job_kind")? != JobKind::RunResidentProcess.as_db_str()
+        || job_payload.get("residentProcessId").and_then(Value::as_str)
+            != Some(process_id.to_string().as_str())
+        || job_payload.get("generation").and_then(Value::as_u64) != Some(generation)
+    {
+        return Err(not_live(
+            "resident placement lease does not match the current process generation",
+        ));
     }
     let labels = parse_labels(&row.try_get::<String, _>("labels")?)?;
     let provider_mode = label(&labels, "provider_mode")?.to_string();
@@ -164,6 +178,204 @@ async fn placement_fence(
         provider_pod_name: row.try_get("provider_pod_name")?,
         provider_pod_uid: row.try_get("provider_pod_uid")?,
     })
+}
+
+struct MaestroUriComponents<'a> {
+    organization_id: &'a str,
+    workspace_id: &'a str,
+    sandbox_id: SandboxId,
+    pod_uid: Uuid,
+    placement_generation: u64,
+    runner_session_id: &'a str,
+    runtime_image: &'a str,
+    service_name: &'a str,
+    resident_process_generation: u64,
+    lease_id: Uuid,
+    fence: &'a PlacementFence,
+}
+
+fn maestro_expected_server_uri_san(binding: &MaestroUriComponents<'_>) -> Result<String, ApiError> {
+    let digest = binding
+        .runtime_image
+        .rsplit_once("@sha256:")
+        .map(|(_, digest)| digest)
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| not_live("Maestro runtime image digest is invalid"))?;
+    let sandbox_id = binding.sandbox_id.to_string();
+    let pod_uid = binding.pod_uid.to_string();
+    let placement_generation = binding.placement_generation.to_string();
+    let service_port = MAESTRO_HOSTED_RUNNER_CONTAINER_PORT.to_string();
+    let process_generation = binding.resident_process_generation.to_string();
+    let lease_id = binding.lease_id.to_string();
+    let lease_attempt = binding.fence.lease_attempt.to_string();
+    let worker_id = binding.fence.worker_id.to_string();
+    let mut uri = Url::parse("spiffe://identity.evalops.dev/")
+        .map_err(|_| ApiError::internal("Maestro URI SAN base is invalid"))?;
+    uri.path_segments_mut()
+        .map_err(|_| ApiError::internal("Maestro URI SAN cannot contain path segments"))?
+        .extend([
+            "maestro",
+            "v1",
+            "organizations",
+            binding.organization_id,
+            "workspaces",
+            binding.workspace_id,
+            "sandboxes",
+            &sandbox_id,
+            "pods",
+            &pod_uid,
+            "generations",
+            &placement_generation,
+            "sessions",
+            binding.runner_session_id,
+            "images",
+            digest,
+            "services",
+            binding.service_name,
+            "ports",
+            &service_port,
+            "resident-process-generations",
+            &process_generation,
+            "leases",
+            &lease_id,
+            "attempts",
+            &lease_attempt,
+            "workers",
+            &worker_id,
+        ]);
+    Ok(uri.to_string())
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/connection-binding",
+    params(("sandbox_id" = Uuid, Path)),
+    responses(
+        (status = 200, description = "Live tenant-scoped Maestro connection and exact server certificate binding", body = MaestroHostedRunnerConnectionBindingResponse),
+        (status = 404, description = "No tenant-scoped Maestro hosted runner exists", body = ErrorEnvelope),
+        (status = 409, description = "The Maestro placement is not live", body = ErrorEnvelope)
+    )
+)]
+pub(crate) async fn get_maestro_connection_binding(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    axum::extract::Path(sandbox_id): axum::extract::Path<Uuid>,
+) -> Result<Json<MaestroHostedRunnerConnectionBindingResponse>, ApiError> {
+    let sandbox_id = SandboxId(sandbox_id);
+    let sql = format!(
+        "select rp.id, rp.generation, rp.active_lease_id, rp.env,
+                rp.desired_state, rp.observed_state, rp.provider_pod_uid, w.labels
+         from resident_processes rp
+         join sandbox_placements sp on sp.sandbox_id = rp.sandbox_id
+         join workers w on w.id = sp.worker_id
+         where rp.sandbox_id = {} and rp.tenant_id = {} and rp.name = {}",
+        state.db.placeholder(1),
+        state.db.placeholder(2),
+        state.db.placeholder(3),
+    );
+    let row = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .bind(&ctx.tenant_id)
+        .bind(MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME)
+        .fetch_optional(&state.db.pool)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Maestro hosted runner not found"))?;
+    if row.try_get::<String, _>("desired_state")?
+        != ResidentProcessDesiredState::Running.as_db_str()
+        || row.try_get::<String, _>("observed_state")?
+            != ResidentProcessObservedState::Running.as_db_str()
+    {
+        return Err(not_live("Maestro hosted runner is not running"));
+    }
+    let process_id = ResidentProcessId(parse_uuid(&row.try_get::<String, _>("id")?)?);
+    let process_generation = parse_u64(row.try_get("generation")?, "resident generation")?;
+    let lease_id = parse_uuid(
+        &row.try_get::<String, _>("active_lease_id")
+            .map_err(|_| not_live("Maestro hosted runner has no active lease"))?,
+    )?;
+    let pod_uid = row
+        .try_get::<Option<String>, _>("provider_pod_uid")?
+        .and_then(|value| Uuid::parse_str(&value).ok())
+        .ok_or_else(|| not_live("Maestro placement has no authoritative Pod UID"))?;
+    let env: BTreeMap<String, String> = serde_json::from_str(&row.try_get::<String, _>("env")?)
+        .map_err(|_| ApiError::internal("Maestro resident environment is invalid"))?;
+    let organization_id = env
+        .get("MAESTRO_ORGANIZATION_ID")
+        .filter(|value| value.as_str() == ctx.tenant_id)
+        .ok_or_else(|| not_live("Maestro organization binding is invalid"))?;
+    let workspace_id = env
+        .get("MAESTRO_WORKSPACE_ID")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| not_live("Maestro workspace binding is invalid"))?;
+    let runner_session_id = env
+        .get("MAESTRO_RUNNER_SESSION_ID")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| not_live("Maestro runner session binding is invalid"))?;
+    if env
+        .get("MAESTRO_SANDBOX_ID")
+        .and_then(|value| Uuid::parse_str(value).ok())
+        != Some(sandbox_id.0)
+    {
+        return Err(not_live("Maestro sandbox binding is invalid"));
+    }
+    let fence = placement_fence(
+        &state.db,
+        &ctx.tenant_id,
+        process_id,
+        process_generation,
+        lease_id,
+    )
+    .await?;
+    let placement_generation = env
+        .get("MAESTRO_PLACEMENT_GENERATION")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|generation| *generation == fence.placement_generation)
+        .ok_or_else(|| not_live("Maestro placement generation binding is stale"))?;
+    if fence
+        .provider_pod_uid
+        .as_deref()
+        .and_then(|value| Uuid::parse_str(value).ok())
+        != Some(pod_uid)
+    {
+        return Err(not_live("Maestro provider Pod binding is stale"));
+    }
+    let labels = parse_labels(&row.try_get::<String, _>("labels")?)?;
+    let service_namespace = label(&labels, "sandbox_namespace")?.to_string();
+    let service_name = maestro_hosted_runner_service_name(process_id, process_generation, lease_id);
+    let service_host = format!("{service_name}.{service_namespace}.svc.cluster.local");
+    let expected_server_uri_san = maestro_expected_server_uri_san(&MaestroUriComponents {
+        organization_id,
+        workspace_id,
+        sandbox_id,
+        pod_uid,
+        placement_generation,
+        runner_session_id,
+        runtime_image: &fence.runtime_image,
+        service_name: &service_name,
+        resident_process_generation: process_generation,
+        lease_id,
+        fence: &fence,
+    })?;
+    Ok(Json(MaestroHostedRunnerConnectionBindingResponse {
+        ok: true,
+        organization_id: organization_id.clone(),
+        workspace_id: workspace_id.clone(),
+        sandbox_id,
+        pod_uid,
+        placement_generation,
+        runner_session_id: runner_session_id.clone(),
+        runtime_image: fence.runtime_image,
+        service_namespace,
+        service_name,
+        service_host,
+        service_port: MAESTRO_HOSTED_RUNNER_CONTAINER_PORT,
+        expected_server_uri_san,
+        resident_process_generation: process_generation,
+        lease_id,
+        lease_attempt: fence.lease_attempt,
+        lease_expires_at_epoch_seconds: fence.lease_expires_at.timestamp(),
+        worker_id: fence.worker_id,
+    }))
 }
 
 fn token_for(key: &str, record: &AttestationRecord) -> String {
@@ -700,10 +912,10 @@ pub(crate) async fn validate_resident_placement_attestation(
 )]
 pub(crate) async fn validate_maestro_workload_identity(
     State(state): State<AppState>,
-    Extension(ctx): Extension<TenantContext>,
+    Extension(_identity_service): Extension<IdentityServiceContext>,
     Json(request): Json<ValidateMaestroWorkloadIdentityRequest>,
 ) -> Result<Json<MaestroWorkloadIdentityResponse>, ApiError> {
-    if request.organization_id != ctx.tenant_id
+    if request.organization_id.trim().is_empty()
         || request.workspace_id.trim().is_empty()
         || request.runner_session_id.trim().is_empty()
         || request.generation == 0
@@ -723,7 +935,7 @@ pub(crate) async fn validate_maestro_workload_identity(
         state.db.placeholder(3),
     );
     let row = sqlx::query(&sql)
-        .bind(&ctx.tenant_id)
+        .bind(&request.organization_id)
         .bind(request.sandbox_id.to_string())
         .bind(MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME)
         .fetch_optional(&state.db.pool)
@@ -771,7 +983,7 @@ pub(crate) async fn validate_maestro_workload_identity(
     }
     let fence = placement_fence(
         &state.db,
-        &ctx.tenant_id,
+        &request.organization_id,
         process_id,
         process_generation,
         lease_id,

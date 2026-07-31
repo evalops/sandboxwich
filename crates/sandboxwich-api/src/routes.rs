@@ -72,6 +72,10 @@ pub(crate) fn app(state: AppState) -> Router {
             get(get_resident_process).put(put_resident_process),
         )
         .route(
+            "/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/connection-binding",
+            get(get_maestro_connection_binding),
+        )
+        .route(
             "/sandboxes/{sandbox_id}/resident-processes/{name}/stop",
             post(stop_resident_process),
         )
@@ -170,10 +174,6 @@ pub(crate) fn app(state: AppState) -> Router {
         .route(
             "/resident-placement-attestations/validate",
             post(validate_resident_placement_attestation),
-        )
-        .route(
-            "/maestro-workload-identities/validate",
-            post(validate_maestro_workload_identity),
         )
         .route_layer(middleware::from_fn(require_tenant_principal));
 
