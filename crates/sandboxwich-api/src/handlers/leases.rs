@@ -443,13 +443,7 @@ pub(crate) fn worker_supports_runtime_profile(worker: &Worker, job: &Job) -> boo
     let Some((spec, requested_image)) = authoritative_placement(job) else {
         return false;
     };
-    if spec.runtime_profile == SandboxRuntimeProfile::MaestroHostedRunnerV1 {
-        return worker
-            .labels
-            .get("maestro_hosted_runner_image")
-            .is_some_and(|image| immutable_sha256_image(image));
-    }
-    if spec.runtime_profile == SandboxRuntimeProfile::Unprivileged {
+    if spec.runtime_profile != SandboxRuntimeProfile::ApexTrustedSupervisorV1 {
         return true;
     }
     worker

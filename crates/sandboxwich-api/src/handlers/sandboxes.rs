@@ -78,15 +78,7 @@ pub(crate) fn validate_runtime_profile(
     network_egress: &NetworkEgress,
     runtime_image: Option<&str>,
 ) -> Result<(), ApiError> {
-    if *profile == SandboxRuntimeProfile::Unprivileged {
-        return Ok(());
-    }
-    if *profile == SandboxRuntimeProfile::MaestroHostedRunnerV1 {
-        if matches!(network_egress, NetworkEgress::AllowAll) {
-            return Err(ApiError::bad_request(
-                "maestro_hosted_runner_v1 requires deny-by-default egress",
-            ));
-        }
+    if *profile != SandboxRuntimeProfile::ApexTrustedSupervisorV1 {
         return Ok(());
     }
     if matches!(network_egress, NetworkEgress::AllowAll) {
@@ -431,7 +423,7 @@ async fn fetch_sandbox_placement_proof(
     }))
 }
 
-pub(crate) fn immutable_sha256_image(image: &str) -> bool {
+fn immutable_sha256_image(image: &str) -> bool {
     image.rsplit_once('@').is_some_and(|(_, digest)| {
         digest.len() == 71
             && digest.starts_with("sha256:")

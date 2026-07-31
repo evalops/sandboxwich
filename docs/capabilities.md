@@ -17,7 +17,7 @@ until its real provider path is exercised by an end-to-end conformance test.
 | Prompt/model execution | Unsupported | The current worker has no model executor. Dry-run acknowledgements are not model output. |
 | True resume after teardown | Unsupported | Stop destroys resources; create or fork a replacement instead. |
 | Guest-agent lease claim scoping | Experimental | Workers mint opaque `sbw_gtok_` credentials bound to one tenant, worker, sandbox, and expiry. Guest claims are limited to `run_command` and `run_resident_process`; the API rejects omitted filters, cross-sandbox claims, other job kinds, worker administration, expiry, and revocation. Raw tokens are returned once and stored only as SHA-256 hashes. |
-| Resident guest processes | Experimental | A tenant may create one `orb-executor` resident process per sandbox. The closed `maestro_hosted_runner_v1` profile additionally permits one `maestro-hosted-runner` generation with a fixed mounted binary/listener, file-backed auth bootstrap, and no plaintext auth argv or environment value. A typed, exactly versioned agent-capability report gates dispatch. Bootstrap bytes remain in one API process and may be retried only by the same generation/lease/digest fence until the agent acknowledges that exact process as `Starting`; durable rows contain only digest and byte count. API restart, replica failover, and cross-replica replay remain unsupported until a shared ephemeral handoff is added. |
+| Resident guest processes | Experimental | A tenant may create one `orb-executor` resident process per sandbox. A typed, exactly versioned agent-capability report gates dispatch. Bootstrap bytes remain in one API process and may be retried only by the same generation/lease/digest fence until the agent acknowledges that exact process as `Starting`; durable rows contain only digest and byte count. API restart, replica failover, and cross-replica replay remain unsupported until a shared ephemeral handoff is added. |
 | Provider-isolated sidecar (`orb-sidecar`, v2) | Experimental | An apply-mode Kubernetes worker advertises `provider_isolated_resident_process_version=2` only with a digest-pinned `SANDBOXWICH_ISOLATED_RESIDENT_PROCESS_IMAGE` and a nonempty RuntimeClass. V2 keeps the dedicated Pod, immutable transient Secret, separate namespaces, no service-account token, restrictive security context, fenced cleanup, and deny-all ingress from v1. It additionally places a one-time, hash-only Sandboxwich placement proof in a second sidecar-only Secret file, records the authoritative Pod UID from Kubernetes observation, supports tenant-authenticated redemption plus record-bound live validation for Orb, and allows only explicitly configured narrow private issuer CIDRs over TCP/443. V1 rows remain readable during rollout, but only v2 receives an attestation. The sidecar does **not** share guest localhost; integrations use explicit HTTPS. Executor bootstrap remains fail-closed unless the sidecar is `Running` under a live lease. |
 | Active-lifetime reaping (`max_lifetime_seconds`) | Experimental | Background sweep stops a live sandbox past a hard cap measured from `created_at`, through the same path a user-initiated stop uses. Deterministic and fully tested end-to-end. Off by default (`None`); an operator must configure `SANDBOXWICH_DEFAULT_MAX_LIFETIME_SECONDS` or a caller must pass `max_lifetime_seconds` for anything to be reaped. |
 | Active-lifetime reaping (`idle_ttl_seconds`) | Experimental | Same reap path as `max_lifetime_seconds`, but the deadline resets on the most recent of: the sandbox's last lifecycle-state transition, its most recently *queued* guest command, and `last_activity_at` -- a server-maintained timestamp bumped by SSH access, desktop access, and resident-process observation requests (throttled to at most once per 60s per sandbox; see `activity.rs`). Covers every guest-interaction surface this API currently exposes. |
@@ -80,17 +80,6 @@ execution_class=sandboxed_container, and a worker may advertise it only with
 --isolation-profile gvisor, a nonempty RuntimeClass, and the exact
 digest-pinned APEX image. Snapshot/fork and claim-time authoritative refresh
 preserve both dimensions; neither profile can downgrade the other.
-
-The closed `maestro_hosted_runner_v1` profile keeps the ordinary Sandboxwich
-guest image (and its required `sandboxwich-agent`) unchanged. A worker must be
-configured with a separate digest-pinned
-`SANDBOXWICH_MAESTRO_HOSTED_RUNNER_IMAGE`. Kubernetes copies only that image's
-`/usr/local/bin/maestro` into a dedicated `emptyDir` from an unprivileged,
-capability-free init container, then mounts the directory read-only into the
-guest. The profile adds a per-sandbox ClusterIP service on port 8080 and a
-separate NetworkPolicy ingress rule selecting only `runner-host` pods. The
-typed runtime-resource record carries the artifact digest; it never carries an
-access URL or auth token.
 
 
 Operators configure how workers satisfy that request:

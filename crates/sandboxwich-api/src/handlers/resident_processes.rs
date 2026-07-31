@@ -240,10 +240,7 @@ fn ensure_resident_owner_role(
     let owns_role = match (&process.name, ctx.principal) {
         (name, Principal::Worker(_)) if name == ORB_SIDECAR_RESIDENT_PROCESS_NAME => true,
         (name, Principal::Guest { sandbox_id, .. })
-            if matches!(
-                name.as_str(),
-                ORB_EXECUTOR_RESIDENT_PROCESS_NAME | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
-            ) && sandbox_id == process.sandbox_id =>
+            if name == ORB_EXECUTOR_RESIDENT_PROCESS_NAME && sandbox_id == process.sandbox_id =>
         {
             true
         }
@@ -463,7 +460,7 @@ pub(crate) async fn put_resident_process(
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     if !is_supported_resident_process_name(&name) {
         return Err(ApiError::bad_request(
-            "the resident-process contract supports only orb-executor, maestro-hosted-runner, and orb-sidecar",
+            "the resident-process contract supports only orb-executor and orb-sidecar",
         ));
     }
     if name == ORB_SIDECAR_RESIDENT_PROCESS_NAME
@@ -476,113 +473,8 @@ pub(crate) async fn put_resident_process(
             "orb-sidecar requires a non-empty bootstrap credential",
         ));
     }
-    if name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME {
-        let expected_prefix = [
-            MAESTRO_HOSTED_RUNNER_BINARY,
-            "hosted-runner",
-            "--listen",
-            "0.0.0.0:8080",
-        ];
-        if request.argv.iter().map(String::as_str).ne(expected_prefix) {
-            return Err(ApiError::bad_request(
-                "maestro-hosted-runner requires the fixed mounted binary and 0.0.0.0:8080 hosted-runner entrypoint",
-            ));
-        }
-        const ALLOWED_ENV: &[&str] = &[
-            MAESTRO_HOSTED_RUNNER_AUTH_TOKEN_FILE_ENV,
-            "MAESTRO_RUNNER_SESSION_ID",
-            "MAESTRO_REMOTE_RUNNER_OWNER_INSTANCE_ID",
-            "MAESTRO_WORKSPACE_ROOT",
-            "MAESTRO_REMOTE_RUNNER_SNAPSHOT_ROOT",
-            "MAESTRO_REMOTE_RUNNER_RESTORE_MANIFEST",
-            "MAESTRO_REMOTE_RUNNER_WORKSPACE_ID",
-            "MAESTRO_REMOTE_RUNNER_AGENT_ID",
-            "MAESTRO_AGENT_RUN_ID",
-            "MAESTRO_SESSION_ID",
-            "MAESTRO_ATTACH_AUDIENCE",
-            "MAESTRO_HEADLESS_CLI_PATH",
-        ];
-        if request.env.iter().any(|(key, value)| {
-            !ALLOWED_ENV.contains(&key.as_str())
-                || value.is_empty()
-                || value.len() > 512
-                || value.chars().any(char::is_control)
-        }) {
-            return Err(ApiError::bad_request(
-                "maestro-hosted-runner environment must use only bounded typed binding fields",
-            ));
-        }
-        if request
-            .env
-            .get(MAESTRO_HOSTED_RUNNER_AUTH_TOKEN_FILE_ENV)
-            .map(String::as_str)
-            != Some(MAESTRO_HOSTED_RUNNER_AUTH_TOKEN_FILE)
-            || request.env.contains_key("MAESTRO_HOSTED_RUNNER_AUTH_TOKEN")
-            || request.env.contains_key("MAESTRO_WEB_API_KEY")
-        {
-            return Err(ApiError::bad_request(
-                "maestro-hosted-runner requires file-backed auth and forbids plaintext auth environment values",
-            ));
-        }
-        for required in [
-            "MAESTRO_RUNNER_SESSION_ID",
-            "MAESTRO_REMOTE_RUNNER_OWNER_INSTANCE_ID",
-        ] {
-            if !request.env.contains_key(required) {
-                return Err(ApiError::bad_request(format!(
-                    "maestro-hosted-runner requires {required}"
-                )));
-            }
-        }
-        if request
-            .env
-            .get("MAESTRO_WORKSPACE_ROOT")
-            .map(String::as_str)
-            != Some("/workspace")
-            || request
-                .env
-                .get("MAESTRO_HEADLESS_CLI_PATH")
-                .map(String::as_str)
-                != Some(MAESTRO_HOSTED_RUNNER_BINARY)
-        {
-            return Err(ApiError::bad_request(
-                "maestro-hosted-runner requires fixed workspace and child-binary paths",
-            ));
-        }
-        for path_key in [
-            "MAESTRO_REMOTE_RUNNER_SNAPSHOT_ROOT",
-            "MAESTRO_REMOTE_RUNNER_RESTORE_MANIFEST",
-        ] {
-            if request.env.get(path_key).is_some_and(|path| {
-                !path.starts_with("/workspace/")
-                    || std::path::Path::new(path)
-                        .components()
-                        .any(|component| component == std::path::Component::ParentDir)
-            }) {
-                return Err(ApiError::bad_request(
-                    "maestro-hosted-runner snapshot paths must stay beneath /workspace",
-                ));
-            }
-        }
-        if request.bootstrap.as_ref().is_none_or(|bootstrap| {
-            bootstrap.content.is_empty()
-                || bootstrap.target_file != MAESTRO_HOSTED_RUNNER_AUTH_TOKEN_FILE
-                || bootstrap.mode != 0o600
-        }) {
-            return Err(ApiError::bad_request(
-                "maestro-hosted-runner requires a non-empty mode-0600 auth bootstrap at the fixed token-file path",
-            ));
-        }
-    }
     let sandbox_id = SandboxId(sandbox_id);
     let sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
-    if name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
-        && sandbox.runtime_profile != SandboxRuntimeProfile::MaestroHostedRunnerV1
-    {
-        return Err(ApiError::bad_request(
-            "maestro-hosted-runner requires the maestro_hosted_runner_v1 runtime profile",
-        ));
-    }
     if name == ORB_SIDECAR_RESIDENT_PROCESS_NAME
         && !placed_worker_supports_provider_isolated_resident_process(
             &state.db,

@@ -1016,7 +1016,6 @@ pub(crate) fn provider_resource(
             resource.service_port = Some(6080);
             resource.target_port = Some("desktop".to_string());
         }
-        RuntimeResourcePurpose::Maestro => {}
         RuntimeResourcePurpose::Network => {}
         RuntimeResourcePurpose::Snapshot => {}
     }

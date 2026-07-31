@@ -1671,21 +1671,10 @@ fn run_registration_labels_include_actual_placement_proof() {
         ("runtime_image".to_string(), "forged:latest".to_string()),
     ]);
 
-    let maestro_image = "registry.example/maestro@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-    add_placement_proof_labels(
-        &mut labels,
-        ProviderModeArg::Apply,
-        Some(image),
-        Some(maestro_image),
-        false,
-    );
+    add_placement_proof_labels(&mut labels, ProviderModeArg::Apply, Some(image), false);
 
     assert_eq!(labels.get("provider_mode"), Some(&"apply".to_string()));
     assert_eq!(labels.get("runtime_image"), Some(&image.to_string()));
-    assert_eq!(
-        labels.get("maestro_hosted_runner_image"),
-        Some(&maestro_image.to_string())
-    );
     assert!(!labels.contains_key("runtime_profile"));
 }
 
@@ -1699,7 +1688,6 @@ fn apex_registration_labels_include_closed_runtime_profile() {
         Some(
             "registry.example/sandbox@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         ),
-        None,
         true,
     );
 
@@ -1819,24 +1807,6 @@ fn egress_gateway_image_is_an_explicit_provider_contract() {
         gateway.command,
         Command::ProviderCapabilities(ProviderArgs {
             egress_gateway_image: Some(_),
-            ..
-        })
-    ));
-}
-
-#[test]
-fn maestro_hosted_runner_image_is_a_separate_provider_contract() {
-    let cli = Cli::try_parse_from([
-        "sandboxwich-worker",
-        "provider-capabilities",
-        "--maestro-hosted-runner-image",
-        "ghcr.io/evalops/maestro@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    ])
-    .expect("Maestro artifact image is a supported provider option");
-    assert!(matches!(
-        cli.command,
-        Command::ProviderCapabilities(ProviderArgs {
-            maestro_hosted_runner_image: Some(_),
             ..
         })
     ));

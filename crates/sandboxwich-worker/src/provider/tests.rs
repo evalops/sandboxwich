@@ -950,6 +950,7 @@ fn kubernetes_dry_run_covers_provider_smoke_path_without_cluster_mutation() {
         provisioned.metadata["manifests"]["desktopService"]["kind"],
         "Service"
     );
+
     let exec = provider
         .exec_handoff(
             sandbox_id,
@@ -2748,124 +2749,6 @@ fn network_policy_renders_ingress_rule_restricted_to_control_plane_pods() {
 }
 
 #[test]
-fn maestro_hosted_runner_profile_binds_a_private_service() {
-    let provider =
-        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
-            .with_maestro_hosted_runner_image(Some(
-                "ghcr.io/evalops/maestro-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                    .to_string(),
-            ));
-    let sandbox_id = SandboxId::new();
-    let spec = SandboxProvisionSpec {
-        runtime_profile: SandboxRuntimeProfile::MaestroHostedRunnerV1,
-        ..SandboxProvisionSpec::default()
-    };
-
-    let provisioned = provider
-        .provision(sandbox_id, &spec, &CancelSignal::never_cancelled())
-        .expect("hosted Maestro profile should provision");
-    assert_eq!(
-        provisioned.metadata["manifests"]["maestroService"]["kind"],
-        "Service"
-    );
-    assert_eq!(
-        provisioned.metadata["manifests"]["maestroService"]["metadata"]["name"],
-        format!("sandboxwich-maestro-{sandbox_id}")
-    );
-    assert_eq!(
-        provisioned.metadata["manifests"]["maestroService"]["spec"]["ports"],
-        json!([{"name": "maestro", "port": 8080, "targetPort": "maestro"}])
-    );
-    assert_eq!(
-        provisioned.metadata["manifests"]["pod"]["spec"]["containers"][0]["ports"],
-        json!([
-            {"name": "ssh", "containerPort": 2222},
-            {"name": "desktop", "containerPort": 6080},
-            {"name": "maestro", "containerPort": 8080}
-        ])
-    );
-    assert_eq!(
-        provisioned.metadata["manifests"]["pod"]["spec"]["containers"][0]["image"],
-        DEFAULT_SANDBOX_GUEST_IMAGE,
-        "hosted Maestro must not replace the Sandboxwich guest image"
-    );
-    assert_eq!(
-        provisioned.metadata["manifests"]["pod"]["spec"]["initContainers"][1]["image"],
-        "ghcr.io/evalops/maestro-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    );
-    assert_eq!(
-        provisioned.metadata["manifests"]["pod"]["spec"]["initContainers"][1]["args"],
-        json!(["install -m 0555 /usr/local/bin/maestro /runtime/maestro"])
-    );
-    assert_eq!(
-        provisioned.metadata["manifests"]["pod"]["spec"]["containers"][0]["volumeMounts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|mount| mount["name"] == "maestro-runtime")
-            .expect("guest must mount the copied Maestro artifact")["readOnly"],
-        true
-    );
-    let maestro_resource = provisioned
-        .resources
-        .iter()
-        .find(|resource| resource.purpose == RuntimeResourcePurpose::Maestro)
-        .expect("provision must return the typed Maestro service resource");
-    assert_eq!(maestro_resource.resource_kind, RuntimeResourceKind::Service);
-    assert_eq!(
-        maestro_resource.resource_name,
-        format!("sandboxwich-maestro-{sandbox_id}")
-    );
-    assert_eq!(maestro_resource.service_port, Some(8080));
-    assert_eq!(maestro_resource.target_port.as_deref(), Some("maestro"));
-    assert_eq!(
-        maestro_resource.runtime_image.as_deref(),
-        Some(
-            "ghcr.io/evalops/maestro-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        )
-    );
-    let ingress = provisioned.metadata["manifests"]["networkPolicy"]["spec"]["ingress"]
-        .as_array()
-        .unwrap();
-    assert_eq!(ingress.len(), 2);
-    assert_eq!(
-        ingress[1]["from"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/name"],
-        "runner-host"
-    );
-    assert_eq!(
-        ingress[1]["ports"],
-        json!([{"protocol": "TCP", "port": 8080}])
-    );
-}
-
-#[test]
-fn maestro_hosted_runner_profile_rejects_missing_or_mutable_artifact_images() {
-    let spec = SandboxProvisionSpec {
-        runtime_profile: SandboxRuntimeProfile::MaestroHostedRunnerV1,
-        ..SandboxProvisionSpec::default()
-    };
-    let provider =
-        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
-    assert!(
-        provider
-            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
-            .unwrap_err()
-            .to_string()
-            .contains("not configured")
-    );
-
-    let mutable = provider
-        .with_maestro_hosted_runner_image(Some("ghcr.io/evalops/maestro:latest".to_string()));
-    assert!(
-        mutable
-            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
-            .unwrap_err()
-            .to_string()
-            .contains("digest-pinned Maestro artifact image")
-    );
-}
-
-#[test]
 fn ingress_namespace_and_selector_are_configurable() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
@@ -3775,7 +3658,7 @@ fn adoption_contract_rejects_immutable_or_security_drift_for_every_resource_kind
         &spec.memory_limit,
     );
     let network_policy = provider
-        .network_policy_manifest(sandbox_id, &spec.network_egress, false)
+        .network_policy_manifest(sandbox_id, &spec.network_egress)
         .expect("render network policy");
     let pod = provider.pod_manifest(sandbox_id, &spec);
     let service = provider.ssh_service_manifest(sandbox_id);

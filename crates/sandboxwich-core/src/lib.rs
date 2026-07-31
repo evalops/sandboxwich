@@ -521,7 +521,6 @@ db_variant_enum! {
 pub enum SandboxRuntimeProfile {
     Unprivileged => "unprivileged",
     ApexTrustedSupervisorV1 => "apex_trusted_supervisor_v1",
-    MaestroHostedRunnerV1 => "maestro_hosted_runner_v1",
 }
 }
 
@@ -706,7 +705,6 @@ pub enum RuntimeResourcePurpose {
     Workspace => "workspace",
     Ssh => "ssh",
     Desktop => "desktop",
-    Maestro => "maestro",
     Snapshot => "snapshot",
     Network => "network",
 }
@@ -1874,16 +1872,6 @@ pub const RESIDENT_PLACEMENT_ATTESTATION_FILE: &str =
 /// [`resident_process_run_as_uid`]).
 pub const ORB_EXECUTOR_RESIDENT_PROCESS_NAME: &str = "orb-executor";
 
-/// The long-horizon Maestro control process for the closed hosted-runner
-/// runtime profile. Like `orb-executor`, it runs as the sandbox workload uid,
-/// but it is independently generation-fenced and receives a private,
-/// control-plane-only hosted service.
-pub const MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME: &str = "maestro-hosted-runner";
-pub const MAESTRO_HOSTED_RUNNER_BINARY: &str = "/opt/maestro/maestro";
-pub const MAESTRO_HOSTED_RUNNER_AUTH_TOKEN_FILE: &str =
-    "/run/sandboxwich/bootstrap/maestro-hosted-runner-auth-token";
-pub const MAESTRO_HOSTED_RUNNER_AUTH_TOKEN_FILE_ENV: &str = "MAESTRO_HOSTED_RUNNER_AUTH_TOKEN_FILE";
-
 /// The v1 credential sidecar (evalops/orb#296, evalops/sandboxwich#176): a
 /// second resident process, one per sandbox, that is spawned under
 /// [`ORB_SIDECAR_RESIDENT_PROCESS_UID`] rather than the agent workload's own
@@ -1910,16 +1898,13 @@ pub const ORB_SIDECAR_RESIDENT_PROCESS_NAME: &str = "orb-sidecar";
 pub const ORB_SIDECAR_RESIDENT_PROCESS_UID: u32 = 10111;
 
 /// Whether `name` is a resident-process kind the API accepts. v1 supports
-/// exactly three: the agent workload (`orb-executor`), the long-horizon
-/// control process (`maestro-hosted-runner`), and the credential sidecar
-/// (`orb-sidecar`). Each is limited to one live instance per sandbox by the
-/// `unique(sandbox_id, name)` storage constraint.
+/// exactly two: the agent workload (`orb-executor`) and the credential
+/// sidecar (`orb-sidecar`), each limited to one live instance per sandbox by
+/// the `unique(sandbox_id, name)` storage constraint.
 pub fn is_supported_resident_process_name(name: &str) -> bool {
     matches!(
         name,
-        ORB_EXECUTOR_RESIDENT_PROCESS_NAME
-            | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
-            | ORB_SIDECAR_RESIDENT_PROCESS_NAME
+        ORB_EXECUTOR_RESIDENT_PROCESS_NAME | ORB_SIDECAR_RESIDENT_PROCESS_NAME
     )
 }
 
@@ -3555,15 +3540,12 @@ mod tests {
     }
 
     #[test]
-    fn supported_resident_process_names_are_explicit_and_distinct() {
+    fn orb_sidecar_is_a_supported_resident_process_name_distinct_from_orb_executor() {
         assert!(is_supported_resident_process_name(
             ORB_EXECUTOR_RESIDENT_PROCESS_NAME
         ));
         assert!(is_supported_resident_process_name(
             ORB_SIDECAR_RESIDENT_PROCESS_NAME
-        ));
-        assert!(is_supported_resident_process_name(
-            MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
         ));
         assert!(!is_supported_resident_process_name("something-else"));
         assert!(!is_supported_resident_process_name(""));
@@ -3578,10 +3560,6 @@ mod tests {
         // orb-executor inherits the agent's own uid -- no explicit switch.
         assert_eq!(
             resident_process_run_as_uid(ORB_EXECUTOR_RESIDENT_PROCESS_NAME),
-            None
-        );
-        assert_eq!(
-            resident_process_run_as_uid(MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME),
             None
         );
         assert_eq!(resident_process_run_as_uid("unknown"), None);
