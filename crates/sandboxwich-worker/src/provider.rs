@@ -21,18 +21,19 @@ use sandboxwich_core::{
     MAESTRO_HOSTED_RUNNER_IDENTITY_CA_SECRET, MAESTRO_HOSTED_RUNNER_IDENTITY_EXCHANGE_URL,
     MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME, MAESTRO_HOSTED_RUNNER_SERVICE_ACCOUNT,
     MAESTRO_HOSTED_RUNNER_TOKEN_AUDIENCE, MAESTRO_HOSTED_RUNNER_TOKEN_DIRECTORY,
-    MAESTRO_HOSTED_RUNNER_TOKEN_FILE, MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES, MAX_SANDBOX_FILE_BYTES,
-    MaterializeFileDestination, MaterializeFileObservation, MemoryLimit, NetworkAllowRuleKind,
-    NetworkEgress, ORB_SIDECAR_RESIDENT_PROCESS_UID,
+    MAESTRO_HOSTED_RUNNER_TOKEN_FILE, MAESTRO_HOSTED_RUNNER_UID,
+    MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT, MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES,
+    MAX_SANDBOX_FILE_BYTES, MaterializeFileDestination, MaterializeFileObservation, MemoryLimit,
+    NetworkAllowRuleKind, NetworkEgress, ORB_SIDECAR_RESIDENT_PROCESS_UID,
     PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL,
     PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE, ProviderCapabilityReport,
     ProviderForkHandle, ProviderHealthReport, ProviderHealthStatus, ProviderRuntimeResource,
     ProviderSandboxHandle, ProviderSnapshotHandle, ProvisioningErrorClass, ProvisioningStage,
     ProvisioningStageUpdateRequest, RESIDENT_PLACEMENT_ATTESTATION_FILE,
     RESIDENT_PROCESS_BOOTSTRAP_PREFIX, ResidentProcessId, RuntimeResourceInventoryResponse,
-    RuntimeResourceKind, RuntimeResourcePurpose, RuntimeResourceStatus, SandboxId,
-    SandboxProvisionSpec, SandboxRuntimeProfile, SnapshotId, WorkerCapability, WorkspaceMode,
-    validate_agent_command_request,
+    RuntimeResourceKind, RuntimeResourcePurpose, RuntimeResourceStatus, SANDBOX_WORKSPACE_GID,
+    SandboxId, SandboxProvisionSpec, SandboxRuntimeProfile, SnapshotId, WorkerCapability,
+    WorkspaceMode, validate_agent_command_request,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -304,6 +305,8 @@ pub struct IsolatedResidentProcessSpec {
     pub argv: Vec<String>,
     pub cwd: Option<String>,
     pub env: BTreeMap<String, String>,
+    pub workspace_mode: WorkspaceMode,
+    pub workspace_claim_name: Option<String>,
     pub bootstrap: Option<IsolatedResidentProcessBootstrap>,
 }
 
@@ -319,6 +322,8 @@ impl std::fmt::Debug for IsolatedResidentProcessSpec {
             .field("argv", &self.argv)
             .field("cwd", &self.cwd)
             .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .field("workspace_mode", &self.workspace_mode)
+            .field("workspace_claim_name", &self.workspace_claim_name)
             .field("bootstrap", &self.bootstrap)
             .finish()
     }
@@ -4258,6 +4263,32 @@ impl KubernetesApplyProvider {
                     == Some(MAESTRO_HOSTED_RUNNER_IDENTITY_CA_FILE),
                 "Maestro hosted runner requires the canonical Identity CA path"
             );
+            anyhow::ensure!(
+                spec.workspace_mode == WorkspaceMode::Persistent,
+                "Maestro hosted runner requires a persistent workspace"
+            );
+            let workspace_claim_name = spec
+                .workspace_claim_name
+                .as_deref()
+                .context("Maestro hosted runner requires an authoritative workspace PVC")?;
+            let sandbox_claim = format!("sandboxwich-pvc-{}", spec.sandbox_id);
+            let managed_home_claim = workspace_claim_name
+                .strip_prefix("sandboxwich-home-")
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .is_some_and(|id| format!("sandboxwich-home-{id}") == workspace_claim_name);
+            anyhow::ensure!(
+                workspace_claim_name == sandbox_claim || managed_home_claim,
+                "Maestro hosted runner workspace PVC is invalid"
+            );
+            anyhow::ensure!(
+                spec.cwd.as_deref() == Some(MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT),
+                "Maestro hosted runner requires the canonical workspace working directory"
+            );
+            anyhow::ensure!(
+                spec.env.get("MAESTRO_WORKSPACE_ROOT").map(String::as_str)
+                    == Some(MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT),
+                "Maestro hosted runner requires the canonical durable workspace root"
+            );
         } else {
             let bootstrap = spec
                 .bootstrap
@@ -4407,6 +4438,11 @@ impl KubernetesApplyProvider {
             .iter()
             .map(|(name, value)| json!({ "name": name, "value": value }))
             .collect::<Vec<_>>();
+        let resident_uid = if maestro {
+            MAESTRO_HOSTED_RUNNER_UID
+        } else {
+            ORB_SIDECAR_RESIDENT_PROCESS_UID
+        };
         let mut container = json!({
             "name": if maestro { "maestro-hosted-runner" } else { "orb-sidecar" },
             "image": image,
@@ -4425,8 +4461,8 @@ impl KubernetesApplyProvider {
                 "allowPrivilegeEscalation": false,
                 "readOnlyRootFilesystem": true,
                 "runAsNonRoot": true,
-                "runAsUser": ORB_SIDECAR_RESIDENT_PROCESS_UID,
-                "runAsGroup": ORB_SIDECAR_RESIDENT_PROCESS_UID,
+                "runAsUser": resident_uid,
+                "runAsGroup": resident_uid,
                 "capabilities": { "drop": ["ALL"] },
                 "seccompProfile": { "type": "RuntimeDefault" },
             },
@@ -4443,11 +4479,17 @@ impl KubernetesApplyProvider {
             container["volumeMounts"]
                 .as_array_mut()
                 .expect("volumeMounts is an array")
-                .push(json!({
+                .extend([
+                    json!({
                     "name": "workload-identity",
                     "mountPath": MAESTRO_HOSTED_RUNNER_TOKEN_DIRECTORY,
                     "readOnly": true,
-                }));
+                    }),
+                    json!({
+                        "name": "workspace",
+                        "mountPath": MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT,
+                    }),
+                ]);
         } else {
             container["volumeMounts"]
                 .as_array_mut()
@@ -4495,6 +4537,14 @@ impl KubernetesApplyProvider {
                         }
                     }]
                 }
+                }),
+                json!({
+                    "name": "workspace",
+                    "persistentVolumeClaim": {
+                        "claimName": spec.workspace_claim_name
+                            .as_deref()
+                            .expect("validated Maestro workspace PVC"),
+                    },
                 }),
             ]);
         } else {
@@ -4618,9 +4668,9 @@ impl KubernetesApplyProvider {
                 "terminationGracePeriodSeconds": 30,
                 "securityContext": {
                     "runAsNonRoot": true,
-                    "runAsUser": ORB_SIDECAR_RESIDENT_PROCESS_UID,
-                    "runAsGroup": ORB_SIDECAR_RESIDENT_PROCESS_UID,
-                    "fsGroup": ORB_SIDECAR_RESIDENT_PROCESS_UID,
+                    "runAsUser": resident_uid,
+                    "runAsGroup": resident_uid,
+                    "fsGroup": if maestro { SANDBOX_WORKSPACE_GID } else { resident_uid },
                     "seccompProfile": { "type": "RuntimeDefault" },
                 },
                 "initContainers": init_containers,
@@ -4629,13 +4679,35 @@ impl KubernetesApplyProvider {
             },
         });
         if maestro {
-            pod["spec"]
+            let pod_spec = pod["spec"].as_object_mut().expect("Pod spec is an object");
+            let security_context = pod_spec["securityContext"]
                 .as_object_mut()
-                .expect("Pod spec is an object")
-                .insert(
-                    "serviceAccountName".to_string(),
-                    json!(MAESTRO_HOSTED_RUNNER_SERVICE_ACCOUNT),
-                );
+                .expect("Pod security context is an object");
+            security_context.insert(
+                "supplementalGroups".to_string(),
+                json!([SANDBOX_WORKSPACE_GID]),
+            );
+            security_context.insert("fsGroupChangePolicy".to_string(), json!("OnRootMismatch"));
+            pod_spec.insert(
+                "serviceAccountName".to_string(),
+                json!(MAESTRO_HOSTED_RUNNER_SERVICE_ACCOUNT),
+            );
+            pod_spec.insert(
+                "affinity".to_string(),
+                json!({
+                    "podAffinity": {
+                        "requiredDuringSchedulingIgnoredDuringExecution": [{
+                            "labelSelector": {
+                                "matchLabels": {
+                                    "sandboxwich.dev/sandbox-id": spec.sandbox_id.to_string(),
+                                    "sandboxwich.dev/component": "runtime",
+                                }
+                            },
+                            "topologyKey": "kubernetes.io/hostname",
+                        }]
+                    }
+                }),
+            );
         }
         manifests.push(network_policy);
         if maestro {

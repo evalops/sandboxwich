@@ -920,6 +920,34 @@ fn run_command_without_provision_spec_is_rejected_rather_than_defaulted() {
 }
 
 #[test]
+fn maestro_hosted_runner_without_provision_spec_is_rejected_rather_than_defaulted() {
+    let provider = ResidentTestProvider::terminal_failure();
+    let cancellation = LeaseCancellation::new();
+    let mut job = resident_job(ResidentProcessRestartPolicy::Never);
+    let payload = job
+        .payload
+        .as_object_mut()
+        .expect("resident job payload is an object");
+    payload.insert(
+        "name".into(),
+        json!(MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME),
+    );
+    let error = execute_isolated_resident_process_job(
+        &job,
+        sandboxwich_core::LeaseId::new(),
+        None,
+        &provider,
+        &cancellation.signal,
+        &cancellation,
+        &mut |_| Ok(()),
+    )
+    .expect_err("missing provisionSpec on Maestro runner should fail, not default");
+
+    assert!(error.to_string().contains("provisionSpec"));
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
 fn stop_sandbox_job_tears_down_resources_via_provider() {
     let sandbox_id = SandboxId::new();
     let outcome = execute_job(

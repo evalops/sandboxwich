@@ -3378,6 +3378,16 @@ fn execute_isolated_resident_process_job(
             .context("resident-process restart policy is missing")?,
     )
     .context("resident-process restart policy is invalid")?;
+    let provision_spec = if process_name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME {
+        required_provision_spec_from_payload(&job.payload)?
+    } else {
+        provision_spec_from_payload(&job.payload)?
+    };
+    let workspace_claim_name = job
+        .payload
+        .get("workspaceClaimName")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
     let spec = IsolatedResidentProcessSpec {
         process_name: process_name.to_string(),
         sandbox_id,
@@ -3387,6 +3397,8 @@ fn execute_isolated_resident_process_job(
         argv,
         cwd,
         env,
+        workspace_mode: provision_spec.workspace_mode,
+        workspace_claim_name,
         bootstrap: bootstrap.map(|bootstrap| IsolatedResidentProcessBootstrap {
             content: bootstrap.content,
             target_file: bootstrap.target_file,

@@ -1878,6 +1878,9 @@ pub const ORB_EXECUTOR_RESIDENT_PROCESS_NAME: &str = "orb-executor";
 /// workload identity.
 pub const MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME: &str = "maestro-hosted-runner";
 pub const MAESTRO_HOSTED_RUNNER_CONTAINER_PORT: u16 = 8443;
+pub const MAESTRO_HOSTED_RUNNER_UID: u32 = 65_532;
+pub const MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT: &str = "/workspace";
+pub const SANDBOX_WORKSPACE_GID: u32 = 10_001;
 pub const MAESTRO_HOSTED_RUNNER_SERVICE_ACCOUNT: &str = "maestro-workload";
 pub const MAESTRO_HOSTED_RUNNER_TOKEN_AUDIENCE: &str =
     "https://identity.evalops.dev/v1/workload-certificates";
@@ -2227,6 +2230,34 @@ pub struct MaestroWorkloadIdentityResponse {
     pub service_account_name: String,
     pub service_name: String,
     pub service_port: u16,
+    pub resident_process_generation: u64,
+    pub lease_id: Uuid,
+    pub lease_attempt: u64,
+    pub lease_expires_at_epoch_seconds: i64,
+    #[schema(value_type = Uuid)]
+    pub worker_id: WorkerId,
+}
+
+/// Non-secret connection and certificate binding for a live, tenant-scoped
+/// Maestro hosted runner. Callers use the exact URI SAN to authenticate the
+/// server certificate issued by Identity; every component is fenced to the
+/// same live provider placement and lease.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MaestroHostedRunnerConnectionBindingResponse {
+    pub ok: bool,
+    pub organization_id: String,
+    pub workspace_id: String,
+    pub sandbox_id: SandboxId,
+    pub pod_uid: Uuid,
+    pub placement_generation: u64,
+    pub runner_session_id: String,
+    pub runtime_image: String,
+    pub service_namespace: String,
+    pub service_name: String,
+    pub service_host: String,
+    pub service_port: u16,
+    pub expected_server_uri_san: String,
     pub resident_process_generation: u64,
     pub lease_id: Uuid,
     pub lease_attempt: u64,

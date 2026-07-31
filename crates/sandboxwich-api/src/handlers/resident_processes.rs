@@ -165,21 +165,26 @@ async fn placed_worker_supports_provider_isolated_resident_process(
     sandbox_id: SandboxId,
     tenant_id: &str,
     process_name: &str,
-) -> Result<bool, ApiError> {
+) -> Result<Option<u64>, ApiError> {
     let sql = format!(
-        "select w.labels
+        "select w.labels, p.generation
          from sandbox_placements p
          join workers w on w.id = p.worker_id
          where p.sandbox_id = {} and w.tenant_id = {}",
         db.placeholder(1),
         db.placeholder(2)
     );
-    let labels = sqlx::query(&sql)
+    let Some(row) = sqlx::query(&sql)
         .bind(sandbox_id.to_string())
         .bind(tenant_id)
         .fetch_optional(&db.pool)
         .await?
-        .and_then(|row| row.try_get::<String, _>("labels").ok())
+    else {
+        return Ok(None);
+    };
+    let labels = row
+        .try_get::<String, _>("labels")
+        .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
     let version_supported = labels
         .as_ref()
@@ -196,7 +201,35 @@ async fn placed_worker_supports_provider_isolated_resident_process(
         .and_then(|labels| labels.get(image_label))
         .and_then(serde_json::Value::as_str)
         .is_some_and(|image| image.contains("@sha256:"));
-    Ok(version_supported && image_is_pinned)
+    if !version_supported || !image_is_pinned {
+        return Ok(None);
+    }
+    let generation = u64::try_from(row.try_get::<i64, _>("generation")?)
+        .ok()
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| ApiError::internal("sandbox placement generation is invalid"))?;
+    Ok(Some(generation))
+}
+
+async fn authoritative_workspace_claim_name(
+    db: &Database,
+    sandbox_id: SandboxId,
+    tenant_id: &str,
+) -> Result<String, ApiError> {
+    let sql = format!(
+        "select home_id from sandbox_home_mounts where sandbox_id = {} and tenant_id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+    );
+    let home_id = sqlx::query_scalar::<_, String>(&sql)
+        .bind(sandbox_id.to_string())
+        .bind(tenant_id)
+        .fetch_optional(&db.pool)
+        .await?;
+    Ok(home_id.map_or_else(
+        || format!("sandboxwich-pvc-{sandbox_id}"),
+        |home_id| format!("sandboxwich-home-{home_id}"),
+    ))
 }
 
 /// Claim-time readiness probe for an executor job. It is deliberately free
@@ -473,7 +506,7 @@ pub(crate) async fn put_resident_process(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
     Path((sandbox_id, name)): Path<(Uuid, String)>,
-    Json(request): Json<ResidentProcessRequest>,
+    Json(mut request): Json<ResidentProcessRequest>,
 ) -> Result<(StatusCode, Json<ResidentProcessResponse>), ApiError> {
     validate_resident_process_request(&request)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -517,7 +550,6 @@ pub(crate) async fn put_resident_process(
             "MAESTRO_ORGANIZATION_ID",
             "MAESTRO_WORKSPACE_ID",
             "MAESTRO_SANDBOX_ID",
-            "MAESTRO_PLACEMENT_GENERATION",
             "MAESTRO_RUNNER_SESSION_ID",
         ];
         if request.env.len() != ALLOWED_ENV.len()
@@ -547,11 +579,6 @@ pub(crate) async fn put_resident_process(
                 .get("MAESTRO_SANDBOX_ID")
                 .and_then(|value| Uuid::parse_str(value).ok())
                 != Some(sandbox_id)
-            || request
-                .env
-                .get("MAESTRO_PLACEMENT_GENERATION")
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_none_or(|generation| generation == 0)
         {
             return Err(ApiError::bad_request(
                 "maestro-hosted-runner requires exact bounded workload identity bindings",
@@ -560,22 +587,49 @@ pub(crate) async fn put_resident_process(
     }
     let sandbox_id = SandboxId(sandbox_id);
     let sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
-    if matches!(
+    let workspace_claim_name = if name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME {
+        if sandbox.workspace_mode != WorkspaceMode::Persistent {
+            return Err(ApiError::bad_request(
+                "maestro-hosted-runner requires workspace_mode=persistent",
+            ));
+        }
+        Some(authoritative_workspace_claim_name(&state.db, sandbox_id, &sandbox.tenant_id).await?)
+    } else {
+        None
+    };
+    let provider_placement_generation = if matches!(
         name.as_str(),
         ORB_SIDECAR_RESIDENT_PROCESS_NAME | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
-    ) && !placed_worker_supports_provider_isolated_resident_process(
-        &state.db,
-        sandbox_id,
-        &sandbox.tenant_id,
-        &name,
-    )
-    .await?
-    {
-        return Err(ApiError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "resident_sidecar_worker_unsupported",
-            message: "the resident sidecar requires its placed worker to advertise the matching digest-pinned provider-isolated v2 runtime".into(),
-        });
+    ) {
+        Some(
+            placed_worker_supports_provider_isolated_resident_process(
+                &state.db,
+                sandbox_id,
+                &sandbox.tenant_id,
+                &name,
+            )
+            .await?
+            .ok_or_else(|| ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "resident_sidecar_worker_unsupported",
+                message: "the resident sidecar requires its placed worker to advertise the matching digest-pinned provider-isolated v2 runtime".into(),
+            })?,
+        )
+    } else {
+        None
+    };
+    if name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME {
+        request.cwd = Some(MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT.into());
+        request.env.insert(
+            "MAESTRO_WORKSPACE_ROOT".into(),
+            MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT.into(),
+        );
+        request.env.insert(
+            "MAESTRO_PLACEMENT_GENERATION".into(),
+            provider_placement_generation
+                .expect("Maestro hosted runner has a provider-isolated placement")
+                .to_string(),
+        );
     }
     let bootstrap_digest = request
         .bootstrap
@@ -685,6 +739,15 @@ pub(crate) async fn put_resident_process(
         last_error: None,
     };
     add_provision_spec_to_payload(&mut job, &sandbox)?;
+    if let Some(workspace_claim_name) = workspace_claim_name {
+        job.payload
+            .as_object_mut()
+            .expect("resident-process payload is an object")
+            .insert(
+                "workspaceClaimName".into(),
+                serde_json::Value::String(workspace_claim_name),
+            );
+    }
 
     let bootstrap_reservation = request
         .bootstrap
