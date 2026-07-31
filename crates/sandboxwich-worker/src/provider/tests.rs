@@ -170,6 +170,8 @@ fn isolated_sidecar_spec(bootstrap: &[u8]) -> IsolatedResidentProcessSpec {
         argv: vec!["/opt/orb/bin/orb-sidecar".to_string()],
         cwd: Some("/workspace".to_string()),
         env: BTreeMap::from([("ORB_API".to_string(), "https://orb.invalid".to_string())]),
+        workspace_mode: WorkspaceMode::Persistent,
+        workspace_claim_name: None,
         bootstrap: Some(IsolatedResidentProcessBootstrap {
             content: bootstrap.to_vec(),
             target_file: "/run/sandboxwich/bootstrap/orb-token".to_string(),
@@ -193,7 +195,9 @@ fn maestro_hosted_runner_spec() -> IsolatedResidentProcessSpec {
             "--listen".to_string(),
             "0.0.0.0:8443".to_string(),
         ],
-        cwd: None,
+        cwd: Some(sandboxwich_core::MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT.to_string()),
+        workspace_mode: WorkspaceMode::Persistent,
+        workspace_claim_name: Some(format!("sandboxwich-pvc-{sandbox_id}")),
         env: BTreeMap::from([
             (
                 "MAESTRO_KUBERNETES_TOKEN_FILE".to_string(),
@@ -206,6 +210,10 @@ fn maestro_hosted_runner_spec() -> IsolatedResidentProcessSpec {
             (
                 "MAESTRO_IDENTITY_TLS_CA_FILE".to_string(),
                 sandboxwich_core::MAESTRO_HOSTED_RUNNER_IDENTITY_CA_FILE.to_string(),
+            ),
+            (
+                "MAESTRO_WORKSPACE_ROOT".to_string(),
+                sandboxwich_core::MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT.to_string(),
             ),
             ("MAESTRO_ORGANIZATION_ID".to_string(), "org-1".to_string()),
             (
@@ -221,6 +229,59 @@ fn maestro_hosted_runner_spec() -> IsolatedResidentProcessSpec {
         ]),
         bootstrap: None,
     }
+}
+
+#[test]
+fn maestro_hosted_runner_rejects_workspace_modes_without_a_shareable_pvc() {
+    let provider = KubernetesApplyProvider::new(
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Gvisor)
+            .with_runtime_class_name(Some("gvisor".to_string())),
+        "kubectl",
+    )
+    .with_maestro_hosted_runner_image(Some(format!(
+        "ghcr.io/evalops/maestro@sha256:{}",
+        "a".repeat(64)
+    )));
+    for mode in [WorkspaceMode::Ephemeral, WorkspaceMode::GenericEphemeral] {
+        let mut spec = maestro_hosted_runner_spec();
+        spec.workspace_mode = mode;
+        assert!(
+            provider
+                .isolated_resident_process_manifests(&spec)
+                .expect_err("ephemeral Maestro workspace must fail closed")
+                .to_string()
+                .contains("persistent workspace")
+        );
+    }
+}
+
+#[test]
+fn maestro_hosted_runner_mounts_the_authoritative_managed_home_claim() {
+    let provider = KubernetesApplyProvider::new(
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Gvisor)
+            .with_runtime_class_name(Some("gvisor".to_string())),
+        "kubectl",
+    )
+    .with_maestro_hosted_runner_image(Some(format!(
+        "ghcr.io/evalops/maestro@sha256:{}",
+        "a".repeat(64)
+    )));
+    let mut spec = maestro_hosted_runner_spec();
+    let home_id = Uuid::now_v7();
+    spec.workspace_claim_name = Some(format!("sandboxwich-home-{home_id}"));
+    let manifests = provider
+        .isolated_resident_process_manifests(&spec)
+        .expect("persistent managed-home workspace must render");
+    let pod = manifests
+        .iter()
+        .find(|manifest| manifest["kind"] == "Pod")
+        .expect("Maestro Pod");
+    assert_eq!(
+        pod["spec"]["volumes"][2]["persistentVolumeClaim"]["claimName"],
+        format!("sandboxwich-home-{home_id}")
+    );
 }
 
 #[test]
@@ -258,6 +319,45 @@ fn maestro_hosted_runner_uses_only_projected_identity_in_an_isolated_pod() {
     assert_eq!(pod["spec"]["hostIPC"], false);
     assert_eq!(pod["spec"]["hostNetwork"], false);
     assert_eq!(pod["spec"]["containers"][0]["image"], image);
+    assert_eq!(pod["spec"]["containers"][0]["workingDir"], "/workspace");
+    assert!(
+        pod["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry["name"] == "MAESTRO_WORKSPACE_ROOT" && entry["value"] == "/workspace"
+            }),
+        "Sandboxwich must author Maestro's durable workspace root"
+    );
+    assert_eq!(
+        pod["spec"]["containers"][0]["securityContext"]["runAsUser"],
+        65532
+    );
+    assert_eq!(
+        pod["spec"]["containers"][0]["securityContext"]["runAsGroup"],
+        65532
+    );
+    assert_eq!(pod["spec"]["securityContext"]["fsGroup"], 10001);
+    assert_eq!(
+        pod["spec"]["securityContext"]["supplementalGroups"],
+        serde_json::json!([10001])
+    );
+    assert_eq!(
+        pod["spec"]["affinity"]["podAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"][0]
+            ["topologyKey"],
+        "kubernetes.io/hostname"
+    );
+    assert_eq!(
+        pod["spec"]["affinity"]["podAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"][0]
+            ["labelSelector"]["matchLabels"]["sandboxwich.dev/sandbox-id"],
+        spec.sandbox_id.to_string()
+    );
+    assert_eq!(
+        pod["spec"]["affinity"]["podAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"][0]
+            ["labelSelector"]["matchLabels"]["sandboxwich.dev/component"],
+        "runtime"
+    );
     assert_eq!(
         pod["spec"]["volumes"][1]["projected"]["sources"][0]["serviceAccountToken"]["audience"],
         sandboxwich_core::MAESTRO_HOSTED_RUNNER_TOKEN_AUDIENCE
@@ -281,6 +381,27 @@ fn maestro_hosted_runner_uses_only_projected_identity_in_an_isolated_pod() {
         "projected-token rotation requires mounting the containing directory"
     );
     assert_eq!(
+        pod["spec"]["containers"][0]["volumeMounts"][2],
+        serde_json::json!({
+            "name": "workspace",
+            "mountPath": "/workspace"
+        })
+    );
+    assert_eq!(
+        pod["spec"]["volumes"][2],
+        serde_json::json!({
+            "name": "workspace",
+            "persistentVolumeClaim": {
+                "claimName": format!("sandboxwich-pvc-{}", spec.sandbox_id)
+            }
+        })
+    );
+    assert_eq!(
+        pod["spec"]["initContainers"],
+        serde_json::json!([]),
+        "workspace sharing must not add a privileged init container or quota request"
+    );
+    assert_eq!(
         service["spec"]["ports"][0]["port"],
         sandboxwich_core::MAESTRO_HOSTED_RUNNER_CONTAINER_PORT
     );
@@ -302,6 +423,17 @@ fn maestro_hosted_runner_uses_only_projected_identity_in_an_isolated_pod() {
     assert!(!rendered.contains("\"kind\":\"Secret\""));
     assert!(!rendered.contains("\"cidr\":\"0.0.0.0/0\""));
     assert!(!rendered.contains("MAESTRO_HOSTED_RUNNER_AUTH_TOKEN"));
+
+    let guest = provider.dry_run.pod_manifest(
+        spec.sandbox_id,
+        &SandboxProvisionSpec {
+            workspace_mode: WorkspaceMode::Persistent,
+            ..SandboxProvisionSpec::default()
+        },
+    );
+    let rendered_guest = serde_json::to_string(&guest).expect("render guest Pod");
+    assert!(!rendered_guest.contains("workload-identity"));
+    assert!(!rendered_guest.contains(MAESTRO_HOSTED_RUNNER_TOKEN_DIRECTORY));
 }
 
 #[test]

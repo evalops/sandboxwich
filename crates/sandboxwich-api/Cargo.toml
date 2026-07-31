@@ -13,6 +13,7 @@ authors.workspace = true
 anyhow.workspace = true
 async-stream.workspace = true
 axum.workspace = true
+axum-server.workspace = true
 base64.workspace = true
 chrono.workspace = true
 futures-core.workspace = true
@@ -21,6 +22,8 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 hmac.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
 sqlx.workspace = true
 subtle.workspace = true
 tokio.workspace = true
@@ -28,8 +31,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 utoipa.workspace = true
+url.workspace = true
+x509-parser.workspace = true
 
 [dev-dependencies]
+rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 reqwest.workspace = true
 sandboxwich-core.workspace = true
 tempfile = "3.27"

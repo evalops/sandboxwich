@@ -1,5 +1,17 @@
 use anyhow::Context;
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::PathBuf};
+
+pub(crate) const IDENTITY_SERVICE_CLIENT_URI: &str =
+    "spiffe://identity.evalops.dev/service/identity/sandboxwich-fence";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IdentityMtlsConfig {
+    pub(crate) bind: SocketAddr,
+    pub(crate) cert_file: PathBuf,
+    pub(crate) key_file: PathBuf,
+    pub(crate) client_ca_file: PathBuf,
+    pub(crate) client_uri: String,
+}
 
 #[derive(Clone)]
 pub(crate) struct AuthConfig {
@@ -42,6 +54,7 @@ pub(crate) struct ApiConfig {
     pub(crate) disable_expiry_sweeper: bool,
     pub(crate) apex_callback_base_url: Option<String>,
     pub(crate) placement_attestation_derivation_key: Option<String>,
+    pub(crate) identity_mtls: Option<IdentityMtlsConfig>,
     pub(crate) sandbox_lifetime: SandboxLifetimeConfig,
 }
 
@@ -128,6 +141,13 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
             "SANDBOXWICH_PLACEMENT_ATTESTATION_DERIVATION_KEY must contain at least 32 bytes"
         );
     }
+    let identity_mtls = parse_identity_mtls_config(
+        std::env::var("SANDBOXWICH_IDENTITY_MTLS_BIND").ok(),
+        std::env::var("SANDBOXWICH_IDENTITY_MTLS_CERT_FILE").ok(),
+        std::env::var("SANDBOXWICH_IDENTITY_MTLS_KEY_FILE").ok(),
+        std::env::var("SANDBOXWICH_IDENTITY_MTLS_CLIENT_CA_FILE").ok(),
+        std::env::var("SANDBOXWICH_IDENTITY_MTLS_CLIENT_URI").ok(),
+    )?;
     let sandbox_lifetime = SandboxLifetimeConfig {
         default_max_lifetime_seconds: parse_env_optional_u64(
             "SANDBOXWICH_DEFAULT_MAX_LIFETIME_SECONDS",
@@ -152,8 +172,51 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
         disable_expiry_sweeper,
         apex_callback_base_url,
         placement_attestation_derivation_key,
+        identity_mtls,
         sandbox_lifetime,
     })
+}
+
+pub(crate) fn parse_identity_mtls_config(
+    bind: Option<String>,
+    cert_file: Option<String>,
+    key_file: Option<String>,
+    client_ca_file: Option<String>,
+    client_uri: Option<String>,
+) -> anyhow::Result<Option<IdentityMtlsConfig>> {
+    let (bind, cert_file, key_file, client_ca_file, client_uri) =
+        match (bind, cert_file, key_file, client_ca_file, client_uri) {
+            (None, None, None, None, None) => return Ok(None),
+            (Some(bind), Some(cert), Some(key), Some(ca), Some(uri)) => (bind, cert, key, ca, uri),
+            _ => anyhow::bail!(
+                "SANDBOXWICH_IDENTITY_MTLS_BIND, SANDBOXWICH_IDENTITY_MTLS_CERT_FILE, \
+                 SANDBOXWICH_IDENTITY_MTLS_KEY_FILE, \
+                 SANDBOXWICH_IDENTITY_MTLS_CLIENT_CA_FILE, and \
+                 SANDBOXWICH_IDENTITY_MTLS_CLIENT_URI must be configured together"
+            ),
+        };
+    let bind = bind.trim();
+    let cert_file = cert_file.trim();
+    let key_file = key_file.trim();
+    let client_ca_file = client_ca_file.trim();
+    let client_uri = client_uri.trim();
+    if cert_file.is_empty() || key_file.is_empty() || client_ca_file.is_empty() {
+        anyhow::bail!("Identity mTLS certificate and key paths must be non-empty");
+    }
+    if client_uri != IDENTITY_SERVICE_CLIENT_URI {
+        anyhow::bail!(
+            "SANDBOXWICH_IDENTITY_MTLS_CLIENT_URI must be exactly {IDENTITY_SERVICE_CLIENT_URI}"
+        );
+    }
+    Ok(Some(IdentityMtlsConfig {
+        bind: bind
+            .parse()
+            .with_context(|| format!("invalid SANDBOXWICH_IDENTITY_MTLS_BIND value: {bind}"))?,
+        cert_file: PathBuf::from(cert_file),
+        key_file: PathBuf::from(key_file),
+        client_ca_file: PathBuf::from(client_ca_file),
+        client_uri: client_uri.to_string(),
+    }))
 }
 
 pub(crate) fn parse_api_command(
@@ -277,6 +340,67 @@ mod tests {
         ] {
             assert!(parse_apex_callback_base_url(Some(invalid.into())).is_err());
         }
+    }
+
+    #[test]
+    fn identity_mtls_configuration_is_optional_or_complete_with_the_exact_client_uri() {
+        assert!(
+            parse_identity_mtls_config(None, None, None, None, None)
+                .unwrap()
+                .is_none()
+        );
+
+        let complete = parse_identity_mtls_config(
+            Some("127.0.0.1:3443".into()),
+            Some("/tls/server.crt".into()),
+            Some("/tls/server.key".into()),
+            Some("/tls/client-ca.crt".into()),
+            Some(IDENTITY_SERVICE_CLIENT_URI.into()),
+        )
+        .unwrap()
+        .expect("complete Identity mTLS config");
+        assert_eq!(complete.bind, "127.0.0.1:3443".parse().unwrap());
+        assert_eq!(complete.client_uri, IDENTITY_SERVICE_CLIENT_URI);
+
+        for partial in [
+            [Some("127.0.0.1:3443"), None, None, None, None],
+            [
+                None,
+                Some("/tls/server.crt"),
+                Some("/tls/server.key"),
+                Some("/tls/client-ca.crt"),
+                Some(IDENTITY_SERVICE_CLIENT_URI),
+            ],
+            [
+                Some("127.0.0.1:3443"),
+                Some("/tls/server.crt"),
+                Some("/tls/server.key"),
+                Some("/tls/client-ca.crt"),
+                None,
+            ],
+        ] {
+            assert!(
+                parse_identity_mtls_config(
+                    partial[0].map(str::to_string),
+                    partial[1].map(str::to_string),
+                    partial[2].map(str::to_string),
+                    partial[3].map(str::to_string),
+                    partial[4].map(str::to_string),
+                )
+                .is_err()
+            );
+        }
+
+        assert!(
+            parse_identity_mtls_config(
+                Some("127.0.0.1:3443".into()),
+                Some("/tls/server.crt".into()),
+                Some("/tls/server.key".into()),
+                Some("/tls/client-ca.crt".into()),
+                Some("spiffe://identity.evalops.dev/service/other".into()),
+            )
+            .is_err()
+        );
     }
 
     #[test]

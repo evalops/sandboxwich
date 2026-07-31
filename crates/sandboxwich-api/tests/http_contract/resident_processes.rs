@@ -221,22 +221,12 @@ fn resident_process_request(
     }
 }
 
-#[tokio::test]
-async fn maestro_workload_identity_requires_the_live_exact_provider_fence() {
-    let data_dir = tempfile::tempdir().unwrap();
-    let server = TestServer::start(
-        format!(
-            "sqlite://{}",
-            data_dir.path().join("maestro-workload.db").display()
-        ),
-        Some(data_dir),
-    )
-    .await;
-    let (sandbox_id, worker, _) =
-        provisioned_sandbox_with_guest(&server, "maestro-wif", true).await;
-    let client = server.client();
-    let runner_session_id = "runner-session-1";
-    let request = ResidentProcessRequest {
+fn maestro_hosted_runner_request(
+    sandbox_id: SandboxId,
+    workspace_id: &str,
+    runner_session_id: &str,
+) -> ResidentProcessRequest {
+    ResidentProcessRequest {
         argv: vec![
             "/usr/local/bin/maestro".into(),
             "hosted-runner".into(),
@@ -258,15 +248,90 @@ async fn maestro_workload_identity_requires_the_live_exact_provider_fence() {
                 MAESTRO_HOSTED_RUNNER_IDENTITY_CA_FILE.into(),
             ),
             ("MAESTRO_ORGANIZATION_ID".into(), "default".into()),
-            ("MAESTRO_WORKSPACE_ID".into(), "workspace-1".into()),
+            ("MAESTRO_WORKSPACE_ID".into(), workspace_id.into()),
             ("MAESTRO_SANDBOX_ID".into(), sandbox_id.to_string()),
-            ("MAESTRO_PLACEMENT_GENERATION".into(), "1".into()),
             ("MAESTRO_RUNNER_SESSION_ID".into(), runner_session_id.into()),
         ]),
         restart_policy: ResidentProcessRestartPolicy::OnFailure,
         expected_generation: 0,
         bootstrap: None,
-    };
+    }
+}
+
+#[tokio::test]
+async fn maestro_hosted_runner_rejects_ephemeral_workspace_before_dispatch() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("maestro-ephemeral.db").display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let client = server.client();
+    let sandbox: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("maestro-ephemeral".into()),
+            template: Some("ubuntu-dev".into()),
+            memory_limit: None,
+            network_egress: Some(NetworkEgress::DenyAll),
+            workspace_mode: Some(WorkspaceMode::Ephemeral),
+            runtime_profile: None,
+            execution_class: None,
+            ttl_seconds: Some(3600),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let response = client
+        .put(format!(
+            "{}/sandboxes/{}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&maestro_hosted_runner_request(
+            sandbox.sandbox.id,
+            "workspace-1",
+            "runner-session-1",
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("workspace_mode=persistent")
+    );
+}
+
+#[tokio::test]
+async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("maestro-workload.db").display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let (sandbox_id, worker, _) =
+        provisioned_sandbox_with_guest(&server, "maestro-wif", true).await;
+    let client = server.client();
+    let workspace_id = "workspace/with spaces";
+    let runner_session_id = "runner/session with spaces";
+    let request = maestro_hosted_runner_request(sandbox_id, workspace_id, runner_session_id);
     let mut redirected_exchange = request.clone();
     redirected_exchange.env.insert(
         "MAESTRO_IDENTITY_EXCHANGE_URL".into(),
@@ -298,6 +363,41 @@ async fn maestro_workload_identity_requires_the_live_exact_provider_fence() {
         .await
         .unwrap();
     assert!(created.resident_process.bootstrap_sha256.is_none());
+    assert_eq!(
+        created.resident_process.cwd.as_deref(),
+        Some(MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT)
+    );
+    assert_eq!(
+        created
+            .resident_process
+            .env
+            .get("MAESTRO_WORKSPACE_ROOT")
+            .map(String::as_str),
+        Some(MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT)
+    );
+    assert_eq!(
+        created
+            .resident_process
+            .env
+            .get("MAESTRO_PLACEMENT_GENERATION")
+            .map(String::as_str),
+        Some("1"),
+        "Sandboxwich must inject its canonical placement generation"
+    );
+    let connection_binding_url = format!(
+        "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}/connection-binding",
+        server.base_url
+    );
+    assert_eq!(
+        client
+            .get(&connection_binding_url)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::CONFLICT,
+        "a pending process must not expose a connection binding"
+    );
 
     let worker_http = worker_client(&worker);
     let claimed: ClaimLeaseResponse = worker_http
@@ -323,6 +423,14 @@ async fn maestro_workload_identity_requires_the_live_exact_provider_fence() {
         lease.job.payload["name"],
         MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
     );
+    assert_eq!(
+        lease.job.payload["workspaceClaimName"],
+        format!("sandboxwich-pvc-{sandbox_id}")
+    );
+    assert_eq!(
+        lease.job.payload["provisionSpec"]["workspace_mode"],
+        "persistent"
+    );
     let pod_uid = Uuid::now_v7();
     worker_http
         .post(format!(
@@ -346,15 +454,57 @@ async fn maestro_workload_identity_requires_the_live_exact_provider_fence() {
         .error_for_status()
         .unwrap();
 
+    let connection: MaestroHostedRunnerConnectionBindingResponse = client
+        .get(&connection_binding_url)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let service_name = maestro_hosted_runner_service_name(
+        created.resident_process.id,
+        created.resident_process.generation,
+        lease.id.0,
+    );
+    assert_eq!(connection.service_name, service_name);
+    assert_eq!(
+        connection.service_host,
+        format!("{service_name}.sandboxwich-sandboxes.svc.cluster.local")
+    );
+    assert_eq!(
+        connection.expected_server_uri_san,
+        format!(
+            "spiffe://identity.evalops.dev/maestro/v1/organizations/default/workspaces/workspace%2Fwith%20spaces/sandboxes/{sandbox_id}/pods/{pod_uid}/generations/1/sessions/runner%2Fsession%20with%20spaces/images/{}/services/{service_name}/ports/8443/resident-process-generations/1/leases/{}/attempts/1/workers/{}",
+            "b".repeat(64),
+            lease.id,
+            worker.worker.id
+        ),
+        "the expected URI SAN must use Identity's exact URL path-segment encoding"
+    );
+    assert_eq!(
+        reqwest::Client::new()
+            .get(&connection_binding_url)
+            .bearer_auth(TEST_TENANT_B_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "another tenant must not discover the binding"
+    );
+
     let binding = ValidateMaestroWorkloadIdentityRequest {
         organization_id: "default".into(),
-        workspace_id: "workspace-1".into(),
+        workspace_id: workspace_id.into(),
         sandbox_id,
         pod_uid,
         generation: 1,
         runner_session_id: runner_session_id.into(),
     };
-    let validated_response = client
+    let denied = client
         .post(format!(
             "{}/v1/maestro-workload-identities/validate",
             server.base_url
@@ -363,44 +513,52 @@ async fn maestro_workload_identity_requires_the_live_exact_provider_fence() {
         .send()
         .await
         .unwrap();
-    let validation_status = validated_response.status();
-    let validation_body = validated_response.text().await.unwrap();
     assert_eq!(
-        validation_status,
-        reqwest::StatusCode::OK,
-        "{validation_body}"
+        denied.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "the tenant listener must not expose the Identity-only fence route"
     );
-    let validated: MaestroWorkloadIdentityResponse =
-        serde_json::from_str(&validation_body).unwrap();
-    assert!(validated.active);
-    assert_eq!(validated.pod_uid, pod_uid);
-    assert_eq!(validated.generation, 1);
-    assert_eq!(validated.lease_id, lease.id.0);
-    assert_eq!(validated.worker_id, worker.worker.id);
-    assert_eq!(validated.service_port, MAESTRO_HOSTED_RUNNER_CONTAINER_PORT);
-    assert_eq!(
-        validated.runtime_image,
-        "ghcr.io/evalops/maestro@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-    );
-    assert_eq!(
-        validated.service_account_name,
-        MAESTRO_HOSTED_RUNNER_SERVICE_ACCOUNT
-    );
-    assert!(validated.lease_expires_at_epoch_seconds > chrono::Utc::now().timestamp());
 
-    let stale = client
-        .post(format!(
-            "{}/v1/maestro-workload-identities/validate",
-            server.base_url
-        ))
-        .json(&ValidateMaestroWorkloadIdentityRequest {
-            generation: 2,
-            ..binding
-        })
-        .send()
+    sqlx::any::install_default_drivers();
+    let pool = AnyPool::connect(&server.database_url).await.unwrap();
+    sqlx::query("update resident_processes set generation = ? where id = ?")
+        .bind(2_i64)
+        .bind(created.resident_process.id.to_string())
+        .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(stale.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        client
+            .get(&connection_binding_url)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::CONFLICT,
+        "a process generation that no longer matches its lease job must fail closed"
+    );
+    sqlx::query("update resident_processes set generation = ? where id = ?")
+        .bind(1_i64)
+        .bind(created.resident_process.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("update job_leases set expires_at = ? where id = ?")
+        .bind("2000-01-01T00:00:00Z")
+        .bind(lease.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .get(&connection_binding_url)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::CONFLICT,
+        "an expired lease must not expose a connection binding"
+    );
 }
 
 async fn set_provider_isolation_version(
