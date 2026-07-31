@@ -1878,6 +1878,9 @@ pub const ORB_EXECUTOR_RESIDENT_PROCESS_NAME: &str = "orb-executor";
 /// workload identity.
 pub const MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME: &str = "maestro-hosted-runner";
 pub const MAESTRO_HOSTED_RUNNER_CONTAINER_PORT: u16 = 8443;
+pub const MAESTRO_HOSTED_RUNNER_UID: u32 = 65_532;
+pub const MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT: &str = "/workspace";
+pub const SANDBOX_WORKSPACE_GID: u32 = 10_001;
 pub const MAESTRO_HOSTED_RUNNER_SERVICE_ACCOUNT: &str = "maestro-workload";
 pub const MAESTRO_HOSTED_RUNNER_TOKEN_AUDIENCE: &str =
     "https://identity.evalops.dev/v1/workload-certificates";

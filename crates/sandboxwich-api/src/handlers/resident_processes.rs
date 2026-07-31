@@ -211,6 +211,27 @@ async fn placed_worker_supports_provider_isolated_resident_process(
     Ok(Some(generation))
 }
 
+async fn authoritative_workspace_claim_name(
+    db: &Database,
+    sandbox_id: SandboxId,
+    tenant_id: &str,
+) -> Result<String, ApiError> {
+    let sql = format!(
+        "select home_id from sandbox_home_mounts where sandbox_id = {} and tenant_id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+    );
+    let home_id = sqlx::query_scalar::<_, String>(&sql)
+        .bind(sandbox_id.to_string())
+        .bind(tenant_id)
+        .fetch_optional(&db.pool)
+        .await?;
+    Ok(home_id.map_or_else(
+        || format!("sandboxwich-pvc-{sandbox_id}"),
+        |home_id| format!("sandboxwich-home-{home_id}"),
+    ))
+}
+
 /// Claim-time readiness probe for an executor job. It is deliberately free
 /// of telemetry side effects because guests poll this path: a configured
 /// sidecar defers the claim until the provider-isolated row is Running under
@@ -566,6 +587,16 @@ pub(crate) async fn put_resident_process(
     }
     let sandbox_id = SandboxId(sandbox_id);
     let sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
+    let workspace_claim_name = if name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME {
+        if sandbox.workspace_mode != WorkspaceMode::Persistent {
+            return Err(ApiError::bad_request(
+                "maestro-hosted-runner requires workspace_mode=persistent",
+            ));
+        }
+        Some(authoritative_workspace_claim_name(&state.db, sandbox_id, &sandbox.tenant_id).await?)
+    } else {
+        None
+    };
     let provider_placement_generation = if matches!(
         name.as_str(),
         ORB_SIDECAR_RESIDENT_PROCESS_NAME | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
@@ -588,6 +619,11 @@ pub(crate) async fn put_resident_process(
         None
     };
     if name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME {
+        request.cwd = Some(MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT.into());
+        request.env.insert(
+            "MAESTRO_WORKSPACE_ROOT".into(),
+            MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT.into(),
+        );
         request.env.insert(
             "MAESTRO_PLACEMENT_GENERATION".into(),
             provider_placement_generation
@@ -703,6 +739,15 @@ pub(crate) async fn put_resident_process(
         last_error: None,
     };
     add_provision_spec_to_payload(&mut job, &sandbox)?;
+    if let Some(workspace_claim_name) = workspace_claim_name {
+        job.payload
+            .as_object_mut()
+            .expect("resident-process payload is an object")
+            .insert(
+                "workspaceClaimName".into(),
+                serde_json::Value::String(workspace_claim_name),
+            );
+    }
 
     let bootstrap_reservation = request
         .bootstrap

@@ -221,23 +221,12 @@ fn resident_process_request(
     }
 }
 
-#[tokio::test]
-async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
-    let data_dir = tempfile::tempdir().unwrap();
-    let server = TestServer::start(
-        format!(
-            "sqlite://{}",
-            data_dir.path().join("maestro-workload.db").display()
-        ),
-        Some(data_dir),
-    )
-    .await;
-    let (sandbox_id, worker, _) =
-        provisioned_sandbox_with_guest(&server, "maestro-wif", true).await;
-    let client = server.client();
-    let workspace_id = "workspace/with spaces";
-    let runner_session_id = "runner/session with spaces";
-    let request = ResidentProcessRequest {
+fn maestro_hosted_runner_request(
+    sandbox_id: SandboxId,
+    workspace_id: &str,
+    runner_session_id: &str,
+) -> ResidentProcessRequest {
+    ResidentProcessRequest {
         argv: vec![
             "/usr/local/bin/maestro".into(),
             "hosted-runner".into(),
@@ -266,7 +255,83 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
         restart_policy: ResidentProcessRestartPolicy::OnFailure,
         expected_generation: 0,
         bootstrap: None,
-    };
+    }
+}
+
+#[tokio::test]
+async fn maestro_hosted_runner_rejects_ephemeral_workspace_before_dispatch() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("maestro-ephemeral.db").display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let client = server.client();
+    let sandbox: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            name: Some("maestro-ephemeral".into()),
+            template: Some("ubuntu-dev".into()),
+            memory_limit: None,
+            network_egress: Some(NetworkEgress::DenyAll),
+            workspace_mode: Some(WorkspaceMode::Ephemeral),
+            runtime_profile: None,
+            execution_class: None,
+            ttl_seconds: Some(3600),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let response = client
+        .put(format!(
+            "{}/sandboxes/{}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&maestro_hosted_runner_request(
+            sandbox.sandbox.id,
+            "workspace-1",
+            "runner-session-1",
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("workspace_mode=persistent")
+    );
+}
+
+#[tokio::test]
+async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("maestro-workload.db").display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let (sandbox_id, worker, _) =
+        provisioned_sandbox_with_guest(&server, "maestro-wif", true).await;
+    let client = server.client();
+    let workspace_id = "workspace/with spaces";
+    let runner_session_id = "runner/session with spaces";
+    let request = maestro_hosted_runner_request(sandbox_id, workspace_id, runner_session_id);
     let mut redirected_exchange = request.clone();
     redirected_exchange.env.insert(
         "MAESTRO_IDENTITY_EXCHANGE_URL".into(),
@@ -298,6 +363,18 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
         .await
         .unwrap();
     assert!(created.resident_process.bootstrap_sha256.is_none());
+    assert_eq!(
+        created.resident_process.cwd.as_deref(),
+        Some(MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT)
+    );
+    assert_eq!(
+        created
+            .resident_process
+            .env
+            .get("MAESTRO_WORKSPACE_ROOT")
+            .map(String::as_str),
+        Some(MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT)
+    );
     assert_eq!(
         created
             .resident_process
@@ -345,6 +422,14 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
     assert_eq!(
         lease.job.payload["name"],
         MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
+    );
+    assert_eq!(
+        lease.job.payload["workspaceClaimName"],
+        format!("sandboxwich-pvc-{sandbox_id}")
+    );
+    assert_eq!(
+        lease.job.payload["provisionSpec"]["workspace_mode"],
+        "persistent"
     );
     let pod_uid = Uuid::now_v7();
     worker_http
