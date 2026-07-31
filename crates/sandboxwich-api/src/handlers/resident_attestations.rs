@@ -12,6 +12,7 @@ use sandboxwich_core::*;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+use std::collections::BTreeMap;
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
@@ -84,7 +85,7 @@ async fn placement_fence(
     lease_id: Uuid,
 ) -> Result<PlacementFence, ApiError> {
     let sql = format!(
-        "select rp.provider_isolation_version, rp.provider_pod_name, rp.provider_pod_uid,
+        "select rp.name, rp.provider_isolation_version, rp.provider_pod_name, rp.provider_pod_uid,
                 jl.attempt, jl.job_id, jl.worker_id,
                 jl.status, jl.expires_at, sp.worker_id as placement_worker_id,
                 sp.generation as placement_generation, w.labels
@@ -93,12 +94,13 @@ async fn placement_fence(
          join sandbox_placements sp on sp.sandbox_id = rp.sandbox_id
          join workers w on w.id = jl.worker_id
          where rp.id = {} and rp.tenant_id = {} and rp.generation = {}
-           and rp.active_lease_id = {} and rp.name = {}",
+           and rp.active_lease_id = {} and rp.name in ({}, {})",
         db.placeholder(1),
         db.placeholder(2),
         db.placeholder(3),
         db.placeholder(4),
         db.placeholder(5),
+        db.placeholder(6),
     );
     let row = sqlx::query(&sql)
         .bind(process_id.to_string())
@@ -109,6 +111,7 @@ async fn placement_fence(
         )
         .bind(lease_id.to_string())
         .bind(ORB_SIDECAR_RESIDENT_PROCESS_NAME)
+        .bind(MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME)
         .fetch_optional(&db.pool)
         .await?
         .ok_or_else(|| not_live("resident placement fence is no longer active"))?;
@@ -127,7 +130,13 @@ async fn placement_fence(
     if provider_mode != "apply" {
         return Err(not_live("resident placement is not provider-applied"));
     }
-    let runtime_image = label(&labels, PROVIDER_ISOLATED_RESIDENT_PROCESS_IMAGE_LABEL)?.to_string();
+    let process_name: String = row.try_get("name")?;
+    let runtime_image_label = if process_name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME {
+        MAESTRO_HOSTED_RUNNER_IMAGE_LABEL
+    } else {
+        PROVIDER_ISOLATED_RESIDENT_PROCESS_IMAGE_LABEL
+    };
+    let runtime_image = label(&labels, runtime_image_label)?.to_string();
     if !runtime_image.contains("@sha256:") {
         return Err(not_live("resident sidecar image is not digest-pinned"));
     }
@@ -676,5 +685,128 @@ pub(crate) async fn validate_resident_placement_attestation(
     Ok(Json(ResidentPlacementAttestationResponse {
         ok: true,
         claims,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/maestro-workload-identities/validate",
+    request_body = ValidateMaestroWorkloadIdentityRequest,
+    responses(
+        (status = 200, description = "Maestro workload identity is bound to the live canonical placement", body = MaestroWorkloadIdentityResponse),
+        (status = 404, description = "No matching tenant-scoped Maestro placement", body = ErrorEnvelope),
+        (status = 409, description = "The workload placement is stale or mismatched", body = ErrorEnvelope)
+    )
+)]
+pub(crate) async fn validate_maestro_workload_identity(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Json(request): Json<ValidateMaestroWorkloadIdentityRequest>,
+) -> Result<Json<MaestroWorkloadIdentityResponse>, ApiError> {
+    if request.organization_id != ctx.tenant_id
+        || request.workspace_id.trim().is_empty()
+        || request.runner_session_id.trim().is_empty()
+        || request.generation == 0
+    {
+        return Err(unavailable());
+    }
+    let sql = format!(
+        "select rp.id, rp.generation, rp.active_lease_id, rp.env,
+                rp.desired_state, rp.observed_state,
+                rp.provider_pod_name, rp.provider_pod_uid, w.labels
+         from resident_processes rp
+         join job_leases jl on jl.id = rp.active_lease_id
+         join workers w on w.id = jl.worker_id
+         where rp.tenant_id = {} and rp.sandbox_id = {} and rp.name = {}",
+        state.db.placeholder(1),
+        state.db.placeholder(2),
+        state.db.placeholder(3),
+    );
+    let row = sqlx::query(&sql)
+        .bind(&ctx.tenant_id)
+        .bind(request.sandbox_id.to_string())
+        .bind(MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME)
+        .fetch_optional(&state.db.pool)
+        .await?
+        .ok_or_else(unavailable)?;
+    if row.try_get::<String, _>("desired_state")?
+        != ResidentProcessDesiredState::Running.as_db_str()
+        || row.try_get::<String, _>("observed_state")?
+            != ResidentProcessObservedState::Running.as_db_str()
+    {
+        return Err(not_live("Maestro hosted runner is not running"));
+    }
+    let process_id = ResidentProcessId(parse_uuid(&row.try_get::<String, _>("id")?)?);
+    let process_generation = parse_u64(row.try_get("generation")?, "resident generation")?;
+    let lease_id = parse_uuid(
+        &row.try_get::<String, _>("active_lease_id")
+            .map_err(|_| not_live("Maestro hosted runner has no active lease"))?,
+    )?;
+    let env: BTreeMap<String, String> = serde_json::from_str(&row.try_get::<String, _>("env")?)
+        .map_err(|_| ApiError::internal("Maestro resident environment is invalid"))?;
+    let provider_pod_name: String = row
+        .try_get::<Option<String>, _>("provider_pod_name")?
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| not_live("Maestro placement has no observed Pod name"))?;
+    let provider_pod_uid = row
+        .try_get::<Option<String>, _>("provider_pod_uid")?
+        .and_then(|value| Uuid::parse_str(&value).ok())
+        .ok_or_else(|| not_live("Maestro placement has no authoritative Pod UID"))?;
+    let binding_matches = env.get("MAESTRO_ORGANIZATION_ID") == Some(&request.organization_id)
+        && env.get("MAESTRO_WORKSPACE_ID") == Some(&request.workspace_id)
+        && env
+            .get("MAESTRO_SANDBOX_ID")
+            .and_then(|value| Uuid::parse_str(value).ok())
+            == Some(request.sandbox_id.0)
+        && env
+            .get("MAESTRO_PLACEMENT_GENERATION")
+            .and_then(|value| value.parse::<u64>().ok())
+            == Some(request.generation)
+        && env.get("MAESTRO_RUNNER_SESSION_ID") == Some(&request.runner_session_id)
+        && provider_pod_uid == request.pod_uid;
+    if !binding_matches {
+        return Err(not_live(
+            "Maestro workload request does not match its canonical binding",
+        ));
+    }
+    let fence = placement_fence(
+        &state.db,
+        &ctx.tenant_id,
+        process_id,
+        process_generation,
+        lease_id,
+    )
+    .await?;
+    if fence.placement_generation != request.generation
+        || fence
+            .provider_pod_uid
+            .as_deref()
+            .and_then(|value| Uuid::parse_str(value).ok())
+            != Some(request.pod_uid)
+        || fence.provider_pod_name.as_deref() != Some(provider_pod_name.as_str())
+    {
+        return Err(not_live("Maestro placement fence changed"));
+    }
+    let labels = parse_labels(&row.try_get::<String, _>("labels")?)?;
+    let sandbox_namespace = label(&labels, "sandbox_namespace")?.to_string();
+    Ok(Json(MaestroWorkloadIdentityResponse {
+        active: true,
+        organization_id: request.organization_id,
+        workspace_id: request.workspace_id,
+        sandbox_id: request.sandbox_id,
+        pod_name: provider_pod_name,
+        pod_uid: provider_pod_uid,
+        generation: request.generation,
+        runner_session_id: request.runner_session_id,
+        runtime_image: fence.runtime_image,
+        service_account_namespace: sandbox_namespace,
+        service_account_name: MAESTRO_HOSTED_RUNNER_SERVICE_ACCOUNT.into(),
+        service_name: maestro_hosted_runner_service_name(process_id, process_generation, lease_id),
+        service_port: MAESTRO_HOSTED_RUNNER_CONTAINER_PORT,
+        resident_process_generation: process_generation,
+        lease_id,
+        lease_attempt: fence.lease_attempt,
+        lease_expires_at_epoch_seconds: fence.lease_expires_at.timestamp(),
+        worker_id: fence.worker_id,
     }))
 }

@@ -356,6 +356,10 @@ pub(crate) async fn ensure_lease_worker_scope(
         let owns_role = matches!(
             (process_name.as_str(), ctx.principal),
             (ORB_SIDECAR_RESIDENT_PROCESS_NAME, Principal::Worker(_))
+                | (
+                    MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME,
+                    Principal::Worker(_)
+                )
                 | (ORB_EXECUTOR_RESIDENT_PROCESS_NAME, Principal::Guest { .. })
         ) && ctx
             .guest_sandbox_id()

@@ -162,6 +162,7 @@ fn only_compiler_cache_provider_operations_can_target_root_helper() {
 
 fn isolated_sidecar_spec(bootstrap: &[u8]) -> IsolatedResidentProcessSpec {
     IsolatedResidentProcessSpec {
+        process_name: sandboxwich_core::ORB_SIDECAR_RESIDENT_PROCESS_NAME.to_string(),
         sandbox_id: SandboxId::new(),
         process_id: sandboxwich_core::ResidentProcessId::new(),
         generation: 7,
@@ -169,13 +170,142 @@ fn isolated_sidecar_spec(bootstrap: &[u8]) -> IsolatedResidentProcessSpec {
         argv: vec!["/opt/orb/bin/orb-sidecar".to_string()],
         cwd: Some("/workspace".to_string()),
         env: BTreeMap::from([("ORB_API".to_string(), "https://orb.invalid".to_string())]),
-        bootstrap: IsolatedResidentProcessBootstrap {
+        bootstrap: Some(IsolatedResidentProcessBootstrap {
             content: bootstrap.to_vec(),
             target_file: "/run/sandboxwich/bootstrap/orb-token".to_string(),
             mode: 0o400,
             placement_attestation: None,
-        },
+        }),
     }
+}
+
+fn maestro_hosted_runner_spec() -> IsolatedResidentProcessSpec {
+    let sandbox_id = SandboxId::new();
+    IsolatedResidentProcessSpec {
+        process_name: sandboxwich_core::MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME.to_string(),
+        sandbox_id,
+        process_id: sandboxwich_core::ResidentProcessId::new(),
+        generation: 4,
+        lease_id: Uuid::now_v7(),
+        argv: vec![
+            "/usr/local/bin/maestro".to_string(),
+            "hosted-runner".to_string(),
+            "--listen".to_string(),
+            "0.0.0.0:8443".to_string(),
+        ],
+        cwd: None,
+        env: BTreeMap::from([
+            (
+                "MAESTRO_KUBERNETES_TOKEN_FILE".to_string(),
+                sandboxwich_core::MAESTRO_HOSTED_RUNNER_TOKEN_FILE.to_string(),
+            ),
+            (
+                "MAESTRO_IDENTITY_EXCHANGE_URL".to_string(),
+                "https://identity.evalops.svc/v1/workload-certificates".to_string(),
+            ),
+            ("MAESTRO_ORGANIZATION_ID".to_string(), "org-1".to_string()),
+            (
+                "MAESTRO_WORKSPACE_ID".to_string(),
+                "workspace-1".to_string(),
+            ),
+            ("MAESTRO_SANDBOX_ID".to_string(), sandbox_id.to_string()),
+            ("MAESTRO_PLACEMENT_GENERATION".to_string(), "7".to_string()),
+            (
+                "MAESTRO_RUNNER_SESSION_ID".to_string(),
+                "runner-session-1".to_string(),
+            ),
+        ]),
+        bootstrap: None,
+    }
+}
+
+#[test]
+fn maestro_hosted_runner_uses_only_projected_identity_in_an_isolated_pod() {
+    let image = format!("ghcr.io/evalops/maestro@sha256:{}", "a".repeat(64));
+    let provider = KubernetesApplyProvider::new(
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-control", None, None)
+            .with_sandbox_namespace(Some("sandboxwich-sandboxes".to_string()))
+            .with_ingress_namespace(Some("evalops".to_string()))
+            .with_isolation_profile(IsolationProfile::Gvisor)
+            .with_runtime_class_name(Some("gvisor".to_string()))
+            .with_isolated_sidecar_https_cidrs(vec!["10.40.0.10/32".parse().expect("CIDR")])
+            .expect("narrow issuer egress"),
+        "kubectl",
+    )
+    .with_maestro_hosted_runner_image(Some(image.clone()));
+    let spec = maestro_hosted_runner_spec();
+    let manifests = provider
+        .isolated_resident_process_manifests(&spec)
+        .expect("projected-identity Maestro sidecar should render");
+
+    assert_eq!(manifests.len(), 3, "no Secret manifest may be rendered");
+    assert_eq!(manifests[0]["kind"], "NetworkPolicy");
+    assert_eq!(manifests[1]["kind"], "Service");
+    assert_eq!(manifests[2]["kind"], "Pod");
+    let policy = &manifests[0];
+    let service = &manifests[1];
+    let pod = &manifests[2];
+    assert_eq!(
+        pod["spec"]["serviceAccountName"],
+        sandboxwich_core::MAESTRO_HOSTED_RUNNER_SERVICE_ACCOUNT
+    );
+    assert_eq!(pod["spec"]["automountServiceAccountToken"], false);
+    assert_eq!(pod["spec"]["hostPID"], false);
+    assert_eq!(pod["spec"]["hostIPC"], false);
+    assert_eq!(pod["spec"]["hostNetwork"], false);
+    assert_eq!(pod["spec"]["containers"][0]["image"], image);
+    assert_eq!(
+        pod["spec"]["volumes"][1]["projected"]["sources"][0]["serviceAccountToken"]["audience"],
+        sandboxwich_core::MAESTRO_HOSTED_RUNNER_TOKEN_AUDIENCE
+    );
+    assert_eq!(
+        pod["spec"]["volumes"][1]["projected"]["sources"][0]["serviceAccountToken"]["expirationSeconds"],
+        600
+    );
+    assert_eq!(
+        pod["spec"]["containers"][0]["volumeMounts"][1]["mountPath"],
+        sandboxwich_core::MAESTRO_HOSTED_RUNNER_TOKEN_FILE
+    );
+    assert_eq!(
+        service["spec"]["ports"][0]["port"],
+        sandboxwich_core::MAESTRO_HOSTED_RUNNER_CONTAINER_PORT
+    );
+    assert_eq!(
+        policy["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/name"],
+        "runner-host"
+    );
+    let rendered = serde_json::to_string(&manifests).expect("render manifests");
+    assert!(!rendered.contains("\"kind\":\"Secret\""));
+    assert!(!rendered.contains("\"cidr\":\"0.0.0.0/0\""));
+    assert!(!rendered.contains("MAESTRO_HOSTED_RUNNER_AUTH_TOKEN"));
+}
+
+#[test]
+fn maestro_hosted_runner_rejects_static_bootstrap_material() {
+    let provider = KubernetesApplyProvider::new(
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Gvisor)
+            .with_runtime_class_name(Some("gvisor".to_string())),
+        "kubectl",
+    )
+    .with_maestro_hosted_runner_image(Some(format!(
+        "ghcr.io/evalops/maestro@sha256:{}",
+        "a".repeat(64)
+    )));
+    let mut spec = maestro_hosted_runner_spec();
+    spec.bootstrap = Some(IsolatedResidentProcessBootstrap {
+        content: b"forbidden-bearer".to_vec(),
+        target_file: "/run/sandboxwich/bootstrap/token".into(),
+        mode: 0o400,
+        placement_attestation: None,
+    });
+    assert!(
+        provider
+            .isolated_resident_process_manifests(&spec)
+            .expect_err("static Maestro bootstrap must fail closed")
+            .to_string()
+            .contains("forbids static bootstrap")
+    );
 }
 
 #[test]
@@ -189,7 +319,10 @@ fn isolated_sidecar_v2_mounts_attestation_as_a_separate_secret_file() {
     )
     .with_isolated_resident_process_image(Some(image));
     let mut spec = isolated_sidecar_spec(b"orb-bootstrap-canary");
-    spec.bootstrap.placement_attestation = Some(b"placement-attestation-canary".to_vec());
+    spec.bootstrap
+        .as_mut()
+        .expect("orb bootstrap")
+        .placement_attestation = Some(b"placement-attestation-canary".to_vec());
 
     let manifests = provider
         .isolated_resident_process_manifests(&spec)
@@ -256,8 +389,9 @@ fn isolated_sidecar_v2_rejects_bootstrap_attestation_path_collision() {
     )
     .with_isolated_resident_process_image(Some(image));
     let mut spec = isolated_sidecar_spec(b"bootstrap");
-    spec.bootstrap.target_file = RESIDENT_PLACEMENT_ATTESTATION_FILE.to_string();
-    spec.bootstrap.placement_attestation = Some(b"attestation".to_vec());
+    let bootstrap = spec.bootstrap.as_mut().expect("orb bootstrap");
+    bootstrap.target_file = RESIDENT_PLACEMENT_ATTESTATION_FILE.to_string();
+    bootstrap.placement_attestation = Some(b"attestation".to_vec());
     let error = provider
         .isolated_resident_process_manifests(&spec)
         .expect_err("the two secret keys must never target the same file");

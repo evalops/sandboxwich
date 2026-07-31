@@ -17,9 +17,12 @@ use clap::ValueEnum;
 use ipnet::IpNet;
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, DbVariant, ExecutionClass, HomeId,
-    MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES, MAX_SANDBOX_FILE_BYTES, MaterializeFileDestination,
-    MaterializeFileObservation, MemoryLimit, NetworkAllowRuleKind, NetworkEgress,
-    ORB_SIDECAR_RESIDENT_PROCESS_UID, PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL,
+    MAESTRO_HOSTED_RUNNER_CONTAINER_PORT, MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME,
+    MAESTRO_HOSTED_RUNNER_SERVICE_ACCOUNT, MAESTRO_HOSTED_RUNNER_TOKEN_AUDIENCE,
+    MAESTRO_HOSTED_RUNNER_TOKEN_FILE, MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES, MAX_SANDBOX_FILE_BYTES,
+    MaterializeFileDestination, MaterializeFileObservation, MemoryLimit, NetworkAllowRuleKind,
+    NetworkEgress, ORB_SIDECAR_RESIDENT_PROCESS_UID,
+    PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL,
     PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE, ProviderCapabilityReport,
     ProviderForkHandle, ProviderHealthReport, ProviderHealthStatus, ProviderRuntimeResource,
     ProviderSandboxHandle, ProviderSnapshotHandle, ProvisioningErrorClass, ProvisioningStage,
@@ -291,6 +294,7 @@ impl std::fmt::Debug for IsolatedResidentProcessBootstrap {
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct IsolatedResidentProcessSpec {
+    pub process_name: String,
     pub sandbox_id: SandboxId,
     pub process_id: ResidentProcessId,
     pub generation: u64,
@@ -298,13 +302,14 @@ pub struct IsolatedResidentProcessSpec {
     pub argv: Vec<String>,
     pub cwd: Option<String>,
     pub env: BTreeMap<String, String>,
-    pub bootstrap: IsolatedResidentProcessBootstrap,
+    pub bootstrap: Option<IsolatedResidentProcessBootstrap>,
 }
 
 impl std::fmt::Debug for IsolatedResidentProcessSpec {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("IsolatedResidentProcessSpec")
+            .field("process_name", &self.process_name)
             .field("sandbox_id", &self.sandbox_id)
             .field("process_id", &self.process_id)
             .field("generation", &self.generation)
@@ -2353,6 +2358,7 @@ pub struct KubernetesApplyProvider {
     kubectl_command_timeout: Duration,
     max_captured_output_bytes: u64,
     isolated_resident_process_image: Option<String>,
+    maestro_hosted_runner_image: Option<String>,
     isolated_resident_process_startup_timeout: Duration,
     isolated_resident_process_poll_interval: Duration,
     isolated_resident_process_max_poll_interval: Duration,
@@ -2834,6 +2840,7 @@ impl KubernetesApplyProvider {
             kubectl_command_timeout: Duration::from_secs(DEFAULT_KUBECTL_COMMAND_TIMEOUT_SECS),
             max_captured_output_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
             isolated_resident_process_image: None,
+            maestro_hosted_runner_image: None,
             isolated_resident_process_startup_timeout: Duration::from_secs(
                 DEFAULT_ISOLATED_RESIDENT_PROCESS_STARTUP_TIMEOUT_SECS,
             ),
@@ -2910,6 +2917,14 @@ impl KubernetesApplyProvider {
         self
     }
 
+    pub fn with_maestro_hosted_runner_image(mut self, image: Option<String>) -> Self {
+        self.maestro_hosted_runner_image = image.and_then(|image| {
+            let image = image.trim();
+            (!image.is_empty()).then(|| image.to_string())
+        });
+        self
+    }
+
     pub fn with_isolated_resident_process_startup_timeout(mut self, timeout: Duration) -> Self {
         self.isolated_resident_process_startup_timeout = timeout.max(Duration::from_millis(1));
         self
@@ -2928,6 +2943,14 @@ impl KubernetesApplyProvider {
 
     pub fn isolated_resident_process_image(&self) -> Option<&str> {
         self.isolated_resident_process_image.as_deref()
+    }
+
+    fn image_for_isolated_resident_process(&self, process_name: &str) -> Option<&str> {
+        if process_name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME {
+            self.maestro_hosted_runner_image.as_deref()
+        } else {
+            self.isolated_resident_process_image()
+        }
     }
 
     fn isolated_resident_process_configured(&self) -> bool {
@@ -4143,12 +4166,25 @@ impl KubernetesApplyProvider {
         format!("sw-scnp-{}", isolated_resident_process_fence_suffix(spec))
     }
 
+    fn maestro_hosted_runner_service_name(&self, spec: &IsolatedResidentProcessSpec) -> String {
+        sandboxwich_core::maestro_hosted_runner_service_name(
+            spec.process_id,
+            spec.generation,
+            spec.lease_id,
+        )
+    }
+
     fn validate_isolated_resident_process_spec(
         &self,
         spec: &IsolatedResidentProcessSpec,
     ) -> anyhow::Result<()> {
+        let maestro = spec.process_name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME;
+        anyhow::ensure!(
+            maestro || spec.process_name == sandboxwich_core::ORB_SIDECAR_RESIDENT_PROCESS_NAME,
+            "only explicit provider-isolated process kinds are accepted"
+        );
         let image = self
-            .isolated_resident_process_image()
+            .image_for_isolated_resident_process(&spec.process_name)
             .context("isolated resident-process sidecar image is not configured")?;
         anyhow::ensure!(
             image_is_digest_pinned(image),
@@ -4184,45 +4220,78 @@ impl KubernetesApplyProvider {
             }),
             "isolated resident-process environment is invalid"
         );
-        anyhow::ensure!(
-            !spec.bootstrap.content.is_empty()
-                && spec.bootstrap.content.len() <= MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES,
-            "isolated resident-process bootstrap must be between 1 byte and 64 KiB"
-        );
-        anyhow::ensure!(
-            (0o400..=0o700).contains(&spec.bootstrap.mode),
-            "isolated resident-process bootstrap mode must be between 0400 and 0700"
-        );
-        let prefix = std::path::Path::new(RESIDENT_PROCESS_BOOTSTRAP_PREFIX);
-        let target = std::path::Path::new(&spec.bootstrap.target_file);
-        let relative = target
-            .strip_prefix(prefix)
-            .context("isolated resident-process bootstrap path is outside the allowed root")?;
-        anyhow::ensure!(
-            !relative.as_os_str().is_empty()
-                && relative
-                    .components()
-                    .all(|component| { matches!(component, std::path::Component::Normal(_)) }),
-            "isolated resident-process bootstrap target is invalid"
-        );
-        if let Some(attestation) = &spec.bootstrap.placement_attestation {
+        if maestro {
             anyhow::ensure!(
-                !attestation.is_empty()
-                    && attestation.len() <= MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES,
-                "isolated resident-process placement attestation must be between 1 byte and 64 KiB"
+                spec.bootstrap.is_none(),
+                "Maestro workload identity forbids static bootstrap material"
             );
             anyhow::ensure!(
-                spec.bootstrap.target_file != RESIDENT_PLACEMENT_ATTESTATION_FILE,
-                "isolated resident-process bootstrap target collides with the placement attestation path"
+                spec.argv
+                    == [
+                        "/usr/local/bin/maestro",
+                        "hosted-runner",
+                        "--listen",
+                        "0.0.0.0:8443",
+                    ],
+                "Maestro hosted runner command is not the fixed mTLS entrypoint"
             );
+            anyhow::ensure!(
+                spec.env
+                    .get("MAESTRO_KUBERNETES_TOKEN_FILE")
+                    .map(String::as_str)
+                    == Some(MAESTRO_HOSTED_RUNNER_TOKEN_FILE),
+                "Maestro hosted runner requires the projected workload token path"
+            );
+        } else {
+            let bootstrap = spec
+                .bootstrap
+                .as_ref()
+                .context("isolated resident-process bootstrap is required")?;
+            anyhow::ensure!(
+                !bootstrap.content.is_empty()
+                    && bootstrap.content.len() <= MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES,
+                "isolated resident-process bootstrap must be between 1 byte and 64 KiB"
+            );
+            anyhow::ensure!(
+                (0o400..=0o700).contains(&bootstrap.mode),
+                "isolated resident-process bootstrap mode must be between 0400 and 0700"
+            );
+            let prefix = std::path::Path::new(RESIDENT_PROCESS_BOOTSTRAP_PREFIX);
+            let target = std::path::Path::new(&bootstrap.target_file);
+            let relative = target
+                .strip_prefix(prefix)
+                .context("isolated resident-process bootstrap path is outside the allowed root")?;
+            anyhow::ensure!(
+                !relative.as_os_str().is_empty()
+                    && relative
+                        .components()
+                        .all(|component| { matches!(component, std::path::Component::Normal(_)) }),
+                "isolated resident-process bootstrap target is invalid"
+            );
+            if let Some(attestation) = &bootstrap.placement_attestation {
+                anyhow::ensure!(
+                    !attestation.is_empty()
+                        && attestation.len() <= MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES,
+                    "isolated resident-process placement attestation must be between 1 byte and 64 KiB"
+                );
+                anyhow::ensure!(
+                    bootstrap.target_file != RESIDENT_PLACEMENT_ATTESTATION_FILE,
+                    "isolated resident-process bootstrap target collides with the placement attestation path"
+                );
+            }
         }
         Ok(())
     }
 
     fn isolated_resident_process_labels(&self, spec: &IsolatedResidentProcessSpec) -> Value {
         json!({
-            "app.kubernetes.io/name": "orb-sidecar",
+            "app.kubernetes.io/name": if spec.process_name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME {
+                "maestro-hosted-runner"
+            } else {
+                "orb-sidecar"
+            },
             "app.kubernetes.io/component": "isolated-resident-process",
+            "sandboxwich.dev/resident-process-kind": spec.process_name,
             "sandboxwich.dev/sandbox-id": spec.sandbox_id.to_string(),
             "sandboxwich.dev/resident-process-id": spec.process_id.to_string(),
             "sandboxwich.dev/generation": spec.generation.to_string(),
@@ -4235,52 +4304,14 @@ impl KubernetesApplyProvider {
         spec: &IsolatedResidentProcessSpec,
     ) -> anyhow::Result<Vec<Value>> {
         self.validate_isolated_resident_process_spec(spec)?;
+        let maestro = spec.process_name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME;
         let pod_name = isolated_resident_process_pod_name(spec);
         let secret_name = self.isolated_resident_process_secret_name(spec);
         let network_policy_name = self.isolated_resident_process_network_policy_name(spec);
         let labels = self.isolated_resident_process_labels(spec);
-        let relative_target = std::path::Path::new(&spec.bootstrap.target_file)
-            .strip_prefix(RESIDENT_PROCESS_BOOTSTRAP_PREFIX)
-            .expect("validated bootstrap target")
-            .to_string_lossy()
-            .into_owned();
-        let mut secret_data = Map::from_iter([(
-            "bootstrap".to_string(),
-            json!(general_purpose::STANDARD.encode(&spec.bootstrap.content)),
-        )]);
-        let mut secret_items = vec![json!({
-            "key": "bootstrap",
-            "path": relative_target,
-            "mode": spec.bootstrap.mode,
-        })];
-        if let Some(attestation) = &spec.bootstrap.placement_attestation {
-            secret_data.insert(
-                "placement-attestation".to_string(),
-                json!(general_purpose::STANDARD.encode(attestation)),
-            );
-            let attestation_path = std::path::Path::new(RESIDENT_PLACEMENT_ATTESTATION_FILE)
-                .strip_prefix(RESIDENT_PROCESS_BOOTSTRAP_PREFIX)
-                .expect("placement attestation path is under the bootstrap root")
-                .to_string_lossy()
-                .into_owned();
-            secret_items.push(json!({
-                "key": "placement-attestation",
-                "path": attestation_path,
-                "mode": 0o400,
-            }));
-        }
-        let secret = json!({
-            "apiVersion": "v1",
-            "kind": "Secret",
-            "metadata": {
-                "name": secret_name,
-                "namespace": self.dry_run.effective_sandbox_namespace(),
-                "labels": labels,
-            },
-            "type": "Opaque",
-            "immutable": true,
-            "data": secret_data,
-        });
+        let image = self
+            .image_for_isolated_resident_process(&spec.process_name)
+            .expect("validated isolated resident-process image");
         let mut network_egress = self.dry_run.dns_egress_rules();
         network_egress.extend(
             self.dry_run
@@ -4293,10 +4324,34 @@ impl KubernetesApplyProvider {
                     })
                 }),
         );
-        network_egress.push(json!({
-            "to": [{ "ipBlock": self.dry_run.ip_block("0.0.0.0/0")? }],
-            "ports": [{ "protocol": "TCP", "port": 443 }],
-        }));
+        if !maestro {
+            network_egress.push(json!({
+                "to": [{ "ipBlock": self.dry_run.ip_block("0.0.0.0/0")? }],
+                "ports": [{ "protocol": "TCP", "port": 443 }],
+            }));
+        }
+        let ingress = if maestro {
+            vec![json!({
+                "from": [{
+                    "namespaceSelector": {
+                        "matchLabels": {
+                            "kubernetes.io/metadata.name": self.dry_run.effective_ingress_namespace()
+                        }
+                    },
+                    "podSelector": {
+                        "matchLabels": {
+                            "app.kubernetes.io/name": "runner-host"
+                        }
+                    }
+                }],
+                "ports": [{
+                    "protocol": "TCP",
+                    "port": MAESTRO_HOSTED_RUNNER_CONTAINER_PORT
+                }]
+            })]
+        } else {
+            Vec::new()
+        };
         let network_policy = json!({
             "apiVersion": "networking.k8s.io/v1",
             "kind": "NetworkPolicy",
@@ -4308,7 +4363,7 @@ impl KubernetesApplyProvider {
             "spec": {
                 "podSelector": { "matchLabels": labels },
                 "policyTypes": ["Ingress", "Egress"],
-                "ingress": [],
+                "ingress": ingress,
                 "egress": network_egress,
             },
         });
@@ -4318,13 +4373,19 @@ impl KubernetesApplyProvider {
             .map(|(name, value)| json!({ "name": name, "value": value }))
             .collect::<Vec<_>>();
         let mut container = json!({
-            "name": "orb-sidecar",
-            "image": self
-                .isolated_resident_process_image()
-                .expect("validated sidecar image"),
+            "name": if maestro { "maestro-hosted-runner" } else { "orb-sidecar" },
+            "image": image,
             "imagePullPolicy": "IfNotPresent",
             "command": spec.argv,
             "env": env,
+            "ports": if maestro {
+                json!([{
+                    "name": "maestro-mtls",
+                    "containerPort": MAESTRO_HOSTED_RUNNER_CONTAINER_PORT
+                }])
+            } else {
+                json!([])
+            },
             "securityContext": {
                 "allowPrivilegeEscalation": false,
                 "readOnlyRootFilesystem": true,
@@ -4338,24 +4399,164 @@ impl KubernetesApplyProvider {
                 "requests": { "cpu": "50m", "memory": "64Mi" },
                 "limits": { "cpu": "500m", "memory": "256Mi" },
             },
-            "volumeMounts": [
-                {
+            "volumeMounts": [{
+                "name": "tmp",
+                "mountPath": "/tmp",
+            }],
+        });
+        if maestro {
+            container["volumeMounts"]
+                .as_array_mut()
+                .expect("volumeMounts is an array")
+                .push(json!({
+                    "name": "workload-identity",
+                    "mountPath": MAESTRO_HOSTED_RUNNER_TOKEN_FILE,
+                    "subPath": "token",
+                    "readOnly": true,
+                }));
+        } else {
+            container["volumeMounts"]
+                .as_array_mut()
+                .expect("volumeMounts is an array")
+                .push(json!({
                     "name": "bootstrap",
                     "mountPath": RESIDENT_PROCESS_BOOTSTRAP_PREFIX,
-                },
-                {
-                    "name": "tmp",
-                    "mountPath": "/tmp",
-                },
-            ],
-        });
+                }));
+        }
         if let Some(cwd) = &spec.cwd {
             container
                 .as_object_mut()
                 .expect("container is an object")
                 .insert("workingDir".to_string(), json!(cwd));
         }
-        let pod = json!({
+        let mut volumes = Vec::new();
+        let mut init_containers = Vec::new();
+        let mut manifests = Vec::new();
+        if maestro {
+            volumes.extend([
+                json!({
+                    "name": "tmp",
+                    "emptyDir": {
+                        "sizeLimit": "64Mi",
+                    },
+                }),
+                json!({
+                    "name": "workload-identity",
+                    "projected": {
+                        "defaultMode": 0o400,
+                        "sources": [{
+                            "serviceAccountToken": {
+                                "audience": MAESTRO_HOSTED_RUNNER_TOKEN_AUDIENCE,
+                                "expirationSeconds": 600,
+                                "path": "token",
+                            }
+                        }]
+                    }
+                }),
+            ]);
+        } else {
+            let bootstrap = spec.bootstrap.as_ref().expect("validated bootstrap");
+            let relative_target = std::path::Path::new(&bootstrap.target_file)
+                .strip_prefix(RESIDENT_PROCESS_BOOTSTRAP_PREFIX)
+                .expect("validated bootstrap target")
+                .to_string_lossy()
+                .into_owned();
+            let mut secret_data = Map::from_iter([(
+                "bootstrap".to_string(),
+                json!(general_purpose::STANDARD.encode(&bootstrap.content)),
+            )]);
+            let mut secret_items = vec![json!({
+                "key": "bootstrap",
+                "path": relative_target,
+                "mode": bootstrap.mode,
+            })];
+            if let Some(attestation) = &bootstrap.placement_attestation {
+                secret_data.insert(
+                    "placement-attestation".to_string(),
+                    json!(general_purpose::STANDARD.encode(attestation)),
+                );
+                let attestation_path = std::path::Path::new(RESIDENT_PLACEMENT_ATTESTATION_FILE)
+                    .strip_prefix(RESIDENT_PROCESS_BOOTSTRAP_PREFIX)
+                    .expect("placement attestation path is under bootstrap root")
+                    .to_string_lossy()
+                    .into_owned();
+                secret_items.push(json!({
+                    "key": "placement-attestation",
+                    "path": attestation_path,
+                    "mode": 0o400,
+                }));
+            }
+            manifests.push(json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {
+                    "name": secret_name,
+                    "namespace": self.dry_run.effective_sandbox_namespace(),
+                    "labels": labels,
+                },
+                "type": "Opaque",
+                "immutable": true,
+                "data": secret_data,
+            }));
+            init_containers.push(json!({
+                "name": "bootstrap-handoff",
+                "image": image,
+                "imagePullPolicy": "IfNotPresent",
+                "command": [
+                    "/bin/sh",
+                    "-c",
+                    "set -eu; cp -R /source/. /run/sandboxwich/bootstrap/; chmod -R go-rwx /run/sandboxwich/bootstrap",
+                ],
+                "securityContext": {
+                    "allowPrivilegeEscalation": false,
+                    "readOnlyRootFilesystem": true,
+                    "runAsNonRoot": true,
+                    "runAsUser": ORB_SIDECAR_RESIDENT_PROCESS_UID,
+                    "runAsGroup": ORB_SIDECAR_RESIDENT_PROCESS_UID,
+                    "capabilities": { "drop": ["ALL"] },
+                    "seccompProfile": { "type": "RuntimeDefault" },
+                },
+                "resources": {
+                    "requests": { "cpu": "10m", "memory": "16Mi" },
+                    "limits": { "cpu": "100m", "memory": "32Mi" },
+                },
+                "volumeMounts": [
+                    {
+                        "name": "bootstrap-source",
+                        "mountPath": "/source",
+                        "readOnly": true,
+                    },
+                    {
+                        "name": "bootstrap",
+                        "mountPath": RESIDENT_PROCESS_BOOTSTRAP_PREFIX,
+                    },
+                ],
+            }));
+            volumes.extend([
+                json!({
+                    "name": "bootstrap-source",
+                    "secret": {
+                        "secretName": secret_name,
+                        "defaultMode": bootstrap.mode,
+                        "items": secret_items,
+                    },
+                }),
+                json!({
+                    "name": "bootstrap",
+                    "emptyDir": {
+                        "medium": "Memory",
+                        "sizeLimit": "1Mi",
+                    },
+                }),
+                json!({
+                    "name": "tmp",
+                    "emptyDir": {
+                        "sizeLimit": "64Mi",
+                    },
+                }),
+            ]);
+        }
+        let mut pod = json!({
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {
@@ -4379,76 +4580,50 @@ impl KubernetesApplyProvider {
                     "fsGroup": ORB_SIDECAR_RESIDENT_PROCESS_UID,
                     "seccompProfile": { "type": "RuntimeDefault" },
                 },
-                "initContainers": [{
-                    "name": "bootstrap-handoff",
-                    "image": self
-                        .isolated_resident_process_image()
-                        .expect("validated sidecar image"),
-                    "imagePullPolicy": "IfNotPresent",
-                    "command": [
-                        "/bin/sh",
-                        "-c",
-                        "set -eu; cp -R /source/. /run/sandboxwich/bootstrap/; chmod -R go-rwx /run/sandboxwich/bootstrap",
-                    ],
-                    "securityContext": {
-                        "allowPrivilegeEscalation": false,
-                        "readOnlyRootFilesystem": true,
-                        "runAsNonRoot": true,
-                        "runAsUser": ORB_SIDECAR_RESIDENT_PROCESS_UID,
-                        "runAsGroup": ORB_SIDECAR_RESIDENT_PROCESS_UID,
-                        "capabilities": { "drop": ["ALL"] },
-                        "seccompProfile": { "type": "RuntimeDefault" },
-                    },
-                    "resources": {
-                        "requests": { "cpu": "10m", "memory": "16Mi" },
-                        "limits": { "cpu": "100m", "memory": "32Mi" },
-                    },
-                    "volumeMounts": [
-                        {
-                            "name": "bootstrap-source",
-                            "mountPath": "/source",
-                            "readOnly": true,
-                        },
-                        {
-                            "name": "bootstrap",
-                            "mountPath": RESIDENT_PROCESS_BOOTSTRAP_PREFIX,
-                        },
-                    ],
-                }],
+                "initContainers": init_containers,
                 "containers": [container],
-                "volumes": [
-                    {
-                        "name": "bootstrap-source",
-                        "secret": {
-                            "secretName": secret_name,
-                            "defaultMode": spec.bootstrap.mode,
-                            "items": secret_items,
-                        },
-                    },
-                    {
-                        "name": "bootstrap",
-                        "emptyDir": {
-                            "medium": "Memory",
-                            "sizeLimit": "1Mi",
-                        },
-                    },
-                    {
-                        "name": "tmp",
-                        "emptyDir": {
-                            "sizeLimit": "64Mi",
-                        },
-                    },
-                ],
+                "volumes": volumes,
             },
         });
-        Ok(vec![secret, network_policy, pod])
+        if maestro {
+            pod["spec"]
+                .as_object_mut()
+                .expect("Pod spec is an object")
+                .insert(
+                    "serviceAccountName".to_string(),
+                    json!(MAESTRO_HOSTED_RUNNER_SERVICE_ACCOUNT),
+                );
+        }
+        manifests.push(network_policy);
+        if maestro {
+            manifests.push(json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {
+                    "name": self.maestro_hosted_runner_service_name(spec),
+                    "namespace": self.dry_run.effective_sandbox_namespace(),
+                    "labels": labels,
+                },
+                "spec": {
+                    "type": "ClusterIP",
+                    "selector": labels,
+                    "ports": [{
+                        "name": "maestro-mtls",
+                        "port": MAESTRO_HOSTED_RUNNER_CONTAINER_PORT,
+                        "targetPort": "maestro-mtls",
+                    }]
+                }
+            }));
+        }
+        manifests.push(pod);
+        Ok(manifests)
     }
 
     fn isolated_resident_process_cleanup_manifests(
         &self,
         spec: &IsolatedResidentProcessSpec,
     ) -> Vec<Value> {
-        vec![
+        let mut manifests = vec![
             json!({
                 "apiVersion": "networking.k8s.io/v1",
                 "kind": "NetworkPolicy",
@@ -4465,15 +4640,27 @@ impl KubernetesApplyProvider {
                     "namespace": self.dry_run.effective_sandbox_namespace(),
                 },
             }),
-            json!({
+        ];
+        if spec.process_name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME {
+            manifests.push(json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {
+                    "name": self.maestro_hosted_runner_service_name(spec),
+                    "namespace": self.dry_run.effective_sandbox_namespace(),
+                },
+            }));
+        } else {
+            manifests.push(json!({
                 "apiVersion": "v1",
                 "kind": "Secret",
                 "metadata": {
                     "name": self.isolated_resident_process_secret_name(spec),
                     "namespace": self.dry_run.effective_sandbox_namespace(),
                 },
-            }),
-        ]
+            }));
+        }
+        manifests
     }
 
     fn observe_isolated_resident_process(

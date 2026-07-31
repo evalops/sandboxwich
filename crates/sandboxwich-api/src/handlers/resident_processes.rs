@@ -164,6 +164,7 @@ async fn placed_worker_supports_provider_isolated_resident_process(
     db: &Database,
     sandbox_id: SandboxId,
     tenant_id: &str,
+    process_name: &str,
 ) -> Result<bool, ApiError> {
     let sql = format!(
         "select w.labels
@@ -180,11 +181,22 @@ async fn placed_worker_supports_provider_isolated_resident_process(
         .await?
         .and_then(|row| row.try_get::<String, _>("labels").ok())
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
-    Ok(labels
+    let version_supported = labels
         .as_ref()
         .and_then(|labels| labels.get(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL))
         .and_then(serde_json::Value::as_str)
-        == Some(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE))
+        == Some(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE);
+    let image_label = if process_name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME {
+        MAESTRO_HOSTED_RUNNER_IMAGE_LABEL
+    } else {
+        PROVIDER_ISOLATED_RESIDENT_PROCESS_IMAGE_LABEL
+    };
+    let image_is_pinned = labels
+        .as_ref()
+        .and_then(|labels| labels.get(image_label))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|image| image.contains("@sha256:"));
+    Ok(version_supported && image_is_pinned)
 }
 
 /// Claim-time readiness probe for an executor job. It is deliberately free
@@ -238,7 +250,14 @@ fn ensure_resident_owner_role(
     ctx: &TenantContext,
 ) -> Result<(), ApiError> {
     let owns_role = match (&process.name, ctx.principal) {
-        (name, Principal::Worker(_)) if name == ORB_SIDECAR_RESIDENT_PROCESS_NAME => true,
+        (name, Principal::Worker(_))
+            if matches!(
+                name.as_str(),
+                ORB_SIDECAR_RESIDENT_PROCESS_NAME | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
+            ) =>
+        {
+            true
+        }
         (name, Principal::Guest { sandbox_id, .. })
             if name == ORB_EXECUTOR_RESIDENT_PROCESS_NAME && sandbox_id == process.sandbox_id =>
         {
@@ -460,7 +479,7 @@ pub(crate) async fn put_resident_process(
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     if !is_supported_resident_process_name(&name) {
         return Err(ApiError::bad_request(
-            "the resident-process contract supports only orb-executor and orb-sidecar",
+            "the resident-process contract supports only orb-executor, orb-sidecar, and maestro-hosted-runner",
         ));
     }
     if name == ORB_SIDECAR_RESIDENT_PROCESS_NAME
@@ -473,20 +492,82 @@ pub(crate) async fn put_resident_process(
             "orb-sidecar requires a non-empty bootstrap credential",
         ));
     }
+    if name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME {
+        if request.bootstrap.is_some() {
+            return Err(ApiError::bad_request(
+                "maestro-hosted-runner forbids static bootstrap material",
+            ));
+        }
+        if request.argv
+            != [
+                "/usr/local/bin/maestro",
+                "hosted-runner",
+                "--listen",
+                "0.0.0.0:8443",
+            ]
+        {
+            return Err(ApiError::bad_request(
+                "maestro-hosted-runner requires the fixed mTLS entrypoint",
+            ));
+        }
+        const ALLOWED_ENV: &[&str] = &[
+            "MAESTRO_KUBERNETES_TOKEN_FILE",
+            "MAESTRO_IDENTITY_EXCHANGE_URL",
+            "MAESTRO_ORGANIZATION_ID",
+            "MAESTRO_WORKSPACE_ID",
+            "MAESTRO_SANDBOX_ID",
+            "MAESTRO_PLACEMENT_GENERATION",
+            "MAESTRO_RUNNER_SESSION_ID",
+        ];
+        if request.env.len() != ALLOWED_ENV.len()
+            || request.env.iter().any(|(key, value)| {
+                !ALLOWED_ENV.contains(&key.as_str())
+                    || value.is_empty()
+                    || value.len() > 512
+                    || value.chars().any(char::is_control)
+            })
+            || request
+                .env
+                .get("MAESTRO_KUBERNETES_TOKEN_FILE")
+                .map(String::as_str)
+                != Some(MAESTRO_HOSTED_RUNNER_TOKEN_FILE)
+            || request
+                .env
+                .get("MAESTRO_IDENTITY_EXCHANGE_URL")
+                .is_none_or(|url| !url.starts_with("https://"))
+            || request
+                .env
+                .get("MAESTRO_SANDBOX_ID")
+                .and_then(|value| Uuid::parse_str(value).ok())
+                != Some(sandbox_id)
+            || request
+                .env
+                .get("MAESTRO_PLACEMENT_GENERATION")
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_none_or(|generation| generation == 0)
+        {
+            return Err(ApiError::bad_request(
+                "maestro-hosted-runner requires exact bounded workload identity bindings",
+            ));
+        }
+    }
     let sandbox_id = SandboxId(sandbox_id);
     let sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
-    if name == ORB_SIDECAR_RESIDENT_PROCESS_NAME
-        && !placed_worker_supports_provider_isolated_resident_process(
-            &state.db,
-            sandbox_id,
-            &sandbox.tenant_id,
-        )
-        .await?
+    if matches!(
+        name.as_str(),
+        ORB_SIDECAR_RESIDENT_PROCESS_NAME | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
+    ) && !placed_worker_supports_provider_isolated_resident_process(
+        &state.db,
+        sandbox_id,
+        &sandbox.tenant_id,
+        &name,
+    )
+    .await?
     {
         return Err(ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: "resident_sidecar_worker_unsupported",
-            message: "orb-sidecar requires its placed worker to advertise provider-isolated resident-process v2 support".into(),
+            message: "the resident sidecar requires its placed worker to advertise the matching digest-pinned provider-isolated v2 runtime".into(),
         });
     }
     let bootstrap_digest = request
@@ -495,11 +576,12 @@ pub(crate) async fn put_resident_process(
         .map(|bootstrap| format!("{:x}", Sha256::digest(&bootstrap.content)));
 
     if let Ok(current) = fetch_named_resident_process(&state.db, sandbox_id, &name).await {
-        if name == ORB_SIDECAR_RESIDENT_PROCESS_NAME
-            && !supported_provider_isolation_version(
-                provider_isolation_version(&state.db, current.id).await?,
-            )
-        {
+        if matches!(
+            name.as_str(),
+            ORB_SIDECAR_RESIDENT_PROCESS_NAME | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
+        ) && !supported_provider_isolation_version(
+            provider_isolation_version(&state.db, current.id).await?,
+        ) {
             return Err(ApiError::conflict_code(
                 "resident_sidecar_isolation_upgrade_required",
                 "the existing orb-sidecar predates supported provider isolation and cannot be reused",
@@ -643,11 +725,16 @@ pub(crate) async fn put_resident_process(
         .bind(process.desired_state.as_db_str())
         .bind(process.observed_state.as_db_str())
         .bind(process.generation as i64)
-        .bind(if process.name == ORB_SIDECAR_RESIDENT_PROCESS_NAME {
-            i64::from(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION)
-        } else {
-            0
-        })
+        .bind(
+            if matches!(
+                process.name.as_str(),
+                ORB_SIDECAR_RESIDENT_PROCESS_NAME | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
+            ) {
+                i64::from(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION)
+            } else {
+                0
+            },
+        )
         .bind(process.created_at.to_rfc3339())
         .bind(process.updated_at.to_rfc3339())
         .execute(&mut *tx)
@@ -1078,9 +1165,11 @@ pub(crate) async fn observe_resident_process(
             "resident observation does not match the active lease",
         ));
     }
-    if process.name == ORB_SIDECAR_RESIDENT_PROCESS_NAME
-        && provider_isolation_version(&state.db, process.id).await?
-            == PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION
+    if matches!(
+        process.name.as_str(),
+        ORB_SIDECAR_RESIDENT_PROCESS_NAME | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
+    ) && provider_isolation_version(&state.db, process.id).await?
+        == PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION
         && matches!(
             request.observed_state,
             ResidentProcessObservedState::Starting | ResidentProcessObservedState::Running
