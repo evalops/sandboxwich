@@ -276,6 +276,12 @@ struct ProviderArgs {
     #[arg(long, env = "SANDBOXWICH_RUNTIME_IMAGE")]
     runtime_image: Option<String>,
 
+    /// Digest-pinned Maestro artifact copied into hosted-runner sandboxes.
+    /// This is separate from the Sandboxwich guest image, which must retain
+    /// `/usr/local/bin/sandboxwich-agent`.
+    #[arg(long, env = "SANDBOXWICH_MAESTRO_HOSTED_RUNNER_IMAGE")]
+    maestro_hosted_runner_image: Option<String>,
+
     /// Enables the one closed uid-0 trusted-supervisor profile. This is only
     /// advertised when the configured runtime image is digest-pinned.
     #[arg(
@@ -905,7 +911,7 @@ async fn main() -> anyhow::Result<()> {
                 args.provider_mode,
             );
             let mut labels: BTreeMap<_, _> = args.label.into_iter().collect();
-            add_placement_proof_labels(&mut labels, args.provider_mode, None, false);
+            add_placement_proof_labels(&mut labels, args.provider_mode, None, None, false);
             let response = register_worker(
                 &client,
                 &api,
@@ -1007,6 +1013,10 @@ async fn main() -> anyhow::Result<()> {
                 &mut labels,
                 args.provider.provider_mode,
                 args.provider.provider.runtime_image.as_deref(),
+                args.provider
+                    .provider
+                    .maestro_hosted_runner_image
+                    .as_deref(),
                 args.provider.provider.apex_trusted_supervisor_v1,
             );
             add_provider_isolated_resident_process_label(&mut labels, provider_isolated_sidecar);
@@ -1099,6 +1109,13 @@ async fn main() -> anyhow::Result<()> {
 
 fn provider_from_args(args: ProviderArgs) -> anyhow::Result<KubernetesDryRunProvider> {
     let runtime_class_name = non_empty(args.runtime_class_name);
+    let maestro_hosted_runner_image = non_empty(args.maestro_hosted_runner_image);
+    if let Some(image) = &maestro_hosted_runner_image {
+        anyhow::ensure!(
+            image_is_digest_pinned(image),
+            "Maestro hosted-runner image must be pinned by sha256 digest"
+        );
+    }
     validate_isolation_configuration(args.isolation_profile, runtime_class_name.as_deref())?;
     let dns_service_ips = runtime_dns_service_ips(args.dns_service_ips);
     let provider = KubernetesDryRunProvider::with_snapshot_class(
@@ -1108,6 +1125,7 @@ fn provider_from_args(args: ProviderArgs) -> anyhow::Result<KubernetesDryRunProv
         non_empty(args.snapshot_class),
     )
     .with_runtime_image(non_empty(args.runtime_image))
+    .with_maestro_hosted_runner_image(maestro_hosted_runner_image)
     .with_apex_trusted_supervisor_v1(args.apex_trusted_supervisor_v1)
     .with_egress_gateway_image(non_empty(args.egress_gateway_image))
     .with_workspace_storage(non_empty(args.workspace_storage))
@@ -1339,6 +1357,7 @@ fn add_placement_proof_labels(
     labels: &mut BTreeMap<String, String>,
     provider_mode: ProviderModeArg,
     runtime_image: Option<&str>,
+    maestro_hosted_runner_image: Option<&str>,
     apex_trusted_supervisor_v1: bool,
 ) {
     labels.insert(
@@ -1351,6 +1370,9 @@ fn add_placement_proof_labels(
     );
     if let Some(runtime_image) = runtime_image.filter(|value| !value.trim().is_empty()) {
         labels.insert("runtime_image".to_string(), runtime_image.to_string());
+    }
+    if let Some(image) = maestro_hosted_runner_image.filter(|value| !value.trim().is_empty()) {
+        labels.insert("maestro_hosted_runner_image".to_string(), image.to_string());
     }
     if apex_trusted_supervisor_v1 {
         labels.insert(

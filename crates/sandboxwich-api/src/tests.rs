@@ -571,6 +571,58 @@ fn apex_runtime_profile_requires_pinned_image_and_deny_by_default_egress() {
 }
 
 #[test]
+fn maestro_hosted_runner_profile_keeps_the_guest_image_and_requires_deny_by_default_egress() {
+    let request = |template: &str, network_egress| CreateSandboxRequest {
+        name: None,
+        template: Some(template.to_string()),
+        memory_limit: None,
+        network_egress: Some(network_egress),
+        workspace_mode: None,
+        runtime_profile: Some(SandboxRuntimeProfile::MaestroHostedRunnerV1),
+        ttl_seconds: None,
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
+        execution_class: Some(ExecutionClass::DevelopmentContainer),
+    };
+
+    assert!(
+        provision_spec_from_request(
+            &request(
+                "ghcr.io/evalops/sandboxwich-guest:latest",
+                NetworkEgress::DenyAll
+            ),
+            None,
+        )
+        .is_ok()
+    );
+    assert!(
+        provision_spec_from_request(
+            &request(
+                "ghcr.io/evalops/sandboxwich-guest:latest",
+                NetworkEgress::Allowlist {
+                    rules: vec![NetworkAllowRule {
+                        kind: NetworkAllowRuleKind::Host,
+                        value: "model-gateway.example.com".to_string(),
+                    }],
+                },
+            ),
+            None,
+        )
+        .is_ok()
+    );
+    assert!(
+        provision_spec_from_request(
+            &request(
+                "ghcr.io/evalops/sandboxwich-guest:latest",
+                NetworkEgress::AllowAll,
+            ),
+            None,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn snapshot_fork_request_rejects_placement_mismatches() {
     let image = format!("ghcr.io/evalops/apex@sha256:{}", "e".repeat(64));
     let source = SnapshotRestoreSource {
@@ -766,6 +818,64 @@ fn apex_profile_bound_jobs_only_match_the_exact_profile_worker_image() {
             &malformed,
         ));
     }
+}
+
+#[test]
+fn maestro_profile_jobs_only_match_workers_with_a_pinned_artifact() {
+    let now = Utc::now();
+    let job = Job {
+        id: JobId::new(),
+        tenant_id: "tenant-a".to_string(),
+        kind: JobKind::ProvisionSandbox,
+        status: JobStatus::Queued,
+        payload: json!({
+            "sandboxId": SandboxId::new(),
+            "runtimeImage": "ghcr.io/evalops/sandboxwich-guest:latest",
+            "provisionSpec": SandboxProvisionSpec {
+                memory_limit: MemoryLimit::FourG,
+                network_egress: NetworkEgress::DenyAll,
+                workspace_mode: WorkspaceMode::Persistent,
+                runtime_profile: SandboxRuntimeProfile::MaestroHostedRunnerV1,
+                execution_class: ExecutionClass::DevelopmentContainer,
+            }
+        }),
+        required_capability: WorkerCapability::ProvisionSandbox,
+        priority: 0,
+        attempts: 0,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
+    };
+    let worker = |image: Option<&str>| Worker {
+        id: WorkerId::new(),
+        tenant_id: "tenant-a".to_string(),
+        name: "worker".to_string(),
+        status: WorkerStatus::Online,
+        provider: "kubernetes".to_string(),
+        capabilities: vec![WorkerCapability::ProvisionSandbox],
+        max_concurrent_jobs: 1,
+        labels: image
+            .map(|image| {
+                BTreeMap::from([("maestro_hosted_runner_image".to_string(), image.to_string())])
+            })
+            .unwrap_or_default(),
+        registered_at: now,
+        last_heartbeat_at: Some(now),
+    };
+    let pinned = format!("ghcr.io/evalops/maestro@sha256:{}", "d".repeat(64));
+
+    assert!(worker_supports_runtime_profile(
+        &worker(Some(&pinned)),
+        &job
+    ));
+    assert!(!worker_supports_runtime_profile(
+        &worker(Some("ghcr.io/evalops/maestro:latest")),
+        &job
+    ));
+    assert!(!worker_supports_runtime_profile(&worker(None), &job));
 }
 
 #[tokio::test]

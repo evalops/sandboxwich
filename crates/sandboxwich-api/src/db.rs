@@ -755,7 +755,7 @@ pub(crate) async fn sqlite_rebuild_sandboxes_with_parent_snapshot_fk(
             execution_class text not null default 'development_container'
                 check (execution_class in ('development_container', 'sandboxed_container', 'virtual_machine')),
             runtime_profile text not null default 'unprivileged'
-                check (runtime_profile in ('unprivileged', 'apex_trusted_supervisor_v1')),
+                check (runtime_profile in ('unprivileged', 'apex_trusted_supervisor_v1', 'maestro_hosted_runner_v1')),
             max_lifetime_seconds integer,
             idle_ttl_seconds integer,
             last_activity_at text

@@ -357,6 +357,10 @@ pub(crate) async fn ensure_lease_worker_scope(
             (process_name.as_str(), ctx.principal),
             (ORB_SIDECAR_RESIDENT_PROCESS_NAME, Principal::Worker(_))
                 | (ORB_EXECUTOR_RESIDENT_PROCESS_NAME, Principal::Guest { .. })
+                | (
+                    MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME,
+                    Principal::Guest { .. }
+                )
         ) && ctx
             .guest_sandbox_id()
             .is_none_or(|sandbox_id| sandbox_id == process_sandbox_id);

@@ -475,6 +475,7 @@ pub struct KubernetesDryRunProvider {
     storage_class: Option<String>,
     snapshot_class: Option<String>,
     runtime_image: String,
+    maestro_hosted_runner_image: Option<String>,
     apex_trusted_supervisor_v1: bool,
     egress_gateway_image: Option<String>,
     workspace_storage: String,
@@ -563,6 +564,7 @@ impl KubernetesDryRunProvider {
             storage_class,
             snapshot_class,
             runtime_image: DEFAULT_SANDBOX_GUEST_IMAGE.to_string(),
+            maestro_hosted_runner_image: None,
             apex_trusted_supervisor_v1: false,
             egress_gateway_image: None,
             workspace_storage: "2Gi".to_string(),
@@ -597,6 +599,11 @@ impl KubernetesDryRunProvider {
         self
     }
 
+    pub fn with_maestro_hosted_runner_image(mut self, image: Option<String>) -> Self {
+        self.maestro_hosted_runner_image = image;
+        self
+    }
+
     pub fn with_apex_trusted_supervisor_v1(mut self, enabled: bool) -> Self {
         self.apex_trusted_supervisor_v1 = enabled;
         self
@@ -604,6 +611,16 @@ impl KubernetesDryRunProvider {
 
     fn validate_runtime_profile(&self, spec: &SandboxProvisionSpec) -> anyhow::Result<()> {
         self.validate_network_policy_egress(&spec.network_egress)?;
+        if spec.runtime_profile == SandboxRuntimeProfile::MaestroHostedRunnerV1 {
+            let image = self
+                .maestro_hosted_runner_image
+                .as_deref()
+                .context("maestro_hosted_runner_v1 is not configured")?;
+            anyhow::ensure!(
+                image_is_digest_pinned(image),
+                "maestro_hosted_runner_v1 requires a digest-pinned Maestro artifact image"
+            );
+        }
         if spec.runtime_profile == SandboxRuntimeProfile::ApexTrustedSupervisorV1 {
             anyhow::ensure!(
                 self.apex_trusted_supervisor_v1 && image_is_digest_pinned(&self.runtime_image),
@@ -910,6 +927,9 @@ impl KubernetesDryRunProvider {
             labels.insert("snapshot_class".to_string(), snapshot_class.clone());
         }
         labels.insert("runtime_image".to_string(), self.runtime_image.clone());
+        if let Some(image) = &self.maestro_hosted_runner_image {
+            labels.insert("maestro_hosted_runner_image".to_string(), image.clone());
+        }
         if self.apex_trusted_supervisor_v1 {
             labels.insert(
                 "runtime_profile".to_string(),
@@ -946,7 +966,11 @@ impl KubernetesDryRunProvider {
         spec: &SandboxProvisionSpec,
     ) -> anyhow::Result<serde_json::Value> {
         self.validate_runtime_profile(spec)?;
-        let network_policy = self.network_policy_manifest(sandbox_id, &spec.network_egress)?;
+        let network_policy = self.network_policy_manifest(
+            sandbox_id,
+            &spec.network_egress,
+            spec.runtime_profile == SandboxRuntimeProfile::MaestroHostedRunnerV1,
+        )?;
         let egress_gateway_pod =
             self.egress_gateway_pod_manifest(sandbox_id, &spec.network_egress)?;
         let egress_gateway_service =
@@ -982,6 +1006,8 @@ impl KubernetesDryRunProvider {
                 "pvc": pvc,
                 "sshService": self.ssh_service_manifest(sandbox_id),
                 "desktopService": self.desktop_service_manifest(sandbox_id),
+                "maestroService": (spec.runtime_profile == SandboxRuntimeProfile::MaestroHostedRunnerV1)
+                    .then(|| self.maestro_service_manifest(sandbox_id)),
                 "networkPolicy": network_policy,
                 "egressGatewayPod": egress_gateway_pod,
                 "egressGatewayService": egress_gateway_service,
@@ -1283,6 +1309,17 @@ impl KubernetesDryRunProvider {
                 "value": "/run/sandboxwich/vnc/vnc-password"
             }));
         }
+        if spec.runtime_profile == SandboxRuntimeProfile::MaestroHostedRunnerV1 {
+            volume_mounts.push(json!({
+                "name": "maestro-runtime",
+                "mountPath": "/opt/maestro",
+                "readOnly": true
+            }));
+            volumes.push(json!({
+                "name": "maestro-runtime",
+                "emptyDir": {}
+            }));
+        }
 
         let ephemeral_storage = Self::ephemeral_storage_limit(&spec.memory_limit);
         let apex_supervisor =
@@ -1339,27 +1376,62 @@ impl KubernetesDryRunProvider {
             "name": "workspace",
             "mountPath": "/workspace"
         }]);
+        let mut init_containers = vec![json!({
+            "name": "compiler-cache-init",
+            "image": self.runtime_image,
+            "imagePullPolicy": image_pull_policy_for(&self.runtime_image),
+            "command": [
+                "/usr/local/bin/sandboxwich-agent",
+                "compiler-cache-prepare-workspace"
+            ],
+            "resources": {
+                "requests": { "cpu": "5m", "memory": "16Mi" },
+                "limits": { "cpu": "50m", "memory": "64Mi" }
+            },
+            "securityContext": compiler_cache_security_context,
+            "volumeMounts": compiler_cache_mounts
+        })];
+        if spec.runtime_profile == SandboxRuntimeProfile::MaestroHostedRunnerV1 {
+            init_containers.push(json!({
+                "name": "maestro-runtime-install",
+                "image": self.maestro_hosted_runner_image,
+                "imagePullPolicy": image_pull_policy_for(
+                    self.maestro_hosted_runner_image
+                        .as_deref()
+                        .expect("profile validation requires a Maestro artifact image")
+                ),
+                "command": ["/bin/sh", "-c"],
+                "args": ["install -m 0555 /usr/local/bin/maestro /runtime/maestro"],
+                "resources": {
+                    "requests": { "cpu": "5m", "memory": "16Mi" },
+                    "limits": { "cpu": "50m", "memory": "64Mi" }
+                },
+                "securityContext": {
+                    "allowPrivilegeEscalation": false,
+                    "readOnlyRootFilesystem": true,
+                    "runAsNonRoot": true,
+                    "runAsUser": 10001,
+                    "runAsGroup": 10001,
+                    "capabilities": { "drop": ["ALL"] },
+                    "seccompProfile": { "type": "RuntimeDefault" }
+                },
+                "volumeMounts": [{
+                    "name": "maestro-runtime",
+                    "mountPath": "/runtime"
+                }]
+            }));
+        }
+        let mut sandbox_ports = vec![
+            json!({"name": "ssh", "containerPort": 2222}),
+            json!({"name": "desktop", "containerPort": 6080}),
+        ];
+        if spec.runtime_profile == SandboxRuntimeProfile::MaestroHostedRunnerV1 {
+            sandbox_ports.push(json!({"name": "maestro", "containerPort": 8080}));
+        }
         let mut pod_spec = Map::from_iter([
             ("automountServiceAccountToken".to_string(), json!(false)),
             ("securityContext".to_string(), pod_security_context),
-            (
-                "initContainers".to_string(),
-                json!([{
-                    "name": "compiler-cache-init",
-                    "image": self.runtime_image,
-                    "imagePullPolicy": image_pull_policy_for(&self.runtime_image),
-                    "command": [
-                        "/usr/local/bin/sandboxwich-agent",
-                        "compiler-cache-prepare-workspace"
-                    ],
-                    "resources": {
-                        "requests": { "cpu": "5m", "memory": "16Mi" },
-                        "limits": { "cpu": "50m", "memory": "64Mi" }
-                    },
-                    "securityContext": compiler_cache_security_context,
-                    "volumeMounts": compiler_cache_mounts
-                }]),
-            ),
+            ("initContainers".to_string(), json!(init_containers)),
             (
                 "containers".to_string(),
                 json!([{
@@ -1368,10 +1440,7 @@ impl KubernetesDryRunProvider {
                     // Mutable tags (`:latest`) must re-pull; pin/tags used by
                     // kind and local loads must not force registry access.
                     "imagePullPolicy": image_pull_policy_for(&self.runtime_image),
-                    "ports": [
-                        {"name": "ssh", "containerPort": 2222},
-                        {"name": "desktop", "containerPort": 6080}
-                    ],
+                    "ports": sandbox_ports,
                     "env": env,
                     "resources": {
                         "requests": {
@@ -1640,10 +1709,29 @@ impl KubernetesDryRunProvider {
         })
     }
 
+    fn maestro_ingress_rule(&self) -> serde_json::Value {
+        json!({
+            "from": [{
+                "namespaceSelector": {
+                    "matchLabels": {
+                        "kubernetes.io/metadata.name": self.effective_ingress_namespace()
+                    }
+                },
+                "podSelector": {
+                    "matchLabels": {
+                        "app.kubernetes.io/name": "runner-host"
+                    }
+                }
+            }],
+            "ports": [{"protocol": "TCP", "port": 8080}]
+        })
+    }
+
     fn network_policy_manifest(
         &self,
         sandbox_id: SandboxId,
         network_egress: &NetworkEgress,
+        maestro_hosted_runner: bool,
     ) -> anyhow::Result<serde_json::Value> {
         self.validate_network_policy_egress(network_egress)?;
         if self.fqdn_egress_backend.as_deref() == Some("cilium")
@@ -1652,7 +1740,11 @@ impl KubernetesDryRunProvider {
                 .iter()
                 .any(|rule| rule.kind == NetworkAllowRuleKind::Host)
         {
-            return Ok(self.cilium_fqdn_policy_manifest(sandbox_id, network_egress));
+            return Ok(self.cilium_fqdn_policy_manifest(
+                sandbox_id,
+                network_egress,
+                maestro_hosted_runner,
+            ));
         }
         let mut egress = match network_egress {
             NetworkEgress::DenyAll => Vec::new(),
@@ -1688,6 +1780,10 @@ impl KubernetesDryRunProvider {
         egress.extend(self.dns_egress_rules());
         egress.push(self.api_egress_rule());
 
+        let mut ingress = vec![self.ingress_rule()];
+        if maestro_hosted_runner {
+            ingress.push(self.maestro_ingress_rule());
+        }
         Ok(json!({
             "apiVersion": "networking.k8s.io/v1",
             "kind": "NetworkPolicy",
@@ -1700,7 +1796,7 @@ impl KubernetesDryRunProvider {
                     }
                 },
                 "policyTypes": ["Ingress", "Egress"],
-                "ingress": [self.ingress_rule()],
+                "ingress": ingress,
                 "egress": egress
             }
         }))
@@ -1710,6 +1806,7 @@ impl KubernetesDryRunProvider {
         &self,
         sandbox_id: SandboxId,
         network_egress: &NetworkEgress,
+        maestro_hosted_runner: bool,
     ) -> serde_json::Value {
         let rules = network_egress.rules();
         let hosts: Vec<_> = rules
@@ -1772,18 +1869,28 @@ impl KubernetesDryRunProvider {
                 "toPorts": [{"ports": [{"port": "53", "protocol": "ANY"}]}]
             })
         }));
+        let mut ingress = vec![json!({
+            "fromEndpoints": [{"matchLabels": ingress_labels}],
+            "toPorts": [{"ports": [
+                {"port": "2222", "protocol": "TCP"}, {"port": "6080", "protocol": "TCP"}, {"port": "5900", "protocol": "TCP"}
+            ]}]
+        })];
+        if maestro_hosted_runner {
+            ingress.push(json!({
+                "fromEndpoints": [{"matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": self.effective_ingress_namespace(),
+                    "k8s:app.kubernetes.io/name": "runner-host"
+                }}],
+                "toPorts": [{"ports": [{"port": "8080", "protocol": "TCP"}]}]
+            }));
+        }
         json!({
             "apiVersion": "cilium.io/v2",
             "kind": "CiliumNetworkPolicy",
             "metadata": self.object_metadata(format!("sandboxwich-egress-{sandbox_id}"), Some(sandbox_id)),
             "spec": {
                 "endpointSelector": {"matchLabels": {"sandboxwich.dev/sandbox-id": sandbox_id}},
-                "ingress": [{
-                    "fromEndpoints": [{"matchLabels": ingress_labels}],
-                    "toPorts": [{"ports": [
-                        {"port": "2222", "protocol": "TCP"}, {"port": "6080", "protocol": "TCP"}, {"port": "5900", "protocol": "TCP"}
-                    ]}]
-                }],
+                "ingress": ingress,
                 "egress": egress,
                 "egressDeny": [{"toCIDRSet": denied_cidrs}]
             }
@@ -2033,6 +2140,26 @@ impl KubernetesDryRunProvider {
         })
     }
 
+    fn maestro_service_manifest(&self, sandbox_id: SandboxId) -> serde_json::Value {
+        json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": self.object_metadata(format!("sandboxwich-maestro-{sandbox_id}"), Some(sandbox_id)),
+            "spec": {
+                "type": "ClusterIP",
+                "selector": {
+                    "sandboxwich.dev/sandbox-id": sandbox_id,
+                    "sandboxwich.dev/component": "runtime"
+                },
+                "ports": [{
+                    "name": "maestro",
+                    "port": 8080,
+                    "targetPort": "maestro"
+                }]
+            }
+        })
+    }
+
     fn volume_snapshot_manifest(
         &self,
         sandbox_id: SandboxId,
@@ -2077,6 +2204,9 @@ impl KubernetesDryRunProvider {
             self.desktop_service_resource(sandbox_id, status.clone()),
             self.network_policy_resource(sandbox_id, status.clone()),
         ]);
+        if spec.runtime_profile == SandboxRuntimeProfile::MaestroHostedRunnerV1 {
+            resources.push(self.maestro_service_resource(sandbox_id, status.clone()));
+        }
         resources.extend(self.egress_gateway_resources(
             sandbox_id,
             &spec.network_egress,
@@ -2127,6 +2257,9 @@ impl KubernetesDryRunProvider {
             self.desktop_service_resource(child_sandbox_id, status.clone()),
             self.network_policy_resource(child_sandbox_id, status.clone()),
         ];
+        if spec.runtime_profile == SandboxRuntimeProfile::MaestroHostedRunnerV1 {
+            resources.push(self.maestro_service_resource(child_sandbox_id, status.clone()));
+        }
         resources.extend(self.egress_gateway_resources(
             child_sandbox_id,
             &spec.network_egress,
@@ -2279,6 +2412,25 @@ impl KubernetesDryRunProvider {
         );
         resource.service_port = Some(6080);
         resource.target_port = Some("desktop".to_string());
+        resource
+    }
+
+    fn maestro_service_resource(
+        &self,
+        sandbox_id: SandboxId,
+        status: RuntimeResourceStatus,
+    ) -> ProviderRuntimeResource {
+        let mut resource = self.base_resource(
+            sandbox_id,
+            None,
+            RuntimeResourceKind::Service,
+            RuntimeResourcePurpose::Maestro,
+            format!("sandboxwich-maestro-{sandbox_id}"),
+            status,
+        );
+        resource.service_port = Some(8080);
+        resource.target_port = Some("maestro".to_string());
+        resource.runtime_image = self.maestro_hosted_runner_image.clone();
         resource
     }
 
@@ -3030,9 +3182,11 @@ impl KubernetesApplyProvider {
             }
         }
 
-        let network_policy = self
-            .dry_run
-            .network_policy_manifest(sandbox_id, &spec.network_egress)?;
+        let network_policy = self.dry_run.network_policy_manifest(
+            sandbox_id,
+            &spec.network_egress,
+            spec.runtime_profile == SandboxRuntimeProfile::MaestroHostedRunnerV1,
+        )?;
         let network_identity =
             self.apply_or_adopt_manifest(&network_policy, sandbox_id, cancelled)?;
         report(stage_update(
@@ -3094,6 +3248,15 @@ impl KubernetesApplyProvider {
             ProvisioningStage::ServiceReady,
             Some(service_identity),
         ))?;
+        if spec.runtime_profile == SandboxRuntimeProfile::MaestroHostedRunnerV1 {
+            let maestro_service = self.dry_run.maestro_service_manifest(sandbox_id);
+            let service_identity =
+                self.apply_or_adopt_manifest(&maestro_service, sandbox_id, cancelled)?;
+            report(stage_update(
+                ProvisioningStage::ServiceReady,
+                Some(service_identity),
+            ))?;
+        }
         report(stage_update(ProvisioningStage::SandboxReady, None))?;
 
         let mut handle = match home_id {
@@ -3542,7 +3705,7 @@ impl KubernetesApplyProvider {
         let provision_pod = self.dry_run.pod_manifest(sandbox_id, &spec);
         let provision_network_policy = self
             .dry_run
-            .network_policy_manifest(sandbox_id, &spec.network_egress)
+            .network_policy_manifest(sandbox_id, &spec.network_egress, false)
             .expect("default network egress should render");
         let provision_ssh_service = self.dry_run.ssh_service_manifest(sandbox_id);
         let provision_service = self.dry_run.desktop_service_manifest(sandbox_id);
@@ -3555,7 +3718,7 @@ impl KubernetesApplyProvider {
         let fork_pod = self.dry_run.pod_manifest(child_sandbox_id, &spec);
         let fork_network_policy = self
             .dry_run
-            .network_policy_manifest(child_sandbox_id, &spec.network_egress)
+            .network_policy_manifest(child_sandbox_id, &spec.network_egress, false)
             .expect("default network egress should render");
         let fork_ssh_service = self.dry_run.ssh_service_manifest(child_sandbox_id);
         let fork_service = self.dry_run.desktop_service_manifest(child_sandbox_id);
@@ -3771,13 +3934,17 @@ impl KubernetesApplyProvider {
         {
             manifests.push(policy);
         }
-        manifests.push(
-            self.dry_run
-                .network_policy_manifest(sandbox_id, &spec.network_egress)?,
-        );
+        manifests.push(self.dry_run.network_policy_manifest(
+            sandbox_id,
+            &spec.network_egress,
+            spec.runtime_profile == SandboxRuntimeProfile::MaestroHostedRunnerV1,
+        )?);
         manifests.push(self.dry_run.pod_manifest(sandbox_id, spec));
         manifests.push(self.dry_run.ssh_service_manifest(sandbox_id));
         manifests.push(self.dry_run.desktop_service_manifest(sandbox_id));
+        if spec.runtime_profile == SandboxRuntimeProfile::MaestroHostedRunnerV1 {
+            manifests.push(self.dry_run.maestro_service_manifest(sandbox_id));
+        }
         Ok(manifests)
     }
 
@@ -3812,13 +3979,17 @@ impl KubernetesApplyProvider {
         {
             manifests.push(policy);
         }
-        manifests.push(
-            self.dry_run
-                .network_policy_manifest(child_sandbox_id, &spec.network_egress)?,
-        );
+        manifests.push(self.dry_run.network_policy_manifest(
+            child_sandbox_id,
+            &spec.network_egress,
+            spec.runtime_profile == SandboxRuntimeProfile::MaestroHostedRunnerV1,
+        )?);
         manifests.push(self.dry_run.pod_manifest(child_sandbox_id, spec));
         manifests.push(self.dry_run.ssh_service_manifest(child_sandbox_id));
         manifests.push(self.dry_run.desktop_service_manifest(child_sandbox_id));
+        if spec.runtime_profile == SandboxRuntimeProfile::MaestroHostedRunnerV1 {
+            manifests.push(self.dry_run.maestro_service_manifest(child_sandbox_id));
+        }
         Ok(manifests)
     }
 
@@ -5195,8 +5366,11 @@ impl SandboxProvider for KubernetesDryRunProvider {
     ) -> anyhow::Result<ProviderForkHandle> {
         self.validate_runtime_profile(spec)?;
         self.validate_network_policy_egress(&spec.network_egress)?;
-        let network_policy =
-            self.network_policy_manifest(child_sandbox_id, &spec.network_egress)?;
+        let network_policy = self.network_policy_manifest(
+            child_sandbox_id,
+            &spec.network_egress,
+            spec.runtime_profile == SandboxRuntimeProfile::MaestroHostedRunnerV1,
+        )?;
         Ok(ProviderForkHandle {
             provider: "kubernetes".to_string(),
             parent_sandbox_id,
@@ -5230,6 +5404,8 @@ impl SandboxProvider for KubernetesDryRunProvider {
                     "pod": self.pod_manifest(child_sandbox_id, spec),
                     "sshService": self.ssh_service_manifest(child_sandbox_id),
                     "desktopService": self.desktop_service_manifest(child_sandbox_id),
+                    "maestroService": (spec.runtime_profile == SandboxRuntimeProfile::MaestroHostedRunnerV1)
+                        .then(|| self.maestro_service_manifest(child_sandbox_id)),
                     "networkPolicy": network_policy,
                     "guestTokenSecret": self.guest_token_secret_manifest_redacted(child_sandbox_id),
                 }
