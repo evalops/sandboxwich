@@ -61,6 +61,41 @@ fn not_live(message: impl Into<String>) -> ApiError {
     ApiError::conflict_code("placement_attestation_not_live", message)
 }
 
+fn maestro_workload_stale_generation() -> ApiError {
+    ApiError::conflict_code(
+        "maestro_workload_stale_generation",
+        "Maestro workload placement generation is stale",
+    )
+}
+
+fn validate_maestro_canonical_binding(
+    request: &ValidateMaestroWorkloadIdentityRequest,
+    env: &BTreeMap<String, String>,
+    provider_pod_uid: Uuid,
+) -> Result<(), ApiError> {
+    if env
+        .get("MAESTRO_PLACEMENT_GENERATION")
+        .and_then(|value| value.parse::<u64>().ok())
+        != Some(request.generation)
+    {
+        return Err(maestro_workload_stale_generation());
+    }
+    let binding_matches = env.get("MAESTRO_ORGANIZATION_ID") == Some(&request.organization_id)
+        && env.get("MAESTRO_WORKSPACE_ID") == Some(&request.workspace_id)
+        && env
+            .get("MAESTRO_SANDBOX_ID")
+            .and_then(|value| Uuid::parse_str(value).ok())
+            == Some(request.sandbox_id.0)
+        && env.get("MAESTRO_RUNNER_SESSION_ID") == Some(&request.runner_session_id)
+        && provider_pod_uid == request.pod_uid;
+    if !binding_matches {
+        return Err(not_live(
+            "Maestro workload request does not match its canonical binding",
+        ));
+    }
+    Ok(())
+}
+
 fn parse_u64(value: i64, field: &'static str) -> Result<u64, ApiError> {
     u64::try_from(value)
         .map_err(|_| ApiError::internal(format!("database contains invalid {field}")))
@@ -964,23 +999,7 @@ pub(crate) async fn validate_maestro_workload_identity(
         .try_get::<Option<String>, _>("provider_pod_uid")?
         .and_then(|value| Uuid::parse_str(&value).ok())
         .ok_or_else(|| not_live("Maestro placement has no authoritative Pod UID"))?;
-    let binding_matches = env.get("MAESTRO_ORGANIZATION_ID") == Some(&request.organization_id)
-        && env.get("MAESTRO_WORKSPACE_ID") == Some(&request.workspace_id)
-        && env
-            .get("MAESTRO_SANDBOX_ID")
-            .and_then(|value| Uuid::parse_str(value).ok())
-            == Some(request.sandbox_id.0)
-        && env
-            .get("MAESTRO_PLACEMENT_GENERATION")
-            .and_then(|value| value.parse::<u64>().ok())
-            == Some(request.generation)
-        && env.get("MAESTRO_RUNNER_SESSION_ID") == Some(&request.runner_session_id)
-        && provider_pod_uid == request.pod_uid;
-    if !binding_matches {
-        return Err(not_live(
-            "Maestro workload request does not match its canonical binding",
-        ));
-    }
+    validate_maestro_canonical_binding(&request, &env, provider_pod_uid)?;
     let fence = placement_fence(
         &state.db,
         &request.organization_id,
@@ -989,12 +1008,14 @@ pub(crate) async fn validate_maestro_workload_identity(
         lease_id,
     )
     .await?;
-    if fence.placement_generation != request.generation
-        || fence
-            .provider_pod_uid
-            .as_deref()
-            .and_then(|value| Uuid::parse_str(value).ok())
-            != Some(request.pod_uid)
+    if fence.placement_generation != request.generation {
+        return Err(maestro_workload_stale_generation());
+    }
+    if fence
+        .provider_pod_uid
+        .as_deref()
+        .and_then(|value| Uuid::parse_str(value).ok())
+        != Some(request.pod_uid)
         || fence.provider_pod_name.as_deref() != Some(provider_pod_name.as_str())
     {
         return Err(not_live("Maestro placement fence changed"));
@@ -1021,4 +1042,62 @@ pub(crate) async fn validate_maestro_workload_identity(
         lease_expires_at_epoch_seconds: fence.lease_expires_at.timestamp(),
         worker_id: fence.worker_id,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn maestro_binding(
+        generation: u64,
+    ) -> (
+        ValidateMaestroWorkloadIdentityRequest,
+        BTreeMap<String, String>,
+    ) {
+        let sandbox_id = SandboxId::new();
+        let pod_uid = Uuid::now_v7();
+        let request = ValidateMaestroWorkloadIdentityRequest {
+            organization_id: "org-1".into(),
+            workspace_id: "workspace-1".into(),
+            sandbox_id,
+            pod_uid,
+            generation,
+            runner_session_id: "session-1".into(),
+        };
+        let env = BTreeMap::from([
+            ("MAESTRO_ORGANIZATION_ID".into(), "org-1".into()),
+            ("MAESTRO_WORKSPACE_ID".into(), "workspace-1".into()),
+            ("MAESTRO_SANDBOX_ID".into(), sandbox_id.to_string()),
+            (
+                "MAESTRO_PLACEMENT_GENERATION".into(),
+                generation.to_string(),
+            ),
+            ("MAESTRO_RUNNER_SESSION_ID".into(), "session-1".into()),
+        ]);
+        (request, env)
+    }
+
+    #[test]
+    fn maestro_workload_binding_reports_stale_generation_with_stable_code() {
+        let (request, mut env) = maestro_binding(7);
+        env.insert("MAESTRO_PLACEMENT_GENERATION".into(), "8".into());
+
+        let error = validate_maestro_canonical_binding(&request, &env, request.pod_uid)
+            .expect_err("stale generation must be rejected");
+
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "maestro_workload_stale_generation");
+    }
+
+    #[test]
+    fn maestro_workload_binding_keeps_non_generation_mismatches_generic() {
+        let (mut request, env) = maestro_binding(7);
+        request.workspace_id = "workspace-2".into();
+
+        let error = validate_maestro_canonical_binding(&request, &env, request.pod_uid)
+            .expect_err("mismatched canonical binding must be rejected");
+
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "placement_attestation_not_live");
+    }
 }
