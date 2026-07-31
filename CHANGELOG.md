@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.1.5 - 2026-07-28
+### Other
+
+- Update Cargo.lock dependencies
+
 ## 0.1.4 - 2026-07-26
 ### Added
 
