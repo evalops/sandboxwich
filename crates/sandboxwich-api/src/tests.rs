@@ -477,13 +477,14 @@ fn authoritative_job_enrichment_overwrites_caller_placement_metadata() {
         required_execution_class: ExecutionClass::DevelopmentContainer,
     };
 
-    add_provision_spec_to_payload(&mut job, &sandbox).expect("enrich job");
+    add_provision_spec_to_payload(&mut job, &sandbox, &[]).expect("enrich job");
 
     assert_eq!(job.payload["runtimeImage"], json!(sandbox.template));
     assert_eq!(
         serde_json::from_value::<SandboxProvisionSpec>(job.payload["provisionSpec"].clone())
             .expect("provision spec"),
         SandboxProvisionSpec {
+            secret_mounts: Vec::new(),
             memory_limit: sandbox.memory_limit,
             network_egress: sandbox.network_egress,
             workspace_mode: sandbox.workspace_mode,
@@ -497,6 +498,7 @@ fn authoritative_job_enrichment_overwrites_caller_placement_metadata() {
 fn apex_runtime_profile_requires_pinned_image_and_deny_by_default_egress() {
     let pinned = format!("ghcr.io/evalops/apex@sha256:{}", "a".repeat(64));
     let request = |template: &str, network_egress| CreateSandboxRequest {
+        secret_ref_ids: Vec::new(),
         name: None,
         template: Some(template.to_string()),
         memory_limit: None,
@@ -556,6 +558,7 @@ fn apex_runtime_profile_requires_pinned_image_and_deny_by_default_egress() {
         execution_class: ExecutionClass::SandboxedContainer,
     };
     let inherited = CreateSandboxRequest {
+        secret_ref_ids: Vec::new(),
         name: None,
         template: None,
         memory_limit: None,
@@ -577,6 +580,7 @@ fn snapshot_fork_request_rejects_placement_mismatches() {
         source_sandbox_id: SandboxId::new(),
         runtime_image: image.clone(),
         provision_spec: SandboxProvisionSpec {
+            secret_mounts: Vec::new(),
             memory_limit: MemoryLimit::FourG,
             network_egress: NetworkEgress::DenyAll,
             workspace_mode: WorkspaceMode::Persistent,
@@ -664,6 +668,7 @@ fn apex_profile_bound_jobs_only_match_the_exact_profile_worker_image() {
             "sandboxId": SandboxId::new(),
             "runtimeImage": requested_image,
             "provisionSpec": SandboxProvisionSpec {
+                secret_mounts: Vec::new(),
                 memory_limit: MemoryLimit::FourG,
                 network_egress: NetworkEgress::DenyAll,
                 workspace_mode: WorkspaceMode::Persistent,
@@ -1013,7 +1018,7 @@ fn looks_like_cidr_rejects_garbage_and_out_of_range_prefixes() {
 #[test]
 fn db_enum_fingerprint_is_versioned_and_stable_for_current_registry() {
     let fingerprint = db_enum_schema_fingerprint();
-    assert!(fingerprint.starts_with("db-enum-v7:"));
+    assert!(fingerprint.starts_with("db-enum-v8:"));
     assert_eq!(fingerprint, db_enum_schema_fingerprint());
 }
 
@@ -2378,6 +2383,7 @@ async fn snapshot_restore_claim_rejects_expired_ready_source() {
         provider_metadata: json!({}),
         runtime_image: Some(sandbox.template.clone()),
         provision_spec: Some(SandboxProvisionSpec {
+            secret_mounts: Vec::new(),
             memory_limit: sandbox.memory_limit.clone(),
             network_egress: sandbox.network_egress.clone(),
             workspace_mode: sandbox.workspace_mode.clone(),
@@ -2436,6 +2442,7 @@ async fn snapshot_restore_claim_retains_authoritative_placement_after_source_del
         .expect("persist source placement");
     let now = Utc::now();
     let expected_spec = SandboxProvisionSpec {
+        secret_mounts: Vec::new(),
         memory_limit: sandbox.memory_limit.clone(),
         network_egress: sandbox.network_egress.clone(),
         workspace_mode: sandbox.workspace_mode.clone(),

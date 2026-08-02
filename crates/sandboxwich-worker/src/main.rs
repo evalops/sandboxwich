@@ -23,14 +23,15 @@ use sandboxwich_core::{
     ApexTaskInstructionsCallbackResponse, ClaimLeaseRequest, ClaimLeaseResponse,
     CompleteLeaseRequest, ErrorEnvelope, FailLeaseRequest, GuestTokenResponse, HomeId, JobKind,
     LeaseResponse, MAESTRO_HOSTED_RUNNER_IMAGE_LABEL, MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME,
-    MintGuestTokenRequest, ORB_SIDECAR_RESIDENT_PROCESS_NAME,
-    PROVIDER_ISOLATED_RESIDENT_PROCESS_IMAGE_LABEL,
+    MintGuestTokenRequest, NetworkAllowRule, NetworkAllowRuleKind, NetworkEgress,
+    ORB_SIDECAR_RESIDENT_PROCESS_NAME, PROVIDER_ISOLATED_RESIDENT_PROCESS_IMAGE_LABEL,
     PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL,
-    PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE, ProvisioningOperationResponse,
+    PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE, PROVIDER_SECRET_DELIVERY_LABEL,
+    PROVIDER_SECRET_DELIVERY_LABEL_VALUE, ProvisioningOperationResponse,
     ProvisioningStageUpdateRequest, RegisterWorkerRequest, RenewLeaseRequest,
     ResidentProcessBootstrapReadRequest, ResidentProcessBootstrapReadResponse, ResidentProcessId,
     ResidentProcessObservationRequest, ResidentProcessObservedState, ResidentProcessRestartPolicy,
-    RuntimeResourceInventoryResponse, SandboxProvisionSpec, WorkerCapability,
+    RuntimeResourceInventoryResponse, SandboxId, SandboxProvisionSpec, WorkerCapability,
     WorkerHeartbeatRequest, WorkerJobResult, WorkerResponse, build_api_client,
     validate_agent_command_request,
 };
@@ -72,6 +73,7 @@ enum Command {
     ProviderCapabilities(ProviderArgs),
     ProviderHealth(ProviderArgs),
     ProviderSmoke(ProviderArgs),
+    RenderEgressPolicy(RenderEgressPolicyArgs),
     ProviderApplyPlan(ProviderApplyArgs),
     ProviderApplySmoke(ProviderApplyArgs),
     Register(RegisterArgs),
@@ -294,6 +296,11 @@ struct ProviderArgs {
 
     #[arg(long)]
     ssh_authorized_keys_secret: Option<String>,
+
+    /// Secrets Store CSI driver serving tenant `SecretProviderClass` objects.
+    /// Unset means secret delivery is refused rather than skipped.
+    #[arg(long, env = "SANDBOXWICH_SECRET_CSI_DRIVER")]
+    secret_csi_driver: Option<String>,
 
     #[arg(long, env = "SANDBOXWICH_RUNTIME_CLASS_NAME")]
     runtime_class_name: Option<String>,
@@ -522,6 +529,37 @@ struct ProviderApplyArgs {
         default_value_t = DEFAULT_MAX_CAPTURED_OUTPUT_BYTES
     )]
     max_captured_output_bytes: u64,
+}
+
+/// Prints the egress policy `provision` would apply for the given allowlist,
+/// so live network conformance suites (see
+/// `deploy/kubernetes/cilium-fqdn-conformance.sh`) enforce against the shipped
+/// rendering rather than a hand-maintained copy of it.
+#[derive(Debug, Args)]
+struct RenderEgressPolicyArgs {
+    #[command(flatten)]
+    provider: ProviderArgs,
+
+    /// Sandbox the policy selects. Conformance suites label their probe pod
+    /// with this id so the rendered `endpointSelector` matches it.
+    #[arg(long, value_parser = parse_sandbox_id)]
+    sandbox_id: SandboxId,
+
+    #[arg(long, value_enum, default_value_t = NetworkEgressModeArg::Allowlist)]
+    egress_mode: NetworkEgressModeArg,
+
+    #[arg(long = "allow-host")]
+    allow_host: Vec<String>,
+
+    #[arg(long = "allow-cidr")]
+    allow_cidr: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum NetworkEgressModeArg {
+    DenyAll,
+    Allowlist,
+    AllowAll,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -887,6 +925,18 @@ async fn main() -> anyhow::Result<()> {
                 }))?
             );
         }
+        Command::RenderEgressPolicy(args) => {
+            let sandbox_id = args.sandbox_id;
+            let network_egress =
+                network_egress_from_args(args.egress_mode, args.allow_host, args.allow_cidr)?;
+            let provider = provider_from_args(args.provider)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &provider.render_egress_policy(sandbox_id, &network_egress)?
+                )?
+            );
+        }
         Command::ProviderApplyPlan(args) => {
             let provider = apply_provider_from_args(args)?;
             let plan = provider.smoke_plan(
@@ -1042,6 +1092,10 @@ async fn main() -> anyhow::Result<()> {
                 args.provider.provider.runtime_image.as_deref(),
                 args.provider.provider.apex_trusted_supervisor_v1,
             );
+            add_secret_delivery_label(
+                &mut labels,
+                non_empty(args.provider.provider.secret_csi_driver.clone()).is_some(),
+            );
             add_provider_isolated_resident_process_label(&mut labels, provider_isolated_sidecar);
             add_provider_isolated_resident_process_image_label(
                 &mut labels,
@@ -1138,6 +1192,39 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn parse_sandbox_id(value: &str) -> Result<SandboxId, uuid::Error> {
+    value.parse().map(SandboxId)
+}
+
+fn network_egress_from_args(
+    mode: NetworkEgressModeArg,
+    allow_hosts: Vec<String>,
+    allow_cidrs: Vec<String>,
+) -> anyhow::Result<NetworkEgress> {
+    let rules: Vec<NetworkAllowRule> = allow_hosts
+        .into_iter()
+        .map(|value| NetworkAllowRule {
+            kind: NetworkAllowRuleKind::Host,
+            value,
+        })
+        .chain(allow_cidrs.into_iter().map(|value| NetworkAllowRule {
+            kind: NetworkAllowRuleKind::Cidr,
+            value,
+        }))
+        .collect();
+    match mode {
+        NetworkEgressModeArg::Allowlist if rules.is_empty() => {
+            anyhow::bail!("allowlist egress requires at least one --allow-host or --allow-cidr")
+        }
+        NetworkEgressModeArg::Allowlist => Ok(NetworkEgress::Allowlist { rules }),
+        _ if !rules.is_empty() => anyhow::bail!(
+            "--allow-host/--allow-cidr are only meaningful with --egress-mode allowlist"
+        ),
+        NetworkEgressModeArg::DenyAll => Ok(NetworkEgress::DenyAll),
+        NetworkEgressModeArg::AllowAll => Ok(NetworkEgress::AllowAll),
+    }
+}
+
 fn provider_from_args(args: ProviderArgs) -> anyhow::Result<KubernetesDryRunProvider> {
     let runtime_class_name = non_empty(args.runtime_class_name);
     validate_isolation_configuration(args.isolation_profile, runtime_class_name.as_deref())?;
@@ -1153,6 +1240,7 @@ fn provider_from_args(args: ProviderArgs) -> anyhow::Result<KubernetesDryRunProv
     .with_egress_gateway_image(non_empty(args.egress_gateway_image))
     .with_workspace_storage(non_empty(args.workspace_storage))
     .with_ssh_authorized_keys_secret(non_empty(args.ssh_authorized_keys_secret))
+    .with_secret_csi_driver(non_empty(args.secret_csi_driver))
     .with_isolation_profile(args.isolation_profile)
     .with_runtime_class_name(runtime_class_name)
     .with_cilium_fqdn_egress(args.cilium_fqdn_egress)
@@ -3720,6 +3808,19 @@ fn add_provider_isolated_resident_process_label(
         labels.insert(
             PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL.to_string(),
             PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE.to_string(),
+        );
+    }
+}
+
+/// Advertises secret delivery only when the CSI driver is actually configured,
+/// so the scheduler never places a secret-bound sandbox on a worker whose
+/// provider would refuse it.
+fn add_secret_delivery_label(labels: &mut BTreeMap<String, String>, configured: bool) {
+    labels.remove(PROVIDER_SECRET_DELIVERY_LABEL);
+    if configured {
+        labels.insert(
+            PROVIDER_SECRET_DELIVERY_LABEL.to_string(),
+            PROVIDER_SECRET_DELIVERY_LABEL_VALUE.to_string(),
         );
     }
 }

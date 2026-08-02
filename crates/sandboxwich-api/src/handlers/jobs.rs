@@ -5,6 +5,7 @@ use crate::handlers::commands::*;
 use crate::handlers::files::*;
 use crate::handlers::leases::*;
 use crate::handlers::sandboxes::*;
+use crate::handlers::secrets::fetch_sandbox_secret_mounts;
 use crate::handlers::snapshots::*;
 use crate::handlers::workers::*;
 use crate::pagination::*;
@@ -213,12 +214,14 @@ pub(crate) async fn enrich_job_payload_with_provision_spec(
         | JobKind::ApexTaskInstructions => {
             let sandbox = fetch_sandbox(db, sandbox_id_from_job(job)?).await?;
             job.required_execution_class = sandbox.execution_class.clone();
-            add_provision_spec_to_payload(job, &sandbox)?;
+            let secret_mounts = fetch_sandbox_secret_mounts(db, sandbox.id).await?;
+            add_provision_spec_to_payload(job, &sandbox, &secret_mounts)?;
         }
         JobKind::ForkSandbox => {
             let child = fetch_sandbox(db, child_sandbox_id_from_job(job)?).await?;
             job.required_execution_class = child.execution_class.clone();
-            add_provision_spec_to_payload(job, &child)?;
+            let secret_mounts = fetch_sandbox_secret_mounts(db, child.id).await?;
+            add_provision_spec_to_payload(job, &child, &secret_mounts)?;
         }
         JobKind::DeleteHome => {}
     }
@@ -228,6 +231,7 @@ pub(crate) async fn enrich_job_payload_with_provision_spec(
 pub(crate) fn add_provision_spec_to_payload(
     job: &mut Job,
     sandbox: &Sandbox,
+    secret_mounts: &[SandboxSecretMount],
 ) -> Result<(), ApiError> {
     let Some(payload) = job.payload.as_object_mut() else {
         return Err(ApiError::bad_request("job payload must be an object"));
@@ -239,6 +243,7 @@ pub(crate) fn add_provision_spec_to_payload(
     payload.insert(
         "provisionSpec".to_string(),
         serde_json::to_value(SandboxProvisionSpec {
+            secret_mounts: secret_mounts.to_vec(),
             execution_class: sandbox.execution_class.clone(),
             memory_limit: sandbox.memory_limit.clone(),
             network_egress: sandbox.network_egress.clone(),

@@ -24,6 +24,7 @@ pub(crate) async fn legacy_snapshot_reads_and_expiry_survive_missing_placement_b
     let created: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             name: Some("legacy-snapshot".to_string()),
             template: None,
             memory_limit: None,
@@ -187,6 +188,7 @@ pub(crate) async fn apex_snapshot_claim_requires_exact_profile_and_runtime_image
     let created: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             name: Some("apex-snapshot".to_string()),
             template: Some(runtime_image.clone()),
             memory_limit: Some(MemoryLimit::FourG),
@@ -390,6 +392,7 @@ async fn snapshot_fork_preserves_vm_execution_class_and_requires_vm_worker() {
     let source: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: Some(ExecutionClass::VirtualMachine),
             workspace_mode: Some(WorkspaceMode::Persistent),
             name: Some("snapshot-vm-source".to_string()),
@@ -1075,6 +1078,7 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
     let archived: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: None,
             runtime_profile: None,
@@ -1179,6 +1183,7 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
             server.base_url, sandbox.sandbox.id
         ))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: None,
             runtime_profile: None,
@@ -1451,6 +1456,7 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
             server.base_url, sandbox.sandbox.id
         ))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: None,
             runtime_profile: None,

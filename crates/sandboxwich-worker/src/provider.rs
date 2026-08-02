@@ -32,8 +32,9 @@ use sandboxwich_core::{
     ProvisioningStage, ProvisioningStageUpdateRequest, RESIDENT_PLACEMENT_ATTESTATION_FILE,
     RESIDENT_PROCESS_BOOTSTRAP_PREFIX, ResidentProcessId, RuntimeResourceInventoryResponse,
     RuntimeResourceKind, RuntimeResourcePurpose, RuntimeResourceStatus, SANDBOX_WORKSPACE_GID,
-    SandboxId, SandboxProvisionSpec, SandboxRuntimeProfile, SnapshotId, WorkerCapability,
-    WorkspaceMode, validate_agent_command_request,
+    SandboxId, SandboxProvisionSpec, SandboxRuntimeProfile, SecretBackend, SecretDelivery,
+    SnapshotId, WorkerCapability, WorkspaceMode, secret_mount_dir, validate_agent_command_request,
+    validate_secret_ref_name,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -231,6 +232,15 @@ pub const GUEST_TOKEN_REDACTED: &str = "[redacted]";
 /// value (only) from byte equality.
 pub const GUEST_TOKEN_SECRET_NAME_PREFIX: &str = "sandboxwich-guest-token-";
 const GKE_FQDN_RESOURCE_KIND: &str = "fqdnnetworkpolicy.networking.gke.io";
+/// Kind of the policy the Cilium FQDN backend renders. `networkpolicy` in
+/// `SANDBOX_TEARDOWN_RESOURCE_KINDS` does not match it, so a sandbox stopped
+/// under this backend would leave its policy behind. Only appended when the
+/// backend is selected, since the CRD exists only on Cilium clusters.
+const CILIUM_FQDN_RESOURCE_KIND: &str = "ciliumnetworkpolicy.cilium.io";
+/// Ports an allowlisted host name is reachable on. Shared by both FQDN
+/// backends so the same allow rule grants the same reachability whether it is
+/// enforced by the per-sandbox egress gateway or by Cilium `toFQDNs`.
+const FQDN_EGRESS_PORTS: [u16; 2] = [80, 443];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct SandboxTeardownSpec {
@@ -498,6 +508,10 @@ pub trait SandboxProvider {
     }
 }
 
+fn is_path_separator(c: char) -> bool {
+    c == '/' || c == '\\'
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KubernetesDryRunProvider {
     cluster: String,
@@ -557,6 +571,11 @@ pub struct KubernetesDryRunProvider {
     /// var (GH-67).
     vnc_password_secret: Option<String>,
     fqdn_egress_backend: Option<String>,
+    /// Secrets Store CSI driver name (e.g. `secrets-store.csi.k8s.io`) the
+    /// operator has installed. Delivery of secret references is refused
+    /// outright while this is unset: rendering a Pod without the volume would
+    /// hand the guest a sandbox that silently lacks its credential.
+    secret_csi_driver: Option<String>,
     guest_credentials: Option<GuestCredentials>,
 }
 
@@ -581,6 +600,18 @@ impl std::fmt::Debug for GuestCredentials {
 }
 
 impl KubernetesDryRunProvider {
+    /// Renders the egress policy a `provision` would apply for `network_egress`,
+    /// without provisioning anything. This is the exact manifest the live
+    /// conformance suites apply, so the suites exercise the shipped rendering
+    /// instead of a hand-maintained copy of it.
+    pub fn render_egress_policy(
+        &self,
+        sandbox_id: SandboxId,
+        network_egress: &NetworkEgress,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.network_policy_manifest(sandbox_id, network_egress)
+    }
+
     pub fn with_snapshot_class(
         cluster: impl Into<String>,
         namespace: impl Into<String>,
@@ -616,6 +647,7 @@ impl KubernetesDryRunProvider {
             )]),
             vnc_password_secret: None,
             fqdn_egress_backend: None,
+            secret_csi_driver: None,
             guest_credentials: None,
         }
     }
@@ -632,8 +664,59 @@ impl KubernetesDryRunProvider {
         self
     }
 
+    /// Fail-closed gate for secret delivery. A sandbox that asked for a
+    /// credential must either get it or fail to provision; there is no
+    /// degraded mode where the Pod comes up without the mount, and no path
+    /// where a delivery location comes from anywhere but the control plane's
+    /// own derivation.
+    fn validate_secret_delivery(&self, spec: &SandboxProvisionSpec) -> anyhow::Result<()> {
+        if spec.secret_mounts.is_empty() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.secret_csi_driver.is_some(),
+            "secret delivery requires a Secrets Store CSI driver configured on this worker"
+        );
+        let mut seen_names = std::collections::HashSet::new();
+        for mount in &spec.secret_mounts {
+            // Two mounts sharing a name render two Pod volumes with the same
+            // name; the control plane cannot produce that, so reject it here
+            // rather than let the API server reject it at apply time.
+            anyhow::ensure!(
+                seen_names.insert(mount.name.as_str()),
+                "secret delivery name {} appears more than once in this spec",
+                mount.name
+            );
+            match mount.delivery {
+                SecretDelivery::File => {}
+            }
+            match mount.source.backend {
+                SecretBackend::CsiSecretProviderClass => {}
+            }
+            // The name is re-validated, not just used: recomputing the
+            // expected directory from an unchecked name would put the
+            // attacker's value on both sides of the comparison.
+            anyhow::ensure!(
+                validate_secret_ref_name(&mount.name).is_ok(),
+                "secret delivery name {} is not a valid reference name",
+                mount.name
+            );
+            let expected_dir = secret_mount_dir(&mount.name);
+            anyhow::ensure!(
+                mount.mount_dir == expected_dir
+                    && mount.file_path == format!("{expected_dir}/{}", mount.source.object_key)
+                    && !mount.source.object_key.chars().any(is_path_separator)
+                    && mount.source.object_key.chars().any(|c| c != '.'),
+                "secret delivery path for {} is not control-plane derived",
+                mount.name
+            );
+        }
+        Ok(())
+    }
+
     fn validate_runtime_profile(&self, spec: &SandboxProvisionSpec) -> anyhow::Result<()> {
         self.validate_network_policy_egress(&spec.network_egress)?;
+        self.validate_secret_delivery(spec)?;
         if spec.runtime_profile == SandboxRuntimeProfile::ApexTrustedSupervisorV1 {
             anyhow::ensure!(
                 self.apex_trusted_supervisor_v1 && image_is_digest_pinned(&self.runtime_image),
@@ -687,6 +770,14 @@ impl KubernetesDryRunProvider {
 
     pub fn with_ssh_authorized_keys_secret(mut self, secret: Option<String>) -> Self {
         self.ssh_authorized_keys_secret = secret;
+        self
+    }
+
+    pub fn with_secret_csi_driver(mut self, driver: Option<String>) -> Self {
+        self.secret_csi_driver = driver.and_then(|driver| {
+            let driver = driver.trim();
+            (!driver.is_empty()).then(|| driver.to_string())
+        });
         self
     }
 
@@ -765,11 +856,16 @@ impl KubernetesDryRunProvider {
         base: &str,
         persisted_gke_fqdn: bool,
     ) -> String {
+        let mut kinds = base.to_string();
         if persisted_gke_fqdn {
-            format!("{base},{GKE_FQDN_RESOURCE_KIND}")
-        } else {
-            base.to_string()
+            kinds.push(',');
+            kinds.push_str(GKE_FQDN_RESOURCE_KIND);
         }
+        if self.fqdn_egress_backend.as_deref() == Some("cilium") {
+            kinds.push(',');
+            kinds.push_str(CILIUM_FQDN_RESOURCE_KIND);
+        }
+        kinds
     }
 
     /// Merges operator-supplied CIDRs into the excluded set (deduped
@@ -1116,7 +1212,7 @@ impl KubernetesDryRunProvider {
             self.host_rules(network_egress)
                 .map(ToString::to_string)
                 .collect(),
-            vec![80, 443],
+            FQDN_EGRESS_PORTS.to_vec(),
             denied_cidrs,
         )?))
     }
@@ -1325,6 +1421,36 @@ impl KubernetesDryRunProvider {
                 "name": "SANDBOXWICH_VNC_PASSWORD_FILE",
                 "value": "/run/sandboxwich/vnc/vnc-password"
             }));
+        }
+
+        // Locators only. The kubelet's Secrets Store CSI driver reads the
+        // material from the external store into this Pod's tmpfs; no plaintext
+        // copy is created in a Kubernetes Secret, in etcd, or in this process,
+        // and the guest gets the *path* through `<NAME>_FILE`, never the value.
+        // Unconfigured drivers never reach here: `validate_secret_delivery`
+        // already refused the provision.
+        if let Some(driver) = &self.secret_csi_driver {
+            for mount in &spec.secret_mounts {
+                volume_mounts.push(json!({
+                    "name": mount.volume_name(),
+                    "mountPath": mount.mount_dir,
+                    "readOnly": true
+                }));
+                volumes.push(json!({
+                    "name": mount.volume_name(),
+                    "csi": {
+                        "driver": driver,
+                        "readOnly": true,
+                        "volumeAttributes": {
+                            "secretProviderClass": mount.source.object_name
+                        }
+                    }
+                }));
+                env.push(json!({
+                    "name": mount.env_file_variable,
+                    "value": mount.file_path
+                }));
+            }
         }
 
         let ephemeral_storage = Self::ephemeral_storage_limit(&spec.memory_limit);
@@ -1695,7 +1821,7 @@ impl KubernetesDryRunProvider {
                 .iter()
                 .any(|rule| rule.kind == NetworkAllowRuleKind::Host)
         {
-            return Ok(self.cilium_fqdn_policy_manifest(sandbox_id, network_egress));
+            return self.cilium_fqdn_policy_manifest(sandbox_id, network_egress);
         }
         let mut egress = match network_egress {
             NetworkEgress::DenyAll => Vec::new(),
@@ -1749,11 +1875,24 @@ impl KubernetesDryRunProvider {
         }))
     }
 
+    /// Renders the `CiliumNetworkPolicy` used when the Cilium FQDN backend is
+    /// selected. The rendering is the enforcement boundary itself, so three
+    /// properties are load-bearing and covered by
+    /// `deploy/kubernetes/cilium-fqdn-conformance.sh`:
+    ///
+    /// * the DNS rule carries L7 `rules.dns`; without it Cilium never sees the
+    ///   answers that populate `toFQDNs` and every allowlisted name is
+    ///   unreachable (`toFQDNs` rules "do nothing if there is no L7 DNS rule
+    ///   covering the endpoint"),
+    /// * allowlisted names are reachable only on the same ports the
+    ///   egress-gateway backend proxies, and
+    /// * `egressDeny` is omitted rather than rendered with an empty CIDR set,
+    ///   which is not a deny of anything.
     fn cilium_fqdn_policy_manifest(
         &self,
         sandbox_id: SandboxId,
         network_egress: &NetworkEgress,
-    ) -> serde_json::Value {
+    ) -> anyhow::Result<serde_json::Value> {
         let rules = network_egress.rules();
         let hosts: Vec<_> = rules
             .iter()
@@ -1776,8 +1915,7 @@ impl KubernetesDryRunProvider {
                     "exceptCIDRs": block.get("except").cloned().unwrap_or_else(|| json!([]))
                 }))
             })
-            .collect::<anyhow::Result<Vec<_>>>()
-            .expect("CIDRs were validated before provider dispatch");
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let mut ingress_labels = serde_json::Map::from_iter([(
             "k8s:io.kubernetes.pod.namespace".to_string(),
             json!(self.effective_ingress_namespace()),
@@ -1790,13 +1928,22 @@ impl KubernetesDryRunProvider {
             .iter()
             .map(|cidr| json!({"cidr": cidr}))
             .collect();
-        let mut egress = vec![json!({"toFQDNs": hosts})];
+        let mut egress = vec![json!({
+            "toFQDNs": hosts,
+            "toPorts": [{"ports": FQDN_EGRESS_PORTS
+                .iter()
+                .map(|port| json!({"port": port.to_string(), "protocol": "TCP"}))
+                .collect::<Vec<_>>()}]
+        })];
         if !cidrs.is_empty() {
             egress.push(json!({"toCIDRSet": cidrs}));
         }
         egress.push(json!({
             "toEndpoints": [{"matchLabels": {"k8s:io.kubernetes.pod.namespace": self.dns_namespace, "k8s:k8s-app": "kube-dns"}}],
-            "toPorts": [{"ports": [{"port": "53", "protocol": "ANY"}]}]
+            "toPorts": [{
+                "ports": [{"port": "53", "protocol": "ANY"}],
+                "rules": {"dns": [{"matchPattern": "*"}]}
+            }]
         }));
         egress.push(json!({
             "toEndpoints": [{"matchLabels": {
@@ -1805,32 +1952,34 @@ impl KubernetesDryRunProvider {
             }}],
             "toPorts": [{"ports": [{"port": "3217", "protocol": "TCP"}]}]
         }));
-        egress.extend(self.dns_service_ips.iter().map(|address| {
-            let cidr = match address {
-                IpAddr::V4(address) => format!("{address}/32"),
-                IpAddr::V6(address) => format!("{address}/128"),
-            };
-            json!({
-                "toCIDRSet": [{"cidr": cidr}],
-                "toPorts": [{"ports": [{"port": "53", "protocol": "ANY"}]}]
-            })
-        }));
-        json!({
+        // Deliberately no bare-address DNS rule for `dns_service_ips`: only
+        // answers returned through a rule carrying L7 `rules.dns` reach the
+        // Cilium DNS proxy and populate the `toFQDNs` cache, so a resolver
+        // reachable purely as an address (NodeLocal DNSCache and friends)
+        // would resolve names that stay unreachable. Under this backend the
+        // sandbox resolves through the cluster DNS endpoints above -- the
+        // cluster DNS ClusterIP translates to those same endpoints -- and any
+        // other resolver stays denied instead of silently degrading the
+        // allowlist.
+        let mut spec = json!({
+            "endpointSelector": {"matchLabels": {"sandboxwich.dev/sandbox-id": sandbox_id}},
+            "ingress": [{
+                "fromEndpoints": [{"matchLabels": ingress_labels}],
+                "toPorts": [{"ports": [
+                    {"port": "2222", "protocol": "TCP"}, {"port": "6080", "protocol": "TCP"}, {"port": "5900", "protocol": "TCP"}
+                ]}]
+            }],
+            "egress": egress
+        });
+        if !denied_cidrs.is_empty() {
+            spec["egressDeny"] = json!([{"toCIDRSet": denied_cidrs}]);
+        }
+        Ok(json!({
             "apiVersion": "cilium.io/v2",
             "kind": "CiliumNetworkPolicy",
             "metadata": self.object_metadata(format!("sandboxwich-egress-{sandbox_id}"), Some(sandbox_id)),
-            "spec": {
-                "endpointSelector": {"matchLabels": {"sandboxwich.dev/sandbox-id": sandbox_id}},
-                "ingress": [{
-                    "fromEndpoints": [{"matchLabels": ingress_labels}],
-                    "toPorts": [{"ports": [
-                        {"port": "2222", "protocol": "TCP"}, {"port": "6080", "protocol": "TCP"}, {"port": "5900", "protocol": "TCP"}
-                    ]}]
-                }],
-                "egress": egress,
-                "egressDeny": [{"toCIDRSet": denied_cidrs}]
-            }
-        })
+            "spec": spec
+        }))
     }
 
     fn egress_gateway_pod_manifest(

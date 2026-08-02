@@ -10,6 +10,7 @@ pub(crate) mod operations;
 pub(crate) mod resident_attestations;
 pub(crate) mod resident_processes;
 pub(crate) mod sandboxes;
+pub(crate) mod secrets;
 pub(crate) mod snapshots;
 pub(crate) mod ssh;
 pub(crate) mod workers;

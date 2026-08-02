@@ -4,6 +4,7 @@ use sandboxwich_core::*;
 
 fn persistent_sandbox(name: &str) -> CreateSandboxRequest {
     CreateSandboxRequest {
+        secret_ref_ids: Vec::new(),
         name: Some(name.into()),
         template: None,
         memory_limit: None,

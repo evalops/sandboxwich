@@ -7,6 +7,7 @@ use crate::handlers::jobs::*;
 use crate::handlers::leases::*;
 use crate::handlers::operations::operation_from_job;
 use crate::handlers::sandboxes::*;
+use crate::handlers::secrets::fetch_sandbox_secret_mounts;
 use crate::pagination::*;
 use crate::reconcile::*;
 use crate::rows::*;
@@ -71,7 +72,8 @@ pub(crate) async fn create_snapshot(
         updated_at: scheduled_at,
         last_error: None,
     };
-    add_provision_spec_to_payload(&mut job, &sandbox)?;
+    let secret_mounts = fetch_sandbox_secret_mounts(&state.db, sandbox.id).await?;
+    add_provision_spec_to_payload(&mut job, &sandbox, &secret_mounts)?;
     insert_job(&state.db, &job).await?;
 
     Ok((
@@ -184,6 +186,7 @@ pub(crate) async fn fork_snapshot(
             "snapshotId": snapshot_id,
             "runtimeImage": child.template,
             "provisionSpec": SandboxProvisionSpec {
+                secret_mounts: Vec::new(),
                 execution_class: child.execution_class.clone(),
                 memory_limit: child.memory_limit.clone(),
                 network_egress: child.network_egress.clone(),
@@ -496,6 +499,7 @@ pub(crate) fn pending_snapshot_from_request(
         provider_metadata: request.provider_metadata.unwrap_or_else(|| json!({})),
         runtime_image: Some(sandbox.template.clone()),
         provision_spec: Some(SandboxProvisionSpec {
+            secret_mounts: Vec::new(),
             execution_class: sandbox.execution_class.clone(),
             memory_limit: sandbox.memory_limit.clone(),
             network_egress: sandbox.network_egress.clone(),
@@ -975,6 +979,7 @@ pub(crate) async fn queue_forks_waiting_on_snapshot_on_connection(
                     "snapshotId": snapshot_id,
                     "runtimeImage": child.template,
                     "provisionSpec": SandboxProvisionSpec {
+                        secret_mounts: Vec::new(),
                         execution_class: child.execution_class.clone(),
                         memory_limit: child.memory_limit.clone(),
                         network_egress: child.network_egress.clone(),
