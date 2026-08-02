@@ -702,6 +702,7 @@ pub(crate) async fn run_contract(server: TestServer) {
     assert_expired_lease_requeues_command(&client, &server, &created, &worker).await;
     assert_prompt_job_lifecycle(&client, &server, &created).await;
     assert_desktop_session_lifecycle(&client, &server, &created).await;
+    assert_desktop_brokered_transport(&client, &server, &created, &worker).await;
     assert_snapshot_fork_and_cleanup_lifecycle(&client, &server, &created, &worker).await;
 
     let stopped: SandboxResponse = client
@@ -775,15 +776,22 @@ pub(crate) async fn run_contract(server: TestServer) {
         .unwrap();
     assert_eq!(archived.sandbox.state, SandboxState::Archived);
 
-    let resumed = client
-        .post(format!(
-            "{}/sandboxes/{}/resume",
+    assert_snapshot_backed_resume_lifecycle(&client, &server, &created).await;
+
+    let archived: SandboxResponse = client
+        .get(format!(
+            "{}/sandboxes/{}",
             server.base_url, created.sandbox.id
         ))
         .send()
         .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
         .unwrap();
-    assert_eq!(resumed.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(archived.sandbox.state, SandboxState::Archived);
 
     assert_job_completion_does_not_resurrect_concurrently_archived_sandbox(
         &client, &server, &created,
