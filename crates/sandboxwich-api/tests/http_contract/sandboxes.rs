@@ -16,6 +16,7 @@ async fn sandbox_read_reports_actual_worker_placement_proof() {
     let created: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             name: Some("placement-proof".into()),
             template: Some(
                 "image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -114,6 +115,7 @@ async fn sandbox_read_reports_actual_worker_placement_proof() {
     let unplaced: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             name: Some("unplaced-proof".into()),
             template: None,
             memory_limit: None,
@@ -176,6 +178,7 @@ async fn execution_class_defaults_persists_and_inherits_through_fork() {
     let defaulted: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: None,
             name: Some("execution-default".to_string()),
@@ -203,6 +206,7 @@ async fn execution_class_defaults_persists_and_inherits_through_fork() {
     let vm: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: Some(ExecutionClass::VirtualMachine),
             workspace_mode: None,
             name: Some("execution-vm".to_string()),
@@ -245,6 +249,7 @@ async fn execution_class_defaults_persists_and_inherits_through_fork() {
             server.base_url, vm.sandbox.id
         ))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: None,
             name: Some("execution-vm-child".to_string()),
@@ -285,6 +290,7 @@ async fn disposable_workspace_mode_round_trips_and_rejects_durable_operations() 
     let created: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: Some(WorkspaceMode::Ephemeral),
             runtime_profile: None,
@@ -347,6 +353,7 @@ async fn disposable_workspace_mode_round_trips_and_rejects_durable_operations() 
             server.base_url, created.sandbox.id
         ))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: None,
             runtime_profile: None,
@@ -388,6 +395,7 @@ pub(crate) async fn list_sandboxes_hydrates_each_allowlist_sandboxes_own_rules()
     let single_rule: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: None,
             runtime_profile: None,
@@ -416,6 +424,7 @@ pub(crate) async fn list_sandboxes_hydrates_each_allowlist_sandboxes_own_rules()
     let multi_rule: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: None,
             runtime_profile: None,
@@ -450,6 +459,7 @@ pub(crate) async fn list_sandboxes_hydrates_each_allowlist_sandboxes_own_rules()
     let no_rules: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: None,
             runtime_profile: None,
@@ -534,6 +544,7 @@ async fn stop_before_first_provision_is_claimable_and_cannot_be_undone() {
     let created: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: None,
             runtime_profile: None,
@@ -702,6 +713,7 @@ pub(crate) async fn assert_resource_tiers_and_file_contracts(
     let sized: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: None,
             runtime_profile: None,
@@ -740,6 +752,7 @@ pub(crate) async fn assert_resource_tiers_and_file_contracts(
     let host_allowlist = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: None,
             runtime_profile: None,
@@ -997,6 +1010,7 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
             server.base_url, sandbox.sandbox.id
         ))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: None,
             runtime_profile: None,

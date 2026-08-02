@@ -170,6 +170,27 @@ and survive API restarts. Exhausted request or mutation budgets return `429`
 with `Retry-After` and the stable codes `tenant_rate_limit_exceeded` or
 `tenant_mutation_quota_exceeded`; tenants without a policy remain unlimited.
 
+`/v1/secret-refs` records where a tenant's long-lived user or model
+credentials live, never the credentials themselves. A reference is scoped to
+the authenticated organization plus a `workspaceId`, names an object in an
+operator-owned backend, and is validated before storage because its name
+becomes a guest file name. The typed contract has no field that can carry
+credential material in either direction, so a raw value cannot enter the
+control plane even by mistake. `DELETE` revokes a reference as a durable state
+transition rather than erasing the record.
+
+`POST /v1/sandboxes` binds references through `secretRefIds`. Each is resolved
+in the caller's own scope at create time — an unknown, foreign, revoked,
+duplicated, or cross-workspace reference fails the create rather than producing
+a sandbox that silently lacks a credential — and the worker mounts it into the
+guest as a read-only [Secrets Store CSI](https://secrets-store-csi-driver.sigs.k8s.io/)
+volume at `/run/sandboxwich/secrets/<name>`, with the *path* exposed as
+`SANDBOXWICH_SECRET_<NAME>_FILE`. The material never passes through the control
+plane or a Kubernetes `Secret`; the kubelet fetches it from the external store
+directly. Delivery requires an operator-configured CSI driver
+(`--secret-csi-driver`) and is refused outright without one — see
+[docs/kubernetes.md](docs/kubernetes.md).
+
 Sandbox creation and stop are asynchronous and return HTTP `202` with an
 Operation. Resource-only creation endpoints return `201`. Resume is explicitly
 unsupported until a provider can restore durable state. The prompt endpoint

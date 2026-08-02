@@ -5,6 +5,7 @@ use crate::handlers::commands::*;
 use crate::handlers::homes::claim_home_mount_on_connection;
 use crate::handlers::jobs::*;
 use crate::handlers::operations::operation_from_job;
+use crate::handlers::secrets::*;
 use crate::handlers::snapshots::*;
 use crate::pagination::*;
 use crate::reconcile::list_runtime_resources_for_sandbox;
@@ -65,6 +66,7 @@ pub(crate) fn provision_spec_from_request(
         ));
     }
     Ok(SandboxProvisionSpec {
+        secret_mounts: Vec::new(),
         execution_class,
         memory_limit,
         network_egress,
@@ -223,7 +225,9 @@ pub(crate) async fn create_sandbox_with_home(
     home_id: Option<HomeId>,
 ) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
     let now = Utc::now();
-    let provision_spec = provision_spec_from_request(&request, None)?;
+    let mut provision_spec = provision_spec_from_request(&request, None)?;
+    provision_spec.secret_mounts =
+        resolve_secret_mounts(&state.db, &ctx.tenant_id, &request.secret_ref_ids).await?;
     if home_id.is_some() && provision_spec.workspace_mode != WorkspaceMode::Persistent {
         return Err(ApiError::bad_request(
             "managed homes require workspace_mode=persistent",
@@ -281,9 +285,16 @@ pub(crate) async fn create_sandbox_with_home(
         updated_at: now,
         last_error: None,
     };
-    add_provision_spec_to_payload(&mut job, &sandbox)?;
+    add_provision_spec_to_payload(&mut job, &sandbox, &provision_spec.secret_mounts)?;
     let mut tx = state.db.pool.begin().await?;
     insert_sandbox_on_connection(&state.db, &mut tx, &sandbox).await?;
+    insert_sandbox_secret_bindings_on_connection(
+        &state.db,
+        &mut tx,
+        sandbox.id,
+        &provision_spec.secret_mounts,
+    )
+    .await?;
     if let Some(home_id) = home_id {
         claim_home_mount_on_connection(&state.db, &mut tx, home_id, &ctx.tenant_id, sandbox.id)
             .await?;
@@ -513,7 +524,8 @@ pub(crate) async fn stop_sandbox_via_job(
         updated_at: now,
         last_error: None,
     };
-    add_provision_spec_to_payload(&mut job, sandbox)?;
+    let secret_mounts = fetch_sandbox_secret_mounts(db, sandbox_id).await?;
+    add_provision_spec_to_payload(&mut job, sandbox, &secret_mounts)?;
     let mut tx = db.pool.begin().await?;
     let transitioned = set_sandbox_state_on_connection(
         db,
@@ -708,6 +720,14 @@ pub(crate) async fn fork_sandbox(
     Json(request): Json<CreateSandboxRequest>,
 ) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
     let parent = ensure_sandbox_tenant(&state.db, SandboxId(sandbox_id), &ctx).await?;
+    // A fork copies a workspace, not an entitlement: secret bindings are not
+    // inherited, and asking for them here is rejected rather than silently
+    // dropped so a caller never believes a forked sandbox holds credentials.
+    if !request.secret_ref_ids.is_empty() {
+        return Err(ApiError::bad_request(
+            "secret references cannot be bound on fork; create a sandbox instead",
+        ));
+    }
     let provision_spec = provision_spec_from_request(&request, Some(&parent))?;
     if parent.workspace_mode != WorkspaceMode::Persistent
         || provision_spec.workspace_mode != WorkspaceMode::Persistent
@@ -732,6 +752,7 @@ pub(crate) async fn fork_sandbox(
         }),
         runtime_image: Some(parent.template.clone()),
         provision_spec: Some(SandboxProvisionSpec {
+            secret_mounts: Vec::new(),
             execution_class: parent.execution_class.clone(),
             memory_limit: parent.memory_limit.clone(),
             network_egress: parent.network_egress.clone(),
@@ -789,6 +810,7 @@ pub(crate) async fn fork_sandbox(
             "operation": { "kind": OperationKind::ForkSandbox, "resourceId": child.id },
             "runtimeImage": parent.template,
             "provisionSpec": SandboxProvisionSpec {
+                secret_mounts: Vec::new(),
                 execution_class: parent.execution_class.clone(),
                 memory_limit: parent.memory_limit.clone(),
                 network_egress: parent.network_egress.clone(),

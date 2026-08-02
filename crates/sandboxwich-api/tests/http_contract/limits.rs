@@ -118,6 +118,7 @@ async fn assert_limit_contract(server: TestServer) {
         .await
         .unwrap();
     let body = CreateSandboxRequest {
+        secret_ref_ids: Vec::new(),
         execution_class: None,
         workspace_mode: None,
         runtime_profile: None,

@@ -58,6 +58,7 @@ async fn max_lifetime_reaps_a_live_sandbox_but_never_touches_an_unconfigured_per
     let reapable: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             name: Some("reap-me".to_string()),
             template: None,
             memory_limit: None,
@@ -85,6 +86,7 @@ async fn max_lifetime_reaps_a_live_sandbox_but_never_touches_an_unconfigured_per
     let untouched: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             name: Some("never-reap-me".to_string()),
             template: None,
             memory_limit: None,
@@ -224,6 +226,7 @@ async fn assert_idle_ttl_reap_join_is_correct_on(server: TestServer) {
     let has_recent_command: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             name: Some("idle-but-has-recent-command".to_string()),
             template: None,
             memory_limit: None,
@@ -247,6 +250,7 @@ async fn assert_idle_ttl_reap_join_is_correct_on(server: TestServer) {
     let truly_idle: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             name: Some("truly-idle".to_string()),
             template: None,
             memory_limit: None,

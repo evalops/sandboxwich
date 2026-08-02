@@ -7,6 +7,7 @@ use crate::handlers::jobs::{add_provision_spec_to_payload, insert_job_on_connect
 use crate::handlers::resident_attestations::{
     issue_resident_placement_attestation, record_provider_pod_identity,
 };
+use crate::handlers::secrets::fetch_sandbox_secret_mounts;
 use crate::rows::{parse_timestamp, row_to_job, row_to_resident_process};
 use crate::state::{
     AppState, LiveResidentBootstrap, Principal, ResidentBootstrapDelivery,
@@ -738,7 +739,8 @@ pub(crate) async fn put_resident_process(
         updated_at: now,
         last_error: None,
     };
-    add_provision_spec_to_payload(&mut job, &sandbox)?;
+    let secret_mounts = fetch_sandbox_secret_mounts(&state.db, sandbox.id).await?;
+    add_provision_spec_to_payload(&mut job, &sandbox, &secret_mounts)?;
     if let Some(workspace_claim_name) = workspace_claim_name {
         job.payload
             .as_object_mut()

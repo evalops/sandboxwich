@@ -51,14 +51,20 @@ These capabilities remain Experimental until every gate below passes for a named
 
 ## Next work
 
-1. Add live Cilium FQDN conformance on a Cilium-backed disposable cluster.
+1. Promote Cilium FQDN egress from Experimental. The live suite
+   (`deploy/kubernetes/cilium-fqdn-conformance.sh`, `cilium-fqdn` job) now
+   proves allow, deny, DNS failure, redirect, IPv4, and IPv6 against a
+   Cilium-backed disposable cluster using the shipped policy rendering. What
+   remains is a Cilium-backed *production* target: the deploy repo has no
+   Cilium-managed cluster, so `SANDBOXWICH_CILIUM_FQDN_EGRESS=true` has no
+   production evidence and the egress-gateway backend stays the default.
 2. Add a microVM provider and compare its lifecycle and recovery behavior with RuntimeClass-backed Kubernetes.
 3. Add a brokered desktop transport; current desktop records do not create an ingress tunnel.
-4. Add production secret storage before accepting long-lived user or model credentials.
+4. Add live Secrets Store CSI conformance on a cluster with the driver installed. Reference storage, binding, and rendered read-only CSI mounts are covered by contract tests against the real API and provider surface, but no test asserts against a kubelet actually mounting material.
 5. Add live sidecar conformance on a real cluster across worker restart and an explicit guest-to-sidecar network relay; the isolated Pod still does not share guest localhost. Resident bootstrap handoff is no longer process-local: with `SANDBOXWICH_BOOTSTRAP_HANDOFF_KEY` configured, sealed ephemeral rows carry it across API restart, replica failover, and cross-replica replay under the same generation/lease/digest fence, covered by SQLite and PostgreSQL contract tests.
 
 ## Non-goals for 0.1
 
 - Billing.
-- Long-lived production secret storage.
+- Secret backends other than operator-provisioned `SecretProviderClass` objects served by the Secrets Store CSI driver, and any path that accepts raw credential bytes into the control plane.
 - Unsupported isolation claims for the dry-run provider.
