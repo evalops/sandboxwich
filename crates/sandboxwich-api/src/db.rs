@@ -183,11 +183,13 @@ pub(crate) async fn ensure_database_constraints(db: &Database) -> anyhow::Result
 }
 
 pub(crate) const DB_ENUM_SCHEMA_METADATA_KEY: &str = "db_enum_constraints_fingerprint";
-// v7 adds the managed-home lifecycle constraint. v6 combined execution-class constraints with the
+// v8 adds the secret-reference backend/delivery/state constraints. v7 added
+// the managed-home lifecycle constraint. v6 combined execution-class
+// constraints with the
 // sandboxes.parent_snapshot_id -> snapshot_restore_sources(snapshot_id)
 // foreign key. Bumping the version forces existing installations to install
 // the new guards on upgrade.
-pub(crate) const DB_ENUM_SCHEMA_FINGERPRINT_VERSION: &str = "db-enum-v7";
+pub(crate) const DB_ENUM_SCHEMA_FINGERPRINT_VERSION: &str = "db-enum-v8";
 pub(crate) const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 pub(crate) const FNV_PRIME: u64 = 0x00000100000001b3;
 
@@ -544,6 +546,27 @@ pub(crate) const DB_ENUM_COLUMNS: &[DbEnumColumn] = &[
         "provisioning_stage_observations_error_class_check",
         <ProvisioningErrorClass as DbVariant>::VALUES,
         "invalid provisioning observation error class",
+    ),
+    DbEnumColumn::new(
+        "secret_refs",
+        "backend",
+        "secret_refs_backend_check",
+        <SecretBackend as DbVariant>::VALUES,
+        "invalid secret reference backend",
+    ),
+    DbEnumColumn::new(
+        "secret_refs",
+        "delivery",
+        "secret_refs_delivery_check",
+        <SecretDelivery as DbVariant>::VALUES,
+        "invalid secret reference delivery mode",
+    ),
+    DbEnumColumn::new(
+        "secret_refs",
+        "state",
+        "secret_refs_state_check",
+        <SecretRefState as DbVariant>::VALUES,
+        "invalid secret reference state",
     ),
 ];
 

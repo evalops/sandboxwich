@@ -38,6 +38,8 @@ mod reap;
 mod resident_processes;
 #[path = "http_contract/sandboxes.rs"]
 mod sandboxes;
+#[path = "http_contract/secrets.rs"]
+mod secrets;
 #[path = "http_contract/snapshots.rs"]
 mod snapshots;
 #[path = "http_contract/types.rs"]

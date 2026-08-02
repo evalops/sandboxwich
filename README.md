@@ -152,6 +152,17 @@ and survive API restarts. Exhausted request or mutation budgets return `429`
 with `Retry-After` and the stable codes `tenant_rate_limit_exceeded` or
 `tenant_mutation_quota_exceeded`; tenants without a policy remain unlimited.
 
+`/v1/secret-refs` records where a tenant's long-lived user or model
+credentials live, never the credentials themselves. A reference is scoped to
+the authenticated organization plus a `workspaceId`, names an object in an
+operator-owned backend, and is validated before storage because its name
+becomes a guest file name. The typed contract has no field that can carry
+credential material in either direction, so a raw value cannot enter the
+control plane even by mistake. `DELETE` revokes a reference as a durable state
+transition rather than erasing the record. Binding a reference to a sandbox,
+and mounting it into the guest, is not implemented yet — see
+[docs/capabilities.md](docs/capabilities.md).
+
 Sandbox creation and stop are asynchronous and return HTTP `202` with an
 Operation. Resource-only creation endpoints return `201`. Resume is explicitly
 unsupported until a provider can restore durable state. The prompt endpoint
