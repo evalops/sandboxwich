@@ -1,6 +1,7 @@
 mod activity;
 mod api_contract;
 mod auth;
+mod bootstrap_handoff;
 mod cleanup;
 mod config;
 mod db;
@@ -29,6 +30,7 @@ use anyhow::Context;
 use tracing_subscriber::EnvFilter;
 
 use crate::api_contract::openapi_document;
+use crate::bootstrap_handoff::SharedBootstrapHandoff;
 use crate::config::AuthConfig;
 use crate::config::{ApiCommand, load_api_config};
 use crate::db::connect_database;
@@ -84,7 +86,26 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let resident_bootstraps = ResidentBootstrapStore::default();
+    let resident_bootstraps = match config.bootstrap_handoff_key {
+        Some(key) => {
+            let handoff = SharedBootstrapHandoff::new(key, config.bootstrap_handoff_ttl);
+            tracing::info!(
+                key_id = handoff.key_id(),
+                ttl_seconds = handoff.ttl().as_secs(),
+                "resident bootstrap handoff is shared: bootstrap delivery survives API restart \
+                 and replica failover"
+            );
+            ResidentBootstrapStore::default().with_shared_handoff(handoff)
+        }
+        None => {
+            tracing::info!(
+                "SANDBOXWICH_BOOTSTRAP_HANDOFF_KEY is not set: resident bootstrap bytes stay in \
+                 this process, so an API restart or a read served by another replica cannot \
+                 complete a pending bootstrap"
+            );
+            ResidentBootstrapStore::default()
+        }
+    };
     if config.disable_expiry_sweeper {
         tracing::info!(
             "SANDBOXWICH_DISABLE_EXPIRY_SWEEPER is set: not spawning the lease/snapshot/desktop-\

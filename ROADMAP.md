@@ -62,7 +62,7 @@ These capabilities remain Experimental until every gate below passes for a named
 2. Add a microVM provider and compare its lifecycle and recovery behavior with RuntimeClass-backed Kubernetes.
 3. Finish the brokered desktop transport. Desktop access now returns a typed `DesktopTransport` referencing the sandbox's persisted desktop `Service` runtime resource and a short-lived, sandbox-bound credential (returned once, stored only as a hash, rotated by revocation). Still outstanding: the external broker that validates the credential and relays clients onto the tunnel, and the public ingress/Gateway in front of the desktop `Service` in evalops/deploy.
 4. Add live Secrets Store CSI conformance on a cluster with the driver installed. Reference storage, binding, and rendered read-only CSI mounts are covered by contract tests against the real API and provider surface, but no test asserts against a kubelet actually mounting material.
-5. Add live sidecar conformance across worker restart, API replica failover, and an explicit guest-to-sidecar network relay; bootstrap handoff is currently process-local and the isolated Pod does not share guest localhost.
+5. Add live sidecar conformance on a real cluster across worker restart and an explicit guest-to-sidecar network relay; the isolated Pod still does not share guest localhost. Resident bootstrap handoff is no longer process-local: with `SANDBOXWICH_BOOTSTRAP_HANDOFF_KEY` configured, sealed ephemeral rows carry it across API restart, replica failover, and cross-replica replay under the same generation/lease/digest fence, covered by SQLite and PostgreSQL contract tests.
 
 ## Non-goals for 0.1
 

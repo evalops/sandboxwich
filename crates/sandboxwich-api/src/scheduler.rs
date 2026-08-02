@@ -1,3 +1,4 @@
+use crate::bootstrap_handoff::expire_due_bootstrap_handoffs;
 use crate::db::*;
 use crate::handlers::desktop::*;
 use crate::handlers::leases::*;
@@ -49,6 +50,11 @@ pub(crate) fn spawn_expiry_sweeper(
             }
             if let Err(error) = reconcile_worker_liveness(&db).await {
                 tracing::warn!(?error, "worker liveness reconciliation failed");
+            }
+            // Unconditional: rows sealed by a key this process no longer holds
+            // still have to age out.
+            if let Err(error) = expire_due_bootstrap_handoffs(&db).await {
+                tracing::warn!(%error, "resident bootstrap handoff retention sweep failed");
             }
             if let Err(error) = expire_idempotency_records(&db).await {
                 tracing::warn!(?error, "idempotency retention sweep failed");
