@@ -1002,7 +1002,11 @@ fn resume_sandbox_job_restores_the_workspace_from_its_snapshot() {
             }),
             WorkerCapability::Snapshot,
         ),
-        &provider(),
+        // Through the dispatch enum the worker binary actually runs on, not the
+        // concrete provider: a missing arm there falls through to the trait's
+        // fail-closed default, which a test calling the provider directly
+        // cannot see.
+        &RuntimeProvider::DryRun(provider()),
         &CancelSignal::never_cancelled(),
     )
     .expect("resume job should execute");

@@ -763,6 +763,19 @@ impl SandboxProvider for RuntimeProvider {
         }
     }
 
+    fn resume(
+        &self,
+        sandbox_id: sandboxwich_core::SandboxId,
+        snapshot_id: sandboxwich_core::SnapshotId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<sandboxwich_core::ProviderResumeHandle> {
+        match self {
+            Self::DryRun(provider) => provider.resume(sandbox_id, snapshot_id, spec, cancelled),
+            Self::Apply(provider) => provider.resume(sandbox_id, snapshot_id, spec, cancelled),
+        }
+    }
+
     fn stop(
         &self,
         sandbox_id: sandboxwich_core::SandboxId,
