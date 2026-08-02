@@ -3914,7 +3914,7 @@ impl KubernetesApplyProvider {
     /// `exec_handoff` reuses whatever Pod is present. For
     /// `sandboxed_container` and `virtual_machine` that field *is* the
     /// isolation boundary, so it is verified against the API server's view
-    /// before any guest work runs.
+    /// before a sandbox is reported ready and before a command lease runs.
     fn verify_pod_runtime_class(
         &self,
         sandbox_id: SandboxId,
@@ -6238,6 +6238,12 @@ impl SandboxProvider for KubernetesApplyProvider {
                 wait.status,
                 wait.stderr
             );
+        }
+        // A fork inherits the parent's execution class, so the child Pod owes
+        // the same live boundary evidence a provisioned one does.
+        if let Err(error) = self.verify_pod_runtime_class(child_sandbox_id, spec, cancelled) {
+            self.rollback_applied_resources(child_sandbox_id, "fork (verify pod RuntimeClass)");
+            return Err(error);
         }
         let mut handle = self.dry_run.fork(
             parent_sandbox_id,

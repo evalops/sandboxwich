@@ -199,10 +199,10 @@ that class based only on registration or rendered manifests.
 
 A dry-run worker never advertises `virtual_machine` at all, and on the apply
 path the provider re-reads the admitted Pod's `spec.runtimeClassName` from the
-API server before any guest work runs -- both when it provisions the Pod and
-when it reuses an existing one. A mismatch (including a webhook that stripped
-the field) is a terminal `runtime_class_boundary_unverified` failure and the
-sandbox's resources are torn down.
+API server -- when it provisions the Pod, when it forks one, and again before
+it reuses an existing Pod for a command. A mismatch (including a webhook that
+stripped the field) is a terminal `runtime_class_boundary_unverified` failure
+and the sandbox's resources are torn down.
 
 ### Kata / virtual_machine conformance
 

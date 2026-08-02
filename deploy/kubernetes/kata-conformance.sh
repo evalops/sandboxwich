@@ -102,7 +102,7 @@ kubectl -n sandboxwich create secret generic sandboxwich-secrets \
   --from-file="api-token=${TMP_DIR}/api-token"
 kubectl -n sandboxwich create deployment postgres --image="${POSTGRES_IMAGE}" --dry-run=client -o yaml | \
   kubectl set env --local -f - POSTGRES_DB=sandboxwich POSTGRES_USER=postgres \
-    POSTGRES_PASSWORD=postgres -o yaml | kubectl apply -f -
+    POSTGRES_PASSWORD=postgres -o yaml | kubectl -n sandboxwich apply -f -
 kubectl -n sandboxwich expose deployment postgres --port=5432
 kubectl -n sandboxwich rollout status deployment/postgres --timeout=180s
 
@@ -119,8 +119,8 @@ sed \
 sed \
   -e "s#ghcr.io/evalops/sandboxwich-worker@sha256:[0-9a-f]\{64\}#${WORKER_IMAGE}#g" \
   -e "s#ghcr.io/evalops/sandboxwich-ubuntu-dev@sha256:[a-f0-9]\{64\}#${RUNTIME_IMAGE}#g" \
-  -e "s/value: k3s-dev/value: ${CLUSTER_NAME}/" \
-  -e "s/value: local-path/value: ${STORAGE_CLASS}/" \
+  -e "s#value: k3s-dev#value: ${CLUSTER_NAME}#" \
+  -e "s#value: local-path#value: ${STORAGE_CLASS}#" \
   "${ROOT_DIR}/deploy/kubernetes/worker.yaml" >"${TMP_DIR}/worker.yaml"
 sed -i "/name: SANDBOXWICH_EGRESS_GATEWAY_IMAGE/{n;s#value: .*#value: ${GATEWAY_IMAGE}#;}" \
   "${TMP_DIR}/worker.yaml"
@@ -128,10 +128,17 @@ sed -i "/name: SANDBOXWICH_RUNTIME_CLASS_NAME/{n;s#value: .*#value: ${RUNTIME_CL
   "${TMP_DIR}/worker.yaml"
 sed -i "/name: SANDBOXWICH_ISOLATION_PROFILE/{n;s#value: .*#value: kata#;}" \
   "${TMP_DIR}/worker.yaml"
-grep -Fq "value: ${RUNTIME_CLASS}" "${TMP_DIR}/worker.yaml" || \
-  fail "worker manifest missing RuntimeClass value ${RUNTIME_CLASS}"
-grep -Fq "value: kata" "${TMP_DIR}/worker.yaml" || \
-  fail "worker manifest missing the kata isolation profile"
+# Anchored on the preceding `name:` line: a bare `value: kata` also matches the
+# RuntimeClass line (`value: kata-qemu`) and so would not prove the isolation
+# profile was substituted.
+assert_env_value() {
+  local variable="$1" expected="$2"
+  grep -A1 -F "name: ${variable}" "${TMP_DIR}/worker.yaml" |
+    grep -Eq "^[[:space:]]*value: ${expected}\$" ||
+    fail "worker manifest does not set ${variable} to ${expected}"
+}
+assert_env_value SANDBOXWICH_RUNTIME_CLASS_NAME "${RUNTIME_CLASS}"
+assert_env_value SANDBOXWICH_ISOLATION_PROFILE kata
 
 kubectl apply -f "${TMP_DIR}/api-migrate.yaml"
 kubectl -n sandboxwich wait --for=condition=complete -f "${TMP_DIR}/api-migrate.yaml" --timeout=180s

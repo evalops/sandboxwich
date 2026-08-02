@@ -1780,6 +1780,38 @@ fn virtual_machine_provision_succeeds_when_the_live_pod_carries_the_runtime_clas
 }
 
 #[test]
+fn virtual_machine_fork_fails_closed_when_the_child_pod_lost_its_runtime_class() {
+    // A fork inherits the parent's execution class, so a child whose
+    // RuntimeClass was stripped would present an ordinary container as a VM.
+    let (kubectl, log_path) = write_runtime_class_fake_kubectl("", false);
+    let provider = kata_apply_provider(&kubectl);
+    let spec = virtual_machine_spec();
+
+    let error = provider
+        .fork(
+            SandboxId::new(),
+            SandboxId::new(),
+            SnapshotId::new(),
+            &spec,
+            &CancelSignal::never_cancelled(),
+        )
+        .expect_err("a forked pod outside the VM boundary must not be reported ready");
+    assert_eq!(
+        error
+            .downcast_ref::<ProviderError>()
+            .expect("boundary failures are typed provider errors")
+            .reason_code(),
+        "runtime_class_boundary_unverified"
+    );
+    let invocations = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(!invocations.contains(" exec "), "{invocations}");
+    assert!(
+        invocations.contains(" delete "),
+        "the rejected fork's resources must be torn down: {invocations}"
+    );
+}
+
+#[test]
 fn development_container_provision_does_not_read_the_pod_runtime_class() {
     let (kubectl, log_path) = write_runtime_class_fake_kubectl("", false);
     let provider = apply_provider_with_fake_kubectl(&kubectl);

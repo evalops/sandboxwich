@@ -110,9 +110,13 @@ starts no guest, so it cannot supply a VM boundary. Only an apply-mode worker
 with the `kata` profile and a nonempty RuntimeClass does. On the apply path the
 provider additionally reads the admitted Pod's `spec.runtimeClassName` from the
 API server and fails closed (terminal, `runtime_class_boundary_unverified`)
-unless it matches the configured RuntimeClass, before any guest work runs and
-again before an existing Pod is reused. A rendered manifest is not evidence: a
-mutating webhook can strip the field.
+unless it matches the configured RuntimeClass. That read happens before a
+provisioned or forked sandbox is reported ready and again before an existing
+Pod is reused for a command, so no command lease runs against an unverified
+boundary. `materialize_file` and the APEX instruction read still exec into an
+already-verified Pod without repeating the read; they carry no execution class,
+so closing that would mean caching the verified boundary per sandbox. A
+rendered manifest is not evidence: a mutating webhook can strip the field.
 
 ### SW-3: what remains before `virtual_machine` can be certified
 
