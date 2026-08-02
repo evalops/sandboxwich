@@ -27,9 +27,10 @@
 //!   tenant, sandbox, generation, and digest, so a row cannot be replayed
 //!   under a different identity, and the plaintext digest is re-verified
 //!   after opening.
-//! - A row sealed under a different key id, an expired row, or a row that
-//!   fails to open is treated as absent, which surfaces as the existing
-//!   `resident_bootstrap_unavailable` response.
+//! - A row sealed under a different key id, an expired row, a structurally
+//!   malformed row, or a row that fails to open is treated as absent, which
+//!   surfaces as the existing `resident_bootstrap_unavailable` response. Only
+//!   a database failure is an error.
 
 use crate::db::Database;
 use crate::state::LiveResidentBootstrap;
@@ -144,32 +145,38 @@ impl SharedBootstrapHandoff {
         let row_sandbox_id: String = row.try_get("sandbox_id")?;
         let key_id: String = row.try_get("key_id")?;
         let expires_at: String = row.try_get("expires_at")?;
-        let expires_at = DateTime::parse_from_rfc3339(&expires_at)
-            .map_err(|_| HandoffError::Corrupt)?
-            .with_timezone(&Utc);
-        if row_sandbox_id != sandbox_id.to_string() || key_id != self.key_id || expires_at <= now {
+        let Ok(expires_at) = DateTime::parse_from_rfc3339(&expires_at) else {
+            return Ok(unreadable("expires_at is not an RFC 3339 timestamp"));
+        };
+        if row_sandbox_id != sandbox_id.to_string()
+            || key_id != self.key_id
+            || expires_at.with_timezone(&Utc) <= now
+        {
             return Ok(None);
         }
         let generation: i64 = row.try_get("generation")?;
         let byte_count: i64 = row.try_get("byte_count")?;
         let mode: i64 = row.try_get("mode")?;
+        let (Ok(mode), Ok(generation)) = (u32::try_from(mode), u64::try_from(generation)) else {
+            return Ok(unreadable("mode or generation is out of range"));
+        };
         let bootstrap_shell = LiveResidentBootstrap {
             tenant_id: row.try_get("tenant_id")?,
             content: Vec::new(),
             sha256: row.try_get("sha256")?,
             target_file: row.try_get("target_file")?,
-            mode: u32::try_from(mode).map_err(|_| HandoffError::Corrupt)?,
-            generation: u64::try_from(generation).map_err(|_| HandoffError::Corrupt)?,
+            mode,
+            generation,
         };
-        let nonce_bytes = BASE64
-            .decode(row.try_get::<String, _>("nonce")?)
-            .map_err(|_| HandoffError::Corrupt)?;
+        let Ok(nonce_bytes) = BASE64.decode(row.try_get::<String, _>("nonce")?) else {
+            return Ok(unreadable("nonce is not base64"));
+        };
         if nonce_bytes.len() != 24 {
-            return Err(HandoffError::Corrupt);
+            return Ok(unreadable("nonce is not 24 bytes"));
         }
-        let ciphertext = BASE64
-            .decode(row.try_get::<String, _>("ciphertext")?)
-            .map_err(|_| HandoffError::Corrupt)?;
+        let Ok(ciphertext) = BASE64.decode(row.try_get::<String, _>("ciphertext")?) else {
+            return Ok(unreadable("ciphertext is not base64"));
+        };
         let Ok(content) = self.cipher.decrypt(
             XNonce::from_slice(&nonce_bytes),
             Payload {
@@ -226,6 +233,14 @@ pub(crate) async fn expire_due_bootstrap_handoffs(db: &Database) -> Result<u64, 
     Ok(deleted.rows_affected())
 }
 
+/// A structurally broken row is an absent row, matching the treatment of a
+/// row this process cannot open: the read surfaces as
+/// `resident_bootstrap_unavailable` rather than an opaque server error.
+fn unreadable(reason: &str) -> Option<LiveResidentBootstrap> {
+    tracing::warn!(reason, "ignoring unreadable resident bootstrap handoff row");
+    None
+}
+
 /// Binds a sealed row to exactly one resident identity: rekeying any of
 /// these fields makes the ciphertext unopenable rather than replayable.
 fn associated_data(
@@ -258,7 +273,6 @@ fn key_id(key: &[u8; BOOTSTRAP_HANDOFF_KEY_BYTES]) -> String {
 pub(crate) enum HandoffError {
     Database(sqlx::Error),
     Seal,
-    Corrupt,
 }
 
 impl std::fmt::Display for HandoffError {
@@ -266,7 +280,6 @@ impl std::fmt::Display for HandoffError {
         match self {
             Self::Database(error) => write!(formatter, "bootstrap handoff database error: {error}"),
             Self::Seal => write!(formatter, "bootstrap handoff could not be sealed"),
-            Self::Corrupt => write!(formatter, "bootstrap handoff row is malformed"),
         }
     }
 }

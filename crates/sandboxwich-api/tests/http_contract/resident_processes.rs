@@ -3653,3 +3653,93 @@ async fn shared_bootstrap_handoff_rejects_a_replica_with_another_key() {
             .unwrap();
     assert_eq!(bootstrap.content, b"handoff-rotation-secret");
 }
+
+/// A terminal observation destroys the one-read bootstrap. The shared tier
+/// must never outlive the process-local copy, or a restart would resurrect a
+/// secret that was deliberately reclaimed.
+#[tokio::test]
+async fn terminal_observation_reclaims_the_shared_bootstrap_handoff() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_with_shared_bootstrap_handoff(
+        format!(
+            "sqlite://{}",
+            data_dir
+                .path()
+                .join("resident-bootstrap-handoff-reclaim.db")
+                .display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let (sandbox_id, worker, guest_client) =
+        provisioned_sandbox_with_guest(&server, "bootstrap-handoff-reclaim", false).await;
+    let created: ResidentProcessResponse = server
+        .client()
+        .put(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/orb-executor",
+            server.base_url
+        ))
+        .json(&resident_process_request(
+            "/usr/local/bin/orb-executor",
+            b"handoff-reclaim-secret",
+            "/run/sandboxwich/bootstrap/orb-token",
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let process_id = created.resident_process.id;
+    let lease = claim_resident_process_lease(&server, &worker, &guest_client, sandbox_id).await;
+    let request = ResidentProcessBootstrapReadRequest {
+        generation: created.resident_process.generation,
+        lease_id: lease.id.0,
+        expected_sha256: created.resident_process.bootstrap_sha256.clone().unwrap(),
+    };
+    assert_eq!(
+        shared_bootstrap_handoff_rows(&server, process_id)
+            .await
+            .len(),
+        1
+    );
+
+    guest_client
+        .post(format!(
+            "{}/resident-processes/{process_id}/observations",
+            server.base_url
+        ))
+        .json(&ResidentProcessObservationRequest {
+            generation: request.generation,
+            lease_id: request.lease_id,
+            observed_state: ResidentProcessObservedState::Failed,
+            pid: None,
+            exit_code: Some(1),
+            error_code: None,
+            error_message: None,
+            provider_pod_name: None,
+            provider_pod_uid: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    assert!(
+        shared_bootstrap_handoff_rows(&server, process_id)
+            .await
+            .is_empty(),
+        "a terminal observation must drop the shared copy with the local one"
+    );
+    server.restart(true).await;
+    assert_eq!(
+        read_resident_bootstrap(&server.base_url, &guest_client, process_id, &request)
+            .await
+            .status(),
+        reqwest::StatusCode::GONE,
+        "a reclaimed bootstrap must not come back after a restart"
+    );
+}

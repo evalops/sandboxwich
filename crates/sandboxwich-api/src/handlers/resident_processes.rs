@@ -1469,6 +1469,10 @@ pub(crate) async fn observe_resident_process(
                 sha256,
                 Some(&fence),
             );
+            state
+                .resident_bootstraps
+                .forget_shared(&state.db, process_id)
+                .await;
         }
         let ack_sql = format!(
             "select bootstrap_acknowledged_at from resident_processes where id = {}",
