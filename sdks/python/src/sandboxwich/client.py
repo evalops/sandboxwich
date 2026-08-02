@@ -244,18 +244,26 @@ class SandboxwichClient:
         return SandboxResponse.model_validate(response.json())
 
     def resume_sandbox(
-        self, sandbox_id: uuid.UUID | str, *, idempotency_key: str | None = None
+        self,
+        sandbox_id: uuid.UUID | str,
+        *,
+        snapshot_id: uuid.UUID | str | None = None,
+        idempotency_key: str | None = None,
     ) -> SandboxResponse:
-        """`POST /v1/sandboxes/{id}/resume`.
+        """`POST /v1/sandboxes/{id}/resume`. Returns HTTP 202.
 
-        Included for CLI parity, but per docs/capabilities.md ("True resume
-        after teardown": Unsupported) the API currently always returns a
-        typed `501 unsupported` (raised here as `UnsupportedError`) -- stop
-        destroys resources, so create or fork a replacement instead.
+        Restores an *archived* sandbox in place from one of its own ready
+        snapshots (the most recent one unless `snapshot_id` says otherwise),
+        keeping its id, creation time, and lifetime configuration. The sandbox
+        moves to `Provisioning` immediately and `Ready` once a worker has
+        restored the workspace. Fails closed with a typed `409`
+        (`ConflictError`) when the sandbox is not archived or has no matching
+        restorable snapshot; see docs/capabilities.md.
         """
         response = self._request(
             "POST",
             f"/v1/sandboxes/{sandbox_id}/resume",
+            json_body={"snapshot_id": str(snapshot_id) if snapshot_id else None},
             mutating=True,
             idempotency_key=idempotency_key,
         )

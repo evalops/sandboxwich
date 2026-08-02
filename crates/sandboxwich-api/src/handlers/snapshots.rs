@@ -240,6 +240,114 @@ pub(crate) async fn fork_snapshot(
     ))
 }
 
+/// The snapshot a resume will restore from, once it has been proven to
+/// belong to the sandbox being resumed and to describe that sandbox's exact
+/// placement.
+#[derive(Debug)]
+pub(crate) struct SandboxResumeSource {
+    pub(crate) snapshot_id: SnapshotId,
+}
+
+/// Resolves and validates the snapshot a `POST /sandboxes/{id}/resume` will
+/// restore, either the explicitly requested one or the sandbox's most
+/// recently created restorable snapshot.
+///
+/// Fails closed in every ambiguous case: a snapshot that belongs to another
+/// sandbox, a snapshot whose recorded placement no longer matches the
+/// sandbox's own, and a sandbox with no restorable snapshot at all are all
+/// refused rather than resumed onto an empty or foreign workspace.
+pub(crate) async fn claim_sandbox_resume_snapshot_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    sandbox: &Sandbox,
+    requested: Option<SnapshotId>,
+    ctx: &TenantContext,
+    now: DateTime<Utc>,
+) -> Result<SandboxResumeSource, ApiError> {
+    let snapshot_id = match requested {
+        Some(snapshot_id) => snapshot_id,
+        None => latest_restorable_snapshot_on_connection(db, connection, sandbox.id, ctx, now)
+            .await?
+            .ok_or_else(|| {
+                ApiError::conflict_code(
+                    "resume_snapshot_unavailable",
+                    format!(
+                        "cannot resume sandbox {}: it has no restorable snapshot; a stopped \
+                         sandbox can only be resumed from a snapshot taken while it was running",
+                        sandbox.id
+                    ),
+                )
+            })?,
+    };
+    let source =
+        claim_snapshot_restore_source_on_connection(db, connection, snapshot_id, ctx, now).await?;
+    if source.source_sandbox_id != sandbox.id {
+        return Err(ApiError::conflict_code(
+            "resume_snapshot_foreign",
+            format!(
+                "snapshot {snapshot_id} was taken from sandbox {}, not {}; restore it into a \
+                 new sandbox with POST /v1/snapshots/{snapshot_id}/fork instead",
+                source.source_sandbox_id, sandbox.id
+            ),
+        ));
+    }
+    if source.runtime_image != sandbox.template
+        || source.provision_spec.memory_limit != sandbox.memory_limit
+        || source.provision_spec.network_egress != sandbox.network_egress
+        || source.provision_spec.workspace_mode != sandbox.workspace_mode
+        || source.provision_spec.runtime_profile != sandbox.runtime_profile
+        || source.execution_class != sandbox.execution_class
+    {
+        return Err(ApiError::conflict_code(
+            "resume_placement_mismatch",
+            format!(
+                "snapshot {snapshot_id} records a different placement than sandbox {}; \
+                 restore it into a new sandbox instead",
+                sandbox.id
+            ),
+        ));
+    }
+    Ok(SandboxResumeSource { snapshot_id })
+}
+
+/// Most recently created snapshot of `sandbox_id` that is still restorable.
+/// Ordering is by creation time, with the snapshot id as a deterministic
+/// tiebreak so two snapshots created in the same clock tick never resolve
+/// arbitrarily.
+async fn latest_restorable_snapshot_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    sandbox_id: SandboxId,
+    ctx: &TenantContext,
+    now: DateTime<Utc>,
+) -> Result<Option<SnapshotId>, ApiError> {
+    let sql = format!(
+        "select snapshots.id
+           from snapshot_restore_sources
+           join snapshots on snapshots.id = snapshot_restore_sources.snapshot_id
+          where snapshot_restore_sources.source_sandbox_id = {}
+            and snapshot_restore_sources.tenant_id = {}
+            and snapshot_restore_sources.status = 'ready'
+            and (snapshot_restore_sources.expires_at is null or snapshot_restore_sources.expires_at > {})
+          order by snapshots.created_at desc, snapshots.id desc
+          limit 1",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3)
+    );
+    let Some(row) = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .bind(&ctx.tenant_id)
+        .bind(now.to_rfc3339())
+        .fetch_optional(&mut *connection)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let snapshot_id: String = row.try_get("id")?;
+    Ok(Some(SnapshotId(parse_uuid(&snapshot_id)?)))
+}
+
 #[derive(Debug)]
 pub(crate) struct SnapshotRestoreSource {
     pub(crate) source_sandbox_id: SandboxId,

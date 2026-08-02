@@ -105,20 +105,23 @@ def test_429_maps_to_rate_limited_error_with_retry_after(client):
 
 
 @respx.mock
-def test_501_resume_sandbox_maps_to_unsupported_error(client):
+def test_409_resume_without_a_restorable_snapshot_maps_to_conflict_error(client):
     sandbox_id = uuid4()
     respx.post(f"{BASE_URL}/v1/sandboxes/{sandbox_id}/resume").mock(
         return_value=httpx.Response(
-            501,
-            json=_error_body("unsupported", f"resume is not supported for sandbox {sandbox_id}"),
+            409,
+            json=_error_body(
+                "resume_snapshot_unavailable",
+                f"cannot resume sandbox {sandbox_id}: no restorable snapshot",
+            ),
         )
     )
 
-    with pytest.raises(UnsupportedError) as excinfo:
+    with pytest.raises(ConflictError) as excinfo:
         client.resume_sandbox(sandbox_id)
 
-    assert excinfo.value.status_code == 501
-    assert excinfo.value.code == "unsupported"
+    assert excinfo.value.status_code == 409
+    assert excinfo.value.code == "resume_snapshot_unavailable"
 
 
 @respx.mock
