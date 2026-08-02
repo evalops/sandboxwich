@@ -14,7 +14,7 @@ use crate::util::*;
 use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sandboxwich_core::*;
 use serde_json::json;
 use sqlx::AnyConnection;
@@ -713,34 +713,7 @@ pub(crate) async fn resume_sandbox(
     let mut tx = state.db.pool.begin().await?;
     let mut sandbox =
         ensure_sandbox_tenant_on_connection(&state.db, &mut tx, sandbox_id, &ctx.tenant_id).await?;
-    // Checked before anything else so a caller resuming a live sandbox is told
-    // that, rather than getting a snapshot-shaped error from the claim below.
-    // The CAS further down is still the authority; this is just the honest
-    // error for the non-racing case.
-    if !SandboxState::RESUME_LEGAL_FROM.contains(&sandbox.state) {
-        return Err(sandbox_not_resumable(sandbox_id, &sandbox.state));
-    }
-    if sandbox.workspace_mode != WorkspaceMode::Persistent {
-        return Err(ApiError::conflict_code(
-            "workspace_mode_resume_unsupported",
-            "resume requires workspace_mode=persistent",
-        ));
-    }
-    if let Some(max_lifetime_seconds) = sandbox.max_lifetime_seconds
-        && let Some(deadline) =
-            crate::reap::max_lifetime_expired(sandbox.created_at, max_lifetime_seconds, now)
-    {
-        // Resuming keeps the original creation time, so a sandbox already past
-        // its hard cap would be reaped again by the next sweep. Refuse instead
-        // of restoring a sandbox that cannot legally run.
-        return Err(ApiError::conflict_code(
-            "resume_lifetime_exhausted",
-            format!(
-                "cannot resume sandbox {sandbox_id}: its max_lifetime_seconds deadline \
-                 ({deadline}) has passed; restore the snapshot into a new sandbox instead"
-            ),
-        ));
-    }
+    ensure_sandbox_resumable(&sandbox, now)?;
     let restore = claim_sandbox_resume_snapshot_on_connection(
         &state.db,
         &mut tx,
@@ -816,6 +789,47 @@ pub(crate) async fn resume_sandbox(
             placement: None,
         }),
     ))
+}
+
+/// Every precondition a resume has beyond owning the sandbox, checked before
+/// the snapshot is claimed so a caller resuming a live sandbox is told that
+/// rather than getting a snapshot-shaped error.
+///
+/// Shared with the `/v1/jobs` path: a directly created `ResumeSandbox` job
+/// reaches the same worker code, and running a restore against a *live*
+/// sandbox would have the provider apply a cloned-volume PVC over the bound
+/// one, fail, and roll back -- deleting the running sandbox's workspace. The
+/// state CAS in `resume_sandbox` remains the authority for the racing case.
+pub(crate) fn ensure_sandbox_resumable(
+    sandbox: &Sandbox,
+    now: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    if !SandboxState::RESUME_LEGAL_FROM.contains(&sandbox.state) {
+        return Err(sandbox_not_resumable(sandbox.id, &sandbox.state));
+    }
+    if sandbox.workspace_mode != WorkspaceMode::Persistent {
+        return Err(ApiError::conflict_code(
+            "workspace_mode_resume_unsupported",
+            "resume requires workspace_mode=persistent",
+        ));
+    }
+    if let Some(max_lifetime_seconds) = sandbox.max_lifetime_seconds
+        && let Some(deadline) =
+            crate::reap::max_lifetime_expired(sandbox.created_at, max_lifetime_seconds, now)
+    {
+        // Resuming keeps the original creation time, so a sandbox already past
+        // its hard cap would be reaped again by the next sweep. Refuse instead
+        // of restoring a sandbox that cannot legally run.
+        return Err(ApiError::conflict_code(
+            "resume_lifetime_exhausted",
+            format!(
+                "cannot resume sandbox {}: its max_lifetime_seconds deadline \
+                 ({deadline}) has passed; restore the snapshot into a new sandbox instead",
+                sandbox.id
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn sandbox_not_resumable(sandbox_id: SandboxId, actual: &SandboxState) -> ApiError {

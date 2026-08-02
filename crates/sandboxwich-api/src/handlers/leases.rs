@@ -2321,6 +2321,10 @@ pub(crate) async fn apply_completed_job_on_connection(
                 db,
                 connection,
                 sandbox_id,
+                // Runtime generation only: the sandbox's own snapshots are
+                // still restorable (and are what this resume just read from),
+                // so their `volume_snapshot` resources must survive.
+                RuntimeResourceGeneration::RuntimeOnly,
                 Utc::now(),
                 "superseded by snapshot-backed resume",
             )

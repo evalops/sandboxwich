@@ -264,6 +264,12 @@ pub(crate) async fn validate_job_payload_tenant(
             // is cloned from, so a directly-created resume job goes through the
             // same tenant/ownership/placement claim the resume route uses.
             let sandbox = ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
+            let now = Utc::now();
+            // The same preconditions the resume route enforces. Without them a
+            // tenant could queue a restore against its own *running* sandbox,
+            // and the provider's failed apply would roll back (delete) that
+            // sandbox's live Pod and workspace volume.
+            ensure_sandbox_resumable(&sandbox, now)?;
             let mut connection = db.pool.acquire().await?;
             claim_sandbox_resume_snapshot_on_connection(
                 db,
@@ -271,7 +277,7 @@ pub(crate) async fn validate_job_payload_tenant(
                 &sandbox,
                 Some(snapshot_id_from_job(job)?),
                 ctx,
-                Utc::now(),
+                now,
             )
             .await?;
         }

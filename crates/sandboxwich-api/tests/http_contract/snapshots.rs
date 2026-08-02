@@ -1776,6 +1776,19 @@ pub(crate) async fn assert_snapshot_backed_resume_lifecycle(
             && resource.source_snapshot_id == Some(restorable.id)
             && resource.status == RuntimeResourceStatus::Ready
     }));
+    // Retiring the torn-down runtime generation must not touch the sandbox's
+    // snapshots: the snapshot this resume read from is still restorable, and
+    // its own cleanup is driven by snapshot expiry, not by the runtime.
+    assert!(
+        resources.resources.iter().any(|resource| {
+            resource.resource_kind == RuntimeResourceKind::VolumeSnapshot
+                && resource.snapshot_id == Some(restorable.id)
+                && resource.status != RuntimeResourceStatus::Destroyed
+                && resource.status != RuntimeResourceStatus::Deleted
+        }),
+        "a resume must leave the snapshot it restored from alive: {:?}",
+        resources.resources
+    );
 
     let events: EventListResponse = client
         .get(format!(
@@ -1938,6 +1951,29 @@ async fn resume_fails_closed_without_a_restorable_snapshot_and_rewinds_on_failur
         .await
         .unwrap();
     assert_eq!(still_archived.sandbox.state, SandboxState::Archived);
+
+    // The `/v1/jobs` path reaches the same worker code, so it enforces the same
+    // preconditions: a resume job against a *live* sandbox would have the
+    // provider apply a cloned-volume PVC over the bound one, fail, and roll
+    // back -- deleting the running sandbox's workspace.
+    let injected = client
+        .post(format!("{}/jobs", server.base_url))
+        .json(&serde_json::json!({
+            "kind": "resume_sandbox",
+            "payload": {
+                "sandboxId": other.sandbox.id,
+                "snapshotId": other_snapshot,
+                "runtimeImage": other.sandbox.template,
+                "provisionSpec": {"workspace_mode": "persistent"}
+            },
+            "required_capability": "k8s_pod"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(injected.status(), StatusCode::CONFLICT);
+    let injected: ErrorEnvelope = injected.json().await.unwrap();
+    assert_eq!(injected.code, "sandbox_not_resumable");
 
     // A resume whose provider work fails permanently rewinds to `Archived`
     // rather than parking the sandbox in `Error`: no resources were created,
