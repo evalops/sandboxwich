@@ -34,6 +34,7 @@ use sandboxwich_core::{
     RuntimeResourceKind, RuntimeResourcePurpose, RuntimeResourceStatus, SANDBOX_WORKSPACE_GID,
     SandboxId, SandboxProvisionSpec, SandboxRuntimeProfile, SecretBackend, SecretDelivery,
     SnapshotId, WorkerCapability, WorkspaceMode, secret_mount_dir, validate_agent_command_request,
+    validate_secret_ref_name,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -644,6 +645,14 @@ impl KubernetesDryRunProvider {
             match mount.source.backend {
                 SecretBackend::CsiSecretProviderClass => {}
             }
+            // The name is re-validated, not just used: recomputing the
+            // expected directory from an unchecked name would put the
+            // attacker's value on both sides of the comparison.
+            anyhow::ensure!(
+                validate_secret_ref_name(&mount.name).is_ok(),
+                "secret delivery name {} is not a valid reference name",
+                mount.name
+            );
             let expected_dir = secret_mount_dir(&mount.name);
             anyhow::ensure!(
                 mount.mount_dir == expected_dir

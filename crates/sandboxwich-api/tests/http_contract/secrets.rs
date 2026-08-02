@@ -445,6 +445,23 @@ async fn run_secret_binding_contract(server: TestServer) {
         );
     }
 
+    // A fork never inherits a binding, and asking for one is refused rather
+    // than dropped: a caller must not end up believing a fork holds a
+    // credential it does not have.
+    assert_eq!(
+        client
+            .post(format!(
+                "{}/sandboxes/{}/fork",
+                server.base_url, created.sandbox.id
+            ))
+            .json(&create_sandbox_request(vec![bound.id]))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+
     // A revoked reference can never come back through a binding.
     client
         .delete(format!("{}/secret-refs/{}", server.base_url, bound.id))

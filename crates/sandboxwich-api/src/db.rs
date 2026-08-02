@@ -568,6 +568,20 @@ pub(crate) const DB_ENUM_COLUMNS: &[DbEnumColumn] = &[
         <SecretRefState as DbVariant>::VALUES,
         "invalid secret reference state",
     ),
+    DbEnumColumn::new(
+        "sandbox_secret_bindings",
+        "backend",
+        "sandbox_secret_bindings_backend_check",
+        <SecretBackend as DbVariant>::VALUES,
+        "invalid secret binding backend",
+    ),
+    DbEnumColumn::new(
+        "sandbox_secret_bindings",
+        "delivery",
+        "sandbox_secret_bindings_delivery_check",
+        <SecretDelivery as DbVariant>::VALUES,
+        "invalid secret binding delivery mode",
+    ),
 ];
 
 pub(crate) fn db_enum_columns() -> &'static [DbEnumColumn] {

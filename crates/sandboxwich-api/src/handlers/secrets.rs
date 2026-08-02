@@ -294,6 +294,10 @@ pub(crate) async fn resolve_secret_mounts(
         }
         mounts.push(SandboxSecretMount::from_ref(&secret_ref));
     }
+    // Sorted by name, matching how the bindings are read back, so the spec a
+    // later job re-derives is identical to the one the Pod came up with
+    // regardless of the order the caller listed its ids in.
+    mounts.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(mounts)
 }
 

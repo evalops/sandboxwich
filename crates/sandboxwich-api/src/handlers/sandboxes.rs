@@ -723,7 +723,7 @@ pub(crate) async fn fork_sandbox(
     // inherited, and asking for them here is rejected rather than silently
     // dropped so a caller never believes a forked sandbox holds credentials.
     if !request.secret_ref_ids.is_empty() {
-        return Err(ApiError::unsupported(
+        return Err(ApiError::bad_request(
             "secret references cannot be bound on fork; create a sandbox instead",
         ));
     }

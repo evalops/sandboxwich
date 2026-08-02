@@ -3326,7 +3326,14 @@ pub const SANDBOX_SECRET_MOUNT_PREFIX: &str = "/run/sandboxwich/secrets";
 /// single sandbox cannot render an unbounded Pod volume list.
 pub const MAX_SANDBOX_SECRET_BINDINGS: usize = 16;
 
-pub const MAX_SECRET_REF_NAME_LEN: usize = 64;
+/// Bounded by what the name has to fit into downstream, not by storage: the
+/// name becomes a Pod volume name under [`SANDBOX_SECRET_VOLUME_PREFIX`], and
+/// a volume name is a DNS-1123 label (63 characters). A longer name would be
+/// accepted at create and then rejected by the API server at apply time.
+pub const MAX_SECRET_REF_NAME_LEN: usize = 63 - SANDBOX_SECRET_VOLUME_PREFIX.len();
+
+/// Prefix keeping a delivery volume from colliding with the worker's own.
+pub const SANDBOX_SECRET_VOLUME_PREFIX: &str = "sandboxwich-secret-";
 pub const MAX_SECRET_SCOPE_ID_LEN: usize = 128;
 pub const MAX_SECRET_SOURCE_OBJECT_NAME_LEN: usize = 253;
 pub const MAX_SECRET_SOURCE_OBJECT_KEY_LEN: usize = 253;
@@ -3631,11 +3638,11 @@ impl SandboxSecretMount {
         }
     }
 
-    /// Pod volume name for this delivery. Safe to derive from the name: names
-    /// are DNS-label-like, and the prefix keeps them from colliding with the
-    /// worker's own volumes.
+    /// Pod volume name for this delivery. A valid DNS-1123 label for every
+    /// name the reference validator accepts: names are label-like, and
+    /// [`MAX_SECRET_REF_NAME_LEN`] leaves room for the prefix.
     pub fn volume_name(&self) -> String {
-        format!("sandboxwich-secret-{}", self.name)
+        format!("{SANDBOX_SECRET_VOLUME_PREFIX}{}", self.name)
     }
 }
 
@@ -4371,7 +4378,12 @@ mod tests {
 
     #[test]
     fn secret_ref_names_are_validated_before_becoming_paths_or_env_variables() {
-        for name in ["openai-api-key", "k", "a1", "x".repeat(64).as_str()] {
+        for name in [
+            "openai-api-key",
+            "k",
+            "a1",
+            "x".repeat(MAX_SECRET_REF_NAME_LEN).as_str(),
+        ] {
             assert!(validate_secret_ref_name(name).is_ok(), "{name} should pass");
         }
         for name in [
@@ -4383,7 +4395,7 @@ mod tests {
             "../escape",
             "with/slash",
             "with_underscore",
-            "x".repeat(65).as_str(),
+            "x".repeat(MAX_SECRET_REF_NAME_LEN + 1).as_str(),
         ] {
             assert_eq!(
                 validate_secret_ref_name(name),
@@ -4428,6 +4440,31 @@ mod tests {
             mount.file_path.starts_with(SANDBOX_SECRET_MOUNT_PREFIX),
             "delivery must stay under the read-only secret prefix"
         );
+    }
+
+    /// The longest name the validator accepts must still render a Pod volume
+    /// name Kubernetes will take; otherwise a create succeeds and the Pod is
+    /// rejected at apply time, long after the caller got its 202.
+    #[test]
+    fn longest_accepted_secret_name_renders_a_valid_dns_label_volume_name() {
+        let now = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        let name = "a".repeat(MAX_SECRET_REF_NAME_LEN);
+        assert!(validate_secret_ref_name(&name).is_ok());
+        assert!(validate_secret_ref_name(&"a".repeat(MAX_SECRET_REF_NAME_LEN + 1)).is_err());
+        let volume_name = SandboxSecretMount::from_ref(&SecretRef {
+            id: SecretRefId::new(),
+            tenant_id: "acme".into(),
+            workspace_id: "ws-1".into(),
+            name,
+            source: secret_source(),
+            delivery: SecretDelivery::File,
+            state: SecretRefState::Active,
+            created_at: now,
+            updated_at: now,
+            revoked_at: None,
+        })
+        .volume_name();
+        assert!(is_dns_label_like(&volume_name, 63, &['-']), "{volume_name}");
     }
 
     #[test]
