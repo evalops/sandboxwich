@@ -18,6 +18,7 @@ async fn provisioned_sandbox_with_guest(
     let created: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             name: Some(name.into()),
             template: Some("ubuntu-dev".into()),
             memory_limit: None,
@@ -273,6 +274,7 @@ async fn maestro_hosted_runner_rejects_ephemeral_workspace_before_dispatch() {
     let sandbox: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             name: Some("maestro-ephemeral".into()),
             template: Some("ubuntu-dev".into()),
             memory_limit: None,
@@ -673,6 +675,7 @@ pub(crate) async fn resident_process_create_is_idempotent_tenant_scoped_and_reda
     let created: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             name: Some("resident-process".into()),
             template: Some("ubuntu-dev".into()),
             memory_limit: None,

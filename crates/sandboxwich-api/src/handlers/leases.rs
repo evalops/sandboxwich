@@ -247,6 +247,9 @@ pub(crate) async fn claim_lease(
         if !worker_supports_execution_class(&worker, &job.required_execution_class) {
             continue;
         }
+        if !worker_supports_secret_delivery(&worker, &job) {
+            continue;
+        }
         // Defense in depth: re-check the caller's sandbox/kind filters (if any) against
         // the typed job for the same reason as the capability check above.
         if let Some(sandbox_id) = request.sandbox_id
@@ -463,6 +466,28 @@ pub(crate) fn worker_supports_runtime_profile(worker: &Worker, job: &Job) -> boo
         .capabilities
         .contains(&WorkerCapability::ApexTrustedSupervisorV1)
         && worker.labels.get("runtime_image").map(String::as_str) == Some(requested_image)
+}
+
+/// Secret delivery depends on operator configuration on the worker, and the
+/// provider refuses to provision without it. Without this check a secret-bound
+/// sandbox in a mixed fleet can be claimed by a worker that was never set up to
+/// deliver credentials, fail, and go dead after its retries while a capable
+/// worker sat idle. Placement is negotiated the same way every other
+/// conditionally-available provider feature is.
+pub(crate) fn worker_supports_secret_delivery(worker: &Worker, job: &Job) -> bool {
+    let Some((spec, _)) = authoritative_placement(job) else {
+        // No placement spec means no secret mounts to deliver; other checks
+        // decide whether this job is claimable at all.
+        return true;
+    };
+    if spec.secret_mounts.is_empty() {
+        return true;
+    }
+    worker
+        .labels
+        .get(PROVIDER_SECRET_DELIVERY_LABEL)
+        .map(String::as_str)
+        == Some(PROVIDER_SECRET_DELIVERY_LABEL_VALUE)
 }
 
 pub(crate) async fn fetch_lease_materialization(

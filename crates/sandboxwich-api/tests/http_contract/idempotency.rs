@@ -29,6 +29,7 @@ async fn assert_idempotency_contract(server: TestServer) {
     let key = uuid::Uuid::now_v7().to_string();
     let url = format!("{}/v1/sandboxes", server.base_url);
     let request = CreateSandboxRequest {
+        secret_ref_ids: Vec::new(),
         execution_class: None,
         workspace_mode: None,
         runtime_profile: None,
@@ -73,6 +74,7 @@ async fn assert_idempotency_contract(server: TestServer) {
         .post(&url)
         .header("idempotency-key", &key)
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: None,
             runtime_profile: None,
@@ -90,6 +92,7 @@ async fn assert_idempotency_contract(server: TestServer) {
         .post(&url)
         .header("idempotency-key", &key)
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: Some(ExecutionClass::VirtualMachine),
             ..request.clone()
         })
@@ -105,6 +108,7 @@ async fn assert_idempotency_contract(server: TestServer) {
         .bearer_auth(TEST_TENANT_B_TOKEN)
         .header("idempotency-key", &key)
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: None,
             runtime_profile: None,

@@ -929,6 +929,10 @@ pub struct SandboxProvisionSpec {
     pub runtime_profile: SandboxRuntimeProfile,
     #[serde(default)]
     pub execution_class: ExecutionClass,
+    /// Resolved secret deliveries for this sandbox. Locators only; the worker
+    /// turns each one into a read-only CSI volume mount.
+    #[serde(default)]
+    pub secret_mounts: Vec<SandboxSecretMount>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1058,6 +1062,12 @@ pub struct CreateSandboxRequest {
     /// exceeds the operator-configured ceiling.
     #[serde(default)]
     pub idle_ttl_seconds: Option<u64>,
+    /// Secret references to deliver to this sandbox as read-only files. Each
+    /// id is resolved in the caller's own tenant scope at create time; an
+    /// unknown, revoked, or foreign reference fails the create rather than
+    /// producing a sandbox that silently lacks a credential.
+    #[serde(default)]
+    pub secret_ref_ids: Vec<SecretRefId>,
 }
 
 db_variant_enum! {
@@ -3416,6 +3426,345 @@ pub struct SshKeyListResponse {
     pub ssh_keys: Vec<SshKey>,
 }
 
+/// Read-only directory every delivered sandbox secret file is mounted under.
+/// The path is derived by the control plane from the reference's validated
+/// name, never supplied by a caller: a tenant-chosen destination path is a
+/// write primitive over the runtime image.
+pub const SANDBOX_SECRET_MOUNT_PREFIX: &str = "/run/sandboxwich/secrets";
+
+/// Maximum number of secret references one sandbox may bind. Bounded so a
+/// single sandbox cannot render an unbounded Pod volume list.
+pub const MAX_SANDBOX_SECRET_BINDINGS: usize = 16;
+
+/// Bounded by what the name has to fit into downstream, not by storage: the
+/// name becomes a Pod volume name under [`SANDBOX_SECRET_VOLUME_PREFIX`], and
+/// a volume name is a DNS-1123 label (63 characters). A longer name would be
+/// accepted at create and then rejected by the API server at apply time.
+pub const MAX_SECRET_REF_NAME_LEN: usize = 63 - SANDBOX_SECRET_VOLUME_PREFIX.len();
+
+/// Prefix keeping a delivery volume from colliding with the worker's own.
+pub const SANDBOX_SECRET_VOLUME_PREFIX: &str = "sandboxwich-secret-";
+
+/// Advertises that a worker is configured to deliver secret references, so a
+/// secret-bound sandbox is only placed on a worker that can actually mount it.
+/// A label rather than a new [`WorkerCapability`] value, for the same reason
+/// as the sidecar labels above: the capability enum is a closed wire enum, and
+/// a worker advertising an unknown value cannot register against an older API
+/// server during a rolling upgrade.
+pub const PROVIDER_SECRET_DELIVERY_LABEL: &str = "provider_secret_delivery";
+pub const PROVIDER_SECRET_DELIVERY_LABEL_VALUE: &str = "csi_secret_provider_class";
+pub const MAX_SECRET_SCOPE_ID_LEN: usize = 128;
+pub const MAX_SECRET_SOURCE_OBJECT_NAME_LEN: usize = 253;
+pub const MAX_SECRET_SOURCE_OBJECT_KEY_LEN: usize = 253;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(transparent)]
+pub struct SecretRefId(pub Uuid);
+
+impl SecretRefId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for SecretRefId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for SecretRefId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+db_variant_enum! {
+/// Where the secret *material* actually lives. Sandboxwich stores a
+/// reference to it and never reads, transports, or persists the bytes.
+///
+/// `csi_secret_provider_class` names a `SecretProviderClass` the operator has
+/// provisioned for the tenant. The kubelet's Secrets Store CSI driver reads
+/// the material from the external store and mounts it into the Pod's tmpfs
+/// directly, so no plaintext copy is ever created in a Kubernetes `Secret`
+/// object, in etcd, or in any sandboxwich process. The class name is
+/// tenant-supplied; its namespace never is, because a tenant-chosen namespace
+/// would be a cross-tenant read primitive.
+pub enum SecretBackend {
+    CsiSecretProviderClass => "csi_secret_provider_class",
+}
+}
+
+db_variant_enum! {
+/// How the material reaches the sandbox. `file` is the only supported mode:
+/// a read-only file mounted under [`SANDBOX_SECRET_MOUNT_PREFIX`].
+///
+/// Argv delivery is deliberately absent (visible in `/proc/*/cmdline`), and
+/// so is delivering the value in an environment variable; the guest receives
+/// only the *path* through `<NAME>_FILE`-style variables (see
+/// [`SecretRef::env_file_variable`]).
+pub enum SecretDelivery {
+    File => "file",
+}
+}
+
+db_variant_enum! {
+pub enum SecretRefState {
+    Active => "active",
+    Revoked => "revoked",
+}
+}
+
+/// Typed locator for externally held secret material. Carries no value field
+/// on purpose, in any direction: the control plane must not be able to accept
+/// raw credential bytes even by accident.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SecretSource {
+    pub backend: SecretBackend,
+    /// Name of the `SecretProviderClass` in the operator-owned secret
+    /// namespace.
+    pub object_name: String,
+    /// File the class writes the material to inside the CSI mount.
+    pub object_key: String,
+}
+
+/// A durable, tenant-scoped reference to long-lived user or model credentials.
+///
+/// `tenant_id` is the platform organization; `workspace_id` narrows it
+/// further. Both are part of every read, bind, and delete path, so a
+/// reference is invisible and unbindable outside its own scope.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretRef {
+    pub id: SecretRefId,
+    pub tenant_id: String,
+    pub workspace_id: String,
+    pub name: String,
+    pub source: SecretSource,
+    pub delivery: SecretDelivery,
+    pub state: SecretRefState,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+impl SecretRef {
+    /// Absolute in-guest directory the delivery volume is mounted at. Derived
+    /// from the validated name, never from caller input.
+    pub fn mount_dir(&self) -> String {
+        secret_mount_dir(&self.name)
+    }
+
+    /// Absolute in-guest path of the delivered file.
+    pub fn file_path(&self) -> String {
+        format!("{}/{}", self.mount_dir(), self.source.object_key)
+    }
+
+    /// Environment variable carrying the *path* (never the value) of the
+    /// delivered file.
+    pub fn env_file_variable(&self) -> String {
+        secret_env_file_variable(&self.name)
+    }
+}
+
+/// Absolute in-guest mount directory for a validated secret-reference name.
+pub fn secret_mount_dir(name: &str) -> String {
+    format!("{SANDBOX_SECRET_MOUNT_PREFIX}/{name}")
+}
+
+/// Environment variable name exposing the mount path of a validated
+/// secret-reference name. Safe to derive mechanically because names are
+/// restricted to `[a-z0-9-]`.
+pub fn secret_env_file_variable(name: &str) -> String {
+    format!(
+        "SANDBOXWICH_SECRET_{}_FILE",
+        name.replace('-', "_").to_uppercase()
+    )
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum SecretRefValidationError {
+    #[error(
+        "secret reference name must be 1-{MAX_SECRET_REF_NAME_LEN} characters of [a-z0-9-], starting and ending with [a-z0-9]"
+    )]
+    Name,
+    #[error("secret workspace id must be 1-{MAX_SECRET_SCOPE_ID_LEN} non-whitespace characters")]
+    WorkspaceId,
+    #[error(
+        "secret source object name must be 1-{MAX_SECRET_SOURCE_OBJECT_NAME_LEN} characters of [a-z0-9.-], starting and ending with [a-z0-9]"
+    )]
+    SourceObjectName,
+    #[error(
+        "secret source object key must be 1-{MAX_SECRET_SOURCE_OBJECT_KEY_LEN} characters of [A-Za-z0-9._-]"
+    )]
+    SourceObjectKey,
+    #[error("a sandbox may bind at most {MAX_SANDBOX_SECRET_BINDINGS} secret references")]
+    TooManyBindings,
+    #[error("secret reference {0} is bound more than once")]
+    DuplicateBinding(SecretRefId),
+}
+
+/// Validates the set of references one sandbox binds. Bounded and
+/// duplicate-free: two bindings of the same reference would derive the same
+/// mount path, and a Pod with two volume mounts at one path is rejected by
+/// the API server only *after* the sandbox row exists.
+pub fn validate_secret_ref_bindings(
+    secret_ref_ids: &[SecretRefId],
+) -> Result<(), SecretRefValidationError> {
+    if secret_ref_ids.len() > MAX_SANDBOX_SECRET_BINDINGS {
+        return Err(SecretRefValidationError::TooManyBindings);
+    }
+    let mut seen = std::collections::HashSet::with_capacity(secret_ref_ids.len());
+    for id in secret_ref_ids {
+        if !seen.insert(*id) {
+            return Err(SecretRefValidationError::DuplicateBinding(*id));
+        }
+    }
+    Ok(())
+}
+
+fn is_dns_label_like(value: &str, max_len: usize, extra: &[char]) -> bool {
+    if value.is_empty() || value.len() > max_len {
+        return false;
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || extra.contains(&c))
+    {
+        return false;
+    }
+    let boundary_ok = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    value.chars().next().is_some_and(boundary_ok)
+        && value.chars().next_back().is_some_and(boundary_ok)
+}
+
+/// Validates a secret-reference name: the control plane turns it into a
+/// filesystem path and an environment variable name, so it is restricted to
+/// a DNS-label-like shape.
+pub fn validate_secret_ref_name(name: &str) -> Result<(), SecretRefValidationError> {
+    if is_dns_label_like(name, MAX_SECRET_REF_NAME_LEN, &['-']) {
+        Ok(())
+    } else {
+        Err(SecretRefValidationError::Name)
+    }
+}
+
+pub fn validate_secret_workspace_id(workspace_id: &str) -> Result<(), SecretRefValidationError> {
+    let valid = !workspace_id.is_empty()
+        && workspace_id.len() <= MAX_SECRET_SCOPE_ID_LEN
+        && workspace_id.trim() == workspace_id
+        && !workspace_id.chars().any(char::is_whitespace);
+    valid
+        .then_some(())
+        .ok_or(SecretRefValidationError::WorkspaceId)
+}
+
+impl SecretSource {
+    pub fn validate(&self) -> Result<(), SecretRefValidationError> {
+        if !is_dns_label_like(
+            &self.object_name,
+            MAX_SECRET_SOURCE_OBJECT_NAME_LEN,
+            &['-', '.'],
+        ) {
+            return Err(SecretRefValidationError::SourceObjectName);
+        }
+        // The key becomes a file name inside the CSI mount, so dot segments
+        // are rejected outright rather than only the path separator: `..` is
+        // a traversal primitive the moment anything joins it to a directory.
+        let key_ok = !self.object_key.is_empty()
+            && self.object_key.len() <= MAX_SECRET_SOURCE_OBJECT_KEY_LEN
+            && !self.object_key.chars().all(|c| c == '.')
+            && self
+                .object_key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        key_ok
+            .then_some(())
+            .ok_or(SecretRefValidationError::SourceObjectKey)
+    }
+}
+
+/// `deny_unknown_fields` is load-bearing: it is what makes "the control plane
+/// cannot be handed raw credential bytes" a contract rather than a
+/// convention. A client that tries to send `value`/`data` is rejected by the
+/// extractor itself, before any handler runs (422 `invalid_request`).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateSecretRefRequest {
+    pub workspace_id: String,
+    pub name: String,
+    pub source: SecretSource,
+    #[serde(default = "default_secret_delivery")]
+    pub delivery: SecretDelivery,
+}
+
+fn default_secret_delivery() -> SecretDelivery {
+    SecretDelivery::File
+}
+
+impl CreateSecretRefRequest {
+    pub fn validate(&self) -> Result<(), SecretRefValidationError> {
+        validate_secret_workspace_id(&self.workspace_id)?;
+        validate_secret_ref_name(&self.name)?;
+        self.source.validate()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretRefResponse {
+    pub ok: bool,
+    pub secret_ref: SecretRef,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretRefListResponse {
+    pub ok: bool,
+    pub secret_refs: Vec<SecretRef>,
+}
+
+/// Resolved, material-free delivery instruction handed to a worker through
+/// the provisioning job payload. Every field is a locator: there is nothing
+/// here to redact because there is nothing secret here.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SandboxSecretMount {
+    pub secret_ref_id: SecretRefId,
+    pub name: String,
+    pub source: SecretSource,
+    pub delivery: SecretDelivery,
+    /// Read-only directory the worker must mount the delivery volume at.
+    pub mount_dir: String,
+    /// Path of the delivered file inside that directory.
+    pub file_path: String,
+    /// Environment variable the guest reads the path (not the value) from.
+    pub env_file_variable: String,
+}
+
+impl SandboxSecretMount {
+    pub fn from_ref(secret_ref: &SecretRef) -> Self {
+        Self {
+            secret_ref_id: secret_ref.id,
+            name: secret_ref.name.clone(),
+            source: secret_ref.source.clone(),
+            delivery: secret_ref.delivery.clone(),
+            mount_dir: secret_ref.mount_dir(),
+            file_path: secret_ref.file_path(),
+            env_file_variable: secret_ref.env_file_variable(),
+        }
+    }
+
+    /// Pod volume name for this delivery. A valid DNS-1123 label for every
+    /// name the reference validator accepts: names are label-like, and
+    /// [`MAX_SECRET_REF_NAME_LEN`] leaves room for the prefix.
+    pub fn volume_name(&self) -> String {
+        format!("{SANDBOX_SECRET_VOLUME_PREFIX}{}", self.name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4138,6 +4487,180 @@ mod tests {
             } else {
                 assert!(!self_loop, "{state:?} -> {state:?} should not be legal");
             }
+        }
+    }
+
+    fn secret_source() -> SecretSource {
+        SecretSource {
+            backend: SecretBackend::CsiSecretProviderClass,
+            object_name: "tenant-model-credentials".into(),
+            object_key: "openai.api-key".into(),
+        }
+    }
+
+    #[test]
+    fn create_secret_ref_request_rejects_raw_material_fields() {
+        let with_value = serde_json::json!({
+            "workspaceId": "ws-1",
+            "name": "openai-api-key",
+            "source": {
+                "backend": "csi_secret_provider_class",
+                "objectName": "tenant-model-credentials",
+                "objectKey": "openai.api-key"
+            },
+            "value": "sk-secret-canary"
+        });
+        let error = serde_json::from_value::<CreateSecretRefRequest>(with_value)
+            .expect_err("the create contract must not accept raw secret material");
+        assert!(error.to_string().contains("value"));
+
+        let inside_source = serde_json::json!({
+            "workspaceId": "ws-1",
+            "name": "openai-api-key",
+            "source": {
+                "backend": "csi_secret_provider_class",
+                "objectName": "tenant-model-credentials",
+                "objectKey": "openai.api-key",
+                "data": "sk-secret-canary"
+            }
+        });
+        assert!(serde_json::from_value::<CreateSecretRefRequest>(inside_source).is_err());
+    }
+
+    #[test]
+    fn secret_ref_names_are_validated_before_becoming_paths_or_env_variables() {
+        for name in [
+            "openai-api-key",
+            "k",
+            "a1",
+            "x".repeat(MAX_SECRET_REF_NAME_LEN).as_str(),
+        ] {
+            assert!(validate_secret_ref_name(name).is_ok(), "{name} should pass");
+        }
+        for name in [
+            "",
+            "-leading",
+            "trailing-",
+            "Upper",
+            "with space",
+            "../escape",
+            "with/slash",
+            "with_underscore",
+            "x".repeat(MAX_SECRET_REF_NAME_LEN + 1).as_str(),
+        ] {
+            assert_eq!(
+                validate_secret_ref_name(name),
+                Err(SecretRefValidationError::Name),
+                "{name} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_ref_delivery_locations_are_derived_not_caller_supplied() {
+        let now = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        let secret_ref = SecretRef {
+            id: SecretRefId::new(),
+            tenant_id: "acme".into(),
+            workspace_id: "ws-1".into(),
+            name: "openai-api-key".into(),
+            source: secret_source(),
+            delivery: SecretDelivery::File,
+            state: SecretRefState::Active,
+            created_at: now,
+            updated_at: now,
+            revoked_at: None,
+        };
+        assert_eq!(
+            secret_ref.mount_dir(),
+            "/run/sandboxwich/secrets/openai-api-key"
+        );
+        assert_eq!(
+            secret_ref.file_path(),
+            "/run/sandboxwich/secrets/openai-api-key/openai.api-key"
+        );
+        assert_eq!(
+            secret_ref.env_file_variable(),
+            "SANDBOXWICH_SECRET_OPENAI_API_KEY_FILE"
+        );
+        let mount = SandboxSecretMount::from_ref(&secret_ref);
+        assert_eq!(mount.mount_dir, secret_ref.mount_dir());
+        assert_eq!(mount.file_path, secret_ref.file_path());
+        assert_eq!(mount.env_file_variable, secret_ref.env_file_variable());
+        assert!(
+            mount.file_path.starts_with(SANDBOX_SECRET_MOUNT_PREFIX),
+            "delivery must stay under the read-only secret prefix"
+        );
+    }
+
+    /// The longest name the validator accepts must still render a Pod volume
+    /// name Kubernetes will take; otherwise a create succeeds and the Pod is
+    /// rejected at apply time, long after the caller got its 202.
+    #[test]
+    fn longest_accepted_secret_name_renders_a_valid_dns_label_volume_name() {
+        let now = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        let name = "a".repeat(MAX_SECRET_REF_NAME_LEN);
+        assert!(validate_secret_ref_name(&name).is_ok());
+        assert!(validate_secret_ref_name(&"a".repeat(MAX_SECRET_REF_NAME_LEN + 1)).is_err());
+        let volume_name = SandboxSecretMount::from_ref(&SecretRef {
+            id: SecretRefId::new(),
+            tenant_id: "acme".into(),
+            workspace_id: "ws-1".into(),
+            name,
+            source: secret_source(),
+            delivery: SecretDelivery::File,
+            state: SecretRefState::Active,
+            created_at: now,
+            updated_at: now,
+            revoked_at: None,
+        })
+        .volume_name();
+        assert!(is_dns_label_like(&volume_name, 63, &['-']), "{volume_name}");
+    }
+
+    #[test]
+    fn secret_source_locators_are_validated() {
+        assert!(secret_source().validate().is_ok());
+        for object_name in ["", "Upper", "-lead", "name with space", "ns/name"] {
+            let source = SecretSource {
+                object_name: object_name.into(),
+                ..secret_source()
+            };
+            assert_eq!(
+                source.validate(),
+                Err(SecretRefValidationError::SourceObjectName)
+            );
+        }
+        // Dot segments are rejected outright, not just the separator: the key
+        // becomes a file name inside the delivery mount.
+        for object_key in [
+            "",
+            "key with space",
+            "key/with/slash",
+            "../key",
+            ".",
+            "..",
+            "...",
+        ] {
+            let source = SecretSource {
+                object_key: object_key.into(),
+                ..secret_source()
+            };
+            assert_eq!(
+                source.validate(),
+                Err(SecretRefValidationError::SourceObjectKey)
+            );
+        }
+    }
+
+    #[test]
+    fn secret_workspace_scope_is_required() {
+        assert!(validate_secret_workspace_id("ws-1").is_ok());
+        for workspace_id in ["", " ", " ws-1", "ws 1", "x".repeat(129).as_str()] {
+            assert_eq!(
+                validate_secret_workspace_id(workspace_id),
+                Err(SecretRefValidationError::WorkspaceId)
+            );
         }
     }
 }

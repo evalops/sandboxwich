@@ -19,6 +19,10 @@ use sandboxwich_core::{
     info(title = "Sandboxwich API", version = "1.0.0"),
     paths(
         crate::handlers::sandboxes::create_sandbox,
+        crate::handlers::secrets::create_secret_ref,
+        crate::handlers::secrets::list_secret_refs,
+        crate::handlers::secrets::get_secret_ref,
+        crate::handlers::secrets::revoke_secret_ref,
         crate::handlers::sandboxes::get_sandbox_observed_state,
         crate::handlers::commands::queue_command,
         crate::handlers::commands::get_command,
@@ -76,6 +80,12 @@ use sandboxwich_core::{
         ,sandboxwich_core::ValidateMaestroWorkloadIdentityRequest
         ,sandboxwich_core::MaestroWorkloadIdentityResponse
         ,sandboxwich_core::MaestroHostedRunnerConnectionBindingResponse
+        ,sandboxwich_core::SecretSource
+        ,sandboxwich_core::SecretRef
+        ,sandboxwich_core::CreateSecretRefRequest
+        ,sandboxwich_core::SecretRefResponse
+        ,sandboxwich_core::SecretRefListResponse
+        ,sandboxwich_core::SandboxSecretMount
     )),
     tags((name = "operations", description = "Asynchronous operation lifecycle"))
 )]
@@ -126,6 +136,10 @@ const PUBLIC_V1_OPERATIONS: &[(&str, &str)] = &[
     ("get", "/v1/desktop-sessions/{desktop_session_id}"),
     ("post", "/v1/desktop-sessions/{desktop_session_id}/status"),
     ("post", "/v1/desktop-sessions/{desktop_session_id}/access"),
+    ("get", "/v1/secret-refs"),
+    ("post", "/v1/secret-refs"),
+    ("get", "/v1/secret-refs/{secret_ref_id}"),
+    ("delete", "/v1/secret-refs/{secret_ref_id}"),
     ("post", "/v1/snapshots/cleanup"),
     ("get", "/v1/snapshots/{snapshot_id}"),
     ("post", "/v1/snapshots/{snapshot_id}/fork"),
@@ -180,6 +194,7 @@ pub(crate) fn openapi_document() -> OpenApiDocument {
             "get" => HttpMethod::Get,
             "post" => HttpMethod::Post,
             "put" => HttpMethod::Put,
+            "delete" => HttpMethod::Delete,
             _ => unreachable!("operation catalog contains an unsupported method"),
         };
         let operation = OperationBuilder::new()
