@@ -32,8 +32,9 @@ use sandboxwich_core::{
     ProvisioningStageUpdateRequest, RESIDENT_PLACEMENT_ATTESTATION_FILE,
     RESIDENT_PROCESS_BOOTSTRAP_PREFIX, ResidentProcessId, RuntimeResourceInventoryResponse,
     RuntimeResourceKind, RuntimeResourcePurpose, RuntimeResourceStatus, SANDBOX_WORKSPACE_GID,
-    SandboxId, SandboxProvisionSpec, SandboxRuntimeProfile, SnapshotId, WorkerCapability,
-    WorkspaceMode, validate_agent_command_request,
+    SandboxId, SandboxProvisionSpec, SandboxRuntimeProfile, SecretBackend, SecretDelivery,
+    SnapshotId, WorkerCapability, WorkspaceMode, secret_mount_dir, validate_agent_command_request,
+    validate_secret_ref_name,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -489,6 +490,10 @@ pub trait SandboxProvider {
     }
 }
 
+fn is_path_separator(c: char) -> bool {
+    c == '/' || c == '\\'
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KubernetesDryRunProvider {
     cluster: String,
@@ -548,6 +553,11 @@ pub struct KubernetesDryRunProvider {
     /// var (GH-67).
     vnc_password_secret: Option<String>,
     fqdn_egress_backend: Option<String>,
+    /// Secrets Store CSI driver name (e.g. `secrets-store.csi.k8s.io`) the
+    /// operator has installed. Delivery of secret references is refused
+    /// outright while this is unset: rendering a Pod without the volume would
+    /// hand the guest a sandbox that silently lacks its credential.
+    secret_csi_driver: Option<String>,
     guest_credentials: Option<GuestCredentials>,
 }
 
@@ -619,6 +629,7 @@ impl KubernetesDryRunProvider {
             )]),
             vnc_password_secret: None,
             fqdn_egress_backend: None,
+            secret_csi_driver: None,
             guest_credentials: None,
         }
     }
@@ -635,8 +646,59 @@ impl KubernetesDryRunProvider {
         self
     }
 
+    /// Fail-closed gate for secret delivery. A sandbox that asked for a
+    /// credential must either get it or fail to provision; there is no
+    /// degraded mode where the Pod comes up without the mount, and no path
+    /// where a delivery location comes from anywhere but the control plane's
+    /// own derivation.
+    fn validate_secret_delivery(&self, spec: &SandboxProvisionSpec) -> anyhow::Result<()> {
+        if spec.secret_mounts.is_empty() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.secret_csi_driver.is_some(),
+            "secret delivery requires a Secrets Store CSI driver configured on this worker"
+        );
+        let mut seen_names = std::collections::HashSet::new();
+        for mount in &spec.secret_mounts {
+            // Two mounts sharing a name render two Pod volumes with the same
+            // name; the control plane cannot produce that, so reject it here
+            // rather than let the API server reject it at apply time.
+            anyhow::ensure!(
+                seen_names.insert(mount.name.as_str()),
+                "secret delivery name {} appears more than once in this spec",
+                mount.name
+            );
+            match mount.delivery {
+                SecretDelivery::File => {}
+            }
+            match mount.source.backend {
+                SecretBackend::CsiSecretProviderClass => {}
+            }
+            // The name is re-validated, not just used: recomputing the
+            // expected directory from an unchecked name would put the
+            // attacker's value on both sides of the comparison.
+            anyhow::ensure!(
+                validate_secret_ref_name(&mount.name).is_ok(),
+                "secret delivery name {} is not a valid reference name",
+                mount.name
+            );
+            let expected_dir = secret_mount_dir(&mount.name);
+            anyhow::ensure!(
+                mount.mount_dir == expected_dir
+                    && mount.file_path == format!("{expected_dir}/{}", mount.source.object_key)
+                    && !mount.source.object_key.chars().any(is_path_separator)
+                    && mount.source.object_key.chars().any(|c| c != '.'),
+                "secret delivery path for {} is not control-plane derived",
+                mount.name
+            );
+        }
+        Ok(())
+    }
+
     fn validate_runtime_profile(&self, spec: &SandboxProvisionSpec) -> anyhow::Result<()> {
         self.validate_network_policy_egress(&spec.network_egress)?;
+        self.validate_secret_delivery(spec)?;
         if spec.runtime_profile == SandboxRuntimeProfile::ApexTrustedSupervisorV1 {
             anyhow::ensure!(
                 self.apex_trusted_supervisor_v1 && image_is_digest_pinned(&self.runtime_image),
@@ -690,6 +752,14 @@ impl KubernetesDryRunProvider {
 
     pub fn with_ssh_authorized_keys_secret(mut self, secret: Option<String>) -> Self {
         self.ssh_authorized_keys_secret = secret;
+        self
+    }
+
+    pub fn with_secret_csi_driver(mut self, driver: Option<String>) -> Self {
+        self.secret_csi_driver = driver.and_then(|driver| {
+            let driver = driver.trim();
+            (!driver.is_empty()).then(|| driver.to_string())
+        });
         self
     }
 
@@ -1320,6 +1390,36 @@ impl KubernetesDryRunProvider {
                 "name": "SANDBOXWICH_VNC_PASSWORD_FILE",
                 "value": "/run/sandboxwich/vnc/vnc-password"
             }));
+        }
+
+        // Locators only. The kubelet's Secrets Store CSI driver reads the
+        // material from the external store into this Pod's tmpfs; no plaintext
+        // copy is created in a Kubernetes Secret, in etcd, or in this process,
+        // and the guest gets the *path* through `<NAME>_FILE`, never the value.
+        // Unconfigured drivers never reach here: `validate_secret_delivery`
+        // already refused the provision.
+        if let Some(driver) = &self.secret_csi_driver {
+            for mount in &spec.secret_mounts {
+                volume_mounts.push(json!({
+                    "name": mount.volume_name(),
+                    "mountPath": mount.mount_dir,
+                    "readOnly": true
+                }));
+                volumes.push(json!({
+                    "name": mount.volume_name(),
+                    "csi": {
+                        "driver": driver,
+                        "readOnly": true,
+                        "volumeAttributes": {
+                            "secretProviderClass": mount.source.object_name
+                        }
+                    }
+                }));
+                env.push(json!({
+                    "name": mount.env_file_variable,
+                    "value": mount.file_path
+                }));
+            }
         }
 
         let ephemeral_storage = Self::ephemeral_storage_limit(&spec.memory_limit);

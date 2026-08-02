@@ -18,6 +18,7 @@ async fn unprivileged_compiler_cache_job_is_reachable_with_separate_identity() {
     let sandbox: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             name: Some("compiler-cache-job".into()),
             template: None,
             memory_limit: None,
@@ -98,6 +99,7 @@ async fn legacy_provision_fixture(name: &str) -> (TestServer, SandboxResponse, W
     let sandbox: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             name: Some(name.to_string()),
             template: None,
             memory_limit: Some(MemoryLimit::FourG),
@@ -271,6 +273,7 @@ async fn materialization_bytes_are_worker_fenced_ref_only_and_consumed_only_when
     let sandbox: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             name: Some("materialization".to_string()),
             template: Some(runtime_image.clone()),
             memory_limit: None,
@@ -772,6 +775,7 @@ pub(crate) async fn job_can_be_fetched_by_id_with_tenant_isolation() {
     let sandbox: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: Some(ExecutionClass::VirtualMachine),
             workspace_mode: None,
             runtime_profile: None,
@@ -967,6 +971,7 @@ async fn create_sandbox(
     client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: None,
             runtime_profile: None,
@@ -1436,6 +1441,7 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
         .post(format!("{}/sandboxes", server.base_url))
         .bearer_auth(TEST_TENANT_B_TOKEN)
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: None,
             runtime_profile: None,

@@ -497,6 +497,7 @@ async fn main() -> anyhow::Result<()> {
                 .post(format!("{api}/sandboxes"))
                 .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&CreateSandboxRequest {
+                    secret_ref_ids: Vec::new(),
                     name: args.name,
                     template: args.template,
                     memory_limit: args.memory_limit.map(Into::into),
@@ -564,6 +565,7 @@ async fn main() -> anyhow::Result<()> {
                 .post(format!("{api}/sandboxes/{}/fork", args.sandbox_id))
                 .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
                 .json(&CreateSandboxRequest {
+                    secret_ref_ids: Vec::new(),
                     name: args.name,
                     template: None,
                     memory_limit: None,

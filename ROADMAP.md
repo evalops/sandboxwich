@@ -60,11 +60,11 @@ These capabilities remain Experimental until every gate below passes for a named
    production evidence and the egress-gateway backend stays the default.
 2. Add a microVM provider and compare its lifecycle and recovery behavior with RuntimeClass-backed Kubernetes.
 3. Add a brokered desktop transport; current desktop records do not create an ingress tunnel.
-4. Add production secret storage before accepting long-lived user or model credentials.
+4. Add live Secrets Store CSI conformance on a cluster with the driver installed. Reference storage, binding, and rendered read-only CSI mounts are covered by contract tests against the real API and provider surface, but no test asserts against a kubelet actually mounting material.
 5. Add live sidecar conformance across worker restart, API replica failover, and an explicit guest-to-sidecar network relay; bootstrap handoff is currently process-local and the isolated Pod does not share guest localhost.
 
 ## Non-goals for 0.1
 
 - Billing.
-- Long-lived production secret storage.
+- Secret backends other than operator-provisioned `SecretProviderClass` objects served by the Secrets Store CSI driver, and any path that accepts raw credential bytes into the control plane.
 - Unsupported isolation claims for the dry-run provider.

@@ -288,6 +288,51 @@ kubectl -n sandboxwich-sandboxes create secret generic sandboxwich-vnc-password 
 
 Pass `--vnc-password-secret sandboxwich-vnc-password` (or set `SANDBOXWICH_VNC_PASSWORD_SECRET`) so the worker mounts it read-only at `/run/sandboxwich/vnc/vnc-password` in the sandbox container (exposed via `SANDBOXWICH_VNC_PASSWORD_FILE`), the same way the SSH authorized-keys Secret is mounted rather than injected as a plain env var.
 
+## Secret Reference Delivery
+
+Secret references (`/v1/secret-refs`) are delivered to a sandbox through the
+[Secrets Store CSI driver](https://secrets-store-csi-driver.sigs.k8s.io/), not
+through Kubernetes Secrets. The kubelet reads the material from the external
+store into the Pod's tmpfs, so no plaintext copy is written to a `Secret`
+object, to etcd, or to any sandboxwich process; the control plane only ever
+handles locators.
+
+Install the driver plus your store's provider, then create one
+`SecretProviderClass` per tenant credential in the sandbox namespace. A
+reference's `source.objectName` is that class's name and `source.objectKey` is
+the file the class writes:
+
+```yaml
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: acme-openai
+  namespace: sandboxwich-sandboxes
+spec:
+  provider: aws
+  parameters:
+    objects: |
+      - objectName: "acme/openai"
+        objectType: "secretsmanager"
+        objectAlias: "api-key"
+```
+
+Pass `--secret-csi-driver secrets-store.csi.k8s.io` (or set
+`SANDBOXWICH_SECRET_CSI_DRIVER`) on the worker. **Delivery fails closed:** while
+the flag is unset, provisioning a sandbox that binds a reference is refused
+rather than producing a Pod that silently lacks its credential. A worker
+started with the flag registers the label
+`provider_secret_delivery=csi_secret_provider_class`, and the API only leases
+secret-bound provisioning work to a worker carrying it, so in a fleet where
+only some workers are configured the job waits for a capable worker instead of
+dying on an unconfigured one.
+
+Each bound reference becomes a read-only CSI volume at
+`/run/sandboxwich/secrets/<name>`, and the guest receives the *path* — never
+the value — in `SANDBOXWICH_SECRET_<NAME>_FILE`. Mount locations are derived by
+the control plane from the validated reference name; a caller cannot choose
+them, and the class's namespace is never tenant-supplied.
+
 ## Sandbox Namespace Isolation
 
 Sandbox Pods, Services, PVCs, NetworkPolicies, and optional GKE FQDNNetworkPolicies render into a dedicated namespace, separate from the control-plane namespace running `sandboxwich-api` and the `sandboxwich-secrets` Secret (`SANDBOXWICH_DATABASE_URL`, `api-token`). Configure it with `--sandbox-namespace` / `SANDBOXWICH_SANDBOX_NAMESPACE`; unset falls back to `--namespace` (the control-plane namespace), preserving older single-namespace deployments. `deploy/kubernetes/worker.yaml` creates a `sandboxwich-sandboxes` Namespace and scopes the worker's Role/RoleBinding to it exclusively, so a compromised worker cannot reach control-plane pods or the database credential.

@@ -6,6 +6,7 @@ use crate::handlers::sandboxes::{
     fetch_sandbox, fetch_sandbox_on_connection, hydrate_sandbox_network_egress_on_connection,
     set_sandbox_state_on_connection,
 };
+use crate::handlers::secrets::fetch_sandbox_secret_mounts_on_connection;
 use crate::state::*;
 use axum::Json;
 use axum::extract::{Extension, Path, State};
@@ -375,7 +376,9 @@ async fn request_divergence_stop_on_connection(
         updated_at: now,
         last_error: None,
     };
-    add_provision_spec_to_payload(&mut job, &sandbox)?;
+    let secret_mounts =
+        fetch_sandbox_secret_mounts_on_connection(&state.db, connection, sandbox.id).await?;
+    add_provision_spec_to_payload(&mut job, &sandbox, &secret_mounts)?;
     set_sandbox_state_on_connection(
         &state.db,
         connection,
