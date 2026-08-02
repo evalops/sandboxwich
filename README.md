@@ -89,6 +89,24 @@ If neither is set, the API fails closed: it refuses every non-probe request with
 
 `POST /snapshots/cleanup` performs cross-tenant maintenance (expiring snapshots and deleting archived sandboxes for every tenant) and is gated by a separate `SANDBOXWICH_OPERATOR_TOKEN` credential, checked via the `x-sandboxwich-operator-token` header. This token is intentionally distinct from tenant/shared tokens: a valid tenant credential is never sufficient to run cleanup, and cleanup is disabled (rejected) until an operator token is configured.
 
+### Resident bootstrap handoff across replicas
+
+Resident-process bootstrap bytes (the `orb-executor`/`orb-sidecar` secret
+delivered once under a generation/lease/digest fence) live in the API process
+that admitted them. Set `SANDBOXWICH_BOOTSTRAP_HANDOFF_KEY` — standard base64
+of exactly 32 bytes, identical on every replica — to also seal them into an
+ephemeral `resident_bootstrap_handoffs` row so an API restart or a read served
+by a different replica can still complete the delivery. The row holds
+XChaCha20-Poly1305 ciphertext, never plaintext; is bound by associated data to
+the exact resident process, sandbox, tenant, generation, and digest; is deleted
+on acknowledgment, stop, reclaim, and sandbox deletion; and expires after
+`SANDBOXWICH_BOOTSTRAP_HANDOFF_TTL_SECONDS` (default 3600). Rotating the key
+does not weaken anything: rows sealed under the old key simply stop opening,
+which is the same fail-closed outcome as no shared tier at all.
+
+Leaving the variable unset keeps the previous behavior, where a control-plane
+restart strands a pending bootstrap.
+
 ### Sandbox lifetime: three separate knobs
 
 Sandboxes carry three independent, easy-to-conflate timing fields. Do not assume they're the same thing:

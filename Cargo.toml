@@ -41,6 +41,7 @@ axum = { version = "0.8", features = ["multipart"] }
 axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 base64 = "0.22"
 cap-std = "4.0.2"
+chacha20poly1305 = { version = "0.10", features = ["getrandom"] }
 chrono = { version = "0.4", features = ["serde"] }
 futures-core = "0.3"
 flate2 = "1.1"

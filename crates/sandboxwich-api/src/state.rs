@@ -1,3 +1,4 @@
+use crate::bootstrap_handoff::{SharedBootstrapHandoff, delete_handoff};
 use crate::config::*;
 use crate::db::*;
 use sandboxwich_core::*;
@@ -138,8 +139,12 @@ impl Drop for ApexWaiterGuard {
 
 #[derive(Clone)]
 pub(crate) struct LiveResidentBootstrap {
-    /// Instance-local admission metadata; never persisted or returned with
-    /// the secret-bearing bootstrap response.
+    /// Admission metadata; never returned with the secret-bearing bootstrap
+    /// response, and never persisted in plaintext. When a shared ephemeral
+    /// handoff is configured, `content` is persisted only as AEAD ciphertext
+    /// sealed under an operator-held key (see [`crate::bootstrap_handoff`]);
+    /// durable `resident_processes` rows still carry nothing beyond the
+    /// digest and byte count.
     pub(crate) tenant_id: String,
     pub(crate) content: Vec<u8>,
     pub(crate) sha256: String,
@@ -184,8 +189,15 @@ struct ResidentBootstrapStoreInner {
     capacity: usize,
 }
 
+/// Process-local admission and delivery state for resident bootstraps,
+/// optionally backed by a shared ephemeral tier (see
+/// [`crate::bootstrap_handoff`]) that lets another API process — or this one
+/// after a restart — rehydrate the bytes under the same fence.
 #[derive(Clone)]
-pub(crate) struct ResidentBootstrapStore(Arc<Mutex<ResidentBootstrapStoreInner>>);
+pub(crate) struct ResidentBootstrapStore {
+    inner: Arc<Mutex<ResidentBootstrapStoreInner>>,
+    handoff: Option<Arc<SharedBootstrapHandoff>>,
+}
 
 impl Default for ResidentBootstrapStore {
     fn default() -> Self {
@@ -195,19 +207,83 @@ impl Default for ResidentBootstrapStore {
 
 impl ResidentBootstrapStore {
     fn with_capacity(capacity: usize) -> Self {
-        Self(Arc::new(Mutex::new(ResidentBootstrapStoreInner {
-            values: HashMap::new(),
-            reserved: 0,
-            reserved_by_tenant: HashMap::new(),
-            capacity,
-        })))
+        Self {
+            inner: Arc::new(Mutex::new(ResidentBootstrapStoreInner {
+                values: HashMap::new(),
+                reserved: 0,
+                reserved_by_tenant: HashMap::new(),
+                capacity,
+            })),
+            handoff: None,
+        }
+    }
+
+    pub(crate) fn with_shared_handoff(mut self, handoff: SharedBootstrapHandoff) -> Self {
+        self.handoff = Some(Arc::new(handoff));
+        self
+    }
+
+    pub(crate) fn shared_handoff(&self) -> Option<&SharedBootstrapHandoff> {
+        self.handoff.as_deref()
+    }
+
+    /// Reinstates a bootstrap this process never admitted, recovered from
+    /// the shared ephemeral tier. `delivered_fence` comes from the durable
+    /// `bootstrap_delivered_*` columns, so a bootstrap already delivered
+    /// under some fence comes back Delivered under that same fence and keeps
+    /// rejecting every other one.
+    ///
+    /// Rehydration never displaces an entry this process already holds and
+    /// never exceeds the store bound.
+    pub(crate) fn rehydrate(
+        &self,
+        id: ResidentProcessId,
+        bootstrap: LiveResidentBootstrap,
+        delivered_fence: Option<ResidentBootstrapFence>,
+    ) -> Result<(), ()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("resident bootstrap mutex poisoned");
+        if inner.values.contains_key(&id) {
+            return Ok(());
+        }
+        if inner.values.len() + inner.reserved >= inner.capacity {
+            return Err(());
+        }
+        let entry = match delivered_fence {
+            Some(fence) => ResidentBootstrapEntry::Delivered { bootstrap, fence },
+            None => ResidentBootstrapEntry::Ready(bootstrap),
+        };
+        inner.values.insert(id, entry);
+        Ok(())
+    }
+
+    /// Drops the shared copy once the process-local one is gone. Best
+    /// effort: a failure here leaves a row that the retention sweep and the
+    /// `resident_processes` cascade both still remove, and that stays
+    /// unusable anyway because the durable delivery fence has moved on.
+    pub(crate) async fn forget_shared(&self, db: &Database, id: ResidentProcessId) {
+        if self.handoff.is_none() {
+            return;
+        }
+        if let Err(error) = delete_handoff(db, id).await {
+            tracing::warn!(
+                %error,
+                resident_process_id = %id,
+                "failed to delete shared resident bootstrap handoff"
+            );
+        }
     }
 
     pub(crate) fn reserve(
         &self,
         bootstrap: LiveResidentBootstrap,
     ) -> Result<ResidentBootstrapReservation, ()> {
-        let mut inner = self.0.lock().expect("resident bootstrap mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("resident bootstrap mutex poisoned");
         if inner.values.len() + inner.reserved >= inner.capacity {
             return Err(());
         }
@@ -244,7 +320,10 @@ impl ResidentBootstrapStore {
         id: &ResidentProcessId,
         fence: ResidentBootstrapFence,
     ) -> Result<ResidentBootstrapDelivery, ResidentBootstrapDeliveryError> {
-        let mut inner = self.0.lock().expect("resident bootstrap mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("resident bootstrap mutex poisoned");
         let entry = inner
             .values
             .remove(id)
@@ -306,7 +385,10 @@ impl ResidentBootstrapStore {
         id: &ResidentProcessId,
         fence: &ResidentBootstrapFence,
     ) -> bool {
-        let mut inner = self.0.lock().expect("resident bootstrap mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("resident bootstrap mutex poisoned");
         match inner.values.get_mut(id) {
             Some(ResidentBootstrapEntry::Delivered {
                 fence: delivered_fence,
@@ -334,7 +416,10 @@ impl ResidentBootstrapStore {
         sha256: &str,
         fence: Option<&ResidentBootstrapFence>,
     ) -> bool {
-        let mut inner = self.0.lock().expect("resident bootstrap mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("resident bootstrap mutex poisoned");
         let should_remove = matches!(
             inner.values.get(id),
             Some(ResidentBootstrapEntry::Ready(bootstrap))
@@ -383,6 +468,14 @@ pub(crate) struct ResidentBootstrapReservation {
 }
 
 impl ResidentBootstrapReservation {
+    /// The admitted bytes, for sealing into the shared ephemeral tier in the
+    /// same transaction that inserts the resident-process row.
+    pub(crate) fn bootstrap(&self) -> &LiveResidentBootstrap {
+        self.bootstrap
+            .as_ref()
+            .expect("resident bootstrap reservation already published")
+    }
+
     pub(crate) fn publish(mut self, id: ResidentProcessId) {
         let bootstrap = self
             .bootstrap
@@ -390,7 +483,7 @@ impl ResidentBootstrapReservation {
             .expect("resident bootstrap reservation already published");
         let mut inner = self
             .store
-            .0
+            .inner
             .lock()
             .expect("resident bootstrap mutex poisoned");
         inner.reserved -= 1;
@@ -414,7 +507,7 @@ impl Drop for ResidentBootstrapReservation {
         if let Some(bootstrap) = self.bootstrap.as_ref() {
             let mut inner = self
                 .store
-                .0
+                .inner
                 .lock()
                 .expect("resident bootstrap mutex poisoned");
             inner.reserved -= 1;
@@ -456,7 +549,7 @@ impl ResidentBootstrapDelivery {
         let response = bootstrap.clone();
         let mut inner = self
             .store
-            .0
+            .inner
             .lock()
             .expect("resident bootstrap mutex poisoned");
         let previous = inner.values.remove(&self.id);
@@ -490,7 +583,7 @@ impl Drop for ResidentBootstrapDelivery {
         if let Some(bootstrap) = self.bootstrap.take() {
             let mut inner = self
                 .store
-                .0
+                .inner
                 .lock()
                 .expect("resident bootstrap mutex poisoned");
             let previous = inner.values.remove(&self.id);
@@ -542,6 +635,58 @@ mod tests {
             lease_id,
             sha256: "digest".into(),
         }
+    }
+
+    #[test]
+    fn rehydration_restores_the_durable_delivery_fence_and_respects_capacity() {
+        let store = ResidentBootstrapStore::with_capacity(1);
+        let id = ResidentProcessId::new();
+        let lease_id = Uuid::now_v7();
+        let fence = resident_bootstrap_fence(lease_id);
+
+        // A bootstrap recovered as already delivered replays only under the
+        // fence the durable row recorded.
+        store
+            .rehydrate(id, resident_bootstrap("tenant-a", 1), Some(fence.clone()))
+            .unwrap();
+        assert!(matches!(
+            store.begin_delivery(&id, resident_bootstrap_fence(Uuid::now_v7())),
+            Err(ResidentBootstrapDeliveryError::FenceMismatch)
+        ));
+        let delivery = store.begin_delivery(&id, fence.clone()).unwrap();
+        assert_eq!(delivery.bootstrap().content, b"secret");
+        delivery.mark_delivered().unwrap();
+
+        // Rehydration never displaces what this process already holds, and
+        // never exceeds the store bound.
+        store
+            .rehydrate(id, resident_bootstrap("tenant-b", 9), None)
+            .unwrap();
+        assert_eq!(
+            store
+                .begin_delivery(&id, fence.clone())
+                .unwrap()
+                .bootstrap()
+                .tenant_id,
+            "tenant-a"
+        );
+        assert!(
+            store
+                .rehydrate(
+                    ResidentProcessId::new(),
+                    resident_bootstrap("tenant-a", 1),
+                    None
+                )
+                .is_err()
+        );
+
+        // Acknowledgment is still terminal; the shared row it deletes is what
+        // stops a later process from rehydrating the bootstrap at all.
+        assert!(store.acknowledge(&id, &fence));
+        assert!(matches!(
+            store.begin_delivery(&id, fence),
+            Err(ResidentBootstrapDeliveryError::Unavailable)
+        ));
     }
 
     #[test]

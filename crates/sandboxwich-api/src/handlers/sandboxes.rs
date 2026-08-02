@@ -627,6 +627,7 @@ pub(crate) async fn stop_sandbox_via_job(
     tx.commit().await?;
     for (process_id, generation, sha256, fence) in resident_bootstrap_identities {
         resident_bootstraps.reclaim(&process_id, generation, &sha256, fence.as_ref());
+        resident_bootstraps.forget_shared(db, process_id).await;
     }
     Ok(Some(job))
 }

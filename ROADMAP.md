@@ -55,7 +55,7 @@ These capabilities remain Experimental until every gate below passes for a named
 2. Add a microVM provider and compare its lifecycle and recovery behavior with RuntimeClass-backed Kubernetes.
 3. Add a brokered desktop transport; current desktop records do not create an ingress tunnel.
 4. Add production secret storage before accepting long-lived user or model credentials.
-5. Add live sidecar conformance across worker restart, API replica failover, and an explicit guest-to-sidecar network relay; bootstrap handoff is currently process-local and the isolated Pod does not share guest localhost.
+5. Add live sidecar conformance on a real cluster across worker restart and an explicit guest-to-sidecar network relay; the isolated Pod still does not share guest localhost. Resident bootstrap handoff is no longer process-local: with `SANDBOXWICH_BOOTSTRAP_HANDOFF_KEY` configured, sealed ephemeral rows carry it across API restart, replica failover, and cross-replica replay under the same generation/lease/digest fence, covered by SQLite and PostgreSQL contract tests.
 
 ## Non-goals for 0.1
 

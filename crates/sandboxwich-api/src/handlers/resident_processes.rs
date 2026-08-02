@@ -9,8 +9,8 @@ use crate::handlers::resident_attestations::{
 };
 use crate::rows::{parse_timestamp, row_to_job, row_to_resident_process};
 use crate::state::{
-    AppState, LiveResidentBootstrap, Principal, ResidentBootstrapDeliveryError,
-    ResidentBootstrapFence, TenantContext,
+    AppState, LiveResidentBootstrap, Principal, ResidentBootstrapDelivery,
+    ResidentBootstrapDeliveryError, ResidentBootstrapFence, TenantContext,
 };
 use async_stream::stream;
 use axum::Json;
@@ -768,6 +768,11 @@ pub(crate) async fn put_resident_process(
             message: "resident bootstrap capacity is exhausted".into(),
         })?;
 
+    let handoff_bootstrap = bootstrap_reservation
+        .as_ref()
+        .filter(|_| state.resident_bootstraps.shared_handoff().is_some())
+        .map(|reservation| reservation.bootstrap().clone());
+
     let insert_sql = format!(
         "insert into resident_processes (
             id, sandbox_id, tenant_id, name, argv, cwd, env,
@@ -810,6 +815,29 @@ pub(crate) async fn put_resident_process(
         .execute(&mut *tx)
         .await?;
     insert_job_on_connection(&state.db, &mut tx, &job).await?;
+    // Seal the shared ephemeral copy in the same transaction as the row it
+    // belongs to, so a crash between the two can never leave a resident
+    // process whose bootstrap exists only in this process's memory.
+    if let (Some(handoff), Some(bootstrap)) = (
+        state.resident_bootstraps.shared_handoff(),
+        handoff_bootstrap.as_ref(),
+    ) {
+        handoff
+            .publish_on_connection(
+                &state.db,
+                &mut tx,
+                process.id,
+                process.sandbox_id,
+                bootstrap,
+                now,
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "failed to seal shared resident bootstrap handoff");
+                ApiError::internal("failed to record the resident bootstrap handoff")
+            })?;
+    }
+    drop(handoff_bootstrap);
     tx.commit().await?;
     if let Some(reservation) = bootstrap_reservation {
         reservation.publish(process.id);
@@ -942,6 +970,10 @@ pub(crate) async fn stop_resident_process(
             sha256,
             delivered_fence.as_ref(),
         );
+        state
+            .resident_bootstraps
+            .forget_shared(&state.db, process.id)
+            .await;
     }
     get_resident_process(State(state), Extension(ctx), Path((sandbox_id.0, name))).await
 }
@@ -964,24 +996,7 @@ pub(crate) async fn read_resident_process_bootstrap(
         lease_id: request.lease_id,
         sha256: request.expected_sha256.clone(),
     };
-    let delivery = state
-        .resident_bootstraps
-        .begin_delivery(&process_id, fence.clone())
-        .map_err(|error| match error {
-            ResidentBootstrapDeliveryError::Unavailable => ApiError {
-                status: StatusCode::GONE,
-                code: "resident_bootstrap_unavailable",
-                message: "resident bootstrap is unavailable or already acknowledged".into(),
-            },
-            ResidentBootstrapDeliveryError::InFlight => ApiError::conflict_code(
-                "resident_bootstrap_delivery_in_flight",
-                "resident bootstrap delivery is already in flight",
-            ),
-            ResidentBootstrapDeliveryError::FenceMismatch => ApiError::conflict_code(
-                "resident_bootstrap_fence_mismatch",
-                "resident bootstrap was delivered under a different lease fence",
-            ),
-        })?;
+    let delivery = begin_bootstrap_delivery(&state, &process, fence.clone()).await?;
     if delivery.bootstrap().generation != request.generation
         || delivery.bootstrap().sha256 != request.expected_sha256
     {
@@ -1172,6 +1187,72 @@ pub(crate) async fn read_resident_process_bootstrap(
         mode: bootstrap.mode,
         placement_attestation,
     }))
+}
+
+/// Starts a delivery attempt against the process-local store, rehydrating
+/// from the shared ephemeral handoff first if this process never admitted
+/// (or has since restarted and lost) the bootstrap.
+///
+/// Rehydration changes nothing about the fence: whether the recovered
+/// bootstrap is Ready or already Delivered is read back from the durable
+/// `bootstrap_delivered_*` columns, so a replica that never saw the original
+/// delivery still answers a mismatched generation, lease, or digest with
+/// `resident_bootstrap_fence_mismatch`, and an acknowledged bootstrap has no
+/// shared row left to recover at all.
+async fn begin_bootstrap_delivery(
+    state: &AppState,
+    process: &ResidentProcess,
+    fence: ResidentBootstrapFence,
+) -> Result<ResidentBootstrapDelivery, ApiError> {
+    let mut error = match state
+        .resident_bootstraps
+        .begin_delivery(&process.id, fence.clone())
+    {
+        Ok(delivery) => return Ok(delivery),
+        Err(error) => error,
+    };
+    if error == ResidentBootstrapDeliveryError::Unavailable
+        && let Some(handoff) = state.resident_bootstraps.shared_handoff()
+        && let Some(bootstrap) = handoff
+            .load(&state.db, process.id, process.sandbox_id, Utc::now())
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "failed to read shared resident bootstrap handoff");
+                ApiError::internal("failed to read the resident bootstrap handoff")
+            })?
+    {
+        let delivered_fence = delivered_bootstrap_fence(&state.db, process.id).await?;
+        if state
+            .resident_bootstraps
+            .rehydrate(process.id, bootstrap, delivered_fence)
+            .is_err()
+        {
+            return Err(ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "resident_bootstrap_capacity",
+                message: "resident bootstrap capacity is exhausted".into(),
+            });
+        }
+        match state.resident_bootstraps.begin_delivery(&process.id, fence) {
+            Ok(delivery) => return Ok(delivery),
+            Err(retry_error) => error = retry_error,
+        }
+    }
+    Err(match error {
+        ResidentBootstrapDeliveryError::Unavailable => ApiError {
+            status: StatusCode::GONE,
+            code: "resident_bootstrap_unavailable",
+            message: "resident bootstrap is unavailable or already acknowledged".into(),
+        },
+        ResidentBootstrapDeliveryError::InFlight => ApiError::conflict_code(
+            "resident_bootstrap_delivery_in_flight",
+            "resident bootstrap delivery is already in flight",
+        ),
+        ResidentBootstrapDeliveryError::FenceMismatch => ApiError::conflict_code(
+            "resident_bootstrap_fence_mismatch",
+            "resident bootstrap was delivered under a different lease fence",
+        ),
+    })
 }
 
 pub(crate) async fn observe_resident_process(
@@ -1405,6 +1486,10 @@ pub(crate) async fn observe_resident_process(
             .is_some();
         if acknowledged {
             state.resident_bootstraps.acknowledge(&process_id, &fence);
+            state
+                .resident_bootstraps
+                .forget_shared(&state.db, process_id)
+                .await;
         }
     }
     // The guest reports observations periodically for as long as the

@@ -1,5 +1,8 @@
+use crate::bootstrap_handoff::{
+    BOOTSTRAP_HANDOFF_KEY_BYTES, DEFAULT_BOOTSTRAP_HANDOFF_TTL, parse_bootstrap_handoff_key,
+};
 use anyhow::Context;
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 pub(crate) const IDENTITY_SERVICE_CLIENT_URI: &str =
     "spiffe://identity.evalops.dev/service/identity/sandboxwich-fence";
@@ -54,6 +57,13 @@ pub(crate) struct ApiConfig {
     pub(crate) disable_expiry_sweeper: bool,
     pub(crate) apex_callback_base_url: Option<String>,
     pub(crate) placement_attestation_derivation_key: Option<String>,
+    /// Sealing key for the shared ephemeral resident-bootstrap handoff.
+    /// Unset means no shared tier: bootstrap bytes stay in the process that
+    /// admitted them, and an API restart or a read on another replica
+    /// strands the resident process exactly as it did before the handoff
+    /// existed.
+    pub(crate) bootstrap_handoff_key: Option<[u8; BOOTSTRAP_HANDOFF_KEY_BYTES]>,
+    pub(crate) bootstrap_handoff_ttl: Duration,
     pub(crate) identity_mtls: Option<IdentityMtlsConfig>,
     pub(crate) sandbox_lifetime: SandboxLifetimeConfig,
 }
@@ -133,6 +143,17 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+    let bootstrap_handoff_key = std::env::var("SANDBOXWICH_BOOTSTRAP_HANDOFF_KEY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| parse_bootstrap_handoff_key(&value))
+        .transpose()?;
+    let bootstrap_handoff_ttl = match parse_env_u32("SANDBOXWICH_BOOTSTRAP_HANDOFF_TTL_SECONDS", 0)?
+    {
+        0 => DEFAULT_BOOTSTRAP_HANDOFF_TTL,
+        seconds => Duration::from_secs(u64::from(seconds)),
+    };
     if placement_attestation_derivation_key
         .as_ref()
         .is_some_and(|key| key.len() < 32)
@@ -172,6 +193,8 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
         disable_expiry_sweeper,
         apex_callback_base_url,
         placement_attestation_derivation_key,
+        bootstrap_handoff_key,
+        bootstrap_handoff_ttl,
         identity_mtls,
         sandbox_lifetime,
     })
