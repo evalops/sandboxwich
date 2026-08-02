@@ -32,6 +32,7 @@ async fn create_sandbox_with_idle_ttl(
     client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             name: Some(name.to_string()),
             template: None,
             memory_limit: None,

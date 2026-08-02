@@ -2,6 +2,7 @@ use crate::auth::{ensure_lease_worker_scope, ensure_sandbox_tenant};
 use crate::db::Database;
 use crate::error::ApiError;
 use crate::handlers::jobs::{add_provision_spec_to_payload, insert_job_on_connection};
+use crate::handlers::secrets::fetch_sandbox_secret_mounts;
 use crate::state::{
     APEX_INSTRUCTION_READ_TIMEOUT, ApexInstructionDelivery, ApexWaiterGuard, ApexWaiterInsertError,
     AppState, TenantContext,
@@ -288,7 +289,8 @@ pub(crate) async fn read_apex_task_instructions(
         updated_at: now,
         last_error: None,
     };
-    add_provision_spec_to_payload(&mut job, &sandbox)?;
+    let secret_mounts = fetch_sandbox_secret_mounts(&state.db, sandbox.id).await?;
+    add_provision_spec_to_payload(&mut job, &sandbox, &secret_mounts)?;
     let (sender, receiver) = oneshot::channel();
     match state.apex_waiters.try_insert(callback_nonce, sender) {
         Ok(()) => {}

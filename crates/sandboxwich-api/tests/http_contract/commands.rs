@@ -17,6 +17,7 @@ pub(crate) async fn apex_command_claim_requires_exact_profile_and_runtime_image(
     let created: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             name: Some("apex-command".to_string()),
             template: Some(runtime_image.clone()),
             memory_limit: Some(MemoryLimit::FourG),
@@ -233,6 +234,7 @@ pub(crate) async fn command_stdin_is_redacted_from_tenant_jobs_but_preserved_for
     let created: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             workspace_mode: None,
             runtime_profile: None,
             name: Some("stdin-redaction-test".to_string()),
@@ -463,6 +465,7 @@ pub(crate) async fn command_stdin_over_one_mib_is_rejected_before_job_dispatch()
     let created: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             workspace_mode: None,
             runtime_profile: None,
             name: Some("stdin-limit-test".to_string()),
@@ -573,6 +576,7 @@ pub(crate) async fn small_body_route_rejects_oversized_json_but_upload_route_acc
     let created: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: None,
             runtime_profile: None,
@@ -666,6 +670,7 @@ pub(crate) async fn list_commands_respect_limit_and_paginate_with_cursor() {
     let created: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: None,
             runtime_profile: None,
