@@ -5039,6 +5039,27 @@ fn kubernetes_provision_fails_closed_when_secret_csi_driver_is_unconfigured() {
 }
 
 #[test]
+fn kubernetes_provision_rejects_duplicate_secret_mount_names() {
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_secret_csi_driver(Some("secrets-store.csi.k8s.io".to_string()));
+    let spec = SandboxProvisionSpec {
+        secret_mounts: vec![
+            secret_mount_fixture("openai-api-key"),
+            secret_mount_fixture("openai-api-key"),
+        ],
+        ..SandboxProvisionSpec::default()
+    };
+    let error = provider
+        .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+        .expect_err("two mounts sharing a name render two Pod volumes with the same name");
+    assert!(
+        error.to_string().contains("appears more than once"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn kubernetes_provision_rejects_secret_mounts_with_non_derived_paths() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)

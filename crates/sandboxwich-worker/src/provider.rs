@@ -638,7 +638,16 @@ impl KubernetesDryRunProvider {
             self.secret_csi_driver.is_some(),
             "secret delivery requires a Secrets Store CSI driver configured on this worker"
         );
+        let mut seen_names = std::collections::HashSet::new();
         for mount in &spec.secret_mounts {
+            // Two mounts sharing a name render two Pod volumes with the same
+            // name; the control plane cannot produce that, so reject it here
+            // rather than let the API server reject it at apply time.
+            anyhow::ensure!(
+                seen_names.insert(mount.name.as_str()),
+                "secret delivery name {} appears more than once in this spec",
+                mount.name
+            );
             match mount.delivery {
                 SecretDelivery::File => {}
             }

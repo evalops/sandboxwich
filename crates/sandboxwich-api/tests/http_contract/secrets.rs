@@ -482,6 +482,128 @@ async fn run_secret_binding_contract(server: TestServer) {
     );
 }
 
+async fn register_worker(server: &TestServer, name: &str, secret_delivery: bool) -> WorkerResponse {
+    let mut labels = std::collections::BTreeMap::new();
+    if secret_delivery {
+        labels.insert(
+            PROVIDER_SECRET_DELIVERY_LABEL.to_string(),
+            PROVIDER_SECRET_DELIVERY_LABEL_VALUE.to_string(),
+        );
+    }
+    server
+        .client()
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: name.to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![
+                WorkerCapability::K8sPod,
+                WorkerCapability::ProvisionSandbox,
+                WorkerCapability::RunCommand,
+            ],
+            max_concurrent_jobs: Some(1),
+            labels,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+async fn claim_provision(
+    server: &TestServer,
+    worker: &WorkerResponse,
+    sandbox_id: SandboxId,
+) -> ClaimLeaseResponse {
+    worker_client(worker)
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox_id),
+            kinds: Some(vec![JobKind::ProvisionSandbox]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// Secret delivery is operator-configured on the worker, and the provider
+/// refuses to provision without it. Placement therefore has to be negotiated:
+/// in a mixed fleet an unconfigured worker must not be able to take the job,
+/// fail it, and burn its retries while a configured worker sits idle.
+#[tokio::test]
+async fn secret_bound_provisioning_is_only_leased_to_a_delivery_capable_worker() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("secret-placement.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+    let bound = create_ref(&server, &client, "openai-api-key", "ws-1").await;
+
+    let plain: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&create_sandbox_request(Vec::new()))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let secret_bound: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&create_sandbox_request(vec![bound.id]))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let unconfigured = register_worker(&server, "no-secret-delivery", false).await;
+    assert!(
+        claim_provision(&server, &unconfigured, secret_bound.sandbox.id)
+            .await
+            .lease
+            .is_none(),
+        "a worker without secret delivery must not claim a secret-bound provision"
+    );
+    // The same worker is still perfectly able to take ordinary work, so this
+    // is a targeted requirement rather than a fleet-wide exclusion.
+    assert!(
+        claim_provision(&server, &unconfigured, plain.sandbox.id)
+            .await
+            .lease
+            .is_some()
+    );
+
+    let configured = register_worker(&server, "secret-delivery", true).await;
+    assert!(
+        claim_provision(&server, &configured, secret_bound.sandbox.id)
+            .await
+            .lease
+            .is_some(),
+        "a configured worker must be able to claim the same job"
+    );
+}
+
 #[tokio::test]
 async fn sandbox_secret_bindings_are_tenant_scoped_and_fail_closed_over_sqlite() {
     let data_dir = tempfile::tempdir().unwrap();

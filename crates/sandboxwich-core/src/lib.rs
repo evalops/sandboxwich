@@ -3334,6 +3334,15 @@ pub const MAX_SECRET_REF_NAME_LEN: usize = 63 - SANDBOX_SECRET_VOLUME_PREFIX.len
 
 /// Prefix keeping a delivery volume from colliding with the worker's own.
 pub const SANDBOX_SECRET_VOLUME_PREFIX: &str = "sandboxwich-secret-";
+
+/// Advertises that a worker is configured to deliver secret references, so a
+/// secret-bound sandbox is only placed on a worker that can actually mount it.
+/// A label rather than a new [`WorkerCapability`] value, for the same reason
+/// as the sidecar labels above: the capability enum is a closed wire enum, and
+/// a worker advertising an unknown value cannot register against an older API
+/// server during a rolling upgrade.
+pub const PROVIDER_SECRET_DELIVERY_LABEL: &str = "provider_secret_delivery";
+pub const PROVIDER_SECRET_DELIVERY_LABEL_VALUE: &str = "csi_secret_provider_class";
 pub const MAX_SECRET_SCOPE_ID_LEN: usize = 128;
 pub const MAX_SECRET_SOURCE_OBJECT_NAME_LEN: usize = 253;
 pub const MAX_SECRET_SOURCE_OBJECT_KEY_LEN: usize = 253;

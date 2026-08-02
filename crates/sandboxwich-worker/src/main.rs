@@ -26,7 +26,8 @@ use sandboxwich_core::{
     MintGuestTokenRequest, ORB_SIDECAR_RESIDENT_PROCESS_NAME,
     PROVIDER_ISOLATED_RESIDENT_PROCESS_IMAGE_LABEL,
     PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL,
-    PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE, ProvisioningOperationResponse,
+    PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE, PROVIDER_SECRET_DELIVERY_LABEL,
+    PROVIDER_SECRET_DELIVERY_LABEL_VALUE, ProvisioningOperationResponse,
     ProvisioningStageUpdateRequest, RegisterWorkerRequest, RenewLeaseRequest,
     ResidentProcessBootstrapReadRequest, ResidentProcessBootstrapReadResponse, ResidentProcessId,
     ResidentProcessObservationRequest, ResidentProcessObservedState, ResidentProcessRestartPolicy,
@@ -1033,6 +1034,10 @@ async fn main() -> anyhow::Result<()> {
                 args.provider.provider_mode,
                 args.provider.provider.runtime_image.as_deref(),
                 args.provider.provider.apex_trusted_supervisor_v1,
+            );
+            add_secret_delivery_label(
+                &mut labels,
+                non_empty(args.provider.provider.secret_csi_driver.clone()).is_some(),
             );
             add_provider_isolated_resident_process_label(&mut labels, provider_isolated_sidecar);
             add_provider_isolated_resident_process_image_label(
@@ -3714,6 +3719,19 @@ fn add_provider_isolated_resident_process_label(
         labels.insert(
             PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL.to_string(),
             PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE.to_string(),
+        );
+    }
+}
+
+/// Advertises secret delivery only when the CSI driver is actually configured,
+/// so the scheduler never places a secret-bound sandbox on a worker whose
+/// provider would refuse it.
+fn add_secret_delivery_label(labels: &mut BTreeMap<String, String>, configured: bool) {
+    labels.remove(PROVIDER_SECRET_DELIVERY_LABEL);
+    if configured {
+        labels.insert(
+            PROVIDER_SECRET_DELIVERY_LABEL.to_string(),
+            PROVIDER_SECRET_DELIVERY_LABEL_VALUE.to_string(),
         );
     }
 }

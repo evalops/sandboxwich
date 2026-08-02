@@ -297,7 +297,7 @@ pub(crate) async fn resolve_secret_mounts(
     // Sorted by name, matching how the bindings are read back, so the spec a
     // later job re-derives is identical to the one the Pod came up with
     // regardless of the order the caller listed its ids in.
-    mounts.sort_by(|left, right| left.name.cmp(&right.name));
+    sort_secret_mounts(&mut mounts);
     Ok(mounts)
 }
 
@@ -356,17 +356,29 @@ pub(crate) async fn fetch_sandbox_secret_mounts_on_connection(
     let sql = format!(
         "select secret_ref_id, name, backend, source_object_name, source_object_key,
                 delivery, mount_dir, file_path, env_file_variable
-         from sandbox_secret_bindings where sandbox_id = {}
-         order by name asc",
+         from sandbox_secret_bindings where sandbox_id = {}",
         db.placeholder(1)
     );
-    sqlx::query(&sql)
+    let mut mounts = sqlx::query(&sql)
         .bind(sandbox_id.to_string())
         .fetch_all(&mut *connection)
         .await?
         .into_iter()
         .map(row_to_secret_mount)
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    // Ordered in Rust, not by the database: `order by name` is collation
+    // dependent (a glibc-collated Postgres ignores punctuation at the primary
+    // level, so it disagrees with Rust's byte order), and the invariant here is
+    // that the spec re-derived for a later job is byte-identical to the one the
+    // Pod came up with.
+    sort_secret_mounts(&mut mounts);
+    Ok(mounts)
+}
+
+/// The one ordering used for both the create-time spec and every later
+/// re-derivation of it.
+pub(crate) fn sort_secret_mounts(mounts: &mut [SandboxSecretMount]) {
+    mounts.sort_by(|left, right| left.name.cmp(&right.name));
 }
 
 fn row_to_secret_mount(row: sqlx::any::AnyRow) -> Result<SandboxSecretMount, ApiError> {

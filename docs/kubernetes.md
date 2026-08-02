@@ -294,7 +294,12 @@ spec:
 Pass `--secret-csi-driver secrets-store.csi.k8s.io` (or set
 `SANDBOXWICH_SECRET_CSI_DRIVER`) on the worker. **Delivery fails closed:** while
 the flag is unset, provisioning a sandbox that binds a reference is refused
-rather than producing a Pod that silently lacks its credential.
+rather than producing a Pod that silently lacks its credential. A worker
+started with the flag registers the label
+`provider_secret_delivery=csi_secret_provider_class`, and the API only leases
+secret-bound provisioning work to a worker carrying it, so in a fleet where
+only some workers are configured the job waits for a capable worker instead of
+dying on an unconfigured one.
 
 Each bound reference becomes a read-only CSI volume at
 `/run/sandboxwich/secrets/<name>`, and the guest receives the *path* — never
