@@ -52,10 +52,19 @@ These capabilities remain Experimental until every gate below passes for a named
 ## Next work
 
 1. Add live Cilium FQDN conformance on a Cilium-backed disposable cluster.
-2. Add a microVM provider and compare its lifecycle and recovery behavior with RuntimeClass-backed Kubernetes.
-3. Add a brokered desktop transport; current desktop records do not create an ingress tunnel.
-4. Add production secret storage before accepting long-lived user or model credentials.
-5. Add live sidecar conformance across worker restart, API replica failover, and an explicit guest-to-sidecar network relay; bootstrap handoff is currently process-local and the isolated Pod does not share guest localhost.
+2. Certify the `virtual_machine`/Kata execution class (SW-3). The gate itself
+   exists -- `deploy/kubernetes/kata-conformance.sh`, run by
+   `.github/workflows/kata-conformance.yml` -- and asserts the isolation,
+   lifecycle-recovery and fail-closed requirements above against a real Kata
+   RuntimeClass. What is missing is the cluster: no GitHub-hosted runner
+   exposes `/dev/kvm`, so the gate is manual-dispatch-only against a
+   self-hosted, Kata-capable disposable cluster and has never run green.
+   The class stays Experimental until it does; see docs/capabilities.md,
+   "SW-3: what remains before `virtual_machine` can be certified".
+3. Add a microVM provider and compare its lifecycle and recovery behavior with RuntimeClass-backed Kubernetes.
+4. Add a brokered desktop transport; current desktop records do not create an ingress tunnel.
+5. Add production secret storage before accepting long-lived user or model credentials.
+6. Add live sidecar conformance across worker restart, API replica failover, and an explicit guest-to-sidecar network relay; bootstrap handoff is currently process-local and the isolated Pod does not share guest localhost.
 
 ## Non-goals for 0.1
 

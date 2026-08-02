@@ -104,3 +104,34 @@ chosen cluster. Registration and dry-run provider reports describe configured
 capability, not readiness or certification. In particular,
 `virtual_machine`/Kata execution is experimental and must not be treated as
 certified until the SW-3 live conformance gate passes.
+
+A dry-run worker never advertises `virtual_machine`: a simulated provision
+starts no guest, so it cannot supply a VM boundary. Only an apply-mode worker
+with the `kata` profile and a nonempty RuntimeClass does. On the apply path the
+provider additionally reads the admitted Pod's `spec.runtimeClassName` from the
+API server and fails closed (terminal, `runtime_class_boundary_unverified`)
+unless it matches the configured RuntimeClass, before any guest work runs and
+again before an existing Pod is reused. A rendered manifest is not evidence: a
+mutating webhook can strip the field.
+
+### SW-3: what remains before `virtual_machine` can be certified
+
+`deploy/kubernetes/kata-conformance.sh` is the gate. It provisions a real
+`execution_class=virtual_machine` sandbox through the API on a Kata-capable
+cluster and asserts the guest kernel differs from the node kernel, no host
+processes or kubelet credentials are visible, lease/worker/API restart recovery
+and out-of-band Pod deletion reach deterministic terminal states, cleanup leaks
+nothing, and a worker without the `kata` profile never satisfies VM-class work.
+It has no skip path.
+
+Remaining for certification:
+
+1. A Kata-capable disposable cluster in CI. No GitHub-hosted runner exposes
+   `/dev/kvm`, so `.github/workflows/kata-conformance.yml` is manual dispatch
+   against a self-hosted runner and is not a required check.
+2. A green run of that workflow on a release commit, recorded here.
+3. Deploy-side Kata nodes and RuntimeClass (evalops/deploy) for any
+   non-disposable cluster that should serve the class.
+
+Until 1-3 hold, the class stays Experimental regardless of the fail-closed
+validation and unit coverage already in place.

@@ -1,0 +1,103 @@
+name: kata-conformance
+
+# SW-3 live conformance for the `virtual_machine` execution class.
+#
+# Manual dispatch only, and deliberately not a required check: a Kata
+# RuntimeClass needs a runtime handler backed by hardware (or nested)
+# virtualization, which no GitHub-hosted runner provides. Wiring this on
+# `pull_request` with the runners available today would produce a check that
+# is green because it could not test anything -- exactly the unsupported
+# certification claim docs/capabilities.md warns about.
+#
+# Run it against a disposable, Kata-capable cluster (see docs/kubernetes.md).
+# A green run is the evidence required to promote the class; until this runs
+# green on real Kata nodes, virtual_machine stays experimental.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Self-hosted runner label with kubectl access to a Kata-capable cluster
+        required: true
+        type: string
+      kube_context:
+        description: kubectl context of the disposable Kata cluster
+        required: true
+        type: string
+      runtime_class:
+        description: Kata RuntimeClass name
+        required: false
+        default: kata-qemu
+        type: string
+      storage_class:
+        description: StorageClass for sandbox workspaces
+        required: false
+        default: standard
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.kube_context }}
+  cancel-in-progress: false
+
+jobs:
+  kata:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve digest-pinned images from the deployed manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The conformance run must certify images that exist as published
+          # digests, not locally built tags: a VM boundary proven for an
+          # unpublished build certifies nothing operators can deploy.
+          api_image="$(grep -o 'ghcr.io/evalops/sandboxwich-api@sha256:[0-9a-f]\{64\}' \
+            deploy/kubernetes/api.yaml | head -n1)"
+          worker_image="$(grep -o 'ghcr.io/evalops/sandboxwich-worker@sha256:[0-9a-f]\{64\}' \
+            deploy/kubernetes/worker.yaml | head -n1)"
+          runtime_image="$(grep -o 'ghcr.io/evalops/sandboxwich-ubuntu-dev@sha256:[0-9a-f]\{64\}' \
+            deploy/kubernetes/worker.yaml | head -n1)"
+          for image in "${api_image}" "${worker_image}" "${runtime_image}"; do
+            [[ "${image}" == *@sha256:* ]] || {
+              echo "could not resolve a digest-pinned image from the manifests" >&2
+              exit 1
+            }
+          done
+          {
+            echo "SANDBOXWICH_API_IMAGE=${api_image}"
+            echo "SANDBOXWICH_WORKER_IMAGE=${worker_image}"
+            echo "SANDBOXWICH_GATEWAY_IMAGE=${worker_image}"
+            echo "SANDBOXWICH_RUNTIME_IMAGE=${runtime_image}"
+          } >>"${GITHUB_ENV}"
+      - name: Run Kata (virtual_machine) conformance
+        env:
+          SANDBOXWICH_KUBE_CONTEXT: ${{ inputs.kube_context }}
+          SANDBOXWICH_KATA_RUNTIME_CLASS: ${{ inputs.runtime_class }}
+          SANDBOXWICH_STORAGE_CLASS: ${{ inputs.storage_class }}
+        run: deploy/kubernetes/kata-conformance.sh
+      - name: Collect cluster diagnostics
+        if: failure()
+        env:
+          SANDBOXWICH_KUBE_CONTEXT: ${{ inputs.kube_context }}
+        run: |
+          kubectl --context "${SANDBOXWICH_KUBE_CONTEXT}" get all -A -o wide || true
+          kubectl --context "${SANDBOXWICH_KUBE_CONTEXT}" get events -A --sort-by=.lastTimestamp || true
+          kubectl --context "${SANDBOXWICH_KUBE_CONTEXT}" -n sandboxwich \
+            logs deployment/sandboxwich-worker --tail=-1 --prefix || true
+      - name: Delete conformance namespaces
+        if: always()
+        env:
+          SANDBOXWICH_KUBE_CONTEXT: ${{ inputs.kube_context }}
+        run: |
+          kubectl --context "${SANDBOXWICH_KUBE_CONTEXT}" delete namespace \
+            sandboxwich-sandboxes sandboxwich --ignore-not-found --wait=true || true
