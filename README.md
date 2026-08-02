@@ -152,9 +152,11 @@ and survive API restarts. Exhausted request or mutation budgets return `429`
 with `Retry-After` and the stable codes `tenant_rate_limit_exceeded` or
 `tenant_mutation_quota_exceeded`; tenants without a policy remain unlimited.
 
-Sandbox creation and stop are asynchronous and return HTTP `202` with an
-Operation. Resource-only creation endpoints return `201`. Resume is explicitly
-unsupported until a provider can restore durable state. The prompt endpoint
+Sandbox creation, stop, and resume are asynchronous and return HTTP `202` with
+an Operation. Resource-only creation endpoints return `201`. Resume restores an
+archived sandbox in place from one of its own ready snapshots (see
+`docs/capabilities.md`); it requires `workspace_mode=persistent` and fails
+closed with a typed `409` when no matching snapshot exists. The prompt endpoint
 returns typed `501 agent_prompt_unavailable`, and workers do not advertise the
 prompt capability.
 

@@ -2295,12 +2295,63 @@ pub(crate) async fn apply_completed_job_on_connection(
                 .execute(&mut *connection)
                 .await?;
         }
-        (JobKind::ResumeSandbox, WorkerJobResult::ResumeSandbox { sandbox_id, .. }) => {
-            if sandbox_id != sandbox_id_from_job(job)? {
+        (JobKind::ResumeSandbox, WorkerJobResult::ResumeSandbox { handle }) => {
+            let sandbox_id = sandbox_id_from_job(job)?;
+            let snapshot_id = snapshot_id_from_job(job)?;
+            if handle.sandbox_id != sandbox_id || handle.snapshot_id != snapshot_id {
                 return Err(ApiError::bad_request(
-                    "resume completion result does not match job sandbox",
+                    "resume completion result does not match job payload",
                 ));
             }
+            // The restored workspace PVC legitimately carries the snapshot it
+            // was cloned from; nothing else may.
+            validate_completed_runtime_resources(
+                &handle.resources,
+                sandbox_id,
+                None,
+                Some(snapshot_id),
+            )?;
+            // The stop that archived this sandbox tore its cluster resources
+            // down, but their rows survive as the last known state. Retire
+            // them before recording the restored set so the sandbox's history
+            // shows one destroyed generation followed by one restored
+            // generation, instead of pre-teardown rows silently mutating into
+            // post-restore ones.
+            mark_runtime_resources_deleted_for_sandbox_on_connection(
+                db,
+                connection,
+                sandbox_id,
+                Utc::now(),
+                "superseded by snapshot-backed resume",
+            )
+            .await?;
+            // Recorded before the state transition on purpose: if the sandbox
+            // was stopped again while this resume was in flight, the CAS below
+            // loses and the sandbox stays archived -- but the resources the
+            // provider really did create are now durable rows, so archived
+            // cleanup tears them down instead of leaking them in the cluster.
+            upsert_provider_runtime_resources_on_connection(
+                db,
+                connection,
+                &handle.resources,
+                &job.tenant_id,
+            )
+            .await?;
+            let next_state = SandboxState::Ready;
+            set_sandbox_state_on_connection(
+                db,
+                connection,
+                sandbox_id,
+                SandboxState::RESUME_COMPLETED_LEGAL_FROM,
+                next_state.clone(),
+                json!({
+                    "state": next_state,
+                    "reason": "resume_ready",
+                    "restoredFromSnapshotId": snapshot_id,
+                    "provider": handle.provider
+                }),
+            )
+            .await?;
         }
         (JobKind::DeleteHome, WorkerJobResult::DeleteHome { home_id, .. }) => {
             if home_id != home_id_from_job(job)? {
@@ -2408,6 +2459,10 @@ pub(crate) async fn apply_claimed_job_on_connection(
             )
             .await?;
         }
+        // A `ResumeSandbox` job needs no claim-time transition: unlike a
+        // fork's child (which waits in `Planning` for its parent's snapshot),
+        // the sandbox was already moved to `Provisioning` when the resume was
+        // requested.
         JobKind::ProvisionSandbox
         | JobKind::StopSandbox
         | JobKind::ResumeSandbox
@@ -2488,9 +2543,26 @@ pub(crate) async fn apply_retryable_job_on_connection(
             )
             .await?;
         }
+        JobKind::ResumeSandbox => {
+            // The sandbox stays in `Provisioning` across a resume retry -- the
+            // job is going to run again against the same snapshot -- so this
+            // only records why the attempt is being repeated.
+            insert_event_on_connection(
+                db,
+                connection,
+                sandbox_id_from_job(job)?,
+                SandboxEventKind::LifecycleChanged,
+                json!({
+                    "state": SandboxState::Provisioning,
+                    "reason": "resume_retry",
+                    "restoredFromSnapshotId": snapshot_id_from_job(job)?,
+                    "error": error
+                }),
+            )
+            .await?;
+        }
         JobKind::ProvisionSandbox
         | JobKind::StopSandbox
-        | JobKind::ResumeSandbox
         | JobKind::RunResidentProcess
         | JobKind::MaterializeFile
         | JobKind::ApexTaskInstructions
@@ -2625,7 +2697,26 @@ pub(crate) async fn apply_failed_job_on_connection(
                 .execute(&mut *connection)
                 .await?;
         }
-        JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {}
+        JobKind::ResumeSandbox => {
+            let sandbox_id = sandbox_id_from_job(job)?;
+            let snapshot_id = snapshot_id_from_job(job)?;
+            let next_state = SandboxState::Archived;
+            set_sandbox_state_on_connection(
+                db,
+                connection,
+                sandbox_id,
+                SandboxState::RESUME_FAILED_LEGAL_FROM,
+                next_state.clone(),
+                json!({
+                    "state": next_state,
+                    "reason": "resume_failed",
+                    "restoredFromSnapshotId": snapshot_id,
+                    "error": error
+                }),
+            )
+            .await?;
+        }
+        JobKind::ProvisionSandbox | JobKind::StopSandbox => {}
         JobKind::DeleteHome => {
             mark_home_delete_failed_on_connection(db, connection, home_id_from_job(job)?, error)
                 .await?;

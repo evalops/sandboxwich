@@ -3288,20 +3288,19 @@ fn execute_job_with_reporter(
             }))
         }
         JobKind::ResumeSandbox => {
+            // Stopping a sandbox tears down its Pod/PVC/Services/NetworkPolicy
+            // (see StopSandbox above), so a resume is a re-provision of the
+            // same sandbox with its workspace volume restored from a durable
+            // snapshot rather than created empty. Provider errors propagate so
+            // a failed restore fails the job instead of reporting a sandbox
+            // that is "resumed" without its state.
             let sandbox_id = sandbox_id_from_payload(&job.payload)?;
-            // Decision: stopping a sandbox tears down its Pod/PVC/Services/NetworkPolicy
-            // (see StopSandbox above and provider::SandboxProvider::stop), so there is no
-            // live workload left to resume. Rather than silently reporting success on a
-            // sandbox that in fact no longer exists, fail the job explicitly and point
-            // callers at provisioning a replacement (optionally forked from a snapshot).
-            // A "true" resume (restoring a stopped-but-not-deleted sandbox) is not
-            // implemented; revisit if StopSandbox gains a suspend-in-place mode.
-            Ok(WorkerJobOutcome::Fail {
-                error: format!(
-                    "resume is not supported: stopping sandbox {sandbox_id} tears down its resources; provision a new sandbox (or fork from a snapshot) instead"
-                ),
-                retry: false,
-            })
+            let snapshot_id = snapshot_id_from_payload(&job.payload)?;
+            let spec = provision_spec_from_payload(&job.payload)?;
+            let handle = provider.resume(sandbox_id, snapshot_id, &spec, cancelled)?;
+            Ok(WorkerJobOutcome::Complete(WorkerJobResult::ResumeSandbox {
+                handle,
+            }))
         }
         JobKind::DeleteHome => {
             let home_id = job

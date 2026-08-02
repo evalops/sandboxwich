@@ -381,13 +381,30 @@ pub(crate) async fn upsert_provider_runtime_resource_on_connection(
     };
 
     let existing = fetch_runtime_resource_on_connection(db, connection, resource_id).await?;
+    // A destroyed resource has released its provider identity, so the same
+    // sandbox may recreate that name against a different snapshot lineage --
+    // that is exactly what a snapshot-backed resume does when it restores the
+    // workspace volume the stop tore down. Every other identity change (other
+    // sandbox, or a live resource silently changing lineage) stays rejected.
+    let recreated_by_same_sandbox = existing.sandbox_id == resource.sandbox_id
+        && matches!(
+            existing.status,
+            RuntimeResourceStatus::Deleted | RuntimeResourceStatus::Destroyed
+        );
     if existing.sandbox_id != resource.sandbox_id
-        || existing.snapshot_id != resource.snapshot_id
-        || existing.source_snapshot_id != resource.source_snapshot_id
+        || (!recreated_by_same_sandbox
+            && (existing.snapshot_id != resource.snapshot_id
+                || existing.source_snapshot_id != resource.source_snapshot_id))
     {
-        return Err(ApiError::bad_request(
-            "runtime resource provider identity belongs to a different association",
-        ));
+        return Err(ApiError::bad_request(format!(
+            "runtime resource provider identity belongs to a different association DEBUG name={} status={:?} existing_sb={} new_sb={} existing_src={:?} new_src={:?}",
+            resource.resource_name,
+            existing.status,
+            existing.sandbox_id,
+            resource.sandbox_id,
+            existing.source_snapshot_id,
+            resource.source_snapshot_id
+        )));
     }
     if let Some(tenant_id) = tenant_id {
         ensure_sandbox_tenant_on_connection(db, connection, existing.sandbox_id, tenant_id).await?;
