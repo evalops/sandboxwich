@@ -260,8 +260,31 @@ pub(crate) async fn validate_job_payload_tenant(
     ctx: &TenantContext,
 ) -> Result<(), ApiError> {
     match job.kind {
-        JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {
+        JobKind::ProvisionSandbox | JobKind::StopSandbox => {
             ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
+        }
+        JobKind::ResumeSandbox => {
+            // Owning the sandbox is not sufficient authority to resume it from
+            // an arbitrary snapshot: the snapshot is what the workspace volume
+            // is cloned from, so a directly-created resume job goes through the
+            // same tenant/ownership/placement claim the resume route uses.
+            let sandbox = ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
+            let now = Utc::now();
+            // The same preconditions the resume route enforces. Without them a
+            // tenant could queue a restore against its own *running* sandbox,
+            // and the provider's failed apply would roll back (delete) that
+            // sandbox's live Pod and workspace volume.
+            ensure_sandbox_resumable(&sandbox, now)?;
+            let mut connection = db.pool.acquire().await?;
+            claim_sandbox_resume_snapshot_on_connection(
+                db,
+                &mut connection,
+                &sandbox,
+                Some(snapshot_id_from_job(job)?),
+                ctx,
+                now,
+            )
+            .await?;
         }
         JobKind::RunCommand => {
             ensure_sandbox_tenant(db, sandbox_id_from_job(job)?, ctx).await?;
@@ -525,8 +548,12 @@ pub(crate) struct JobReferences {
 pub(crate) fn job_references(job: &Job) -> Result<JobReferences, ApiError> {
     let mut references = JobReferences::default();
     match job.kind {
-        JobKind::ProvisionSandbox | JobKind::StopSandbox | JobKind::ResumeSandbox => {
+        JobKind::ProvisionSandbox | JobKind::StopSandbox => {
             references.sandbox_id = Some(sandbox_id_from_job(job)?);
+        }
+        JobKind::ResumeSandbox => {
+            references.sandbox_id = Some(sandbox_id_from_job(job)?);
+            references.snapshot_id = Some(snapshot_id_from_job(job)?);
         }
         JobKind::RunCommand => {
             references.sandbox_id = Some(sandbox_id_from_job(job)?);

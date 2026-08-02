@@ -992,30 +992,83 @@ fn stop_sandbox_job_rejects_an_invalid_persisted_teardown_hint() {
 }
 
 #[test]
-fn resume_sandbox_job_fails_instead_of_silently_succeeding() {
+fn resume_sandbox_job_restores_the_workspace_from_its_snapshot() {
     let sandbox_id = SandboxId::new();
+    let snapshot_id = SnapshotId::new();
     let outcome = execute_job(
         &job(
             JobKind::ResumeSandbox,
-            json!({ "sandboxId": sandbox_id }),
-            WorkerCapability::K8sPod,
+            json!({
+                "sandboxId": sandbox_id,
+                "snapshotId": snapshot_id
+            }),
+            WorkerCapability::Snapshot,
+        ),
+        // Through the dispatch enum the worker binary actually runs on, not the
+        // concrete provider: a missing arm there falls through to the trait's
+        // fail-closed default, which a test calling the provider directly
+        // cannot see.
+        &RuntimeProvider::DryRun(provider()),
+        &CancelSignal::never_cancelled(),
+    )
+    .expect("resume job should execute");
+    let WorkerJobResult::ResumeSandbox { handle } = completed_result(outcome) else {
+        panic!("expected resume result");
+    };
+    // The restored sandbox keeps its own identity -- a resume is not a fork --
+    // and its workspace volume is cloned from the snapshot rather than created
+    // empty, which is the whole point of the operation.
+    assert_eq!(handle.sandbox_id, sandbox_id);
+    assert_eq!(handle.snapshot_id, snapshot_id);
+    assert!(handle.resources.iter().any(|resource| {
+        resource.resource_kind == RuntimeResourceKind::PersistentVolumeClaim
+            && resource.sandbox_id == sandbox_id
+            && resource.source_snapshot_id == Some(snapshot_id)
+    }));
+    assert!(
+        handle
+            .resources
+            .iter()
+            .any(|resource| resource.resource_kind == RuntimeResourceKind::Pod)
+    );
+}
+
+#[test]
+fn resume_sandbox_job_refuses_an_ephemeral_workspace() {
+    // Nothing durable was ever written for an ephemeral workspace, so a
+    // "successful" resume would hand back an empty box; fail closed instead.
+    let error = execute_job(
+        &job(
+            JobKind::ResumeSandbox,
+            json!({
+                "sandboxId": SandboxId::new(),
+                "snapshotId": SnapshotId::new(),
+                "provisionSpec": { "workspace_mode": "ephemeral" }
+            }),
+            WorkerCapability::Snapshot,
         ),
         &provider(),
         &CancelSignal::never_cancelled(),
     )
-    .expect("resume job should execute (and report a job failure)");
-    match outcome {
-        WorkerJobOutcome::Fail { error, retry } => {
-            assert!(!retry, "resume is a permanent decision, not worth retrying");
-            assert!(error.contains(&sandbox_id.to_string()));
-        }
-        WorkerJobOutcome::Complete(_) => {
-            panic!("resume must not silently report success")
-        }
-        WorkerJobOutcome::ApexTaskInstructions { .. } => {
-            panic!("resume must not produce an instruction callback")
-        }
-    }
+    .expect_err("resuming an ephemeral workspace must fail");
+
+    assert!(error.to_string().contains("workspace_mode=persistent"));
+}
+
+#[test]
+fn resume_sandbox_job_requires_a_snapshot_to_restore_from() {
+    let error = execute_job(
+        &job(
+            JobKind::ResumeSandbox,
+            json!({ "sandboxId": SandboxId::new() }),
+            WorkerCapability::Snapshot,
+        ),
+        &provider(),
+        &CancelSignal::never_cancelled(),
+    )
+    .expect_err("a resume job without a snapshot must fail rather than provision an empty box");
+
+    assert!(error.to_string().contains("snapshotId"));
 }
 
 #[test]

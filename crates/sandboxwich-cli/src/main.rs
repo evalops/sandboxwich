@@ -11,10 +11,10 @@ use sandboxwich_core::{
     DesktopSessionResponse, DesktopSessionStatus, EventListResponse, FileResponse,
     GuestHealthResponse, GuestStatus, JobListResponse, ListFilesResponse, MemoryLimit,
     NetworkAllowRule, NetworkAllowRuleKind, NetworkEgress, QueueCommandResponse,
-    RequestSshKeyRequest, RuntimeResourceListResponse, SandboxListResponse, SandboxResponse,
-    SandboxState, SnapshotCleanupResponse, SnapshotListResponse, SnapshotResponse,
-    SshAccessRequest, SshAccessResponse, SshKeyListResponse, SshKeyResponse, SshKeyStatus,
-    UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest,
+    RequestSshKeyRequest, ResumeSandboxRequest, RuntimeResourceListResponse, SandboxListResponse,
+    SandboxResponse, SandboxState, SnapshotCleanupResponse, SnapshotId, SnapshotListResponse,
+    SnapshotResponse, SshAccessRequest, SshAccessResponse, SshKeyListResponse, SshKeyResponse,
+    SshKeyStatus, UpdateDesktopSessionRequest, UpdateGuestHealthRequest, UpdateSshKeyStatusRequest,
     WorkerListResponse, WorkspaceMode,
 };
 use uuid::Uuid;
@@ -122,36 +122,66 @@ struct Cli {
 enum Command {
     New(NewArgs),
     List,
-    Get { sandbox_id: Uuid },
-    Resources { sandbox_id: Uuid },
-    Stop { sandbox_id: Uuid },
-    Resume { sandbox_id: Uuid },
+    Get {
+        sandbox_id: Uuid,
+    },
+    Resources {
+        sandbox_id: Uuid,
+    },
+    Stop {
+        sandbox_id: Uuid,
+    },
+    Resume {
+        sandbox_id: Uuid,
+        /// Snapshot to restore the workspace from; defaults to the sandbox's
+        /// most recent restorable snapshot.
+        #[arg(long)]
+        snapshot_id: Option<Uuid>,
+    },
     Fork(ForkArgs),
     CreateSnapshot(CreateSnapshotArgs),
-    Snapshots { sandbox_id: Uuid },
-    Snapshot { snapshot_id: Uuid },
+    Snapshots {
+        sandbox_id: Uuid,
+    },
+    Snapshot {
+        snapshot_id: Uuid,
+    },
     CleanupSnapshots,
     CreateDesktop(CreateDesktopArgs),
-    Desktops { sandbox_id: Uuid },
-    Desktop { desktop_session_id: Uuid },
+    Desktops {
+        sandbox_id: Uuid,
+    },
+    Desktop {
+        desktop_session_id: Uuid,
+    },
     SetDesktopStatus(SetDesktopStatusArgs),
     DesktopAccess(DesktopAccessArgs),
     Ssh(SshAccessArgs),
     Scp(ScpArgs),
     Cp(CpArgs),
     Exec(ExecArgs),
-    Commands { sandbox_id: Uuid },
-    Command { command_id: Uuid },
+    Commands {
+        sandbox_id: Uuid,
+    },
+    Command {
+        command_id: Uuid,
+    },
     Logs(LogsArgs),
     Workers,
     Capacity,
     Jobs,
-    GuestHealth { sandbox_id: Uuid },
+    GuestHealth {
+        sandbox_id: Uuid,
+    },
     SetGuestHealth(SetGuestHealthArgs),
-    SshKeys { sandbox_id: Uuid },
+    SshKeys {
+        sandbox_id: Uuid,
+    },
     AddSshKey(AddSshKeyArgs),
     SetSshKeyStatus(SetSshKeyStatusArgs),
-    Events { sandbox_id: Uuid },
+    Events {
+        sandbox_id: Uuid,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -552,10 +582,16 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             print_json::<SandboxResponse>(response).await?;
         }
-        Command::Resume { sandbox_id } => {
+        Command::Resume {
+            sandbox_id,
+            snapshot_id,
+        } => {
             let response = client
                 .post(format!("{api}/sandboxes/{sandbox_id}/resume"))
                 .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
+                .json(&ResumeSandboxRequest {
+                    snapshot_id: snapshot_id.map(SnapshotId),
+                })
                 .send()
                 .await?;
             print_json::<SandboxResponse>(response).await?;

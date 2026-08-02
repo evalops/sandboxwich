@@ -1608,3 +1608,653 @@ pub(crate) async fn assert_deleting_referenced_snapshot_restore_source_is_reject
         "the referenced snapshot_restore_sources row must survive the rejected delete"
     );
 }
+
+/// Full snapshot-backed resume of an already-archived sandbox: the sandbox
+/// goes back through `Provisioning`, a worker restores its workspace from the
+/// snapshot, and it comes back `Ready` under its *own* id with the restored
+/// volume recorded. Leaves the sandbox archived again so callers can keep
+/// asserting against a stopped sandbox.
+pub(crate) async fn assert_snapshot_backed_resume_lifecycle(
+    client: &reqwest::Client,
+    server: &TestServer,
+    sandbox: &SandboxResponse,
+) {
+    let snapshots: SnapshotListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/snapshots",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let restorable = snapshots
+        .snapshots
+        .iter()
+        .filter(|snapshot| snapshot.status == SnapshotStatus::Ready)
+        .max_by_key(|snapshot| (snapshot.created_at, snapshot.id.0))
+        .expect("the fork lifecycle above leaves this sandbox a ready snapshot");
+
+    let resumed: SandboxResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/resume",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&ResumeSandboxRequest { snapshot_id: None })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // A resume is asynchronous and restores the *same* sandbox: same id, same
+    // creation time, no replacement sandbox handed back.
+    assert_eq!(resumed.sandbox.id, sandbox.sandbox.id);
+    assert_eq!(resumed.sandbox.created_at, sandbox.sandbox.created_at);
+    assert_eq!(resumed.sandbox.state, SandboxState::Provisioning);
+    let operation = resumed.operation.expect("resume returns an operation");
+    assert_eq!(operation.kind, OperationKind::ResumeSandbox);
+
+    // Only an archived sandbox is resumable, so the in-flight resume above
+    // makes a second one a conflict rather than a second restore racing the
+    // first onto the same workspace volume.
+    let conflict = client
+        .post(format!(
+            "{}/sandboxes/{}/resume",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&ResumeSandboxRequest { snapshot_id: None })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    let conflict: ErrorEnvelope = conflict.json().await.unwrap();
+    assert_eq!(conflict.code, "sandbox_not_resumable");
+
+    let resume_worker = register_placed_worker(
+        client,
+        server,
+        "k3s-resume-worker",
+        vec![
+            WorkerCapability::Snapshot,
+            WorkerCapability::K8sPod,
+            WorkerCapability::ProvisionSandbox,
+        ],
+    )
+    .await;
+    let resume_worker_client = worker_client(&resume_worker);
+    let claimed: ClaimLeaseResponse = resume_worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, resume_worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: None,
+            kinds: Some(vec![JobKind::ResumeSandbox]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claimed.lease.expect("resume job must be claimable");
+    assert_eq!(lease.job.kind, JobKind::ResumeSandbox);
+    // The worker is told exactly which snapshot to restore -- it never has to
+    // guess, and it cannot silently provision an empty workspace instead.
+    assert_eq!(
+        lease.job.payload["snapshotId"],
+        serde_json::json!(restorable.id)
+    );
+    assert_eq!(
+        lease.job.payload["runtimeImage"],
+        serde_json::json!(sandbox.sandbox.template)
+    );
+    assert_eq!(
+        lease.job.payload["provisionSpec"]["workspace_mode"],
+        serde_json::json!(WorkspaceMode::Persistent)
+    );
+
+    let completed = resume_worker_client
+        .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::ResumeSandbox {
+                handle: ProviderResumeHandle {
+                    provider: "kubernetes".to_string(),
+                    sandbox_id: sandbox.sandbox.id,
+                    snapshot_id: restorable.id,
+                    resources: fork_resources(sandbox.sandbox.id, restorable.id),
+                    metadata: serde_json::json!({ "operation": "resume" }),
+                },
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<LeaseResponse>()
+        .await
+        .unwrap();
+    assert_eq!(completed.lease.job.status, JobStatus::Succeeded);
+
+    let restored: SandboxResponse = client
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(restored.sandbox.state, SandboxState::Ready);
+
+    let resources: RuntimeResourceListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/runtime-resources",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // The durable evidence that state actually came back: the sandbox's own
+    // workspace volume is recorded as restored from the snapshot.
+    assert!(resources.resources.iter().any(|resource| {
+        resource.resource_kind == RuntimeResourceKind::PersistentVolumeClaim
+            && resource.source_snapshot_id == Some(restorable.id)
+            && resource.status == RuntimeResourceStatus::Ready
+    }));
+    // Retiring the torn-down runtime generation must not touch the sandbox's
+    // snapshots: the snapshot this resume read from is still restorable, and
+    // its own cleanup is driven by snapshot expiry, not by the runtime.
+    assert!(
+        resources.resources.iter().any(|resource| {
+            resource.resource_kind == RuntimeResourceKind::VolumeSnapshot
+                && resource.snapshot_id == Some(restorable.id)
+                && resource.status != RuntimeResourceStatus::Destroyed
+                && resource.status != RuntimeResourceStatus::Deleted
+        }),
+        "a resume must leave the snapshot it restored from alive: {:?}",
+        resources.resources
+    );
+
+    let events: EventListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/events",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(events.events.iter().any(|event| {
+        event.kind == SandboxEventKind::LifecycleChanged
+            && event.data.get("reason").and_then(|value| value.as_str()) == Some("resume_ready")
+    }));
+
+    // Put the sandbox back where the caller found it.
+    client
+        .post(format!(
+            "{}/sandboxes/{}/stop",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let stop_claim: ClaimLeaseResponse = resume_worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, resume_worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox.sandbox.id),
+            kinds: Some(vec![JobKind::StopSandbox]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let stop_lease = stop_claim
+        .lease
+        .expect("the re-stop of the resumed sandbox must be claimable");
+    resume_worker_client
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, stop_lease.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::StopSandbox {
+                provider: "kubernetes".to_string(),
+                sandbox_id: sandbox.sandbox.id,
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+}
+
+/// Deterministic terminal states for the resume paths that must *not* hand
+/// back a running-but-empty sandbox: no restorable snapshot, another
+/// sandbox's snapshot, and a resume the provider could not complete.
+#[tokio::test]
+async fn resume_fails_closed_without_a_restorable_snapshot_and_rewinds_on_failure() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("sandbox-resume.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+    let worker = register_placed_worker(
+        &client,
+        &server,
+        "k3s-resume-edge-worker",
+        vec![
+            WorkerCapability::ProvisionSandbox,
+            WorkerCapability::Snapshot,
+            WorkerCapability::K8sPod,
+        ],
+    )
+    .await;
+    let worker_client = worker_client(&worker);
+
+    let sandbox = create_resume_test_sandbox(&client, &server, "resume-subject").await;
+    assert_provision_job_persists_runtime_resources(&client, &server, &sandbox, &worker).await;
+    let other = create_resume_test_sandbox(&client, &server, "resume-other").await;
+    assert_provision_job_persists_runtime_resources(&client, &server, &other, &worker).await;
+    let other_snapshot = ready_snapshot(&client, &server, &other, &worker).await;
+
+    // A live sandbox is not resumable: resume restores a torn-down sandbox,
+    // it never restarts a running one underneath its own workload.
+    let live = client
+        .post(format!(
+            "{}/sandboxes/{}/resume",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&ResumeSandboxRequest { snapshot_id: None })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(live.status(), StatusCode::CONFLICT);
+    let live: ErrorEnvelope = live.json().await.unwrap();
+    assert_eq!(live.code, "sandbox_not_resumable");
+
+    archive_sandbox(&client, &server, &sandbox, &worker).await;
+
+    // Archived, but nothing was ever snapshotted: refusing is the only honest
+    // answer, since "resuming" would silently produce an empty workspace.
+    let unavailable = client
+        .post(format!(
+            "{}/sandboxes/{}/resume",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&ResumeSandboxRequest { snapshot_id: None })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unavailable.status(), StatusCode::CONFLICT);
+    let unavailable: ErrorEnvelope = unavailable.json().await.unwrap();
+    assert_eq!(unavailable.code, "resume_snapshot_unavailable");
+
+    // Owning the sandbox is not authority to mount another sandbox's volume
+    // into it, even within the same tenant.
+    let foreign = client
+        .post(format!(
+            "{}/sandboxes/{}/resume",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&ResumeSandboxRequest {
+            snapshot_id: Some(other_snapshot),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), StatusCode::CONFLICT);
+    let foreign: ErrorEnvelope = foreign.json().await.unwrap();
+    assert_eq!(foreign.code, "resume_snapshot_foreign");
+    let still_archived: SandboxResponse = client
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(still_archived.sandbox.state, SandboxState::Archived);
+
+    // The `/v1/jobs` path reaches the same worker code, so it enforces the same
+    // preconditions: a resume job against a *live* sandbox would have the
+    // provider apply a cloned-volume PVC over the bound one, fail, and roll
+    // back -- deleting the running sandbox's workspace.
+    let injected = client
+        .post(format!("{}/jobs", server.base_url))
+        .json(&serde_json::json!({
+            "kind": "resume_sandbox",
+            "payload": {
+                "sandboxId": other.sandbox.id,
+                "snapshotId": other_snapshot,
+                "runtimeImage": other.sandbox.template,
+                "provisionSpec": {"workspace_mode": "persistent"}
+            },
+            "required_capability": "k8s_pod"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(injected.status(), StatusCode::CONFLICT);
+    let injected: ErrorEnvelope = injected.json().await.unwrap();
+    assert_eq!(injected.code, "sandbox_not_resumable");
+
+    // A resume whose provider work fails permanently rewinds to `Archived`
+    // rather than parking the sandbox in `Error`: no resources were created,
+    // the snapshot is untouched, and another resume is still possible.
+    archive_sandbox(&client, &server, &other, &worker).await;
+    let resumed: SandboxResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/resume",
+            server.base_url, other.sandbox.id
+        ))
+        .json(&ResumeSandboxRequest { snapshot_id: None })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resumed.sandbox.state, SandboxState::Provisioning);
+    let claimed: ClaimLeaseResponse = worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(other.sandbox.id),
+            kinds: Some(vec![JobKind::ResumeSandbox]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claimed.lease.expect("resume job must be claimable");
+    worker_client
+        .post(format!("{}/leases/{}/fail", server.base_url, lease.id))
+        .json(&FailLeaseRequest {
+            error: "restore pvc did not bind".to_string(),
+            retry: false,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let rewound: SandboxResponse = client
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, other.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rewound.sandbox.state, SandboxState::Archived);
+    let events: EventListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/events",
+            server.base_url, other.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(events.events.iter().any(|event| {
+        event.kind == SandboxEventKind::LifecycleChanged
+            && event.data.get("reason").and_then(|value| value.as_str()) == Some("resume_failed")
+    }));
+
+    // The snapshot survived the failed restore, so the sandbox can be resumed
+    // again -- a failed resume is not a one-way door. Posted with no body at
+    // all, which is the "restore the latest snapshot" request.
+    let retried = client
+        .post(format!(
+            "{}/sandboxes/{}/resume",
+            server.base_url, other.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(retried.status(), StatusCode::ACCEPTED);
+}
+
+async fn create_resume_test_sandbox(
+    client: &reqwest::Client,
+    server: &TestServer,
+    name: &str,
+) -> SandboxResponse {
+    client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
+            execution_class: None,
+            workspace_mode: Some(WorkspaceMode::Persistent),
+            runtime_profile: None,
+            name: Some(name.to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: Some(600),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// Snapshots `sandbox` and drives the resulting job to a ready snapshot.
+async fn ready_snapshot(
+    client: &reqwest::Client,
+    server: &TestServer,
+    sandbox: &SandboxResponse,
+    worker: &WorkerResponse,
+) -> SnapshotId {
+    let snapshot: SnapshotResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/snapshots",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&CreateSnapshotRequest {
+            label: Some("resume-source".to_string()),
+            inventory: None,
+            provider_metadata: None,
+            ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let worker_client = worker_client(worker);
+    let claimed: ClaimLeaseResponse = worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox.sandbox.id),
+            kinds: Some(vec![JobKind::CreateSnapshot]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claimed.lease.expect("snapshot job must be claimable");
+    worker_client
+        .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::CreateSnapshot {
+                handle: ProviderSnapshotHandle {
+                    provider: "kubernetes".to_string(),
+                    snapshot_id: snapshot.snapshot.id,
+                    resources: snapshot_resources(sandbox.sandbox.id, snapshot.snapshot.id),
+                    metadata: serde_json::json!({}),
+                },
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    snapshot.snapshot.id
+}
+
+async fn archive_sandbox(
+    client: &reqwest::Client,
+    server: &TestServer,
+    sandbox: &SandboxResponse,
+    worker: &WorkerResponse,
+) {
+    client
+        .post(format!(
+            "{}/sandboxes/{}/stop",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let worker_client = worker_client(worker);
+    let claimed: ClaimLeaseResponse = worker_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox.sandbox.id),
+            kinds: Some(vec![JobKind::StopSandbox]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claimed.lease.expect("stop job must be claimable");
+    worker_client
+        .post(format!("{}/leases/{}/complete", server.base_url, lease.id))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::StopSandbox {
+                provider: "kubernetes".to_string(),
+                sandbox_id: sandbox.sandbox.id,
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+}
+
+/// Registers a worker with the placement labels every sandbox read expects
+/// (cluster / provider mode / pinned runtime image).
+async fn register_placed_worker(
+    client: &reqwest::Client,
+    server: &TestServer,
+    name: &str,
+    capabilities: Vec<WorkerCapability>,
+) -> WorkerResponse {
+    client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: name.to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities,
+            max_concurrent_jobs: Some(1),
+            labels: [
+                ("cluster".to_string(), "k3s-dev".to_string()),
+                ("provider_mode".to_string(), "apply".to_string()),
+                (
+                    "runtime_image".to_string(),
+                    "image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                ),
+            ]
+            .into(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}

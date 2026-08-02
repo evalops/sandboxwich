@@ -27,9 +27,9 @@ use sandboxwich_core::{
     NetworkAllowRuleKind, NetworkEgress, ORB_SIDECAR_RESIDENT_PROCESS_UID,
     PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL,
     PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE, ProviderCapabilityReport,
-    ProviderForkHandle, ProviderHealthReport, ProviderHealthStatus, ProviderRuntimeResource,
-    ProviderSandboxHandle, ProviderSnapshotHandle, ProvisioningErrorClass, ProvisioningStage,
-    ProvisioningStageUpdateRequest, RESIDENT_PLACEMENT_ATTESTATION_FILE,
+    ProviderForkHandle, ProviderHealthReport, ProviderHealthStatus, ProviderResumeHandle,
+    ProviderRuntimeResource, ProviderSandboxHandle, ProviderSnapshotHandle, ProvisioningErrorClass,
+    ProvisioningStage, ProvisioningStageUpdateRequest, RESIDENT_PLACEMENT_ATTESTATION_FILE,
     RESIDENT_PROCESS_BOOTSTRAP_PREFIX, ResidentProcessId, RuntimeResourceInventoryResponse,
     RuntimeResourceKind, RuntimeResourcePurpose, RuntimeResourceStatus, SANDBOX_WORKSPACE_GID,
     SandboxId, SandboxProvisionSpec, SandboxRuntimeProfile, SecretBackend, SecretDelivery,
@@ -476,6 +476,24 @@ pub trait SandboxProvider {
         spec: &SandboxProvisionSpec,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<ProviderForkHandle>;
+    /// Restore a stopped sandbox's own runtime under its own identity, with
+    /// its workspace volume recreated from `snapshot_id`. Unlike [`fork`],
+    /// this produces no new sandbox: the resources are named for
+    /// `sandbox_id`, exactly as [`provision`] would have named them, so the
+    /// sandbox comes back with its persisted state instead of an empty
+    /// workspace. A provider that cannot restore durable state must not
+    /// implement this -- reporting success without the workspace would be a
+    /// silent data-loss path.
+    fn resume(
+        &self,
+        sandbox_id: SandboxId,
+        snapshot_id: SnapshotId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<ProviderResumeHandle> {
+        let _ = (sandbox_id, snapshot_id, spec, cancelled);
+        anyhow::bail!("provider cannot restore durable state, so resume is unsupported")
+    }
     /// Tear down every resource associated with `sandbox_id`. Must be idempotent:
     /// calling it on an already-stopped (or never-provisioned) sandbox is not an error.
     fn stop(
@@ -1145,6 +1163,19 @@ impl KubernetesDryRunProvider {
             "profile": self.isolation_profile.as_str(),
             "runtimeClassName": self.runtime_class_name
         })
+    }
+
+    /// A resume is only meaningful for a workspace that was durable in the
+    /// first place. An ephemeral workspace has no PVC to restore, so a
+    /// "successful" resume would silently hand back an empty workspace; refuse
+    /// instead of pretending state survived.
+    fn validate_restorable_workspace(&self, spec: &SandboxProvisionSpec) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            spec.workspace_mode == WorkspaceMode::Persistent,
+            "resume requires workspace_mode=persistent; an ephemeral workspace has no durable \
+             state to restore"
+        );
+        Ok(())
     }
 
     fn validate_network_policy_egress(&self, network_egress: &NetworkEgress) -> anyhow::Result<()> {
@@ -5789,6 +5820,58 @@ impl SandboxProvider for KubernetesDryRunProvider {
         })
     }
 
+    fn resume(
+        &self,
+        sandbox_id: SandboxId,
+        snapshot_id: SnapshotId,
+        spec: &SandboxProvisionSpec,
+        _cancelled: &CancelSignal,
+    ) -> anyhow::Result<ProviderResumeHandle> {
+        self.validate_runtime_profile(spec)?;
+        self.validate_network_policy_egress(&spec.network_egress)?;
+        self.validate_restorable_workspace(spec)?;
+        let network_policy = self.network_policy_manifest(sandbox_id, &spec.network_egress)?;
+        Ok(ProviderResumeHandle {
+            provider: "kubernetes".to_string(),
+            sandbox_id,
+            snapshot_id,
+            // Identical shape to a fork's resources, but named for the sandbox
+            // being resumed rather than a new child: the workspace PVC is
+            // recreated from the snapshot under the sandbox's own name.
+            resources: self.fork_resources(
+                sandbox_id,
+                snapshot_id,
+                spec,
+                RuntimeResourceStatus::Planned,
+            ),
+            metadata: json!({
+                "provider": "kubernetes",
+                "mode": "dry_run",
+                "operation": "resume",
+                "cluster": self.cluster,
+                "namespace": self.effective_sandbox_namespace(),
+                "controlPlaneNamespace": self.namespace,
+                "sandboxId": sandbox_id,
+                "snapshotId": snapshot_id,
+                "pvcRestoreName": format!("sandboxwich-pvc-{}", sandbox_id),
+                "storageClass": self.storage_class,
+                "snapshotClass": self.snapshot_class,
+                "runtime": self.runtime_metadata(),
+                "resources": self.resource_metadata(&spec.memory_limit),
+                "networkEgress": spec.network_egress,
+                "isolation": self.isolation_metadata(),
+                "manifests": {
+                    "pvc": self.fork_pvc_manifest(sandbox_id, snapshot_id, &spec.memory_limit),
+                    "pod": self.pod_manifest(sandbox_id, spec),
+                    "sshService": self.ssh_service_manifest(sandbox_id),
+                    "desktopService": self.desktop_service_manifest(sandbox_id),
+                    "networkPolicy": network_policy,
+                    "guestTokenSecret": self.guest_token_secret_manifest_redacted(sandbox_id),
+                }
+            }),
+        })
+    }
+
     fn stop(
         &self,
         _sandbox_id: SandboxId,
@@ -6401,6 +6484,82 @@ impl SandboxProvider for KubernetesApplyProvider {
             spec,
             cancelled,
         )?;
+        mark_resources(
+            &mut handle.resources,
+            RuntimeResourceStatus::Ready,
+            Some(Utc::now()),
+        );
+        if let Some(metadata) = handle.metadata.as_object_mut() {
+            metadata.insert("mode".to_string(), json!("apply"));
+            metadata.insert("applyStatus".to_string(), json!(apply.status));
+            metadata.insert("applyStdout".to_string(), json!(apply.stdout));
+            metadata.insert("waitStatus".to_string(), json!(wait.status));
+            metadata.insert("waitStdout".to_string(), json!(wait.stdout));
+        }
+        Ok(handle)
+    }
+
+    fn resume(
+        &self,
+        sandbox_id: SandboxId,
+        snapshot_id: SnapshotId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<ProviderResumeHandle> {
+        self.dry_run
+            .validate_network_policy_egress(&spec.network_egress)?;
+        self.dry_run.validate_restorable_workspace(spec)?;
+        Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
+        // The restore manifests are the fork manifests: a fork's child and a
+        // resumed sandbox are both "a runtime whose PVC is cloned from a
+        // VolumeSnapshot", they just differ in which sandbox id they carry.
+        let manifests = self.fork_manifests(sandbox_id, snapshot_id, spec)?;
+        let apply = run_kubectl_documents(
+            &self.kubectl,
+            &self.kubectl_args("apply"),
+            &manifests,
+            "apply resume manifests",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        if !apply.success {
+            // Same non-atomicity concern as provision()/fork(). Rolling back
+            // here deletes only resources this apply was creating: the sandbox
+            // was archived, so it had none left, and the snapshot the restore
+            // reads from is a separate object that teardown does not touch --
+            // so a failed resume is retryable rather than destructive.
+            self.rollback_applied_resources(sandbox_id, "resume (kubectl apply)");
+            bail!(
+                "kubectl apply resume manifests failed with {}: {}",
+                apply.status,
+                apply.stderr
+            );
+        }
+        if let Err(error) =
+            self.wait_for_gateway_ready_if_needed(sandbox_id, &spec.network_egress, cancelled)
+        {
+            self.rollback_applied_resources(sandbox_id, "resume (wait for gateway ready)");
+            return Err(error);
+        }
+        let wait = match self.wait_for_pod_ready(sandbox_id, cancelled) {
+            Ok(wait) => wait,
+            Err(error) => {
+                self.rollback_applied_resources(sandbox_id, "resume (wait for pod ready)");
+                return Err(error);
+            }
+        };
+        if !wait.success {
+            self.rollback_applied_resources(sandbox_id, "resume (wait for pod ready)");
+            bail!(
+                "resumed sandbox pod did not become ready with {}: {}",
+                wait.status,
+                wait.stderr
+            );
+        }
+        let mut handle = self
+            .dry_run
+            .resume(sandbox_id, snapshot_id, spec, cancelled)?;
         mark_resources(
             &mut handle.resources,
             RuntimeResourceStatus::Ready,
