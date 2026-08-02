@@ -59,10 +59,19 @@ These capabilities remain Experimental until every gate below passes for a named
    remains is a Cilium-backed *production* target: the deploy repo has no
    Cilium-managed cluster, so `SANDBOXWICH_CILIUM_FQDN_EGRESS=true` has no
    production evidence and the egress-gateway backend stays the default.
-2. Add a microVM provider and compare its lifecycle and recovery behavior with RuntimeClass-backed Kubernetes.
-3. Finish the brokered desktop transport. Desktop access now returns a typed `DesktopTransport` referencing the sandbox's persisted desktop `Service` runtime resource and a short-lived, sandbox-bound credential (returned once, stored only as a hash, rotated by revocation). Still outstanding: the external broker that validates the credential and relays clients onto the tunnel, and the public ingress/Gateway in front of the desktop `Service` in evalops/deploy.
-4. Add live Secrets Store CSI conformance on a cluster with the driver installed. Reference storage, binding, and rendered read-only CSI mounts are covered by contract tests against the real API and provider surface, but no test asserts against a kubelet actually mounting material.
-5. Add live sidecar conformance on a real cluster across worker restart and an explicit guest-to-sidecar network relay; the isolated Pod still does not share guest localhost. Resident bootstrap handoff is no longer process-local: with `SANDBOXWICH_BOOTSTRAP_HANDOFF_KEY` configured, sealed ephemeral rows carry it across API restart, replica failover, and cross-replica replay under the same generation/lease/digest fence, covered by SQLite and PostgreSQL contract tests.
+2. Certify the `virtual_machine`/Kata execution class (SW-3). The gate itself
+   exists -- `deploy/kubernetes/kata-conformance.sh`, run by
+   `.github/workflows/kata-conformance.yml` -- and asserts the isolation,
+   lifecycle-recovery and fail-closed requirements above against a real Kata
+   RuntimeClass. What is missing is the cluster: no GitHub-hosted runner
+   exposes `/dev/kvm`, so the gate is manual-dispatch-only against a
+   self-hosted, Kata-capable disposable cluster and has never run green.
+   The class stays Experimental until it does; see docs/capabilities.md,
+   "SW-3: what remains before `virtual_machine` can be certified".
+3. Add a microVM provider and compare its lifecycle and recovery behavior with RuntimeClass-backed Kubernetes.
+4. Finish the brokered desktop transport. Desktop access now returns a typed `DesktopTransport` referencing the sandbox's persisted desktop `Service` runtime resource and a short-lived, sandbox-bound credential (returned once, stored only as a hash, rotated by revocation). Still outstanding: the external broker that validates the credential and relays clients onto the tunnel, and the public ingress/Gateway in front of the desktop `Service` in evalops/deploy.
+5. Add live Secrets Store CSI conformance on a cluster with the driver installed. Reference storage, binding, and rendered read-only CSI mounts are covered by contract tests against the real API and provider surface, but no test asserts against a kubelet actually mounting material.
+6. Add live sidecar conformance on a real cluster across worker restart and an explicit guest-to-sidecar network relay; the isolated Pod still does not share guest localhost. Resident bootstrap handoff is no longer process-local: with `SANDBOXWICH_BOOTSTRAP_HANDOFF_KEY` configured, sealed ephemeral rows carry it across API restart, replica failover, and cross-replica replay under the same generation/lease/digest fence, covered by SQLite and PostgreSQL contract tests.
 
 ## Non-goals for 0.1
 

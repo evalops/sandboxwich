@@ -739,17 +739,38 @@ impl KubernetesDryRunProvider {
                 "apex_trusted_supervisor_v1 requires deny-by-default egress"
             );
         }
+        if spec.execution_class == ExecutionClass::SandboxedContainer {
+            anyhow::ensure!(
+                self.isolation_profile == IsolationProfile::Gvisor
+                    && self.configured_runtime_class().is_some(),
+                "sandboxed_container execution_class requires the gvisor isolation profile and a RuntimeClass"
+            );
+        }
         if spec.execution_class == ExecutionClass::VirtualMachine {
             anyhow::ensure!(
                 self.isolation_profile == IsolationProfile::Kata
-                    && self
-                        .runtime_class_name
-                        .as_deref()
-                        .is_some_and(|name| !name.trim().is_empty()),
+                    && self.configured_runtime_class().is_some(),
                 "virtual_machine execution_class requires the kata isolation profile and a RuntimeClass"
             );
         }
         Ok(())
+    }
+
+    /// Whether this operator configuration can satisfy `virtual_machine`
+    /// execution: the Kata isolation profile plus a nonempty RuntimeClass.
+    /// Real provisioning is still required, so only the apply provider turns
+    /// this into an advertised capability.
+    fn advertises_virtual_machine(&self) -> bool {
+        self.isolation_profile == IsolationProfile::Kata
+            && self.configured_runtime_class().is_some()
+    }
+
+    /// The operator-configured RuntimeClass, or `None` when it is unset or blank.
+    fn configured_runtime_class(&self) -> Option<&str> {
+        self.runtime_class_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
     }
 
     pub fn with_egress_gateway_image(mut self, image: Option<String>) -> Self {
@@ -2917,6 +2938,23 @@ fn validate_adoption_contract(desired: &Value, observed: &Value) -> anyhow::Resu
     Ok(())
 }
 
+/// Execution classes whose security boundary is supplied by the operator's
+/// Kubernetes RuntimeClass rather than by ordinary container isolation.
+pub(crate) fn execution_class_requires_runtime_class(execution_class: &ExecutionClass) -> bool {
+    match execution_class {
+        ExecutionClass::DevelopmentContainer => false,
+        ExecutionClass::SandboxedContainer | ExecutionClass::VirtualMachine => true,
+    }
+}
+
+fn runtime_class_boundary_failure(message: String) -> ProviderError {
+    ProviderError::classified(
+        ProvisioningErrorClass::TerminalSecurity,
+        "runtime_class_boundary_unverified",
+        anyhow::anyhow!(message),
+    )
+}
+
 fn classified_kubectl_failure(context: &str, stderr: &str) -> ProviderError {
     let message = format!("{context}: {stderr}");
     let normalized = stderr.to_ascii_lowercase();
@@ -3285,6 +3323,7 @@ impl KubernetesApplyProvider {
                 &wait.stderr,
             )));
         }
+        self.verify_pod_runtime_class(sandbox_id, spec, cancelled)?;
         report(stage_update(
             ProvisioningStage::PodReady,
             Some(pod_identity),
@@ -4044,6 +4083,67 @@ impl KubernetesApplyProvider {
         cancelled: &CancelSignal,
     ) -> anyhow::Result<KubectlOutput> {
         self.wait_for_named_pod_ready(&self.pod_name(sandbox_id), cancelled)
+    }
+
+    /// Fails closed unless the live Pod carries the operator-configured
+    /// RuntimeClass required by the sandbox's execution class.
+    ///
+    /// Rendering `runtimeClassName` into a manifest is not evidence that the
+    /// admitted Pod runs under it. A mutating admission webhook may drop or
+    /// rewrite the field, the staged path adopts Pods that already exist, and
+    /// `exec_handoff` reuses whatever Pod is present. For
+    /// `sandboxed_container` and `virtual_machine` that field *is* the
+    /// isolation boundary, so it is verified against the API server's view
+    /// before a sandbox is reported ready and before a command lease runs.
+    fn verify_pod_runtime_class(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<()> {
+        if !execution_class_requires_runtime_class(&spec.execution_class) {
+            return Ok(());
+        }
+        let expected = self.dry_run.configured_runtime_class().ok_or_else(|| {
+            runtime_class_boundary_failure(format!(
+                "{} execution_class requires a RuntimeClass but none is configured",
+                spec.execution_class.as_db_str()
+            ))
+        })?;
+        let pod_name = self.pod_name(sandbox_id);
+        let mut args = self.kubectl_base_args();
+        args.extend([
+            "get".to_string(),
+            "pod".to_string(),
+            pod_name.clone(),
+            "-o".to_string(),
+            "jsonpath={.spec.runtimeClassName}".to_string(),
+        ]);
+        let output = run_kubectl_command(
+            &self.kubectl,
+            &args,
+            "read sandbox pod RuntimeClass",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        if !output.success {
+            return Err(runtime_class_boundary_failure(format!(
+                "could not read the RuntimeClass of pod {pod_name}: {}",
+                output.stderr
+            ))
+            .into());
+        }
+        let observed = output.stdout.trim();
+        if observed != expected {
+            return Err(runtime_class_boundary_failure(format!(
+                "pod {pod_name} runs under RuntimeClass {:?} but {} execution_class requires {expected:?}",
+                observed,
+                spec.execution_class.as_db_str()
+            ))
+            .into());
+        }
+        Ok(())
     }
 
     /// Reads the scheduler's verdict for a Pod whose readiness wait failed.
@@ -5514,9 +5614,10 @@ impl SandboxProvider for KubernetesDryRunProvider {
                 IsolationProfile::Gvisor => {
                     capabilities.push(WorkerCapability::SandboxedContainer);
                 }
-                IsolationProfile::Kata => {
-                    capabilities.push(WorkerCapability::VirtualMachine);
-                }
+                // `virtual_machine` is advertised by the apply provider only
+                // (see its `capability_report`): a simulated provision never
+                // starts a guest, so it can never supply a VM boundary.
+                IsolationProfile::Kata => {}
             }
         }
         if self.fqdn_egress_backend.as_deref() == Some("cilium")
@@ -5791,6 +5892,9 @@ impl SandboxProvider for KubernetesApplyProvider {
     fn capability_report(&self) -> ProviderCapabilityReport {
         let mut report = self.dry_run.capability_report();
         report.capabilities.push(WorkerCapability::MaterializeFile);
+        if self.dry_run.advertises_virtual_machine() {
+            report.capabilities.push(WorkerCapability::VirtualMachine);
+        }
         if self.isolated_resident_process_configured() {
             report.labels.insert(
                 PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL.to_string(),
@@ -5881,6 +5985,10 @@ impl SandboxProvider for KubernetesApplyProvider {
                 wait.stderr
             );
         }
+        if let Err(error) = self.verify_pod_runtime_class(sandbox_id, spec, cancelled) {
+            self.rollback_applied_resources(sandbox_id, "provision (verify pod RuntimeClass)");
+            return Err(error);
+        }
 
         let mut handle = self.dry_run.provision(sandbox_id, spec, cancelled)?;
         mark_resources(
@@ -5933,7 +6041,12 @@ impl SandboxProvider for KubernetesApplyProvider {
         // manifest set (and re-waiting up to 120s) before every command is both slow
         // and unsafe: Pod `resources` are immutable, so an exec whose spec drifts from
         // the original provisioning would otherwise hard-fail every subsequent command.
-        if !self.pod_exists(sandbox_id, cancelled)? {
+        if self.pod_exists(sandbox_id, cancelled)? {
+            // An existing Pod was not necessarily rendered by this provider's
+            // current configuration, so re-verify the isolation boundary
+            // rather than inheriting whatever Pod is present.
+            self.verify_pod_runtime_class(sandbox_id, spec, cancelled)?;
+        } else {
             self.provision(sandbox_id, spec, cancelled)?;
         }
         let started_at = Utc::now();
@@ -6357,6 +6470,12 @@ impl SandboxProvider for KubernetesApplyProvider {
                 wait.status,
                 wait.stderr
             );
+        }
+        // A fork inherits the parent's execution class, so the child Pod owes
+        // the same live boundary evidence a provisioned one does.
+        if let Err(error) = self.verify_pod_runtime_class(child_sandbox_id, spec, cancelled) {
+            self.rollback_applied_resources(child_sandbox_id, "fork (verify pod RuntimeClass)");
+            return Err(error);
         }
         let mut handle = self.dry_run.fork(
             parent_sandbox_id,

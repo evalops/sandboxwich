@@ -223,6 +223,41 @@ they do not certify that the cluster can execute it. VM-class
 conformance certification passes. Do not route production hostile workloads to
 that class based only on registration or rendered manifests.
 
+A dry-run worker never advertises `virtual_machine` at all, and on the apply
+path the provider re-reads the admitted Pod's `spec.runtimeClassName` from the
+API server -- when it provisions the Pod, when it forks one, and again before
+it reuses an existing Pod for a command. A mismatch (including a webhook that
+stripped the field) is a terminal `runtime_class_boundary_unverified` failure
+and the sandbox's resources are torn down.
+
+### Kata / virtual_machine conformance
+
+`deploy/kubernetes/kata-conformance.sh` is the SW-3 gate. Unlike
+`kind-conformance.sh` it does not create its own cluster: a Kata RuntimeClass
+needs a runtime handler backed by hardware or nested virtualization, which kind
+on a GitHub-hosted runner cannot provide. Point it at a disposable cluster that
+already runs a Kata handler:
+
+```sh
+SANDBOXWICH_KUBE_CONTEXT=my-disposable-cluster \
+  SANDBOXWICH_KATA_RUNTIME_CLASS=kata-qemu \
+  SANDBOXWICH_STORAGE_CLASS=standard \
+  SANDBOXWICH_API_IMAGE=ghcr.io/evalops/sandboxwich-api@sha256:... \
+  SANDBOXWICH_WORKER_IMAGE=ghcr.io/evalops/sandboxwich-worker@sha256:... \
+  SANDBOXWICH_GATEWAY_IMAGE=ghcr.io/evalops/sandboxwich-worker@sha256:... \
+  SANDBOXWICH_RUNTIME_IMAGE=ghcr.io/evalops/sandboxwich-ubuntu-dev@sha256:... \
+  deploy/kubernetes/kata-conformance.sh
+```
+
+The script is destructive to the target cluster's `sandboxwich` and
+`sandboxwich-sandboxes` namespaces. It deploys the control plane with
+`SANDBOXWICH_ISOLATION_PROFILE=kata`, provisions a real `virtual_machine`
+sandbox through the API, and asserts the isolation, lifecycle-recovery and
+fail-closed gates from ROADMAP.md. There is no "Kata unavailable, skip" path:
+a green run is the only certification evidence, so it must never be satisfiable
+by a cluster that cannot run VMs. `.github/workflows/kata-conformance.yml` runs
+it on manual dispatch against a self-hosted runner with such a cluster.
+
 Inspect the persisted runtime view with:
 
 ```sh

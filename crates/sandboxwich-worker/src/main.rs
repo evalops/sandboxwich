@@ -3794,7 +3794,16 @@ fn capabilities_for_provider_mode(
     provider_mode: ProviderModeArg,
 ) -> Vec<WorkerCapability> {
     if provider_mode == ProviderModeArg::DryRun {
-        capabilities.retain(|capability| *capability != WorkerCapability::MaterializeFile);
+        capabilities.retain(|capability| {
+            // A dry-run worker simulates provisioning: it never starts a
+            // guest, so it can never supply a virtual machine boundary. If it
+            // advertised `virtual_machine`, the API would route VM-class work
+            // to it and the sandbox would reach `ready` with no VM behind it.
+            !matches!(
+                capability,
+                WorkerCapability::MaterializeFile | WorkerCapability::VirtualMachine
+            )
+        });
     }
     capabilities
 }
