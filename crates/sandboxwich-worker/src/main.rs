@@ -295,6 +295,11 @@ struct ProviderArgs {
     #[arg(long)]
     ssh_authorized_keys_secret: Option<String>,
 
+    /// Secrets Store CSI driver serving tenant `SecretProviderClass` objects.
+    /// Unset means secret delivery is refused rather than skipped.
+    #[arg(long, env = "SANDBOXWICH_SECRET_CSI_DRIVER")]
+    secret_csi_driver: Option<String>,
+
     #[arg(long, env = "SANDBOXWICH_RUNTIME_CLASS_NAME")]
     runtime_class_name: Option<String>,
 
@@ -1140,6 +1145,7 @@ fn provider_from_args(args: ProviderArgs) -> anyhow::Result<KubernetesDryRunProv
     .with_egress_gateway_image(non_empty(args.egress_gateway_image))
     .with_workspace_storage(non_empty(args.workspace_storage))
     .with_ssh_authorized_keys_secret(non_empty(args.ssh_authorized_keys_secret))
+    .with_secret_csi_driver(non_empty(args.secret_csi_driver))
     .with_isolation_profile(args.isolation_profile)
     .with_runtime_class_name(runtime_class_name)
     .with_cilium_fqdn_egress(args.cilium_fqdn_egress)

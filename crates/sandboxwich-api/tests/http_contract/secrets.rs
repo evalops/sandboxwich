@@ -14,7 +14,7 @@ fn create_request(name: &str, workspace_id: &str) -> CreateSecretRefRequest {
         workspace_id: workspace_id.into(),
         name: name.into(),
         source: SecretSource {
-            backend: SecretBackend::KubernetesSecret,
+            backend: SecretBackend::CsiSecretProviderClass,
             object_name: "tenant-model-credentials".into(),
             object_key: "openai.api-key".into(),
         },
@@ -53,7 +53,7 @@ async fn run_secret_ref_contract(server: TestServer) {
     assert_eq!(created.secret_ref.state, SecretRefState::Active);
     assert_eq!(created.secret_ref.workspace_id, "ws-1");
     assert_eq!(
-        created.secret_ref.mount_path(),
+        created.secret_ref.mount_dir(),
         "/run/sandboxwich/secrets/openai-api-key"
     );
 
@@ -207,7 +207,7 @@ async fn secret_reference_surface_cannot_carry_credential_material() {
             "workspaceId": "ws-1",
             "name": "openai-api-key",
             "source": {
-                "backend": "kubernetes_secret",
+                "backend": "csi_secret_provider_class",
                 "objectName": "tenant-model-credentials",
                 "objectKey": "openai.api-key"
             },
@@ -217,7 +217,7 @@ async fn secret_reference_surface_cannot_carry_credential_material() {
             "workspaceId": "ws-1",
             "name": "openai-api-key",
             "source": {
-                "backend": "kubernetes_secret",
+                "backend": "csi_secret_provider_class",
                 "objectName": "tenant-model-credentials",
                 "objectKey": "openai.api-key",
                 "data": CANARY
@@ -319,4 +319,168 @@ async fn secret_reference_routes_require_authentication() {
             .status(),
         StatusCode::UNAUTHORIZED
     );
+}
+
+fn create_sandbox_request(secret_ref_ids: Vec<SecretRefId>) -> CreateSandboxRequest {
+    CreateSandboxRequest {
+        secret_ref_ids,
+        name: Some("secret-binding".into()),
+        template: None,
+        memory_limit: None,
+        network_egress: None,
+        workspace_mode: None,
+        runtime_profile: None,
+        ttl_seconds: Some(120),
+        max_lifetime_seconds: None,
+        idle_ttl_seconds: None,
+        execution_class: None,
+    }
+}
+
+async fn create_ref(
+    server: &TestServer,
+    client: &reqwest::Client,
+    name: &str,
+    workspace: &str,
+) -> SecretRef {
+    client
+        .post(format!("{}/secret-refs", server.base_url))
+        .json(&create_request(name, workspace))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<SecretRefResponse>()
+        .await
+        .unwrap()
+        .secret_ref
+}
+
+async fn run_secret_binding_contract(server: TestServer) {
+    let client = server.client();
+    let bound = create_ref(&server, &client, "openai-api-key", "ws-1").await;
+
+    let created: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&create_sandbox_request(vec![bound.id]))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // The worker receives a locator, a derived read-only path, and a path
+    // variable -- and nothing else. There is no field here that *could*
+    // hold material.
+    let jobs: JobListResponse = client
+        .get(format!("{}/jobs", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let job = jobs
+        .jobs
+        .iter()
+        .find(|job| job.payload["sandboxId"] == serde_json::json!(created.sandbox.id))
+        .expect("provisioning job");
+    let mounts = &job.payload["provisionSpec"]["secret_mounts"];
+    assert_eq!(mounts[0]["secretRefId"], serde_json::json!(bound.id));
+    assert_eq!(
+        mounts[0]["mountDir"],
+        "/run/sandboxwich/secrets/openai-api-key"
+    );
+    assert_eq!(
+        mounts[0]["filePath"],
+        "/run/sandboxwich/secrets/openai-api-key/openai.api-key"
+    );
+    assert_eq!(
+        mounts[0]["envFileVariable"],
+        "SANDBOXWICH_SECRET_OPENAI_API_KEY_FILE"
+    );
+
+    // Another tenant's reference is not merely unauthorized, it does not
+    // exist: binding it fails exactly like an unknown id.
+    let foreign = create_ref(&server, &tenant_b_client(), "openai-api-key", "ws-1").await;
+    for id in [foreign.id, SecretRefId::new()] {
+        assert_eq!(
+            client
+                .post(format!("{}/sandboxes", server.base_url))
+                .json(&create_sandbox_request(vec![id]))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    // Duplicates, over-binding, and cross-workspace sets are all refused
+    // before a sandbox row exists.
+    let other_workspace = create_ref(&server, &client, "anthropic-api-key", "ws-2").await;
+    let many = (0..MAX_SANDBOX_SECRET_BINDINGS + 1)
+        .map(|_| SecretRefId::new())
+        .collect::<Vec<_>>();
+    for ids in [
+        vec![bound.id, bound.id],
+        many,
+        vec![bound.id, other_workspace.id],
+    ] {
+        assert_eq!(
+            client
+                .post(format!("{}/sandboxes", server.base_url))
+                .json(&create_sandbox_request(ids))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    // A revoked reference can never come back through a binding.
+    client
+        .delete(format!("{}/secret-refs/{}", server.base_url, bound.id))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        client
+            .post(format!("{}/sandboxes", server.base_url))
+            .json(&create_sandbox_request(vec![bound.id]))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn sandbox_secret_bindings_are_tenant_scoped_and_fail_closed_over_sqlite() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("secret-bindings.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    run_secret_binding_contract(server).await;
+}
+
+#[tokio::test]
+async fn sandbox_secret_bindings_are_tenant_scoped_and_fail_closed_over_postgres_when_configured() {
+    let Ok(database_url) = std::env::var("SANDBOXWICH_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let server = TestServer::start(database_url, None).await;
+    run_secret_binding_contract(server).await;
 }

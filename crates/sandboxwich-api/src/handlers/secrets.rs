@@ -259,6 +259,136 @@ fn row_to_secret_ref(row: sqlx::any::AnyRow) -> Result<SecretRef, ApiError> {
     })
 }
 
+/// Resolves the references a sandbox create asked to bind into material-free
+/// delivery instructions.
+///
+/// Fail-closed in every direction: an unknown, foreign, or revoked reference
+/// fails the create rather than producing a sandbox that silently lacks a
+/// credential, and all bound references must live in one workspace, because a
+/// sandbox that mounts two workspaces' credentials side by side is a
+/// workspace-isolation hole regardless of how the guest behaves.
+pub(crate) async fn resolve_secret_mounts(
+    db: &Database,
+    tenant_id: &str,
+    secret_ref_ids: &[SecretRefId],
+) -> Result<Vec<SandboxSecretMount>, ApiError> {
+    validate_secret_ref_bindings(secret_ref_ids)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let mut mounts = Vec::with_capacity(secret_ref_ids.len());
+    let mut workspace_id: Option<String> = None;
+    for secret_ref_id in secret_ref_ids {
+        let secret_ref = fetch_secret_ref(db, *secret_ref_id, tenant_id).await?;
+        if secret_ref.state != SecretRefState::Active {
+            return Err(ApiError::bad_request(format!(
+                "secret reference {secret_ref_id} is revoked"
+            )));
+        }
+        match &workspace_id {
+            Some(existing) if *existing != secret_ref.workspace_id => {
+                return Err(ApiError::bad_request(
+                    "all bound secret references must belong to one workspace",
+                ));
+            }
+            Some(_) => {}
+            None => workspace_id = Some(secret_ref.workspace_id.clone()),
+        }
+        mounts.push(SandboxSecretMount::from_ref(&secret_ref));
+    }
+    Ok(mounts)
+}
+
+pub(crate) async fn insert_sandbox_secret_bindings_on_connection(
+    db: &Database,
+    connection: &mut sqlx::AnyConnection,
+    sandbox_id: SandboxId,
+    mounts: &[SandboxSecretMount],
+) -> Result<(), ApiError> {
+    let now = Utc::now().to_rfc3339();
+    for mount in mounts {
+        let sql = format!(
+            "insert into sandbox_secret_bindings (
+                 sandbox_id, secret_ref_id, name, backend, source_object_name,
+                 source_object_key, delivery, mount_dir, file_path, env_file_variable, created_at
+             ) values ({})",
+            db.placeholders(11)
+        );
+        sqlx::query(&sql)
+            .bind(sandbox_id.to_string())
+            .bind(mount.secret_ref_id.to_string())
+            .bind(&mount.name)
+            .bind(mount.source.backend.as_db_str())
+            .bind(&mount.source.object_name)
+            .bind(&mount.source.object_key)
+            .bind(mount.delivery.as_db_str())
+            .bind(&mount.mount_dir)
+            .bind(&mount.file_path)
+            .bind(&mount.env_file_variable)
+            .bind(&now)
+            .execute(&mut *connection)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Bindings snapshotted at create time, in a stable order. Every job that
+/// re-derives a sandbox's provisioning spec reads them from here, so a
+/// long-lived sandbox keeps the exact spec its Pod was provisioned with.
+pub(crate) async fn fetch_sandbox_secret_mounts(
+    db: &Database,
+    sandbox_id: SandboxId,
+) -> Result<Vec<SandboxSecretMount>, ApiError> {
+    let mut connection = db.pool.acquire().await?;
+    fetch_sandbox_secret_mounts_on_connection(db, &mut connection, sandbox_id).await
+}
+
+/// Same read against a caller-held connection. Callers already inside a
+/// transaction must use this: taking a second SQLite connection while holding
+/// a write transaction deadlocks against the database lock.
+pub(crate) async fn fetch_sandbox_secret_mounts_on_connection(
+    db: &Database,
+    connection: &mut sqlx::AnyConnection,
+    sandbox_id: SandboxId,
+) -> Result<Vec<SandboxSecretMount>, ApiError> {
+    let sql = format!(
+        "select secret_ref_id, name, backend, source_object_name, source_object_key,
+                delivery, mount_dir, file_path, env_file_variable
+         from sandbox_secret_bindings where sandbox_id = {}
+         order by name asc",
+        db.placeholder(1)
+    );
+    sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .fetch_all(&mut *connection)
+        .await?
+        .into_iter()
+        .map(row_to_secret_mount)
+        .collect()
+}
+
+fn row_to_secret_mount(row: sqlx::any::AnyRow) -> Result<SandboxSecretMount, ApiError> {
+    let secret_ref_id: String = row.try_get("secret_ref_id")?;
+    let backend: String = row.try_get("backend")?;
+    let delivery: String = row.try_get("delivery")?;
+    Ok(SandboxSecretMount {
+        secret_ref_id: SecretRefId(
+            Uuid::parse_str(&secret_ref_id)
+                .map_err(|_| ApiError::internal("invalid secret binding id"))?,
+        ),
+        name: row.try_get("name")?,
+        source: SecretSource {
+            backend: SecretBackend::parse_db_str(&backend)
+                .map_err(|error| ApiError::internal(error.to_string()))?,
+            object_name: row.try_get("source_object_name")?,
+            object_key: row.try_get("source_object_key")?,
+        },
+        delivery: SecretDelivery::parse_db_str(&delivery)
+            .map_err(|error| ApiError::internal(error.to_string()))?,
+        mount_dir: row.try_get("mount_dir")?,
+        file_path: row.try_get("file_path")?,
+        env_file_variable: row.try_get("env_file_variable")?,
+    })
+}
+
 fn is_unique_violation(error: &sqlx::Error) -> bool {
     error
         .as_database_error()

@@ -1,5 +1,6 @@
 use super::*;
 use sandboxwich_core::{MAX_COMMAND_STDIN_BYTES, NetworkAllowRule};
+use sandboxwich_core::{SandboxSecretMount, SecretRef, SecretRefId, SecretRefState, SecretSource};
 
 #[test]
 fn compiler_cache_materialization_stages_then_restores_before_success() {
@@ -1630,6 +1631,7 @@ fn kubernetes_workspace_modes_render_distinct_bounded_storage_contracts() {
         (WorkspaceMode::Persistent, "persistentVolumeClaim", true),
     ] {
         let spec = SandboxProvisionSpec {
+            secret_mounts: Vec::new(),
             workspace_mode: mode.clone(),
             execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
             memory_limit: MemoryLimit::OneG,
@@ -1720,6 +1722,7 @@ fn configured_workspace_storage_overrides_non_default_tier_disk_size() {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
             .with_workspace_storage(Some("20Gi".to_string()));
     let spec = SandboxProvisionSpec {
+        secret_mounts: Vec::new(),
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::FourG,
@@ -1743,6 +1746,7 @@ fn kubernetes_dry_run_renders_resource_network_and_runtime_class_controls() {
             .with_isolation_profile(IsolationProfile::Gvisor)
             .with_runtime_class_name(Some("gvisor".to_string()));
     let spec = SandboxProvisionSpec {
+        secret_mounts: Vec::new(),
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::FourG,
@@ -1839,6 +1843,7 @@ fn kubernetes_dry_run_rejects_host_allow_rules_for_standard_network_policy() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
+        secret_mounts: Vec::new(),
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
@@ -1863,6 +1868,7 @@ fn cilium_fqdn_backend_renders_host_allow_rules() {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
             .with_cilium_fqdn_egress(true);
     let spec = SandboxProvisionSpec {
+        secret_mounts: Vec::new(),
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
@@ -1928,6 +1934,7 @@ fn host_rules_render_a_separate_gateway_and_no_direct_public_egress() {
             .with_egress_gateway_image(Some(image.clone()));
     let sandbox_id = SandboxId::new();
     let spec = SandboxProvisionSpec {
+        secret_mounts: Vec::new(),
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
@@ -2058,6 +2065,7 @@ fn host_rules_reject_an_unpinned_gateway_image() {
                 "ghcr.io/evalops/sandboxwich-worker:latest".to_string(),
             ));
     let spec = SandboxProvisionSpec {
+        secret_mounts: Vec::new(),
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
@@ -2653,6 +2661,7 @@ fn allow_all_egress_carves_out_control_plane_and_dns_ranges() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
+        secret_mounts: Vec::new(),
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
@@ -2717,6 +2726,7 @@ fn allowlist_egress_carves_out_control_plane_ranges_contained_within_allowed_cid
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
+        secret_mounts: Vec::new(),
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
@@ -2763,6 +2773,7 @@ fn allowlist_egress_leaves_disjoint_narrow_cidrs_untouched() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
+        secret_mounts: Vec::new(),
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
@@ -2797,6 +2808,7 @@ fn allowlist_egress_rejects_cidr_fully_covered_by_an_excluded_range() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
+        secret_mounts: Vec::new(),
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
@@ -2820,6 +2832,7 @@ fn allowlist_egress_rejects_cidr_exactly_equal_to_an_excluded_range() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
+        secret_mounts: Vec::new(),
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
@@ -2842,6 +2855,7 @@ fn allowlist_egress_carves_out_control_plane_ranges_when_wide_open_cidr_is_allow
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
+        secret_mounts: Vec::new(),
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
@@ -2875,6 +2889,7 @@ fn ipv6_allowlist_cidr_containing_an_ipv6_excluded_range_carves_it_out() {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
             .with_egress_excluded_cidrs(vec!["fd00:ec2::254/128".to_string()]);
     let spec = SandboxProvisionSpec {
+        secret_mounts: Vec::new(),
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
@@ -2912,6 +2927,7 @@ fn ipv6_allow_rule_is_unaffected_by_default_ipv4_excluded_cidrs() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
+        secret_mounts: Vec::new(),
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
@@ -2941,6 +2957,7 @@ fn operator_supplied_egress_excluded_cidrs_merge_with_defaults() {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
             .with_egress_excluded_cidrs(vec!["172.16.0.0/12".to_string()]);
     let spec = SandboxProvisionSpec {
+        secret_mounts: Vec::new(),
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
@@ -2974,6 +2991,7 @@ fn with_egress_excluded_cidrs_replace_drops_the_defaults() {
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
             .with_egress_excluded_cidrs_replace(vec!["172.16.0.0/12".to_string()]);
     let spec = SandboxProvisionSpec {
+        secret_mounts: Vec::new(),
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
@@ -3000,6 +3018,7 @@ fn deny_all_egress_keeps_only_dns_and_authenticated_api_control_plane_rules() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
+        secret_mounts: Vec::new(),
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::OneG,
@@ -3094,6 +3113,7 @@ fn pod_disables_service_account_token_automount_and_sets_ephemeral_storage_limit
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let spec = SandboxProvisionSpec {
+        secret_mounts: Vec::new(),
         workspace_mode: sandboxwich_core::WorkspaceMode::Persistent,
         execution_class: sandboxwich_core::ExecutionClass::DevelopmentContainer,
         memory_limit: MemoryLimit::FourG,
@@ -4927,4 +4947,114 @@ fn kubectl_output_is_capped_at_the_configured_byte_limit() {
     );
 
     let _ = std::fs::remove_dir_all(kubectl.parent().expect("kubectl script has a parent dir"));
+}
+
+fn secret_mount_fixture(name: &str) -> SandboxSecretMount {
+    let now = chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap();
+    SandboxSecretMount::from_ref(&SecretRef {
+        id: SecretRefId::new(),
+        tenant_id: "acme".into(),
+        workspace_id: "ws-1".into(),
+        name: name.into(),
+        source: SecretSource {
+            backend: SecretBackend::CsiSecretProviderClass,
+            object_name: "acme-openai".into(),
+            object_key: "api-key".into(),
+        },
+        delivery: SecretDelivery::File,
+        state: SecretRefState::Active,
+        created_at: now,
+        updated_at: now,
+        revoked_at: None,
+    })
+}
+
+#[test]
+fn kubernetes_pod_delivers_secret_references_as_read_only_csi_mounts() {
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_secret_csi_driver(Some("secrets-store.csi.k8s.io".to_string()));
+    let spec = SandboxProvisionSpec {
+        secret_mounts: vec![secret_mount_fixture("openai-api-key")],
+        ..SandboxProvisionSpec::default()
+    };
+    let provisioned = provider
+        .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+        .expect("dry-run provision should succeed");
+    let pod = &provisioned.metadata["manifests"]["pod"];
+
+    let volume = pod["spec"]["volumes"]
+        .as_array()
+        .expect("volumes should be an array")
+        .iter()
+        .find(|volume| volume["name"] == "sandboxwich-secret-openai-api-key")
+        .expect("secret delivery volume should be rendered");
+    assert_eq!(volume["csi"]["driver"], "secrets-store.csi.k8s.io");
+    assert_eq!(volume["csi"]["readOnly"], true);
+    assert_eq!(
+        volume["csi"]["volumeAttributes"]["secretProviderClass"],
+        "acme-openai"
+    );
+    // No `secret`/`secretName` anywhere: the whole point of the CSI path is
+    // that no Kubernetes Secret object ever holds this material.
+    assert!(volume.get("secret").is_none());
+
+    assert!(
+        pod["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .expect("volume mounts should be an array")
+            .iter()
+            .any(|mount| mount["name"] == "sandboxwich-secret-openai-api-key"
+                && mount["mountPath"] == "/run/sandboxwich/secrets/openai-api-key"
+                && mount["readOnly"] == true)
+    );
+    // The guest learns the path, never the value.
+    assert!(
+        pod["spec"]["containers"][0]["env"]
+            .as_array()
+            .expect("env should be an array")
+            .iter()
+            .any(
+                |env| env["name"] == "SANDBOXWICH_SECRET_OPENAI_API_KEY_FILE"
+                    && env["value"] == "/run/sandboxwich/secrets/openai-api-key/api-key"
+            )
+    );
+}
+
+#[test]
+fn kubernetes_provision_fails_closed_when_secret_csi_driver_is_unconfigured() {
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+    let spec = SandboxProvisionSpec {
+        secret_mounts: vec![secret_mount_fixture("openai-api-key")],
+        ..SandboxProvisionSpec::default()
+    };
+    let error = provider
+        .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+        .expect_err("a sandbox that asked for a credential must not come up without it");
+    assert!(
+        error.to_string().contains("Secrets Store CSI driver"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn kubernetes_provision_rejects_secret_mounts_with_non_derived_paths() {
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_secret_csi_driver(Some("secrets-store.csi.k8s.io".to_string()));
+    let mut mount = secret_mount_fixture("openai-api-key");
+    mount.mount_dir = "/etc".into();
+    mount.file_path = "/etc/api-key".into();
+    let spec = SandboxProvisionSpec {
+        secret_mounts: vec![mount],
+        ..SandboxProvisionSpec::default()
+    };
+    let error = provider
+        .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+        .expect_err("a delivery path the control plane did not derive must be refused");
+    assert!(
+        error.to_string().contains("not control-plane derived"),
+        "unexpected error: {error}"
+    );
 }

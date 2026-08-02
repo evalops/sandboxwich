@@ -15,7 +15,7 @@ create table if not exists secret_refs (
     created_at text not null,
     updated_at text not null,
     revoked_at text,
-    constraint secret_refs_backend_check check (backend in ('kubernetes_secret')),
+    constraint secret_refs_backend_check check (backend in ('csi_secret_provider_class')),
     constraint secret_refs_delivery_check check (delivery in ('file')),
     constraint secret_refs_state_check check (state in ('active', 'revoked'))
 );

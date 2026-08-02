@@ -37,6 +37,7 @@ async fn create_execution_sandbox(
     client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: Some(execution_class),
             workspace_mode: None,
             name: Some(name.to_string()),
@@ -310,6 +311,7 @@ pub(crate) async fn runtime_resource_inventory_is_worker_scoped_and_bounded() {
     let sandbox: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: None,
             runtime_profile: None,
@@ -486,6 +488,7 @@ pub(crate) async fn runtime_resource_inventory_is_worker_scoped_and_bounded() {
     let tenant_b_sandbox: SandboxResponse = tenant_b
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             name: Some("tenant-b-inventory-sandbox".to_string()),
             template: None,
             memory_limit: None,
@@ -638,6 +641,7 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
         client
             .post(format!("{}/sandboxes", server.base_url))
             .json(&CreateSandboxRequest {
+                secret_ref_ids: Vec::new(),
                 execution_class: None,
                 workspace_mode: None,
                 runtime_profile: None,
@@ -1250,6 +1254,7 @@ pub(crate) async fn guest_tokens_are_scoped_to_their_own_sandbox_within_one_work
         client
             .post(format!("{}/sandboxes", server.base_url))
             .json(&CreateSandboxRequest {
+                secret_ref_ids: Vec::new(),
                 workspace_mode: None,
                 name: Some(name.to_string()),
                 template: None,

@@ -2,6 +2,7 @@ use crate::auth::*;
 use crate::db::*;
 use crate::error::*;
 use crate::handlers::jobs::*;
+use crate::handlers::secrets::fetch_sandbox_secret_mounts;
 use crate::pagination::*;
 use crate::rows::*;
 use crate::state::*;
@@ -112,6 +113,7 @@ pub(crate) async fn queue_command(
             "stdin": stdin,
             "timeoutSecs": timeout_secs,
             "provisionSpec": SandboxProvisionSpec {
+                secret_mounts: Vec::new(),
                 execution_class: sandbox.execution_class.clone(),
                 memory_limit: sandbox.memory_limit.clone(),
                 network_egress: sandbox.network_egress.clone(),
@@ -129,7 +131,8 @@ pub(crate) async fn queue_command(
         updated_at: now,
         last_error: None,
     };
-    add_provision_spec_to_payload(&mut job, &sandbox)?;
+    let secret_mounts = fetch_sandbox_secret_mounts(&state.db, sandbox.id).await?;
+    add_provision_spec_to_payload(&mut job, &sandbox, &secret_mounts)?;
 
     let mut tx = state.db.pool.begin().await?;
     insert_command_on_connection(&state.db, &mut tx, &command).await?;

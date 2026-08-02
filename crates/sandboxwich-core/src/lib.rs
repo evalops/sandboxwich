@@ -895,6 +895,10 @@ pub struct SandboxProvisionSpec {
     pub runtime_profile: SandboxRuntimeProfile,
     #[serde(default)]
     pub execution_class: ExecutionClass,
+    /// Resolved secret deliveries for this sandbox. Locators only; the worker
+    /// turns each one into a read-only CSI volume mount.
+    #[serde(default)]
+    pub secret_mounts: Vec<SandboxSecretMount>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1024,6 +1028,12 @@ pub struct CreateSandboxRequest {
     /// exceeds the operator-configured ceiling.
     #[serde(default)]
     pub idle_ttl_seconds: Option<u64>,
+    /// Secret references to deliver to this sandbox as read-only files. Each
+    /// id is resolved in the caller's own tenant scope at create time; an
+    /// unknown, revoked, or foreign reference fails the create rather than
+    /// producing a sandbox that silently lacks a credential.
+    #[serde(default)]
+    pub secret_ref_ids: Vec<SecretRefId>,
 }
 
 db_variant_enum! {
@@ -3347,12 +3357,15 @@ db_variant_enum! {
 /// Where the secret *material* actually lives. Sandboxwich stores a
 /// reference to it and never reads, transports, or persists the bytes.
 ///
-/// `kubernetes_secret` names an object in the operator-owned secret source
-/// namespace configured on the worker. The object name is tenant-supplied,
-/// the namespace never is: a tenant-chosen namespace would be a cross-tenant
-/// read primitive.
+/// `csi_secret_provider_class` names a `SecretProviderClass` the operator has
+/// provisioned for the tenant. The kubelet's Secrets Store CSI driver reads
+/// the material from the external store and mounts it into the Pod's tmpfs
+/// directly, so no plaintext copy is ever created in a Kubernetes `Secret`
+/// object, in etcd, or in any sandboxwich process. The class name is
+/// tenant-supplied; its namespace never is, because a tenant-chosen namespace
+/// would be a cross-tenant read primitive.
 pub enum SecretBackend {
-    KubernetesSecret => "kubernetes_secret",
+    CsiSecretProviderClass => "csi_secret_provider_class",
 }
 }
 
@@ -3383,9 +3396,10 @@ pub enum SecretRefState {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SecretSource {
     pub backend: SecretBackend,
-    /// Name of the source object in the operator-owned secret namespace.
+    /// Name of the `SecretProviderClass` in the operator-owned secret
+    /// namespace.
     pub object_name: String,
-    /// Key within that object holding the material.
+    /// File the class writes the material to inside the CSI mount.
     pub object_key: String,
 }
 
@@ -3411,10 +3425,15 @@ pub struct SecretRef {
 }
 
 impl SecretRef {
-    /// Absolute in-guest path of the delivered file. Derived from the
-    /// validated name, never from caller input.
-    pub fn mount_path(&self) -> String {
-        secret_mount_path(&self.name)
+    /// Absolute in-guest directory the delivery volume is mounted at. Derived
+    /// from the validated name, never from caller input.
+    pub fn mount_dir(&self) -> String {
+        secret_mount_dir(&self.name)
+    }
+
+    /// Absolute in-guest path of the delivered file.
+    pub fn file_path(&self) -> String {
+        format!("{}/{}", self.mount_dir(), self.source.object_key)
     }
 
     /// Environment variable carrying the *path* (never the value) of the
@@ -3424,8 +3443,8 @@ impl SecretRef {
     }
 }
 
-/// Absolute in-guest path for a validated secret-reference name.
-pub fn secret_mount_path(name: &str) -> String {
+/// Absolute in-guest mount directory for a validated secret-reference name.
+pub fn secret_mount_dir(name: &str) -> String {
     format!("{SANDBOX_SECRET_MOUNT_PREFIX}/{name}")
 }
 
@@ -3459,6 +3478,25 @@ pub enum SecretRefValidationError {
     TooManyBindings,
     #[error("secret reference {0} is bound more than once")]
     DuplicateBinding(SecretRefId),
+}
+
+/// Validates the set of references one sandbox binds. Bounded and
+/// duplicate-free: two bindings of the same reference would derive the same
+/// mount path, and a Pod with two volume mounts at one path is rejected by
+/// the API server only *after* the sandbox row exists.
+pub fn validate_secret_ref_bindings(
+    secret_ref_ids: &[SecretRefId],
+) -> Result<(), SecretRefValidationError> {
+    if secret_ref_ids.len() > MAX_SANDBOX_SECRET_BINDINGS {
+        return Err(SecretRefValidationError::TooManyBindings);
+    }
+    let mut seen = std::collections::HashSet::with_capacity(secret_ref_ids.len());
+    for id in secret_ref_ids {
+        if !seen.insert(*id) {
+            return Err(SecretRefValidationError::DuplicateBinding(*id));
+        }
+    }
+    Ok(())
 }
 
 fn is_dns_label_like(value: &str, max_len: usize, extra: &[char]) -> bool {
@@ -3506,8 +3544,12 @@ impl SecretSource {
         ) {
             return Err(SecretRefValidationError::SourceObjectName);
         }
+        // The key becomes a file name inside the CSI mount, so dot segments
+        // are rejected outright rather than only the path separator: `..` is
+        // a traversal primitive the moment anything joins it to a directory.
         let key_ok = !self.object_key.is_empty()
             && self.object_key.len() <= MAX_SECRET_SOURCE_OBJECT_KEY_LEN
+            && !self.object_key.chars().all(|c| c == '.')
             && self
                 .object_key
                 .chars()
@@ -3520,7 +3562,8 @@ impl SecretSource {
 
 /// `deny_unknown_fields` is load-bearing: it is what makes "the control plane
 /// cannot be handed raw credential bytes" a contract rather than a
-/// convention. A client that tries to send `value`/`data` gets a 400.
+/// convention. A client that tries to send `value`/`data` is rejected by the
+/// extractor itself, before any handler runs (422 `invalid_request`).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateSecretRefRequest {
@@ -3567,8 +3610,10 @@ pub struct SandboxSecretMount {
     pub name: String,
     pub source: SecretSource,
     pub delivery: SecretDelivery,
-    /// Read-only path the worker must mount the material at.
-    pub mount_path: String,
+    /// Read-only directory the worker must mount the delivery volume at.
+    pub mount_dir: String,
+    /// Path of the delivered file inside that directory.
+    pub file_path: String,
     /// Environment variable the guest reads the path (not the value) from.
     pub env_file_variable: String,
 }
@@ -3580,9 +3625,17 @@ impl SandboxSecretMount {
             name: secret_ref.name.clone(),
             source: secret_ref.source.clone(),
             delivery: secret_ref.delivery.clone(),
-            mount_path: secret_ref.mount_path(),
+            mount_dir: secret_ref.mount_dir(),
+            file_path: secret_ref.file_path(),
             env_file_variable: secret_ref.env_file_variable(),
         }
+    }
+
+    /// Pod volume name for this delivery. Safe to derive from the name: names
+    /// are DNS-label-like, and the prefix keeps them from colliding with the
+    /// worker's own volumes.
+    pub fn volume_name(&self) -> String {
+        format!("sandboxwich-secret-{}", self.name)
     }
 }
 
@@ -4281,7 +4334,7 @@ mod tests {
 
     fn secret_source() -> SecretSource {
         SecretSource {
-            backend: SecretBackend::KubernetesSecret,
+            backend: SecretBackend::CsiSecretProviderClass,
             object_name: "tenant-model-credentials".into(),
             object_key: "openai.api-key".into(),
         }
@@ -4293,7 +4346,7 @@ mod tests {
             "workspaceId": "ws-1",
             "name": "openai-api-key",
             "source": {
-                "backend": "kubernetes_secret",
+                "backend": "csi_secret_provider_class",
                 "objectName": "tenant-model-credentials",
                 "objectKey": "openai.api-key"
             },
@@ -4307,7 +4360,7 @@ mod tests {
             "workspaceId": "ws-1",
             "name": "openai-api-key",
             "source": {
-                "backend": "kubernetes_secret",
+                "backend": "csi_secret_provider_class",
                 "objectName": "tenant-model-credentials",
                 "objectKey": "openai.api-key",
                 "data": "sk-secret-canary"
@@ -4356,18 +4409,23 @@ mod tests {
             revoked_at: None,
         };
         assert_eq!(
-            secret_ref.mount_path(),
+            secret_ref.mount_dir(),
             "/run/sandboxwich/secrets/openai-api-key"
+        );
+        assert_eq!(
+            secret_ref.file_path(),
+            "/run/sandboxwich/secrets/openai-api-key/openai.api-key"
         );
         assert_eq!(
             secret_ref.env_file_variable(),
             "SANDBOXWICH_SECRET_OPENAI_API_KEY_FILE"
         );
         let mount = SandboxSecretMount::from_ref(&secret_ref);
-        assert_eq!(mount.mount_path, secret_ref.mount_path());
+        assert_eq!(mount.mount_dir, secret_ref.mount_dir());
+        assert_eq!(mount.file_path, secret_ref.file_path());
         assert_eq!(mount.env_file_variable, secret_ref.env_file_variable());
         assert!(
-            mount.mount_path.starts_with(SANDBOX_SECRET_MOUNT_PREFIX),
+            mount.file_path.starts_with(SANDBOX_SECRET_MOUNT_PREFIX),
             "delivery must stay under the read-only secret prefix"
         );
     }
@@ -4385,7 +4443,17 @@ mod tests {
                 Err(SecretRefValidationError::SourceObjectName)
             );
         }
-        for object_key in ["", "key with space", "key/with/slash", "../key"] {
+        // Dot segments are rejected outright, not just the separator: the key
+        // becomes a file name inside the delivery mount.
+        for object_key in [
+            "",
+            "key with space",
+            "key/with/slash",
+            "../key",
+            ".",
+            "..",
+            "...",
+        ] {
             let source = SecretSource {
                 object_key: object_key.into(),
                 ..secret_source()
