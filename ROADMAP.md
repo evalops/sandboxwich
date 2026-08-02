@@ -52,7 +52,13 @@ These capabilities remain Experimental until every gate below passes for a named
 
 ## Next work
 
-1. Add live Cilium FQDN conformance on a Cilium-backed disposable cluster.
+1. Promote Cilium FQDN egress from Experimental. The live suite
+   (`deploy/kubernetes/cilium-fqdn-conformance.sh`, `cilium-fqdn` job) now
+   proves allow, deny, DNS failure, redirect, IPv4, and IPv6 against a
+   Cilium-backed disposable cluster using the shipped policy rendering. What
+   remains is a Cilium-backed *production* target: the deploy repo has no
+   Cilium-managed cluster, so `SANDBOXWICH_CILIUM_FQDN_EGRESS=true` has no
+   production evidence and the egress-gateway backend stays the default.
 2. Add a microVM provider and compare its lifecycle and recovery behavior with RuntimeClass-backed Kubernetes.
 3. Add a brokered desktop transport; current desktop records do not create an ingress tunnel.
 4. Add production secret storage before accepting long-lived user or model credentials.
