@@ -693,6 +693,7 @@ pub(crate) async fn run_contract(server: TestServer) {
     assert_expired_lease_requeues_command(&client, &server, &created, &worker).await;
     assert_prompt_job_lifecycle(&client, &server, &created).await;
     assert_desktop_session_lifecycle(&client, &server, &created).await;
+    assert_desktop_brokered_transport(&client, &server, &created, &worker).await;
     assert_snapshot_fork_and_cleanup_lifecycle(&client, &server, &created, &worker).await;
 
     let stopped: SandboxResponse = client
