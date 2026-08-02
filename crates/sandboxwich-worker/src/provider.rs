@@ -231,6 +231,15 @@ pub const GUEST_TOKEN_REDACTED: &str = "[redacted]";
 /// value (only) from byte equality.
 pub const GUEST_TOKEN_SECRET_NAME_PREFIX: &str = "sandboxwich-guest-token-";
 const GKE_FQDN_RESOURCE_KIND: &str = "fqdnnetworkpolicy.networking.gke.io";
+/// Kind of the policy the Cilium FQDN backend renders. `networkpolicy` in
+/// `SANDBOX_TEARDOWN_RESOURCE_KINDS` does not match it, so a sandbox stopped
+/// under this backend would leave its policy behind. Only appended when the
+/// backend is selected, since the CRD exists only on Cilium clusters.
+const CILIUM_FQDN_RESOURCE_KIND: &str = "ciliumnetworkpolicy.cilium.io";
+/// Ports an allowlisted host name is reachable on. Shared by both FQDN
+/// backends so the same allow rule grants the same reachability whether it is
+/// enforced by the per-sandbox egress gateway or by Cilium `toFQDNs`.
+const FQDN_EGRESS_PORTS: [u16; 2] = [80, 443];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct SandboxTeardownSpec {
@@ -563,6 +572,18 @@ impl std::fmt::Debug for GuestCredentials {
 }
 
 impl KubernetesDryRunProvider {
+    /// Renders the egress policy a `provision` would apply for `network_egress`,
+    /// without provisioning anything. This is the exact manifest the live
+    /// conformance suites apply, so the suites exercise the shipped rendering
+    /// instead of a hand-maintained copy of it.
+    pub fn render_egress_policy(
+        &self,
+        sandbox_id: SandboxId,
+        network_egress: &NetworkEgress,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.network_policy_manifest(sandbox_id, network_egress)
+    }
+
     pub fn with_snapshot_class(
         cluster: impl Into<String>,
         namespace: impl Into<String>,
@@ -747,11 +768,16 @@ impl KubernetesDryRunProvider {
         base: &str,
         persisted_gke_fqdn: bool,
     ) -> String {
+        let mut kinds = base.to_string();
         if persisted_gke_fqdn {
-            format!("{base},{GKE_FQDN_RESOURCE_KIND}")
-        } else {
-            base.to_string()
+            kinds.push(',');
+            kinds.push_str(GKE_FQDN_RESOURCE_KIND);
         }
+        if self.fqdn_egress_backend.as_deref() == Some("cilium") {
+            kinds.push(',');
+            kinds.push_str(CILIUM_FQDN_RESOURCE_KIND);
+        }
+        kinds
     }
 
     /// Merges operator-supplied CIDRs into the excluded set (deduped
@@ -1085,7 +1111,7 @@ impl KubernetesDryRunProvider {
             self.host_rules(network_egress)
                 .map(ToString::to_string)
                 .collect(),
-            vec![80, 443],
+            FQDN_EGRESS_PORTS.to_vec(),
             denied_cidrs,
         )?))
     }
@@ -1664,7 +1690,7 @@ impl KubernetesDryRunProvider {
                 .iter()
                 .any(|rule| rule.kind == NetworkAllowRuleKind::Host)
         {
-            return Ok(self.cilium_fqdn_policy_manifest(sandbox_id, network_egress));
+            return self.cilium_fqdn_policy_manifest(sandbox_id, network_egress);
         }
         let mut egress = match network_egress {
             NetworkEgress::DenyAll => Vec::new(),
@@ -1718,11 +1744,24 @@ impl KubernetesDryRunProvider {
         }))
     }
 
+    /// Renders the `CiliumNetworkPolicy` used when the Cilium FQDN backend is
+    /// selected. The rendering is the enforcement boundary itself, so three
+    /// properties are load-bearing and covered by
+    /// `deploy/kubernetes/cilium-fqdn-conformance.sh`:
+    ///
+    /// * the DNS rule carries L7 `rules.dns`; without it Cilium never sees the
+    ///   answers that populate `toFQDNs` and every allowlisted name is
+    ///   unreachable (`toFQDNs` rules "do nothing if there is no L7 DNS rule
+    ///   covering the endpoint"),
+    /// * allowlisted names are reachable only on the same ports the
+    ///   egress-gateway backend proxies, and
+    /// * `egressDeny` is omitted rather than rendered with an empty CIDR set,
+    ///   which is not a deny of anything.
     fn cilium_fqdn_policy_manifest(
         &self,
         sandbox_id: SandboxId,
         network_egress: &NetworkEgress,
-    ) -> serde_json::Value {
+    ) -> anyhow::Result<serde_json::Value> {
         let rules = network_egress.rules();
         let hosts: Vec<_> = rules
             .iter()
@@ -1745,8 +1784,7 @@ impl KubernetesDryRunProvider {
                     "exceptCIDRs": block.get("except").cloned().unwrap_or_else(|| json!([]))
                 }))
             })
-            .collect::<anyhow::Result<Vec<_>>>()
-            .expect("CIDRs were validated before provider dispatch");
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let mut ingress_labels = serde_json::Map::from_iter([(
             "k8s:io.kubernetes.pod.namespace".to_string(),
             json!(self.effective_ingress_namespace()),
@@ -1759,13 +1797,22 @@ impl KubernetesDryRunProvider {
             .iter()
             .map(|cidr| json!({"cidr": cidr}))
             .collect();
-        let mut egress = vec![json!({"toFQDNs": hosts})];
+        let mut egress = vec![json!({
+            "toFQDNs": hosts,
+            "toPorts": [{"ports": FQDN_EGRESS_PORTS
+                .iter()
+                .map(|port| json!({"port": port.to_string(), "protocol": "TCP"}))
+                .collect::<Vec<_>>()}]
+        })];
         if !cidrs.is_empty() {
             egress.push(json!({"toCIDRSet": cidrs}));
         }
         egress.push(json!({
             "toEndpoints": [{"matchLabels": {"k8s:io.kubernetes.pod.namespace": self.dns_namespace, "k8s:k8s-app": "kube-dns"}}],
-            "toPorts": [{"ports": [{"port": "53", "protocol": "ANY"}]}]
+            "toPorts": [{
+                "ports": [{"port": "53", "protocol": "ANY"}],
+                "rules": {"dns": [{"matchPattern": "*"}]}
+            }]
         }));
         egress.push(json!({
             "toEndpoints": [{"matchLabels": {
@@ -1774,32 +1821,34 @@ impl KubernetesDryRunProvider {
             }}],
             "toPorts": [{"ports": [{"port": "3217", "protocol": "TCP"}]}]
         }));
-        egress.extend(self.dns_service_ips.iter().map(|address| {
-            let cidr = match address {
-                IpAddr::V4(address) => format!("{address}/32"),
-                IpAddr::V6(address) => format!("{address}/128"),
-            };
-            json!({
-                "toCIDRSet": [{"cidr": cidr}],
-                "toPorts": [{"ports": [{"port": "53", "protocol": "ANY"}]}]
-            })
-        }));
-        json!({
+        // Deliberately no bare-address DNS rule for `dns_service_ips`: only
+        // answers returned through a rule carrying L7 `rules.dns` reach the
+        // Cilium DNS proxy and populate the `toFQDNs` cache, so a resolver
+        // reachable purely as an address (NodeLocal DNSCache and friends)
+        // would resolve names that stay unreachable. Under this backend the
+        // sandbox resolves through the cluster DNS endpoints above -- the
+        // cluster DNS ClusterIP translates to those same endpoints -- and any
+        // other resolver stays denied instead of silently degrading the
+        // allowlist.
+        let mut spec = json!({
+            "endpointSelector": {"matchLabels": {"sandboxwich.dev/sandbox-id": sandbox_id}},
+            "ingress": [{
+                "fromEndpoints": [{"matchLabels": ingress_labels}],
+                "toPorts": [{"ports": [
+                    {"port": "2222", "protocol": "TCP"}, {"port": "6080", "protocol": "TCP"}, {"port": "5900", "protocol": "TCP"}
+                ]}]
+            }],
+            "egress": egress
+        });
+        if !denied_cidrs.is_empty() {
+            spec["egressDeny"] = json!([{"toCIDRSet": denied_cidrs}]);
+        }
+        Ok(json!({
             "apiVersion": "cilium.io/v2",
             "kind": "CiliumNetworkPolicy",
             "metadata": self.object_metadata(format!("sandboxwich-egress-{sandbox_id}"), Some(sandbox_id)),
-            "spec": {
-                "endpointSelector": {"matchLabels": {"sandboxwich.dev/sandbox-id": sandbox_id}},
-                "ingress": [{
-                    "fromEndpoints": [{"matchLabels": ingress_labels}],
-                    "toPorts": [{"ports": [
-                        {"port": "2222", "protocol": "TCP"}, {"port": "6080", "protocol": "TCP"}, {"port": "5900", "protocol": "TCP"}
-                    ]}]
-                }],
-                "egress": egress,
-                "egressDeny": [{"toCIDRSet": denied_cidrs}]
-            }
-        })
+            "spec": spec
+        }))
     }
 
     fn egress_gateway_pod_manifest(
