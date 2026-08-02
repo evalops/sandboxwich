@@ -1552,6 +1552,253 @@ fn provision_staged_rejects_vm_class_before_applying_anything() {
 }
 
 #[test]
+fn sandboxed_container_execution_class_requires_gvisor_and_runtime_class() {
+    let spec = SandboxProvisionSpec {
+        execution_class: ExecutionClass::SandboxedContainer,
+        network_egress: NetworkEgress::DenyAll,
+        ..SandboxProvisionSpec::default()
+    };
+
+    let gvisor =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Gvisor)
+            .with_runtime_class_name(Some("gvisor".to_string()));
+    gvisor
+        .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+        .expect("gvisor worker with a RuntimeClass renders sandboxed-container work");
+
+    // A RuntimeClass alone is not an isolation profile: production workers run
+    // with `--runtime-class-name gvisor` and the default development profile.
+    let runtime_class_only =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_runtime_class_name(Some("gvisor".to_string()));
+    let error = runtime_class_only
+        .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+        .expect_err("sandboxed-container work must fail closed without the gvisor profile");
+    assert!(
+        format!("{error:#}")
+            .contains("sandboxed_container execution_class requires the gvisor isolation profile"),
+        "rejected for the wrong reason: {error:#}"
+    );
+
+    let kata =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Kata)
+            .with_runtime_class_name(Some("kata-qemu".to_string()));
+    assert!(
+        kata.provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+            .is_err(),
+        "a Kata worker must not silently satisfy sandboxed_container work"
+    );
+}
+
+/// A fake kubectl whose live Pod reports `observed_runtime_class` (empty means
+/// the Pod carries no `runtimeClassName` at all), and whose `get pod` existence
+/// probe answers `pod_exists`.
+fn write_runtime_class_fake_kubectl(
+    observed_runtime_class: &str,
+    pod_exists: bool,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "sandboxwich-runtime-class-kubectl-{}",
+        SandboxId::new()
+    ));
+    std::fs::create_dir_all(&dir).expect("create runtime class fake kubectl dir");
+    let log_path = dir.join("log.txt");
+    let script_path = dir.join("kubectl");
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "{log}"
+case " $* " in
+  *runtimeClassName*) printf '%s' '{observed}' ;;
+  *" get pod "*) printf '%s' '{existing}' ;;
+  *" exec "*) cat >/dev/null 2>&1 || true; printf 'guest-ran' ;;
+  *) cat >/dev/null 2>&1 || true ;;
+esac
+"#,
+        log = log_path.display(),
+        observed = observed_runtime_class,
+        existing = if pod_exists {
+            "pod/sandboxwich-guest"
+        } else {
+            ""
+        },
+    );
+    std::fs::write(&script_path, script).expect("write runtime class fake kubectl");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("stat runtime class fake kubectl")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions)
+            .expect("chmod runtime class fake kubectl");
+    }
+    (script_path, log_path)
+}
+
+fn kata_apply_provider(kubectl: &std::path::Path) -> KubernetesApplyProvider {
+    KubernetesApplyProvider::new(
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Kata)
+            .with_runtime_class_name(Some("kata-qemu".to_string())),
+        kubectl.to_string_lossy().into_owned(),
+    )
+    .with_kubectl_context(Some("in-cluster".to_string()))
+    .with_mutation_gate(true, true)
+}
+
+fn virtual_machine_spec() -> SandboxProvisionSpec {
+    SandboxProvisionSpec {
+        execution_class: ExecutionClass::VirtualMachine,
+        network_egress: NetworkEgress::DenyAll,
+        ..SandboxProvisionSpec::default()
+    }
+}
+
+#[test]
+fn virtual_machine_provision_fails_closed_when_the_live_pod_lost_its_runtime_class() {
+    // Rendering `runtimeClassName` is not evidence that the admitted Pod runs
+    // under it: a mutating webhook may strip the field, leaving an ordinary
+    // container that would otherwise be reported as a ready VM sandbox.
+    let (kubectl, log_path) = write_runtime_class_fake_kubectl("", false);
+    let provider = kata_apply_provider(&kubectl);
+    let spec = virtual_machine_spec();
+
+    let error = provider
+        .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+        .expect_err("a pod without the required RuntimeClass must not become a VM sandbox");
+    let provider_error = error
+        .downcast_ref::<ProviderError>()
+        .expect("boundary failures are typed provider errors");
+    assert_eq!(
+        provider_error.reason_code(),
+        "runtime_class_boundary_unverified"
+    );
+    assert_eq!(provider_error.disposition(), RetryDisposition::Permanent);
+    assert_eq!(
+        provider_error.error_class(),
+        ProvisioningErrorClass::TerminalSecurity
+    );
+    let invocations = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        !invocations.contains(" exec "),
+        "no guest work may run behind an unverified boundary: {invocations}"
+    );
+    assert!(
+        invocations.contains(" delete "),
+        "the rejected sandbox's resources must be torn down: {invocations}"
+    );
+}
+
+#[test]
+fn virtual_machine_provision_staged_fails_closed_on_a_mismatched_runtime_class() {
+    let (kubectl, log_path) = write_stateful_fake_kubectl_with_observed_runtime_class("gvisor");
+    let provider = kata_apply_provider(&kubectl);
+    let spec = virtual_machine_spec();
+
+    let mut reports = Vec::new();
+    let error = provider
+        .provision_staged(
+            SandboxId::new(),
+            &spec,
+            &CancelSignal::never_cancelled(),
+            |report| {
+                reports.push(report);
+                Ok(())
+            },
+        )
+        .expect_err("a pod running under another RuntimeClass must fail closed");
+    assert_eq!(
+        error
+            .downcast_ref::<ProviderError>()
+            .expect("boundary failures are typed provider errors")
+            .reason_code(),
+        "runtime_class_boundary_unverified"
+    );
+    assert!(
+        !reports
+            .iter()
+            .any(|report| report.stage == ProvisioningStage::SandboxReady),
+        "an unverified sandbox must never be reported ready: {reports:?}"
+    );
+    let invocations = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(!invocations.contains(" exec "), "{invocations}");
+}
+
+#[test]
+fn virtual_machine_exec_reverifies_the_boundary_of_an_existing_pod() {
+    let (kubectl, log_path) = write_runtime_class_fake_kubectl("gvisor", true);
+    let provider = kata_apply_provider(&kubectl);
+    let spec = virtual_machine_spec();
+
+    let error = provider
+        .exec_handoff(
+            SandboxId::new(),
+            &spec,
+            AgentCommandRequest {
+                argv: vec!["echo".to_string(), "hello".to_string()],
+                cwd: None,
+                env: BTreeMap::new(),
+                stdin: None,
+                timeout_secs: None,
+            },
+            &CancelSignal::never_cancelled(),
+        )
+        .expect_err("an adopted pod outside the VM boundary must not run guest commands");
+    assert_eq!(
+        error
+            .downcast_ref::<ProviderError>()
+            .expect("boundary failures are typed provider errors")
+            .reason_code(),
+        "runtime_class_boundary_unverified"
+    );
+    let invocations = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        !invocations.contains(" exec "),
+        "no guest command may run in a pod outside the requested boundary: {invocations}"
+    );
+}
+
+#[test]
+fn virtual_machine_provision_succeeds_when_the_live_pod_carries_the_runtime_class() {
+    let (kubectl, log_path) = write_runtime_class_fake_kubectl("kata-qemu", false);
+    let provider = kata_apply_provider(&kubectl);
+    let spec = virtual_machine_spec();
+
+    let handle = provider
+        .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+        .expect("a verified Kata pod provisions normally");
+    assert_eq!(handle.metadata["mode"], "apply");
+    let invocations = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        invocations.contains("jsonpath={.spec.runtimeClassName}"),
+        "the live boundary must be read from the API server: {invocations}"
+    );
+    assert!(!invocations.contains(" delete "), "{invocations}");
+}
+
+#[test]
+fn development_container_provision_does_not_read_the_pod_runtime_class() {
+    let (kubectl, log_path) = write_runtime_class_fake_kubectl("", false);
+    let provider = apply_provider_with_fake_kubectl(&kubectl);
+
+    provider
+        .provision(
+            SandboxId::new(),
+            &SandboxProvisionSpec {
+                network_egress: NetworkEgress::DenyAll,
+                ..SandboxProvisionSpec::default()
+            },
+            &CancelSignal::never_cancelled(),
+        )
+        .expect("development-container work is unaffected by the RuntimeClass boundary check");
+    let invocations = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(!invocations.contains("runtimeClassName"), "{invocations}");
+}
+
+#[test]
 fn image_pull_policy_tracks_tag_mutability() {
     assert_eq!(
         image_pull_policy_for("ghcr.io/evalops/sandboxwich-ubuntu-dev:latest"),
@@ -1817,12 +2064,16 @@ fn kubernetes_dry_run_reports_exact_typed_isolation_capability() {
             ))
     );
 
+    // A simulated provision never starts a guest, so a dry-run report must not
+    // claim the VM boundary even when the operator configured Kata. Only the
+    // apply provider built from the same configuration advertises it.
     let kata =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
             .with_isolation_profile(IsolationProfile::Kata)
             .with_runtime_class_name(Some("kata-qemu".to_string()));
     assert!(
-        kata.capability_report()
+        !kata
+            .capability_report()
             .capabilities
             .contains(&WorkerCapability::VirtualMachine)
     );
@@ -1831,6 +2082,22 @@ fn kubernetes_dry_run_reports_exact_typed_isolation_capability() {
             .capability_report()
             .capabilities
             .contains(&WorkerCapability::SandboxedContainer)
+    );
+    assert!(
+        KubernetesApplyProvider::new(kata, "kubectl")
+            .capability_report()
+            .capabilities
+            .contains(&WorkerCapability::VirtualMachine)
+    );
+
+    let kata_without_runtime_class =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Kata);
+    assert!(
+        !KubernetesApplyProvider::new(kata_without_runtime_class, "kubectl")
+            .capability_report()
+            .capabilities
+            .contains(&WorkerCapability::VirtualMachine)
     );
 }
 
@@ -3556,6 +3823,14 @@ fn apply_provider_with_fake_kubectl(kubectl: &std::path::Path) -> KubernetesAppl
 }
 
 fn write_stateful_fake_kubectl() -> (std::path::PathBuf, std::path::PathBuf) {
+    write_stateful_fake_kubectl_with_observed_runtime_class("")
+}
+
+/// Stateful fake kubectl whose live Pods report `observed_runtime_class` for
+/// the provider's `spec.runtimeClassName` boundary read.
+fn write_stateful_fake_kubectl_with_observed_runtime_class(
+    observed_runtime_class: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
     let dir =
         std::env::temp_dir().join(format!("sandboxwich-stateful-kubectl-{}", SandboxId::new()));
     std::fs::create_dir_all(&dir).expect("create stateful fake kubectl dir");
@@ -3566,6 +3841,7 @@ fn write_stateful_fake_kubectl() -> (std::path::PathBuf, std::path::PathBuf) {
 set -eu
 printf '%s\n' "$*" >> "{log}"
 case " $* " in
+  *runtimeClassName*) printf '%s' '{observed_runtime_class}' ;;
   *" get "*)
     kind=''
     name=''
@@ -3600,6 +3876,7 @@ esac
 "#,
         log = log_path.display(),
         dir = dir.display(),
+        observed_runtime_class = observed_runtime_class,
     );
     std::fs::write(&script_path, script).expect("write stateful fake kubectl");
     {

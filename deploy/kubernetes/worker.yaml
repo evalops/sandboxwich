@@ -169,6 +169,13 @@ spec:
               value: ""
             - name: SANDBOXWICH_RUNTIME_CLASS_NAME
               value: ""
+            # Typed isolation profile: development, gvisor or kata. It selects
+            # the execution classes this worker advertises -- `gvisor` for
+            # sandboxed_container and `kata` for virtual_machine -- and both of
+            # those require the RuntimeClass above to be nonempty. A worker
+            # never satisfies an execution class it is not configured for.
+            - name: SANDBOXWICH_ISOLATION_PROFILE
+              value: development
             # Optional provider-isolated orb-sidecar image. The worker advertises
             # that capability only when this is digest-pinned and the RuntimeClass
             # above is nonempty; the sidecar Pod uses that RuntimeClass too.
@@ -244,6 +251,8 @@ spec:
             - $(SANDBOXWICH_VNC_PASSWORD_SECRET)
             - --runtime-class-name
             - $(SANDBOXWICH_RUNTIME_CLASS_NAME)
+            - --isolation-profile
+            - $(SANDBOXWICH_ISOLATION_PROFILE)
             - --ingress-namespace
             - $(SANDBOXWICH_NAMESPACE)
             - --label

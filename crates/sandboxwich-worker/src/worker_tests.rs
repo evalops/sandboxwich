@@ -1669,8 +1669,10 @@ fn isolation_profile_cli_is_typed_validated_and_passed_to_provider() {
         report.labels.get("runtime_class_name"),
         Some(&"kata-qemu".to_string())
     );
+    // The dry-run provider report describes configured isolation but never
+    // claims the VM boundary; only real (apply-mode) provisioning does.
     assert!(
-        report
+        !report
             .capabilities
             .contains(&WorkerCapability::VirtualMachine)
     );
