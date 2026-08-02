@@ -1,6 +1,9 @@
 use crate::common::*;
+use crate::types::placeholders;
 use reqwest::StatusCode;
 use sandboxwich_core::*;
+use sqlx::Row;
+use sqlx::any::AnyPoolOptions;
 
 pub(crate) async fn assert_desktop_session_lifecycle(
     client: &reqwest::Client,
@@ -154,6 +157,15 @@ pub(crate) async fn assert_desktop_session_lifecycle(
             .access_url
             .starts_with("https://broker.example.test/sessions/")
     );
+    // Every access mint now also returns a one-time, sandbox-bound brokered
+    // transport credential (ROADMAP #3).
+    assert!(
+        access.credential.token.starts_with("sbw_dtok_"),
+        "desktop credential must carry the typed transport-token prefix"
+    );
+    assert_eq!(access.credential.sandbox_id, sandbox.sandbox.id);
+    assert_eq!(access.credential.session_id, desktop.desktop_session.id);
+    assert_eq!(access.credential.expires_at, access.access.expires_at);
 
     let events: EventListResponse = client
         .get(format!(
@@ -238,4 +250,351 @@ pub(crate) async fn assert_desktop_session_lifecycle(
         expired_seen.is_some(),
         "expired desktop session should be reported via the background sweep"
     );
+}
+
+/// Covers the ROADMAP #3 brokered desktop transport: an access mint now
+/// resolves the sandbox's persisted desktop `Service` runtime resource into a
+/// typed [`DesktopTransport`] and issues a short-lived, sandbox-bound
+/// credential that is stored only as a hash and rotates by revocation.
+pub(crate) async fn assert_desktop_brokered_transport(
+    client: &reqwest::Client,
+    server: &TestServer,
+    sandbox: &SandboxResponse,
+    worker: &WorkerResponse,
+) {
+    let worker_api = worker_client(worker);
+
+    // Persist a Ready desktop Service the way the provider reconcile loop
+    // would, so the access mint has a live tunnel resource to reference.
+    let mut desktop_resource = provider_resource(
+        sandbox.sandbox.id,
+        None,
+        RuntimeResourceKind::Service,
+        RuntimeResourcePurpose::Desktop,
+        format!("sandboxwich-desktop-{}", sandbox.sandbox.id),
+    );
+    desktop_resource.service_port = Some(6080);
+    desktop_resource.target_port = Some("desktop".to_string());
+    worker_api
+        .post(format!(
+            "{}/workers/{}/runtime-resources/reconcile",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ReconcileRuntimeResourcesRequest {
+            provider: "kubernetes".to_string(),
+            namespace: "sandboxwich-contract".to_string(),
+            cluster: Some("k3s-dev".to_string()),
+            resources: vec![desktop_resource],
+            mark_missing_deleted: false,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let resources: RuntimeResourceListResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/runtime-resources",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let desktop_service = resources
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.resource_kind == RuntimeResourceKind::Service
+                && resource.purpose == RuntimeResourcePurpose::Desktop
+        })
+        .expect("provider desktop Service must be persisted as a runtime resource");
+
+    let desktop: DesktopSessionResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/desktop-sessions",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&CreateDesktopSessionRequest {
+            broker: Some("k3s-broker".to_string()),
+            broker_url: Some("https://broker.example.test".to_string()),
+            access_mode: Some(DesktopAccessMode::Browser),
+            connection_metadata: None,
+            ttl_seconds: Some(600),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Fail closed: no credential row is written for a session that is not yet
+    // Ready, and the mint is rejected.
+    let denied = client
+        .post(format!(
+            "{}/desktop-sessions/{}/access",
+            server.base_url, desktop.desktop_session.id
+        ))
+        .json(&DesktopAccessRequest {
+            ttl_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        count_desktop_credentials(&server.database_url, desktop.desktop_session.id).await,
+        0,
+        "a non-ready session must not have a persisted credential"
+    );
+
+    let ready: DesktopSessionResponse = client
+        .post(format!(
+            "{}/desktop-sessions/{}/status",
+            server.base_url, desktop.desktop_session.id
+        ))
+        .json(&UpdateDesktopSessionRequest {
+            status: DesktopSessionStatus::Ready,
+            broker: None,
+            broker_url: None,
+            access_mode: None,
+            connection_metadata: None,
+            ttl_seconds: Some(600),
+            error: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Requesting more than the 900s ceiling clamps the credential's lifetime,
+    // and it can never outlive the session.
+    let access: DesktopAccessResponse = client
+        .post(format!(
+            "{}/desktop-sessions/{}/access",
+            server.base_url, desktop.desktop_session.id
+        ))
+        .json(&DesktopAccessRequest {
+            ttl_seconds: Some(100_000),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let transport = access
+        .access
+        .transport
+        .as_ref()
+        .expect("access must reference the live desktop tunnel");
+    assert_eq!(transport.kind, DesktopTransportKind::NovncWebsocket);
+    assert_eq!(transport.runtime_resource_id, desktop_service.id);
+    assert_eq!(
+        transport.service_name,
+        format!("sandboxwich-desktop-{}", sandbox.sandbox.id)
+    );
+    assert_eq!(transport.namespace, "sandboxwich-contract");
+    assert_eq!(transport.service_port, 6080);
+    assert_eq!(transport.status, RuntimeResourceStatus::Ready);
+    assert!(transport.ready);
+
+    assert!(access.credential.token.starts_with("sbw_dtok_"));
+    assert_eq!(access.credential.sandbox_id, sandbox.sandbox.id);
+    assert_eq!(access.credential.session_id, desktop.desktop_session.id);
+    assert_eq!(access.credential.expires_at, access.access.expires_at);
+    let session_expires_at = ready
+        .desktop_session
+        .expires_at
+        .expect("session created with a ttl has an expiry");
+    assert!(
+        access.credential.expires_at <= session_expires_at,
+        "credential must never outlive its desktop session"
+    );
+    assert!(
+        access.credential.expires_at <= chrono::Utc::now() + chrono::Duration::seconds(905),
+        "credential ttl must be clamped to the 900s ceiling"
+    );
+
+    // The raw token is never persisted: only a hash is stored, and it is not
+    // the token itself.
+    let stored = desktop_credential_rows(&server.database_url, desktop.desktop_session.id).await;
+    assert_eq!(stored.len(), 1);
+    let (first_hash, first_revoked) = &stored[0];
+    assert_ne!(first_hash, &access.credential.token);
+    assert!(!first_hash.starts_with("sbw_dtok_"));
+    assert_eq!(first_hash.len(), 64);
+    assert!(first_revoked.is_none());
+
+    // Re-minting rotates by revocation: a new token, and the prior credential
+    // is revoked so a session has at most one live credential.
+    let rotated: DesktopAccessResponse = client
+        .post(format!(
+            "{}/desktop-sessions/{}/access",
+            server.base_url, desktop.desktop_session.id
+        ))
+        .json(&DesktopAccessRequest {
+            ttl_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_ne!(rotated.credential.token, access.credential.token);
+    assert_ne!(rotated.credential.id, access.credential.id);
+    let after_rotation =
+        desktop_credential_rows(&server.database_url, desktop.desktop_session.id).await;
+    assert_eq!(after_rotation.len(), 2);
+    assert_eq!(
+        after_rotation
+            .iter()
+            .filter(|(_, revoked)| revoked.is_none())
+            .count(),
+        1,
+        "exactly one desktop credential stays live after rotation"
+    );
+
+    // A sandbox with no persisted desktop Service still mints a credential but
+    // reports no transport, so callers cannot mistake it for a reachable
+    // desktop.
+    let bare: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            execution_class: None,
+            workspace_mode: None,
+            runtime_profile: None,
+            name: Some("desktop-no-tunnel".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let bare_session: DesktopSessionResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/desktop-sessions",
+            server.base_url, bare.sandbox.id
+        ))
+        .json(&CreateDesktopSessionRequest {
+            broker: Some("k3s-broker".to_string()),
+            broker_url: None,
+            access_mode: Some(DesktopAccessMode::Vnc),
+            connection_metadata: None,
+            ttl_seconds: Some(300),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    client
+        .post(format!(
+            "{}/desktop-sessions/{}/status",
+            server.base_url, bare_session.desktop_session.id
+        ))
+        .json(&UpdateDesktopSessionRequest {
+            status: DesktopSessionStatus::Ready,
+            broker: None,
+            broker_url: None,
+            access_mode: None,
+            connection_metadata: None,
+            ttl_seconds: Some(300),
+            error: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let bare_access: DesktopAccessResponse = client
+        .post(format!(
+            "{}/desktop-sessions/{}/access",
+            server.base_url, bare_session.desktop_session.id
+        ))
+        .json(&DesktopAccessRequest {
+            ttl_seconds: Some(60),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        bare_access.access.transport.is_none(),
+        "a sandbox with no desktop Service must not report a transport"
+    );
+    assert!(bare_access.credential.token.starts_with("sbw_dtok_"));
+}
+
+async fn desktop_credential_rows(
+    database_url: &str,
+    desktop_session_id: DesktopSessionId,
+) -> Vec<(String, Option<String>)> {
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(database_url)
+        .await
+        .unwrap();
+    let sql = format!(
+        "select token_hash, revoked_at from desktop_access_credentials
+         where desktop_session_id = {} order by created_at asc",
+        placeholders(database_url, 1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(desktop_session_id.to_string())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    rows.into_iter()
+        .map(|row| {
+            (
+                row.try_get::<String, _>("token_hash").unwrap(),
+                row.try_get::<Option<String>, _>("revoked_at").unwrap(),
+            )
+        })
+        .collect()
+}
+
+async fn count_desktop_credentials(
+    database_url: &str,
+    desktop_session_id: DesktopSessionId,
+) -> usize {
+    desktop_credential_rows(database_url, desktop_session_id)
+        .await
+        .len()
 }

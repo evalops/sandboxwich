@@ -272,6 +272,31 @@ The rendered per-sandbox NetworkPolicy also:
 - Carves the control-plane/link-local/cluster CIDRs (`--egress-excluded-cidr` / `SANDBOXWICH_EGRESS_EXCLUDED_CIDRS`, default `169.254.0.0/16,10.42.0.0/16,10.43.0.0/16`, merged with any operator-supplied CIDRs unless `--egress-excluded-cidrs-replace` is set) out of *every* egress allow rule that overlaps them, not just `0.0.0.0/0` -- an allowlist entry as broad as `10.0.0.0/8` also gets the overlapping ranges carved out -- so sandboxes can never reach the apiserver or cloud metadata endpoints regardless of egress mode.
 - Adds an ingress policy restricting the sandbox's ssh/desktop/vnc ports (2222/6080/5900) to pods matching `--ingress-namespace`/`--ingress-selector-label` (default: the control-plane namespace, pods labeled `app.kubernetes.io/part-of=sandboxwich`), closing the previous cross-tenant path where any pod on the cluster network could reach another tenant's sandbox desktop directly.
 
+## Brokered desktop transport
+
+The provider renders a per-sandbox desktop `Service` (ClusterIP on port
+`6080`, in front of the guest's noVNC bridge) and persists it as a
+`runtime_resources` row of kind `service` / purpose `desktop`. `POST
+/v1/desktop-sessions/{id}/access` resolves that row into a typed
+`DesktopTransport` on the access response — the `Service` name, namespace,
+cluster, port, and reconciled readiness — so a caller learns exactly which
+in-cluster tunnel resource backs the session rather than a bare URL. When no
+desktop `Service` has been persisted yet the transport is `null` and the
+access record is metadata-only, so a caller cannot mistake it for a reachable
+desktop.
+
+Each access mint also issues a short-lived, sandbox-bound credential
+(`sbw_dtok_` prefix): the raw token is returned exactly once, stored only as a
+SHA-256 hash in `desktop_access_credentials`, bound to one
+tenant/sandbox/desktop session, expiry-clamped to the session, and rotated by
+revoking the session's previous credential. The credential never goes on argv
+and its `Debug` rendering is redacted. The out-of-band broker that validates
+this credential and relays a client onto the `Service`, and the public
+ingress/Gateway that fronts it, are deployment concerns tracked in
+evalops/deploy and are not part of this control plane yet — the ClusterIP
+remains reachable only from the control-plane namespace per the ingress
+NetworkPolicy above.
+
 ## Guarded Provider Apply Smoke
 
 The standalone provider apply smoke can render the exact `kubectl` plan for a non-production provider drill. It covers provision, exec handoff metadata, snapshot, fork from a `VolumeSnapshot`, and cleanup manifests. Planning never mutates a cluster.

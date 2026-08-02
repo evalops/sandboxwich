@@ -464,6 +464,28 @@ impl fmt::Display for RuntimeResourceId {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
+pub struct DesktopAccessCredentialId(pub Uuid);
+
+impl DesktopAccessCredentialId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for DesktopAccessCredentialId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for DesktopAccessCredentialId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct CleanupRunId(pub Uuid);
 
 impl CleanupRunId {
@@ -685,6 +707,18 @@ pub enum DesktopAccessMode {
     Browser => "browser",
     Vnc => "vnc",
     Rdp => "rdp",
+}
+}
+
+db_variant_enum! {
+/// Wire protocol a brokered desktop transport speaks to the sandbox's
+/// in-cluster desktop `Service`. The starter Ubuntu runtime exposes a noVNC
+/// bridge on port 6080 (`x11vnc` behind websockify), so the only transport a
+/// worker can render today is `NovncWebsocket`. Kept as a typed, extensible
+/// contract rather than a free-form string so a future RDP/websocket gateway
+/// is an additive variant, never a string-routing change.
+pub enum DesktopTransportKind {
+    NovncWebsocket => "novnc_websocket",
 }
 }
 
@@ -1409,6 +1443,34 @@ pub struct DesktopAccessRequest {
     pub ttl_seconds: Option<u64>,
 }
 
+/// The live, provider-rendered ingress tunnel a brokered desktop access
+/// record points at. This is a typed reference to the sandbox's persisted
+/// `runtime_resources` row of kind `Service` / purpose `Desktop` (the
+/// ClusterIP the Kubernetes provider already renders in front of the guest's
+/// noVNC bridge), resolved at access-mint time. `None` on a `DesktopAccess`
+/// means no such tunnel resource has been persisted for the sandbox yet, so
+/// the access record is metadata-only exactly as before -- callers must not
+/// treat a credential without a `transport` as a reachable desktop.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DesktopTransport {
+    pub kind: DesktopTransportKind,
+    /// Persisted `runtime_resources` row backing the tunnel.
+    pub runtime_resource_id: RuntimeResourceId,
+    /// Kubernetes `Service` name the broker connects to (never a public
+    /// address: the ClusterIP is reachable only from the control-plane
+    /// namespace the broker runs in, per the rendered ingress NetworkPolicy).
+    pub service_name: String,
+    pub namespace: String,
+    pub cluster: Option<String>,
+    pub service_port: u16,
+    /// The tunnel's reconciled status. Only `Ready` means the provider has
+    /// observed the Service applied; anything else is a not-yet-live tunnel.
+    pub status: RuntimeResourceStatus,
+    /// Convenience mirror of `status == Ready`, so a broker can fail closed on
+    /// a not-yet-ready tunnel without needing to know every non-ready variant.
+    pub ready: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DesktopAccess {
     pub session_id: DesktopSessionId,
@@ -1418,6 +1480,40 @@ pub struct DesktopAccess {
     pub access_url: String,
     pub expires_at: DateTime<Utc>,
     pub connection_metadata: serde_json::Value,
+    /// Reference to the live ingress tunnel this access record connects
+    /// through, when the provider has rendered and persisted one. See
+    /// [`DesktopTransport`].
+    #[serde(default)]
+    pub transport: Option<DesktopTransport>,
+}
+
+/// Short-lived, sandbox-bound credential the broker requires before it will
+/// relay a client onto the desktop tunnel. Mirrors the guest-token contract
+/// (issue #109/#111): the raw `token` is returned exactly once from the
+/// access-mint response, never persisted (only its SHA-256 hash is stored),
+/// bound to one tenant/sandbox/session, expires, and is rotated by revoking
+/// the session's previous credential. Its `Debug` impl redacts the token so
+/// it can never leak through a log line or diagnostic dump.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DesktopAccessCredential {
+    pub id: DesktopAccessCredentialId,
+    pub token: String,
+    pub sandbox_id: SandboxId,
+    pub session_id: DesktopSessionId,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for DesktopAccessCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopAccessCredential")
+            .field("id", &self.id)
+            .field("token", &"<redacted>")
+            .field("sandbox_id", &self.sandbox_id)
+            .field("session_id", &self.session_id)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1432,10 +1528,24 @@ pub struct DesktopSessionListResponse {
     pub desktop_sessions: Vec<DesktopSession>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DesktopAccessResponse {
     pub ok: bool,
     pub access: DesktopAccess,
+    /// The one-time brokered-transport credential. Present on every
+    /// access-mint response; the raw token is never returned again.
+    pub credential: DesktopAccessCredential,
+}
+
+impl fmt::Debug for DesktopAccessResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopAccessResponse")
+            .field("ok", &self.ok)
+            .field("access", &self.access)
+            .field("credential", &self.credential)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3590,6 +3700,37 @@ mod tests {
     }
 
     #[test]
+    fn desktop_access_response_debug_redacts_the_live_token() {
+        let response = DesktopAccessResponse {
+            ok: true,
+            access: DesktopAccess {
+                session_id: DesktopSessionId::new(),
+                sandbox_id: SandboxId::new(),
+                broker: "k3s-broker".into(),
+                access_mode: DesktopAccessMode::Browser,
+                access_url: "https://broker.example.test/sessions/x".into(),
+                expires_at: Utc::now(),
+                connection_metadata: serde_json::Value::Null,
+                transport: None,
+            },
+            credential: DesktopAccessCredential {
+                id: DesktopAccessCredentialId::new(),
+                token: "sbw_dtok_supersecret".into(),
+                sandbox_id: SandboxId::new(),
+                session_id: DesktopSessionId::new(),
+                expires_at: Utc::now(),
+            },
+        };
+        // The raw token is serialized once (the one-time access response) but
+        // must never survive into a Debug/log rendering.
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["credential"]["token"], "sbw_dtok_supersecret");
+        let rendered = format!("{response:?}");
+        assert!(!rendered.contains("sbw_dtok_supersecret"));
+        assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
     fn resident_process_request_rejects_unsafe_process_and_bootstrap_inputs() {
         let valid = ResidentProcessRequest {
             argv: vec!["/usr/local/bin/orb-executor".into()],
@@ -3731,6 +3872,7 @@ mod tests {
         assert_db_variant_contract::<SnapshotStatus>();
         assert_db_variant_contract::<DesktopSessionStatus>();
         assert_db_variant_contract::<DesktopAccessMode>();
+        assert_db_variant_contract::<DesktopTransportKind>();
         assert_db_variant_contract::<RuntimeResourceKind>();
         assert_db_variant_contract::<RuntimeResourcePurpose>();
         assert_db_variant_contract::<RuntimeResourceStatus>();

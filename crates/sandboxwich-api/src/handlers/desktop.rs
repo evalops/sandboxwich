@@ -4,6 +4,7 @@ use crate::db::*;
 use crate::error::*;
 use crate::handlers::commands::*;
 use crate::handlers::ssh::*;
+use crate::reconcile::list_runtime_resources_for_sandbox;
 use crate::rows::*;
 use crate::state::*;
 use crate::util::*;
@@ -99,12 +100,117 @@ pub(crate) async fn create_desktop_access(
     let desktop_session =
         fetch_desktop_session(&state.db, DesktopSessionId(desktop_session_id)).await?;
     ensure_sandbox_tenant(&state.db, desktop_session.sandbox_id, &ctx).await?;
-    let access = mint_desktop_access(&desktop_session, request.ttl_seconds)?;
+    // Fail closed: `mint_desktop_access` rejects a non-`Ready` or expired
+    // session, so no credential row is ever written for a session a caller
+    // cannot legitimately connect to.
+    let mut access = mint_desktop_access(&desktop_session, request.ttl_seconds)?;
+    access.transport = resolve_desktop_transport(&state.db, desktop_session.sandbox_id).await?;
+    let credential = mint_desktop_access_credential(
+        &state.db,
+        &ctx.tenant_id,
+        &desktop_session,
+        access.expires_at,
+    )
+    .await?;
     // Minting desktop access is the moment a caller is about to actually use
     // the sandbox's desktop -- one of the idle-TTL activity signals.
     // Best-effort: must not fail this request if the bump itself fails.
     bump_sandbox_activity_best_effort(&state.db, desktop_session.sandbox_id, Utc::now()).await;
-    Ok(Json(DesktopAccessResponse { ok: true, access }))
+    Ok(Json(DesktopAccessResponse {
+        ok: true,
+        access,
+        credential,
+    }))
+}
+
+/// Resolves the sandbox's live brokered desktop tunnel: its persisted
+/// `runtime_resources` row of kind `Service` / purpose `Desktop` (rendered by
+/// the Kubernetes provider in front of the guest's noVNC bridge). Returns
+/// `None` when no such row exists yet (or it has been torn down), leaving the
+/// access record metadata-only exactly as before.
+pub(crate) async fn resolve_desktop_transport(
+    db: &Database,
+    sandbox_id: SandboxId,
+) -> Result<Option<DesktopTransport>, ApiError> {
+    let resources = list_runtime_resources_for_sandbox(db, sandbox_id).await?;
+    let Some(resource) = resources.into_iter().find(|resource| {
+        resource.resource_kind == RuntimeResourceKind::Service
+            && resource.purpose == RuntimeResourcePurpose::Desktop
+            && !matches!(
+                resource.status,
+                RuntimeResourceStatus::Deleted | RuntimeResourceStatus::Destroyed
+            )
+    }) else {
+        return Ok(None);
+    };
+    Ok(Some(DesktopTransport {
+        kind: DesktopTransportKind::NovncWebsocket,
+        runtime_resource_id: resource.id,
+        service_name: resource.resource_name,
+        namespace: resource.namespace,
+        cluster: resource.cluster,
+        service_port: resource.service_port.unwrap_or(6080),
+        ready: resource.status == RuntimeResourceStatus::Ready,
+        status: resource.status,
+    }))
+}
+
+/// Mints the one-time, sandbox-bound brokered-transport credential for a
+/// desktop access record. The raw token is returned once and never persisted
+/// (only its SHA-256 hash is stored); minting revokes the session's previous
+/// live credential so a session has at most one usable credential at a time
+/// (rotate-by-revocation, mirroring `mint_guest_token`). `expires_at` is the
+/// already-clamped access expiry, so the credential never outlives the
+/// session or the caller's requested TTL ceiling.
+pub(crate) async fn mint_desktop_access_credential(
+    db: &Database,
+    tenant_id: &str,
+    desktop_session: &DesktopSession,
+    expires_at: DateTime<Utc>,
+) -> Result<DesktopAccessCredential, ApiError> {
+    let now = Utc::now();
+    let token = generate_desktop_token();
+    let token_hash = hash_worker_token(&token);
+    let id = DesktopAccessCredentialId::new();
+    let mut tx = db.pool.begin().await?;
+    let revoke_sql = format!(
+        "update desktop_access_credentials set revoked_at = {}
+         where tenant_id = {} and desktop_session_id = {} and revoked_at is null",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3)
+    );
+    sqlx::query(&revoke_sql)
+        .bind(now.to_rfc3339())
+        .bind(tenant_id)
+        .bind(desktop_session.id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    let insert_sql = format!(
+        "insert into desktop_access_credentials
+         (id, tenant_id, sandbox_id, desktop_session_id, token_hash, expires_at, revoked_at, created_at)
+         values ({})",
+        db.placeholders(8)
+    );
+    sqlx::query(&insert_sql)
+        .bind(id.to_string())
+        .bind(tenant_id)
+        .bind(desktop_session.sandbox_id.to_string())
+        .bind(desktop_session.id.to_string())
+        .bind(token_hash)
+        .bind(expires_at.to_rfc3339())
+        .bind(Option::<String>::None)
+        .bind(now.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(DesktopAccessCredential {
+        id,
+        token,
+        sandbox_id: desktop_session.sandbox_id,
+        session_id: desktop_session.id,
+        expires_at,
+    })
 }
 
 pub(crate) fn desktop_session_from_request(
@@ -490,6 +596,8 @@ pub(crate) fn mint_desktop_access(
         access_url: desktop_access_url(desktop_session),
         expires_at,
         connection_metadata: desktop_session.connection_metadata.clone(),
+        // Resolved from persisted runtime resources by the caller after minting.
+        transport: None,
     })
 }
 
