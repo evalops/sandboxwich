@@ -30,6 +30,15 @@ pub(crate) const TEST_TENANT_B_TOKEN: &str = "sandboxwich-test-tenant-b-token";
 pub(crate) const TEST_OPERATOR_TOKEN: &str = "sandboxwich-test-operator-token";
 /// Must match `OPERATOR_TOKEN_HEADER` in `sandboxwich-api::main`.
 pub(crate) const OPERATOR_TOKEN_HEADER: &str = "x-sandboxwich-operator-token";
+/// Base64 of 32 bytes: the shared ephemeral bootstrap-handoff sealing key
+/// (`SANDBOXWICH_BOOTSTRAP_HANDOFF_KEY`) for the restart/failover tests. Every
+/// process that must be able to open another's sealed rows is started with
+/// this exact value.
+pub(crate) const TEST_BOOTSTRAP_HANDOFF_KEY: &str = "c2FuZGJveHdpY2gtdGVzdC1ib290c3RyYXAta2V5ISE=";
+/// A second, unrelated sealing key: a process holding this one must not be
+/// able to open rows sealed under `TEST_BOOTSTRAP_HANDOFF_KEY`.
+pub(crate) const ROTATED_TEST_BOOTSTRAP_HANDOFF_KEY: &str =
+    "c2FuZGJveHdpY2gtdGVzdC1yb3RhdGVkLWtleSEhISE=";
 
 pub(crate) struct TestServer {
     pub(crate) base_url: String,
@@ -1280,6 +1289,57 @@ impl TestServer {
             .with_auth_token(None)
     }
 
+    /// Like `start`, but with the shared ephemeral bootstrap handoff enabled,
+    /// so bootstrap delivery can outlive this process. `restart` and
+    /// `spawn_replica` below produce the other processes that read what this
+    /// one sealed.
+    pub(crate) async fn start_with_shared_bootstrap_handoff(
+        database_url: String,
+        data_dir: Option<TempDir>,
+    ) -> Self {
+        Self::spawn(database_url, data_dir, true, false, |command| {
+            command
+                .env(
+                    "SANDBOXWICH_TENANT_TOKENS",
+                    format!("default={TEST_DEFAULT_TENANT_TOKEN},tenant-b={TEST_TENANT_B_TOKEN}"),
+                )
+                .env("SANDBOXWICH_OPERATOR_TOKEN", TEST_OPERATOR_TOKEN)
+                .env(
+                    "SANDBOXWICH_BOOTSTRAP_HANDOFF_KEY",
+                    TEST_BOOTSTRAP_HANDOFF_KEY,
+                );
+        })
+        .await
+        .with_auth_token(Some(TEST_DEFAULT_TENANT_TOKEN.to_string()))
+    }
+
+    /// Kills this server and starts a new process against the same database,
+    /// modelling a control-plane restart: nothing but the database survives.
+    /// The Postgres per-test database (and its teardown guard) is reused, so
+    /// the restarted process sees exactly the rows the killed one left.
+    pub(crate) async fn restart(&mut self, shared_bootstrap_handoff: bool) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let key = shared_bootstrap_handoff.then_some(TEST_BOOTSTRAP_HANDOFF_KEY);
+        let (base_url, child) = spawn_process_against(&self.database_url, key).await;
+        self.base_url = base_url;
+        self.child = child;
+    }
+
+    /// Starts a second, concurrently running server process against the same
+    /// database: the replica a request fails over to.
+    pub(crate) async fn spawn_replica(&self, shared_bootstrap_handoff: bool) -> TestReplica {
+        let key = shared_bootstrap_handoff.then_some(TEST_BOOTSTRAP_HANDOFF_KEY);
+        let (base_url, child) = spawn_process_against(&self.database_url, key).await;
+        TestReplica { base_url, child }
+    }
+
+    /// A replica holding a specific sealing key, for rotation coverage.
+    pub(crate) async fn spawn_replica_with_key(&self, key: &str) -> TestReplica {
+        let (base_url, child) = spawn_process_against(&self.database_url, Some(key)).await;
+        TestReplica { base_url, child }
+    }
+
     pub(crate) fn with_auth_token(mut self, auth_token: Option<String>) -> Self {
         self.auth_token = auth_token;
         self
@@ -1349,6 +1409,55 @@ impl TestServer {
             None => reqwest::Client::new(),
         }
     }
+}
+
+/// A second API process sharing another `TestServer`'s database. Owns only
+/// its own child process; the database (and, on Postgres, its teardown
+/// guard) belongs to the `TestServer` it was spawned from.
+pub(crate) struct TestReplica {
+    pub(crate) base_url: String,
+    pub(crate) child: Child,
+}
+
+impl Drop for TestReplica {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Spawns one more API process against an already-migrated database, with
+/// the same auth configuration `start_with_shared_bootstrap_handoff` uses.
+async fn spawn_process_against(
+    database_url: &str,
+    bootstrap_handoff_key: Option<&str>,
+) -> (String, Child) {
+    const MAX_SPAWN_ATTEMPTS: u32 = 5;
+    let mut last_bind_race: Option<String> = None;
+    for _ in 0..MAX_SPAWN_ATTEMPTS {
+        let attempt = try_spawn_once(database_url, true, false, &|command: &mut Command| {
+            command
+                .env(
+                    "SANDBOXWICH_TENANT_TOKENS",
+                    format!("default={TEST_DEFAULT_TENANT_TOKEN},tenant-b={TEST_TENANT_B_TOKEN}"),
+                )
+                .env("SANDBOXWICH_OPERATOR_TOKEN", TEST_OPERATOR_TOKEN);
+            if let Some(key) = bootstrap_handoff_key {
+                command.env("SANDBOXWICH_BOOTSTRAP_HANDOFF_KEY", key);
+            }
+        })
+        .await;
+        match attempt {
+            SpawnAttempt::Healthy { base_url, child } => return (base_url, child),
+            SpawnAttempt::LostBindRace(detail) => last_bind_race = Some(detail),
+            SpawnAttempt::Failed(detail) => panic!("{detail}"),
+        }
+    }
+    panic!(
+        "server never became healthy after {MAX_SPAWN_ATTEMPTS} attempts, each time losing the \
+         ephemeral-port bind race: {}",
+        last_bind_race.unwrap_or_else(|| "<no attempts recorded>".to_string())
+    );
 }
 
 /// A client authenticated with `worker`'s scoped credential (see GH-64),
