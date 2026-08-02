@@ -28,7 +28,8 @@ These capabilities remain Experimental until every gate below passes for a named
 
 ### Lifecycle recovery
 
-- Provision, command, stop, snapshot, fork, cancellation, lease loss, worker restart, API restart, and out-of-band resource deletion have deterministic terminal states.
+- Provision, command, stop, snapshot, fork, resume, cancellation, lease loss, worker restart, API restart, and out-of-band resource deletion have deterministic terminal states.
+- Snapshot-backed resume is deterministic in all three outcomes: `archived -> provisioning` on request, `provisioning -> ready` on provider success, and `provisioning -> archived` on permanent failure (a retryable failure stays in `provisioning`). A failed resume leaves the snapshot intact and the sandbox resumable again.
 - Cleanup and reconciliation are idempotent and retain an operator-readable record of failures.
 
 ### Conformance

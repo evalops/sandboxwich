@@ -586,7 +586,27 @@ impl SandboxState {
     /// A sandbox can only be resumed from `Archived`. Resuming from any other
     /// state (in particular `Error`) would either race a job that is still
     /// writing to the sandbox, or paper over a failure that a fresh
-    /// fork/create should handle instead.
+    /// fork/create should handle instead. A resume request moves the sandbox
+    /// straight to `Provisioning`: the durable workspace is restored from a
+    /// snapshot into the sandbox's own runtime resources, so the sandbox is
+    /// being provisioned again under its original identity.
+    pub const RESUME_LEGAL_FROM: &'static [SandboxState] = &[SandboxState::Archived];
+
+    /// A `ResumeSandbox` job completing successfully moves the sandbox from
+    /// `Provisioning` to `Ready`. A sandbox that left `Provisioning` while
+    /// the resume was in flight (a concurrent stop, say) stays where it is:
+    /// the completion's restored resources are still recorded, so archived
+    /// cleanup tears them down rather than leaking them.
+    pub const RESUME_COMPLETED_LEGAL_FROM: &'static [SandboxState] = &[SandboxState::Provisioning];
+
+    /// A `ResumeSandbox` job that failed permanently returns the sandbox to
+    /// `Archived` -- the exact durable state it was in before the resume was
+    /// requested, with its snapshot still intact and another resume (or a
+    /// fork) still possible. `Error` would be a worse terminal state here:
+    /// a failed resume leaves no runtime resources behind, so the sandbox is
+    /// not in a broken half-provisioned state, it is simply still stopped.
+    pub const RESUME_FAILED_LEGAL_FROM: &'static [SandboxState] = &[SandboxState::Provisioning];
+
     /// A `ForkSandbox` job being claimed by a worker moves its child sandbox
     /// out of `Planning` (queued, waiting on the parent snapshot) into
     /// `Provisioning`.
@@ -635,10 +655,11 @@ impl SandboxState {
     /// | Planning     | Ready        | `ProvisionSandbox` job completed                       |
     /// | Planning     | Error        | parent `CreateSnapshot` job failed                     |
     /// | Planning     | Archiving    | user stop requested                                    |
-    /// | Provisioning | Ready        | `ForkSandbox`/`ProvisionSandbox` job completed          |
+    /// | Provisioning | Ready        | `ForkSandbox`/`ProvisionSandbox`/`ResumeSandbox` completed |
     /// | Provisioning | Planning     | `ForkSandbox` job retried                              |
     /// | Provisioning | Error        | `ForkSandbox` job permanently failed                    |
     /// | Provisioning | Archiving    | user stop requested                                    |
+    /// | Provisioning | Archived     | `ResumeSandbox` job permanently failed                  |
     /// | Ready        | Ready        | `ProvisionSandbox` job completed (reprovision, no-op)   |
     /// | Ready        | Archiving    | user stop requested                                    |
     /// | Running      | Ready        | `ProvisionSandbox` job completed                       |
@@ -646,6 +667,7 @@ impl SandboxState {
     /// | Idle         | Ready        | `ProvisionSandbox` job completed                       |
     /// | Idle         | Archiving    | user stop requested                                    |
     /// | Archiving    | Archived     | provider-confirmed stop completion                     |
+    /// | Archived     | Provisioning | snapshot-backed resume requested                       |
     /// | Error        | Ready        | `ProvisionSandbox` job completed (manual retry)         |
     /// | Error        | Archiving    | user stop requested                                    |
     ///
@@ -668,6 +690,9 @@ impl SandboxState {
             || (Self::PROVISION_COMPLETED_LEGAL_FROM.contains(self) && *next == SandboxState::Ready)
             || (Self::SNAPSHOT_FAILED_CHILD_LEGAL_FROM.contains(self)
                 && *next == SandboxState::Error)
+            || (Self::RESUME_LEGAL_FROM.contains(self) && *next == SandboxState::Provisioning)
+            || (Self::RESUME_COMPLETED_LEGAL_FROM.contains(self) && *next == SandboxState::Ready)
+            || (Self::RESUME_FAILED_LEGAL_FROM.contains(self) && *next == SandboxState::Archived)
     }
 
     /// Every state that can legally transition into `next` per
@@ -1378,6 +1403,19 @@ pub struct ForkSnapshotRequest {
     /// See `Sandbox::idle_ttl_seconds`.
     #[serde(default)]
     pub idle_ttl_seconds: Option<u64>,
+}
+
+/// Restores a stopped (`archived`) sandbox in place from one of its durable
+/// snapshots. Unlike `ForkSnapshotRequest` this carries no placement fields:
+/// a resume keeps the sandbox's own persisted template, memory limit, egress
+/// policy, runtime profile, execution class, and lifetime knobs, so there is
+/// nothing for a caller to restate (or silently change).
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ResumeSandboxRequest {
+    /// Snapshot to restore the workspace from. Defaults to the sandbox's most
+    /// recently created restorable snapshot.
+    #[serde(default)]
+    pub snapshot_id: Option<SnapshotId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -3157,6 +3195,22 @@ pub struct ProviderForkHandle {
     pub metadata: serde_json::Value,
 }
 
+/// Provider evidence for a snapshot-backed resume: the sandbox keeps its own
+/// identity (unlike a fork, which has a distinct child), and its workspace is
+/// restored from `snapshot_id`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderResumeHandle {
+    pub provider: String,
+    #[serde(alias = "sandboxId")]
+    pub sandbox_id: SandboxId,
+    #[serde(alias = "snapshotId")]
+    pub snapshot_id: SnapshotId,
+    #[serde(default)]
+    pub resources: Vec<ProviderRuntimeResource>,
+    #[serde(default, alias = "providerMetadata")]
+    pub metadata: serde_json::Value,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkerJobResult {
@@ -3198,8 +3252,7 @@ pub enum WorkerJobResult {
         sandbox_id: SandboxId,
     },
     ResumeSandbox {
-        provider: String,
-        sandbox_id: SandboxId,
+        handle: ProviderResumeHandle,
     },
     DeleteHome {
         provider: String,
@@ -4386,6 +4439,7 @@ mod tests {
             (Provisioning, Planning),
             (Provisioning, Error),
             (Provisioning, Archiving),
+            (Provisioning, Archived),
             (Ready, Ready),
             (Ready, Archiving),
             (Running, Ready),
@@ -4393,6 +4447,7 @@ mod tests {
             (Idle, Ready),
             (Idle, Archiving),
             (Archiving, Archived),
+            (Archived, Provisioning),
             (Error, Ready),
             (Error, Archiving),
         ];
@@ -4410,8 +4465,17 @@ mod tests {
     }
 
     #[test]
-    fn archived_has_no_legal_resume_edge() {
+    fn resume_restores_an_archived_sandbox_through_provisioning() {
+        // A resume is never a direct archived -> ready jump: the workspace has
+        // to be restored from a snapshot first, so the sandbox goes back
+        // through `Provisioning` and only a provider-confirmed completion
+        // makes it ready.
         assert!(!SandboxState::Archived.can_transition_to(&SandboxState::Ready));
+        assert!(SandboxState::Archived.can_transition_to(&SandboxState::Provisioning));
+        assert_eq!(
+            SandboxState::legal_predecessors(&SandboxState::Provisioning),
+            vec![SandboxState::Planning, SandboxState::Archived],
+        );
         assert_eq!(
             SandboxState::legal_predecessors(&SandboxState::Ready),
             vec![
@@ -4422,7 +4486,12 @@ mod tests {
                 SandboxState::Idle,
                 SandboxState::Error,
             ],
-            "archived sandboxes cannot become ready until a real restore contract exists"
+        );
+        // A permanently failed resume puts the sandbox back exactly where it
+        // was, rather than parking it in `Error` with no resources.
+        assert_eq!(
+            SandboxState::legal_predecessors(&SandboxState::Archived),
+            vec![SandboxState::Provisioning, SandboxState::Archiving],
         );
     }
 

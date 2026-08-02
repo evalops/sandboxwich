@@ -258,6 +258,9 @@ pub(crate) async fn cleanup_archived_sandboxes(
                 db,
                 &mut tx,
                 sandbox.id,
+                // The sandbox row itself is about to be deleted, so nothing may
+                // be left pointing at it -- including its snapshot resources.
+                RuntimeResourceGeneration::All,
                 now,
                 "archived sandbox deleted during cleanup",
             )

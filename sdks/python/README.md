@@ -98,10 +98,13 @@ matrix is the actual product contract, not this README.
 
 Notably, as reflected in this SDK:
 
-- **`resume_sandbox` is unsupported today.** The route exists for CLI
-  parity, but the API always returns a typed `501 unsupported`
-  (`UnsupportedError`) — stop destroys the sandbox's resources, so create or
-  fork a replacement instead.
+- **`resume_sandbox` is Experimental and snapshot-backed.** It restores an
+  *archived* sandbox in place from one of its own ready snapshots, so it only
+  works for `workspace_mode=persistent` sandboxes that were snapshotted before
+  they were stopped. Without a matching snapshot it fails closed with a typed
+  `409` (`ConflictError`, e.g. `resume_snapshot_unavailable`) rather than
+  handing back an empty workspace. It restores volume state, not live
+  processes or memory.
 - **Command execution and snapshots are Experimental.** In Kubernetes apply
   mode, command execution uses `kubectl exec` and snapshots require a working
   CSI `VolumeSnapshotClass`; a dry-run worker only simulates these paths.
