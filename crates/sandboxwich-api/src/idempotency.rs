@@ -66,6 +66,18 @@ struct StoredResponse {
     body: Vec<u8>,
 }
 
+/// Response extension a handler inserts to declare its body secret-bearing, so
+/// this middleware must NOT persist it for idempotent replay. `complete_record`
+/// stores the full response body base64-encoded in `idempotency_records` for
+/// `IDEMPOTENCY_RETENTION_HOURS`; a one-time credential (e.g. the `sbw_dtok_`
+/// desktop-access token) written there would outlive its own expiry in a
+/// tenant-readable column, violating the AGENTS.md secrets rule. When present,
+/// the processing claim is dropped instead of completed, so a duplicate request
+/// re-executes (re-mints) rather than replaying a stored secret -- the same
+/// "no cached body -> re-execute" path as a completion-persist failure.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SkipIdempotencyResponsePersist;
+
 pub(crate) async fn enforce_idempotency(
     State(state): State<AppState>,
     request: Request,
@@ -152,10 +164,23 @@ pub(crate) async fn enforce_idempotency(
     }
 
     let response = next.run(request).await;
+    let skip_persist = response
+        .extensions()
+        .get::<SkipIdempotencyResponsePersist>()
+        .is_some();
     let stored = capture_response(response).await;
     if stored.status == StatusCode::TOO_MANY_REQUESTS {
         if let Err(error) = abandon_record(&state.db, &context.tenant_id, &key).await {
             tracing::error!(?error, tenant_id = %context.tenant_id, "failed to release throttled idempotency claim");
+        }
+        return stored.into_response();
+    }
+    if skip_persist {
+        // Secret-bearing response: never write its body to `idempotency_records`.
+        // Drop the processing claim so a duplicate re-executes (re-mints) instead
+        // of replaying a stored secret. See `SkipIdempotencyResponsePersist`.
+        if let Err(error) = abandon_record(&state.db, &context.tenant_id, &key).await {
+            tracing::error!(?error, tenant_id = %context.tenant_id, "failed to release secret-bearing idempotency claim");
         }
         return stored.into_response();
     }
