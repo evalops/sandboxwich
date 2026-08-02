@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+## 0.1.6 - 2026-08-02
+### Added
+
+- *(secrets)* Deliver secret references as read-only CSI mounts
+- *(secrets)* Tenant-scoped secret-reference store
+- *(kubernetes)* Host WIF-bound Maestro runners
+- *(kubernetes)* Host generation-fenced Maestro runners
+- *(worker)* Render an enforceable Cilium FQDN egress policy
+
+### Fixed
+
+- *(secrets)* Negotiate secret-delivery placement, harden spec validation
+- *(secrets)* Bound delivery names, revalidate at the worker, stabilize mount order
+- *(kubernetes)* Mount durable Maestro workspace
+- *(identity)* Isolate Maestro workload fence
+- *(identity)* Pin Maestro exchange trust
+- *(identity)* Preserve projected-token rotation
+- Give bootstrap handoff migration a unique version
+- *(snapshots)* Carry secret mount fields through resume
+- *(identity)* Classify stale Maestro generations
+- *(worker)* Delete the Cilium policy on teardown and make the port case load-bearing
+
+### Other
+
+- Merge branch 'main' into devin/1785659573-brokered-desktop-transport
+- Merge origin/main into brokered desktop transport
+- Merge branch 'main' into devin/1785659399-shared-bootstrap-handoff
+- Merge branch 'main' into devin/1785659399-shared-bootstrap-handoff
+- Merge origin/main into snapshot-backed resume
+- Revert "feat(kubernetes): host generation-fenced Maestro runners"
+- Merge remote-tracking branch 'origin/main' into codex/sandboxwich-pr223
+- Merge origin/main into Kata conformance gate
+- Merge remote-tracking branch 'origin/main' into codex/sandboxwich-pr223
+
 ## 0.1.5 - 2026-07-28
 ### Other
 
