@@ -624,6 +624,22 @@ pub(crate) async fn stop_sandbox_via_job(
         .bind(sandbox_id.to_string())
         .execute(&mut *tx)
         .await?;
+    // A stopped sandbox has no reachable desktop, so its brokered
+    // desktop-access credentials must die with it (mirrors the guest-token
+    // revocation above) rather than staying live until their <=900s expiry.
+    let revoke_desktop_sql = format!(
+        "update desktop_access_credentials set revoked_at = {}
+         where tenant_id = {} and sandbox_id = {} and revoked_at is null",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3)
+    );
+    sqlx::query(&revoke_desktop_sql)
+        .bind(now.to_rfc3339())
+        .bind(&sandbox.tenant_id)
+        .bind(sandbox_id.to_string())
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     for (process_id, generation, sha256, fence) in resident_bootstrap_identities {
         resident_bootstraps.reclaim(&process_id, generation, &sha256, fence.as_ref());
