@@ -1917,6 +1917,105 @@ fn cilium_fqdn_backend_renders_controlled_wildcards_as_patterns() {
     );
 }
 
+/// Cilium learns FQDN-to-address bindings only from DNS answers its proxy
+/// observes, and it only proxies DNS carrying an L7 `rules.dns` selector.
+/// Without this rule the `toFQDNs` cache stays empty and every allowlisted
+/// name is unreachable, which the live conformance suite reproduces.
+#[test]
+fn cilium_fqdn_backend_proxies_dns_so_the_allowlist_resolves() {
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_cilium_fqdn_egress(true);
+    let policy = provider
+        .render_egress_policy(SandboxId::new(), &host_allowlist("api.example.com"))
+        .expect("configured Cilium must render host allow rules");
+
+    let dns_rule = policy["spec"]["egress"]
+        .as_array()
+        .expect("egress rules")
+        .iter()
+        .find(|rule| rule["toEndpoints"][0]["matchLabels"]["k8s:k8s-app"] == "kube-dns")
+        .expect("cluster DNS egress rule");
+    assert_eq!(dns_rule["toPorts"][0]["ports"][0]["port"], "53");
+    assert_eq!(
+        dns_rule["toPorts"][0]["rules"]["dns"],
+        json!([{"matchPattern": "*"}])
+    );
+}
+
+/// The egress-gateway backend proxies HTTP and HTTPS only; the Cilium backend
+/// has to scope allowlisted names the same way, or the same allowlist grants a
+/// wider boundary depending on which backend rendered it.
+#[test]
+fn cilium_fqdn_backend_scopes_allowed_hosts_to_http_ports() {
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_cilium_fqdn_egress(true);
+    let policy = provider
+        .render_egress_policy(SandboxId::new(), &host_allowlist("api.example.com"))
+        .expect("configured Cilium must render host allow rules");
+
+    assert_eq!(
+        policy["spec"]["egress"][0]["toPorts"][0]["ports"],
+        json!([
+            {"port": "80", "protocol": "TCP"},
+            {"port": "443", "protocol": "TCP"}
+        ])
+    );
+}
+
+/// A name resolving into the metadata or control-plane range must not become
+/// reachable just because it is on the allowlist.
+#[test]
+fn cilium_fqdn_backend_denies_the_excluded_ranges_alongside_the_allowlist() {
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_cilium_fqdn_egress(true);
+    let policy = provider
+        .render_egress_policy(SandboxId::new(), &host_allowlist("api.example.com"))
+        .expect("configured Cilium must render host allow rules");
+
+    let denied: Vec<_> = policy["spec"]["egressDeny"][0]["toCIDRSet"]
+        .as_array()
+        .expect("egressDeny CIDR set")
+        .iter()
+        .map(|entry| entry["cidr"].as_str().expect("cidr").to_string())
+        .collect();
+    assert!(denied.contains(&"169.254.0.0/16".to_string()), "{policy}");
+}
+
+#[test]
+fn cilium_fqdn_backend_rejects_an_unparseable_cidr_allow_rule() {
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_cilium_fqdn_egress(true);
+    let network_egress = NetworkEgress::Allowlist {
+        rules: vec![
+            sandboxwich_core::NetworkAllowRule {
+                kind: NetworkAllowRuleKind::Host,
+                value: "api.example.com".to_string(),
+            },
+            sandboxwich_core::NetworkAllowRule {
+                kind: NetworkAllowRuleKind::Cidr,
+                value: "10.0.0.0/33".to_string(),
+            },
+        ],
+    };
+
+    provider
+        .render_egress_policy(SandboxId::new(), &network_egress)
+        .expect_err("an unparseable CIDR must fail closed instead of panicking");
+}
+
+fn host_allowlist(host: &str) -> NetworkEgress {
+    NetworkEgress::Allowlist {
+        rules: vec![sandboxwich_core::NetworkAllowRule {
+            kind: NetworkAllowRuleKind::Host,
+            value: host.to_string(),
+        }],
+    }
+}
+
 #[test]
 fn host_rules_render_a_separate_gateway_and_no_direct_public_egress() {
     let image = format!(
