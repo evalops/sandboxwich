@@ -26,7 +26,8 @@ use sandboxwich_core::{
     MintGuestTokenRequest, NetworkAllowRule, NetworkAllowRuleKind, NetworkEgress,
     ORB_SIDECAR_RESIDENT_PROCESS_NAME, PROVIDER_ISOLATED_RESIDENT_PROCESS_IMAGE_LABEL,
     PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL,
-    PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE, ProvisioningOperationResponse,
+    PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE, PROVIDER_SECRET_DELIVERY_LABEL,
+    PROVIDER_SECRET_DELIVERY_LABEL_VALUE, ProvisioningOperationResponse,
     ProvisioningStageUpdateRequest, RegisterWorkerRequest, RenewLeaseRequest,
     ResidentProcessBootstrapReadRequest, ResidentProcessBootstrapReadResponse, ResidentProcessId,
     ResidentProcessObservationRequest, ResidentProcessObservedState, ResidentProcessRestartPolicy,
@@ -295,6 +296,11 @@ struct ProviderArgs {
 
     #[arg(long)]
     ssh_authorized_keys_secret: Option<String>,
+
+    /// Secrets Store CSI driver serving tenant `SecretProviderClass` objects.
+    /// Unset means secret delivery is refused rather than skipped.
+    #[arg(long, env = "SANDBOXWICH_SECRET_CSI_DRIVER")]
+    secret_csi_driver: Option<String>,
 
     #[arg(long, env = "SANDBOXWICH_RUNTIME_CLASS_NAME")]
     runtime_class_name: Option<String>,
@@ -1073,6 +1079,10 @@ async fn main() -> anyhow::Result<()> {
                 args.provider.provider.runtime_image.as_deref(),
                 args.provider.provider.apex_trusted_supervisor_v1,
             );
+            add_secret_delivery_label(
+                &mut labels,
+                non_empty(args.provider.provider.secret_csi_driver.clone()).is_some(),
+            );
             add_provider_isolated_resident_process_label(&mut labels, provider_isolated_sidecar);
             add_provider_isolated_resident_process_image_label(
                 &mut labels,
@@ -1217,6 +1227,7 @@ fn provider_from_args(args: ProviderArgs) -> anyhow::Result<KubernetesDryRunProv
     .with_egress_gateway_image(non_empty(args.egress_gateway_image))
     .with_workspace_storage(non_empty(args.workspace_storage))
     .with_ssh_authorized_keys_secret(non_empty(args.ssh_authorized_keys_secret))
+    .with_secret_csi_driver(non_empty(args.secret_csi_driver))
     .with_isolation_profile(args.isolation_profile)
     .with_runtime_class_name(runtime_class_name)
     .with_cilium_fqdn_egress(args.cilium_fqdn_egress)
@@ -3794,6 +3805,19 @@ fn add_provider_isolated_resident_process_label(
         labels.insert(
             PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL.to_string(),
             PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE.to_string(),
+        );
+    }
+}
+
+/// Advertises secret delivery only when the CSI driver is actually configured,
+/// so the scheduler never places a secret-bound sandbox on a worker whose
+/// provider would refuse it.
+fn add_secret_delivery_label(labels: &mut BTreeMap<String, String>, configured: bool) {
+    labels.remove(PROVIDER_SECRET_DELIVERY_LABEL);
+    if configured {
+        labels.insert(
+            PROVIDER_SECRET_DELIVERY_LABEL.to_string(),
+            PROVIDER_SECRET_DELIVERY_LABEL_VALUE.to_string(),
         );
     }
 }

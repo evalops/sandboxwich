@@ -12,6 +12,7 @@ use crate::handlers::operations::*;
 use crate::handlers::resident_attestations::*;
 use crate::handlers::resident_processes::*;
 use crate::handlers::sandboxes::*;
+use crate::handlers::secrets::*;
 use crate::handlers::snapshots::*;
 use crate::handlers::ssh::*;
 use crate::handlers::workers::*;
@@ -116,6 +117,14 @@ pub(crate) fn app(state: AppState) -> Router {
         .route(
             "/desktop-sessions/{desktop_session_id}/access",
             post(create_desktop_access),
+        )
+        .route(
+            "/secret-refs",
+            get(list_secret_refs).post(create_secret_ref),
+        )
+        .route(
+            "/secret-refs/{secret_ref_id}",
+            get(get_secret_ref).delete(revoke_secret_ref),
         )
         .route("/snapshots/cleanup", post(cleanup_snapshots))
         .route("/snapshots/{snapshot_id}", get(get_snapshot))
