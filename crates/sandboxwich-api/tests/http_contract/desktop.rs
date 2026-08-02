@@ -559,6 +559,7 @@ pub(crate) async fn assert_desktop_brokered_transport(
     let bare: SandboxResponse = client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: None,
             runtime_profile: None,
