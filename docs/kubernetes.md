@@ -31,7 +31,16 @@ observes, so without it every allowlisted name is unreachable), and an
 `egressDeny` covering the metadata and control-plane ranges. Everything else is
 denied by the policy's default deny. Resolvers reachable only as an address are
 deliberately not allowed: their answers bypass the DNS proxy and the allowlist
-would silently stop resolving.
+would silently stop resolving. Concretely, the addresses in
+`SANDBOXWICH_DNS_SERVICE_IPS` (and the ones an in-cluster worker merges from
+its own `/etc/resolv.conf`) get no rule of their own under this backend. A
+Sandbox whose resolver is the cluster-DNS Service is unaffected — that
+ClusterIP translates to the kube-dns endpoints the policy allows — but on a
+cluster where pods resolve through an address-only cache such as GKE NodeLocal
+DNSCache at `169.254.20.10`, resolution stops entirely (that address is inside
+the `egressDeny` link-local range as well). The failure is closed, not open,
+but it takes down all allowlisted egress: do not select this backend on such a
+cluster.
 
 `deploy/kubernetes/cilium-fqdn-conformance.sh` (CI job `cilium-fqdn`) enforces
 this live on a disposable dual-stack Cilium cluster, applying the same manifest

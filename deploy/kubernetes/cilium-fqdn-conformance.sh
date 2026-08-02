@@ -43,12 +43,17 @@ workdir="$(mktemp -d)"
 allowed_container=sandboxwich-conformance-allowed
 denied_container=sandboxwich-conformance-denied
 
+# Leaves the cluster reusable: a namespace still Terminating fails the next
+# run's `create namespace`, and a restored Corefile is only served after
+# CoreDNS reloads.
 cleanup() {
-  kubectl delete namespace "${namespace}" --wait=false >/dev/null 2>&1 || true
+  kubectl delete namespace "${namespace}" --wait=true --timeout=120s >/dev/null 2>&1 || true
   docker rm -f "${allowed_container}" "${denied_container}" >/dev/null 2>&1 || true
-  kubectl -n kube-system get configmap coredns -o json >/dev/null 2>&1 &&
+  if kubectl -n kube-system get configmap coredns -o json >/dev/null 2>&1 &&
     kubectl -n kube-system patch configmap coredns --type merge \
-      --patch-file "${workdir}/coredns-original.json" >/dev/null 2>&1 || true
+      --patch-file "${workdir}/coredns-original.json" >/dev/null 2>&1; then
+    kubectl -n kube-system rollout restart deployment/coredns >/dev/null 2>&1 || true
+  fi
   rm -rf "${workdir}"
 }
 trap cleanup EXIT
@@ -73,6 +78,14 @@ server {
   location / { return 200 "allowed-origin\n"; }
   location /redirect-to-denied { return 302 http://${denied_host}/; }
   location /redirect-to-allowed { return 302 http://${allowed_host}/; }
+}
+# The allowlisted origin also serves a port the rendered policy does not name,
+# so the port-scoping case fails on a missing deny rather than passing on a
+# refused connection.
+server {
+  listen 8080;
+  listen [::]:8080;
+  location / { return 200 "allowed-origin-8080\n"; }
 }
 NGINX
 cat >"${workdir}/denied.conf" <<'NGINX'
@@ -109,6 +122,11 @@ if [[ "${skip_ipv6}" != true && ( -z "${allowed_ipv6}" || -z "${denied_ipv6}" ) 
   echo "conformance origins did not receive IPv6 addresses; the cluster is not dual-stack" >&2
   exit 1
 fi
+# Off-policy control for allowed-fqdn-other-port: prove 8080 answers when no
+# CiliumNetworkPolicy is in the way, so the later deny measures the policy.
+docker run --rm --network "${docker_network}" "${probe_image}" \
+  curl -fsS --retry 5 --retry-connrefused --max-time 20 \
+  "http://${allowed_ipv4}:8080/" >/dev/null
 
 # --- DNS -------------------------------------------------------------------
 kubectl -n kube-system get configmap coredns -o json |

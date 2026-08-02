@@ -231,6 +231,11 @@ pub const GUEST_TOKEN_REDACTED: &str = "[redacted]";
 /// value (only) from byte equality.
 pub const GUEST_TOKEN_SECRET_NAME_PREFIX: &str = "sandboxwich-guest-token-";
 const GKE_FQDN_RESOURCE_KIND: &str = "fqdnnetworkpolicy.networking.gke.io";
+/// Kind of the policy the Cilium FQDN backend renders. `networkpolicy` in
+/// `SANDBOX_TEARDOWN_RESOURCE_KINDS` does not match it, so a sandbox stopped
+/// under this backend would leave its policy behind. Only appended when the
+/// backend is selected, since the CRD exists only on Cilium clusters.
+const CILIUM_FQDN_RESOURCE_KIND: &str = "ciliumnetworkpolicy.cilium.io";
 /// Ports an allowlisted host name is reachable on. Shared by both FQDN
 /// backends so the same allow rule grants the same reachability whether it is
 /// enforced by the per-sandbox egress gateway or by Cilium `toFQDNs`.
@@ -763,11 +768,16 @@ impl KubernetesDryRunProvider {
         base: &str,
         persisted_gke_fqdn: bool,
     ) -> String {
+        let mut kinds = base.to_string();
         if persisted_gke_fqdn {
-            format!("{base},{GKE_FQDN_RESOURCE_KIND}")
-        } else {
-            base.to_string()
+            kinds.push(',');
+            kinds.push_str(GKE_FQDN_RESOURCE_KIND);
         }
+        if self.fqdn_egress_backend.as_deref() == Some("cilium") {
+            kinds.push(',');
+            kinds.push_str(CILIUM_FQDN_RESOURCE_KIND);
+        }
+        kinds
     }
 
     /// Merges operator-supplied CIDRs into the excluded set (deduped

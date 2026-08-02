@@ -3536,6 +3536,22 @@ fn teardown_args_honor_persisted_gke_fqdn_resource_on_an_unconfigured_worker() {
 }
 
 #[test]
+fn teardown_deletes_the_cilium_policy_under_the_cilium_fqdn_backend() {
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_cilium_fqdn_egress(true);
+    let apply = KubernetesApplyProvider::new(provider, "kubectl").with_mutation_gate(true, true);
+
+    let args = apply.teardown_args(SandboxId::new());
+
+    // `networkpolicy` does not match the CRD, so without this the policy that
+    // is the enforcement boundary outlives the Sandbox it was rendered for.
+    assert!(args.contains(&format!(
+        "{SANDBOX_TEARDOWN_RESOURCE_KINDS},{CILIUM_FQDN_RESOURCE_KIND}"
+    )));
+}
+
+#[test]
 fn teardown_args_omit_context_flag_for_in_cluster_service_account() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);

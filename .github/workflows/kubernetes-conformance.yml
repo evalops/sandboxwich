@@ -209,7 +209,7 @@ jobs:
           kubectl wait nodes --all --for=condition=Ready --timeout=300s
           # Pods scheduled before the CNI was ready stay in ContainerCreating;
           # the suite needs cluster DNS to answer.
-          kubectl -n kube-system delete pod -l k8s-app=kube-dns --wait=false
+          kubectl -n kube-system delete pod -l k8s-app=kube-dns --wait=true --timeout=180s
           kubectl -n kube-system rollout status deployment/coredns --timeout=300s
       - name: Run Cilium FQDN conformance
         run: deploy/kubernetes/cilium-fqdn-conformance.sh
