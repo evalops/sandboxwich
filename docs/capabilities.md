@@ -15,7 +15,7 @@ until its real provider path is exercised by an end-to-end conformance test.
 | Snapshots and forks | Experimental | Requires a working CSI `VolumeSnapshotClass`; not all clusters support it. |
 | SSH and browser desktop metadata | Experimental | Access records do not provide an ingress tunnel by themselves. |
 | Prompt/model execution | Unsupported | The current worker has no model executor. Dry-run acknowledgements are not model output. |
-| True resume after teardown | Unsupported | Stop destroys resources; create or fork a replacement instead. |
+| Snapshot-backed resume after teardown | Experimental | `POST /v1/sandboxes/{id}/resume` restores an `archived` sandbox in place from one of *its own* ready snapshots, keeping its id, creation time, and lifetime configuration. Requires `workspace_mode=persistent`, a same-sandbox ready snapshot whose placement and runtime profile still match, and therefore a working CSI `VolumeSnapshotClass`. Fails closed (`resume_snapshot_unavailable`, `resume_snapshot_foreign`, `resume_placement_mismatch`, `resume_lifetime_exhausted`) rather than restoring an empty workspace. Restores whatever the snapshot captured -- workspace volume state, not live process, memory, or in-flight command state. Exercised in apply mode only as far as the Kubernetes restore path is exercised elsewhere; the contract suite covers the API and dry-run provider paths. |
 | Guest-agent lease claim scoping | Experimental | Workers mint opaque `sbw_gtok_` credentials bound to one tenant, worker, sandbox, and expiry. Guest claims are limited to `run_command` and `run_resident_process`; the API rejects omitted filters, cross-sandbox claims, other job kinds, worker administration, expiry, and revocation. Raw tokens are returned once and stored only as SHA-256 hashes. |
 | Resident guest processes | Experimental | A tenant may create one `orb-executor` resident process per sandbox. A typed, exactly versioned agent-capability report gates dispatch. Bootstrap bytes may be retried only by the same generation/lease/digest fence until the agent acknowledges that exact process as `Starting`; durable `resident_processes` rows contain only digest and byte count. With `SANDBOXWICH_BOOTSTRAP_HANDOFF_KEY` configured, the bytes are additionally sealed (XChaCha20-Poly1305, associated data binding process, sandbox, tenant, generation, and digest) into an ephemeral `resident_bootstrap_handoffs` row, so API restart, replica failover, and cross-replica replay all complete under that same fence; the row is deleted on acknowledgment, stop, reclaim, and sandbox deletion, expires on a TTL, and is unreadable by a process holding a different key. Without the key there is no shared tier and bootstrap stays process-local. |
 | Provider-isolated sidecar (`orb-sidecar`, v2) | Experimental | An apply-mode Kubernetes worker advertises `provider_isolated_resident_process_version=2` only with a digest-pinned `SANDBOXWICH_ISOLATED_RESIDENT_PROCESS_IMAGE` and a nonempty RuntimeClass. V2 keeps the dedicated Pod, immutable transient Secret, separate namespaces, no service-account token, restrictive security context, fenced cleanup, and deny-all ingress from v1. It additionally places a one-time, hash-only Sandboxwich placement proof in a second sidecar-only Secret file, records the authoritative Pod UID from Kubernetes observation, supports tenant-authenticated redemption plus record-bound live validation for Orb, and allows only explicitly configured narrow private issuer CIDRs over TCP/443. V1 rows remain readable during rollout, but only v2 receives an attestation. The sidecar does **not** share guest localhost; integrations use explicit HTTPS, and an explicit guest-to-sidecar network relay is still unsupported. Executor bootstrap remains fail-closed unless the sidecar is `Running` under a live lease, and survives API restart and replica failover exactly as the resident-process row above describes. |
@@ -66,6 +66,15 @@ values were. Restoring from a snapshot is a new sandbox with a new
 creation time, not a continuation of the old one, so there is no single
 "parent" whose cap would be unambiguous to inherit -- unlike an in-place
 fork, which has exactly one.
+
+`POST /sandboxes/{id}/resume` is the third case, and it inherits *everything*:
+it is the same sandbox, so its `max_lifetime_seconds`, `idle_ttl_seconds`,
+execution class, runtime profile, and `created_at` are unchanged by the
+restore. Because the hard cap is still measured from the original
+`created_at`, resuming a sandbox already past that cap is rejected with
+`resume_lifetime_exhausted` instead of restoring a sandbox the next reap
+sweep would immediately stop again -- restore that snapshot into a new
+sandbox with `POST /snapshots/{id}/fork` if a fresh clock is what you want.
 
 See the README's "Sandbox lifetime: three separate knobs" section for the
 full config surface (env vars and CLI flags).

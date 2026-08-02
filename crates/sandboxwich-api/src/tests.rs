@@ -2570,19 +2570,20 @@ async fn database_trigger_rejects_a_transition_no_action_ever_performs() {
     // Defense-in-depth check for the trigger backstop installed by
     // `ensure_sqlite_constraints`: even a raw UPDATE that bypasses every
     // Rust-level CAS helper must be rejected for an edge that is not in
-    // `sandbox_legal_transition_pairs()` (e.g. archived -> provisioning,
-    // which no handler ever performs).
+    // `sandbox_legal_transition_pairs()` (e.g. archived -> running, which no
+    // handler ever performs -- resume moves an archived sandbox back through
+    // `provisioning`, never straight into a live state).
     let db = test_sqlite_db().await;
     let sandbox = seed_sandbox_with_state(&db, SandboxState::Archived).await;
 
-    let result = sqlx::query("update sandboxes set state = 'provisioning' where id = ?")
+    let result = sqlx::query("update sandboxes set state = 'running' where id = ?")
         .bind(sandbox.id.to_string())
         .execute(&db.pool)
         .await;
 
     assert!(
         result.is_err(),
-        "the database trigger backstop must reject archived -> provisioning"
+        "the database trigger backstop must reject archived -> running"
     );
 
     let unchanged = fetch_sandbox(&db, sandbox.id).await.expect("fetch sandbox");
