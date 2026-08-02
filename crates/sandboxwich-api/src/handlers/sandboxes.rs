@@ -736,6 +736,7 @@ pub(crate) async fn resume_sandbox(
     )
     .await?;
     let provision_spec = SandboxProvisionSpec {
+        secret_mounts: Vec::new(),
         execution_class: sandbox.execution_class.clone(),
         memory_limit: sandbox.memory_limit.clone(),
         network_egress: sandbox.network_egress.clone(),

@@ -2084,6 +2084,7 @@ async fn create_resume_test_sandbox(
     client
         .post(format!("{}/sandboxes", server.base_url))
         .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
             execution_class: None,
             workspace_mode: Some(WorkspaceMode::Persistent),
             runtime_profile: None,
