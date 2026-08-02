@@ -21,6 +21,13 @@ pub(crate) const PROBE_PATHS: &[&str] = &["/healthz", "/readyz"];
 /// tenant/shared-token lists without needing to try both on every request.
 pub(crate) const WORKER_TOKEN_PREFIX: &str = "sbw_wtok_";
 pub(crate) const GUEST_TOKEN_PREFIX: &str = "sbw_gtok_";
+/// Prefix on every minted brokered-desktop-transport credential (ROADMAP
+/// #3). Unlike the worker/guest prefixes this token is never presented to
+/// this API as a bearer credential -- it is validated by the out-of-band
+/// desktop broker -- so the auth middleware deliberately does not route it;
+/// the prefix exists only so the credential is self-describing and the
+/// canary-token sweep can recognize a leaked one.
+pub(crate) const DESKTOP_TOKEN_PREFIX: &str = "sbw_dtok_";
 
 pub(crate) async fn auth_and_tenant(
     State(state): State<AppState>,
@@ -156,6 +163,18 @@ pub(crate) async fn resolve_guest_token(
 pub(crate) fn generate_guest_token() -> String {
     format!(
         "{GUEST_TOKEN_PREFIX}{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    )
+}
+
+/// Mints a brokered-desktop-transport credential (ROADMAP #3): high-entropy
+/// (256 bits), prefixed so it is self-describing and canary-detectable, and
+/// never persisted in this form -- only [`hash_worker_token`]'s output is
+/// stored, in `desktop_access_credentials.token_hash`.
+pub(crate) fn generate_desktop_token() -> String {
+    format!(
+        "{DESKTOP_TOKEN_PREFIX}{}{}",
         Uuid::new_v4().simple(),
         Uuid::new_v4().simple()
     )

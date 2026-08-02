@@ -381,9 +381,22 @@ pub(crate) async fn upsert_provider_runtime_resource_on_connection(
     };
 
     let existing = fetch_runtime_resource_on_connection(db, connection, resource_id).await?;
+    // A torn-down resource has released its provider identity, so the same
+    // sandbox may recreate that name from a different *source* snapshot --
+    // that is exactly what a snapshot-backed resume does when it restores the
+    // workspace volume the stop deleted. Deliberately narrow: the row's own
+    // `snapshot_id` (which snapshot a resource *is*, as opposed to what it was
+    // cloned from) may never change, and a live resource may not change
+    // lineage at all.
+    let restored_by_same_sandbox = existing.sandbox_id == resource.sandbox_id
+        && existing.snapshot_id == resource.snapshot_id
+        && matches!(
+            existing.status,
+            RuntimeResourceStatus::Deleted | RuntimeResourceStatus::Destroyed
+        );
     if existing.sandbox_id != resource.sandbox_id
         || existing.snapshot_id != resource.snapshot_id
-        || existing.source_snapshot_id != resource.source_snapshot_id
+        || (!restored_by_same_sandbox && existing.source_snapshot_id != resource.source_snapshot_id)
     {
         return Err(ApiError::bad_request(
             "runtime resource provider identity belongs to a different association",
@@ -709,20 +722,43 @@ pub(crate) async fn mark_runtime_resource_deleted(
     fetch_runtime_resource(db, resource_id).await
 }
 
+/// Which of a sandbox's resources a sweep is allowed to retire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeResourceGeneration {
+    /// Everything recorded against the sandbox, including the `volume_snapshot`
+    /// resources backing its snapshots. Only correct when the sandbox itself is
+    /// going away.
+    All,
+    /// Only the sandbox's own runtime resources (Pod, workspace PVC, Services,
+    /// NetworkPolicy, Secret). A snapshot's `volume_snapshot` resource is
+    /// recorded under its source sandbox's id but outlives the sandbox's
+    /// runtime -- it is what a later restore reads from, and its cleanup is
+    /// driven by snapshot expiry -- so a runtime-generation sweep must leave it
+    /// alone.
+    RuntimeOnly,
+}
+
 pub(crate) async fn mark_runtime_resources_deleted_for_sandbox_on_connection(
     db: &Database,
     connection: &mut AnyConnection,
     sandbox_id: SandboxId,
+    generation: RuntimeResourceGeneration,
     deleted_at: DateTime<Utc>,
     error: &str,
 ) -> Result<Vec<RuntimeResource>, ApiError> {
+    let generation_filter = match generation {
+        RuntimeResourceGeneration::All => "",
+        RuntimeResourceGeneration::RuntimeOnly => {
+            " and snapshot_id is null and purpose <> 'snapshot'"
+        }
+    };
     let sql = format!(
         "select id, sandbox_id, snapshot_id, provider, resource_kind, purpose, resource_name,
                 namespace, status, cluster, storage_class, snapshot_class, storage_size,
                 runtime_image, service_port, target_port, source_snapshot_id, created_at,
                 updated_at, observed_at, last_reconciled_at, ready_at, deleted_at, error
          from runtime_resources
-         where sandbox_id = {} and status not in ('deleted', 'destroyed')
+         where sandbox_id = {} and status not in ('deleted', 'destroyed'){generation_filter}
          order by updated_at asc, id asc",
         db.placeholder(1)
     );

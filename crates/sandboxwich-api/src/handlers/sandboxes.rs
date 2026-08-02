@@ -15,7 +15,7 @@ use crate::util::*;
 use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sandboxwich_core::*;
 use serde_json::json;
 use sqlx::AnyConnection;
@@ -636,6 +636,22 @@ pub(crate) async fn stop_sandbox_via_job(
         .bind(sandbox_id.to_string())
         .execute(&mut *tx)
         .await?;
+    // A stopped sandbox has no reachable desktop, so its brokered
+    // desktop-access credentials must die with it (mirrors the guest-token
+    // revocation above) rather than staying live until their <=900s expiry.
+    let revoke_desktop_sql = format!(
+        "update desktop_access_credentials set revoked_at = {}
+         where tenant_id = {} and sandbox_id = {} and revoked_at is null",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3)
+    );
+    sqlx::query(&revoke_desktop_sql)
+        .bind(now.to_rfc3339())
+        .bind(&sandbox.tenant_id)
+        .bind(sandbox_id.to_string())
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     for (process_id, generation, sha256, fence) in resident_bootstrap_identities {
         resident_bootstraps.reclaim(&process_id, generation, &sha256, fence.as_ref());
@@ -700,15 +716,160 @@ async fn sandbox_state_http_conflict(
     })
 }
 
+/// Restores a stopped sandbox in place from one of its durable snapshots.
+///
+/// A resume is deliberately *not* a fork: the sandbox keeps its own id,
+/// creation time, placement, and all three lifetime knobs, and the workspace
+/// PVC is recreated from the snapshot under the sandbox's own name. That is
+/// also why the request carries no placement fields -- there is nothing here
+/// a caller could restate, so there is no way to shed a caller-imposed
+/// `max_lifetime_seconds` by resuming (which `POST /snapshots/{id}/fork`
+/// deliberately does allow; see `docs/capabilities.md`). A sandbox already
+/// past its hard cap is refused rather than resumed into an immediate reap.
+#[utoipa::path(post, path = "/v1/sandboxes/{sandbox_id}/resume", params(("sandbox_id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = "Tenant-scoped replay key"), ("X-Request-Id" = Option<String>, Header), ("traceparent" = Option<String>, Header)), request_body = ResumeSandboxRequest, responses((status = 202, description = "Resume accepted with the restored sandbox and asynchronous operation", body = SandboxResponse), (status = 404, body = ErrorEnvelope), (status = 409, body = ErrorEnvelope)))]
 pub(crate) async fn resume_sandbox(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
-) -> Result<Json<SandboxResponse>, ApiError> {
-    ensure_sandbox_tenant(&state.db, SandboxId(sandbox_id), &ctx).await?;
-    Err(ApiError::unsupported(format!(
-        "resume is not supported for sandbox {sandbox_id}; create or fork a sandbox instead"
-    )))
+    // Optional so a caller with nothing to say ("restore the latest snapshot")
+    // can post an empty body, the way `stop` already accepts one.
+    request: Option<Json<ResumeSandboxRequest>>,
+) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
+    let Json(request) = request.unwrap_or_default();
+    let sandbox_id = SandboxId(sandbox_id);
+    let now = Utc::now();
+    let mut tx = state.db.pool.begin().await?;
+    let mut sandbox =
+        ensure_sandbox_tenant_on_connection(&state.db, &mut tx, sandbox_id, &ctx.tenant_id).await?;
+    ensure_sandbox_resumable(&sandbox, now)?;
+    let restore = claim_sandbox_resume_snapshot_on_connection(
+        &state.db,
+        &mut tx,
+        &sandbox,
+        request.snapshot_id,
+        &ctx,
+        now,
+    )
+    .await?;
+    let provision_spec = SandboxProvisionSpec {
+        secret_mounts: Vec::new(),
+        execution_class: sandbox.execution_class.clone(),
+        memory_limit: sandbox.memory_limit.clone(),
+        network_egress: sandbox.network_egress.clone(),
+        workspace_mode: sandbox.workspace_mode.clone(),
+        runtime_profile: sandbox.runtime_profile.clone(),
+    };
+    let job = Job {
+        id: JobId::new(),
+        tenant_id: sandbox.tenant_id.clone(),
+        kind: JobKind::ResumeSandbox,
+        status: JobStatus::Queued,
+        payload: json!({
+            "sandboxId": sandbox_id,
+            "snapshotId": restore.snapshot_id,
+            "runtimeImage": sandbox.template,
+            "provisionSpec": provision_spec
+        }),
+        required_capability: fork_capability(&sandbox.runtime_profile, &sandbox.network_egress),
+        required_execution_class: sandbox.execution_class.clone(),
+        priority: 0,
+        attempts: 0,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+    };
+    let next_state = SandboxState::Provisioning;
+    let moved = set_sandbox_state_on_connection(
+        &state.db,
+        &mut tx,
+        sandbox_id,
+        SandboxState::RESUME_LEGAL_FROM,
+        next_state.clone(),
+        json!({
+            "state": next_state,
+            "reason": "resume_requested",
+            "restoredFromSnapshotId": restore.snapshot_id
+        }),
+    )
+    .await?;
+    if !moved {
+        // Lost the race against a concurrent writer. Release the transaction
+        // before reading the sandbox again: the pool may hand out a single
+        // connection, and this read must not wait on a transaction it owns.
+        drop(tx);
+        return Err(match fetch_sandbox_state(&state.db, sandbox_id).await? {
+            None => ApiError::not_found("sandbox not found"),
+            Some(actual) => sandbox_not_resumable(sandbox_id, &actual),
+        });
+    }
+    insert_job_on_connection(&state.db, &mut tx, &job).await?;
+    tx.commit().await?;
+
+    sandbox.state = next_state;
+    sandbox.updated_at = now;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SandboxResponse {
+            ok: true,
+            sandbox,
+            operation: Some(operation_from_job(&job)?),
+            placement: None,
+        }),
+    ))
+}
+
+/// Every precondition a resume has beyond owning the sandbox, checked before
+/// the snapshot is claimed so a caller resuming a live sandbox is told that
+/// rather than getting a snapshot-shaped error.
+///
+/// Shared with the `/v1/jobs` path: a directly created `ResumeSandbox` job
+/// reaches the same worker code, and running a restore against a *live*
+/// sandbox would have the provider apply a cloned-volume PVC over the bound
+/// one, fail, and roll back -- deleting the running sandbox's workspace. The
+/// state CAS in `resume_sandbox` remains the authority for the racing case.
+pub(crate) fn ensure_sandbox_resumable(
+    sandbox: &Sandbox,
+    now: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    if !SandboxState::RESUME_LEGAL_FROM.contains(&sandbox.state) {
+        return Err(sandbox_not_resumable(sandbox.id, &sandbox.state));
+    }
+    if sandbox.workspace_mode != WorkspaceMode::Persistent {
+        return Err(ApiError::conflict_code(
+            "workspace_mode_resume_unsupported",
+            "resume requires workspace_mode=persistent",
+        ));
+    }
+    if let Some(max_lifetime_seconds) = sandbox.max_lifetime_seconds
+        && let Some(deadline) =
+            crate::reap::max_lifetime_expired(sandbox.created_at, max_lifetime_seconds, now)
+    {
+        // Resuming keeps the original creation time, so a sandbox already past
+        // its hard cap would be reaped again by the next sweep. Refuse instead
+        // of restoring a sandbox that cannot legally run.
+        return Err(ApiError::conflict_code(
+            "resume_lifetime_exhausted",
+            format!(
+                "cannot resume sandbox {}: its max_lifetime_seconds deadline \
+                 ({deadline}) has passed; restore the snapshot into a new sandbox instead",
+                sandbox.id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn sandbox_not_resumable(sandbox_id: SandboxId, actual: &SandboxState) -> ApiError {
+    ApiError::conflict_code(
+        "sandbox_not_resumable",
+        format!(
+            "cannot resume sandbox {sandbox_id}: only an archived sandbox can be resumed \
+             (currently {})",
+            state_to_str(actual)
+        ),
+    )
 }
 
 #[utoipa::path(post, path = "/v1/sandboxes/{sandbox_id}/fork", params(("sandbox_id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = "Tenant-scoped replay key"), ("X-Request-Id" = Option<String>, Header), ("traceparent" = Option<String>, Header)), request_body = CreateSandboxRequest, responses((status = 202, description = "Fork accepted with child sandbox and asynchronous operation", body = SandboxResponse), (status = 404, body = ErrorEnvelope)))]
