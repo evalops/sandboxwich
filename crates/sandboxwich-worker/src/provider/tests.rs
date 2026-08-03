@@ -3915,16 +3915,16 @@ fn teardown_args_honor_persisted_gke_fqdn_resource_on_an_unconfigured_worker() {
         .with_kubectl_context(Some("gke-ci".to_string()))
         .with_mutation_gate(true, true);
 
-    let args = apply.teardown_args_with_spec(
+    let commands = apply.optional_teardown_args(
         SandboxId::new(),
         &SandboxTeardownSpec {
             delete_gke_fqdn_policy: true,
         },
     );
 
-    assert!(args.contains(&format!(
-        "{SANDBOX_TEARDOWN_RESOURCE_KINDS},{GKE_FQDN_RESOURCE_KIND}"
-    )));
+    assert_eq!(commands.len(), 1);
+    assert!(commands[0].contains(&GKE_FQDN_RESOURCE_KIND.to_string()));
+    assert!(!commands[0].contains(&SANDBOX_TEARDOWN_RESOURCE_KINDS.to_string()));
 }
 
 #[test]
@@ -3934,13 +3934,44 @@ fn teardown_deletes_the_cilium_policy_under_the_cilium_fqdn_backend() {
             .with_cilium_fqdn_egress(true);
     let apply = KubernetesApplyProvider::new(provider, "kubectl").with_mutation_gate(true, true);
 
-    let args = apply.teardown_args(SandboxId::new());
+    let commands = apply.optional_teardown_args(SandboxId::new(), &SandboxTeardownSpec::default());
 
     // `networkpolicy` does not match the CRD, so without this the policy that
     // is the enforcement boundary outlives the Sandbox it was rendered for.
-    assert!(args.contains(&format!(
-        "{SANDBOX_TEARDOWN_RESOURCE_KINDS},{CILIUM_FQDN_RESOURCE_KIND}"
-    )));
+    assert_eq!(commands.len(), 1);
+    assert!(commands[0].contains(&CILIUM_FQDN_RESOURCE_KIND.to_string()));
+}
+
+#[test]
+fn stop_deletes_core_resources_when_optional_gke_crd_is_absent() {
+    let (kubectl, log_path) = write_fake_kubectl_missing_optional_resource();
+    let provider = apply_provider_with_fake_kubectl(&kubectl);
+    let sandbox_id = SandboxId::new();
+
+    provider
+        .stop(
+            sandbox_id,
+            &SandboxTeardownSpec {
+                delete_gke_fqdn_policy: true,
+            },
+            &CancelSignal::never_cancelled(),
+        )
+        .expect("an absent optional CRD must not fail core teardown");
+
+    let log = std::fs::read_to_string(&log_path).expect("read fake kubectl log");
+    let core_delete = format!(
+        "delete {SANDBOX_TEARDOWN_RESOURCE_KINDS} -l sandboxwich.dev/sandbox-id={sandbox_id}"
+    );
+    assert!(
+        log.contains(&core_delete),
+        "core teardown did not run: {log}"
+    );
+    assert!(
+        log.contains(&format!("delete {GKE_FQDN_RESOURCE_KIND} -l")),
+        "optional cleanup was not attempted separately: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
 }
 
 #[test]
@@ -4040,6 +4071,39 @@ fn write_fake_kubectl(fail_verb: Option<&'static str>) -> (std::path::PathBuf, s
              esac\n\
              exit 0\n",
         log = log_path.display(),
+    );
+    let script_path = dir.join("kubectl");
+    std::fs::write(&script_path, script).expect("write fake kubectl script");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat fake kubectl script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod fake kubectl script");
+    }
+    (script_path, log_path)
+}
+
+fn write_fake_kubectl_missing_optional_resource() -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "sandboxwich-fake-kubectl-missing-crd-{}",
+        SandboxId::new()
+    ));
+    std::fs::create_dir_all(&dir).expect("create fake kubectl temp dir");
+    let log_path = dir.join("log.txt");
+    let script = format!(
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$*\" >> \"{log}\"\n\
+         case \" $* \" in\n\
+         *\" {resource_kind} \"*)\n\
+           echo 'error: the server doesn'\"'\"'t have a resource type \"fqdnnetworkpolicy\"' >&2\n\
+           exit 1\n\
+           ;;\n\
+         esac\n\
+         exit 0\n",
+        log = log_path.display(),
+        resource_kind = GKE_FQDN_RESOURCE_KIND,
     );
     let script_path = dir.join("kubectl");
     std::fs::write(&script_path, script).expect("write fake kubectl script");
@@ -4397,6 +4461,7 @@ fn provision_staged_applies_gateway_policy_and_waits_for_gateway_before_runtime(
         uid: "uid-fqdn".to_string(),
         resident_lease_id: None,
         created_at: None,
+        volume_claim_phase: None,
     };
     assert_eq!(
         kubernetes_delete_path(&fqdn_observed).expect("GKE FQDN delete path"),
@@ -4438,11 +4503,14 @@ fn provision_staged_stops_before_the_next_resource_when_reporting_fails() {
         "workspace and network policy apply before their durable reports: {log}"
     );
     assert!(!log.contains(" wait "), "pod stage must not start: {log}");
+    // A rejected stage update is the control plane refusing this attempt's
+    // authority, and it can arrive before the renewal loop fires the cancel
+    // signal. Deleting by sandbox-id label could then destroy resources a new
+    // lease owner already applied, so residue from this path is left to the
+    // unbound-workspace-claim backstop instead.
     assert!(
-        log.contains(&format!(
-            "delete pod,persistentvolumeclaim,service,networkpolicy,secret -l sandboxwich.dev/sandbox-id={sandbox_id}"
-        )),
-        "staged provisioning must roll back after a report failure: {log}"
+        !log.contains(" delete "),
+        "a rejected stage update must not trigger rollback: {log}"
     );
     let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
 }
@@ -4854,6 +4922,7 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             uid: "uid-live".to_string(),
             resident_lease_id: None,
             created_at: None,
+            volume_claim_phase: None,
         },
         ObservedKubernetesResource {
             sandbox_id: Some(orphan_sandbox),
@@ -4863,6 +4932,7 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             uid: "uid-orphan".to_string(),
             resident_lease_id: None,
             created_at: None,
+            volume_claim_phase: None,
         },
         ObservedKubernetesResource {
             sandbox_id: Some(expired_sandbox),
@@ -4872,6 +4942,7 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             uid: "uid-expired".to_string(),
             resident_lease_id: None,
             created_at: None,
+            volume_claim_phase: None,
         },
         ObservedKubernetesResource {
             sandbox_id: None,
@@ -4881,6 +4952,7 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             uid: "uid-foreign".to_string(),
             resident_lease_id: None,
             created_at: None,
+            volume_claim_phase: None,
         },
         ObservedKubernetesResource {
             sandbox_id: Some(live_sandbox),
@@ -4890,6 +4962,7 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             uid: "replacement-uid".to_string(),
             resident_lease_id: None,
             created_at: None,
+            volume_claim_phase: None,
         },
     ];
     let expired =
@@ -4951,6 +5024,7 @@ fn resident_resource_reconciliation_is_fenced_by_active_lease_not_live_sandbox()
         uid: format!("uid-{lease_id}"),
         resident_lease_id: Some(lease_id),
         created_at: Some(created_at),
+        volume_claim_phase: None,
     };
     let decisions = classify_reconciliation(
         &inventory,
@@ -5036,6 +5110,7 @@ esac
         uid: "uid-orphan".to_string(),
         resident_lease_id: Some(resident_lease),
         created_at: Some(Utc::now() - chrono::Duration::minutes(6)),
+        volume_claim_phase: None,
     };
     assert_eq!(
         kubernetes_delete_path(&observed).expect("delete path"),
@@ -5092,6 +5167,380 @@ esac
             .iter()
             .all(|decision| !decision.delete_allowed)
     );
+}
+
+/// Stateful fake kubectl that rejects the `kubectl apply` of one lowercase kind
+/// with `stderr`, mirroring how the API server rejects a Pod whose namespace
+/// ResourceQuota is exhausted.
+fn write_stateful_fake_kubectl_rejecting_apply(
+    rejected_kind: &str,
+    stderr: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("sandboxwich-quota-kubectl-{}", SandboxId::new()));
+    std::fs::create_dir_all(&dir).expect("create quota fake kubectl dir");
+    let log_path = dir.join("log.txt");
+    let script_path = dir.join("kubectl");
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "{log}"
+case " $* " in
+  *" get "*)
+    kind=''
+    name=''
+    previous=''
+    for arg in "$@"; do
+      if [ "$previous" = get ]; then kind="$arg"; previous=kind; continue; fi
+      if [ "$previous" = kind ]; then name="$arg"; break; fi
+      previous="$arg"
+    done
+    kind=$(printf '%s' "$kind" | tr '[:upper:]' '[:lower:]')
+    marker="{dir}/$kind-$name"
+    [ -f "$marker" ] || exit 0
+    python3 - "$marker" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    value = json.load(source)
+metadata = value.setdefault("metadata", {{}})
+metadata["uid"] = "uid-" + metadata["name"]
+metadata["generation"] = 1
+print(json.dumps(value))
+PY
+    ;;
+  *" apply "*)
+    payload=$(cat)
+    kind=$(printf '%s' "$payload" | sed -n 's/.*"kind": "\([^"]*\)".*/\1/p' | head -1 | tr '[:upper:]' '[:lower:]')
+    name=$(printf '%s' "$payload" | sed -n 's/.*"name": "\([^"]*\)".*/\1/p' | head -1)
+    if [ "$kind" = "{rejected_kind}" ]; then
+      printf '%s\n' '{stderr}' >&2
+      exit 1
+    fi
+    printf '%s' "$payload" > "{dir}/$kind-$name"
+    ;;
+  *" wait "*) ;;
+  *" delete "*) ;;
+esac
+"#,
+        log = log_path.display(),
+        dir = dir.display(),
+    );
+    std::fs::write(&script_path, script).expect("write quota fake kubectl");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("stat quota fake kubectl")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).expect("chmod quota fake kubectl");
+    }
+    (script_path, log_path)
+}
+
+const QUOTA_REJECTION_STDERR: &str = r#"Error from server (Forbidden): error when creating "STDIN": pods "sandboxwich-quota" is forbidden: exceeded quota: sandbox-capacity, used: pods=40, limited: pods=40"#;
+
+#[test]
+fn staged_provision_rolls_back_its_workspace_claim_when_the_pod_is_quota_rejected() {
+    // The 2026-08-03 leak in its original shape: the staged path applies the
+    // workspace PVC first and the namespace ResourceQuota then rejects the Pod.
+    let (kubectl, log_path) =
+        write_stateful_fake_kubectl_rejecting_apply("pod", QUOTA_REJECTION_STDERR);
+    let provider = apply_provider_with_fake_kubectl(&kubectl);
+    let sandbox_id = SandboxId::new();
+
+    let error = provider
+        .provision_staged(
+            sandbox_id,
+            &SandboxProvisionSpec::default(),
+            &CancelSignal::never_cancelled(),
+            |_| Ok(()),
+        )
+        .expect_err("a quota-rejected pod apply must fail the staged provision");
+    assert!(
+        error.to_string().contains("exceeded quota"),
+        "the original quota rejection must not be masked by the rollback: {error:#}"
+    );
+
+    let log = std::fs::read_to_string(&log_path).expect("read quota kubectl log");
+    assert!(
+        log.contains(&format!(
+            "delete pod,persistentvolumeclaim,service,networkpolicy,secret -l sandboxwich.dev/sandbox-id={sandbox_id}"
+        )),
+        "the staged claim must be deleted in the same failure path: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+#[test]
+fn staged_provision_does_not_roll_back_after_its_lease_is_lost() {
+    // For a ProvisionSandbox lease the only reachable cancellation is
+    // LeaseCancellationReason::LeaseLost, and main.rs cancels precisely so the
+    // job stops instead of continuing against a lease it can no longer prove is
+    // its own -- the job may already have been re-queued and completed by
+    // another worker. rollback_applied_resources is a label-scoped delete with
+    // no UID precondition that deliberately ignores the cancel signal, so
+    // rolling back here would delete the new owner's live Pod, Services and
+    // Bound workspace claim.
+    let (kubectl, log_path) =
+        write_stateful_fake_kubectl_rejecting_apply("pod", QUOTA_REJECTION_STDERR);
+    let provider = apply_provider_with_fake_kubectl(&kubectl);
+    let sandbox_id = SandboxId::new();
+    let cancelled = CancelSignal::new();
+    let lease_lost = cancelled.clone();
+
+    provider
+        .provision_staged(
+            sandbox_id,
+            &SandboxProvisionSpec::default(),
+            &cancelled,
+            |report| {
+                // The workspace claim is applied by the time this fires, so the
+                // rollback guard -- not an empty apply set -- is what is under
+                // test here.
+                if report.stage == sandboxwich_core::ProvisioningStage::WorkspaceReady {
+                    lease_lost.cancel();
+                }
+                Ok(())
+            },
+        )
+        .expect_err("a cancelled staged provision must fail");
+
+    let log = std::fs::read_to_string(&log_path).expect("read cancelled kubectl log");
+    assert!(
+        log.contains(" apply "),
+        "the workspace claim must have been applied before the lease was lost: {log}"
+    );
+    assert!(
+        !log.contains(" delete "),
+        "a worker that lost its lease must not delete the new owner's resources: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+/// Builds an observed claim for the unbound-workspace-claim backstop cases.
+fn observed_claim(
+    sandbox_id: Option<SandboxId>,
+    name: String,
+    uid: &str,
+    phase: Option<VolumeClaimPhase>,
+    created_at: chrono::DateTime<Utc>,
+) -> ObservedKubernetesResource {
+    ObservedKubernetesResource {
+        sandbox_id,
+        resource_kind: RuntimeResourceKind::PersistentVolumeClaim,
+        namespace: "sandboxwich-ci".to_string(),
+        name,
+        uid: uid.to_string(),
+        resident_lease_id: None,
+        created_at: Some(created_at),
+        volume_claim_phase: phase,
+    }
+}
+
+#[test]
+fn stale_unbound_workspace_claims_are_reaped_and_every_other_claim_is_left_alone() {
+    // 2026-08-03: 2,772 Pending sandboxwich-pvc-* claims accumulated in the
+    // evalops-sandboxes namespace in three hours. Their sandbox rows still
+    // existed, so `sandbox_ids` classified every one of them Indeterminate and
+    // nothing ever deleted them.
+    let now = Utc::now();
+    let leaked = SandboxId::new();
+    let bound_sandbox = SandboxId::new();
+    let provisioning = SandboxId::new();
+    let recorded = SandboxId::new();
+    let unknown_phase = SandboxId::new();
+    let inventory = ReconciliationInventory {
+        sandbox_ids: std::collections::HashSet::from([
+            leaked,
+            bound_sandbox,
+            provisioning,
+            recorded,
+            unknown_phase,
+        ]),
+        active_resident_lease_ids: std::collections::HashSet::new(),
+        resources: vec![ExpectedKubernetesResource {
+            sandbox_id: recorded,
+            resource_kind: RuntimeResourceKind::PersistentVolumeClaim,
+            namespace: "sandboxwich-ci".to_string(),
+            name: format!("sandboxwich-pvc-{recorded}"),
+            uid: "uid-recorded".to_string(),
+            expires_at: None,
+        }],
+    };
+    let observed = vec![
+        observed_claim(
+            Some(leaked),
+            format!("sandboxwich-pvc-{leaked}"),
+            "uid-leaked",
+            Some(VolumeClaimPhase::Pending),
+            now - chrono::Duration::hours(2),
+        ),
+        observed_claim(
+            Some(bound_sandbox),
+            format!("sandboxwich-pvc-{bound_sandbox}"),
+            "uid-bound",
+            Some(VolumeClaimPhase::Bound),
+            now - chrono::Duration::hours(2),
+        ),
+        observed_claim(
+            Some(provisioning),
+            format!("sandboxwich-pvc-{provisioning}"),
+            "uid-provisioning",
+            Some(VolumeClaimPhase::Pending),
+            now - chrono::Duration::minutes(2),
+        ),
+        observed_claim(
+            Some(recorded),
+            format!("sandboxwich-pvc-{recorded}"),
+            "uid-recorded",
+            Some(VolumeClaimPhase::Pending),
+            now - chrono::Duration::hours(2),
+        ),
+        observed_claim(
+            Some(unknown_phase),
+            format!("sandboxwich-pvc-{unknown_phase}"),
+            "uid-unknown-phase",
+            None,
+            now - chrono::Duration::hours(2),
+        ),
+        observed_claim(
+            None,
+            format!("sandboxwich-home-{}", HomeId::new()),
+            "uid-home",
+            Some(VolumeClaimPhase::Pending),
+            now - chrono::Duration::hours(2),
+        ),
+    ];
+
+    let decisions = classify_reconciliation(
+        &inventory,
+        &observed,
+        &std::collections::HashMap::new(),
+        now,
+    );
+
+    assert_eq!(
+        decisions[0].classification,
+        ReconciliationClassification::Orphaned,
+        "a never-bound workspace claim older than the TTL with no control-plane record is residue"
+    );
+    assert!(decisions[0].delete_allowed);
+    assert_eq!(
+        decisions[1].classification,
+        ReconciliationClassification::Indeterminate,
+        "a Bound claim holds workspace data and is never reaped by the backstop"
+    );
+    assert!(!decisions[1].delete_allowed);
+    assert_eq!(
+        decisions[2].classification,
+        ReconciliationClassification::Indeterminate,
+        "a claim staged minutes ago belongs to a provision still in flight"
+    );
+    assert!(!decisions[2].delete_allowed);
+    assert_eq!(
+        decisions[3].classification,
+        ReconciliationClassification::Expected,
+        "a claim the control plane recorded stays on the archived-cleanup path"
+    );
+    assert!(!decisions[3].delete_allowed);
+    assert_eq!(
+        decisions[4].classification,
+        ReconciliationClassification::Indeterminate,
+        "an unreported phase must fail closed rather than be assumed Pending"
+    );
+    assert!(!decisions[4].delete_allowed);
+    assert_eq!(
+        decisions[5].classification,
+        ReconciliationClassification::Indeterminate,
+        "managed home claims outlive their runtimes and are out of scope"
+    );
+    assert!(!decisions[5].delete_allowed);
+}
+
+#[test]
+fn reconciliation_discovery_reads_claim_phase_from_kubectl() {
+    let dir = std::env::temp_dir().join(format!("sandboxwich-claim-phase-{}", SandboxId::new()));
+    std::fs::create_dir_all(&dir).expect("create claim phase fake dir");
+    let log_path = dir.join("log.txt");
+    let script_path = dir.join("kubectl");
+    let leaked = SandboxId::new();
+    let bound = SandboxId::new();
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "{log}"
+case " $* " in
+  *" get "*)
+    printf '%s\n' '{{"items":[{{"kind":"PersistentVolumeClaim","metadata":{{"namespace":"sandboxwich-ci","name":"sandboxwich-pvc-{leaked}","uid":"uid-leaked","creationTimestamp":"2020-01-01T00:00:00Z","labels":{{"sandboxwich.dev/sandbox-id":"{leaked}"}}}},"status":{{"phase":"Pending"}}}},{{"kind":"PersistentVolumeClaim","metadata":{{"namespace":"sandboxwich-ci","name":"sandboxwich-pvc-{bound}","uid":"uid-bound","creationTimestamp":"2020-01-01T00:00:00Z","labels":{{"sandboxwich.dev/sandbox-id":"{bound}"}}}},"status":{{"phase":"Bound"}}}}]}}'
+    ;;
+esac
+"#,
+        log = log_path.display(),
+    );
+    std::fs::write(&script_path, script).expect("write claim phase fake kubectl");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("stat claim phase fake kubectl")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).expect("chmod fake kubectl");
+    }
+    let provider = apply_provider_with_fake_kubectl(&script_path);
+    // Both sandbox rows are still live, which is exactly the state the leaked
+    // claims were discovered in; neither claim was ever recorded as a runtime
+    // resource.
+    let inventory = RuntimeResourceInventoryResponse {
+        ok: true,
+        provider: "kubernetes".to_string(),
+        cluster: Some("k3s-ci".to_string()),
+        namespace: "sandboxwich-ci".to_string(),
+        sandbox_ids: vec![leaked, bound],
+        complete: true,
+        resources: Vec::new(),
+        active_resident_lease_ids: Vec::new(),
+        next_cursor: None,
+    };
+    let outcome = provider
+        .reconcile_orphans(
+            Ok(inventory),
+            ReconciliationLimits {
+                max_scanned: 10,
+                max_deleted: 1,
+                max_elapsed: Duration::from_secs(5),
+            },
+            false,
+            &CancelSignal::never_cancelled(),
+        )
+        .expect("claim phase reconciliation");
+    assert_eq!(
+        outcome.decisions[0].classification,
+        ReconciliationClassification::Orphaned,
+        "the Pending claim is provisioning residue"
+    );
+    assert!(outcome.decisions[0].delete_allowed);
+    assert_eq!(
+        outcome.decisions[1].classification,
+        ReconciliationClassification::Indeterminate,
+        "the Bound claim must never be deleted by reconciliation"
+    );
+    assert!(!outcome.decisions[1].delete_allowed);
+    assert_eq!(
+        kubernetes_delete_path(
+            outcome.decisions[0]
+                .resource
+                .as_ref()
+                .expect("orphan decision carries its resource")
+        )
+        .expect("delete path"),
+        format!(
+            "/api/v1/namespaces/sandboxwich-ci/persistentvolumeclaims/sandboxwich-pvc-{leaked}"
+        )
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
