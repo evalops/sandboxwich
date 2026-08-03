@@ -3294,6 +3294,37 @@ impl KubernetesApplyProvider {
         home_id: Option<HomeId>,
         spec: &SandboxProvisionSpec,
         cancelled: &CancelSignal,
+        report: F,
+    ) -> anyhow::Result<ProviderSandboxHandle>
+    where
+        F: FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
+    {
+        let mut resources_applied = false;
+        match self.provision_staged_with_home_inner(
+            sandbox_id,
+            home_id,
+            spec,
+            cancelled,
+            &mut resources_applied,
+            report,
+        ) {
+            Ok(handle) => Ok(handle),
+            Err(error) => {
+                if resources_applied {
+                    self.rollback_applied_resources(sandbox_id, "staged provision");
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn provision_staged_with_home_inner<F>(
+        &self,
+        sandbox_id: SandboxId,
+        home_id: Option<HomeId>,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+        resources_applied: &mut bool,
         mut report: F,
     ) -> anyhow::Result<ProviderSandboxHandle>
     where
@@ -3384,10 +3415,18 @@ impl KubernetesApplyProvider {
                 |home_id| self.dry_run.home_pvc_manifest(home_id, &spec.memory_limit),
             );
             let workspace_identity = match home_id {
-                Some(home_id) => {
-                    self.apply_or_adopt_home_manifest(&workspace, home_id, cancelled)?
-                }
-                None => self.apply_or_adopt_manifest(&workspace, sandbox_id, cancelled)?,
+                Some(home_id) => self.apply_or_adopt_home_manifest(
+                    &workspace,
+                    home_id,
+                    cancelled,
+                    resources_applied,
+                )?,
+                None => self.apply_or_adopt_manifest(
+                    &workspace,
+                    sandbox_id,
+                    cancelled,
+                    resources_applied,
+                )?,
             };
             report(stage_update(
                 ProvisioningStage::WorkspaceReady,
@@ -3401,8 +3440,12 @@ impl KubernetesApplyProvider {
             .dry_run
             .egress_gateway_network_policy_manifest(sandbox_id, &spec.network_egress)?
         {
-            let policy_identity =
-                self.apply_or_adopt_manifest(&gateway_policy, sandbox_id, cancelled)?;
+            let policy_identity = self.apply_or_adopt_manifest(
+                &gateway_policy,
+                sandbox_id,
+                cancelled,
+                resources_applied,
+            )?;
             report(stage_update(
                 ProvisioningStage::NetworkPolicyReady,
                 Some(policy_identity),
@@ -3411,12 +3454,17 @@ impl KubernetesApplyProvider {
                 .dry_run
                 .egress_gateway_service_manifest(sandbox_id, &spec.network_egress)
                 .context("gateway service missing for host policy")?;
-            self.apply_or_adopt_manifest(&gateway_service, sandbox_id, cancelled)?;
+            self.apply_or_adopt_manifest(
+                &gateway_service,
+                sandbox_id,
+                cancelled,
+                resources_applied,
+            )?;
             let gateway_pod = self
                 .dry_run
                 .egress_gateway_pod_manifest(sandbox_id, &spec.network_egress)?
                 .context("gateway pod missing for host policy")?;
-            self.apply_or_adopt_manifest(&gateway_pod, sandbox_id, cancelled)?;
+            self.apply_or_adopt_manifest(&gateway_pod, sandbox_id, cancelled, resources_applied)?;
             let gateway_name = format!("sandboxwich-egress-gateway-{sandbox_id}");
             let wait = self.wait_for_named_pod_ready(&gateway_name, cancelled)?;
             if !wait.success {
@@ -3430,8 +3478,12 @@ impl KubernetesApplyProvider {
         let network_policy = self
             .dry_run
             .network_policy_manifest(sandbox_id, &spec.network_egress)?;
-        let network_identity =
-            self.apply_or_adopt_manifest(&network_policy, sandbox_id, cancelled)?;
+        let network_identity = self.apply_or_adopt_manifest(
+            &network_policy,
+            sandbox_id,
+            cancelled,
+            resources_applied,
+        )?;
         report(stage_update(
             ProvisioningStage::NetworkPolicyReady,
             Some(network_identity),
@@ -3442,7 +3494,8 @@ impl KubernetesApplyProvider {
         // The unstaged `provision` path gets this ordering from
         // `provision_manifests`; this staged path must apply it explicitly.
         if let Some(secret) = self.dry_run.guest_token_secret_manifest(sandbox_id) {
-            let secret_identity = self.apply_or_adopt_manifest(&secret, sandbox_id, cancelled)?;
+            let secret_identity =
+                self.apply_or_adopt_manifest(&secret, sandbox_id, cancelled, resources_applied)?;
             report(stage_update(
                 ProvisioningStage::CredentialsReady,
                 Some(secret_identity),
@@ -3458,7 +3511,8 @@ impl KubernetesApplyProvider {
                     .pod_manifest_with_home(sandbox_id, home_id, spec)
             },
         );
-        let pod_identity = self.apply_or_adopt_manifest(&pod, sandbox_id, cancelled)?;
+        let pod_identity =
+            self.apply_or_adopt_manifest(&pod, sandbox_id, cancelled, resources_applied)?;
         let wait = self.wait_for_pod_ready(sandbox_id, cancelled)?;
         if !wait.success {
             let context = "sandbox pod did not become ready";
@@ -3480,14 +3534,18 @@ impl KubernetesApplyProvider {
 
         let ssh_service = self.dry_run.ssh_service_manifest(sandbox_id);
         let ssh_service_identity =
-            self.apply_or_adopt_manifest(&ssh_service, sandbox_id, cancelled)?;
+            self.apply_or_adopt_manifest(&ssh_service, sandbox_id, cancelled, resources_applied)?;
         report(stage_update(
             ProvisioningStage::ServiceReady,
             Some(ssh_service_identity),
         ))?;
         let desktop_service = self.dry_run.desktop_service_manifest(sandbox_id);
-        let service_identity =
-            self.apply_or_adopt_manifest(&desktop_service, sandbox_id, cancelled)?;
+        let service_identity = self.apply_or_adopt_manifest(
+            &desktop_service,
+            sandbox_id,
+            cancelled,
+            resources_applied,
+        )?;
         report(stage_update(
             ProvisioningStage::ServiceReady,
             Some(service_identity),
@@ -3768,6 +3826,7 @@ impl KubernetesApplyProvider {
         manifest: &Value,
         sandbox_id: SandboxId,
         cancelled: &CancelSignal,
+        resources_applied: &mut bool,
     ) -> anyhow::Result<KubernetesResourceIdentity> {
         self.apply_or_adopt_manifest_with_identity(
             manifest,
@@ -3775,6 +3834,7 @@ impl KubernetesApplyProvider {
             &sandbox_id.to_string(),
             "sandbox",
             cancelled,
+            resources_applied,
         )
     }
 
@@ -3783,6 +3843,7 @@ impl KubernetesApplyProvider {
         manifest: &Value,
         home_id: HomeId,
         cancelled: &CancelSignal,
+        resources_applied: &mut bool,
     ) -> anyhow::Result<KubernetesResourceIdentity> {
         self.apply_or_adopt_manifest_with_identity(
             manifest,
@@ -3790,6 +3851,7 @@ impl KubernetesApplyProvider {
             &home_id.to_string(),
             "home",
             cancelled,
+            resources_applied,
         )
     }
 
@@ -3800,6 +3862,7 @@ impl KubernetesApplyProvider {
         identity_value: &str,
         identity_name: &str,
         cancelled: &CancelSignal,
+        resources_applied: &mut bool,
     ) -> anyhow::Result<KubernetesResourceIdentity> {
         let kind = manifest["kind"]
             .as_str()
@@ -3817,6 +3880,7 @@ impl KubernetesApplyProvider {
             return Ok(identity);
         }
 
+        *resources_applied = true;
         let apply = run_kubectl_documents(
             &self.kubectl,
             &self.kubectl_args("apply"),
