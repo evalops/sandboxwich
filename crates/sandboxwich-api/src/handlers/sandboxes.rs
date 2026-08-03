@@ -9,6 +9,7 @@ use crate::handlers::secrets::*;
 use crate::handlers::snapshots::*;
 use crate::pagination::*;
 use crate::reconcile::list_runtime_resources_for_sandbox;
+use crate::request_id::RequestTrace;
 use crate::rows::*;
 use crate::state::*;
 use crate::util::*;
@@ -213,9 +214,10 @@ pub(crate) fn looks_like_cidr(value: &str) -> bool {
 pub(crate) async fn create_sandbox(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
+    Extension(trace): Extension<RequestTrace>,
     Json(request): Json<CreateSandboxRequest>,
 ) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
-    create_sandbox_with_home(state, ctx, request, None).await
+    create_sandbox_with_home(state, ctx, request, None, trace).await
 }
 
 pub(crate) async fn create_sandbox_with_home(
@@ -223,8 +225,10 @@ pub(crate) async fn create_sandbox_with_home(
     ctx: TenantContext,
     request: CreateSandboxRequest,
     home_id: Option<HomeId>,
+    trace: RequestTrace,
 ) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
     let now = Utc::now();
+    let managed_home = home_id.is_some();
     let mut provision_spec = provision_spec_from_request(&request, None)?;
     provision_spec.secret_mounts =
         resolve_secret_mounts(&state.db, &ctx.tenant_id, &request.secret_ref_ids).await?;
@@ -285,6 +289,7 @@ pub(crate) async fn create_sandbox_with_home(
         updated_at: now,
         last_error: None,
     };
+    trace.add_to_payload(&mut job.payload);
     add_provision_spec_to_payload(&mut job, &sandbox, &provision_spec.secret_mounts)?;
     let mut tx = state.db.pool.begin().await?;
     insert_sandbox_on_connection(&state.db, &mut tx, &sandbox).await?;
@@ -321,6 +326,19 @@ pub(crate) async fn create_sandbox_with_home(
     .await?;
     insert_job_on_connection(&state.db, &mut tx, &job).await?;
     tx.commit().await?;
+
+    tracing::info!(
+        request_id = %trace.request_id,
+        trace_id = %trace.trace_id,
+        sandbox_id = %sandbox.id,
+        job_id = %job.id,
+        memory_limit = %sandbox.memory_limit,
+        network_egress = %sandbox.network_egress.mode().as_db_str(),
+        workspace_mode = %sandbox.workspace_mode.as_db_str(),
+        execution_class = %sandbox.execution_class.as_db_str(),
+        managed_home,
+        "sandbox_create_accepted"
+    );
 
     Ok((
         StatusCode::ACCEPTED,
@@ -494,6 +512,7 @@ pub(crate) async fn stop_sandbox_via_job(
     resident_bootstraps: &ResidentBootstrapStore,
     sandbox: &Sandbox,
     lifecycle_event_data: serde_json::Value,
+    trace: Option<RequestTrace>,
 ) -> Result<Option<Job>, ApiError> {
     let sandbox_id = sandbox.id;
     let delete_gke_fqdn_policy = list_runtime_resources_for_sandbox(db, sandbox_id)
@@ -524,6 +543,9 @@ pub(crate) async fn stop_sandbox_via_job(
         updated_at: now,
         last_error: None,
     };
+    if let Some(trace) = trace {
+        trace.add_to_payload(&mut job.payload);
+    }
     let secret_mounts = fetch_sandbox_secret_mounts(db, sandbox_id).await?;
     add_provision_spec_to_payload(&mut job, sandbox, &secret_mounts)?;
     let mut tx = db.pool.begin().await?;
@@ -663,16 +685,20 @@ pub(crate) async fn stop_sandbox_via_job(
 pub(crate) async fn stop_sandbox(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
+    Extension(trace): Extension<RequestTrace>,
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
     let sandbox_id = SandboxId(sandbox_id);
     let mut sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
     let now = Utc::now();
+    let request_id = trace.request_id.clone();
+    let trace_id = trace.trace_id.clone();
     let Some(job) = stop_sandbox_via_job(
         &state.db,
         &state.resident_bootstraps,
         &sandbox,
         json!({"state": SandboxState::Archiving, "reason": "stop_requested"}),
+        Some(trace),
     )
     .await?
     else {
@@ -684,6 +710,13 @@ pub(crate) async fn stop_sandbox(
     };
     sandbox.state = SandboxState::Archiving;
     sandbox.updated_at = now;
+    tracing::info!(
+        request_id = %request_id,
+        trace_id = %trace_id,
+        sandbox_id = %sandbox.id,
+        job_id = %job.id,
+        "sandbox_stop_accepted"
+    );
     Ok((
         StatusCode::ACCEPTED,
         Json(SandboxResponse {

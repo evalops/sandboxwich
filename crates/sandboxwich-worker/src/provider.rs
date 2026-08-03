@@ -279,6 +279,42 @@ fn kubectl_optional_resource_type_is_missing(stderr: &str) -> bool {
         || stderr.contains("the server does not have a resource type")
 }
 
+fn kubectl_failure_category(stderr: &str) -> &'static str {
+    let stderr = stderr.to_ascii_lowercase();
+    if stderr.contains("exceeded quota") {
+        "resource_quota"
+    } else if stderr.contains("insufficient cpu")
+        || stderr.contains("insufficient memory")
+        || stderr.contains("unschedulable")
+        || stderr.contains("unbound immediate persistentvolumeclaims")
+    {
+        "scheduling_capacity"
+    } else if stderr.contains("forbidden")
+        || stderr.contains("admission")
+        || stderr.contains("denied")
+        || stderr.contains("unauthorized")
+    {
+        "policy_denied"
+    } else if stderr.contains("invalid")
+        || stderr.contains("immutable")
+        || stderr.contains("required value")
+    {
+        "kubernetes_contract"
+    } else {
+        "provider_transient"
+    }
+}
+
+fn optional_resource_kind(args: &[String]) -> &'static str {
+    if args.iter().any(|arg| arg == GKE_FQDN_RESOURCE_KIND) {
+        GKE_FQDN_RESOURCE_KIND
+    } else if args.iter().any(|arg| arg == CILIUM_FQDN_RESOURCE_KIND) {
+        CILIUM_FQDN_RESOURCE_KIND
+    } else {
+        "optional"
+    }
+}
+
 /// Cheaply cloneable signal a job's background lease-renewal task (see
 /// `handle_lease` in `main.rs`) uses to tell an in-flight `exec_handoff` call
 /// that the lease is gone -- renewal failed after retries -- so the
@@ -3336,6 +3372,23 @@ impl KubernetesApplyProvider {
     where
         F: FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
     {
+        let span = tracing::info_span!(
+            "sandboxwich.provider.provision",
+            operation = "provision_staged",
+            sandbox_id = %sandbox_id,
+            managed_home = home_id.is_some(),
+            memory_limit = %spec.memory_limit,
+            workspace_mode = %spec.workspace_mode.as_db_str(),
+            execution_class = %spec.execution_class.as_db_str(),
+            runtime_profile = %spec.runtime_profile.as_db_str(),
+            network_egress = %spec.network_egress.mode().as_db_str(),
+            duration_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+            error_code = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let started = Instant::now();
+        tracing::info!(sandbox_id = %sandbox_id, "sandboxwich_provision_started");
         let mut resources_applied = false;
         // Whether the failure came out of the caller's stage-update callback
         // (the control plane) rather than out of kubectl. A rejected stage
@@ -3358,8 +3411,25 @@ impl KubernetesApplyProvider {
             &mut resources_applied,
             &mut guarded_report,
         ) {
-            Ok(handle) => Ok(handle),
+            Ok(handle) => {
+                span.record("duration_ms", started.elapsed().as_millis() as u64);
+                span.record("outcome", "success");
+                tracing::info!(
+                    sandbox_id = %sandbox_id,
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    "sandboxwich_provision_completed"
+                );
+                Ok(handle)
+            }
             Err(error) => {
+                let error_code = error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<ProviderError>())
+                    .map(|error| error.reason_code())
+                    .unwrap_or("provider_error");
+                span.record("duration_ms", started.elapsed().as_millis() as u64);
+                span.record("outcome", "error");
+                span.record("error_code", error_code);
                 // Never roll back an attempt that was cancelled. For a
                 // ProvisionSandbox/ForkSandbox lease the only reachable
                 // cancellation is `LeaseCancellationReason::LeaseLost`, raised
@@ -3392,6 +3462,15 @@ impl KubernetesApplyProvider {
                 if resources_applied && !cancelled.is_cancelled() && !report_rejected.get() {
                     self.rollback_applied_resources(sandbox_id, "staged provision");
                 }
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error_code,
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    resources_applied,
+                    cancelled = cancelled.is_cancelled(),
+                    report_rejected = report_rejected.get(),
+                    "sandboxwich_provision_failed"
+                );
                 Err(error)
             }
         }
@@ -4561,6 +4640,8 @@ impl KubernetesApplyProvider {
     /// could delete anything) and turn a best-effort cleanup into a guaranteed
     /// leak.
     fn rollback_applied_resources(&self, sandbox_id: SandboxId, context: &'static str) {
+        let started = Instant::now();
+        tracing::info!(sandbox_id = %sandbox_id, context, "sandboxwich_cleanup_started");
         let args = self.teardown_args(sandbox_id);
         match run_kubectl_command(
             &self.kubectl,
@@ -4575,13 +4656,29 @@ impl KubernetesApplyProvider {
                     "sandboxwich-worker: rolled back resources for sandbox {sandbox_id} after \
                      failed {context}"
                 );
+                tracing::info!(
+                    sandbox_id = %sandbox_id,
+                    context,
+                    resource_group = SANDBOX_TEARDOWN_RESOURCE_KINDS,
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    "sandboxwich_cleanup_core_completed"
+                );
             }
             Ok(output) => {
+                let error_category = kubectl_failure_category(&output.stderr);
                 eprintln!(
                     "warning: rollback of sandbox {sandbox_id} resources after failed {context} \
                      itself failed with {}: {} (resources may be leaked; original error is not \
                      masked by this)",
                     output.status, output.stderr
+                );
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    context,
+                    resource_group = SANDBOX_TEARDOWN_RESOURCE_KINDS,
+                    error_category,
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    "sandboxwich_cleanup_core_failed"
                 );
             }
             Err(error) => {
@@ -4590,9 +4687,18 @@ impl KubernetesApplyProvider {
                      could not run kubectl: {error:#} (resources may be leaked; original error is \
                      not masked by this)"
                 );
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    context,
+                    resource_group = SANDBOX_TEARDOWN_RESOURCE_KINDS,
+                    error_category = "worker_command_error",
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    "sandboxwich_cleanup_core_failed"
+                );
             }
         }
         for args in self.optional_teardown_args(sandbox_id, &SandboxTeardownSpec::default()) {
+            let resource_kind = optional_resource_kind(&args);
             match run_kubectl_command(
                 &self.kubectl,
                 &args,
@@ -4601,15 +4707,41 @@ impl KubernetesApplyProvider {
                 None,
                 self.max_captured_output_bytes,
             ) {
-                Ok(output)
-                    if output.success
-                        || kubectl_optional_resource_type_is_missing(&output.stderr) => {}
+                Ok(output) if output.success => {
+                    tracing::info!(
+                        sandbox_id = %sandbox_id,
+                        context,
+                        resource_kind,
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        "sandboxwich_cleanup_optional_completed"
+                    );
+                }
+                Ok(output) if kubectl_optional_resource_type_is_missing(&output.stderr) => {
+                    tracing::info!(
+                        sandbox_id = %sandbox_id,
+                        context,
+                        resource_kind,
+                        reason = "resource_type_missing",
+                        nonfatal = true,
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        "sandboxwich_cleanup_optional_skipped"
+                    );
+                }
                 Ok(output) => {
+                    let error_category = kubectl_failure_category(&output.stderr);
                     eprintln!(
                         "warning: rollback of optional sandbox {sandbox_id} resources after failed \
                          {context} itself failed with {}: {} (resources may be leaked; original \
                          error is not masked by this)",
                         output.status, output.stderr
+                    );
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        context,
+                        resource_kind,
+                        error_category,
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        "sandboxwich_cleanup_optional_failed"
                     );
                 }
                 Err(error) => {
@@ -4617,6 +4749,14 @@ impl KubernetesApplyProvider {
                         "warning: rollback of optional sandbox {sandbox_id} resources after failed \
                          {context} could not run kubectl: {error:#} (resources may be leaked; \
                          original error is not masked by this)"
+                    );
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        context,
+                        resource_kind,
+                        error_category = "worker_command_error",
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        "sandboxwich_cleanup_optional_failed"
                     );
                 }
             }
@@ -6272,6 +6412,21 @@ impl SandboxProvider for KubernetesApplyProvider {
         spec: &SandboxProvisionSpec,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<ProviderSandboxHandle> {
+        let span = tracing::info_span!(
+            "sandboxwich.provider.provision",
+            operation = "provision",
+            sandbox_id = %sandbox_id,
+            memory_limit = %spec.memory_limit,
+            workspace_mode = %spec.workspace_mode.as_db_str(),
+            execution_class = %spec.execution_class.as_db_str(),
+            runtime_profile = %spec.runtime_profile.as_db_str(),
+            network_egress = %spec.network_egress.mode().as_db_str(),
+            duration_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let started = Instant::now();
+        tracing::info!(sandbox_id = %sandbox_id, "sandboxwich_provision_started");
         self.dry_run
             .validate_network_policy_egress(&spec.network_egress)?;
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
@@ -6335,6 +6490,13 @@ impl SandboxProvider for KubernetesApplyProvider {
             metadata.insert("waitStatus".to_string(), json!(wait.status));
             metadata.insert("waitStdout".to_string(), json!(wait.stdout));
         }
+        span.record("duration_ms", started.elapsed().as_millis() as u64);
+        span.record("outcome", "success");
+        tracing::info!(
+            sandbox_id = %sandbox_id,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "sandboxwich_provision_completed"
+        );
         Ok(handle)
     }
 
@@ -6913,20 +7075,56 @@ impl SandboxProvider for KubernetesApplyProvider {
         spec: &SandboxTeardownSpec,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<()> {
+        let span = tracing::info_span!(
+            "sandboxwich.provider.cleanup",
+            operation = "stop",
+            sandbox_id = %sandbox_id,
+            delete_gke_fqdn_policy = spec.delete_gke_fqdn_policy,
+            duration_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+            error_category = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let started = Instant::now();
+        tracing::info!(sandbox_id = %sandbox_id, "sandboxwich_cleanup_started");
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
         // Built-in resources must be deleted separately from optional CRDs.
         // `kubectl delete a,b` aborts the whole request if either API kind is
         // undiscoverable, even with `--ignore-not-found`.
         let args = self.teardown_args(sandbox_id);
-        let output = run_kubectl_command(
+        let output = match run_kubectl_command(
             &self.kubectl,
             &args,
             "delete sandbox resources",
             self.kubectl_command_timeout,
             Some(cancelled),
             self.max_captured_output_bytes,
-        )?;
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                span.record("duration_ms", started.elapsed().as_millis() as u64);
+                span.record("outcome", "error");
+                span.record("error_category", "worker_command_error");
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error_category = "worker_command_error",
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    "sandboxwich_cleanup_failed"
+                );
+                return Err(error);
+            }
+        };
         if !output.success {
+            let error_category = kubectl_failure_category(&output.stderr);
+            span.record("duration_ms", started.elapsed().as_millis() as u64);
+            span.record("outcome", "error");
+            span.record("error_category", error_category);
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                error_category,
+                duration_ms = started.elapsed().as_millis() as u64,
+                "sandboxwich_cleanup_failed"
+            );
             bail!(
                 "kubectl delete sandbox resources failed with {}: {}",
                 output.status,
@@ -6934,15 +7132,58 @@ impl SandboxProvider for KubernetesApplyProvider {
             );
         }
         for args in self.optional_teardown_args(sandbox_id, spec) {
-            let output = run_kubectl_command(
+            let resource_kind = optional_resource_kind(&args);
+            let output = match run_kubectl_command(
                 &self.kubectl,
                 &args,
                 "delete optional sandbox resources",
                 self.kubectl_command_timeout,
                 Some(cancelled),
                 self.max_captured_output_bytes,
-            )?;
-            if !output.success && !kubectl_optional_resource_type_is_missing(&output.stderr) {
+            ) {
+                Ok(output) => output,
+                Err(error) => {
+                    span.record("duration_ms", started.elapsed().as_millis() as u64);
+                    span.record("outcome", "error");
+                    span.record("error_category", "worker_command_error");
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        resource_kind,
+                        error_category = "worker_command_error",
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        "sandboxwich_cleanup_optional_failed"
+                    );
+                    return Err(error);
+                }
+            };
+            if output.success {
+                tracing::info!(
+                    sandbox_id = %sandbox_id,
+                    resource_kind,
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    "sandboxwich_cleanup_optional_completed"
+                );
+            } else if kubectl_optional_resource_type_is_missing(&output.stderr) {
+                tracing::info!(
+                    sandbox_id = %sandbox_id,
+                    resource_kind,
+                    reason = "resource_type_missing",
+                    nonfatal = true,
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    "sandboxwich_cleanup_optional_skipped"
+                );
+            } else {
+                let error_category = kubectl_failure_category(&output.stderr);
+                span.record("duration_ms", started.elapsed().as_millis() as u64);
+                span.record("outcome", "error");
+                span.record("error_category", error_category);
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    resource_kind,
+                    error_category,
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    "sandboxwich_cleanup_optional_failed"
+                );
                 bail!(
                     "kubectl delete optional sandbox resources failed with {}: {}",
                     output.status,
@@ -6950,6 +7191,13 @@ impl SandboxProvider for KubernetesApplyProvider {
                 );
             }
         }
+        span.record("duration_ms", started.elapsed().as_millis() as u64);
+        span.record("outcome", "success");
+        tracing::info!(
+            sandbox_id = %sandbox_id,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "sandboxwich_cleanup_completed"
+        );
         Ok(())
     }
 
