@@ -834,6 +834,12 @@ impl SandboxProvider for RuntimeProvider {
     }
 }
 
+fn orphan_reconciliation_success_line(scanned: usize, deleted: usize, apply: bool) -> String {
+    format!(
+        "worker: orphan reconciliation completed scanned={scanned} deleted={deleted} apply={apply}"
+    )
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -2096,8 +2102,9 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
                 ))
             });
             match reconciliation {
-                Ok(Some((scanned, deleted, apply))) => eprintln!(
-                    "worker: orphan reconciliation completed scanned={scanned} deleted={deleted} apply={apply}"
+                Ok(Some((scanned, deleted, apply))) => println!(
+                    "{}",
+                    orphan_reconciliation_success_line(scanned, deleted, apply)
                 ),
                 Ok(None) => {}
                 Err(error) => eprintln!("error: orphan reconciliation failed closed: {error:#}"),
