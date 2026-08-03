@@ -3310,7 +3310,32 @@ impl KubernetesApplyProvider {
         ) {
             Ok(handle) => Ok(handle),
             Err(error) => {
-                if resources_applied {
+                // Never roll back an attempt that was cancelled. For a
+                // ProvisionSandbox/ForkSandbox lease the only reachable
+                // cancellation is `LeaseCancellationReason::LeaseLost`, raised
+                // by the renewal loop in `main.rs` when renewal fails after its
+                // retries -- the other three `cancel(...)` call sites are all
+                // resident-process paths, and only resident leases are handed
+                // an external `LeaseCancellation`. So a cancelled signal here
+                // means this worker can no longer prove it owns this sandbox,
+                // and the job may already have been re-queued and completed by
+                // another worker under the same sandbox id.
+                //
+                // `rollback_applied_resources` is a label-scoped
+                // `kubectl delete pod,persistentvolumeclaim,service,networkpolicy,secret
+                // -l sandboxwich.dev/sandbox-id=<id>` with no UID precondition,
+                // and it deliberately ignores the cancel signal so it can still
+                // run after cancellation. Rolling back here would therefore
+                // delete the new owner's live Pod, Services, NetworkPolicy,
+                // Secret and its *Bound* workspace claim -- destroying a running
+                // sandbox and its workspace data to clean up a claim that the
+                // new owner has, in the ordinary case, simply adopted.
+                //
+                // Skipping the rollback trades that for bounded residue: if no
+                // other worker takes the sandbox over, the claim is left Pending
+                // and unrecorded, which is exactly the shape
+                // `is_reapable_unbound_workspace_claim` reaps an hour later.
+                if resources_applied && !cancelled.is_cancelled() {
                     self.rollback_applied_resources(sandbox_id, "staged provision");
                 }
                 Err(error)

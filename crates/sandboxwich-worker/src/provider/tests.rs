@@ -5004,6 +5004,156 @@ esac
     );
 }
 
+/// Stateful fake kubectl that rejects the `kubectl apply` of one lowercase kind
+/// with `stderr`, mirroring how the API server rejects a Pod whose namespace
+/// ResourceQuota is exhausted.
+fn write_stateful_fake_kubectl_rejecting_apply(
+    rejected_kind: &str,
+    stderr: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("sandboxwich-quota-kubectl-{}", SandboxId::new()));
+    std::fs::create_dir_all(&dir).expect("create quota fake kubectl dir");
+    let log_path = dir.join("log.txt");
+    let script_path = dir.join("kubectl");
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "{log}"
+case " $* " in
+  *" get "*)
+    kind=''
+    name=''
+    previous=''
+    for arg in "$@"; do
+      if [ "$previous" = get ]; then kind="$arg"; previous=kind; continue; fi
+      if [ "$previous" = kind ]; then name="$arg"; break; fi
+      previous="$arg"
+    done
+    kind=$(printf '%s' "$kind" | tr '[:upper:]' '[:lower:]')
+    marker="{dir}/$kind-$name"
+    [ -f "$marker" ] || exit 0
+    python3 - "$marker" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    value = json.load(source)
+metadata = value.setdefault("metadata", {{}})
+metadata["uid"] = "uid-" + metadata["name"]
+metadata["generation"] = 1
+print(json.dumps(value))
+PY
+    ;;
+  *" apply "*)
+    payload=$(cat)
+    kind=$(printf '%s' "$payload" | sed -n 's/.*"kind": "\([^"]*\)".*/\1/p' | head -1 | tr '[:upper:]' '[:lower:]')
+    name=$(printf '%s' "$payload" | sed -n 's/.*"name": "\([^"]*\)".*/\1/p' | head -1)
+    if [ "$kind" = "{rejected_kind}" ]; then
+      printf '%s\n' '{stderr}' >&2
+      exit 1
+    fi
+    printf '%s' "$payload" > "{dir}/$kind-$name"
+    ;;
+  *" wait "*) ;;
+  *" delete "*) ;;
+esac
+"#,
+        log = log_path.display(),
+        dir = dir.display(),
+    );
+    std::fs::write(&script_path, script).expect("write quota fake kubectl");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("stat quota fake kubectl")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).expect("chmod quota fake kubectl");
+    }
+    (script_path, log_path)
+}
+
+const QUOTA_REJECTION_STDERR: &str = r#"Error from server (Forbidden): error when creating "STDIN": pods "sandboxwich-quota" is forbidden: exceeded quota: sandbox-capacity, used: pods=40, limited: pods=40"#;
+
+#[test]
+fn staged_provision_rolls_back_its_workspace_claim_when_the_pod_is_quota_rejected() {
+    // The 2026-08-03 leak in its original shape: the staged path applies the
+    // workspace PVC first and the namespace ResourceQuota then rejects the Pod.
+    let (kubectl, log_path) =
+        write_stateful_fake_kubectl_rejecting_apply("pod", QUOTA_REJECTION_STDERR);
+    let provider = apply_provider_with_fake_kubectl(&kubectl);
+    let sandbox_id = SandboxId::new();
+
+    let error = provider
+        .provision_staged(
+            sandbox_id,
+            &SandboxProvisionSpec::default(),
+            &CancelSignal::never_cancelled(),
+            |_| Ok(()),
+        )
+        .expect_err("a quota-rejected pod apply must fail the staged provision");
+    assert!(
+        error.to_string().contains("exceeded quota"),
+        "the original quota rejection must not be masked by the rollback: {error:#}"
+    );
+
+    let log = std::fs::read_to_string(&log_path).expect("read quota kubectl log");
+    assert!(
+        log.contains(&format!(
+            "delete pod,persistentvolumeclaim,service,networkpolicy,secret -l sandboxwich.dev/sandbox-id={sandbox_id}"
+        )),
+        "the staged claim must be deleted in the same failure path: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+#[test]
+fn staged_provision_does_not_roll_back_after_its_lease_is_lost() {
+    // For a ProvisionSandbox lease the only reachable cancellation is
+    // LeaseCancellationReason::LeaseLost, and main.rs cancels precisely so the
+    // job stops instead of continuing against a lease it can no longer prove is
+    // its own -- the job may already have been re-queued and completed by
+    // another worker. rollback_applied_resources is a label-scoped delete with
+    // no UID precondition that deliberately ignores the cancel signal, so
+    // rolling back here would delete the new owner's live Pod, Services and
+    // Bound workspace claim.
+    let (kubectl, log_path) =
+        write_stateful_fake_kubectl_rejecting_apply("pod", QUOTA_REJECTION_STDERR);
+    let provider = apply_provider_with_fake_kubectl(&kubectl);
+    let sandbox_id = SandboxId::new();
+    let cancelled = CancelSignal::new();
+    let lease_lost = cancelled.clone();
+
+    provider
+        .provision_staged(
+            sandbox_id,
+            &SandboxProvisionSpec::default(),
+            &cancelled,
+            |report| {
+                // The workspace claim is applied by the time this fires, so the
+                // rollback guard -- not an empty apply set -- is what is under
+                // test here.
+                if report.stage == sandboxwich_core::ProvisioningStage::WorkspaceReady {
+                    lease_lost.cancel();
+                }
+                Ok(())
+            },
+        )
+        .expect_err("a cancelled staged provision must fail");
+
+    let log = std::fs::read_to_string(&log_path).expect("read cancelled kubectl log");
+    assert!(
+        log.contains(" apply "),
+        "the workspace claim must have been applied before the lease was lost: {log}"
+    );
+    assert!(
+        !log.contains(" delete "),
+        "a worker that lost its lease must not delete the new owner's resources: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
 /// Builds an observed claim for the unbound-workspace-claim backstop cases.
 fn observed_claim(
     sandbox_id: Option<SandboxId>,
