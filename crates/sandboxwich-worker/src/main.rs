@@ -1701,6 +1701,20 @@ fn is_resident_desired_stop(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Extract the stable API error code for structured resident-process traces.
+/// Keep the full response body out of fields so a future API error cannot leak
+/// bootstrap material or other unbounded request data into Cloud Logging.
+fn worker_request_error_code(error: &anyhow::Error) -> Option<String> {
+    error.chain().find_map(|cause| {
+        let WorkerRequestError::Status { body, .. } = cause.downcast_ref()? else {
+            return None;
+        };
+        serde_json::from_str::<ErrorEnvelope>(body)
+            .ok()
+            .map(|envelope| envelope.code)
+    })
+}
+
 fn is_retryable_worker_request(error: &anyhow::Error) -> bool {
     error
         .chain()
@@ -2965,13 +2979,15 @@ async fn report_resident_observation(
     lease_id: sandboxwich_core::LeaseId,
     observation: IsolatedResidentProcessObservation,
 ) -> anyhow::Result<()> {
-    let observed_state = match observation.state {
+    let observed_state = match &observation.state {
         IsolatedResidentProcessState::Starting => ResidentProcessObservedState::Starting,
         IsolatedResidentProcessState::Running => ResidentProcessObservedState::Running,
         IsolatedResidentProcessState::Succeeded => ResidentProcessObservedState::Stopped,
         IsolatedResidentProcessState::Failed => ResidentProcessObservedState::Failed,
     };
-    with_retries(
+    let observed_state_label = observed_state.as_db_str();
+    let started = Instant::now();
+    let result = with_retries(
         "report resident-process observation",
         API_RETRY_ATTEMPTS,
         || async {
@@ -2995,8 +3011,32 @@ async fn report_resident_observation(
             decode_json::<sandboxwich_core::ResidentProcessResponse>(response).await
         },
     )
-    .await?;
-    Ok(())
+    .await;
+    match &result {
+        Ok(_) => tracing::debug!(
+            process_id = %process_id,
+            generation,
+            lease_id = %lease_id.0,
+            observed_state = observed_state_label,
+            provider_pod_name = ?observation.pod_name,
+            provider_pod_uid = ?observation.pod_uid,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "sandboxwich_resident_observation_reported"
+        ),
+        Err(error) => tracing::warn!(
+            process_id = %process_id,
+            generation,
+            lease_id = %lease_id.0,
+            observed_state = observed_state_label,
+            provider_pod_name = ?observation.pod_name,
+            provider_pod_uid = ?observation.pod_uid,
+            error_code = ?worker_request_error_code(error),
+            duration_ms = started.elapsed().as_millis() as u64,
+            error = %error,
+            "sandboxwich_resident_observation_rejected"
+        ),
+    }
+    result.map(|_| ())
 }
 
 async fn report_desired_stop_resident_observation(

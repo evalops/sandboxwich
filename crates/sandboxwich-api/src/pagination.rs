@@ -93,18 +93,32 @@ pub(crate) async fn fetch_keyset_page<T>(
     cursor: &Option<(PageDirection, PageCursor)>,
     row_map: impl Fn(AnyRow) -> Result<T, ApiError>,
 ) -> Result<(Vec<T>, Option<String>), ApiError> {
-    let next_placeholder = db.placeholder(fixed_binds.len() + 1);
+    // Keep the cursor predicate sargable.  Concatenating the two key columns
+    // (`created_at || '|' || id`) forces PostgreSQL to materialize and sort all
+    // matching rows before it can apply the page boundary.  Comparing the
+    // tuple components independently lets composite indexes seek directly to
+    // the next page while preserving the exact same ordering semantics.
+    let first_cursor_placeholder = db.placeholder(fixed_binds.len() + 1);
+    let second_cursor_placeholder = db.placeholder(fixed_binds.len() + 2);
     let (predicate, order_dir, cursor_bind) = match cursor {
         None => (String::new(), "asc", None),
         Some((PageDirection::After, c)) => (
-            format!(" and (created_at || '{PAGE_CURSOR_SEP}' || id) > {next_placeholder}"),
+            format!(
+                " and (created_at > {first_cursor_placeholder}
+                       or (created_at = {first_cursor_placeholder}
+                           and id > {second_cursor_placeholder}))"
+            ),
             "asc",
-            Some(format!("{}{PAGE_CURSOR_SEP}{}", c.created_at, c.id)),
+            Some((&c.created_at, &c.id)),
         ),
         Some((PageDirection::Before, c)) => (
-            format!(" and (created_at || '{PAGE_CURSOR_SEP}' || id) < {next_placeholder}"),
+            format!(
+                " and (created_at < {first_cursor_placeholder}
+                       or (created_at = {first_cursor_placeholder}
+                           and id < {second_cursor_placeholder}))"
+            ),
             "desc",
-            Some(format!("{}{PAGE_CURSOR_SEP}{}", c.created_at, c.id)),
+            Some((&c.created_at, &c.id)),
         ),
     };
 
@@ -118,8 +132,8 @@ pub(crate) async fn fetch_keyset_page<T>(
     for bind in fixed_binds {
         query = query.bind(bind.clone());
     }
-    if let Some(bind) = cursor_bind {
-        query = query.bind(bind);
+    if let Some((created_at, id)) = cursor_bind {
+        query = query.bind(created_at).bind(id);
     }
 
     let mut rows = query.fetch_all(&db.pool).await?;
