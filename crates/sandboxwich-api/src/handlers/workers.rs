@@ -13,6 +13,7 @@ use sandboxwich_core::*;
 use serde_json::json;
 use sqlx::AnyConnection;
 use sqlx::Row;
+use std::time::Instant;
 use uuid::Uuid;
 
 #[derive(Debug, serde::Deserialize)]
@@ -131,6 +132,7 @@ pub(crate) async fn runtime_resource_inventory(
     active_resident_lease_ids.truncate(200);
     let mut fixed_binds = scope_worker_ids;
     fixed_binds.push(query.namespace.clone());
+    let inventory_started = Instant::now();
     let (resources, next_cursor) =
         fetch_keyset_page(&state.db, &sql, &fixed_binds, limit, &cursor, |row| {
             let created_at: String = row.try_get("sandbox_created_at")?;
@@ -161,6 +163,30 @@ pub(crate) async fn runtime_resource_inventory(
             })
         })
         .await?;
+    let inventory_duration_ms = inventory_started.elapsed().as_millis() as u64;
+    if inventory_duration_ms >= 500 {
+        tracing::warn!(
+            worker_id = %worker_id.0,
+            namespace = %query.namespace,
+            scope_workers = fixed_binds.len().saturating_sub(1),
+            page_limit = limit,
+            cursor_present = cursor.is_some(),
+            rows_returned = resources.len(),
+            duration_ms = inventory_duration_ms,
+            "sandboxwich_runtime_inventory_slow"
+        );
+    } else {
+        tracing::debug!(
+            worker_id = %worker_id.0,
+            namespace = %query.namespace,
+            scope_workers = fixed_binds.len().saturating_sub(1),
+            page_limit = limit,
+            cursor_present = cursor.is_some(),
+            rows_returned = resources.len(),
+            duration_ms = inventory_duration_ms,
+            "sandboxwich_runtime_inventory_completed"
+        );
+    }
     Ok(Json(RuntimeResourceInventoryResponse {
         ok: true,
         provider: worker.provider,

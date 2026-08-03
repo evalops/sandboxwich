@@ -5,6 +5,7 @@ use crate::rows::parse_timestamp;
 use chrono::{DateTime, Utc};
 use sqlx::Row;
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 const LATENCY_BUCKETS: &[f64] = &[1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 900.0];
 #[derive(Clone)]
@@ -164,7 +165,24 @@ async fn fetch_stage_observations(
          where 1 = 1{filter}
          order by o.lease_id, o.observed_at, o.stage_index"
     );
+    let started = Instant::now();
     let rows = fetch_rows(db, &sql, tenant_id).await?;
+    let duration_ms = started.elapsed().as_millis() as u64;
+    if duration_ms >= 500 {
+        tracing::warn!(
+            tenant_id = tenant_id.unwrap_or("operator"),
+            rows_returned = rows.len(),
+            duration_ms,
+            "sandboxwich_provisioning_stage_metrics_slow"
+        );
+    } else {
+        tracing::debug!(
+            tenant_id = tenant_id.unwrap_or("operator"),
+            rows_returned = rows.len(),
+            duration_ms,
+            "sandboxwich_provisioning_stage_metrics_completed"
+        );
+    }
     let mut previous = BTreeMap::<String, DateTime<Utc>>::new();
     let mut observations = Vec::with_capacity(rows.len());
     for row in rows {
