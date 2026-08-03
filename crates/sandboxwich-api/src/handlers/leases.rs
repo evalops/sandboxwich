@@ -2296,24 +2296,36 @@ pub(crate) async fn apply_completed_job_on_connection(
             )
             .await?;
             if !transitioned && !handle.resources.is_empty() {
-                let current = fetch_sandbox_on_connection(db, connection, sandbox_id).await?;
-                if matches!(
-                    current.state,
-                    SandboxState::Archiving | SandboxState::Archived
-                ) {
-                    // The provider has already created durable resources, but
-                    // the lifecycle CAS lost to stop/archive. Keep those
-                    // resources visible and enqueue label-scoped teardown in
-                    // this same transaction; otherwise a late completion can
-                    // strand a Pod/PVC after the sandbox is gone.
-                    enqueue_archived_runtime_cleanup_on_connection(
-                        db,
-                        connection,
-                        &current,
-                        Some(&job.payload),
-                        "late_provision_completion",
-                    )
-                    .await?;
+                match fetch_sandbox_on_connection(db, connection, sandbox_id).await {
+                    Ok(current)
+                        if matches!(
+                            current.state,
+                            SandboxState::Archiving | SandboxState::Archived
+                        ) =>
+                    {
+                        // The provider has already created durable resources, but
+                        // the lifecycle CAS lost to stop/archive. Keep those
+                        // resources visible and enqueue label-scoped teardown in
+                        // this same transaction; otherwise a late completion can
+                        // strand a Pod/PVC after the sandbox is gone.
+                        enqueue_archived_runtime_cleanup_on_connection(
+                            db,
+                            connection,
+                            &current,
+                            Some(&job.payload),
+                            "late_provision_completion",
+                        )
+                        .await?;
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.status == axum::http::StatusCode::NOT_FOUND => {
+                        // Retention cleanup may have removed the sandbox after
+                        // the provider accepted this late completion. There is
+                        // no durable lifecycle row left to mutate; treating the
+                        // completion as already retired keeps an otherwise
+                        // successful provider call from retrying forever.
+                    }
+                    Err(error) => return Err(error),
                 }
             }
         }
@@ -2340,11 +2352,14 @@ pub(crate) async fn apply_completed_job_on_connection(
             let retire_runtime_resources = if transitioned {
                 true
             } else {
-                let current = fetch_sandbox_on_connection(db, connection, sandbox_id).await?;
-                matches!(
-                    current.state,
-                    SandboxState::Archiving | SandboxState::Archived
-                )
+                match fetch_sandbox_on_connection(db, connection, sandbox_id).await {
+                    Ok(current) => matches!(
+                        current.state,
+                        SandboxState::Archiving | SandboxState::Archived
+                    ),
+                    Err(error) if error.status == axum::http::StatusCode::NOT_FOUND => false,
+                    Err(error) => return Err(error),
+                }
             };
             if retire_runtime_resources {
                 mark_runtime_resources_deleted_for_sandbox_on_connection(

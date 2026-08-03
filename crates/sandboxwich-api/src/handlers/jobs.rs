@@ -551,9 +551,9 @@ pub(crate) async fn insert_job_on_connection_if_absent(
         "insert into jobs
          (id, tenant_id, kind, status, payload, required_capability, required_execution_class, priority, attempts, max_attempts,
           scheduled_at, created_at, updated_at, last_error, sandbox_id, command_id, snapshot_id,
-          parent_sandbox_id, child_sandbox_id, prompt_event_id)
+          parent_sandbox_id, child_sandbox_id, prompt_event_id, archived_runtime_cleanup)
          values ({}) on conflict do nothing",
-        db.placeholders(20)
+        db.placeholders(21)
     );
     let result = sqlx::query(&sql)
         .bind(job.id.to_string())
@@ -576,6 +576,7 @@ pub(crate) async fn insert_job_on_connection_if_absent(
         .bind(references.parent_sandbox_id.map(|id| id.to_string()))
         .bind(references.child_sandbox_id.map(|id| id.to_string()))
         .bind(references.prompt_event_id.map(|id| id.to_string()))
+        .bind(true)
         .execute(&mut *connection)
         .await?;
     Ok(result.rows_affected() == 1)
@@ -594,21 +595,17 @@ pub(crate) async fn enqueue_archived_runtime_cleanup_on_connection(
     source_payload: Option<&serde_json::Value>,
     reason: &str,
 ) -> Result<bool, ApiError> {
-    let marker = format!("%\"{ARCHIVED_RUNTIME_CLEANUP_MARKER}\":true%");
     let existing_sql = format!(
         "select 1
          from jobs
          where sandbox_id = {} and kind = {} and status in ('queued', 'leased')
-           and payload like {}
          limit 1",
         db.placeholder(1),
-        db.placeholder(2),
-        db.placeholder(3)
+        db.placeholder(2)
     );
     if sqlx::query(&existing_sql)
         .bind(sandbox.id.to_string())
         .bind(job_kind_to_str(&JobKind::StopSandbox))
-        .bind(&marker)
         .fetch_optional(&mut *connection)
         .await?
         .is_some()

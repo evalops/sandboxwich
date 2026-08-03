@@ -85,8 +85,18 @@ pub(crate) async fn reconcile_archived_runtime_resources(db: &Database) -> Resul
                 }
             }
             Err(error) => {
-                tx.rollback().await?;
-                return Err(error);
+                if let Err(rollback_error) = tx.rollback().await {
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        %rollback_error,
+                        "failed to roll back archived runtime reconciliation"
+                    );
+                }
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    ?error,
+                    "archived runtime reconciliation skipped one sandbox"
+                );
             }
         }
     }
@@ -341,9 +351,9 @@ pub(crate) async fn cleanup_archived_sandboxes(
         let cleaned = async {
             // A normal stop completion may already have retired these rows
             // before the archived record reaches its TTL. Include those
-            // durable tombstone-bearing records in the cleanup report as well
-            // as anything this transaction retires, so cleanup evidence does
-            // not regress just because teardown became more eagerly fenced.
+            // durable records in both the cleanup evidence and the tombstone
+            // input so retention cleanup remains an auditable finalization
+            // step even when provider teardown was eagerly fenced earlier.
             let mut deleted_resources =
                 list_runtime_resources_for_sandbox_on_connection(db, &mut tx, sandbox.id)
                     .await?
@@ -366,7 +376,9 @@ pub(crate) async fn cleanup_archived_sandboxes(
                 "archived sandbox deleted during cleanup",
             )
             .await?;
-            for resource in &newly_deleted {
+            let mut resources_to_tombstone = deleted_resources.clone();
+            resources_to_tombstone.extend(newly_deleted.iter().cloned());
+            for resource in &resources_to_tombstone {
                 insert_runtime_resource_tombstone_on_connection(db, &mut tx, resource, now).await?;
             }
             deleted_resources.extend(newly_deleted);

@@ -2645,7 +2645,7 @@ async fn late_provision_completion_persists_resources_and_queues_idempotent_tear
     let cleanup_count: i64 = sqlx::query(
         "select count(*) as count from jobs
          where sandbox_id = ? and kind = 'stop_sandbox'
-           and payload like '%\"archivedRuntimeCleanup\":true%'",
+           and archived_runtime_cleanup = true",
     )
     .bind(sandbox.id.to_string())
     .fetch_one(&db.pool)
@@ -2809,6 +2809,105 @@ async fn stale_stop_completion_cannot_retire_a_resumed_runtime_generation() {
 }
 
 #[tokio::test]
+async fn archived_cleanup_tombstones_resources_retired_before_retention() {
+    let db = test_sqlite_db().await;
+    let sandbox = seed_sandbox_with_state(&db, SandboxState::Archived).await;
+    sqlx::query("update sandboxes set ttl_seconds = 0, updated_at = ? where id = ?")
+        .bind((Utc::now() - chrono::Duration::seconds(5)).to_rfc3339())
+        .bind(sandbox.id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let resource = ProviderRuntimeResource {
+        sandbox_id: sandbox.id,
+        snapshot_id: None,
+        provider: "kubernetes".to_string(),
+        resource_kind: RuntimeResourceKind::Pod,
+        purpose: RuntimeResourcePurpose::Runtime,
+        resource_name: format!("sandboxwich-{sandbox_id}", sandbox_id = sandbox.id),
+        namespace: "evalops-sandboxes".to_string(),
+        status: RuntimeResourceStatus::Destroyed,
+        cluster: Some("evalops-gke".to_string()),
+        storage_class: None,
+        snapshot_class: None,
+        storage_size: None,
+        runtime_image: Some(sandbox.template.clone()),
+        service_port: None,
+        target_port: None,
+        source_snapshot_id: None,
+        ready_at: Some(Utc::now()),
+        error: Some("provider-confirmed sandbox stop".to_string()),
+    };
+    let mut connection = db.pool.acquire().await.unwrap();
+    upsert_provider_runtime_resources_on_connection(
+        &db,
+        &mut connection,
+        std::slice::from_ref(&resource),
+        &sandbox.tenant_id,
+    )
+    .await
+    .unwrap();
+    drop(connection);
+
+    let cleanup = cleanup_archived_sandboxes(&db).await.unwrap();
+    assert_eq!(cleanup.deleted.len(), 1);
+    assert_eq!(cleanup.runtime_resources_deleted.len(), 1);
+    assert_eq!(
+        cleanup.runtime_resources_deleted[0].resource_name, resource.resource_name,
+        "cleanup evidence retains the already-retired resource"
+    );
+    let tombstone_count: i64 = sqlx::query(
+        "select count(*) as count from runtime_resource_tombstones where resource_name = ?",
+    )
+    .bind(resource.resource_name)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap()
+    .try_get("count")
+    .unwrap();
+    assert_eq!(tombstone_count, 1);
+}
+
+#[tokio::test]
+async fn stop_completion_for_a_purged_sandbox_is_idempotently_acknowledged() {
+    let db = test_sqlite_db().await;
+    let sandbox = seed_sandbox_with_state(&db, SandboxState::Archived).await;
+    sqlx::query("delete from sandboxes where id = ?")
+        .bind(sandbox.id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let stop_job = Job {
+        id: JobId::new(),
+        tenant_id: sandbox.tenant_id,
+        kind: JobKind::StopSandbox,
+        status: JobStatus::Leased,
+        payload: json!({"sandboxId": sandbox.id}),
+        required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: sandbox.execution_class,
+        priority: 1000,
+        attempts: 1,
+        max_attempts: 5,
+        scheduled_at: Utc::now(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        last_error: None,
+    };
+    let mut connection = db.pool.acquire().await.unwrap();
+    apply_completed_job_on_connection(
+        &db,
+        &mut connection,
+        &stop_job,
+        WorkerJobResult::StopSandbox {
+            provider: "kubernetes".to_string(),
+            sandbox_id: sandbox.id,
+        },
+    )
+    .await
+    .expect("completion after retention purge must be acknowledged");
+}
+
+#[tokio::test]
 async fn archived_runtime_reconciliation_recovers_existing_leaks_without_duplicate_jobs() {
     let db = test_sqlite_db().await;
     let sandbox = seed_sandbox_with_state(&db, SandboxState::Archived).await;
@@ -2849,7 +2948,7 @@ async fn archived_runtime_reconciliation_recovers_existing_leaks_without_duplica
     let cleanup_count: i64 = sqlx::query(
         "select count(*) as count from jobs
          where sandbox_id = ? and kind = 'stop_sandbox'
-           and payload like '%\"archivedRuntimeCleanup\":true%'",
+           and archived_runtime_cleanup = true",
     )
     .bind(sandbox.id.to_string())
     .fetch_one(&db.pool)

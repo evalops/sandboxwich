@@ -42,8 +42,10 @@ pub(crate) fn spawn_expiry_sweeper(
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last_archived_runtime_reconciliation =
-            Instant::now() - ARCHIVED_RUNTIME_RECONCILIATION_INTERVAL;
+        let now = Instant::now();
+        let mut last_archived_runtime_reconciliation = now
+            .checked_sub(ARCHIVED_RUNTIME_RECONCILIATION_INTERVAL)
+            .unwrap_or(now);
         // The first tick fires immediately; that's fine, it just means the
         // first sweep runs right away instead of waiting a full interval.
         loop {
