@@ -3294,37 +3294,6 @@ impl KubernetesApplyProvider {
         home_id: Option<HomeId>,
         spec: &SandboxProvisionSpec,
         cancelled: &CancelSignal,
-        report: F,
-    ) -> anyhow::Result<ProviderSandboxHandle>
-    where
-        F: FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
-    {
-        let mut resources_applied = false;
-        match self.provision_staged_with_home_inner(
-            sandbox_id,
-            home_id,
-            spec,
-            cancelled,
-            &mut resources_applied,
-            report,
-        ) {
-            Ok(handle) => Ok(handle),
-            Err(error) => {
-                if resources_applied {
-                    self.rollback_applied_resources(sandbox_id, "staged provision");
-                }
-                Err(error)
-            }
-        }
-    }
-
-    fn provision_staged_with_home_inner<F>(
-        &self,
-        sandbox_id: SandboxId,
-        home_id: Option<HomeId>,
-        spec: &SandboxProvisionSpec,
-        cancelled: &CancelSignal,
-        resources_applied: &mut bool,
         mut report: F,
     ) -> anyhow::Result<ProviderSandboxHandle>
     where
@@ -3358,14 +3327,16 @@ impl KubernetesApplyProvider {
                 report_rejected.set(true);
             })
         };
+        let mut resources_applied = false;
         let result = self.provision_staged_resources(
             sandbox_id,
             home_id,
             spec,
             cancelled,
+            &mut resources_applied,
             &mut guarded_report,
         );
-        if result.is_err() && !report_rejected.get() {
+        if result.is_err() && !report_rejected.get() && resources_applied {
             // The staged path applies the workspace claim, the NetworkPolicy and
             // the guest-token Secret *before* the Pod, so anything that rejects
             // the Pod -- a namespace ResourceQuota denial, an admission webhook,
@@ -3396,6 +3367,7 @@ impl KubernetesApplyProvider {
         home_id: Option<HomeId>,
         spec: &SandboxProvisionSpec,
         cancelled: &CancelSignal,
+        resources_applied: &mut bool,
         mut report: F,
     ) -> anyhow::Result<ProviderSandboxHandle>
     where
