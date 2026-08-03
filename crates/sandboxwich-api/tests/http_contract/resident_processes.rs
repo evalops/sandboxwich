@@ -319,6 +319,64 @@ async fn maestro_hosted_runner_rejects_ephemeral_workspace_before_dispatch() {
 }
 
 #[tokio::test]
+async fn maestro_hosted_runner_reports_pending_placement_before_dispatch() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir
+                .path()
+                .join("maestro-placement-pending.db")
+                .display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let client = server.client();
+    let sandbox: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
+            name: Some("maestro-placement-pending".into()),
+            template: Some("ubuntu-dev".into()),
+            memory_limit: None,
+            network_egress: Some(NetworkEgress::DenyAll),
+            workspace_mode: Some(WorkspaceMode::Persistent),
+            runtime_profile: None,
+            execution_class: None,
+            ttl_seconds: Some(3600),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let response = client
+        .put(format!(
+            "{}/sandboxes/{}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&maestro_hosted_runner_request(
+            sandbox.sandbox.id,
+            "workspace-1",
+            "runner-session-1",
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let error: ErrorEnvelope = response.json().await.unwrap();
+    assert_eq!(error.code, "resident_sidecar_placement_pending");
+}
+
+#[tokio::test]
 async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
     let data_dir = tempfile::tempdir().unwrap();
     let server = TestServer::start(
@@ -1112,6 +1170,11 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
     assert_eq!(
         unsupported_worker.status(),
         reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let unsupported_error: ErrorEnvelope = unsupported_worker.json().await.unwrap();
+    assert_eq!(
+        unsupported_error.code,
+        "resident_sidecar_worker_unsupported"
     );
     let sidecar_create_response = client
         .put(&sidecar_url)

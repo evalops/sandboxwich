@@ -166,7 +166,7 @@ async fn placed_worker_supports_provider_isolated_resident_process(
     sandbox_id: SandboxId,
     tenant_id: &str,
     process_name: &str,
-) -> Result<Option<u64>, ApiError> {
+) -> Result<ProviderIsolatedPlacement, ApiError> {
     let sql = format!(
         "select w.labels, p.generation
          from sandbox_placements p
@@ -181,7 +181,7 @@ async fn placed_worker_supports_provider_isolated_resident_process(
         .fetch_optional(&db.pool)
         .await?
     else {
-        return Ok(None);
+        return Ok(ProviderIsolatedPlacement::Pending);
     };
     let labels = row
         .try_get::<String, _>("labels")
@@ -203,13 +203,19 @@ async fn placed_worker_supports_provider_isolated_resident_process(
         .and_then(serde_json::Value::as_str)
         .is_some_and(|image| image.contains("@sha256:"));
     if !version_supported || !image_is_pinned {
-        return Ok(None);
+        return Ok(ProviderIsolatedPlacement::Unsupported);
     }
     let generation = u64::try_from(row.try_get::<i64, _>("generation")?)
         .ok()
         .filter(|generation| *generation > 0)
         .ok_or_else(|| ApiError::internal("sandbox placement generation is invalid"))?;
-    Ok(Some(generation))
+    Ok(ProviderIsolatedPlacement::Supported(generation))
+}
+
+enum ProviderIsolatedPlacement {
+    Pending,
+    Unsupported,
+    Supported(u64),
 }
 
 async fn authoritative_workspace_claim_name(
@@ -602,20 +608,30 @@ pub(crate) async fn put_resident_process(
         name.as_str(),
         ORB_SIDECAR_RESIDENT_PROCESS_NAME | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
     ) {
-        Some(
-            placed_worker_supports_provider_isolated_resident_process(
-                &state.db,
-                sandbox_id,
-                &sandbox.tenant_id,
-                &name,
-            )
-            .await?
-            .ok_or_else(|| ApiError {
+        let placement = placed_worker_supports_provider_isolated_resident_process(
+            &state.db,
+            sandbox_id,
+            &sandbox.tenant_id,
+            &name,
+        )
+        .await?;
+        Some(match placement {
+            ProviderIsolatedPlacement::Pending => {
+                return Err(ApiError {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    code: "resident_sidecar_placement_pending",
+                    message: "the resident sidecar is waiting for the sandbox to receive a worker placement".into(),
+                });
+            }
+            ProviderIsolatedPlacement::Unsupported => {
+                return Err(ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 code: "resident_sidecar_worker_unsupported",
                 message: "the resident sidecar requires its placed worker to advertise the matching digest-pinned provider-isolated v2 runtime".into(),
-            })?,
-        )
+                });
+            }
+            ProviderIsolatedPlacement::Supported(generation) => generation,
+        })
     } else {
         None
     };
