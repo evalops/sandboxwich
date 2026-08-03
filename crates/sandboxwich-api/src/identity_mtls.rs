@@ -2,6 +2,7 @@ use crate::{
     config::IdentityMtlsConfig,
     handlers::resident_attestations::validate_maestro_workload_identity,
     health::{healthz, readyz},
+    rejection_log::log_mutation_rejections,
     request_id::{attach_request_id, normalize_framework_errors},
     routes::DEFAULT_BODY_LIMIT_BYTES,
     state::AppState,
@@ -225,6 +226,12 @@ pub(crate) fn identity_app(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(DEFAULT_BODY_LIMIT_BYTES))
         .with_state(state)
         .layer(Extension(IdentityServiceContext { _private: () }))
+        // The mTLS fence exposes one mutation route, and a rejection on it was
+        // just as invisible as one on the tenant listener. There is no
+        // `TenantContext` on this listener, so the log line reports an unknown
+        // tenant; everything else (route template, status, code, latency) is
+        // the same.
+        .layer(middleware::from_fn(log_mutation_rejections))
         .layer(middleware::from_fn(normalize_framework_errors))
         .layer(middleware::from_fn(attach_request_id))
 }

@@ -14,6 +14,7 @@ mod limits;
 mod pagination;
 mod reap;
 mod reconcile;
+mod rejection_log;
 mod request_id;
 mod routes;
 mod rows;
