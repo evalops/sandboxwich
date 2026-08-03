@@ -691,6 +691,13 @@ pub(crate) async fn update_provisioning_stage_in_transaction(
             ));
         }
         let sandbox_id = sandbox_id_from_job(&lease.job)?;
+        let sandbox = fetch_sandbox_on_connection(db, &mut tx, sandbox_id).await?;
+        if !SandboxState::PROVISION_COMPLETED_LEGAL_FROM.contains(&sandbox.state) {
+            return Err(ApiError::conflict_code(
+                "provisioning_sandbox_stopped",
+                "provisioning progress is no longer accepted after sandbox stop",
+            ));
+        }
 
         let existing_sql = format!(
             "select lease_id, lease_attempt, stage, stage_index, resource_kind,
