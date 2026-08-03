@@ -101,7 +101,7 @@ enum Command {
     CompilerCacheCapture(CompilerCacheCaptureArgs),
     /// Validate and atomically activate a staged compiler-cache snapshot.
     CompilerCacheRestore(CompilerCacheRestoreArgs),
-    /// Establish the root-owned workspace boundary before the workload starts.
+    /// Establish the restricted helper workspace boundary before the workload starts.
     CompilerCachePrepareWorkspace,
     /// Hold the dedicated compiler-cache helper container open after verifying its boundary.
     CompilerCacheHelper,
