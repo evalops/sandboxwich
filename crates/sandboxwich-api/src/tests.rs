@@ -1707,6 +1707,68 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
     assert_eq!(reprovision.stage, ProvisioningStage::WorkspacePlanned);
 }
 
+#[tokio::test]
+async fn provisioning_stage_update_is_fenced_after_concurrent_stop() {
+    let db = test_sqlite_db().await;
+    let worker_id = seed_worker(&db).await;
+    let sandbox = seed_sandbox_with_state(&db, SandboxState::Archived).await;
+    let now = Utc::now();
+    let job = Job {
+        id: JobId::new(),
+        tenant_id: sandbox.tenant_id,
+        kind: JobKind::ProvisionSandbox,
+        status: JobStatus::Leased,
+        payload: json!({ "sandboxId": sandbox.id }),
+        required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: sandbox.execution_class,
+        priority: 0,
+        attempts: 1,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+    };
+    insert_job(&db, &job).await.expect("insert provision job");
+    let lease_id = LeaseId::new();
+    seed_expired_active_lease(
+        &db,
+        lease_id,
+        job.id,
+        worker_id,
+        now + chrono::Duration::minutes(5),
+    )
+    .await;
+
+    let error = update_provisioning_stage_in_transaction(
+        &db,
+        lease_id,
+        ProvisioningStageUpdateRequest {
+            stage: ProvisioningStage::WorkspaceReady,
+            resource_kind: Some(RuntimeResourceKind::PersistentVolumeClaim),
+            resource_namespace: Some("sandboxwich-sandboxes".to_string()),
+            resource_name: Some(format!("sandboxwich-pvc-{}", sandbox.id)),
+            resource_uid: Some("uid-created-after-stop".to_string()),
+            observed_generation: None,
+            attempt_count: 1,
+            last_error_class: None,
+            last_error_code: None,
+            last_error: None,
+        },
+    )
+    .await
+    .expect_err("an archived sandbox must fence further staged provisioning");
+
+    assert_eq!(error.code, "provisioning_sandbox_stopped");
+    let operation_count: i64 =
+        sqlx::query_scalar("select count(*) from provisioning_operations where sandbox_id = ?")
+            .bind(sandbox.id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(operation_count, 0);
+}
+
 async fn seed_worker(db: &Database) -> WorkerId {
     let now = Utc::now();
     let worker = Worker {
@@ -2981,6 +3043,103 @@ async fn archived_runtime_reconciliation_recovers_existing_leaks_without_duplica
     .try_get("count")
     .unwrap();
     assert_eq!(cleanup_count, 1);
+}
+
+#[tokio::test]
+async fn archived_runtime_reconciliation_skips_active_cleanup_backlog_before_batch_limit() {
+    let db = test_sqlite_db().await;
+
+    for _ in 0..100 {
+        let sandbox = seed_sandbox_with_state(&db, SandboxState::Archived).await;
+        let resource = ProviderRuntimeResource {
+            sandbox_id: sandbox.id,
+            snapshot_id: None,
+            provider: "kubernetes".to_string(),
+            resource_kind: RuntimeResourceKind::Pod,
+            purpose: RuntimeResourcePurpose::Runtime,
+            resource_name: format!("sandboxwich-{}", sandbox.id),
+            namespace: "evalops-sandboxes".to_string(),
+            status: RuntimeResourceStatus::Ready,
+            cluster: None,
+            storage_class: None,
+            snapshot_class: None,
+            storage_size: None,
+            runtime_image: Some(sandbox.template.clone()),
+            service_port: None,
+            target_port: None,
+            source_snapshot_id: None,
+            ready_at: Some(Utc::now()),
+            error: None,
+        };
+        let mut connection = db.pool.acquire().await.unwrap();
+        upsert_provider_runtime_resources_on_connection(
+            &db,
+            &mut connection,
+            &[resource],
+            &sandbox.tenant_id,
+        )
+        .await
+        .unwrap();
+        assert!(
+            enqueue_archived_runtime_cleanup_on_connection(
+                &db,
+                &mut connection,
+                &sandbox,
+                None,
+                "existing_backlog",
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    let victim = seed_sandbox_with_state(&db, SandboxState::Archived).await;
+    let victim_resource = ProviderRuntimeResource {
+        sandbox_id: victim.id,
+        snapshot_id: None,
+        provider: "kubernetes".to_string(),
+        resource_kind: RuntimeResourceKind::Pod,
+        purpose: RuntimeResourcePurpose::Runtime,
+        resource_name: format!("sandboxwich-{}", victim.id),
+        namespace: "evalops-sandboxes".to_string(),
+        status: RuntimeResourceStatus::Ready,
+        cluster: None,
+        storage_class: None,
+        snapshot_class: None,
+        storage_size: None,
+        runtime_image: Some(victim.template.clone()),
+        service_port: None,
+        target_port: None,
+        source_snapshot_id: None,
+        ready_at: Some(Utc::now()),
+        error: None,
+    };
+    let mut connection = db.pool.acquire().await.unwrap();
+    upsert_provider_runtime_resources_on_connection(
+        &db,
+        &mut connection,
+        &[victim_resource],
+        &victim.tenant_id,
+    )
+    .await
+    .unwrap();
+    drop(connection);
+
+    assert_eq!(
+        reconcile_archived_runtime_resources(&db).await.unwrap(),
+        1,
+        "100 already-active cleanup jobs must not starve the next leak"
+    );
+    let victim_cleanup_count: i64 = sqlx::query_scalar(
+        "select count(*) from jobs
+         where sandbox_id = ? and kind = 'stop_sandbox'
+           and archived_runtime_cleanup = true",
+    )
+    .bind(victim.id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(victim_cleanup_count, 1);
 }
 
 #[tokio::test]
