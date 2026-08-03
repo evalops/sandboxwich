@@ -28,6 +28,12 @@ pub(crate) async fn reconcile_archived_runtime_resources(db: &Database) -> Resul
            and runtime_resources.snapshot_id is null
            and runtime_resources.purpose <> 'snapshot'
            and runtime_resources.status not in ('deleted', 'destroyed')
+           and not exists (
+             select 1 from jobs
+             where jobs.sandbox_id = sandboxes.id
+               and jobs.kind = 'stop_sandbox'
+               and jobs.status in ('queued', 'leased')
+           )
          order by sandboxes.id asc
          limit {ARCHIVED_RUNTIME_RECONCILIATION_BATCH_SIZE}"
     );
