@@ -4439,11 +4439,14 @@ fn provision_staged_stops_before_the_next_resource_when_reporting_fails() {
         "workspace and network policy apply before their durable reports: {log}"
     );
     assert!(!log.contains(" wait "), "pod stage must not start: {log}");
+    // A rejected stage update is the control plane refusing this attempt's
+    // authority, and it can arrive before the renewal loop fires the cancel
+    // signal. Deleting by sandbox-id label could then destroy resources a new
+    // lease owner already applied, so residue from this path is left to the
+    // unbound-workspace-claim backstop instead.
     assert!(
-        log.contains(&format!(
-            "delete pod,persistentvolumeclaim,service,networkpolicy,secret -l sandboxwich.dev/sandbox-id={sandbox_id}"
-        )),
-        "staged provisioning must roll back after a report failure: {log}"
+        !log.contains(" delete "),
+        "a rejected stage update must not trigger rollback: {log}"
     );
     let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
 }

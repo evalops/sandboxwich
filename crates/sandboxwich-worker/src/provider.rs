@@ -3321,19 +3321,32 @@ impl KubernetesApplyProvider {
         home_id: Option<HomeId>,
         spec: &SandboxProvisionSpec,
         cancelled: &CancelSignal,
-        report: F,
+        mut report: F,
     ) -> anyhow::Result<ProviderSandboxHandle>
     where
         F: FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
     {
         let mut resources_applied = false;
+        // Whether the failure came out of the caller's stage-update callback
+        // (the control plane) rather than out of kubectl. A rejected stage
+        // update is the control plane refusing this attempt's authority --
+        // usually because the lease moved -- and it can arrive *before* the
+        // renewal loop notices the loss and fires the cancel signal. In that
+        // window the cancellation check below has not tripped yet, so the
+        // rejection itself must also fence the rollback.
+        let report_rejected = std::cell::Cell::new(false);
+        let mut guarded_report = |update: ProvisioningStageUpdateRequest| {
+            report(update).inspect_err(|_| {
+                report_rejected.set(true);
+            })
+        };
         match self.provision_staged_with_home_inner(
             sandbox_id,
             home_id,
             spec,
             cancelled,
             &mut resources_applied,
-            report,
+            &mut guarded_report,
         ) {
             Ok(handle) => Ok(handle),
             Err(error) => {
@@ -3362,7 +3375,11 @@ impl KubernetesApplyProvider {
                 // other worker takes the sandbox over, the claim is left Pending
                 // and unrecorded, which is exactly the shape
                 // `is_reapable_unbound_workspace_claim` reaps an hour later.
-                if resources_applied && !cancelled.is_cancelled() {
+                //
+                // The same trade governs a rejected stage update: rolling back
+                // on it would delete resources a new lease owner may already
+                // own, so residue from that path is also left to the backstop.
+                if resources_applied && !cancelled.is_cancelled() && !report_rejected.get() {
                     self.rollback_applied_resources(sandbox_id, "staged provision");
                 }
                 Err(error)
