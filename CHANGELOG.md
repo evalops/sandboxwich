@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## 0.1.7 - 2026-08-03
+### Fixed
+
+- *(api)* Reconcile recreated provisioning resources
+- *(sandboxwich)* Close archived cleanup race paths
+- *(sandboxwich)* Reconcile archived runtime leaks
+- *(worker)* Classify ResourceQuota rejections as retryable capacity
+- *(worker)* Roll back failed staged provisioning
+- *(worker)* Report successful reconciliation at info level
+- *(sandboxwich)* Harden restricted cache and kubectl bounds
+
+### Other
+
+- *(sandbox)* Move compiler-cache staging out of the guest mount namespace and drop root
+- Merge origin/main into compiler-cache-nonroot-redesign
+- Merge branch 'main' into quota-retryable-capacity
+
 ## 0.1.6 - 2026-08-02
 ### Added
 
