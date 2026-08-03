@@ -704,6 +704,7 @@ pub(crate) async fn update_provisioning_stage_in_transaction(
             .fetch_optional(&mut *tx)
             .await?;
         let mut replace_existing_operation = false;
+        let mut rotate_resource_identity = false;
         if let Some(row) = existing.as_ref() {
             let existing_lease_id: String = row.try_get("lease_id")?;
             let existing_lease_sql = format!(
@@ -800,10 +801,17 @@ pub(crate) async fn update_provisioning_stage_in_transaction(
                     if stored_uid != resource_uid
                         || stored_generation != request.observed_generation
                     {
-                        return Err(ApiError::conflict_code(
-                            "provisioning_resource_identity_conflict",
-                            "durable resource identity cannot change within a stage",
-                        ));
+                        let existing_attempt: i64 = row.try_get("lease_attempt")?;
+                        if lease.attempt <= existing_attempt {
+                            return Err(ApiError::conflict_code(
+                                "provisioning_resource_identity_conflict",
+                                "durable resource identity cannot change within a stage",
+                            ));
+                        }
+                        // A retry can recreate a named Kubernetes object with a
+                        // new UID. The newer fenced lease is allowed to replace
+                        // that observation; same-attempt changes remain fenced.
+                        rotate_resource_identity = true;
                     }
                     if lease.attempt == existing_attempt
                         && i64::from(request.stage.ordinal()) == existing_stage_index
@@ -984,11 +992,19 @@ pub(crate) async fn update_provisioning_stage_in_transaction(
                 "insert into provisioning_operation_resources
                  (sandbox_id, stage, resource_kind, resource_namespace, resource_name,
                   resource_uid, observed_generation, updated_at)
-                 values ({}) on conflict do nothing",
+                 values ({}) {}",
                 (1..=8)
                     .map(|index| db.placeholder(index))
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join(", "),
+                if rotate_resource_identity {
+                    "on conflict (sandbox_id, stage, resource_kind, resource_namespace, resource_name)
+                     do update set resource_uid = excluded.resource_uid,
+                                   observed_generation = excluded.observed_generation,
+                                   updated_at = excluded.updated_at"
+                } else {
+                    "on conflict do nothing"
+                }
             );
             sqlx::query(&resource_sql)
                 .bind(sandbox_id.to_string())
