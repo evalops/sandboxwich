@@ -226,6 +226,22 @@ pub const SANDBOX_RECONCILIATION_RESOURCE_KINDS: &str =
     "pod,persistentvolumeclaim,service,secret,networkpolicy";
 pub const GUEST_TOKEN_REDACTED: &str = "[redacted]";
 
+/// Name prefix of the per-sandbox workspace PersistentVolumeClaim
+/// (`sandboxwich-pvc-<sandbox id>`). Managed home claims are named
+/// `sandboxwich-home-<home id>` instead and are deliberately *not* matched by
+/// this prefix: a home claim outlives every runtime that mounts it, so orphan
+/// reconciliation must never treat one as provisioning residue.
+pub const WORKSPACE_CLAIM_NAME_PREFIX: &str = "sandboxwich-pvc-";
+/// Minimum age before orphan reconciliation will reap a never-bound workspace
+/// claim the control plane has no record of. Provisioning applies the claim and
+/// the Pod within one lease (minutes at the outside), and a
+/// `WaitForFirstConsumer` claim binds as soon as its Pod is scheduled, so an
+/// hour is roughly an order of magnitude beyond any legitimate Pending window
+/// while still bounding how long residue can accumulate. Chosen to sit well
+/// above the five-minute grace `classify_reconciliation` already applies to
+/// resident-process pods.
+const UNBOUND_WORKSPACE_CLAIM_REAP_AFTER_MINUTES: i64 = 60;
+
 /// Name prefix for the per-sandbox guest-token Secret (see
 /// `guest_token_secret_name`). Also used by the Secret adoption contract to
 /// recognize these Secrets and exempt their per-attempt-minted `api-token`
@@ -2600,6 +2616,31 @@ struct ObservedKubernetesResource {
     uid: String,
     resident_lease_id: Option<Uuid>,
     created_at: Option<chrono::DateTime<Utc>>,
+    /// `status.phase` of an observed PersistentVolumeClaim; `None` for every
+    /// other kind and for claims whose phase the API server did not report.
+    volume_claim_phase: Option<VolumeClaimPhase>,
+}
+
+/// Bind phase of an observed PersistentVolumeClaim. Only `Pending` is
+/// actionable for reconciliation: a claim that has never bound has no
+/// PersistentVolume behind it and therefore no workspace data to lose. `Bound`
+/// and every other phase (including `Lost`) are treated as data-bearing and are
+/// never reaped by the unbound-claim backstop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VolumeClaimPhase {
+    Pending,
+    Bound,
+    Other,
+}
+
+impl VolumeClaimPhase {
+    fn parse(phase: &str) -> Self {
+        match phase {
+            "Pending" => Self::Pending,
+            "Bound" => Self::Bound,
+            _ => Self::Other,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -2637,6 +2678,37 @@ pub struct ReconciliationOutcome {
     pub(crate) decisions: Vec<ReconciliationDecision>,
     pub(crate) deleted: usize,
     pub(crate) apply: bool,
+}
+
+/// True when `resource` is a workspace PersistentVolumeClaim that a failed
+/// provision left behind and that is safe to delete on the evidence available.
+///
+/// Every condition is required and each one is load-bearing:
+///
+/// * kind is `PersistentVolumeClaim` and the name carries
+///   [`WORKSPACE_CLAIM_NAME_PREFIX`], so managed home claims
+///   (`sandboxwich-home-*`, which outlive their runtimes) are out of scope.
+/// * the observed phase is exactly `Pending`. A claim that never bound has no
+///   PersistentVolume and therefore no workspace bytes to destroy, and no Pod
+///   is mounting it. A `Bound` claim -- or one whose phase the API server did
+///   not report -- is never reaped here. Kubernetes' own `pvc-protection`
+///   finalizer is the second line of defence: it blocks removal of a claim that
+///   a Pod started using between discovery and delete.
+/// * a creation timestamp exists and is older than
+///   [`UNBOUND_WORKSPACE_CLAIM_REAP_AFTER_MINUTES`], so a claim staged by a
+///   provision still in flight is never taken out from under it. A claim with
+///   no timestamp fails closed.
+fn is_reapable_unbound_workspace_claim(
+    resource: &ObservedKubernetesResource,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    resource.resource_kind == RuntimeResourceKind::PersistentVolumeClaim
+        && resource.name.starts_with(WORKSPACE_CLAIM_NAME_PREFIX)
+        && resource.volume_claim_phase == Some(VolumeClaimPhase::Pending)
+        && resource.created_at.is_some_and(|created_at| {
+            now.signed_duration_since(created_at)
+                >= chrono::Duration::minutes(UNBOUND_WORKSPACE_CLAIM_REAP_AFTER_MINUTES)
+        })
 }
 
 fn classify_reconciliation(
@@ -2689,6 +2761,23 @@ fn classify_reconciliation(
                 }
                 Some(_) => ReconciliationClassification::Orphaned,
             };
+            // Backstop for provisioning residue: a workspace claim the control
+            // plane holds no runtime-resource record for, which never bound and
+            // is older than every legitimate provisioning window. Without this
+            // such a claim classifies `Indeterminate` forever (its sandbox row
+            // still exists, so the `sandbox_ids` arm above protects it) and
+            // nothing ever deletes it. See the 2026-08-03 incident: 2,772
+            // Pending `sandboxwich-pvc-*` claims accumulated in three hours
+            // after quota-rejected Pod applies left their staged claims behind.
+            let classification =
+                if matches!(classification, ReconciliationClassification::Indeterminate)
+                    && coordinate_match.is_none()
+                    && is_reapable_unbound_workspace_claim(resource, now)
+                {
+                    ReconciliationClassification::Orphaned
+                } else {
+                    classification
+                };
             ReconciliationDecision {
                 delete_allowed: matches!(
                     classification,
@@ -3217,10 +3306,73 @@ impl KubernetesApplyProvider {
         // and the staged path reaches `dry_run.provision` -- the other route to
         // this check -- only after the Pod is already Ready, so without this a
         // rejected execution class would still have run the workload.
+        //
+        // These three checks stay outside the rollback guard below on purpose:
+        // a provider that fails `validate_apply_gate` has mutation disabled, so
+        // it must not issue the rollback `kubectl delete` either.
         self.dry_run.validate_runtime_profile(spec)?;
         self.dry_run
             .validate_network_policy_egress(&spec.network_egress)?;
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
+
+        // Whether the failure came out of the caller's stage-update callback
+        // (the control plane) rather than out of kubectl. Rolling back on a
+        // control-plane rejection is not safe: the usual reason a stage update
+        // is rejected is that this attempt no longer owns the sandbox's lease,
+        // and a label-scoped delete would then tear down the resources the
+        // *new* owner has already applied under the same sandbox id. Residue
+        // from that case is instead reaped by the unbound-workspace-claim
+        // backstop in `classify_reconciliation`, which is exactly the shape it
+        // recognizes: an applied claim the control plane holds no record of.
+        let report_rejected = std::cell::Cell::new(false);
+        let mut guarded_report = |update: ProvisioningStageUpdateRequest| {
+            report(update).inspect_err(|_| {
+                report_rejected.set(true);
+            })
+        };
+        let result = self.provision_staged_resources(
+            sandbox_id,
+            home_id,
+            spec,
+            cancelled,
+            &mut guarded_report,
+        );
+        if result.is_err() && !report_rejected.get() {
+            // The staged path applies the workspace claim, the NetworkPolicy and
+            // the guest-token Secret *before* the Pod, so anything that rejects
+            // the Pod -- a namespace ResourceQuota denial, an admission webhook,
+            // a readiness timeout -- used to leave those earlier objects behind
+            // with nothing owning them. On 2026-08-03 that leaked 2,772 Pending
+            // `sandboxwich-pvc-*` claims into evalops-sandboxes in three hours,
+            // because quota-rejected provisions retried every few seconds and
+            // each attempt staged one more claim. The unstaged `provision` path
+            // has rolled back this way since the original leak fix; this makes
+            // the staged path match it.
+            //
+            // Label-scoped, so it can only ever remove objects carrying this
+            // sandbox's id: a managed home claim (`sandboxwich-home-*`, labelled
+            // with a home id and no sandbox id) is not matched, and neither is
+            // any other sandbox's workspace.
+            self.rollback_applied_resources(sandbox_id, "provision (staged)");
+        }
+        result
+    }
+
+    /// Applies the staged manifest sequence. Split out of
+    /// [`Self::provision_staged_with_home`] so every failure between the first
+    /// apply and `SandboxReady` runs through one rollback, rather than needing a
+    /// cleanup call bolted onto each `?`.
+    fn provision_staged_resources<F>(
+        &self,
+        sandbox_id: SandboxId,
+        home_id: Option<HomeId>,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+        mut report: F,
+    ) -> anyhow::Result<ProviderSandboxHandle>
+    where
+        F: FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
+    {
         report(stage_update(ProvisioningStage::WorkspacePlanned, None))?;
 
         if spec.workspace_mode == WorkspaceMode::Persistent {
@@ -3410,7 +3562,18 @@ impl KubernetesApplyProvider {
                     .as_str()
                     .context("observed Kubernetes resource omitted kind")?;
                 let label = item["metadata"]["labels"]["sandboxwich.dev/sandbox-id"].as_str();
+                // Only claims carry a bind phase that matters here, and an
+                // unreported phase must stay `None` so the unbound-claim
+                // backstop fails closed rather than guessing `Pending`.
+                let volume_claim_phase = (kind == "PersistentVolumeClaim")
+                    .then(|| {
+                        item["status"]["phase"]
+                            .as_str()
+                            .map(VolumeClaimPhase::parse)
+                    })
+                    .flatten();
                 Ok(ObservedKubernetesResource {
+                    volume_claim_phase,
                     sandbox_id: label
                         .and_then(|value| Uuid::parse_str(value).ok())
                         .map(SandboxId),
