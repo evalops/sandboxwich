@@ -75,6 +75,15 @@ pub(crate) async fn list_runtime_resources_for_sandbox(
     db: &Database,
     sandbox_id: SandboxId,
 ) -> Result<Vec<RuntimeResource>, ApiError> {
+    let mut connection = db.pool.acquire().await?;
+    list_runtime_resources_for_sandbox_on_connection(db, &mut connection, sandbox_id).await
+}
+
+pub(crate) async fn list_runtime_resources_for_sandbox_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    sandbox_id: SandboxId,
+) -> Result<Vec<RuntimeResource>, ApiError> {
     let sql = format!(
         "select id, sandbox_id, snapshot_id, provider, resource_kind, purpose, resource_name,
                 namespace, status, cluster, storage_class, snapshot_class, storage_size,
@@ -87,7 +96,7 @@ pub(crate) async fn list_runtime_resources_for_sandbox(
     );
     let rows = sqlx::query(&sql)
         .bind(sandbox_id.to_string())
-        .fetch_all(&db.pool)
+        .fetch_all(&mut *connection)
         .await?;
 
     rows.into_iter().map(row_to_runtime_resource).collect()

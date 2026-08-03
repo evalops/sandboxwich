@@ -1,4 +1,5 @@
 use crate::bootstrap_handoff::expire_due_bootstrap_handoffs;
+use crate::cleanup::reconcile_archived_runtime_resources;
 use crate::db::*;
 use crate::handlers::desktop::*;
 use crate::handlers::leases::*;
@@ -9,8 +10,12 @@ use crate::limits::expire_tenant_limit_counters;
 use crate::reap::reap_expired_active_sandboxes;
 use crate::state::ResidentBootstrapStore;
 use std::time::Duration;
+use std::time::Instant;
 
-/// Runs the lease/snapshot/desktop-session expiry sweeps on a fixed interval in
+const ARCHIVED_RUNTIME_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Runs the lease/snapshot/desktop-session expiry and archived-runtime repair
+/// sweeps on a fixed interval in
 /// a single background task, instead of on every tenant-scoped read request.
 /// This keeps read handlers O(1) in tenant data instead of doing global,
 /// mutating work proportional to total table size on every GET, and it means
@@ -26,7 +31,9 @@ use std::time::Duration;
 /// sandboxes`) run at all: disabling this sweeper means `max_lifetime_seconds`
 /// and `idle_ttl_seconds` are stored but never enforced on this instance,
 /// exactly as leases/snapshots/desktop-sessions/idempotency/tenant-limits
-/// already behave when disabled.
+/// already behave when disabled. It also intentionally disables archived-
+/// runtime repair: production must keep this sweeper enabled so a late
+/// provider completion cannot strand capacity after an archive.
 pub(crate) fn spawn_expiry_sweeper(
     db: Database,
     resident_bootstraps: ResidentBootstrapStore,
@@ -35,6 +42,10 @@ pub(crate) fn spawn_expiry_sweeper(
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let now = Instant::now();
+        let mut last_archived_runtime_reconciliation = now
+            .checked_sub(ARCHIVED_RUNTIME_RECONCILIATION_INTERVAL)
+            .unwrap_or(now);
         // The first tick fires immediately; that's fine, it just means the
         // first sweep runs right away instead of waiting a full interval.
         loop {
@@ -61,6 +72,23 @@ pub(crate) fn spawn_expiry_sweeper(
             }
             if let Err(error) = expire_tenant_limit_counters(&db).await {
                 tracing::warn!(?error, "tenant limit counter retention sweep failed");
+            }
+            if last_archived_runtime_reconciliation.elapsed()
+                >= ARCHIVED_RUNTIME_RECONCILIATION_INTERVAL
+            {
+                match reconcile_archived_runtime_resources(&db).await {
+                    Ok(enqueued) if enqueued > 0 => {
+                        tracing::warn!(
+                            enqueued,
+                            "queued teardown for archived sandboxes with live runtime resources"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(?error, "archived runtime resource reconciliation failed");
+                    }
+                }
+                last_archived_runtime_reconciliation = Instant::now();
             }
             match reap_expired_active_sandboxes(&db, &resident_bootstraps).await {
                 Ok(reaped) => {

@@ -1,5 +1,6 @@
 use crate::db::*;
 use crate::error::*;
+use crate::handlers::jobs::enqueue_archived_runtime_cleanup_on_connection;
 use crate::handlers::sandboxes::*;
 use crate::handlers::snapshots::*;
 use crate::reconcile::*;
@@ -8,6 +9,100 @@ use crate::util::*;
 use chrono::Utc;
 use sandboxwich_core::*;
 use sqlx::AnyConnection;
+use sqlx::Row;
+use uuid::Uuid;
+
+const ARCHIVED_RUNTIME_RECONCILIATION_BATCH_SIZE: u32 = 100;
+
+/// Finds archived sandboxes that still have provider-owned runtime rows and
+/// queues an idempotent label-scoped stop job for each one. This is a repair
+/// loop, not the retention cleanup: it runs independently of TTL so a late
+/// provision completion cannot keep a Pod/PVC consuming capacity until the
+/// sandbox's normal retention window expires.
+pub(crate) async fn reconcile_archived_runtime_resources(db: &Database) -> Result<usize, ApiError> {
+    let candidate_sql = format!(
+        "select distinct sandboxes.id
+         from sandboxes
+         join runtime_resources on runtime_resources.sandbox_id = sandboxes.id
+         where sandboxes.state = 'archived'
+           and runtime_resources.snapshot_id is null
+           and runtime_resources.purpose <> 'snapshot'
+           and runtime_resources.status not in ('deleted', 'destroyed')
+         order by sandboxes.id asc
+         limit {ARCHIVED_RUNTIME_RECONCILIATION_BATCH_SIZE}"
+    );
+    let rows = sqlx::query(&candidate_sql).fetch_all(&db.pool).await?;
+    let mut enqueued = 0;
+
+    for row in rows {
+        let sandbox_id: String = row.try_get("id")?;
+        let sandbox_id = SandboxId(
+            Uuid::parse_str(&sandbox_id)
+                .map_err(|_| ApiError::internal("database contains invalid sandbox id"))?,
+        );
+        let mut tx = db.pool.begin().await?;
+        let result = async {
+            let sandbox = match fetch_sandbox_on_connection(db, &mut tx, sandbox_id).await {
+                Ok(sandbox) if sandbox.state == SandboxState::Archived => sandbox,
+                Ok(_) => return Ok(false),
+                Err(error) if error.status == axum::http::StatusCode::NOT_FOUND => {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            };
+            let active_resource_sql = format!(
+                "select 1
+                 from runtime_resources
+                 where sandbox_id = {} and snapshot_id is null
+                   and purpose <> 'snapshot'
+                   and status not in ('deleted', 'destroyed')
+                 limit 1",
+                db.placeholder(1)
+            );
+            if sqlx::query(&active_resource_sql)
+                .bind(sandbox_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_none()
+            {
+                return Ok(false);
+            }
+            enqueue_archived_runtime_cleanup_on_connection(
+                db,
+                &mut tx,
+                &sandbox,
+                None,
+                "archived_runtime_reconciliation",
+            )
+            .await
+        }
+        .await;
+        match result {
+            Ok(inserted) => {
+                tx.commit().await?;
+                if inserted {
+                    enqueued += 1;
+                }
+            }
+            Err(error) => {
+                if let Err(rollback_error) = tx.rollback().await {
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        %rollback_error,
+                        "failed to roll back archived runtime reconciliation"
+                    );
+                }
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    ?error,
+                    "archived runtime reconciliation skipped one sandbox"
+                );
+            }
+        }
+    }
+
+    Ok(enqueued)
+}
 
 pub(crate) async fn insert_cleanup_run(
     db: &Database,
@@ -254,7 +349,23 @@ pub(crate) async fn cleanup_archived_sandboxes(
         }
         let mut tx = db.pool.begin().await?;
         let cleaned = async {
-            let deleted_resources = mark_runtime_resources_deleted_for_sandbox_on_connection(
+            // A normal stop completion may already have retired these rows
+            // before the archived record reaches its TTL. Include those
+            // durable records in both the cleanup evidence and the tombstone
+            // input so retention cleanup remains an auditable finalization
+            // step even when provider teardown was eagerly fenced earlier.
+            let mut deleted_resources =
+                list_runtime_resources_for_sandbox_on_connection(db, &mut tx, sandbox.id)
+                    .await?
+                    .into_iter()
+                    .filter(|resource| {
+                        matches!(
+                            resource.status,
+                            RuntimeResourceStatus::Deleted | RuntimeResourceStatus::Destroyed
+                        )
+                    })
+                    .collect::<Vec<_>>();
+            let newly_deleted = mark_runtime_resources_deleted_for_sandbox_on_connection(
                 db,
                 &mut tx,
                 sandbox.id,
@@ -265,9 +376,12 @@ pub(crate) async fn cleanup_archived_sandboxes(
                 "archived sandbox deleted during cleanup",
             )
             .await?;
-            for resource in &deleted_resources {
+            let mut resources_to_tombstone = deleted_resources.clone();
+            resources_to_tombstone.extend(newly_deleted.iter().cloned());
+            for resource in &resources_to_tombstone {
                 insert_runtime_resource_tombstone_on_connection(db, &mut tx, resource, now).await?;
             }
+            deleted_resources.extend(newly_deleted);
             // Authoritative re-check: run it on the *same* connection as the
             // delete, as late as possible, right before the delete itself.
             // The pre-check above runs against the pool before this

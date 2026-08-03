@@ -121,6 +121,12 @@ pub(crate) async fn collect_prometheus_metrics(
     );
     append_gauge(
         &mut body,
+        "sandboxwich_archived_runtime_resource_count",
+        "Archived sandboxes with provider runtime resources that are not retired.",
+        metrics.scalar("archived_runtime_resources"),
+    );
+    append_gauge(
+        &mut body,
         "sandboxwich_job_leases_active",
         "Active job leases.",
         metrics.scalar("job_leases_active"),
@@ -246,6 +252,14 @@ pub(crate) async fn fetch_prometheus_metrics(
              from runtime_resources
              group by status
              union all
+             select 'archived_runtime_resources' as family, '' as label, count(*) as value
+             from runtime_resources
+             join sandboxes on sandboxes.id = runtime_resources.sandbox_id
+             where sandboxes.state = 'archived'
+               and runtime_resources.snapshot_id is null
+               and runtime_resources.purpose <> 'snapshot'
+               and runtime_resources.status not in ('deleted', 'destroyed')
+             union all
              select 'job_leases_active' as family, '' as label, count(*) as value
              from job_leases
              where status = 'active'
@@ -298,34 +312,43 @@ pub(crate) async fn fetch_prometheus_metrics(
              where sandboxes.tenant_id = {p4}
              group by runtime_resources.status
              union all
+             select 'archived_runtime_resources' as family, '' as label, count(*) as value
+             from runtime_resources
+             join sandboxes on sandboxes.id = runtime_resources.sandbox_id
+             where sandboxes.tenant_id = {p5}
+               and sandboxes.state = 'archived'
+               and runtime_resources.snapshot_id is null
+               and runtime_resources.purpose <> 'snapshot'
+               and runtime_resources.status not in ('deleted', 'destroyed')
+             union all
              select 'job_leases_active' as family, '' as label, count(*) as value
              from job_leases
              join jobs on jobs.id = job_leases.job_id
-             where job_leases.status = 'active' and jobs.tenant_id = {p5}
+             where job_leases.status = 'active' and jobs.tenant_id = {p6}
              union all
              select 'worker_capacity_slots' as family, '' as label, coalesce(sum(max_concurrent_jobs), 0) as value
              from workers
-             where status = 'online' and tenant_id = {p6}
+             where status = 'online' and tenant_id = {p7}
              union all
              select 'worker_available_slots' as family, '' as label,
-                    coalesce((select sum(max_concurrent_jobs) from workers where status = 'online' and tenant_id = {p11}), 0)
+                    coalesce((select sum(max_concurrent_jobs) from workers where status = 'online' and tenant_id = {p8}), 0)
                       - (select count(*) from job_leases join jobs on jobs.id = job_leases.job_id
-                         where job_leases.status = 'active' and jobs.tenant_id = {p12}) as value
+                         where job_leases.status = 'active' and jobs.tenant_id = {p9}) as value
              union all
              select 'job_lease' as family, job_leases.status as label, count(*) as value
              from job_leases join jobs on jobs.id = job_leases.job_id
-             where jobs.tenant_id = {p7} group by job_leases.status
+             where jobs.tenant_id = {p10} group by job_leases.status
              union all
              select 'job_attempts' as family, '' as label, coalesce(sum(attempts), 0) as value
-             from jobs where tenant_id = {p8}
+             from jobs where tenant_id = {p11}
              union all
              select 'idempotency_record' as family, state as label, count(*) as value
-             from idempotency_records where tenant_id = {p9} group by state
+             from idempotency_records where tenant_id = {p12} group by state
              union all
              select 'guest_token' as family,
                     case when revoked_at is null then 'issued' else 'revoked' end as label,
                     count(*) as value
-             from guest_tokens where tenant_id = {p10}
+             from guest_tokens where tenant_id = {p13}
              group by case when revoked_at is null then 'issued' else 'revoked' end
              order by family asc, label asc",
             p1 = db.placeholder(1),
@@ -340,12 +363,13 @@ pub(crate) async fn fetch_prometheus_metrics(
             p10 = db.placeholder(10),
             p11 = db.placeholder(11),
             p12 = db.placeholder(12),
+            p13 = db.placeholder(13),
         ),
     };
 
     let mut query = sqlx::query(&sql);
     if let Some(tenant_id) = tenant_id {
-        for _ in 0..12 {
+        for _ in 0..13 {
             query = query.bind(tenant_id.to_string());
         }
     }
