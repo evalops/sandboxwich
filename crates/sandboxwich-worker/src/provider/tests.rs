@@ -4343,6 +4343,7 @@ fn provision_staged_applies_gateway_policy_and_waits_for_gateway_before_runtime(
         uid: "uid-fqdn".to_string(),
         resident_lease_id: None,
         created_at: None,
+        volume_claim_phase: None,
     };
     assert_eq!(
         kubernetes_delete_path(&fqdn_observed).expect("GKE FQDN delete path"),
@@ -4756,6 +4757,7 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             uid: "uid-live".to_string(),
             resident_lease_id: None,
             created_at: None,
+            volume_claim_phase: None,
         },
         ObservedKubernetesResource {
             sandbox_id: Some(orphan_sandbox),
@@ -4765,6 +4767,7 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             uid: "uid-orphan".to_string(),
             resident_lease_id: None,
             created_at: None,
+            volume_claim_phase: None,
         },
         ObservedKubernetesResource {
             sandbox_id: Some(expired_sandbox),
@@ -4774,6 +4777,7 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             uid: "uid-expired".to_string(),
             resident_lease_id: None,
             created_at: None,
+            volume_claim_phase: None,
         },
         ObservedKubernetesResource {
             sandbox_id: None,
@@ -4783,6 +4787,7 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             uid: "uid-foreign".to_string(),
             resident_lease_id: None,
             created_at: None,
+            volume_claim_phase: None,
         },
         ObservedKubernetesResource {
             sandbox_id: Some(live_sandbox),
@@ -4792,6 +4797,7 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             uid: "replacement-uid".to_string(),
             resident_lease_id: None,
             created_at: None,
+            volume_claim_phase: None,
         },
     ];
     let expired =
@@ -4853,6 +4859,7 @@ fn resident_resource_reconciliation_is_fenced_by_active_lease_not_live_sandbox()
         uid: format!("uid-{lease_id}"),
         resident_lease_id: Some(lease_id),
         created_at: Some(created_at),
+        volume_claim_phase: None,
     };
     let decisions = classify_reconciliation(
         &inventory,
@@ -4938,6 +4945,7 @@ esac
         uid: "uid-orphan".to_string(),
         resident_lease_id: Some(resident_lease),
         created_at: Some(Utc::now() - chrono::Duration::minutes(6)),
+        volume_claim_phase: None,
     };
     assert_eq!(
         kubernetes_delete_path(&observed).expect("delete path"),
@@ -4994,6 +5002,230 @@ esac
             .iter()
             .all(|decision| !decision.delete_allowed)
     );
+}
+
+/// Builds an observed claim for the unbound-workspace-claim backstop cases.
+fn observed_claim(
+    sandbox_id: Option<SandboxId>,
+    name: String,
+    uid: &str,
+    phase: Option<VolumeClaimPhase>,
+    created_at: chrono::DateTime<Utc>,
+) -> ObservedKubernetesResource {
+    ObservedKubernetesResource {
+        sandbox_id,
+        resource_kind: RuntimeResourceKind::PersistentVolumeClaim,
+        namespace: "sandboxwich-ci".to_string(),
+        name,
+        uid: uid.to_string(),
+        resident_lease_id: None,
+        created_at: Some(created_at),
+        volume_claim_phase: phase,
+    }
+}
+
+#[test]
+fn stale_unbound_workspace_claims_are_reaped_and_every_other_claim_is_left_alone() {
+    // 2026-08-03: 2,772 Pending sandboxwich-pvc-* claims accumulated in the
+    // evalops-sandboxes namespace in three hours. Their sandbox rows still
+    // existed, so `sandbox_ids` classified every one of them Indeterminate and
+    // nothing ever deleted them.
+    let now = Utc::now();
+    let leaked = SandboxId::new();
+    let bound_sandbox = SandboxId::new();
+    let provisioning = SandboxId::new();
+    let recorded = SandboxId::new();
+    let unknown_phase = SandboxId::new();
+    let inventory = ReconciliationInventory {
+        sandbox_ids: std::collections::HashSet::from([
+            leaked,
+            bound_sandbox,
+            provisioning,
+            recorded,
+            unknown_phase,
+        ]),
+        active_resident_lease_ids: std::collections::HashSet::new(),
+        resources: vec![ExpectedKubernetesResource {
+            sandbox_id: recorded,
+            resource_kind: RuntimeResourceKind::PersistentVolumeClaim,
+            namespace: "sandboxwich-ci".to_string(),
+            name: format!("sandboxwich-pvc-{recorded}"),
+            uid: "uid-recorded".to_string(),
+            expires_at: None,
+        }],
+    };
+    let observed = vec![
+        observed_claim(
+            Some(leaked),
+            format!("sandboxwich-pvc-{leaked}"),
+            "uid-leaked",
+            Some(VolumeClaimPhase::Pending),
+            now - chrono::Duration::hours(2),
+        ),
+        observed_claim(
+            Some(bound_sandbox),
+            format!("sandboxwich-pvc-{bound_sandbox}"),
+            "uid-bound",
+            Some(VolumeClaimPhase::Bound),
+            now - chrono::Duration::hours(2),
+        ),
+        observed_claim(
+            Some(provisioning),
+            format!("sandboxwich-pvc-{provisioning}"),
+            "uid-provisioning",
+            Some(VolumeClaimPhase::Pending),
+            now - chrono::Duration::minutes(2),
+        ),
+        observed_claim(
+            Some(recorded),
+            format!("sandboxwich-pvc-{recorded}"),
+            "uid-recorded",
+            Some(VolumeClaimPhase::Pending),
+            now - chrono::Duration::hours(2),
+        ),
+        observed_claim(
+            Some(unknown_phase),
+            format!("sandboxwich-pvc-{unknown_phase}"),
+            "uid-unknown-phase",
+            None,
+            now - chrono::Duration::hours(2),
+        ),
+        observed_claim(
+            None,
+            format!("sandboxwich-home-{}", HomeId::new()),
+            "uid-home",
+            Some(VolumeClaimPhase::Pending),
+            now - chrono::Duration::hours(2),
+        ),
+    ];
+
+    let decisions = classify_reconciliation(
+        &inventory,
+        &observed,
+        &std::collections::HashMap::new(),
+        now,
+    );
+
+    assert_eq!(
+        decisions[0].classification,
+        ReconciliationClassification::Orphaned,
+        "a never-bound workspace claim older than the TTL with no control-plane record is residue"
+    );
+    assert!(decisions[0].delete_allowed);
+    assert_eq!(
+        decisions[1].classification,
+        ReconciliationClassification::Indeterminate,
+        "a Bound claim holds workspace data and is never reaped by the backstop"
+    );
+    assert!(!decisions[1].delete_allowed);
+    assert_eq!(
+        decisions[2].classification,
+        ReconciliationClassification::Indeterminate,
+        "a claim staged minutes ago belongs to a provision still in flight"
+    );
+    assert!(!decisions[2].delete_allowed);
+    assert_eq!(
+        decisions[3].classification,
+        ReconciliationClassification::Expected,
+        "a claim the control plane recorded stays on the archived-cleanup path"
+    );
+    assert!(!decisions[3].delete_allowed);
+    assert_eq!(
+        decisions[4].classification,
+        ReconciliationClassification::Indeterminate,
+        "an unreported phase must fail closed rather than be assumed Pending"
+    );
+    assert!(!decisions[4].delete_allowed);
+    assert_eq!(
+        decisions[5].classification,
+        ReconciliationClassification::Indeterminate,
+        "managed home claims outlive their runtimes and are out of scope"
+    );
+    assert!(!decisions[5].delete_allowed);
+}
+
+#[test]
+fn reconciliation_discovery_reads_claim_phase_from_kubectl() {
+    let dir = std::env::temp_dir().join(format!("sandboxwich-claim-phase-{}", SandboxId::new()));
+    std::fs::create_dir_all(&dir).expect("create claim phase fake dir");
+    let log_path = dir.join("log.txt");
+    let script_path = dir.join("kubectl");
+    let leaked = SandboxId::new();
+    let bound = SandboxId::new();
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "{log}"
+case " $* " in
+  *" get "*)
+    printf '%s\n' '{{"items":[{{"kind":"PersistentVolumeClaim","metadata":{{"namespace":"sandboxwich-ci","name":"sandboxwich-pvc-{leaked}","uid":"uid-leaked","creationTimestamp":"2020-01-01T00:00:00Z","labels":{{"sandboxwich.dev/sandbox-id":"{leaked}"}}}},"status":{{"phase":"Pending"}}}},{{"kind":"PersistentVolumeClaim","metadata":{{"namespace":"sandboxwich-ci","name":"sandboxwich-pvc-{bound}","uid":"uid-bound","creationTimestamp":"2020-01-01T00:00:00Z","labels":{{"sandboxwich.dev/sandbox-id":"{bound}"}}}},"status":{{"phase":"Bound"}}}}]}}'
+    ;;
+esac
+"#,
+        log = log_path.display(),
+    );
+    std::fs::write(&script_path, script).expect("write claim phase fake kubectl");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("stat claim phase fake kubectl")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).expect("chmod fake kubectl");
+    }
+    let provider = apply_provider_with_fake_kubectl(&script_path);
+    // Both sandbox rows are still live, which is exactly the state the leaked
+    // claims were discovered in; neither claim was ever recorded as a runtime
+    // resource.
+    let inventory = RuntimeResourceInventoryResponse {
+        ok: true,
+        provider: "kubernetes".to_string(),
+        cluster: Some("k3s-ci".to_string()),
+        namespace: "sandboxwich-ci".to_string(),
+        sandbox_ids: vec![leaked, bound],
+        complete: true,
+        resources: Vec::new(),
+        active_resident_lease_ids: Vec::new(),
+        next_cursor: None,
+    };
+    let outcome = provider
+        .reconcile_orphans(
+            Ok(inventory),
+            ReconciliationLimits {
+                max_scanned: 10,
+                max_deleted: 1,
+                max_elapsed: Duration::from_secs(5),
+            },
+            false,
+            &CancelSignal::never_cancelled(),
+        )
+        .expect("claim phase reconciliation");
+    assert_eq!(
+        outcome.decisions[0].classification,
+        ReconciliationClassification::Orphaned,
+        "the Pending claim is provisioning residue"
+    );
+    assert!(outcome.decisions[0].delete_allowed);
+    assert_eq!(
+        outcome.decisions[1].classification,
+        ReconciliationClassification::Indeterminate,
+        "the Bound claim must never be deleted by reconciliation"
+    );
+    assert!(!outcome.decisions[1].delete_allowed);
+    assert_eq!(
+        kubernetes_delete_path(
+            outcome.decisions[0]
+                .resource
+                .as_ref()
+                .expect("orphan decision carries its resource")
+        )
+        .expect("delete path"),
+        format!(
+            "/api/v1/namespaces/sandboxwich-ci/persistentvolumeclaims/sandboxwich-pvc-{leaked}"
+        )
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
