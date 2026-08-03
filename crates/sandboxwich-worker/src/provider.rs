@@ -39,7 +39,7 @@ use sandboxwich_core::{
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::egress_gateway::EgressGatewayPolicy;
@@ -178,6 +178,11 @@ pub const DEFAULT_MAX_CAPTURED_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
 pub const APEX_TASK_INSTRUCTIONS_MAX_BYTES: usize = 1024 * 1024;
 const APEX_TASK_INSTRUCTIONS_COMMAND: &str = "/opt/apex/bin/task-instructions";
 const COMPILER_CACHE_HELPER_CONTAINER: &str = "compiler-cache-helper";
+// Keep the compiler-cache helper distinct from the guest workload while
+// remaining compatible with Kubernetes Pod Security "restricted". The
+// shared workspace group lets the helper publish an activated cache for the
+// guest without requiring root or the CHOWN capability.
+const COMPILER_CACHE_HELPER_UID: u32 = 10_002;
 
 /// Default bound applied to every `kubectl` invocation made by
 /// [`KubernetesApplyProvider`] (see [`run_kubectl_command`]). Pod readiness
@@ -1327,6 +1332,13 @@ impl KubernetesDryRunProvider {
             }),
         };
         let mut volumes = vec![workspace_volume];
+        // The private archive is visible only to the compiler-cache helper.
+        // Mounting it separately means the guest never needs access to the
+        // staged archive, even though the helper itself is non-root.
+        volumes.push(json!({
+            "name": "compiler-cache-private",
+            "emptyDir": {}
+        }));
         let mut env = vec![
             json!({
                 "name": "SANDBOXWICH_WORKSPACE",
@@ -1519,37 +1531,22 @@ impl KubernetesDryRunProvider {
         let compiler_cache_security_context = json!({
             "allowPrivilegeEscalation": false,
             "readOnlyRootFilesystem": true,
-            "runAsNonRoot": false,
-            "runAsUser": 0,
-            "runAsGroup": 0,
-            "capabilities": { "drop": ["ALL"], "add": ["CHOWN"] },
+            "runAsNonRoot": true,
+            "runAsUser": COMPILER_CACHE_HELPER_UID,
+            "runAsGroup": SANDBOX_WORKSPACE_GID,
+            "capabilities": { "drop": ["ALL"] },
             "seccompProfile": { "type": "RuntimeDefault" }
         });
         let compiler_cache_mounts = json!([{
             "name": "workspace",
             "mountPath": "/workspace"
+        }, {
+            "name": "compiler-cache-private",
+            "mountPath": "/workspace/.sandboxwich-private"
         }]);
         let mut pod_spec = Map::from_iter([
             ("automountServiceAccountToken".to_string(), json!(false)),
             ("securityContext".to_string(), pod_security_context),
-            (
-                "initContainers".to_string(),
-                json!([{
-                    "name": "compiler-cache-init",
-                    "image": self.runtime_image,
-                    "imagePullPolicy": image_pull_policy_for(&self.runtime_image),
-                    "command": [
-                        "/usr/local/bin/sandboxwich-agent",
-                        "compiler-cache-prepare-workspace"
-                    ],
-                    "resources": {
-                        "requests": { "cpu": "5m", "memory": "16Mi" },
-                        "limits": { "cpu": "50m", "memory": "64Mi" }
-                    },
-                    "securityContext": compiler_cache_security_context,
-                    "volumeMounts": compiler_cache_mounts
-                }]),
-            ),
             (
                 "containers".to_string(),
                 json!([{
@@ -5150,18 +5147,67 @@ struct KubectlOutput {
     stderr: String,
 }
 
+#[derive(Debug)]
+struct CappedBytes {
+    bytes: Vec<u8>,
+    omitted_bytes: u64,
+}
+
+/// Drain a child stream without retaining more than `max_bytes` in memory.
+///
+/// The worker must keep reading after the cap so the child cannot deadlock on
+/// a full pipe, but retaining the complete stream and truncating afterward
+/// still lets a noisy `kubectl` invocation OOM the worker before the cap is
+/// applied. This helper bounds the retained bytes while preserving the exact
+/// omitted-byte count for the caller's diagnostic marker.
+async fn read_to_end_bounded<R>(reader: &mut R, max_bytes: u64) -> std::io::Result<CappedBytes>
+where
+    R: AsyncRead + Unpin,
+{
+    const READ_BUFFER_BYTES: usize = 8 * 1024;
+    let max_bytes = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    let mut captured = Vec::with_capacity(max_bytes.min(READ_BUFFER_BYTES));
+    let mut buffer = [0_u8; READ_BUFFER_BYTES];
+    let mut omitted_bytes = 0_u64;
+
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = max_bytes.saturating_sub(captured.len());
+        let keep = remaining.min(read);
+        captured.extend_from_slice(&buffer[..keep]);
+        omitted_bytes = omitted_bytes.saturating_add((read - keep) as u64);
+    }
+
+    Ok(CappedBytes {
+        bytes: captured,
+        omitted_bytes,
+    })
+}
+
+fn format_capped_output(bytes: &[u8], omitted_bytes: u64) -> String {
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    if omitted_bytes > 0 {
+        text.push_str(&format!("\n[truncated {omitted_bytes} bytes]\n"));
+    }
+    text
+}
+
 /// Decodes `bytes` as (possibly lossy) UTF-8, capping the result at
 /// `max_bytes`. When truncated, appends a marker noting how many bytes were
 /// cut so a truncated capture is never mistaken for the complete output.
+#[cfg(test)]
 fn cap_output_bytes(bytes: &[u8], max_bytes: u64) -> String {
     let max_bytes = usize::try_from(max_bytes).unwrap_or(usize::MAX);
     if bytes.len() <= max_bytes {
-        return String::from_utf8_lossy(bytes).into_owned();
+        return format_capped_output(bytes, 0);
     }
-    let omitted = bytes.len() - max_bytes;
-    let mut text = String::from_utf8_lossy(&bytes[..max_bytes]).into_owned();
-    text.push_str(&format!("\n[truncated {omitted} bytes]\n"));
-    text
+    format_capped_output(
+        bytes.get(..max_bytes).unwrap_or_default(),
+        (bytes.len() - max_bytes) as u64,
+    )
 }
 
 /// Applies/deletes `manifests` via `kubectl -f -`, piping the rendered documents to
@@ -5472,8 +5518,6 @@ async fn run_kubectl_command_async(
     // blocks writing to a full pipe while we block waiting for it to exit).
     // The same reasoning applies to writing the stdin payload.
     let drive = async {
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
         let feed_stdin = async {
             if let (Some(mut stdin), Some(payload)) = (stdin_pipe, stdin_payload) {
                 stdin.write_all(payload).await?;
@@ -5483,12 +5527,12 @@ async fn run_kubectl_command_async(
         let (status, feed_result, stdout_result, stderr_result) = tokio::join!(
             child.wait(),
             feed_stdin,
-            stdout_pipe.read_to_end(&mut stdout),
-            stderr_pipe.read_to_end(&mut stderr),
+            read_to_end_bounded(&mut stdout_pipe, max_output_bytes),
+            read_to_end_bounded(&mut stderr_pipe, max_output_bytes),
         );
         let status = status?;
-        stdout_result?;
-        stderr_result?;
+        let stdout = stdout_result?;
+        let stderr = stderr_result?;
         if status.success() {
             feed_result?;
         }
@@ -5524,8 +5568,8 @@ async fn run_kubectl_command_async(
                         success: status.success(),
                         code: status.code(),
                         status: status.to_string(),
-                        stdout: cap_output_bytes(&stdout, max_output_bytes),
-                        stderr: cap_output_bytes(&stderr, max_output_bytes),
+                        stdout: format_capped_output(&stdout.bytes, stdout.omitted_bytes),
+                        stderr: format_capped_output(&stderr.bytes, stderr.omitted_bytes),
                     })
                 }
                 Err(_elapsed) => {

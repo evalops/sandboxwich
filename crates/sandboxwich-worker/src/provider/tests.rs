@@ -64,23 +64,13 @@ esac
 }
 
 #[test]
-fn compiler_cache_helper_has_a_distinct_minimal_root_boundary() {
+fn compiler_cache_helper_has_a_distinct_restricted_boundary() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let pod = provider.pod_manifest(SandboxId::new(), &SandboxProvisionSpec::default());
-    let init = &pod["spec"]["initContainers"][0];
-    assert_eq!(init["name"], "compiler-cache-init");
-    assert_eq!(
-        init["command"],
-        json!([
-            "/usr/local/bin/sandboxwich-agent",
-            "compiler-cache-prepare-workspace"
-        ])
-    );
-    assert_eq!(init["securityContext"]["runAsUser"], 0);
-    assert_eq!(
-        init["securityContext"]["capabilities"],
-        json!({"drop": ["ALL"], "add": ["CHOWN"]})
+    assert!(
+        pod["spec"].get("initContainers").is_none(),
+        "restricted clusters must not need a privileged cache init container"
     );
 
     let containers = pod["spec"]["containers"].as_array().unwrap();
@@ -95,22 +85,51 @@ fn compiler_cache_helper_has_a_distinct_minimal_root_boundary() {
     assert_eq!(workload["securityContext"]["runAsNonRoot"], true);
     assert_eq!(pod["spec"]["securityContext"]["runAsUser"], 10001);
     assert_eq!(pod["spec"]["securityContext"]["runAsGroup"], 10001);
-    assert_eq!(helper["securityContext"]["runAsUser"], 0);
+    assert_eq!(helper["securityContext"]["runAsNonRoot"], true);
+    assert_eq!(
+        helper["securityContext"]["runAsUser"],
+        COMPILER_CACHE_HELPER_UID
+    );
+    assert_eq!(
+        helper["securityContext"]["runAsGroup"],
+        SANDBOX_WORKSPACE_GID
+    );
     assert_eq!(helper["securityContext"]["allowPrivilegeEscalation"], false);
     assert_eq!(helper["securityContext"]["readOnlyRootFilesystem"], true);
     assert_eq!(
         helper["securityContext"]["capabilities"],
-        json!({"drop": ["ALL"], "add": ["CHOWN"]})
+        json!({"drop": ["ALL"]})
     );
     assert!(helper.get("env").is_none());
     assert!(helper.get("ports").is_none());
-    assert_eq!(helper["volumeMounts"].as_array().unwrap().len(), 1);
+    assert_eq!(helper["volumeMounts"].as_array().unwrap().len(), 2);
     assert_eq!(helper["volumeMounts"][0]["name"], "workspace");
+    assert_eq!(helper["volumeMounts"][1]["name"], "compiler-cache-private");
+    assert_eq!(
+        helper["volumeMounts"][1]["mountPath"],
+        "/workspace/.sandboxwich-private"
+    );
+    assert!(
+        workload["volumeMounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|mount| mount["name"] != "compiler-cache-private"),
+        "the guest must not receive the helper-only archive volume"
+    );
+    assert!(
+        pod["spec"]["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|volume| volume["name"] == "compiler-cache-private"
+                && volume["emptyDir"].is_object())
+    );
     assert_eq!(pod["spec"]["automountServiceAccountToken"], false);
 }
 
 #[test]
-fn only_compiler_cache_provider_operations_can_target_root_helper() {
+fn only_compiler_cache_provider_operations_can_target_compiler_cache_helper() {
     let provider = KubernetesApplyProvider::new(
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None),
         "kubectl",
