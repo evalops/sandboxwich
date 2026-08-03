@@ -178,6 +178,16 @@ pub const DEFAULT_MAX_CAPTURED_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
 pub const APEX_TASK_INSTRUCTIONS_MAX_BYTES: usize = 1024 * 1024;
 const APEX_TASK_INSTRUCTIONS_COMMAND: &str = "/opt/apex/bin/task-instructions";
 const COMPILER_CACHE_HELPER_CONTAINER: &str = "compiler-cache-helper";
+/// EmptyDir mounted only into `compiler-cache-init` and
+/// `compiler-cache-helper`. The guest container deliberately does not mount it,
+/// so staged compiler-cache restore archives are absent from the guest's mount
+/// namespace instead of merely mode-0700 inside it.
+const COMPILER_CACHE_PRIVATE_VOLUME: &str = "compiler-cache-private";
+const COMPILER_CACHE_PRIVATE_MOUNT_PATH: &str = "/run/sandboxwich/compiler-cache";
+/// Bounds the staging volume above the agent's 64 MiB compressed-archive limit,
+/// leaving room for the in-flight temporary file the staging write uses before
+/// its rename.
+const COMPILER_CACHE_PRIVATE_SIZE_LIMIT: &str = "128Mi";
 
 /// Default bound applied to every `kubectl` invocation made by
 /// [`KubernetesApplyProvider`] (see [`run_kubectl_command`]). Pod readiness
@@ -1516,19 +1526,33 @@ impl KubernetesDryRunProvider {
                 "seccompProfile": { "type": "RuntimeDefault" }
             })
         };
+        // Pinned to the unprivileged guest UID on every runtime profile,
+        // including ApexTrustedSupervisorV1 whose pod securityContext runs as
+        // root. Compiler-cache staging no longer needs ownership authority over
+        // /workspace, so these two containers satisfy PodSecurity
+        // restricted:latest without an exemption.
         let compiler_cache_security_context = json!({
             "allowPrivilegeEscalation": false,
             "readOnlyRootFilesystem": true,
-            "runAsNonRoot": false,
-            "runAsUser": 0,
-            "runAsGroup": 0,
-            "capabilities": { "drop": ["ALL"], "add": ["CHOWN"] },
+            "runAsNonRoot": true,
+            "runAsUser": 10001,
+            "runAsGroup": 10001,
+            "capabilities": { "drop": ["ALL"] },
             "seccompProfile": { "type": "RuntimeDefault" }
         });
         let compiler_cache_mounts = json!([{
             "name": "workspace",
             "mountPath": "/workspace"
+        }, {
+            "name": COMPILER_CACHE_PRIVATE_VOLUME,
+            "mountPath": COMPILER_CACHE_PRIVATE_MOUNT_PATH
         }]);
+        // Appended last so `pod_manifest_with_home` keeps rewriting the
+        // workspace volume at index 0.
+        volumes.push(json!({
+            "name": COMPILER_CACHE_PRIVATE_VOLUME,
+            "emptyDir": { "sizeLimit": COMPILER_CACHE_PRIVATE_SIZE_LIMIT }
+        }));
         let mut pod_spec = Map::from_iter([
             ("automountServiceAccountToken".to_string(), json!(false)),
             ("securityContext".to_string(), pod_security_context),

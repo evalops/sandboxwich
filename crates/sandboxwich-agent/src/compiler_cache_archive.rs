@@ -16,14 +16,21 @@ use std::{
 
 pub(crate) const IDENTITY_ENTRY: &str = "foam-compiler-cache-identity-v1.json";
 pub(crate) const DEFAULT_CACHE_ROOT: &str = "/workspace/.cache/sccache";
+/// Staged restore archives live on `compiler-cache-private`, an emptyDir that
+/// the worker mounts only into the `compiler-cache-init` and
+/// `compiler-cache-helper` containers. The guest container does not mount it,
+/// so the staging area is absent from the guest's mount namespace rather than
+/// merely unreadable inside it.
 pub(crate) const DEFAULT_RESTORE_ARCHIVE: &str =
-    "/workspace/.sandboxwich-private/compiler-cache-restore.tar.gz";
+    "/run/sandboxwich/compiler-cache/staging/compiler-cache-restore.tar.gz";
 pub(crate) const DEFAULT_CAPTURE_ARCHIVE: &str = "/workspace/.foam/compiler-cache-capture.tar.gz";
 const WORKSPACE_ROOT: &str = "/workspace";
-const PRIVATE_ROOT: &str = "/workspace/.sandboxwich-private";
 const CACHE_PARENT: &str = "/workspace/.cache";
-const WORKLOAD_UID: u32 = 10001;
-const WORKLOAD_GID: u32 = 10001;
+const CACHE_DIRECTORY_NAME: &str = ".cache";
+/// Mount point of the helper-only staging volume.
+const PRIVATE_MOUNT_ROOT: &str = "/run/sandboxwich/compiler-cache";
+const PRIVATE_DIRECTORY_NAME: &str = "staging";
+const PRIVATE_ROOT: &str = "/run/sandboxwich/compiler-cache/staging";
 
 const MAX_COMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_UNCOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
@@ -277,26 +284,18 @@ pub(crate) fn restore(
 }
 
 pub(crate) fn prepare_workspace_boundary() -> Result<()> {
-    prepare_workspace_boundary_at(Path::new(WORKSPACE_ROOT), 0, 0)
+    prepare_workspace_boundary_at(Path::new(WORKSPACE_ROOT), Path::new(PRIVATE_MOUNT_ROOT))
 }
 
 pub(crate) fn run_helper() -> Result<()> {
-    verify_workspace_boundary(
-        Path::new(WORKSPACE_ROOT),
-        Path::new(CACHE_PARENT),
-        Path::new(PRIVATE_ROOT),
-    )?;
+    verify_workspace_boundary(Path::new(CACHE_PARENT), Path::new(PRIVATE_ROOT))?;
     loop {
         std::thread::park();
     }
 }
 
 pub(crate) fn stage_restore_archive(expected_sha256: &str) -> Result<StagedArchiveSummary> {
-    verify_workspace_boundary(
-        Path::new(WORKSPACE_ROOT),
-        Path::new(CACHE_PARENT),
-        Path::new(PRIVATE_ROOT),
-    )?;
+    verify_workspace_boundary(Path::new(CACHE_PARENT), Path::new(PRIVATE_ROOT))?;
     let destination = Path::new(DEFAULT_RESTORE_ARCHIVE);
     let mut staged = tempfile::Builder::new()
         .prefix(".compiler-cache-upload-")
@@ -329,136 +328,138 @@ pub(crate) fn restore_for_workload(
 ) -> Result<ArchiveSummary> {
     if archive != Path::new(DEFAULT_RESTORE_ARCHIVE) || cache_root != Path::new(DEFAULT_CACHE_ROOT)
     {
-        bail!("root compiler-cache restore is confined to its fixed workspace paths");
+        bail!("compiler-cache restore is confined to its fixed staging and workspace paths");
     }
-    verify_workspace_boundary(
-        Path::new(WORKSPACE_ROOT),
+    restore_for_workload_at(
+        archive,
+        expected_sha256,
+        expected_identity,
+        cache_root,
         Path::new(CACHE_PARENT),
         Path::new(PRIVATE_ROOT),
-    )?;
+    )
+}
+
+/// Activate a staged archive after re-checking the staging boundary.
+///
+/// The helper runs as the same unprivileged UID as the guest, so the guest owns
+/// `/workspace/.cache` and directory ownership no longer carries the integrity
+/// guarantee. The compensating controls live in [`restore`]: the staged bytes
+/// must hash to `expected_sha256`, the embedded identity must byte-match
+/// `expected_identity`, and activation is a `RENAME_NOREPLACE` of a fully
+/// validated staging tree, so a guest-created destination fails the activation
+/// instead of being merged into.
+fn restore_for_workload_at(
+    archive: &Path,
+    expected_sha256: &str,
+    expected_identity: &[u8],
+    cache_root: &Path,
+    cache_parent: &Path,
+    private: &Path,
+) -> Result<ArchiveSummary> {
+    verify_workspace_boundary(cache_parent, private)?;
     let summary = restore(archive, expected_sha256, expected_identity, cache_root)?;
-    chown_activated_tree(cache_root, WORKLOAD_UID, WORKLOAD_GID)?;
-    sync_directory(Path::new(CACHE_PARENT))?;
+    sync_directory(cache_parent)?;
     Ok(summary)
 }
 
 #[cfg(unix)]
-fn prepare_workspace_boundary_at(workspace: &Path, owner_uid: u32, owner_gid: u32) -> Result<()> {
-    use std::os::unix::fs::{PermissionsExt, fchown};
+fn prepare_workspace_boundary_at(workspace: &Path, private_mount: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
 
-    let root = open_directory(workspace)?;
-    fchown(&root, Some(owner_uid), Some(owner_gid))?;
-    root.set_permissions(fs::Permissions::from_mode(0o1777))?;
-    for (name, mode) in [(".cache", 0o1777), (".sandboxwich-private", 0o700)] {
-        let path = Path::new(name);
-        match mkdirat(&root, path, Mode::RWXU) {
-            Ok(()) | Err(Errno::EXIST) => {}
-            Err(error) => return Err(error.into()),
-        }
-        let directory = File::from(openat(
-            &root,
-            path,
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
-            Mode::empty(),
-        )?);
-        fchown(&directory, Some(owner_uid), Some(owner_gid))?;
-        directory.set_permissions(fs::Permissions::from_mode(mode))?;
-        directory.sync_all()?;
+    // The guest owns `/workspace/.cache`: this container only guarantees the
+    // directory exists so a cold workload can initialize SCCACHE_DIR. Nothing
+    // is chowned here, which is why the init container needs neither the CHOWN
+    // capability nor a root UID.
+    let workspace_handle = open_directory(workspace)?;
+    let created_cache = match mkdirat(
+        &workspace_handle,
+        Path::new(CACHE_DIRECTORY_NAME),
+        Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+    ) {
+        Ok(()) => true,
+        Err(Errno::EXIST) => false,
+        Err(error) => return Err(error).context("create the workspace cache parent"),
+    };
+    let cache = open_child_directory(&workspace_handle, CACHE_DIRECTORY_NAME)?;
+    if created_cache {
+        // Only normalize the mode on a directory this run created. On a
+        // persistent workspace the guest already owns `.cache`, and re-chmodding
+        // it would fail for no security benefit.
+        cache.set_permissions(fs::Permissions::from_mode(0o755))?;
     }
-    root.sync_all()?;
+    cache.sync_all()?;
+    workspace_handle.sync_all()?;
+
+    // The staging root lives on the helper-only volume and is created as this
+    // container's own unprivileged UID at 0700, so `verify_workspace_boundary`
+    // can assert exclusive ownership at runtime without any root authority.
+    let mount_handle = open_directory(private_mount)?;
+    match mkdirat(&mount_handle, Path::new(PRIVATE_DIRECTORY_NAME), Mode::RWXU) {
+        Ok(()) | Err(Errno::EXIST) => {}
+        Err(error) => return Err(error).context("create the compiler-cache staging root"),
+    }
+    let staging = open_child_directory(&mount_handle, PRIVATE_DIRECTORY_NAME)?;
+    staging.set_permissions(fs::Permissions::from_mode(0o700))?;
+    staging.sync_all()?;
+    mount_handle.sync_all()?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn prepare_workspace_boundary_at(
-    _workspace: &Path,
-    _owner_uid: u32,
-    _owner_gid: u32,
-) -> Result<()> {
+fn prepare_workspace_boundary_at(_workspace: &Path, _private_mount: &Path) -> Result<()> {
     bail!("compiler-cache helper boundary requires Unix ownership semantics")
 }
 
+/// Assert the invariants the compiler-cache containers depend on.
+///
+/// `private` must be a real directory owned by this process's own effective UID
+/// at mode 0700, which is what makes the staged archive unreachable by anything
+/// other than the two containers that mount the staging volume. `cache_parent`
+/// only has to exist as a real directory (not a symlink); it is guest-owned by
+/// design now, and archive integrity is enforced by digest and identity checks
+/// during activation rather than by its ownership.
 #[cfg(unix)]
-fn verify_workspace_boundary(workspace: &Path, cache_parent: &Path, private: &Path) -> Result<()> {
+fn verify_workspace_boundary(cache_parent: &Path, private: &Path) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    for (path, mode) in [
-        (workspace, 0o1777),
-        (cache_parent, 0o1777),
-        (private, 0o700),
-    ] {
-        let metadata = fs::symlink_metadata(path)?;
-        if !metadata.is_dir()
-            || metadata.uid() != 0
-            || metadata.gid() != 0
-            || metadata.permissions().mode() & 0o7777 != mode
-        {
-            bail!("compiler-cache helper ownership boundary is not intact");
-        }
+    let private_metadata = fs::symlink_metadata(private)
+        .with_context(|| format!("stat compiler-cache staging root {}", private.display()))?;
+    if !private_metadata.is_dir()
+        || private_metadata.uid() != rustix::process::geteuid().as_raw()
+        || private_metadata.permissions().mode() & 0o7777 != 0o700
+    {
+        bail!("compiler-cache staging root is not a 0700 directory owned by this process");
+    }
+    let cache_metadata = fs::symlink_metadata(cache_parent).with_context(|| {
+        format!(
+            "stat compiler-cache workspace parent {}",
+            cache_parent.display()
+        )
+    })?;
+    if !cache_metadata.is_dir() {
+        bail!("compiler-cache workspace parent is not a directory");
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn verify_workspace_boundary(
-    _workspace: &Path,
-    _cache_parent: &Path,
-    _private: &Path,
-) -> Result<()> {
+fn verify_workspace_boundary(_cache_parent: &Path, _private: &Path) -> Result<()> {
     bail!("compiler-cache helper boundary requires Unix ownership semantics")
 }
 
 #[cfg(unix)]
-fn chown_activated_tree(root: &Path, uid: u32, gid: u32) -> Result<()> {
-    chown_activated_tree_with(root, uid, gid, |_| {})
-}
-
-#[cfg(unix)]
-fn chown_activated_tree_with(
-    root: &Path,
-    uid: u32,
-    gid: u32,
-    mut before_chown: impl FnMut(&Path),
-) -> Result<()> {
-    use std::os::unix::fs::fchown;
-
-    let root_handle = open_directory(root)?;
-    let mut files = BTreeSet::new();
-    let mut directories = BTreeSet::new();
-    collect_extracted_tree(root, root, &mut files, &mut directories)?;
-    for (path, _) in files {
-        let file = open_confined(
-            &root_handle,
-            &path,
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )?;
-        before_chown(&path);
-        fchown(&file, Some(uid), Some(gid))?;
-        file.sync_all()?;
+fn open_child_directory(parent: &File, name: &str) -> Result<File> {
+    let directory = File::from(openat(
+        parent,
+        Path::new(name),
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+        Mode::empty(),
+    )?);
+    if !directory.metadata()?.is_dir() {
+        bail!("compiler-cache boundary path is not a directory");
     }
-    let mut directories: Vec<_> = directories.into_iter().collect();
-    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    for path in directories {
-        let directory = open_confined(
-            &root_handle,
-            &path,
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
-            Mode::empty(),
-        )?;
-        before_chown(&path);
-        fchown(&directory, Some(uid), Some(gid))?;
-        directory.sync_all()?;
-    }
-    before_chown(Path::new(""));
-    fchown(&root_handle, Some(uid), Some(gid))?;
-    root_handle.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn chown_activated_tree(_root: &Path, _uid: u32, _gid: u32) -> Result<()> {
-    bail!("compiler-cache ownership handoff requires Unix ownership semantics")
+    Ok(directory)
 }
 
 fn restore_with_limits(
@@ -1444,102 +1445,150 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn workspace_boundary_is_sticky_and_private_roots_are_not_workload_writable() {
+    fn boundary_preparation_leaves_the_cache_to_the_guest_and_staging_to_this_process() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let workspace = tempfile::tempdir().unwrap();
-        let metadata = workspace.path().metadata().unwrap();
-        prepare_workspace_boundary_at(workspace.path(), metadata.uid(), metadata.gid()).unwrap();
-        assert_eq!(
-            workspace.path().metadata().unwrap().permissions().mode() & 0o7777,
-            0o1777
-        );
-        assert_eq!(
-            workspace
-                .path()
-                .join(".cache")
-                .metadata()
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o7777,
-            0o1777
-        );
-        fs::create_dir(workspace.path().join(".cache/sccache"))
+        let private_mount = tempfile::tempdir().unwrap();
+        prepare_workspace_boundary_at(workspace.path(), private_mount.path()).unwrap();
+
+        let cache_parent = workspace.path().join(".cache");
+        assert!(cache_parent.is_dir());
+        fs::create_dir(cache_parent.join("sccache"))
             .expect("a cold UID-10001 workload must be able to initialize SCCACHE_DIR");
-        assert_eq!(
-            workspace
-                .path()
-                .join(".sandboxwich-private")
-                .metadata()
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o7777,
-            0o700
-        );
+        fs::remove_dir(cache_parent.join("sccache")).unwrap();
+
+        let staging = private_mount.path().join(PRIVATE_DIRECTORY_NAME);
+        let metadata = fs::symlink_metadata(&staging).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o700);
+        assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+        verify_workspace_boundary(&cache_parent, &staging).unwrap();
+
+        // The init container must tolerate a warm persistent workspace.
+        prepare_workspace_boundary_at(workspace.path(), private_mount.path()).unwrap();
+        verify_workspace_boundary(&cache_parent, &staging).unwrap();
     }
 
     #[cfg(unix)]
     #[test]
-    fn ownership_handoff_visits_files_and_directories_before_root() {
-        use std::os::unix::fs::MetadataExt;
-
-        let root = tempfile::tempdir().unwrap();
-        fs::create_dir_all(root.path().join("a/b")).unwrap();
-        fs::write(root.path().join("a/b/object"), b"object").unwrap();
-        let metadata = root.path().metadata().unwrap();
-        let mut visited = Vec::new();
-        chown_activated_tree_with(root.path(), metadata.uid(), metadata.gid(), |path| {
-            visited.push(path.to_path_buf());
-        })
-        .unwrap();
-        assert_eq!(visited.last(), Some(&PathBuf::new()));
-        assert!(
-            visited
-                .iter()
-                .position(|path| path == Path::new("a/b/object"))
-                < visited.iter().position(|path| path == Path::new("a/b"))
-        );
-        assert!(
-            visited.iter().position(|path| path == Path::new("a/b"))
-                < visited.iter().position(|path| path == Path::new("a"))
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[ignore = "requires root to spawn the hostile UID-10001 workload"]
-    fn distinct_workload_uid_cannot_overwrite_or_swap_root_staging() {
-        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+    fn boundary_verification_rejects_a_loosened_swapped_or_missing_staging_root() {
+        use std::os::unix::fs::PermissionsExt;
 
         let workspace = tempfile::tempdir().unwrap();
-        prepare_workspace_boundary_at(workspace.path(), 0, 0).unwrap();
-        let staging = workspace.path().join(".cache/.compiler-cache-restore-test");
-        fs::create_dir_all(staging.join("a/b")).unwrap();
-        fs::write(staging.join("a/b/object"), b"original").unwrap();
+        let private_mount = tempfile::tempdir().unwrap();
+        prepare_workspace_boundary_at(workspace.path(), private_mount.path()).unwrap();
+        let cache_parent = workspace.path().join(".cache");
+        let staging = private_mount.path().join(PRIVATE_DIRECTORY_NAME);
+
+        for mode in [0o750, 0o770, 0o777, 0o500] {
+            fs::set_permissions(&staging, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                verify_workspace_boundary(&cache_parent, &staging).is_err(),
+                "mode {mode:o} was accepted"
+            );
+        }
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o700)).unwrap();
+        verify_workspace_boundary(&cache_parent, &staging).unwrap();
+
+        // A staging root swapped for a symlink is not a directory we own.
+        let elsewhere = private_mount.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o700)).unwrap();
+        let swapped = private_mount.path().join("swapped");
+        std::os::unix::fs::symlink(&elsewhere, &swapped).unwrap();
+        assert!(verify_workspace_boundary(&cache_parent, &swapped).is_err());
+
+        // A workspace parent replaced by a symlink is refused before any write.
+        let cache_symlink = workspace.path().join("cache-symlink");
+        std::os::unix::fs::symlink(&cache_parent, &cache_symlink).unwrap();
+        assert!(verify_workspace_boundary(&cache_symlink, &staging).is_err());
+
+        fs::remove_dir_all(&cache_parent).unwrap();
+        assert!(verify_workspace_boundary(&cache_parent, &staging).is_err());
+        assert!(verify_workspace_boundary(&cache_parent, &staging.join("absent")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_archive_tampering_is_rejected_now_that_the_guest_owns_the_cache_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let private_mount = tempfile::tempdir().unwrap();
+        prepare_workspace_boundary_at(workspace.path(), private_mount.path()).unwrap();
+        let cache_parent = workspace.path().join(".cache");
+        let staging = private_mount.path().join(PRIVATE_DIRECTORY_NAME);
+        let cache_root = cache_parent.join("sccache");
+
+        let source = workspace.path().join("source");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("nested/object"), b"cached-object").unwrap();
+        let archive = staging.join("compiler-cache-restore.tar.gz");
+        capture(&source, FOAM_IDENTITY, &archive).unwrap();
+        let expected = digest(&archive);
+
+        let activate = |archive: &Path, expected: &str, identity: &[u8]| {
+            restore_for_workload_at(
+                archive,
+                expected,
+                identity,
+                &cache_root,
+                &cache_parent,
+                &staging,
+            )
+        };
+
+        // Same bytes, different expected identity: refused.
+        let foreign = identity_replacing(
+            "\"sourceTreeSha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+            "\"sourceTreeSha\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"",
+        );
+        assert!(activate(&archive, &expected, &foreign).is_err());
+        assert!(!cache_root.exists());
+
+        // Staged bytes flipped under the recorded digest: refused.
+        let tampered = staging.join("tampered.tar.gz");
+        let mut bytes = fs::read(&archive).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        fs::write(&tampered, &bytes).unwrap();
+        assert!(activate(&tampered, &expected, FOAM_IDENTITY).is_err());
+        assert!(!cache_root.exists());
+
+        // Staged archive wholesale-replaced by a well-formed archive over
+        // attacker-chosen content: refused, because its digest is not the one
+        // the control plane recorded.
+        let other_source = workspace.path().join("other-source");
+        fs::create_dir_all(other_source.join("nested")).unwrap();
+        fs::write(other_source.join("nested/object"), b"attacker-object").unwrap();
+        let other = staging.join("other.tar.gz");
+        capture(&other_source, FOAM_IDENTITY, &other).unwrap();
+        assert_ne!(digest(&other), expected);
+        assert!(activate(&other, &expected, FOAM_IDENTITY).is_err());
+        assert!(!cache_root.exists());
+
+        // A loosened staging root fails closed before any activation work.
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(activate(&archive, &expected, FOAM_IDENTITY).is_err());
+        assert!(!cache_root.exists());
         fs::set_permissions(&staging, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let overwrite = std::process::Command::new("sh")
-            .args(["-c", "printf 'mutated!' > \"$1/a/b/object\"", "sh"])
-            .arg(&staging)
-            .uid(WORKLOAD_UID)
-            .gid(WORKLOAD_GID)
-            .status()
-            .unwrap();
-        assert!(!overwrite.success());
-        assert_eq!(fs::read(staging.join("a/b/object")).unwrap(), b"original");
+        // The untampered archive still activates, owned by this process.
+        let summary = activate(&archive, &expected, FOAM_IDENTITY).unwrap();
+        assert_eq!(summary.sha256, expected);
+        assert_eq!(
+            fs::read(cache_root.join("nested/object")).unwrap(),
+            b"cached-object"
+        );
 
-        let swap = std::process::Command::new("sh")
-            .args(["-c", "mv \"$1/a\" \"$2/swapped-a\"", "sh"])
-            .arg(&staging)
-            .arg(workspace.path())
-            .uid(WORKLOAD_UID)
-            .gid(WORKLOAD_GID)
-            .status()
-            .unwrap();
-        assert!(!swap.success());
-        assert!(staging.join("a/b/object").is_file());
+        // A guest that pre-creates the destination gets a failed activation,
+        // never a partially merged cache.
+        assert!(activate(&archive, &expected, FOAM_IDENTITY).is_err());
+        assert_eq!(
+            fs::read(cache_root.join("nested/object")).unwrap(),
+            b"cached-object"
+        );
     }
 
     #[cfg(unix)]

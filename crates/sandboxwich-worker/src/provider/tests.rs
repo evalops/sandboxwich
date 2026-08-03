@@ -63,13 +63,83 @@ esac
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+fn assert_compiler_cache_containers_are_restricted(pod: &serde_json::Value) {
+    let init = &pod["spec"]["initContainers"][0];
+    assert_eq!(init["name"], "compiler-cache-init");
+    let containers = pod["spec"]["containers"].as_array().unwrap();
+    let workload = containers
+        .iter()
+        .find(|container| container["name"] == "sandbox")
+        .unwrap();
+    let helper = containers
+        .iter()
+        .find(|container| container["name"] == COMPILER_CACHE_HELPER_CONTAINER)
+        .unwrap();
+
+    for (label, container) in [
+        ("compiler-cache-init", init),
+        ("compiler-cache-helper", helper),
+    ] {
+        let security = &container["securityContext"];
+        // PodSecurity restricted:latest: non-root, no added capabilities, no
+        // privilege escalation, RuntimeDefault seccomp.
+        assert_eq!(security["runAsNonRoot"], true, "{label}");
+        assert_eq!(security["runAsUser"], 10001, "{label}");
+        assert_eq!(security["runAsGroup"], 10001, "{label}");
+        assert_eq!(security["allowPrivilegeEscalation"], false, "{label}");
+        assert_eq!(security["readOnlyRootFilesystem"], true, "{label}");
+        assert_eq!(
+            security["capabilities"],
+            json!({"drop": ["ALL"]}),
+            "{label}"
+        );
+        assert!(security["capabilities"].get("add").is_none(), "{label}");
+        assert_eq!(
+            security["seccompProfile"],
+            json!({"type": "RuntimeDefault"}),
+            "{label}"
+        );
+
+        let mounts = container["volumeMounts"].as_array().unwrap();
+        assert!(
+            mounts.iter().any(|mount| {
+                mount["name"] == "compiler-cache-private"
+                    && mount["mountPath"] == "/run/sandboxwich/compiler-cache"
+            }),
+            "{label} does not mount the private staging volume"
+        );
+        // The 5m/16Mi request shape is budgeted in the deploy repo's namespace
+        // quota arithmetic; changing it needs a matching quota change.
+        assert_eq!(
+            container["resources"]["requests"],
+            json!({"cpu": "5m", "memory": "16Mi"}),
+            "{label}"
+        );
+    }
+
+    // The guest never mounts the staging volume, so the staged restore archive
+    // is outside the guest's mount namespace entirely.
+    assert!(
+        workload["volumeMounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|mount| mount["name"] != "compiler-cache-private"),
+        "the guest container mounts the compiler-cache staging volume"
+    );
+    let volumes = pod["spec"]["volumes"].as_array().unwrap();
+    assert_eq!(volumes[0]["name"], "workspace");
+    assert!(volumes.iter().any(|volume| {
+        volume["name"] == "compiler-cache-private" && volume["emptyDir"].is_object()
+    }));
+}
+
 #[test]
-fn compiler_cache_helper_has_a_distinct_minimal_root_boundary() {
+fn compiler_cache_containers_are_non_root_with_a_guest_invisible_staging_volume() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
     let pod = provider.pod_manifest(SandboxId::new(), &SandboxProvisionSpec::default());
     let init = &pod["spec"]["initContainers"][0];
-    assert_eq!(init["name"], "compiler-cache-init");
     assert_eq!(
         init["command"],
         json!([
@@ -77,11 +147,8 @@ fn compiler_cache_helper_has_a_distinct_minimal_root_boundary() {
             "compiler-cache-prepare-workspace"
         ])
     );
-    assert_eq!(init["securityContext"]["runAsUser"], 0);
-    assert_eq!(
-        init["securityContext"]["capabilities"],
-        json!({"drop": ["ALL"], "add": ["CHOWN"]})
-    );
+
+    assert_compiler_cache_containers_are_restricted(&pod);
 
     let containers = pod["spec"]["containers"].as_array().unwrap();
     let workload = containers
@@ -95,18 +162,24 @@ fn compiler_cache_helper_has_a_distinct_minimal_root_boundary() {
     assert_eq!(workload["securityContext"]["runAsNonRoot"], true);
     assert_eq!(pod["spec"]["securityContext"]["runAsUser"], 10001);
     assert_eq!(pod["spec"]["securityContext"]["runAsGroup"], 10001);
-    assert_eq!(helper["securityContext"]["runAsUser"], 0);
-    assert_eq!(helper["securityContext"]["allowPrivilegeEscalation"], false);
-    assert_eq!(helper["securityContext"]["readOnlyRootFilesystem"], true);
-    assert_eq!(
-        helper["securityContext"]["capabilities"],
-        json!({"drop": ["ALL"], "add": ["CHOWN"]})
-    );
     assert!(helper.get("env").is_none());
     assert!(helper.get("ports").is_none());
-    assert_eq!(helper["volumeMounts"].as_array().unwrap().len(), 1);
-    assert_eq!(helper["volumeMounts"][0]["name"], "workspace");
     assert_eq!(pod["spec"]["automountServiceAccountToken"], false);
+}
+
+#[test]
+fn apex_trusted_supervisor_does_not_leak_root_into_the_compiler_cache_containers() {
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+    let spec = SandboxProvisionSpec {
+        runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
+        ..SandboxProvisionSpec::default()
+    };
+    let pod = provider.pod_manifest(SandboxId::new(), &spec);
+    // The trusted profile deliberately runs the pod and the guest container as
+    // root; the compiler-cache containers must not inherit that.
+    assert_eq!(pod["spec"]["securityContext"]["runAsUser"], 0);
+    assert_compiler_cache_containers_are_restricted(&pod);
 }
 
 #[test]
