@@ -216,6 +216,7 @@ pub(crate) async fn attempt_reap_candidate(
             "deadline": deadline,
             "triggeredBy": "expiry_sweeper",
         }),
+        None,
     )
     .await;
     Ok(match stop {

@@ -2393,6 +2393,7 @@ async fn reap_cas_miss_skips_instead_of_enqueuing_a_redundant_stop_job() {
         &ResidentBootstrapStore::default(),
         &sandbox,
         json!({"state": "archiving", "reason": "stop_requested"}),
+        None,
     )
     .await
     .expect("the winning stop must not error");
