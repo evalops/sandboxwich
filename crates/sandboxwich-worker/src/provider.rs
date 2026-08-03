@@ -252,6 +252,12 @@ pub(crate) struct SandboxTeardownSpec {
     pub(crate) delete_gke_fqdn_policy: bool,
 }
 
+fn kubectl_optional_resource_type_is_missing(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("the server doesn't have a resource type")
+        || stderr.contains("the server does not have a resource type")
+}
+
 /// Cheaply cloneable signal a job's background lease-renewal task (see
 /// `handle_lease` in `main.rs`) uses to tell an in-flight `exec_handoff` call
 /// that the lease is gone -- renewal failed after retries -- so the
@@ -864,13 +870,6 @@ impl KubernetesDryRunProvider {
             self.fqdn_egress_backend = Some("cilium".to_string());
         }
         self
-    }
-
-    fn teardown_resource_kinds_with_persisted_gke_fqdn(&self, persisted_gke_fqdn: bool) -> String {
-        self.resource_kinds_with_optional_gke_fqdn(
-            SANDBOX_TEARDOWN_RESOURCE_KINDS,
-            persisted_gke_fqdn,
-        )
     }
 
     fn reconciliation_resource_kinds(&self) -> String {
@@ -4320,24 +4319,40 @@ impl KubernetesApplyProvider {
     /// labeled with this sandbox's id. Split out from `stop` so it can be exercised
     /// in unit tests without invoking a real `kubectl` binary.
     fn teardown_args(&self, sandbox_id: SandboxId) -> Vec<String> {
-        self.teardown_args_with_spec(sandbox_id, &SandboxTeardownSpec::default())
+        self.teardown_args_for_resource_kinds(sandbox_id, SANDBOX_TEARDOWN_RESOURCE_KINDS)
     }
 
-    fn teardown_args_with_spec(
+    fn teardown_args_for_resource_kinds(
         &self,
         sandbox_id: SandboxId,
-        spec: &SandboxTeardownSpec,
+        resource_kinds: &str,
     ) -> Vec<String> {
         let mut args = self.kubectl_base_args();
         args.extend([
             "delete".to_string(),
-            self.dry_run
-                .teardown_resource_kinds_with_persisted_gke_fqdn(spec.delete_gke_fqdn_policy),
+            resource_kinds.to_string(),
             "-l".to_string(),
             format!("sandboxwich.dev/sandbox-id={sandbox_id}"),
             "--ignore-not-found=true".to_string(),
         ]);
         args
+    }
+
+    fn optional_teardown_args(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxTeardownSpec,
+    ) -> Vec<Vec<String>> {
+        let mut commands = Vec::new();
+        if spec.delete_gke_fqdn_policy {
+            commands
+                .push(self.teardown_args_for_resource_kinds(sandbox_id, GKE_FQDN_RESOURCE_KIND));
+        }
+        if self.dry_run.fqdn_egress_backend.as_deref() == Some("cilium") {
+            commands
+                .push(self.teardown_args_for_resource_kinds(sandbox_id, CILIUM_FQDN_RESOURCE_KIND));
+        }
+        commands
     }
 
     /// Best-effort teardown of every resource labeled with `sandbox_id`, used to
@@ -4395,6 +4410,35 @@ impl KubernetesApplyProvider {
                      could not run kubectl: {error:#} (resources may be leaked; original error is \
                      not masked by this)"
                 );
+            }
+        }
+        for args in self.optional_teardown_args(sandbox_id, &SandboxTeardownSpec::default()) {
+            match run_kubectl_command(
+                &self.kubectl,
+                &args,
+                "rollback optional sandbox resources after failed provision/fork",
+                self.kubectl_command_timeout,
+                None,
+                self.max_captured_output_bytes,
+            ) {
+                Ok(output)
+                    if output.success
+                        || kubectl_optional_resource_type_is_missing(&output.stderr) => {}
+                Ok(output) => {
+                    eprintln!(
+                        "warning: rollback of optional sandbox {sandbox_id} resources after failed \
+                         {context} itself failed with {}: {} (resources may be leaked; original \
+                         error is not masked by this)",
+                        output.status, output.stderr
+                    );
+                }
+                Err(error) => {
+                    eprintln!(
+                        "warning: rollback of optional sandbox {sandbox_id} resources after failed \
+                         {context} could not run kubectl: {error:#} (resources may be leaked; \
+                         original error is not masked by this)"
+                    );
+                }
             }
         }
     }
@@ -6690,7 +6734,10 @@ impl SandboxProvider for KubernetesApplyProvider {
         cancelled: &CancelSignal,
     ) -> anyhow::Result<()> {
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
-        let args = self.teardown_args_with_spec(sandbox_id, spec);
+        // Built-in resources must be deleted separately from optional CRDs.
+        // `kubectl delete a,b` aborts the whole request if either API kind is
+        // undiscoverable, even with `--ignore-not-found`.
+        let args = self.teardown_args(sandbox_id);
         let output = run_kubectl_command(
             &self.kubectl,
             &args,
@@ -6705,6 +6752,23 @@ impl SandboxProvider for KubernetesApplyProvider {
                 output.status,
                 output.stderr
             );
+        }
+        for args in self.optional_teardown_args(sandbox_id, spec) {
+            let output = run_kubectl_command(
+                &self.kubectl,
+                &args,
+                "delete optional sandbox resources",
+                self.kubectl_command_timeout,
+                Some(cancelled),
+                self.max_captured_output_bytes,
+            )?;
+            if !output.success && !kubectl_optional_resource_type_is_missing(&output.stderr) {
+                bail!(
+                    "kubectl delete optional sandbox resources failed with {}: {}",
+                    output.status,
+                    output.stderr
+                );
+            }
         }
         Ok(())
     }
