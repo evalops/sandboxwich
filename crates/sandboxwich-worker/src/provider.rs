@@ -3747,7 +3747,28 @@ impl KubernetesApplyProvider {
         apply: bool,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<ReconciliationOutcome> {
-        let started = std::time::Instant::now();
+        self.reconcile_orphans_with_delete(
+            inventory,
+            limits,
+            apply,
+            cancelled,
+            |resource, timeout, cancelled| {
+                self.delete_reconciled_resource(resource, timeout, cancelled)
+            },
+        )
+    }
+
+    fn reconcile_orphans_with_delete<F>(
+        &self,
+        inventory: anyhow::Result<RuntimeResourceInventoryResponse>,
+        limits: ReconciliationLimits,
+        apply: bool,
+        cancelled: &CancelSignal,
+        mut delete: F,
+    ) -> anyhow::Result<ReconciliationOutcome>
+    where
+        F: FnMut(&ObservedKubernetesResource, Duration, &CancelSignal) -> anyhow::Result<()>,
+    {
         let observed = match self.discover_reconciliation_resources(
             limits.max_scanned,
             limits.max_elapsed,
@@ -3813,19 +3834,24 @@ impl KubernetesApplyProvider {
         let mut decisions = plan_orphan_reconciliation(inventory, &observed, &expired, Utc::now());
         decisions.truncate(limits.max_scanned);
         let mut deleted = 0;
+        // Discovery has its own bounded provider-call timeout. Start the
+        // mutation budget only after the inventory is available, otherwise a
+        // large but valid inventory can consume the entire budget and starve
+        // every eligible cleanup forever.
+        let delete_started = std::time::Instant::now();
         if apply {
             for decision in &decisions {
-                if deleted >= limits.max_deleted || started.elapsed() >= limits.max_elapsed {
+                if deleted >= limits.max_deleted || delete_started.elapsed() >= limits.max_elapsed {
                     break;
                 }
                 if decision.delete_allowed
                     && let Some(resource) = decision.resource.as_ref()
                 {
-                    let remaining = limits.max_elapsed.saturating_sub(started.elapsed());
+                    let remaining = limits.max_elapsed.saturating_sub(delete_started.elapsed());
                     if remaining.is_zero() {
                         break;
                     }
-                    self.delete_reconciled_resource(resource, remaining, cancelled)?;
+                    delete(resource, remaining, cancelled)?;
                     deleted += 1;
                 }
             }
