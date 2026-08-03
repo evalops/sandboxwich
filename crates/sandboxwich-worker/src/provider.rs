@@ -2955,7 +2955,18 @@ fn runtime_class_boundary_failure(message: String) -> ProviderError {
 fn classified_kubectl_failure(context: &str, stderr: &str) -> ProviderError {
     let message = format!("{context}: {stderr}");
     let normalized = stderr.to_ascii_lowercase();
-    if normalized.contains("unbound immediate persistentvolumeclaims")
+    // ResourceQuota rejections must be claimed here, ahead of the "forbidden"
+    // arm below. The API server phrases them with the same prefix it uses for
+    // RBAC denials -- `Error from server (Forbidden): ... is forbidden:
+    // exceeded quota: sandbox-capacity, requested: ..., limited: ...` -- so the
+    // "forbidden" test matched them first and returned `TerminalSecurity`,
+    // whose disposition is `RetryDisposition::Permanent`. A sandbox that lost a
+    // quota race therefore died on attempt 1 rather than waiting for a peer to
+    // release its slot; 1,285 provisions failed that way in three hours on
+    // 2026-08-02. Quota pressure is transient, so it belongs in the capacity
+    // class alongside the scheduler back-pressure signals below.
+    if normalized.contains("exceeded quota")
+        || normalized.contains("unbound immediate persistentvolumeclaims")
         || normalized.contains("insufficient cpu")
         || normalized.contains("insufficient memory")
         || normalized.contains("unschedulable")

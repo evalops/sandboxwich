@@ -4568,6 +4568,50 @@ fn kubectl_failures_map_to_typed_provisioning_error_classes() {
     }
 }
 
+/// A ResourceQuota rejection is capacity pressure, not a security verdict.
+///
+/// The API server phrases quota rejections with the same "(Forbidden)" prefix it
+/// uses for RBAC denials, so the `forbidden` arm of
+/// [`classified_kubectl_failure`] used to claim them first and return
+/// `TerminalSecurity`, whose disposition is `RetryDisposition::Permanent`. Every
+/// provision that lost a quota race then died on attempt 1 instead of waiting
+/// for a peer sandbox to release its slot: 1,285 provisions failed that way in a
+/// three-hour window on 2026-08-02.
+#[test]
+fn resource_quota_rejections_are_retryable_capacity_not_terminal_security() {
+    let stderr = "Error from server (Forbidden): error when creating \"STDIN\": \
+pods \"sandbox-6f2a\" is forbidden: exceeded quota: sandbox-capacity, \
+requested: pods=1, used: pods=4, limited: pods=4";
+
+    let error = classified_kubectl_failure("provision stage", stderr);
+
+    assert_eq!(
+        error.error_class(),
+        sandboxwich_core::ProvisioningErrorClass::RetryableCapacity,
+    );
+    assert_eq!(error.reason_code(), "workspace_capacity_pending");
+    assert_eq!(error.disposition(), RetryDisposition::Retryable);
+}
+
+/// The control for the test above: a genuine RBAC denial carries no quota text
+/// and must still be terminal, so a misconfigured ServiceAccount is not retried
+/// against the cluster forever.
+#[test]
+fn rbac_forbidden_still_classifies_as_terminal_security() {
+    let stderr = "Error from server (Forbidden): pods is forbidden: User \
+\"system:serviceaccount:sandboxwich:worker\" cannot create resource \"pods\" \
+in API group \"\" in the namespace \"sandboxwich\"";
+
+    let error = classified_kubectl_failure("provision stage", stderr);
+
+    assert_eq!(
+        error.error_class(),
+        sandboxwich_core::ProvisioningErrorClass::TerminalSecurity,
+    );
+    assert_eq!(error.reason_code(), "kubernetes_policy_denied");
+    assert_eq!(error.disposition(), RetryDisposition::Permanent);
+}
+
 #[test]
 fn unschedulable_pod_is_terminal_rather_than_a_readiness_timeout() {
     // The scheduler text a 4Gi sandbox gets against a pool whose nodes cannot
