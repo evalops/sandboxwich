@@ -100,6 +100,7 @@ async fn openapi_covers_every_public_v1_operation() {
         ("GET", "/v1/jobs"),
         ("POST", "/v1/jobs"),
         ("GET", "/v1/jobs/{job_id}"),
+        ("POST", "/v1/sandboxes/{sandbox_id}/apex-task-instructions"),
         ("POST", "/v1/divergence/reconcile"),
         ("POST", "/v1/sandboxes/{sandbox_id}/tool-call-ledger"),
         ("GET", "/v1/sandboxes/{sandbox_id}/divergence-findings"),

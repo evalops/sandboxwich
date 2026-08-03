@@ -191,6 +191,24 @@ async fn mark_unavailable(db: &Database, request_id: Uuid) -> Result<(), ApiErro
     Ok(())
 }
 
+/// Runner-host (evalops/platform `rust/services/runner-host`) is the only
+/// caller of this route and mirrors its request/response types by hand. The
+/// route is documented here so that mirror can be validated against the
+/// exported OpenAPI document instead of against itself.
+#[utoipa::path(
+    post,
+    path = "/v1/sandboxes/{sandbox_id}/apex-task-instructions",
+    params(
+        ("sandbox_id" = Uuid, Path),
+        ("Idempotency-Key" = String, Header, description = "Tenant-scoped replay key"),
+    ),
+    request_body = ApexTaskInstructionsReadRequest,
+    responses(
+        (status = 200, description = "Instruction read receipt", body = ApexTaskInstructionsReadResponse),
+        (status = 400, body = ErrorEnvelope),
+        (status = 409, description = "Sandbox is not a ready trusted-supervisor sandbox", body = ErrorEnvelope),
+    )
+)]
 pub(crate) async fn read_apex_task_instructions(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,

@@ -1,0 +1,4221 @@
+{
+  "components": {
+    "schemas": {
+      "ActivityClass": {
+        "enum": [
+          "process_spawn",
+          "network_connect",
+          "file_write"
+        ],
+        "type": "string"
+      },
+      "ApexTaskInstructionsReadRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "claimLeaseGeneration": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "expectedByteCount": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "expectedSha256": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "expectedSha256",
+          "expectedByteCount",
+          "claimLeaseGeneration"
+        ],
+        "type": "object"
+      },
+      "ApexTaskInstructionsReadResponse": {
+        "properties": {
+          "byteCount": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "leaseAttempt": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "leaseId": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "outputBase64": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "outputUnavailable": {
+            "type": "boolean"
+          },
+          "providerApplyId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "requestId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "sandboxId": {
+            "$ref": "#/components/schemas/SandboxId"
+          },
+          "sha256": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "requestId",
+          "sandboxId",
+          "leaseAttempt",
+          "providerApplyId",
+          "sha256",
+          "byteCount",
+          "outputUnavailable"
+        ],
+        "type": "object"
+      },
+      "CommandId": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "CommandOutputAnnotation": {
+        "oneOf": [
+          {
+            "properties": {
+              "end_index": {
+                "format": "int64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "file_id": {
+                "$ref": "#/components/schemas/FileId"
+              },
+              "path": {
+                "type": "string"
+              },
+              "start_index": {
+                "format": "int64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "enum": [
+                  "container_file_citation"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "file_id",
+              "path",
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "CommandOutputChunk": {
+        "properties": {
+          "annotations": {
+            "items": {
+              "$ref": "#/components/schemas/CommandOutputAnnotation"
+            },
+            "type": "array"
+          },
+          "chunk": {
+            "type": "string"
+          },
+          "command_id": {
+            "$ref": "#/components/schemas/CommandId"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "$ref": "#/components/schemas/CommandOutputChunkId"
+          },
+          "sequence": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "stream": {
+            "$ref": "#/components/schemas/CommandOutputStream"
+          }
+        },
+        "required": [
+          "id",
+          "command_id",
+          "stream",
+          "sequence",
+          "chunk",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "CommandOutputChunkId": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "CommandOutputListResponse": {
+        "properties": {
+          "chunks": {
+            "items": {
+              "$ref": "#/components/schemas/CommandOutputChunk"
+            },
+            "type": "array"
+          },
+          "complete": {
+            "description": "False while the command may still append more chunks.",
+            "type": "boolean"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "chunks"
+        ],
+        "type": "object"
+      },
+      "CommandOutputStream": {
+        "enum": [
+          "stdout",
+          "stderr"
+        ],
+        "type": "string"
+      },
+      "CommandRequest": {
+        "properties": {
+          "argv": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "cwd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "env": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "stdin": {
+            "description": "Bounded, non-secret bytes delivered to the guest process's stdin.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timeout_secs": {
+            "description": "Maximum time the command may run before the executor kills it and\nreports a timeout failure. Clamped to\n`(0, MAX_COMMAND_TIMEOUT_SECS]` by `queue_command`; `None`/omitted\nfalls back to `DEFAULT_COMMAND_TIMEOUT_SECS`.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "argv"
+        ],
+        "type": "object"
+      },
+      "CommandResponse": {
+        "properties": {
+          "command": {
+            "$ref": "#/components/schemas/CommandRun"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "command"
+        ],
+        "type": "object"
+      },
+      "CommandRun": {
+        "properties": {
+          "argv": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "cwd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "exit_code": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "$ref": "#/components/schemas/CommandId"
+          },
+          "sandbox_id": {
+            "$ref": "#/components/schemas/SandboxId"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CommandStatus"
+          },
+          "stderr": {
+            "type": "string"
+          },
+          "stdout": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "sandbox_id",
+          "status",
+          "argv",
+          "stdout",
+          "stderr",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "CommandStatus": {
+        "enum": [
+          "queued",
+          "running",
+          "finished",
+          "failed"
+        ],
+        "type": "string"
+      },
+      "CreateSandboxRequest": {
+        "properties": {
+          "execution_class": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ExecutionClass"
+              }
+            ]
+          },
+          "idle_ttl_seconds": {
+            "description": "See `Sandbox::idle_ttl_seconds`. Server-side default/clamp config\n(`SANDBOXWICH_DEFAULT_IDLE_TTL_SECONDS` /\n`SANDBOXWICH_MAX_IDLE_TTL_SECONDS`) applies when this is omitted or\nexceeds the operator-configured ceiling.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_lifetime_seconds": {
+            "description": "See `Sandbox::max_lifetime_seconds`. Server-side default/clamp config\n(`SANDBOXWICH_DEFAULT_MAX_LIFETIME_SECONDS` /\n`SANDBOXWICH_MAX_MAX_LIFETIME_SECONDS`) applies when this is omitted\nor exceeds the operator-configured ceiling.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memory_limit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MemoryLimit"
+              }
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "network_egress": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NetworkEgress"
+              }
+            ]
+          },
+          "runtime_profile": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SandboxRuntimeProfile"
+              }
+            ]
+          },
+          "secret_ref_ids": {
+            "description": "Secret references to deliver to this sandbox as read-only files. Each\nid is resolved in the caller's own tenant scope at create time; an\nunknown, revoked, or foreign reference fails the create rather than\nproducing a sandbox that silently lacks a credential.",
+            "items": {
+              "$ref": "#/components/schemas/SecretRefId"
+            },
+            "type": "array"
+          },
+          "template": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ttl_seconds": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "workspace_mode": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WorkspaceMode"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "CreateSecretRefRequest": {
+        "additionalProperties": false,
+        "description": "`deny_unknown_fields` is load-bearing: it is what makes \"the control plane\ncannot be handed raw credential bytes\" a contract rather than a\nconvention. A client that tries to send `value`/`data` is rejected by the\nextractor itself, before any handler runs (422 `invalid_request`).",
+        "properties": {
+          "delivery": {
+            "$ref": "#/components/schemas/SecretDelivery"
+          },
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/SecretSource"
+          },
+          "workspaceId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspaceId",
+          "name",
+          "source"
+        ],
+        "type": "object"
+      },
+      "CreateSnapshotRequest": {
+        "properties": {
+          "inventory": {},
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_metadata": {},
+          "ttl_seconds": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "DivergenceFinding": {
+        "properties": {
+          "activity_class": {
+            "$ref": "#/components/schemas/ActivityClass"
+          },
+          "detected_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/DivergenceKind"
+          },
+          "observation_external_id": {
+            "type": "string"
+          },
+          "receipt_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resource": {
+            "type": "string"
+          },
+          "sandbox_id": {
+            "$ref": "#/components/schemas/SandboxId"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/DivergenceFindingStatus"
+          }
+        },
+        "required": [
+          "id",
+          "sandbox_id",
+          "observation_external_id",
+          "session_id",
+          "kind",
+          "activity_class",
+          "resource",
+          "status",
+          "detected_at"
+        ],
+        "type": "object"
+      },
+      "DivergenceFindingListResponse": {
+        "properties": {
+          "findings": {
+            "items": {
+              "$ref": "#/components/schemas/DivergenceFinding"
+            },
+            "type": "array"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "findings"
+        ],
+        "type": "object"
+      },
+      "DivergenceFindingStatus": {
+        "enum": [
+          "open",
+          "resolved"
+        ],
+        "type": "string"
+      },
+      "DivergenceKind": {
+        "enum": [
+          "unaccounted_activity",
+          "receipt_scope_mismatch"
+        ],
+        "type": "string"
+      },
+      "DivergenceReconcileRequest": {
+        "properties": {
+          "observations": {
+            "items": {
+              "$ref": "#/components/schemas/SensorObservation"
+            },
+            "type": "array"
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "observations"
+        ],
+        "type": "object"
+      },
+      "DivergenceReconcileResponse": {
+        "properties": {
+          "findings_created": {
+            "items": {
+              "$ref": "#/components/schemas/DivergenceFinding"
+            },
+            "type": "array"
+          },
+          "observations_ingested": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "observations_matched": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "retry_after": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "ok",
+          "observations_ingested",
+          "observations_matched",
+          "findings_created"
+        ],
+        "type": "object"
+      },
+      "ErrorEnvelope": {
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
+      "ExecutionClass": {
+        "enum": [
+          "development_container",
+          "sandboxed_container",
+          "virtual_machine"
+        ],
+        "type": "string"
+      },
+      "FileId": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "ForkSnapshotRequest": {
+        "description": "Complete child configuration for restoring directly from a durable\nsnapshot. Fields needed to provision the child are intentionally required\nso this request does not depend on the source sandbox still existing.",
+        "properties": {
+          "idle_ttl_seconds": {
+            "description": "See `Sandbox::idle_ttl_seconds`.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_lifetime_seconds": {
+            "description": "See `Sandbox::max_lifetime_seconds`. Restoring a sandbox from a\nsnapshot is a sandbox-creation path like `create`/`fork`, so it goes\nthrough the same server-side default/clamp.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memory_limit": {
+            "$ref": "#/components/schemas/MemoryLimit"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "network_egress": {
+            "$ref": "#/components/schemas/NetworkEgress"
+          },
+          "runtime_profile": {
+            "$ref": "#/components/schemas/SandboxRuntimeProfile"
+          },
+          "template": {
+            "type": "string"
+          },
+          "ttl_seconds": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "template",
+          "memory_limit"
+        ],
+        "type": "object"
+      },
+      "JobId": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "JobKind": {
+        "enum": [
+          "provision_sandbox",
+          "stop_sandbox",
+          "resume_sandbox",
+          "run_command",
+          "run_resident_process",
+          "materialize_file",
+          "apex_task_instructions",
+          "run_prompt",
+          "create_snapshot",
+          "fork_sandbox",
+          "delete_home"
+        ],
+        "type": "string"
+      },
+      "JobStatus": {
+        "enum": [
+          "queued",
+          "leased",
+          "succeeded",
+          "failed",
+          "dead",
+          "cancelled"
+        ],
+        "type": "string"
+      },
+      "MaestroHostedRunnerConnectionBindingResponse": {
+        "description": "Non-secret connection and certificate binding for a live, tenant-scoped\nMaestro hosted runner. Callers use the exact URI SAN to authenticate the\nserver certificate issued by Identity; every component is fenced to the\nsame live provider placement and lease.",
+        "properties": {
+          "expectedServerUriSan": {
+            "type": "string"
+          },
+          "leaseAttempt": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "leaseExpiresAtEpochSeconds": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "leaseId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "organizationId": {
+            "type": "string"
+          },
+          "placementGeneration": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "podUid": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "residentProcessGeneration": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "runnerSessionId": {
+            "type": "string"
+          },
+          "runtimeImage": {
+            "type": "string"
+          },
+          "sandboxId": {
+            "$ref": "#/components/schemas/SandboxId"
+          },
+          "serviceHost": {
+            "type": "string"
+          },
+          "serviceName": {
+            "type": "string"
+          },
+          "serviceNamespace": {
+            "type": "string"
+          },
+          "servicePort": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "workerId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "workspaceId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "organizationId",
+          "workspaceId",
+          "sandboxId",
+          "podUid",
+          "placementGeneration",
+          "runnerSessionId",
+          "runtimeImage",
+          "serviceNamespace",
+          "serviceName",
+          "serviceHost",
+          "servicePort",
+          "expectedServerUriSan",
+          "residentProcessGeneration",
+          "leaseId",
+          "leaseAttempt",
+          "leaseExpiresAtEpochSeconds",
+          "workerId"
+        ],
+        "type": "object"
+      },
+      "MaestroWorkloadIdentityResponse": {
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lease_attempt": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lease_expires_at_epoch_seconds": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "lease_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "organization_id": {
+            "type": "string"
+          },
+          "pod_name": {
+            "type": "string"
+          },
+          "pod_uid": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "resident_process_generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "runner_session_id": {
+            "type": "string"
+          },
+          "runtime_image": {
+            "type": "string"
+          },
+          "sandbox_id": {
+            "$ref": "#/components/schemas/SandboxId"
+          },
+          "service_account_name": {
+            "type": "string"
+          },
+          "service_account_namespace": {
+            "type": "string"
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "service_port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "worker_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "active",
+          "organization_id",
+          "workspace_id",
+          "sandbox_id",
+          "pod_name",
+          "pod_uid",
+          "generation",
+          "runner_session_id",
+          "runtime_image",
+          "service_account_namespace",
+          "service_account_name",
+          "service_name",
+          "service_port",
+          "resident_process_generation",
+          "lease_id",
+          "lease_attempt",
+          "lease_expires_at_epoch_seconds",
+          "worker_id"
+        ],
+        "type": "object"
+      },
+      "MemoryLimit": {
+        "description": "Memory tier.\n\n`Serialize`/`Deserialize` are implemented by hand below in terms of\n[`DbVariant`], so the wire values are `1g`/`4g`/`16g`/`64g` rather than the\nRust variant names. `utoipa::ToSchema` derives from the variant identifiers\nand cannot see a hand-written `Serialize`, so each variant carries an\nexplicit `#[schema(rename = ...)]`. Without them the exported OpenAPI\ndocument advertises `OneG`/`FourG`/... and any consumer generating a client\nfrom it sends values this type rejects.\n`memory_limit_schema_matches_serialized_values` pins the two together.",
+        "enum": [
+          "1g",
+          "4g",
+          "16g",
+          "64g"
+        ],
+        "type": "string"
+      },
+      "NetworkAllowRule": {
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/NetworkAllowRuleKind"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "value"
+        ],
+        "type": "object"
+      },
+      "NetworkAllowRuleKind": {
+        "enum": [
+          "cidr",
+          "host"
+        ],
+        "type": "string"
+      },
+      "NetworkEgress": {
+        "oneOf": [
+          {
+            "properties": {
+              "mode": {
+                "enum": [
+                  "deny_all"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "mode": {
+                "enum": [
+                  "allowlist"
+                ],
+                "type": "string"
+              },
+              "rules": {
+                "items": {
+                  "$ref": "#/components/schemas/NetworkAllowRule"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "rules",
+              "mode"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "mode": {
+                "enum": [
+                  "allow_all"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "Operation": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "error_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error_message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/OperationKind"
+          },
+          "resource_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/OperationStatus"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "status",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "OperationKind": {
+        "enum": [
+          "provision_sandbox",
+          "stop_sandbox",
+          "resume_sandbox",
+          "run_command",
+          "run_resident_process",
+          "materialize_file",
+          "create_snapshot",
+          "fork_sandbox",
+          "delete_home"
+        ],
+        "type": "string"
+      },
+      "OperationResponse": {
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "operation": {
+            "$ref": "#/components/schemas/Operation"
+          }
+        },
+        "required": [
+          "ok",
+          "operation"
+        ],
+        "type": "object"
+      },
+      "OperationStatus": {
+        "enum": [
+          "queued",
+          "running",
+          "succeeded",
+          "failed",
+          "cancelled"
+        ],
+        "type": "string"
+      },
+      "PutTenantLimitPolicy": {
+        "additionalProperties": false,
+        "properties": {
+          "mutationLimit": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "requestLimit": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "windowSeconds": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "requestLimit",
+          "mutationLimit",
+          "windowSeconds"
+        ],
+        "type": "object"
+      },
+      "QueueCommandResponse": {
+        "properties": {
+          "command": {
+            "$ref": "#/components/schemas/CommandRun"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "operation": {
+            "$ref": "#/components/schemas/Operation"
+          },
+          "queued_job": {
+            "$ref": "#/components/schemas/QueuedCommandJob"
+          }
+        },
+        "required": [
+          "ok",
+          "command",
+          "queued_job",
+          "operation"
+        ],
+        "type": "object"
+      },
+      "QueuedCommandJob": {
+        "properties": {
+          "command_id": {
+            "$ref": "#/components/schemas/CommandId"
+          },
+          "id": {
+            "$ref": "#/components/schemas/JobId"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/JobKind"
+          },
+          "required_capability": {
+            "$ref": "#/components/schemas/WorkerCapability"
+          },
+          "sandbox_id": {
+            "$ref": "#/components/schemas/SandboxId"
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus"
+          }
+        },
+        "required": [
+          "id",
+          "sandbox_id",
+          "command_id",
+          "kind",
+          "status",
+          "required_capability"
+        ],
+        "type": "object"
+      },
+      "ReceiptScope": {
+        "properties": {
+          "activity_class": {
+            "$ref": "#/components/schemas/ActivityClass"
+          },
+          "resource_prefix": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "activity_class",
+          "resource_prefix"
+        ],
+        "type": "object"
+      },
+      "RedeemResidentPlacementAttestationRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "idempotencyKey": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "idempotencyKey"
+        ],
+        "type": "object"
+      },
+      "ResidentPlacementAttestationBootstrap": {
+        "properties": {
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "token"
+        ],
+        "type": "object"
+      },
+      "ResidentPlacementAttestationResponse": {
+        "properties": {
+          "claims": {
+            "$ref": "#/components/schemas/ResidentPlacementClaims"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "claims"
+        ],
+        "type": "object"
+      },
+      "ResidentPlacementClaims": {
+        "properties": {
+          "attestationExpiresAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "attestationId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "issuedAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "jobId": {
+            "$ref": "#/components/schemas/JobId"
+          },
+          "leaseAttempt": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "leaseExpiresAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "leaseId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "placementGeneration": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "providerIsolationVersion": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "providerMode": {
+            "type": "string"
+          },
+          "providerPodUid": {
+            "type": "string"
+          },
+          "residentProcessGeneration": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "residentProcessId": {
+            "$ref": "#/components/schemas/ResidentProcessId"
+          },
+          "runtimeImage": {
+            "type": "string"
+          },
+          "sandboxId": {
+            "$ref": "#/components/schemas/SandboxId"
+          },
+          "tenantId": {
+            "type": "string"
+          },
+          "version": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "workerId": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "attestationId",
+          "tenantId",
+          "sandboxId",
+          "residentProcessId",
+          "residentProcessGeneration",
+          "leaseId",
+          "leaseAttempt",
+          "jobId",
+          "workerId",
+          "placementGeneration",
+          "providerPodUid",
+          "providerMode",
+          "runtimeImage",
+          "providerIsolationVersion",
+          "issuedAt",
+          "attestationExpiresAt",
+          "leaseExpiresAt"
+        ],
+        "type": "object"
+      },
+      "ResidentProcess": {
+        "properties": {
+          "activeLeaseId": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "argv": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "bootstrapByteCount": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "bootstrapMode": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "bootstrapSha256": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "bootstrapTargetFile": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "createdAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "cwd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "desiredState": {
+            "$ref": "#/components/schemas/ResidentProcessDesiredState"
+          },
+          "env": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "exitCode": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "exitedAt": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "$ref": "#/components/schemas/ResidentProcessId"
+          },
+          "lastError": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "observedState": {
+            "$ref": "#/components/schemas/ResidentProcessObservedState"
+          },
+          "pid": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "readyAt": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "restartPolicy": {
+            "$ref": "#/components/schemas/ResidentProcessRestartPolicy"
+          },
+          "sandboxId": {
+            "$ref": "#/components/schemas/SandboxId"
+          },
+          "startedAt": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tenantId": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "sandboxId",
+          "tenantId",
+          "name",
+          "argv",
+          "env",
+          "restartPolicy",
+          "desiredState",
+          "observedState",
+          "generation",
+          "createdAt",
+          "updatedAt"
+        ],
+        "type": "object"
+      },
+      "ResidentProcessBootstrap": {
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "mode": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "targetFile": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "content",
+          "targetFile",
+          "mode"
+        ],
+        "type": "object"
+      },
+      "ResidentProcessBootstrapReadRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedSha256": {
+            "type": "string"
+          },
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "leaseId": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "generation",
+          "leaseId",
+          "expectedSha256"
+        ],
+        "type": "object"
+      },
+      "ResidentProcessBootstrapReadResponse": {
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "mode": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "placementAttestation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ResidentPlacementAttestationBootstrap"
+              }
+            ]
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "targetFile": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "content",
+          "sha256",
+          "targetFile",
+          "mode"
+        ],
+        "type": "object"
+      },
+      "ResidentProcessDesiredState": {
+        "enum": [
+          "running",
+          "stopped"
+        ],
+        "type": "string"
+      },
+      "ResidentProcessId": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "ResidentProcessObservationRequest": {
+        "properties": {
+          "errorCode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "errorMessage": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "exitCode": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "leaseId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "observedState": {
+            "$ref": "#/components/schemas/ResidentProcessObservedState"
+          },
+          "pid": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "providerPodName": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "providerPodUid": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "generation",
+          "leaseId",
+          "observedState"
+        ],
+        "type": "object"
+      },
+      "ResidentProcessObservedState": {
+        "enum": [
+          "pending",
+          "starting",
+          "running",
+          "failed",
+          "stopped",
+          "lost"
+        ],
+        "type": "string"
+      },
+      "ResidentProcessRequest": {
+        "properties": {
+          "argv": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "bootstrap": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ResidentProcessBootstrap"
+              }
+            ]
+          },
+          "cwd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "env": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "expectedGeneration": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "restartPolicy": {
+            "$ref": "#/components/schemas/ResidentProcessRestartPolicy"
+          }
+        },
+        "required": [
+          "argv",
+          "restartPolicy",
+          "expectedGeneration"
+        ],
+        "type": "object"
+      },
+      "ResidentProcessResponse": {
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "operation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Operation"
+              }
+            ]
+          },
+          "residentProcess": {
+            "$ref": "#/components/schemas/ResidentProcess"
+          }
+        },
+        "required": [
+          "ok",
+          "residentProcess"
+        ],
+        "type": "object"
+      },
+      "ResidentProcessRestartPolicy": {
+        "enum": [
+          "never",
+          "on_failure"
+        ],
+        "type": "string"
+      },
+      "Sandbox": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "execution_class": {
+            "$ref": "#/components/schemas/ExecutionClass"
+          },
+          "id": {
+            "$ref": "#/components/schemas/SandboxId"
+          },
+          "idle_ttl_seconds": {
+            "description": "Rolling idle window: if no activity is observed for this many\nseconds, the background expiry sweeper stops the sandbox the same way\n`max_lifetime_seconds` does. `None` (the default) disables idle\nreaping. \"Activity\" is the most recent of this sandbox's own last\nlifecycle-state transition, its most recently queued guest command,\nand `last_activity_at` (SSH access, desktop access, and resident-\nprocess observations all bump it, throttled -- see\n`docs/capabilities.md`).",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_activity_at": {
+            "description": "Server-maintained, throttled \"last seen doing something\" timestamp,\nseparate from `updated_at` (which only moves on lifecycle-state\ntransitions). Bumped by SSH access, desktop access, and resident-\nprocess observation requests -- see `docs/capabilities.md` for the\nfull list and the throttle window. Not caller-settable; absent from\n`CreateSandboxRequest` on purpose. `None` until the first bump (or\nforever, for a sandbox never touched through any of those surfaces).",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_lifetime_seconds": {
+            "description": "Hard cap on how long this sandbox may stay outside `Archived`,\nmeasured from `created_at`. `None` (the default) means no cap. The\nbackground expiry sweeper drives an expired sandbox through the same\n`stop_sandbox` path a user-initiated stop uses once this deadline\npasses, regardless of activity.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memory_limit": {
+            "$ref": "#/components/schemas/MemoryLimit"
+          },
+          "name": {
+            "type": "string"
+          },
+          "network_egress": {
+            "$ref": "#/components/schemas/NetworkEgress"
+          },
+          "parent_snapshot_id": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SnapshotId"
+              }
+            ]
+          },
+          "runtime_profile": {
+            "$ref": "#/components/schemas/SandboxRuntimeProfile"
+          },
+          "state": {
+            "$ref": "#/components/schemas/SandboxState"
+          },
+          "template": {
+            "type": "string"
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "ttl_seconds": {
+            "description": "Retention window for an *already-`archived`* sandbox's record: how\nlong its row (and dependent rows) stay queryable after teardown before\n`run_cleanup_controller` deletes them. Does **not** govern how long a\nlive sandbox may run -- see `max_lifetime_seconds` and\n`idle_ttl_seconds` for that. The three knobs are independent and\ncommonly all set on the same sandbox; see `docs/capabilities.md` for\nthe full distinction.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "workspace_mode": {
+            "$ref": "#/components/schemas/WorkspaceMode"
+          }
+        },
+        "required": [
+          "id",
+          "tenant_id",
+          "name",
+          "state",
+          "template",
+          "memory_limit",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "SandboxId": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "SandboxObservedState": {
+        "description": "Provider-facing projection used by external control planes to reconcile a\nsandbox without depending on the full tenant-visible Sandbox resource.",
+        "properties": {
+          "observedAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "sandboxId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/SandboxState"
+          },
+          "tenantId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sandboxId",
+          "tenantId",
+          "state",
+          "observedAt"
+        ],
+        "type": "object"
+      },
+      "SandboxPlacementProof": {
+        "properties": {
+          "provider": {
+            "type": "string"
+          },
+          "provider_mode": {
+            "type": "string"
+          },
+          "runtime_image": {
+            "type": "string"
+          },
+          "worker_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "worker_id",
+          "provider",
+          "provider_mode",
+          "runtime_image"
+        ],
+        "type": "object"
+      },
+      "SandboxProvisionSpec": {
+        "properties": {
+          "execution_class": {
+            "$ref": "#/components/schemas/ExecutionClass"
+          },
+          "memory_limit": {
+            "$ref": "#/components/schemas/MemoryLimit"
+          },
+          "network_egress": {
+            "$ref": "#/components/schemas/NetworkEgress"
+          },
+          "runtime_profile": {
+            "$ref": "#/components/schemas/SandboxRuntimeProfile"
+          },
+          "secret_mounts": {
+            "description": "Resolved secret deliveries for this sandbox. Locators only; the worker\nturns each one into a read-only CSI volume mount.",
+            "items": {
+              "$ref": "#/components/schemas/SandboxSecretMount"
+            },
+            "type": "array"
+          },
+          "workspace_mode": {
+            "$ref": "#/components/schemas/WorkspaceMode"
+          }
+        },
+        "type": "object"
+      },
+      "SandboxResponse": {
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "operation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Operation"
+              }
+            ]
+          },
+          "placement": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SandboxPlacementProof"
+              }
+            ]
+          },
+          "sandbox": {
+            "$ref": "#/components/schemas/Sandbox"
+          }
+        },
+        "required": [
+          "ok",
+          "sandbox"
+        ],
+        "type": "object"
+      },
+      "SandboxRuntimeProfile": {
+        "description": "Closed runtime trust profiles. The APEX profile permits only the trusted\nimage supervisor to start as uid 0; it is not a tenant-controlled root\ntoggle and guest mission processes still run as uid 10001.",
+        "enum": [
+          "unprivileged",
+          "apex_trusted_supervisor_v1"
+        ],
+        "type": "string"
+      },
+      "SandboxSecretMount": {
+        "additionalProperties": false,
+        "description": "Resolved, material-free delivery instruction handed to a worker through\nthe provisioning job payload. Every field is a locator: there is nothing\nhere to redact because there is nothing secret here.",
+        "properties": {
+          "delivery": {
+            "$ref": "#/components/schemas/SecretDelivery"
+          },
+          "envFileVariable": {
+            "description": "Environment variable the guest reads the path (not the value) from.",
+            "type": "string"
+          },
+          "filePath": {
+            "description": "Path of the delivered file inside that directory.",
+            "type": "string"
+          },
+          "mountDir": {
+            "description": "Read-only directory the worker must mount the delivery volume at.",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "secretRefId": {
+            "$ref": "#/components/schemas/SecretRefId"
+          },
+          "source": {
+            "$ref": "#/components/schemas/SecretSource"
+          }
+        },
+        "required": [
+          "secretRefId",
+          "name",
+          "source",
+          "delivery",
+          "mountDir",
+          "filePath",
+          "envFileVariable"
+        ],
+        "type": "object"
+      },
+      "SandboxState": {
+        "enum": [
+          "planning",
+          "provisioning",
+          "ready",
+          "running",
+          "idle",
+          "archiving",
+          "archived",
+          "error"
+        ],
+        "type": "string"
+      },
+      "SecretBackend": {
+        "description": "Where the secret *material* actually lives. Sandboxwich stores a\nreference to it and never reads, transports, or persists the bytes.\n\n`csi_secret_provider_class` names a `SecretProviderClass` the operator has\nprovisioned for the tenant. The kubelet's Secrets Store CSI driver reads\nthe material from the external store and mounts it into the Pod's tmpfs\ndirectly, so no plaintext copy is ever created in a Kubernetes `Secret`\nobject, in etcd, or in any sandboxwich process. The class name is\ntenant-supplied; its namespace never is, because a tenant-chosen namespace\nwould be a cross-tenant read primitive.",
+        "enum": [
+          "csi_secret_provider_class"
+        ],
+        "type": "string"
+      },
+      "SecretDelivery": {
+        "description": "How the material reaches the sandbox. `file` is the only supported mode:\na read-only file mounted under [`SANDBOX_SECRET_MOUNT_PREFIX`].\n\nArgv delivery is deliberately absent (visible in `/proc/*/cmdline`), and\nso is delivering the value in an environment variable; the guest receives\nonly the *path* through `<NAME>_FILE`-style variables (see\n[`SecretRef::env_file_variable`]).",
+        "enum": [
+          "file"
+        ],
+        "type": "string"
+      },
+      "SecretRef": {
+        "description": "A durable, tenant-scoped reference to long-lived user or model credentials.\n\n`tenant_id` is the platform organization; `workspace_id` narrows it\nfurther. Both are part of every read, bind, and delete path, so a\nreference is invisible and unbindable outside its own scope.",
+        "properties": {
+          "createdAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "delivery": {
+            "$ref": "#/components/schemas/SecretDelivery"
+          },
+          "id": {
+            "$ref": "#/components/schemas/SecretRefId"
+          },
+          "name": {
+            "type": "string"
+          },
+          "revokedAt": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "$ref": "#/components/schemas/SecretSource"
+          },
+          "state": {
+            "$ref": "#/components/schemas/SecretRefState"
+          },
+          "tenantId": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "workspaceId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "workspaceId",
+          "name",
+          "source",
+          "delivery",
+          "state",
+          "createdAt",
+          "updatedAt"
+        ],
+        "type": "object"
+      },
+      "SecretRefId": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "SecretRefListResponse": {
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "secretRefs": {
+            "items": {
+              "$ref": "#/components/schemas/SecretRef"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "ok",
+          "secretRefs"
+        ],
+        "type": "object"
+      },
+      "SecretRefResponse": {
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "secretRef": {
+            "$ref": "#/components/schemas/SecretRef"
+          }
+        },
+        "required": [
+          "ok",
+          "secretRef"
+        ],
+        "type": "object"
+      },
+      "SecretRefState": {
+        "enum": [
+          "active",
+          "revoked"
+        ],
+        "type": "string"
+      },
+      "SecretSource": {
+        "additionalProperties": false,
+        "description": "Typed locator for externally held secret material. Carries no value field\non purpose, in any direction: the control plane must not be able to accept\nraw credential bytes even by accident.",
+        "properties": {
+          "backend": {
+            "$ref": "#/components/schemas/SecretBackend"
+          },
+          "objectKey": {
+            "description": "File the class writes the material to inside the CSI mount.",
+            "type": "string"
+          },
+          "objectName": {
+            "description": "Name of the `SecretProviderClass` in the operator-owned secret\nnamespace.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "backend",
+          "objectName",
+          "objectKey"
+        ],
+        "type": "object"
+      },
+      "SensorObservation": {
+        "properties": {
+          "activity_class": {
+            "$ref": "#/components/schemas/ActivityClass"
+          },
+          "external_id": {
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "resource": {
+            "type": "string"
+          },
+          "sandbox_id": {
+            "$ref": "#/components/schemas/SandboxId"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "external_id",
+          "sandbox_id",
+          "session_id",
+          "activity_class",
+          "resource",
+          "observed_at"
+        ],
+        "type": "object"
+      },
+      "Snapshot": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expires_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "$ref": "#/components/schemas/SnapshotId"
+          },
+          "inventory": {},
+          "label": {
+            "type": "string"
+          },
+          "provider_metadata": {},
+          "provision_spec": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SandboxProvisionSpec"
+              }
+            ]
+          },
+          "ready_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runtime_image": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sandbox_id": {
+            "$ref": "#/components/schemas/SandboxId"
+          },
+          "status": {
+            "$ref": "#/components/schemas/SnapshotStatus"
+          }
+        },
+        "required": [
+          "id",
+          "sandbox_id",
+          "status",
+          "label",
+          "inventory",
+          "provider_metadata",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "SnapshotId": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "SnapshotResponse": {
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "operation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Operation"
+              }
+            ]
+          },
+          "snapshot": {
+            "$ref": "#/components/schemas/Snapshot"
+          }
+        },
+        "required": [
+          "ok",
+          "snapshot"
+        ],
+        "type": "object"
+      },
+      "SnapshotStatus": {
+        "enum": [
+          "pending",
+          "ready",
+          "failed",
+          "expired"
+        ],
+        "type": "string"
+      },
+      "TenantLimitPolicy": {
+        "properties": {
+          "mutationLimit": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "requestLimit": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tenantId": {
+            "type": "string"
+          },
+          "windowSeconds": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "tenantId",
+          "requestLimit",
+          "mutationLimit",
+          "windowSeconds"
+        ],
+        "type": "object"
+      },
+      "ToolCallLedgerEntryRequest": {
+        "properties": {
+          "ended_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "external_id": {
+            "type": "string"
+          },
+          "receipt_id": {
+            "type": "string"
+          },
+          "scopes": {
+            "items": {
+              "$ref": "#/components/schemas/ReceiptScope"
+            },
+            "type": "array"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "external_id",
+          "session_id",
+          "receipt_id",
+          "started_at",
+          "ended_at",
+          "scopes"
+        ],
+        "type": "object"
+      },
+      "ValidateMaestroWorkloadIdentityRequest": {
+        "additionalProperties": false,
+        "description": "Internal Identity-to-Sandboxwich live placement validation. This is not a\nbearer exchange: the caller must already be the authenticated Identity\nservice, and every field is compared with Sandboxwich's authoritative\nresident-process, lease, placement, and observed Pod state.",
+        "properties": {
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "organization_id": {
+            "type": "string"
+          },
+          "pod_uid": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "runner_session_id": {
+            "type": "string"
+          },
+          "sandbox_id": {
+            "$ref": "#/components/schemas/SandboxId"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "organization_id",
+          "workspace_id",
+          "sandbox_id",
+          "pod_uid",
+          "generation",
+          "runner_session_id"
+        ],
+        "type": "object"
+      },
+      "ValidateResidentPlacementAttestationRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "attestationId": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attestationId"
+        ],
+        "type": "object"
+      },
+      "WorkerCapability": {
+        "enum": [
+          "provision_sandbox",
+          "sandboxed_container",
+          "virtual_machine",
+          "run_command",
+          "uid_isolated_resident_process",
+          "materialize_file",
+          "apex_task_instructions",
+          "agent_prompt",
+          "snapshot",
+          "desktop_stream",
+          "k8s_pod",
+          "gvisor_sandbox",
+          "fqdn_egress",
+          "apex_trusted_supervisor_v1"
+        ],
+        "type": "string"
+      },
+      "WorkspaceMode": {
+        "enum": [
+          "ephemeral",
+          "generic_ephemeral",
+          "persistent"
+        ],
+        "type": "string"
+      }
+    }
+  },
+  "info": {
+    "contact": {
+      "name": "EvalOps contributors"
+    },
+    "description": "HTTP control plane for disposable development sandboxes",
+    "license": {
+      "identifier": "Apache-2.0",
+      "name": "Apache-2.0"
+    },
+    "title": "Sandboxwich API",
+    "version": "1.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/v1/capacity": {
+      "get": {
+        "operationId": "get_capacity",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/commands/{command_id}": {
+      "get": {
+        "operationId": "get_command",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "command_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandResponse"
+                }
+              }
+            },
+            "description": "Current typed command status and exit result"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::commands"
+        ]
+      }
+    },
+    "/v1/commands/{command_id}/output": {
+      "get": {
+        "operationId": "list_command_output",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "command_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandOutputListResponse"
+                }
+              }
+            },
+            "description": "Ordered bounded command output page; complete is true only after terminal status"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::commands"
+        ]
+      }
+    },
+    "/v1/desktop-sessions/{desktop_session_id}": {
+      "get": {
+        "operationId": "get_desktop_sessions__desktop_session_id_",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/desktop-sessions/{desktop_session_id}/access": {
+      "post": {
+        "operationId": "post_desktop_sessions__desktop_session_id__access",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/desktop-sessions/{desktop_session_id}/status": {
+      "post": {
+        "operationId": "post_desktop_sessions__desktop_session_id__status",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/divergence/reconcile": {
+      "post": {
+        "operationId": "reconcile_divergence",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DivergenceReconcileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DivergenceReconcileResponse"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "divergence"
+        ]
+      }
+    },
+    "/v1/jobs": {
+      "get": {
+        "operationId": "get_jobs",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      },
+      "post": {
+        "operationId": "post_jobs",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/jobs/{job_id}": {
+      "get": {
+        "operationId": "get_jobs__job_id_",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/leases/{lease_id}/complete": {
+      "post": {
+        "operationId": "post_leases__lease_id__complete",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/leases/{lease_id}/fail": {
+      "post": {
+        "operationId": "post_leases__lease_id__fail",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/leases/{lease_id}/materialization": {
+      "get": {
+        "operationId": "get_leases__lease_id__materialization",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/leases/{lease_id}/output": {
+      "post": {
+        "operationId": "post_leases__lease_id__output",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/leases/{lease_id}/renew": {
+      "post": {
+        "operationId": "post_leases__lease_id__renew",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/metrics": {
+      "get": {
+        "operationId": "get_metrics",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/operations/{operation_id}": {
+      "get": {
+        "operationId": "get_operation",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "operation_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "operations"
+        ]
+      }
+    },
+    "/v1/operations/{operation_id}/cancel": {
+      "post": {
+        "operationId": "cancel_operation",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "operation_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "operations"
+        ]
+      }
+    },
+    "/v1/operations/{operation_id}/events": {
+      "get": {
+        "operationId": "get_operations__operation_id__events",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/operator/tenant-policies/{tenant_id}": {
+      "get": {
+        "operationId": "get_tenant_limit_policy",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantLimitPolicy"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "operator"
+        ]
+      },
+      "put": {
+        "operationId": "put_tenant_limit_policy",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutTenantLimitPolicy"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantLimitPolicy"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "operator"
+        ]
+      }
+    },
+    "/v1/resident-placement-attestations/redeem": {
+      "post": {
+        "operationId": "redeem_resident_placement_attestation",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RedeemResidentPlacementAttestationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResidentPlacementAttestationResponse"
+                }
+              }
+            },
+            "description": "Placement proof atomically redeemed"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unknown, foreign, or distinctly replayed proof"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Placement fence is no longer live"
+          }
+        },
+        "tags": [
+          "crate::handlers::resident_attestations"
+        ]
+      }
+    },
+    "/v1/resident-placement-attestations/validate": {
+      "post": {
+        "operationId": "validate_resident_placement_attestation",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ValidateResidentPlacementAttestationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResidentPlacementAttestationResponse"
+                }
+              }
+            },
+            "description": "Consumed placement record remains live"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unknown, foreign, or unconsumed record"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Placement fence is no longer live"
+          }
+        },
+        "tags": [
+          "crate::handlers::resident_attestations"
+        ]
+      }
+    },
+    "/v1/resident-processes/{process_id}/bootstrap": {
+      "post": {
+        "operationId": "post_resident_processes__process_id__bootstrap",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/resident-processes/{process_id}/observations": {
+      "post": {
+        "operationId": "post_resident_processes__process_id__observations",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/sandboxes": {
+      "get": {
+        "operationId": "get_sandboxes",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      },
+      "post": {
+        "operationId": "create_sandbox",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSandboxRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxResponse"
+                }
+              }
+            },
+            "description": "Sandbox provisioning accepted"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::sandboxes"
+        ]
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}": {
+      "get": {
+        "operationId": "get_sandboxes__sandbox_id_",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/apex-task-instructions": {
+      "post": {
+        "operationId": "read_apex_task_instructions",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Tenant-scoped replay key",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApexTaskInstructionsReadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApexTaskInstructionsReadResponse"
+                }
+              }
+            },
+            "description": "Instruction read receipt"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Sandbox is not a ready trusted-supervisor sandbox"
+          }
+        },
+        "summary": "Runner-host (evalops/platform `rust/services/runner-host`) is the only\ncaller of this route and mirrors its request/response types by hand. The\nroute is documented here so that mirror can be validated against the\nexported OpenAPI document instead of against itself.",
+        "tags": [
+          "crate::handlers::apex_instructions"
+        ]
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/commands": {
+      "get": {
+        "operationId": "get_sandboxes__sandbox_id__commands",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      },
+      "post": {
+        "operationId": "queue_command",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Tenant-scoped replay key",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "header",
+            "name": "traceparent",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommandRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueueCommandResponse"
+                }
+              }
+            },
+            "description": "Command accepted with an Operation resource"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Decoded command stdin exceeds 1 MiB"
+          }
+        },
+        "tags": [
+          "crate::handlers::commands"
+        ]
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/desktop": {
+      "get": {
+        "operationId": "get_sandboxes__sandbox_id__desktop",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/desktop-sessions": {
+      "get": {
+        "operationId": "get_sandboxes__sandbox_id__desktop_sessions",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      },
+      "post": {
+        "operationId": "post_sandboxes__sandbox_id__desktop_sessions",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/divergence-findings": {
+      "get": {
+        "operationId": "list_divergence_findings",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DivergenceFindingListResponse"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "divergence"
+        ]
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/events": {
+      "get": {
+        "operationId": "get_sandboxes__sandbox_id__events",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/files": {
+      "get": {
+        "operationId": "get_sandboxes__sandbox_id__files",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      },
+      "post": {
+        "operationId": "post_sandboxes__sandbox_id__files",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/files/{file_id}": {
+      "get": {
+        "operationId": "get_sandboxes__sandbox_id__files__file_id_",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/fork": {
+      "post": {
+        "operationId": "fork_sandbox",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Tenant-scoped replay key",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "header",
+            "name": "traceparent",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSandboxRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxResponse"
+                }
+              }
+            },
+            "description": "Fork accepted with child sandbox and asynchronous operation"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::sandboxes"
+        ]
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/guest-health": {
+      "get": {
+        "operationId": "get_sandboxes__sandbox_id__guest_health",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      },
+      "post": {
+        "operationId": "post_sandboxes__sandbox_id__guest_health",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/observed-state": {
+      "get": {
+        "operationId": "get_sandbox_observed_state",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxObservedState"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::sandboxes"
+        ]
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/prompt": {
+      "post": {
+        "operationId": "queue_prompt",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::commands"
+        ]
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/connection-binding": {
+      "get": {
+        "operationId": "get_maestro_connection_binding",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MaestroHostedRunnerConnectionBindingResponse"
+                }
+              }
+            },
+            "description": "Live tenant-scoped Maestro connection and exact server certificate binding"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No tenant-scoped Maestro hosted runner exists"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The Maestro placement is not live"
+          }
+        },
+        "tags": [
+          "crate::handlers::resident_attestations"
+        ]
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/resident-processes/{name}": {
+      "get": {
+        "operationId": "get_sandboxes__sandbox_id__resident_processes__name_",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      },
+      "put": {
+        "operationId": "put_resident_process",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Typed resident name; orb-sidecar requires a non-empty bootstrap",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResidentProcessRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResidentProcessResponse"
+                }
+              }
+            },
+            "description": "Existing resident process returned for an idempotent same-spec request"
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResidentProcessResponse"
+                }
+              }
+            },
+            "description": "Resident process accepted"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid request, including a missing or empty orb-sidecar bootstrap"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Bootstrap admission capacity exhausted"
+          }
+        },
+        "tags": [
+          "crate::handlers::resident_processes"
+        ]
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/resident-processes/{name}/events": {
+      "get": {
+        "operationId": "get_sandboxes__sandbox_id__resident_processes__name__events",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/resident-processes/{name}/stop": {
+      "post": {
+        "operationId": "post_sandboxes__sandbox_id__resident_processes__name__stop",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/resume": {
+      "post": {
+        "operationId": "post_sandboxes__sandbox_id__resume",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/runtime-resources": {
+      "get": {
+        "operationId": "get_sandboxes__sandbox_id__runtime_resources",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/snapshots": {
+      "get": {
+        "operationId": "get_sandboxes__sandbox_id__snapshots",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      },
+      "post": {
+        "operationId": "create_snapshot",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Tenant-scoped replay key",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "header",
+            "name": "traceparent",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSnapshotRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SnapshotResponse"
+                }
+              }
+            },
+            "description": "Snapshot accepted with asynchronous operation"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::snapshots"
+        ]
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/ssh-access": {
+      "post": {
+        "operationId": "post_sandboxes__sandbox_id__ssh_access",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/ssh-keys": {
+      "get": {
+        "operationId": "get_sandboxes__sandbox_id__ssh_keys",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      },
+      "post": {
+        "operationId": "post_sandboxes__sandbox_id__ssh_keys",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/stop": {
+      "post": {
+        "operationId": "post_sandboxes__sandbox_id__stop",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/tool-call-ledger": {
+      "post": {
+        "operationId": "append_tool_call_ledger",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ToolCallLedgerEntryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "divergence"
+        ]
+      }
+    },
+    "/v1/secret-refs": {
+      "get": {
+        "operationId": "list_secret_refs",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretRefListResponse"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::secrets"
+        ]
+      },
+      "post": {
+        "operationId": "create_secret_ref",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSecretRefRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretRefResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::secrets"
+        ]
+      }
+    },
+    "/v1/secret-refs/{secret_ref_id}": {
+      "delete": {
+        "operationId": "revoke_secret_ref",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "secret_ref_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretRefResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "summary": "Revocation is a state transition, not a delete: the row stays queryable so\nan operator can see that a credential reference existed and when it was\nwithdrawn. A revoked reference can never be bound to a sandbox again.",
+        "tags": [
+          "crate::handlers::secrets"
+        ]
+      },
+      "get": {
+        "operationId": "get_secret_ref",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "secret_ref_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretRefResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::secrets"
+        ]
+      }
+    },
+    "/v1/snapshots/cleanup": {
+      "post": {
+        "operationId": "post_snapshots_cleanup",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/snapshots/{snapshot_id}": {
+      "get": {
+        "operationId": "get_snapshot",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "snapshot_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SnapshotResponse"
+                }
+              }
+            },
+            "description": "Current typed snapshot lifecycle state"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::snapshots"
+        ]
+      }
+    },
+    "/v1/snapshots/{snapshot_id}/fork": {
+      "post": {
+        "operationId": "fork_snapshot",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "snapshot_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Tenant-scoped replay key",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "header",
+            "name": "traceparent",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ForkSnapshotRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxResponse"
+                }
+              }
+            },
+            "description": "Snapshot restore accepted with child sandbox and asynchronous fork operation"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::snapshots"
+        ]
+      }
+    },
+    "/v1/ssh-keys/{ssh_key_id}/status": {
+      "post": {
+        "operationId": "post_ssh_keys__ssh_key_id__status",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/workers": {
+      "get": {
+        "operationId": "get_workers",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/workers/register": {
+      "post": {
+        "operationId": "post_workers_register",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/workers/{worker_id}/drain": {
+      "post": {
+        "operationId": "post_workers__worker_id__drain",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/workers/{worker_id}/heartbeat": {
+      "post": {
+        "operationId": "post_workers__worker_id__heartbeat",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/workers/{worker_id}/leases/claim": {
+      "post": {
+        "operationId": "post_workers__worker_id__leases_claim",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/workers/{worker_id}/runtime-resources/reconcile": {
+      "post": {
+        "operationId": "post_workers__worker_id__runtime_resources_reconcile",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    },
+    "/v1/workers/{worker_id}/sandboxes/{sandbox_id}/guest-token": {
+      "post": {
+        "operationId": "post_workers__worker_id__sandboxes__sandbox_id__guest_token",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "description": "Asynchronous operation lifecycle",
+      "name": "operations"
+    }
+  ]
+}

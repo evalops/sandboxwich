@@ -209,7 +209,7 @@ pub(crate) fn looks_like_cidr(value: &str) -> bool {
     }
 }
 
-#[utoipa::path(post, path = "/v1/sandboxes", responses((status = 202, description = "Sandbox provisioning accepted"), (status = 400, body = ErrorEnvelope)))]
+#[utoipa::path(post, path = "/v1/sandboxes", request_body = CreateSandboxRequest, responses((status = 202, description = "Sandbox provisioning accepted", body = SandboxResponse), (status = 400, body = ErrorEnvelope)))]
 pub(crate) async fn create_sandbox(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
