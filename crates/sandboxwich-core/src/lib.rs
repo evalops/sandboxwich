@@ -788,12 +788,26 @@ pub enum CleanupRunStatus {
 }
 }
 
+/// Memory tier.
+///
+/// `Serialize`/`Deserialize` are implemented by hand below in terms of
+/// [`DbVariant`], so the wire values are `1g`/`4g`/`16g`/`64g` rather than the
+/// Rust variant names. `utoipa::ToSchema` derives from the variant identifiers
+/// and cannot see a hand-written `Serialize`, so each variant carries an
+/// explicit `#[schema(rename = ...)]`. Without them the exported OpenAPI
+/// document advertises `OneG`/`FourG`/... and any consumer generating a client
+/// from it sends values this type rejects.
+/// `memory_limit_schema_matches_serialized_values` pins the two together.
 #[derive(Clone, Debug, Eq, PartialEq, Default, utoipa::ToSchema)]
 pub enum MemoryLimit {
     #[default]
+    #[schema(rename = "1g")]
     OneG,
+    #[schema(rename = "4g")]
     FourG,
+    #[schema(rename = "16g")]
     SixteenG,
+    #[schema(rename = "64g")]
     SixtyFourG,
 }
 
@@ -2674,7 +2688,7 @@ pub struct CreateJobRequest {
     pub max_attempts: Option<i64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApexTaskInstructionsReadRequest {
     pub expected_sha256: String,
@@ -2682,7 +2696,7 @@ pub struct ApexTaskInstructionsReadRequest {
     pub claim_lease_generation: u64,
 }
 
-#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ApexTaskInstructionsReadResponse {
     pub ok: bool,
