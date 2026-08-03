@@ -109,8 +109,9 @@ async fn main() -> anyhow::Result<()> {
     if config.disable_expiry_sweeper {
         tracing::info!(
             "SANDBOXWICH_DISABLE_EXPIRY_SWEEPER is set: not spawning the lease/snapshot/desktop-\
-             session expiry sweeper. Nothing will expire leases, snapshots, or desktop sessions \
-             on this instance except explicit callers of /snapshots/cleanup."
+             session expiry or archived-runtime reconciliation sweeper. Nothing will expire \
+             leases, snapshots, or desktop sessions on this instance except explicit callers of \
+             /snapshots/cleanup, and archived provider resources will not be repaired."
         );
     } else {
         spawn_expiry_sweeper(

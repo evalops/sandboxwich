@@ -2282,7 +2282,7 @@ pub(crate) async fn apply_completed_job_on_connection(
             )
             .await?;
             let next_state = SandboxState::Ready;
-            set_sandbox_state_on_connection(
+            let transitioned = set_sandbox_state_on_connection(
                 db,
                 connection,
                 sandbox_id,
@@ -2295,6 +2295,27 @@ pub(crate) async fn apply_completed_job_on_connection(
                 }),
             )
             .await?;
+            if !transitioned && !handle.resources.is_empty() {
+                let current = fetch_sandbox_on_connection(db, connection, sandbox_id).await?;
+                if matches!(
+                    current.state,
+                    SandboxState::Archiving | SandboxState::Archived
+                ) {
+                    // The provider has already created durable resources, but
+                    // the lifecycle CAS lost to stop/archive. Keep those
+                    // resources visible and enqueue label-scoped teardown in
+                    // this same transaction; otherwise a late completion can
+                    // strand a Pod/PVC after the sandbox is gone.
+                    enqueue_archived_runtime_cleanup_on_connection(
+                        db,
+                        connection,
+                        &current,
+                        Some(&job.payload),
+                        "late_provision_completion",
+                    )
+                    .await?;
+                }
+            }
         }
         (JobKind::StopSandbox, WorkerJobResult::StopSandbox { sandbox_id, .. }) => {
             if sandbox_id != sandbox_id_from_job(job)? {
@@ -2302,7 +2323,7 @@ pub(crate) async fn apply_completed_job_on_connection(
                     "stop completion result does not match job sandbox",
                 ));
             }
-            set_sandbox_state_on_connection(
+            let transitioned = set_sandbox_state_on_connection(
                 db,
                 connection,
                 sandbox_id,
@@ -2311,6 +2332,31 @@ pub(crate) async fn apply_completed_job_on_connection(
                 json!({"state": SandboxState::Archived, "reason": "stop_completed"}),
             )
             .await?;
+            // Provider teardown is the authority for retiring runtime rows.
+            // A reconciliation stop may arrive after the sandbox is already
+            // Archived (a normal, idempotent CAS miss), so accept that state
+            // while still fencing against an old stop completion destroying a
+            // newly resumed sandbox's current runtime generation.
+            let retire_runtime_resources = if transitioned {
+                true
+            } else {
+                let current = fetch_sandbox_on_connection(db, connection, sandbox_id).await?;
+                matches!(
+                    current.state,
+                    SandboxState::Archiving | SandboxState::Archived
+                )
+            };
+            if retire_runtime_resources {
+                mark_runtime_resources_deleted_for_sandbox_on_connection(
+                    db,
+                    connection,
+                    sandbox_id,
+                    RuntimeResourceGeneration::RuntimeOnly,
+                    Utc::now(),
+                    "provider-confirmed sandbox stop",
+                )
+                .await?;
+            }
             let release_sql = format!(
                 "delete from sandbox_home_mounts where sandbox_id = {}",
                 db.placeholder(1)

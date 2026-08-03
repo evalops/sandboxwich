@@ -5,7 +5,9 @@ use crate::handlers::commands::*;
 use crate::handlers::files::*;
 use crate::handlers::leases::*;
 use crate::handlers::sandboxes::*;
-use crate::handlers::secrets::fetch_sandbox_secret_mounts;
+use crate::handlers::secrets::{
+    fetch_sandbox_secret_mounts, fetch_sandbox_secret_mounts_on_connection,
+};
 use crate::handlers::snapshots::*;
 use crate::handlers::workers::*;
 use crate::pagination::*;
@@ -533,6 +535,138 @@ pub(crate) async fn insert_job_on_connection(
         .execute(&mut *connection)
         .await?;
     Ok(())
+}
+
+/// Inserts a job while allowing the archived-runtime cleanup partial unique
+/// index to collapse races between API replicas. Ordinary job insertion keeps
+/// its existing error semantics; this helper is only for a deliberately
+/// idempotent reconciliation request.
+pub(crate) async fn insert_job_on_connection_if_absent(
+    db: &Database,
+    connection: &mut AnyConnection,
+    job: &Job,
+) -> Result<bool, ApiError> {
+    let references = job_references(job)?;
+    let sql = format!(
+        "insert into jobs
+         (id, tenant_id, kind, status, payload, required_capability, required_execution_class, priority, attempts, max_attempts,
+          scheduled_at, created_at, updated_at, last_error, sandbox_id, command_id, snapshot_id,
+          parent_sandbox_id, child_sandbox_id, prompt_event_id)
+         values ({}) on conflict do nothing",
+        db.placeholders(20)
+    );
+    let result = sqlx::query(&sql)
+        .bind(job.id.to_string())
+        .bind(&job.tenant_id)
+        .bind(job_kind_to_str(&job.kind))
+        .bind(job_status_to_str(&job.status))
+        .bind(serde_json::to_string(&job.payload)?)
+        .bind(worker_capability_to_str(&job.required_capability))
+        .bind(job.required_execution_class.as_db_str())
+        .bind(job.priority)
+        .bind(job.attempts)
+        .bind(job.max_attempts)
+        .bind(job.scheduled_at.to_rfc3339())
+        .bind(job.created_at.to_rfc3339())
+        .bind(job.updated_at.to_rfc3339())
+        .bind(&job.last_error)
+        .bind(references.sandbox_id.map(|id| id.to_string()))
+        .bind(references.command_id.map(|id| id.to_string()))
+        .bind(references.snapshot_id.map(|id| id.to_string()))
+        .bind(references.parent_sandbox_id.map(|id| id.to_string()))
+        .bind(references.child_sandbox_id.map(|id| id.to_string()))
+        .bind(references.prompt_event_id.map(|id| id.to_string()))
+        .execute(&mut *connection)
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+pub(crate) const ARCHIVED_RUNTIME_CLEANUP_MARKER: &str = "archivedRuntimeCleanup";
+
+/// Queue provider teardown for an archived sandbox whose runtime rows still
+/// describe live resources. The marker is intentionally in the payload (and
+/// indexed by a partial unique index) so this remains idempotent after API
+/// restarts, worker retries, and concurrent sweeper replicas.
+pub(crate) async fn enqueue_archived_runtime_cleanup_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    sandbox: &Sandbox,
+    source_payload: Option<&serde_json::Value>,
+    reason: &str,
+) -> Result<bool, ApiError> {
+    let marker = format!("%\"{ARCHIVED_RUNTIME_CLEANUP_MARKER}\":true%");
+    let existing_sql = format!(
+        "select 1
+         from jobs
+         where sandbox_id = {} and kind = {} and status in ('queued', 'leased')
+           and payload like {}
+         limit 1",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3)
+    );
+    if sqlx::query(&existing_sql)
+        .bind(sandbox.id.to_string())
+        .bind(job_kind_to_str(&JobKind::StopSandbox))
+        .bind(&marker)
+        .fetch_optional(&mut *connection)
+        .await?
+        .is_some()
+    {
+        return Ok(false);
+    }
+
+    let now = Utc::now();
+    let mut job = Job {
+        id: JobId::new(),
+        tenant_id: sandbox.tenant_id.clone(),
+        kind: JobKind::StopSandbox,
+        status: JobStatus::Queued,
+        payload: json!({
+            "sandboxId": sandbox.id,
+            // Cleanup is label-scoped and ignore-not-found, so include the
+            // persisted FQDN policy kind even when the original provision
+            // completion did not persist that row before the race.
+            "deleteGkeFqdnPolicy": true,
+            ARCHIVED_RUNTIME_CLEANUP_MARKER: true,
+            "cleanupReason": reason,
+        }),
+        required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: sandbox.execution_class.clone(),
+        priority: 1000,
+        attempts: 0,
+        max_attempts: 5,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+    };
+
+    // Provision jobs written by older API versions may not have carried the
+    // enriched spec. Preserve an authoritative spec from the source job when
+    // present; otherwise derive it on this same connection so a SQLite write
+    // transaction cannot deadlock itself by acquiring a second connection.
+    let source_spec = source_payload
+        .and_then(|payload| payload.get("provisionSpec"))
+        .filter(|spec| spec.is_object())
+        .cloned();
+    if let Some(spec) = source_spec {
+        let payload = job
+            .payload
+            .as_object_mut()
+            .ok_or_else(|| ApiError::internal("archived cleanup payload is not an object"))?;
+        payload.insert("provisionSpec".to_string(), spec);
+        if let Some(runtime_image) = source_payload.and_then(|payload| payload.get("runtimeImage"))
+        {
+            payload.insert("runtimeImage".to_string(), runtime_image.clone());
+        }
+    } else {
+        let secret_mounts =
+            fetch_sandbox_secret_mounts_on_connection(db, connection, sandbox.id).await?;
+        add_provision_spec_to_payload(&mut job, sandbox, &secret_mounts)?;
+    }
+
+    insert_job_on_connection_if_absent(db, connection, &job).await
 }
 
 #[derive(Default)]

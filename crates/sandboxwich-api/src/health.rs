@@ -121,6 +121,12 @@ pub(crate) async fn collect_prometheus_metrics(
     );
     append_gauge(
         &mut body,
+        "sandboxwich_archived_runtime_resource_count",
+        "Archived sandboxes with provider runtime resources that are not retired.",
+        metrics.scalar("archived_runtime_resources"),
+    );
+    append_gauge(
+        &mut body,
         "sandboxwich_job_leases_active",
         "Active job leases.",
         metrics.scalar("job_leases_active"),
@@ -246,6 +252,14 @@ pub(crate) async fn fetch_prometheus_metrics(
              from runtime_resources
              group by status
              union all
+             select 'archived_runtime_resources' as family, '' as label, count(*) as value
+             from runtime_resources
+             join sandboxes on sandboxes.id = runtime_resources.sandbox_id
+             where sandboxes.state = 'archived'
+               and runtime_resources.snapshot_id is null
+               and runtime_resources.purpose <> 'snapshot'
+               and runtime_resources.status not in ('deleted', 'destroyed')
+             union all
              select 'job_leases_active' as family, '' as label, count(*) as value
              from job_leases
              where status = 'active'
@@ -297,6 +311,15 @@ pub(crate) async fn fetch_prometheus_metrics(
              join sandboxes on sandboxes.id = runtime_resources.sandbox_id
              where sandboxes.tenant_id = {p4}
              group by runtime_resources.status
+             union all
+             select 'archived_runtime_resources' as family, '' as label, count(*) as value
+             from runtime_resources
+             join sandboxes on sandboxes.id = runtime_resources.sandbox_id
+             where sandboxes.tenant_id = {p4}
+               and sandboxes.state = 'archived'
+               and runtime_resources.snapshot_id is null
+               and runtime_resources.purpose <> 'snapshot'
+               and runtime_resources.status not in ('deleted', 'destroyed')
              union all
              select 'job_leases_active' as family, '' as label, count(*) as value
              from job_leases
