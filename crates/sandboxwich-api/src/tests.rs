@@ -1462,6 +1462,30 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
     assert_eq!(handshake.stage, ProvisioningStage::NetworkPolicyReady);
     assert_eq!(handshake.lease_attempt, 1);
 
+    let recreated_workspace = update_provisioning_stage_in_transaction(
+        &db,
+        reclaimed_lease_id,
+        ProvisioningStageUpdateRequest {
+            stage: ProvisioningStage::WorkspaceReady,
+            resource_kind: Some(RuntimeResourceKind::PersistentVolumeClaim),
+            resource_namespace: Some("sandboxwich-sandboxes".to_string()),
+            resource_name: Some(format!("sandboxwich-pvc-{}", sandbox.id)),
+            resource_uid: Some("uid-workspace-recreated".to_string()),
+            observed_generation: None,
+            attempt_count: 2,
+            last_error_class: None,
+            last_error_code: None,
+            last_error: None,
+        },
+    )
+    .await
+    .expect("new lease attempt accepts a recreated resource identity");
+    assert_eq!(
+        recreated_workspace.stage,
+        ProvisioningStage::NetworkPolicyReady
+    );
+    assert_eq!(recreated_workspace.lease_attempt, 1);
+
     let replayed_workspace = update_provisioning_stage_in_transaction(
         &db,
         reclaimed_lease_id,
@@ -1470,7 +1494,7 @@ async fn provisioning_stage_update_persists_active_lease_fence() {
             resource_kind: Some(RuntimeResourceKind::PersistentVolumeClaim),
             resource_namespace: Some("sandboxwich-sandboxes".to_string()),
             resource_name: Some(format!("sandboxwich-pvc-{}", sandbox.id)),
-            resource_uid: Some("uid-workspace".to_string()),
+            resource_uid: Some("uid-workspace-recreated".to_string()),
             observed_generation: None,
             attempt_count: 2,
             last_error_class: None,

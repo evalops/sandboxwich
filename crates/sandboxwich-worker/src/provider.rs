@@ -39,7 +39,7 @@ use sandboxwich_core::{
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::egress_gateway::EgressGatewayPolicy;
@@ -3232,6 +3232,37 @@ impl KubernetesApplyProvider {
         home_id: Option<HomeId>,
         spec: &SandboxProvisionSpec,
         cancelled: &CancelSignal,
+        report: F,
+    ) -> anyhow::Result<ProviderSandboxHandle>
+    where
+        F: FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
+    {
+        let mut resources_applied = false;
+        match self.provision_staged_with_home_inner(
+            sandbox_id,
+            home_id,
+            spec,
+            cancelled,
+            &mut resources_applied,
+            report,
+        ) {
+            Ok(handle) => Ok(handle),
+            Err(error) => {
+                if resources_applied {
+                    self.rollback_applied_resources(sandbox_id, "staged provision");
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn provision_staged_with_home_inner<F>(
+        &self,
+        sandbox_id: SandboxId,
+        home_id: Option<HomeId>,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+        resources_applied: &mut bool,
         mut report: F,
     ) -> anyhow::Result<ProviderSandboxHandle>
     where
@@ -3259,10 +3290,18 @@ impl KubernetesApplyProvider {
                 |home_id| self.dry_run.home_pvc_manifest(home_id, &spec.memory_limit),
             );
             let workspace_identity = match home_id {
-                Some(home_id) => {
-                    self.apply_or_adopt_home_manifest(&workspace, home_id, cancelled)?
-                }
-                None => self.apply_or_adopt_manifest(&workspace, sandbox_id, cancelled)?,
+                Some(home_id) => self.apply_or_adopt_home_manifest(
+                    &workspace,
+                    home_id,
+                    cancelled,
+                    resources_applied,
+                )?,
+                None => self.apply_or_adopt_manifest(
+                    &workspace,
+                    sandbox_id,
+                    cancelled,
+                    resources_applied,
+                )?,
             };
             report(stage_update(
                 ProvisioningStage::WorkspaceReady,
@@ -3276,8 +3315,12 @@ impl KubernetesApplyProvider {
             .dry_run
             .egress_gateway_network_policy_manifest(sandbox_id, &spec.network_egress)?
         {
-            let policy_identity =
-                self.apply_or_adopt_manifest(&gateway_policy, sandbox_id, cancelled)?;
+            let policy_identity = self.apply_or_adopt_manifest(
+                &gateway_policy,
+                sandbox_id,
+                cancelled,
+                resources_applied,
+            )?;
             report(stage_update(
                 ProvisioningStage::NetworkPolicyReady,
                 Some(policy_identity),
@@ -3286,12 +3329,17 @@ impl KubernetesApplyProvider {
                 .dry_run
                 .egress_gateway_service_manifest(sandbox_id, &spec.network_egress)
                 .context("gateway service missing for host policy")?;
-            self.apply_or_adopt_manifest(&gateway_service, sandbox_id, cancelled)?;
+            self.apply_or_adopt_manifest(
+                &gateway_service,
+                sandbox_id,
+                cancelled,
+                resources_applied,
+            )?;
             let gateway_pod = self
                 .dry_run
                 .egress_gateway_pod_manifest(sandbox_id, &spec.network_egress)?
                 .context("gateway pod missing for host policy")?;
-            self.apply_or_adopt_manifest(&gateway_pod, sandbox_id, cancelled)?;
+            self.apply_or_adopt_manifest(&gateway_pod, sandbox_id, cancelled, resources_applied)?;
             let gateway_name = format!("sandboxwich-egress-gateway-{sandbox_id}");
             let wait = self.wait_for_named_pod_ready(&gateway_name, cancelled)?;
             if !wait.success {
@@ -3305,8 +3353,12 @@ impl KubernetesApplyProvider {
         let network_policy = self
             .dry_run
             .network_policy_manifest(sandbox_id, &spec.network_egress)?;
-        let network_identity =
-            self.apply_or_adopt_manifest(&network_policy, sandbox_id, cancelled)?;
+        let network_identity = self.apply_or_adopt_manifest(
+            &network_policy,
+            sandbox_id,
+            cancelled,
+            resources_applied,
+        )?;
         report(stage_update(
             ProvisioningStage::NetworkPolicyReady,
             Some(network_identity),
@@ -3317,7 +3369,8 @@ impl KubernetesApplyProvider {
         // The unstaged `provision` path gets this ordering from
         // `provision_manifests`; this staged path must apply it explicitly.
         if let Some(secret) = self.dry_run.guest_token_secret_manifest(sandbox_id) {
-            let secret_identity = self.apply_or_adopt_manifest(&secret, sandbox_id, cancelled)?;
+            let secret_identity =
+                self.apply_or_adopt_manifest(&secret, sandbox_id, cancelled, resources_applied)?;
             report(stage_update(
                 ProvisioningStage::CredentialsReady,
                 Some(secret_identity),
@@ -3333,7 +3386,8 @@ impl KubernetesApplyProvider {
                     .pod_manifest_with_home(sandbox_id, home_id, spec)
             },
         );
-        let pod_identity = self.apply_or_adopt_manifest(&pod, sandbox_id, cancelled)?;
+        let pod_identity =
+            self.apply_or_adopt_manifest(&pod, sandbox_id, cancelled, resources_applied)?;
         let wait = self.wait_for_pod_ready(sandbox_id, cancelled)?;
         if !wait.success {
             let context = "sandbox pod did not become ready";
@@ -3355,14 +3409,18 @@ impl KubernetesApplyProvider {
 
         let ssh_service = self.dry_run.ssh_service_manifest(sandbox_id);
         let ssh_service_identity =
-            self.apply_or_adopt_manifest(&ssh_service, sandbox_id, cancelled)?;
+            self.apply_or_adopt_manifest(&ssh_service, sandbox_id, cancelled, resources_applied)?;
         report(stage_update(
             ProvisioningStage::ServiceReady,
             Some(ssh_service_identity),
         ))?;
         let desktop_service = self.dry_run.desktop_service_manifest(sandbox_id);
-        let service_identity =
-            self.apply_or_adopt_manifest(&desktop_service, sandbox_id, cancelled)?;
+        let service_identity = self.apply_or_adopt_manifest(
+            &desktop_service,
+            sandbox_id,
+            cancelled,
+            resources_applied,
+        )?;
         report(stage_update(
             ProvisioningStage::ServiceReady,
             Some(service_identity),
@@ -3632,6 +3690,7 @@ impl KubernetesApplyProvider {
         manifest: &Value,
         sandbox_id: SandboxId,
         cancelled: &CancelSignal,
+        resources_applied: &mut bool,
     ) -> anyhow::Result<KubernetesResourceIdentity> {
         self.apply_or_adopt_manifest_with_identity(
             manifest,
@@ -3639,6 +3698,7 @@ impl KubernetesApplyProvider {
             &sandbox_id.to_string(),
             "sandbox",
             cancelled,
+            resources_applied,
         )
     }
 
@@ -3647,6 +3707,7 @@ impl KubernetesApplyProvider {
         manifest: &Value,
         home_id: HomeId,
         cancelled: &CancelSignal,
+        resources_applied: &mut bool,
     ) -> anyhow::Result<KubernetesResourceIdentity> {
         self.apply_or_adopt_manifest_with_identity(
             manifest,
@@ -3654,6 +3715,7 @@ impl KubernetesApplyProvider {
             &home_id.to_string(),
             "home",
             cancelled,
+            resources_applied,
         )
     }
 
@@ -3664,6 +3726,7 @@ impl KubernetesApplyProvider {
         identity_value: &str,
         identity_name: &str,
         cancelled: &CancelSignal,
+        resources_applied: &mut bool,
     ) -> anyhow::Result<KubernetesResourceIdentity> {
         let kind = manifest["kind"]
             .as_str()
@@ -3681,6 +3744,7 @@ impl KubernetesApplyProvider {
             return Ok(identity);
         }
 
+        *resources_applied = true;
         let apply = run_kubectl_documents(
             &self.kubectl,
             &self.kubectl_args("apply"),
@@ -5174,18 +5238,67 @@ struct KubectlOutput {
     stderr: String,
 }
 
+#[derive(Debug)]
+struct CappedBytes {
+    bytes: Vec<u8>,
+    omitted_bytes: u64,
+}
+
+/// Drain a child stream without retaining more than `max_bytes` in memory.
+///
+/// The worker must keep reading after the cap so the child cannot deadlock on
+/// a full pipe, but retaining the complete stream and truncating afterward
+/// still lets a noisy `kubectl` invocation OOM the worker before the cap is
+/// applied. This helper bounds the retained bytes while preserving the exact
+/// omitted-byte count for the caller's diagnostic marker.
+async fn read_to_end_bounded<R>(reader: &mut R, max_bytes: u64) -> std::io::Result<CappedBytes>
+where
+    R: AsyncRead + Unpin,
+{
+    const READ_BUFFER_BYTES: usize = 8 * 1024;
+    let max_bytes = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    let mut captured = Vec::with_capacity(max_bytes.min(READ_BUFFER_BYTES));
+    let mut buffer = [0_u8; READ_BUFFER_BYTES];
+    let mut omitted_bytes = 0_u64;
+
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = max_bytes.saturating_sub(captured.len());
+        let keep = remaining.min(read);
+        captured.extend_from_slice(&buffer[..keep]);
+        omitted_bytes = omitted_bytes.saturating_add((read - keep) as u64);
+    }
+
+    Ok(CappedBytes {
+        bytes: captured,
+        omitted_bytes,
+    })
+}
+
+fn format_capped_output(bytes: &[u8], omitted_bytes: u64) -> String {
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    if omitted_bytes > 0 {
+        text.push_str(&format!("\n[truncated {omitted_bytes} bytes]\n"));
+    }
+    text
+}
+
 /// Decodes `bytes` as (possibly lossy) UTF-8, capping the result at
 /// `max_bytes`. When truncated, appends a marker noting how many bytes were
 /// cut so a truncated capture is never mistaken for the complete output.
+#[cfg(test)]
 fn cap_output_bytes(bytes: &[u8], max_bytes: u64) -> String {
     let max_bytes = usize::try_from(max_bytes).unwrap_or(usize::MAX);
     if bytes.len() <= max_bytes {
-        return String::from_utf8_lossy(bytes).into_owned();
+        return format_capped_output(bytes, 0);
     }
-    let omitted = bytes.len() - max_bytes;
-    let mut text = String::from_utf8_lossy(&bytes[..max_bytes]).into_owned();
-    text.push_str(&format!("\n[truncated {omitted} bytes]\n"));
-    text
+    format_capped_output(
+        bytes.get(..max_bytes).unwrap_or_default(),
+        (bytes.len() - max_bytes) as u64,
+    )
 }
 
 /// Applies/deletes `manifests` via `kubectl -f -`, piping the rendered documents to
@@ -5496,8 +5609,6 @@ async fn run_kubectl_command_async(
     // blocks writing to a full pipe while we block waiting for it to exit).
     // The same reasoning applies to writing the stdin payload.
     let drive = async {
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
         let feed_stdin = async {
             if let (Some(mut stdin), Some(payload)) = (stdin_pipe, stdin_payload) {
                 stdin.write_all(payload).await?;
@@ -5507,12 +5618,12 @@ async fn run_kubectl_command_async(
         let (status, feed_result, stdout_result, stderr_result) = tokio::join!(
             child.wait(),
             feed_stdin,
-            stdout_pipe.read_to_end(&mut stdout),
-            stderr_pipe.read_to_end(&mut stderr),
+            read_to_end_bounded(&mut stdout_pipe, max_output_bytes),
+            read_to_end_bounded(&mut stderr_pipe, max_output_bytes),
         );
         let status = status?;
-        stdout_result?;
-        stderr_result?;
+        let stdout = stdout_result?;
+        let stderr = stderr_result?;
         if status.success() {
             feed_result?;
         }
@@ -5548,8 +5659,8 @@ async fn run_kubectl_command_async(
                         success: status.success(),
                         code: status.code(),
                         status: status.to_string(),
-                        stdout: cap_output_bytes(&stdout, max_output_bytes),
-                        stderr: cap_output_bytes(&stderr, max_output_bytes),
+                        stdout: format_capped_output(&stdout.bytes, stdout.omitted_bytes),
+                        stderr: format_capped_output(&stderr.bytes, stderr.omitted_bytes),
                     })
                 }
                 Err(_elapsed) => {

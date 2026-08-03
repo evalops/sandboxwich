@@ -183,7 +183,7 @@ fn apex_trusted_supervisor_does_not_leak_root_into_the_compiler_cache_containers
 }
 
 #[test]
-fn only_compiler_cache_provider_operations_can_target_root_helper() {
+fn only_compiler_cache_provider_operations_can_target_compiler_cache_helper() {
     let provider = KubernetesApplyProvider::new(
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None),
         "kubectl",
@@ -4412,9 +4412,10 @@ fn provision_staged_applies_gateway_policy_and_waits_for_gateway_before_runtime(
 fn provision_staged_stops_before_the_next_resource_when_reporting_fails() {
     let (kubectl, log_path) = write_stateful_fake_kubectl();
     let provider = apply_provider_with_fake_kubectl(&kubectl);
+    let sandbox_id = SandboxId::new();
     let error = provider
         .provision_staged(
-            SandboxId::new(),
+            sandbox_id,
             &SandboxProvisionSpec::default(),
             &CancelSignal::never_cancelled(),
             |report| {
@@ -4437,6 +4438,12 @@ fn provision_staged_stops_before_the_next_resource_when_reporting_fails() {
         "workspace and network policy apply before their durable reports: {log}"
     );
     assert!(!log.contains(" wait "), "pod stage must not start: {log}");
+    assert!(
+        log.contains(&format!(
+            "delete pod,persistentvolumeclaim,service,networkpolicy,secret -l sandboxwich.dev/sandbox-id={sandbox_id}"
+        )),
+        "staged provisioning must roll back after a report failure: {log}"
+    );
     let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
 }
 

@@ -2098,6 +2098,14 @@ fn orphan_reconciliation_apply_requires_both_opt_ins() {
 }
 
 #[test]
+fn orphan_reconciliation_success_line_is_stable_for_info_logging() {
+    assert_eq!(
+        orphan_reconciliation_success_line(183, 0, false),
+        "worker: orphan reconciliation completed scanned=183 deleted=0 apply=false"
+    );
+}
+
+#[test]
 fn resolv_conf_nameservers_capture_the_cluster_dns_endpoints() {
     let resolvers = resolver_ips_from_resolv_conf(
         r#"
