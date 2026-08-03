@@ -75,6 +75,31 @@ cargo test --workspace
 - `TestServer::spawn` retries lost port-bind races automatically (#108);
   don't add sleeps or port hacks around it.
 
+## Published API contract
+
+- `contracts/openapi.v1.json` is the OpenAPI document this API serves at
+  `/v1/openapi.json`, committed so downstream consumers can pin it. Do not
+  hand-edit it. Refresh it with:
+
+  ```sh
+  SANDBOXWICH_UPDATE_OPENAPI_EXPORT=1 cargo test -p sandboxwich-api \
+    --bin sandboxwich-api api_contract::tests::committed_openapi_export_is_current
+  ```
+
+  `committed_openapi_export_is_current` fails when it is stale, so the refresh
+  is part of any PR that changes a route or a schema.
+- evalops/platform's `runner-host` does not import these types; it re-declares
+  them as serde structs in `rust/services/runner-host/src/sandboxwich.rs` and
+  validates them against this exported document. Removing a route or a schema
+  from the document removes the only check standing between that mirror and a
+  production 422 (2026-08-03 hosted-Maestro outage). `#[utoipa::path]` on a
+  route that runner-host calls is load-bearing, not documentation.
+- A hand-written `Serialize`/`Deserialize` impl makes `#[derive(ToSchema)]`
+  lie: the derive reads the Rust variant identifiers and cannot see the impl.
+  `MemoryLimit` needed explicit `#[schema(rename = ...)]` for this reason. When
+  you add a type in that shape, pin the documented values against the
+  serialized values in a test.
+
 ## Layout
 
 - `crates/sandboxwich-api/src/main.rs` is a thin entrypoint; code lives in
