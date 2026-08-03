@@ -3915,16 +3915,16 @@ fn teardown_args_honor_persisted_gke_fqdn_resource_on_an_unconfigured_worker() {
         .with_kubectl_context(Some("gke-ci".to_string()))
         .with_mutation_gate(true, true);
 
-    let args = apply.teardown_args_with_spec(
+    let commands = apply.optional_teardown_args(
         SandboxId::new(),
         &SandboxTeardownSpec {
             delete_gke_fqdn_policy: true,
         },
     );
 
-    assert!(args.contains(&format!(
-        "{SANDBOX_TEARDOWN_RESOURCE_KINDS},{GKE_FQDN_RESOURCE_KIND}"
-    )));
+    assert_eq!(commands.len(), 1);
+    assert!(commands[0].contains(&GKE_FQDN_RESOURCE_KIND.to_string()));
+    assert!(!commands[0].contains(&SANDBOX_TEARDOWN_RESOURCE_KINDS.to_string()));
 }
 
 #[test]
@@ -3934,13 +3934,44 @@ fn teardown_deletes_the_cilium_policy_under_the_cilium_fqdn_backend() {
             .with_cilium_fqdn_egress(true);
     let apply = KubernetesApplyProvider::new(provider, "kubectl").with_mutation_gate(true, true);
 
-    let args = apply.teardown_args(SandboxId::new());
+    let commands = apply.optional_teardown_args(SandboxId::new(), &SandboxTeardownSpec::default());
 
     // `networkpolicy` does not match the CRD, so without this the policy that
     // is the enforcement boundary outlives the Sandbox it was rendered for.
-    assert!(args.contains(&format!(
-        "{SANDBOX_TEARDOWN_RESOURCE_KINDS},{CILIUM_FQDN_RESOURCE_KIND}"
-    )));
+    assert_eq!(commands.len(), 1);
+    assert!(commands[0].contains(&CILIUM_FQDN_RESOURCE_KIND.to_string()));
+}
+
+#[test]
+fn stop_deletes_core_resources_when_optional_gke_crd_is_absent() {
+    let (kubectl, log_path) = write_fake_kubectl_missing_optional_resource();
+    let provider = apply_provider_with_fake_kubectl(&kubectl);
+    let sandbox_id = SandboxId::new();
+
+    provider
+        .stop(
+            sandbox_id,
+            &SandboxTeardownSpec {
+                delete_gke_fqdn_policy: true,
+            },
+            &CancelSignal::never_cancelled(),
+        )
+        .expect("an absent optional CRD must not fail core teardown");
+
+    let log = std::fs::read_to_string(&log_path).expect("read fake kubectl log");
+    let core_delete = format!(
+        "delete {SANDBOX_TEARDOWN_RESOURCE_KINDS} -l sandboxwich.dev/sandbox-id={sandbox_id}"
+    );
+    assert!(
+        log.contains(&core_delete),
+        "core teardown did not run: {log}"
+    );
+    assert!(
+        log.contains(&format!("delete {GKE_FQDN_RESOURCE_KIND} -l")),
+        "optional cleanup was not attempted separately: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
 }
 
 #[test]
@@ -4040,6 +4071,39 @@ fn write_fake_kubectl(fail_verb: Option<&'static str>) -> (std::path::PathBuf, s
              esac\n\
              exit 0\n",
         log = log_path.display(),
+    );
+    let script_path = dir.join("kubectl");
+    std::fs::write(&script_path, script).expect("write fake kubectl script");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat fake kubectl script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod fake kubectl script");
+    }
+    (script_path, log_path)
+}
+
+fn write_fake_kubectl_missing_optional_resource() -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "sandboxwich-fake-kubectl-missing-crd-{}",
+        SandboxId::new()
+    ));
+    std::fs::create_dir_all(&dir).expect("create fake kubectl temp dir");
+    let log_path = dir.join("log.txt");
+    let script = format!(
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$*\" >> \"{log}\"\n\
+         case \" $* \" in\n\
+         *\" {resource_kind} \"*)\n\
+           echo 'error: the server doesn'\"'\"'t have a resource type \"fqdnnetworkpolicy\"' >&2\n\
+           exit 1\n\
+           ;;\n\
+         esac\n\
+         exit 0\n",
+        log = log_path.display(),
+        resource_kind = GKE_FQDN_RESOURCE_KIND,
     );
     let script_path = dir.join("kubectl");
     std::fs::write(&script_path, script).expect("write fake kubectl script");
