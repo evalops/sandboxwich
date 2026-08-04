@@ -1250,6 +1250,71 @@ async fn sandbox_list_pagination_index_covers_tenant_cursor_order() {
 }
 
 #[tokio::test]
+async fn slo_histogram_rollup_counters_accept_more_than_i32() {
+    // This guards both the portable migration and the cumulative upsert width.
+    let db = test_sqlite_db().await;
+    let columns = sqlx::query("pragma table_info(slo_histogram_rollups)")
+        .fetch_all(&db.pool)
+        .await
+        .expect("inspect SLO histogram rollup columns");
+
+    for counter in [
+        "sample_count",
+        "sum_ms",
+        "b0",
+        "b1",
+        "b2",
+        "b3",
+        "b4",
+        "b5",
+        "b6",
+        "b7",
+    ] {
+        let column = columns
+            .iter()
+            .find(|row| row.try_get::<String, _>("name").ok().as_deref() == Some(counter))
+            .unwrap_or_else(|| panic!("missing SLO histogram rollup column {counter}"));
+        assert_eq!(
+            column
+                .try_get::<String, _>("type")
+                .expect("read SLO histogram rollup column type")
+                .to_ascii_uppercase(),
+            "BIGINT",
+            "SLO histogram rollup counter {counter} must use a 64-bit database type"
+        );
+    }
+
+    sqlx::query(
+        "insert into slo_histogram_rollups
+         (bucket_start, tenant_id, metric_kind, sample_count, sum_ms)
+         values (?, ?, ?, ?, ?)",
+    )
+    .bind("2026-08-04T19:00:00Z")
+    .bind("tenant-test")
+    .bind("latency")
+    .bind(2_147_483_648_i64)
+    .bind(2_147_483_648_i64)
+    .execute(&db.pool)
+    .await
+    .expect("64-bit SLO histogram rollup counters must accept production-sized totals");
+
+    let sample_count = sqlx::query(
+        "select sample_count
+         from slo_histogram_rollups
+         where bucket_start = ? and tenant_id = ? and metric_kind = ?",
+    )
+    .bind("2026-08-04T19:00:00Z")
+    .bind("tenant-test")
+    .bind("latency")
+    .fetch_one(&db.pool)
+    .await
+    .expect("read inserted SLO histogram rollup")
+    .try_get::<i64, _>("sample_count")
+    .expect("read 64-bit SLO histogram rollup counter");
+    assert_eq!(sample_count, 2_147_483_648);
+}
+
+#[tokio::test]
 async fn schema_verification_rejects_an_incomplete_latest_migration() {
     let db = test_sqlite_db().await;
     let expected = latest_compiled_migration();
