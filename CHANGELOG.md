@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+## 0.1.7 - 2026-08-04
+### Added
+
+- *(observability)* Correlate sandbox lifecycle traces
+- *(api)* Export the OpenAPI document so downstream mirrors can be validated
+
+### Fixed
+
+- *(api)* Classify concurrent sandbox stops as idempotent
+- Speed inventory reconciliation and trace stale placements
+- *(api)* Distinguish pending resident placement
+- *(api)* Reconcile recreated provisioning resources
+- *(sandboxwich)* Close archived cleanup race paths
+- *(sandboxwich)* Reconcile archived runtime leaks
+- *(worker)* Classify ResourceQuota rejections as retryable capacity
+- *(worker)* Roll back failed staged provisioning
+- *(worker)* Report successful reconciliation at info level
+- *(sandboxwich)* Harden restricted cache and kubectl bounds
+
+### Other
+
+- Merge branch 'main' into contract/openapi-export-for-mirrors
+- Merge origin/main into compiler-cache-nonroot-redesign
+- *(sandbox)* Move compiler-cache staging out of the guest mount namespace and drop root
+- Merge branch 'main' into api-4xx-visibility
+- Merge remote-tracking branch 'origin/main' into codex/provision-503
+- Merge remote-tracking branch 'origin/main' into codex/provision-503
+- Merge remote-tracking branch 'origin/main' into feat/trace-sandbox-lifecycle
+- Merge pull request #237 from evalops/pvc-orphan-reaper-v2
+- Merge remote-tracking branch 'origin/main' into pvc-orphan-reaper-v2
+- Merge branch 'main' into quota-retryable-capacity
+
 ## 0.1.6 - 2026-08-02
 ### Added
 
