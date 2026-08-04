@@ -68,6 +68,7 @@ pub(crate) async fn apex_command_claim_requires_exact_profile_and_runtime_image(
             lease_seconds: Some(60),
             sandbox_id: Some(created.sandbox.id),
             kinds: Some(vec![JobKind::ProvisionSandbox]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -154,6 +155,7 @@ pub(crate) async fn apex_command_claim_requires_exact_profile_and_runtime_image(
             lease_seconds: Some(60),
             sandbox_id: Some(created.sandbox.id),
             kinds: Some(vec![JobKind::RunCommand]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -203,6 +205,7 @@ pub(crate) async fn apex_command_claim_requires_exact_profile_and_runtime_image(
             lease_seconds: Some(60),
             sandbox_id: Some(created.sandbox.id),
             kinds: Some(vec![JobKind::RunCommand]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -285,6 +288,7 @@ pub(crate) async fn command_stdin_is_redacted_from_tenant_jobs_but_preserved_for
             lease_seconds: Some(60),
             sandbox_id: Some(created.sandbox.id),
             kinds: Some(vec![JobKind::ProvisionSandbox]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -416,6 +420,7 @@ pub(crate) async fn command_stdin_is_redacted_from_tenant_jobs_but_preserved_for
             lease_seconds: Some(60),
             sandbox_id: Some(created.sandbox.id),
             kinds: Some(vec![JobKind::RunCommand]),
+            wait_ms: None,
         })
         .send()
         .await

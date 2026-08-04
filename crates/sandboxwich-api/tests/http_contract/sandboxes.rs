@@ -616,6 +616,7 @@ async fn stop_before_first_provision_is_claimable_and_cannot_be_undone() {
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: None,
+            wait_ms: None,
         })
         .send()
         .await
@@ -655,6 +656,7 @@ async fn stop_before_first_provision_is_claimable_and_cannot_be_undone() {
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: None,
+            wait_ms: None,
         })
         .send()
         .await
@@ -1058,6 +1060,7 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox.sandbox.id),
             kinds: Some(vec![JobKind::CreateSnapshot]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -1118,6 +1121,7 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
             lease_seconds: Some(60),
             sandbox_id: Some(forked.sandbox.id),
             kinds: Some(vec![JobKind::ForkSandbox]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -1206,6 +1210,7 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: None,
+            wait_ms: None,
         })
         .send()
         .await

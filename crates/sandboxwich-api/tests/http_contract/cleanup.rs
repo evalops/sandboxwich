@@ -150,6 +150,7 @@ async fn archived_sandbox_cleanup_cascades_dependent_rows_on_sqlite() {
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: None,
+            wait_ms: None,
         })
         .send()
         .await

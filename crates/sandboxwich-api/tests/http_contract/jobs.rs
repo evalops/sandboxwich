@@ -175,6 +175,7 @@ async fn legacy_queued_job_is_authoritatively_repaired_and_claimed() {
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox.sandbox.id),
             kinds: Some(vec![JobKind::ProvisionSandbox]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -227,6 +228,7 @@ async fn irreparable_legacy_queued_job_becomes_observably_dead() {
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: Some(vec![JobKind::ProvisionSandbox]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -329,6 +331,7 @@ async fn materialization_bytes_are_worker_fenced_ref_only_and_consumed_only_when
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox.sandbox.id),
             kinds: Some(vec![JobKind::ProvisionSandbox]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -418,6 +421,7 @@ async fn materialization_bytes_are_worker_fenced_ref_only_and_consumed_only_when
                 lease_seconds: Some(60),
                 sandbox_id: Some(sandbox),
                 kinds: Some(vec![JobKind::MaterializeFile]),
+                wait_ms: None,
             })
             .send()
             .await
@@ -1019,6 +1023,7 @@ pub(crate) async fn provisioning_stage_route_is_put_only_and_worker_fenced() {
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox.sandbox.id),
             kinds: Some(vec![JobKind::ProvisionSandbox]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -1149,6 +1154,7 @@ pub(crate) async fn claim_lease_sandbox_filter_excludes_other_sandbox_jobs() {
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_b.sandbox.id),
             kinds: None,
+            wait_ms: None,
         })
         .send()
         .await
@@ -1174,6 +1180,7 @@ pub(crate) async fn claim_lease_sandbox_filter_excludes_other_sandbox_jobs() {
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_a.sandbox.id),
             kinds: None,
+            wait_ms: None,
         })
         .send()
         .await
@@ -1225,6 +1232,7 @@ pub(crate) async fn claim_lease_kinds_filter_excludes_other_kinds() {
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: Some(vec![JobKind::ProvisionSandbox]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -1281,6 +1289,7 @@ pub(crate) async fn claim_lease_kinds_filter_excludes_other_kinds() {
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: Some(vec![JobKind::RunCommand]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -1327,6 +1336,7 @@ pub(crate) async fn claim_lease_without_filters_still_claims_any_matching_job() 
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: None,
+            wait_ms: None,
         })
         .send()
         .await
@@ -1362,6 +1372,7 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
             lease_seconds: Some(60),
             sandbox_id: Some(sibling.sandbox.id),
             kinds: None,
+            wait_ms: None,
         })
         .send()
         .await
@@ -1386,6 +1397,7 @@ pub(crate) async fn assert_failed_completion_rolls_back_lease_state(
             lease_seconds: Some(60),
             sandbox_id: Some(sibling.sandbox.id),
             kinds: None,
+            wait_ms: None,
         })
         .send()
         .await
@@ -1543,6 +1555,7 @@ pub(crate) async fn assert_retryable_failure_requeues_command(
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: None,
+            wait_ms: None,
         })
         .send()
         .await
@@ -1621,6 +1634,7 @@ pub(crate) async fn assert_retryable_failure_requeues_command(
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: None,
+            wait_ms: None,
         })
         .send()
         .await
@@ -1726,6 +1740,7 @@ pub(crate) async fn assert_command_status_is_derived_from_exit_code(
                 lease_seconds: Some(60),
                 sandbox_id: None,
                 kinds: None,
+                wait_ms: None,
             })
             .send()
             .await
@@ -1840,6 +1855,7 @@ pub(crate) async fn assert_expired_lease_requeues_command(
             lease_seconds: Some(0),
             sandbox_id: None,
             kinds: None,
+            wait_ms: None,
         })
         .send()
         .await
@@ -1958,6 +1974,7 @@ pub(crate) async fn concurrent_provider_identity_collision_is_classified_over_po
                 lease_seconds: Some(60),
                 sandbox_id: Some(first.sandbox.id),
                 kinds: Some(vec![JobKind::ProvisionSandbox]),
+                wait_ms: None,
             })
             .send()
             .await
@@ -1976,6 +1993,7 @@ pub(crate) async fn concurrent_provider_identity_collision_is_classified_over_po
                 lease_seconds: Some(60),
                 sandbox_id: Some(second.sandbox.id),
                 kinds: Some(vec![JobKind::ProvisionSandbox]),
+                wait_ms: None,
             })
             .send()
             .await

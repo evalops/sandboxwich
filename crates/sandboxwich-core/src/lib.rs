@@ -2936,6 +2936,12 @@ pub struct ClaimLeaseRequest {
     /// worker-token callers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kinds: Option<Vec<JobKind>>,
+    /// When no lease is available immediately, wait up to this many
+    /// milliseconds and retry (server-capped). `None`/0 returns empty
+    /// immediately (historical behavior). Prefer this over tight client
+    /// poll loops so queue→claim lag does not dominate TTFT under load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

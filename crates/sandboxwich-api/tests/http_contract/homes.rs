@@ -200,6 +200,7 @@ async fn managed_home_delete_is_explicit_and_asynchronous() {
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: Some(vec![JobKind::DeleteHome]),
+            wait_ms: None,
         })
         .send()
         .await

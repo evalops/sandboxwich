@@ -8,11 +8,13 @@ use crate::handlers::workers::*;
 use crate::idempotency::expire_idempotency_records;
 use crate::limits::expire_tenant_limit_counters;
 use crate::reap::reap_expired_active_sandboxes;
+use crate::slo_metrics::rollup_terminal_slo_observations;
 use crate::state::ResidentBootstrapStore;
 use std::time::Duration;
 use std::time::Instant;
 
 const ARCHIVED_RUNTIME_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(60);
+const METRICS_ROLLUP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Runs the lease/snapshot/desktop-session expiry and archived-runtime repair
 /// sweeps on a fixed interval in
@@ -46,6 +48,7 @@ pub(crate) fn spawn_expiry_sweeper(
         let mut last_archived_runtime_reconciliation = now
             .checked_sub(ARCHIVED_RUNTIME_RECONCILIATION_INTERVAL)
             .unwrap_or(now);
+        let mut last_metrics_rollup = now.checked_sub(METRICS_ROLLUP_INTERVAL).unwrap_or(now);
         // The first tick fires immediately; that's fine, it just means the
         // first sweep runs right away instead of waiting a full interval.
         loop {
@@ -112,6 +115,21 @@ pub(crate) fn spawn_expiry_sweeper(
                 Err(error) => {
                     tracing::warn!(?error, "active sandbox lifetime reap sweep failed");
                 }
+            }
+            if last_metrics_rollup.elapsed() >= METRICS_ROLLUP_INTERVAL {
+                match rollup_terminal_slo_observations(&db).await {
+                    Ok(rolled) if rolled > 0 => {
+                        tracing::info!(
+                            rolled,
+                            "rolled terminal SLO observations into hourly buckets"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(?error, "terminal SLO observation rollup failed");
+                    }
+                }
+                last_metrics_rollup = Instant::now();
             }
         }
     })

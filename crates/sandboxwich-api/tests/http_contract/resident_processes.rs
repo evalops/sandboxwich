@@ -93,6 +93,7 @@ async fn provisioned_sandbox_with_guest(
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_id),
             kinds: Some(vec![JobKind::ProvisionSandbox]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -192,6 +193,7 @@ async fn claim_resident_process_lease(
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_id),
             kinds: Some(vec![JobKind::RunResidentProcess]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -492,6 +494,7 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_id),
             kinds: Some(vec![JobKind::RunResidentProcess]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -865,6 +868,7 @@ pub(crate) async fn resident_process_create_is_idempotent_tenant_scoped_and_reda
             lease_seconds: Some(60),
             sandbox_id: Some(created.sandbox.id),
             kinds: Some(vec![JobKind::ProvisionSandbox]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -949,6 +953,7 @@ pub(crate) async fn resident_process_create_is_idempotent_tenant_scoped_and_reda
             lease_seconds: Some(60),
             sandbox_id: Some(created.sandbox.id),
             kinds: Some(vec![JobKind::RunResidentProcess]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -1308,6 +1313,7 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_id),
             kinds: Some(vec![JobKind::RunResidentProcess]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -1337,6 +1343,7 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
                 lease_seconds: Some(60),
                 sandbox_id: Some(sandbox_id),
                 kinds: Some(vec![JobKind::RunResidentProcess]),
+                wait_ms: None,
             })
             .send()
             .await
@@ -1354,6 +1361,7 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_id),
             kinds: Some(vec![JobKind::RunResidentProcess]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -1373,6 +1381,7 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_id),
             kinds: Some(vec![JobKind::RunResidentProcess]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -1410,6 +1419,7 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_id),
             kinds: Some(vec![JobKind::RunResidentProcess]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -1476,6 +1486,7 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_id),
             kinds: Some(vec![JobKind::RunResidentProcess]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -1503,6 +1514,7 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_id),
             kinds: Some(vec![JobKind::RunResidentProcess]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -1531,6 +1543,7 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_id),
             kinds: Some(vec![JobKind::RunResidentProcess]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -1560,6 +1573,7 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
                 lease_seconds: Some(60),
                 sandbox_id: Some(sandbox_id),
                 kinds: Some(vec![JobKind::RunResidentProcess]),
+                wait_ms: None,
             })
             .send()
             .await
@@ -1577,6 +1591,7 @@ async fn run_orb_sidecar_lifecycle_and_fail_closed_contract(server: TestServer) 
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_id),
             kinds: Some(vec![JobKind::RunResidentProcess]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -2914,6 +2929,7 @@ async fn stopping_before_first_claim_terminalizes_the_queued_resident_job() {
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_id),
             kinds: Some(vec![JobKind::RunResidentProcess]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -3159,6 +3175,7 @@ async fn delivered_bootstrap_cannot_be_requeued_before_first_observation() {
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_id),
             kinds: Some(vec![JobKind::RunResidentProcess]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -3237,6 +3254,7 @@ async fn delivered_bootstrap_lease_expiry_is_terminal_not_requeued() {
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_id),
             kinds: Some(vec![JobKind::RunResidentProcess]),
+            wait_ms: None,
         })
         .send()
         .await
