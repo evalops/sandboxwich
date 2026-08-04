@@ -9,50 +9,50 @@ use sqlx::any::AnyRow;
 use uuid::Uuid;
 
 pub(crate) fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
-    let id: String = row.try_get("id")?;
-    let state: String = row.try_get("state")?;
-    let memory_limit: String = row.try_get("memory_limit")?;
-    let network_egress_mode: String = row.try_get("network_egress_mode")?;
-    let workspace_mode: String = row.try_get("workspace_mode")?;
-    let runtime_profile: String = row.try_get("runtime_profile")?;
-    let execution_class: String = row.try_get("execution_class")?;
-    let created_at: String = row.try_get("created_at")?;
-    let updated_at: String = row.try_get("updated_at")?;
+    // Parse-only text fields are borrowed from the row buffer so the hot list path
+    // does not allocate a String for every enum/uuid/timestamp conversion.
+    let id: &str = row.try_get("id")?;
+    let state: &str = row.try_get("state")?;
+    let memory_limit: &str = row.try_get("memory_limit")?;
+    let network_egress_mode: &str = row.try_get("network_egress_mode")?;
+    let workspace_mode: &str = row.try_get("workspace_mode")?;
+    let runtime_profile: &str = row.try_get("runtime_profile")?;
+    let execution_class: &str = row.try_get("execution_class")?;
+    let created_at: &str = row.try_get("created_at")?;
+    let updated_at: &str = row.try_get("updated_at")?;
     let ttl_seconds: Option<i64> = row.try_get("ttl_seconds")?;
     let max_lifetime_seconds: Option<i64> = row.try_get("max_lifetime_seconds")?;
     let idle_ttl_seconds: Option<i64> = row.try_get("idle_ttl_seconds")?;
-    let last_activity_at: Option<String> = row.try_get("last_activity_at")?;
-    let parent_snapshot_id: Option<String> = row.try_get("parent_snapshot_id")?;
-    let network_egress = match parse_network_egress_mode(&network_egress_mode)? {
+    let last_activity_at: Option<&str> = row.try_get("last_activity_at")?;
+    let parent_snapshot_id: Option<&str> = row.try_get("parent_snapshot_id")?;
+    let network_egress = match parse_network_egress_mode(network_egress_mode)? {
         NetworkEgressMode::DenyAll => NetworkEgress::DenyAll,
         NetworkEgressMode::Allowlist => NetworkEgress::Allowlist { rules: Vec::new() },
         NetworkEgressMode::AllowAll => NetworkEgress::AllowAll,
     };
 
     Ok(Sandbox {
-        execution_class: ExecutionClass::parse_db_str(&execution_class)
+        execution_class: ExecutionClass::parse_db_str(execution_class)
             .map_err(|_| ApiError::internal("database contains invalid execution class"))?,
-        id: SandboxId(parse_uuid(&id)?),
+        id: SandboxId(parse_uuid(id)?),
         tenant_id: row.try_get("tenant_id")?,
         name: row.try_get("name")?,
-        state: parse_state(&state)?,
+        state: parse_state(state)?,
         template: row.try_get("template")?,
-        memory_limit: parse_memory_limit(&memory_limit)?,
+        memory_limit: parse_memory_limit(memory_limit)?,
         network_egress,
-        workspace_mode: WorkspaceMode::parse_db_str(&workspace_mode)
+        workspace_mode: WorkspaceMode::parse_db_str(workspace_mode)
             .map_err(|_| ApiError::internal("database contains invalid workspace mode"))?,
-        runtime_profile: SandboxRuntimeProfile::parse_db_str(&runtime_profile)
+        runtime_profile: SandboxRuntimeProfile::parse_db_str(runtime_profile)
             .map_err(|_| ApiError::internal("database contains invalid runtime profile"))?,
-        created_at: parse_timestamp(&created_at)?,
-        updated_at: parse_timestamp(&updated_at)?,
+        created_at: parse_timestamp(created_at)?,
+        updated_at: parse_timestamp(updated_at)?,
         ttl_seconds: ttl_seconds.map(|ttl| ttl as u64),
         max_lifetime_seconds: max_lifetime_seconds.map(|ttl| ttl as u64),
         idle_ttl_seconds: idle_ttl_seconds.map(|ttl| ttl as u64),
-        last_activity_at: last_activity_at
-            .map(|value| parse_timestamp(&value))
-            .transpose()?,
+        last_activity_at: last_activity_at.map(parse_timestamp).transpose()?,
         parent_snapshot_id: parent_snapshot_id
-            .map(|snapshot| parse_uuid(&snapshot).map(SnapshotId))
+            .map(|snapshot| parse_uuid(snapshot).map(SnapshotId))
             .transpose()?,
     })
 }
@@ -128,9 +128,9 @@ pub(crate) fn row_to_resident_process(row: AnyRow) -> Result<ResidentProcess, Ap
 }
 
 pub(crate) fn row_to_network_allow_rule(row: AnyRow) -> Result<NetworkAllowRule, ApiError> {
-    let kind: String = row.try_get("kind")?;
+    let kind: &str = row.try_get("kind")?;
     Ok(NetworkAllowRule {
-        kind: parse_network_allow_rule_kind(&kind)?,
+        kind: parse_network_allow_rule_kind(kind)?,
         value: row.try_get("value")?,
     })
 }
