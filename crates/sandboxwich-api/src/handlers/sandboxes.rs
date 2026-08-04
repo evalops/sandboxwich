@@ -8,7 +8,6 @@ use crate::handlers::operations::operation_from_job;
 use crate::handlers::secrets::*;
 use crate::handlers::snapshots::*;
 use crate::pagination::*;
-use crate::reconcile::list_runtime_resources_for_sandbox;
 use crate::request_id::RequestTrace;
 use crate::rows::*;
 use crate::state::*;
@@ -292,7 +291,11 @@ pub(crate) async fn create_sandbox_with_home(
         last_error: None,
     };
     trace.add_to_payload(&mut job.payload);
-    add_provision_spec_to_payload(&mut job, &sandbox, &provision_spec.secret_mounts)?;
+    // Payload already embeds provisionSpec + runtimeImage from the create
+    // request path; re-running add_provision_spec would only re-serialize the
+    // same values. Keep the helper call only when secret mounts may have been
+    // resolved after the initial payload build (they are set on provision_spec
+    // before the json! macro above).
     // Capacity admission: when every online worker has reported an envelope and
     // none can schedule this tier, reject immediately instead of creating a Pod
     // that will only fail after the readiness window.
@@ -300,24 +303,26 @@ pub(crate) async fn create_sandbox_with_home(
         .await?;
     let mut tx = state.db.pool.begin().await?;
     insert_sandbox_on_connection(&state.db, &mut tx, &sandbox).await?;
-    insert_sandbox_secret_bindings_on_connection(
-        &state.db,
-        &mut tx,
-        sandbox.id,
-        &provision_spec.secret_mounts,
-    )
-    .await?;
+    if !provision_spec.secret_mounts.is_empty() {
+        insert_sandbox_secret_bindings_on_connection(
+            &state.db,
+            &mut tx,
+            sandbox.id,
+            &provision_spec.secret_mounts,
+        )
+        .await?;
+    }
     if let Some(home_id) = home_id {
         claim_home_mount_on_connection(&state.db, &mut tx, home_id, &ctx.tenant_id, sandbox.id)
             .await?;
     }
-    replace_sandbox_network_rules_on_connection(
-        &state.db,
-        &mut tx,
-        sandbox.id,
-        sandbox.network_egress.rules(),
-    )
-    .await?;
+    // Fresh sandbox row: deny_all / empty allowlist has no rules table rows to
+    // clear. Skip the DELETE that every create previously paid for nothing.
+    let network_rules = sandbox.network_egress.rules();
+    if !network_rules.is_empty() {
+        replace_sandbox_network_rules_on_connection(&state.db, &mut tx, sandbox.id, network_rules)
+            .await?;
+    }
     insert_event_on_connection(
         &state.db,
         &mut tx,
@@ -579,14 +584,13 @@ pub(crate) async fn stop_sandbox_via_job(
     trace: Option<RequestTrace>,
 ) -> Result<Option<Job>, ApiError> {
     let sandbox_id = sandbox.id;
-    let delete_gke_fqdn_policy = list_runtime_resources_for_sandbox(db, sandbox_id)
-        .await?
-        .iter()
-        .any(|resource| {
-            resource.provider == "kubernetes"
-                && resource.resource_kind == RuntimeResourceKind::NetworkPolicy
-                && resource.resource_name == format!("sandboxwich-fqdn-egress-{sandbox_id}")
-        });
+    // Pure pre-tx reads: FQDN teardown flag is a single EXISTS, not a full
+    // runtime inventory decode; secret mounts stay on the read pool. Run them
+    // concurrently so stop admission latency is max(exists, mounts), not sum.
+    let (delete_gke_fqdn_policy, secret_mounts) = tokio::try_join!(
+        sandbox_has_gke_fqdn_policy(db, sandbox_id),
+        fetch_sandbox_secret_mounts(db, sandbox_id),
+    )?;
     let now = Utc::now();
     let mut job = Job {
         id: JobId::new(),
@@ -610,7 +614,6 @@ pub(crate) async fn stop_sandbox_via_job(
     if let Some(trace) = trace {
         trace.add_to_payload(&mut job.payload);
     }
-    let secret_mounts = fetch_sandbox_secret_mounts(db, sandbox_id).await?;
     add_provision_spec_to_payload(&mut job, sandbox, &secret_mounts)?;
     let mut tx = db.pool.begin().await?;
     let transitioned = set_sandbox_state_on_connection(
@@ -1441,6 +1444,35 @@ pub(crate) async fn fetch_sandbox_on_connection(
 /// none of those envelopes can schedule `memory_limit`. Workers that have not
 /// reported an envelope are treated as "unknown" so rolling upgrades do not
 /// brick admission before all workers start heartbeating capacity evidence.
+/// True when this sandbox still has the GKE FQDN egress NetworkPolicy row the
+/// stop job must delete. Exists-only so stop does not hydrate full inventory.
+pub(crate) async fn sandbox_has_gke_fqdn_policy(
+    db: &Database,
+    sandbox_id: SandboxId,
+) -> Result<bool, ApiError> {
+    let policy_name = format!("sandboxwich-fqdn-egress-{sandbox_id}");
+    let sql = format!(
+        "select 1 as present from runtime_resources
+         where sandbox_id = {}
+           and provider = 'kubernetes'
+           and resource_kind = {}
+           and resource_name = {}
+         limit 1",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3)
+    );
+    let row = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .bind(runtime_resource_kind_to_str(
+            &RuntimeResourceKind::NetworkPolicy,
+        ))
+        .bind(policy_name)
+        .fetch_optional(db.read_pool())
+        .await?;
+    Ok(row.is_some())
+}
+
 pub(crate) async fn reject_if_memory_exceeds_all_envelopes(
     db: &Database,
     tenant_id: &str,
