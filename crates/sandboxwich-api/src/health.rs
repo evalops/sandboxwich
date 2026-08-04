@@ -78,6 +78,9 @@ pub(crate) async fn metrics(
 }
 
 pub(crate) async fn check_database_health(db: &Database) -> Result<HealthComponent, ApiError> {
+    // Ready probes must not contend with the single SQLite writer used by
+    // create/claim/heartbeat; the query-only read pool is enough to prove
+    // the database is reachable under WAL.
     sqlx::query("select 1").execute(db.read_pool()).await?;
     Ok(HealthComponent {
         ok: true,
@@ -373,6 +376,8 @@ pub(crate) async fn fetch_prometheus_metrics(
             query = query.bind(tenant_id.to_string());
         }
     }
+    // Aggregate counts are pure reads; keep them off the SQLite write FIFO so
+    // scrapes do not serialize behind creates/claims/heartbeats.
     let rows = query.fetch_all(db.read_pool()).await?;
 
     let mut values = BTreeMap::new();
@@ -411,7 +416,7 @@ pub(crate) async fn fetch_prometheus_metrics(
         if let Some(tenant_id) = tenant_id {
             query = query.bind(tenant_id);
         }
-        let row = query.fetch_one(&db.pool).await?;
+        let row = query.fetch_one(db.read_pool()).await?;
         let observed_at: Option<String> = row.try_get("observed_at")?;
         let age = observed_at
             .as_deref()
