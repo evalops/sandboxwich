@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.1.10 - 2026-08-04
+### Other
+
+- *(api)* Cut lifecycle spin-up and tear-down round trips
+
 ## 0.1.9 - 2026-08-04
 ### Fixed
 
