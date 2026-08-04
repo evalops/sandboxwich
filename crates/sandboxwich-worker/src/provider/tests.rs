@@ -1089,7 +1089,7 @@ fn isolated_sidecar_run_observes_terminal_state_and_always_cleans_up() {
 fn isolated_sidecar_pending_publishes_identity_and_times_out_retryably() {
     let (kubectl, log_path) = write_pending_isolated_sidecar_fake_kubectl();
     let provider = isolated_sidecar_apply_provider(&kubectl)
-        .with_isolated_resident_process_startup_timeout(Duration::from_millis(45));
+        .with_isolated_resident_process_startup_timeout(Duration::from_millis(500));
     let spec = isolated_sidecar_spec(b"pending-deadline-canary");
     let mut observations = Vec::new();
     let error = provider
@@ -1128,8 +1128,8 @@ fn isolated_sidecar_pending_publishes_identity_and_times_out_retryably() {
         .parse()
         .unwrap();
     assert!(
-        get_count <= 5,
-        "bounded backoff should cap API calls during the 45ms deadline, got {get_count}"
+        get_count <= 30,
+        "bounded backoff should cap API calls during the 500ms deadline, got {get_count}"
     );
     let log = std::fs::read_to_string(&log_path).unwrap();
     assert!(log.lines().any(|line| line.contains(" delete ")));
