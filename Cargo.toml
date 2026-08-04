@@ -62,6 +62,10 @@ sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "any", "postgres",
 subtle = "2.6"
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
+# Test-only (dev-dependency of sandboxwich-api): `ServiceExt::oneshot` drives a
+# `Router` through a middleware without binding a socket. Already in the lock
+# file as an axum dependency, so this adds no new package.
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.19", features = ["serde", "v4", "v7"] }

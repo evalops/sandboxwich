@@ -20,6 +20,7 @@ use crate::health::*;
 use crate::idempotency::enforce_idempotency;
 use crate::limits::*;
 use crate::reconcile::*;
+use crate::rejection_log::log_mutation_rejections;
 use crate::request_id::{attach_request_id, normalize_framework_errors};
 use crate::state::*;
 use axum::Router;
@@ -306,6 +307,12 @@ pub(crate) fn app(state: AppState) -> Router {
         .merge(resident_attestation_routes)
         .layer(DefaultBodyLimit::max(DEFAULT_BODY_LIMIT_BYTES))
         .with_state(state.clone())
+        // Deliberately inside `auth_and_tenant` (so the log line can name the
+        // tenant) and inside `normalize_framework_errors` (so an axum `Json`
+        // rejection is still carrying its serde error rather than the generic
+        // envelope substituted for the caller). `Router::layer` runs after
+        // routing, so the matched route template is available here.
+        .layer(middleware::from_fn(log_mutation_rejections))
         .layer(middleware::from_fn_with_state(state, auth_and_tenant))
         .layer(middleware::from_fn(normalize_framework_errors))
         .layer(middleware::from_fn(attach_request_id))
