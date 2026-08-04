@@ -228,6 +228,20 @@ fn maestro_hosted_runner_request(
     workspace_id: &str,
     runner_session_id: &str,
 ) -> ResidentProcessRequest {
+    maestro_hosted_runner_request_for_organization(
+        "default",
+        sandbox_id,
+        workspace_id,
+        runner_session_id,
+    )
+}
+
+fn maestro_hosted_runner_request_for_organization(
+    organization_id: &str,
+    sandbox_id: SandboxId,
+    workspace_id: &str,
+    runner_session_id: &str,
+) -> ResidentProcessRequest {
     ResidentProcessRequest {
         argv: vec![
             "/usr/local/bin/maestro".into(),
@@ -249,7 +263,7 @@ fn maestro_hosted_runner_request(
                 "MAESTRO_IDENTITY_TLS_CA_FILE".into(),
                 MAESTRO_HOSTED_RUNNER_IDENTITY_CA_FILE.into(),
             ),
-            ("MAESTRO_ORGANIZATION_ID".into(), "default".into()),
+            ("MAESTRO_ORGANIZATION_ID".into(), organization_id.into()),
             ("MAESTRO_WORKSPACE_ID".into(), workspace_id.into()),
             ("MAESTRO_SANDBOX_ID".into(), sandbox_id.to_string()),
             ("MAESTRO_RUNNER_SESSION_ID".into(), runner_session_id.into()),
@@ -392,7 +406,15 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
     let client = server.client();
     let workspace_id = "workspace/with spaces";
     let runner_session_id = "runner/session with spaces";
-    let request = maestro_hosted_runner_request(sandbox_id, workspace_id, runner_session_id);
+    // Platform's organization/workspace binding is intentionally distinct
+    // from the API's authenticated Sandboxwich tenant (`default`).
+    let organization_id = "org-cae96cb237bc161dd754903c:workspace-cae96cb237bc161dd754903c";
+    let request = maestro_hosted_runner_request_for_organization(
+        organization_id,
+        sandbox_id,
+        workspace_id,
+        runner_session_id,
+    );
     let mut redirected_exchange = request.clone();
     redirected_exchange.env.insert(
         "MAESTRO_IDENTITY_EXCHANGE_URL".into(),
@@ -535,10 +557,11 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
         connection.service_host,
         format!("{service_name}.sandboxwich-sandboxes.svc.cluster.local")
     );
+    let organization_id_uri = organization_id;
     assert_eq!(
         connection.expected_server_uri_san,
         format!(
-            "spiffe://identity.evalops.dev/maestro/v1/organizations/default/workspaces/workspace%2Fwith%20spaces/sandboxes/{sandbox_id}/pods/{pod_uid}/generations/1/sessions/runner%2Fsession%20with%20spaces/images/{}/services/{service_name}/ports/8443/resident-process-generations/1/leases/{}/attempts/1/workers/{}",
+            "spiffe://identity.evalops.dev/maestro/v1/organizations/{organization_id_uri}/workspaces/workspace%2Fwith%20spaces/sandboxes/{sandbox_id}/pods/{pod_uid}/generations/1/sessions/runner%2Fsession%20with%20spaces/images/{}/services/{service_name}/ports/8443/resident-process-generations/1/leases/{}/attempts/1/workers/{}",
             "b".repeat(64),
             lease.id,
             worker.worker.id
@@ -558,7 +581,7 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
     );
 
     let binding = ValidateMaestroWorkloadIdentityRequest {
-        organization_id: "default".into(),
+        organization_id: organization_id.into(),
         workspace_id: workspace_id.into(),
         sandbox_id,
         pod_uid,

@@ -339,9 +339,13 @@ pub(crate) async fn get_maestro_connection_binding(
         .ok_or_else(|| not_live("Maestro placement has no authoritative Pod UID"))?;
     let env: BTreeMap<String, String> = serde_json::from_str(&row.try_get::<String, _>("env")?)
         .map_err(|_| ApiError::internal("Maestro resident environment is invalid"))?;
+    // Sandboxwich's authenticated tenant is the control-plane storage scope;
+    // the Maestro organization binding is the platform's opaque
+    // organization/workspace scope and may legitimately differ from it.
+    // Tenant ownership was already enforced by the query above.
     let organization_id = env
         .get("MAESTRO_ORGANIZATION_ID")
-        .filter(|value| value.as_str() == ctx.tenant_id)
+        .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| not_live("Maestro organization binding is invalid"))?;
     let workspace_id = env
         .get("MAESTRO_WORKSPACE_ID")
@@ -981,19 +985,17 @@ pub(crate) async fn validate_maestro_workload_identity(
         return Err(unavailable());
     }
     let sql = format!(
-        "select rp.id, rp.generation, rp.active_lease_id, rp.env,
+        "select rp.tenant_id, rp.id, rp.generation, rp.active_lease_id, rp.env,
                 rp.desired_state, rp.observed_state,
                 rp.provider_pod_name, rp.provider_pod_uid, w.labels
          from resident_processes rp
          join job_leases jl on jl.id = rp.active_lease_id
          join workers w on w.id = jl.worker_id
-         where rp.tenant_id = {} and rp.sandbox_id = {} and rp.name = {}",
+         where rp.sandbox_id = {} and rp.name = {}",
         state.db.placeholder(1),
         state.db.placeholder(2),
-        state.db.placeholder(3),
     );
     let row = sqlx::query(&sql)
-        .bind(&request.organization_id)
         .bind(request.sandbox_id.to_string())
         .bind(MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME)
         .fetch_optional(&state.db.pool)
@@ -1012,6 +1014,10 @@ pub(crate) async fn validate_maestro_workload_identity(
         return Err(not_live("Maestro hosted runner is not running"));
     }
     let process_id = ResidentProcessId(parse_uuid(&row.try_get::<String, _>("id")?)?);
+    // `organization_id` is a platform binding, not the Sandboxwich database
+    // tenant. Use the resident row's authoritative tenant for the placement
+    // fence after the canonical organization/workspace binding is checked.
+    let tenant_id: String = row.try_get("tenant_id")?;
     let process_generation = parse_u64(row.try_get("generation")?, "resident generation")?;
     let lease_id = parse_uuid(
         &row.try_get::<String, _>("active_lease_id")
@@ -1030,7 +1036,7 @@ pub(crate) async fn validate_maestro_workload_identity(
     validate_maestro_canonical_binding(&request, &env, provider_pod_uid)?;
     let fence = placement_fence(
         &state.db,
-        &request.organization_id,
+        &tenant_id,
         process_id,
         process_generation,
         lease_id,
