@@ -273,7 +273,10 @@ pub(crate) async fn fetch_prometheus_metrics(
              union all
              select 'worker_available_slots' as family, '' as label,
                     coalesce((select sum(max_concurrent_jobs) from workers where status = 'online'), 0)
-                      - (select count(*) from job_leases where status = 'active') as value
+                      - (select count(*) from job_leases
+                         join jobs on jobs.id = job_leases.job_id
+                         where job_leases.status = 'active'
+                           and jobs.kind != 'run_resident_process') as value
              union all
              select 'job_lease' as family, status as label, count(*) as value
              from job_leases group by status
@@ -336,7 +339,9 @@ pub(crate) async fn fetch_prometheus_metrics(
              select 'worker_available_slots' as family, '' as label,
                     coalesce((select sum(max_concurrent_jobs) from workers where status = 'online' and tenant_id = {p8}), 0)
                       - (select count(*) from job_leases join jobs on jobs.id = job_leases.job_id
-                         where job_leases.status = 'active' and jobs.tenant_id = {p9}) as value
+                         where job_leases.status = 'active'
+                           and jobs.tenant_id = {p9}
+                           and jobs.kind != 'run_resident_process') as value
              union all
              select 'job_lease' as family, job_leases.status as label, count(*) as value
              from job_leases join jobs on jobs.id = job_leases.job_id
