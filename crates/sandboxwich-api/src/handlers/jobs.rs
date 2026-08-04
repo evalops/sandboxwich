@@ -306,7 +306,12 @@ pub(crate) async fn validate_job_payload_tenant(
                             "compiler-cache materialization requires the unprivileged runtime profile",
                         ));
                     }
-                    compiler_cache_identity_from_job(job)?;
+                    let identity = compiler_cache_identity_from_job(job)?;
+                    // Tenant scope in TenantRepositoryPrivate must come from the
+                    // authenticated principal, not a self-declared label that a
+                    // downstream shared-cache consumer (Foam) might trust as an
+                    // authorization key.
+                    bind_compiler_cache_identity_tenant(identity, &ctx.tenant_id)?;
                 }
                 _ => {
                     if sandbox.runtime_profile != SandboxRuntimeProfile::ApexTrustedSupervisorV1 {
@@ -428,6 +433,48 @@ pub(crate) fn compiler_cache_identity_from_job(job: &Job) -> Result<&str, ApiErr
         ));
     }
     Ok(identity)
+}
+
+/// Ensure any `TenantRepositoryPrivate` claim in a compiler-cache identity is
+/// bound to the authenticated tenant. Repository-shared identities and partial
+/// identities without a visibility claim are left alone; full schema validation
+/// still happens in the agent at capture/restore time.
+pub(crate) fn bind_compiler_cache_identity_tenant(
+    identity: &str,
+    tenant_id: &str,
+) -> Result<(), ApiError> {
+    let raw: serde_json::Value = serde_json::from_str(identity)
+        .map_err(|_| ApiError::bad_request("compilerCacheIdentity must be valid JSON"))?;
+    let Some(visibility) = raw
+        .get("namespace")
+        .and_then(|namespace| namespace.get("visibility"))
+    else {
+        return Ok(());
+    };
+    let kind = visibility
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if kind != "tenant_repository_private" {
+        return Ok(());
+    }
+    let claimed = visibility
+        .get("tenant")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if claimed.is_empty() {
+        return Err(ApiError::bad_request(
+            "compilerCacheIdentity tenant_repository_private visibility requires a tenant",
+        ));
+    }
+    if claimed != tenant_id {
+        return Err(ApiError {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            code: "compiler_cache_identity_tenant_mismatch",
+            message: "compilerCacheIdentity tenant must match the authenticated tenant".into(),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) async fn list_jobs(
