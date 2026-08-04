@@ -366,8 +366,9 @@ pub(crate) async fn list_sandboxes(
          where tenant_id = {}",
         state.db.placeholder(1)
     );
-    let (mut sandboxes, next_cursor) = fetch_keyset_page(
+    let (mut sandboxes, next_cursor) = fetch_keyset_page_from_pool(
         &state.db,
+        state.db.sandbox_list_pool(),
         &base_sql,
         std::slice::from_ref(&ctx.tenant_id),
         limit,
@@ -1493,7 +1494,7 @@ pub(crate) async fn list_network_allow_rules_for_sandboxes(
         }
     }
     query.push(") order by sandbox_id asc, kind asc, value asc");
-    let rows = query.build().fetch_all(&db.pool).await?;
+    let rows = query.build().fetch_all(db.sandbox_list_pool()).await?;
 
     let mut grouped: HashMap<SandboxId, Vec<NetworkAllowRule>> = HashMap::new();
     for row in rows {

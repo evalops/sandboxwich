@@ -2,8 +2,8 @@ use crate::db::*;
 use crate::error::*;
 use base64::{Engine as _, engine::general_purpose};
 use serde::Deserialize;
-use sqlx::Row;
 use sqlx::any::AnyRow;
+use sqlx::{AnyPool, Row};
 
 // ---- List pagination helpers ----
 //
@@ -93,6 +93,20 @@ pub(crate) async fn fetch_keyset_page<T>(
     cursor: &Option<(PageDirection, PageCursor)>,
     row_map: impl Fn(AnyRow) -> Result<T, ApiError>,
 ) -> Result<(Vec<T>, Option<String>), ApiError> {
+    fetch_keyset_page_from_pool(db, &db.pool, base_sql, fixed_binds, limit, cursor, row_map).await
+}
+
+/// Variant used by read-isolated endpoints. All existing callers continue to
+/// use [`fetch_keyset_page`] and the control-plane pool by default.
+pub(crate) async fn fetch_keyset_page_from_pool<T>(
+    db: &Database,
+    pool: &AnyPool,
+    base_sql: &str,
+    fixed_binds: &[String],
+    limit: u32,
+    cursor: &Option<(PageDirection, PageCursor)>,
+    row_map: impl Fn(AnyRow) -> Result<T, ApiError>,
+) -> Result<(Vec<T>, Option<String>), ApiError> {
     // Keep the cursor predicate sargable.  Concatenating the two key columns
     // (`created_at || '|' || id`) forces PostgreSQL to materialize and sort all
     // matching rows before it can apply the page boundary.  Comparing the
@@ -136,7 +150,7 @@ pub(crate) async fn fetch_keyset_page<T>(
         query = query.bind(created_at).bind(id);
     }
 
-    let mut rows = query.fetch_all(&db.pool).await?;
+    let mut rows = query.fetch_all(pool).await?;
     let has_more = rows.len() > limit as usize;
     rows.truncate(limit as usize);
 
