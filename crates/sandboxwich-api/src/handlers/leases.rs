@@ -1363,7 +1363,16 @@ pub(crate) async fn complete_lease_in_transaction(
             .await?;
         record_terminal_slo_observation(db, &mut tx, &lease, successful, now).await?;
 
-        fetch_lease_on_connection(db, &mut tx, lease_id).await
+        // Reflect durable transitions in the response without a third lease+job
+        // SELECT (auth path already loaded once; completion mutates known fields).
+        let mut lease = lease;
+        lease.status = LeaseStatus::Completed;
+        lease.completed_at = Some(now);
+        lease.error = None;
+        lease.job.status = JobStatus::Succeeded;
+        lease.job.updated_at = now;
+        lease.job.last_error = None;
+        Ok(lease)
     }
     .await;
 
@@ -1451,6 +1460,7 @@ pub(crate) async fn fail_lease_in_transaction(
         let retry = retry_requested
             && lease.job.attempts < lease.job.max_attempts
             && !resident_bootstrap_was_delivered(db, &mut tx, &lease.job).await?;
+        let mut lease = lease;
         if retry {
             update_job_status_on_connection(
                 db,
@@ -1462,6 +1472,7 @@ pub(crate) async fn fail_lease_in_transaction(
             )
             .await?;
             apply_retryable_job_on_connection(db, &mut tx, &lease.job, error).await?;
+            lease.job.status = JobStatus::Queued;
         } else {
             update_job_status_on_connection(
                 db,
@@ -1474,9 +1485,14 @@ pub(crate) async fn fail_lease_in_transaction(
             .await?;
             apply_failed_job_on_connection(db, &mut tx, &lease.job, error).await?;
             record_terminal_slo_observation(db, &mut tx, &lease, false, now).await?;
+            lease.job.status = JobStatus::Failed;
         }
-
-        fetch_lease_on_connection(db, &mut tx, lease_id).await
+        lease.status = LeaseStatus::Failed;
+        lease.completed_at = Some(now);
+        lease.error = Some(error.to_string());
+        lease.job.updated_at = now;
+        lease.job.last_error = Some(error.to_string());
+        Ok(lease)
     }
     .await;
 
@@ -1813,25 +1829,26 @@ pub(crate) async fn expire_active_lease_on_connection(
     Ok(result.rows_affected() == 1)
 }
 
+/// Lease + job in one round trip. Complete/renew/fail and claim idempotency
+/// all pay this path on the lifecycle hot path.
+const LEASE_WITH_JOB_SELECT: &str = "
+    select l.id as lease_id, l.job_id, l.worker_id, l.status as lease_status, l.attempt,
+           l.leased_at, l.expires_at, l.completed_at, l.error as lease_error,
+           j.id, j.tenant_id, j.kind, j.status, j.payload, j.required_capability,
+           j.required_execution_class, j.priority, j.attempts, j.max_attempts,
+           j.scheduled_at, j.created_at, j.updated_at, j.last_error
+    from job_leases l
+    join jobs j on j.id = l.job_id
+    where l.id = ";
+
 pub(crate) async fn fetch_lease(db: &Database, lease_id: LeaseId) -> Result<JobLease, ApiError> {
-    let sql = format!(
-        "select id, job_id, worker_id, status, attempt, leased_at, expires_at, completed_at, error
-         from job_leases
-         where id = {}",
-        db.placeholder(1)
-    );
+    let sql = format!("{LEASE_WITH_JOB_SELECT}{}", db.placeholder(1));
     let row = sqlx::query(&sql)
         .bind(lease_id.to_string())
         .fetch_optional(db.read_pool())
         .await?
         .ok_or_else(|| ApiError::not_found("lease not found"))?;
-    let lease = row_to_lease_without_job(row)?;
-    let job = fetch_job(db, lease.job_id).await?;
-    Ok(JobLease {
-        required_execution_class: job.required_execution_class.clone(),
-        job,
-        ..lease
-    })
+    row_to_lease_with_job(row)
 }
 
 pub(crate) async fn fetch_lease_on_connection(
@@ -1839,24 +1856,13 @@ pub(crate) async fn fetch_lease_on_connection(
     connection: &mut AnyConnection,
     lease_id: LeaseId,
 ) -> Result<JobLease, ApiError> {
-    let sql = format!(
-        "select id, job_id, worker_id, status, attempt, leased_at, expires_at, completed_at, error
-         from job_leases
-         where id = {}",
-        db.placeholder(1)
-    );
+    let sql = format!("{LEASE_WITH_JOB_SELECT}{}", db.placeholder(1));
     let row = sqlx::query(&sql)
         .bind(lease_id.to_string())
         .fetch_optional(&mut *connection)
         .await?
         .ok_or_else(|| ApiError::not_found("lease not found"))?;
-    let lease = row_to_lease_without_job(row)?;
-    let job = fetch_job_on_connection(db, connection, lease.job_id).await?;
-    Ok(JobLease {
-        required_execution_class: job.required_execution_class.clone(),
-        job,
-        ..lease
-    })
+    row_to_lease_with_job(row)
 }
 
 pub(crate) async fn complete_active_lease_on_connection(

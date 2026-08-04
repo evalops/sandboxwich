@@ -75,7 +75,9 @@ pub(crate) async fn list_runtime_resources_for_sandbox(
     db: &Database,
     sandbox_id: SandboxId,
 ) -> Result<Vec<RuntimeResource>, ApiError> {
-    let mut connection = db.pool.acquire().await?;
+    // Inventory reads are pure; keep them off the write FIFO so stop/complete
+    // paths that only need resource evidence do not serialize behind creates.
+    let mut connection = db.read_pool().acquire().await?;
     list_runtime_resources_for_sandbox_on_connection(db, &mut connection, sandbox_id).await
 }
 

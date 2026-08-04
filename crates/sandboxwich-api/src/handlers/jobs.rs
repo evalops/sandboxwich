@@ -912,7 +912,14 @@ pub(crate) async fn try_claim_job(
             return Ok(None);
         }
 
-        let leased_job = fetch_job_on_connection(db, &mut tx, job.id).await?;
+        // Claim only mutates status/attempts/updated_at. Rebuild the leased job
+        // in memory instead of a second SELECT (and skip the post-insert lease
+        // re-read): every claim pays this path on provision and stop, so the
+        // round-trips dominate TTFT under SQLite.
+        let mut leased_job = job.clone();
+        leased_job.status = JobStatus::Leased;
+        leased_job.attempts = attempt;
+        leased_job.updated_at = now;
         let lease = JobLease {
             id: LeaseId::new(),
             job_id: job.id,
@@ -971,7 +978,6 @@ pub(crate) async fn try_claim_job(
                 ));
             }
         }
-        let lease = fetch_lease_on_connection(db, &mut tx, lease.id).await?;
         Ok(Some(lease))
     };
     match claimed.await {
@@ -1112,6 +1118,10 @@ pub(crate) async fn fetch_job(db: &Database, job_id: JobId) -> Result<Job, ApiEr
     row_to_job(row)
 }
 
+/// Connection-scoped job load for callers already holding a write transaction.
+/// Claim no longer re-reads after the status CAS; keep this for transactional
+/// repair and future lease paths that still need a durable job snapshot.
+#[allow(dead_code)]
 pub(crate) async fn fetch_job_on_connection(
     db: &Database,
     connection: &mut AnyConnection,

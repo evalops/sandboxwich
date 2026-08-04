@@ -516,6 +516,63 @@ pub(crate) fn row_to_lease_without_job(row: AnyRow) -> Result<JobLease, ApiError
     })
 }
 
+/// Map a lease+job join row (see `LEASE_WITH_JOB_SELECT` in leases.rs).
+pub(crate) fn row_to_lease_with_job(row: AnyRow) -> Result<JobLease, ApiError> {
+    let lease_id: &str = row.try_get("lease_id")?;
+    let job_id: &str = row.try_get("job_id")?;
+    let worker_id: &str = row.try_get("worker_id")?;
+    let lease_status: &str = row.try_get("lease_status")?;
+    let leased_at: &str = row.try_get("leased_at")?;
+    let expires_at: &str = row.try_get("expires_at")?;
+    let completed_at: Option<&str> = row.try_get("completed_at")?;
+    let job = row_to_job_from_prefixed_or_bare(&row)?;
+
+    Ok(JobLease {
+        id: LeaseId(parse_uuid(lease_id)?),
+        job_id: JobId(parse_uuid(job_id)?),
+        worker_id: WorkerId(parse_uuid(worker_id)?),
+        status: parse_lease_status(lease_status)?,
+        attempt: row.try_get("attempt")?,
+        leased_at: parse_timestamp(leased_at)?,
+        expires_at: parse_timestamp(expires_at)?,
+        completed_at: completed_at.map(parse_timestamp).transpose()?,
+        error: row.try_get("lease_error")?,
+        required_execution_class: job.required_execution_class.clone(),
+        job,
+    })
+}
+
+fn row_to_job_from_prefixed_or_bare(row: &AnyRow) -> Result<Job, ApiError> {
+    // Join selects bare job columns (id/status/...) alongside lease_id / lease_status.
+    let id: &str = row.try_get("id")?;
+    let kind: &str = row.try_get("kind")?;
+    let status: &str = row.try_get("status")?;
+    let payload: &str = row.try_get("payload")?;
+    let required_capability: &str = row.try_get("required_capability")?;
+    let required_execution_class: &str = row.try_get("required_execution_class")?;
+    let scheduled_at: &str = row.try_get("scheduled_at")?;
+    let created_at: &str = row.try_get("created_at")?;
+    let updated_at: &str = row.try_get("updated_at")?;
+    Ok(Job {
+        id: JobId(parse_uuid(id)?),
+        tenant_id: row.try_get("tenant_id")?,
+        kind: parse_job_kind(kind)?,
+        status: parse_job_status(status)?,
+        payload: serde_json::from_str(payload)?,
+        required_capability: parse_worker_capability(required_capability)?,
+        required_execution_class: ExecutionClass::parse_db_str(required_execution_class).map_err(
+            |_| ApiError::internal("database contains invalid required execution class"),
+        )?,
+        priority: row.try_get("priority")?,
+        attempts: row.try_get("attempts")?,
+        max_attempts: row.try_get("max_attempts")?,
+        scheduled_at: parse_timestamp(scheduled_at)?,
+        created_at: parse_timestamp(created_at)?,
+        updated_at: parse_timestamp(updated_at)?,
+        last_error: row.try_get("last_error")?,
+    })
+}
+
 pub(crate) fn parse_uuid(value: &str) -> Result<Uuid, ApiError> {
     Uuid::parse_str(value).map_err(|_| ApiError::internal("database contains invalid uuid"))
 }
