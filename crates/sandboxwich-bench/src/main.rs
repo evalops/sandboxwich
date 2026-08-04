@@ -99,6 +99,10 @@ struct SeedOptions {
     runtime_resources_per_sandbox: usize,
     workers: usize,
     jobs: usize,
+    /// Fraction of seeded sandboxes that use network_egress_mode=allowlist (0.0–1.0).
+    allowlist_fraction: f64,
+    /// Rules attached to each allowlist sandbox (kind=cidr, distinct values).
+    allowlist_rules_per_sandbox: usize,
 }
 
 #[derive(Clone)]
@@ -149,6 +153,9 @@ impl Args {
                         .usize_opt("--runtime-resources-per-sandbox", 2)?,
                     workers: parser.usize_opt("--workers", 8)?,
                     jobs: parser.usize_opt("--jobs", 250)?,
+                    allowlist_fraction: parser.f64_opt("--allowlist-fraction", 0.0)?,
+                    allowlist_rules_per_sandbox: parser
+                        .usize_opt("--allowlist-rules-per-sandbox", 3)?,
                 },
             }),
             Some("startup") => BenchCommand::Startup(StartupOptions {
@@ -198,6 +205,9 @@ impl Args {
                     .usize_opt("--runtime-resources-per-sandbox", 2)?,
                 workers: parser.usize_opt("--workers", 8)?,
                 jobs: parser.usize_opt("--jobs", 1000)?,
+                allowlist_fraction: parser.f64_opt("--allowlist-fraction", 0.0)?,
+                allowlist_rules_per_sandbox: parser
+                    .usize_opt("--allowlist-rules-per-sandbox", 3)?,
             }),
             Some("--help") | Some("-h") => {
                 println!(
@@ -206,10 +216,11 @@ impl Args {
                         "usage: sandboxwich-bench [all|startup|http|sandbox-ttft|seed]",
                         "examples:",
                         "  sandboxwich-bench all --api-bin target/debug/sandboxwich-api --worker-bin target/debug/sandboxwich-worker",
+                        "  sandboxwich-bench all --allowlist-fraction 1.0 --allowlist-rules-per-sandbox 5",
                         "  sandboxwich-bench startup --database-url sqlite:///tmp/bench.db",
                         "  sandboxwich-bench http --api-url http://127.0.0.1:3217 --path /readyz",
                         "  sandboxwich-bench sandbox-ttft --api-bin target/debug/sandboxwich-api --worker-bin target/debug/sandboxwich-worker",
-                        "  sandboxwich-bench seed --database-url sqlite:///tmp/bench.db",
+                        "  sandboxwich-bench seed --database-url sqlite:///tmp/bench.db --allowlist-fraction 0.5",
                     ]
                     .join("\n")
                 );
@@ -269,6 +280,19 @@ impl ArgParser {
         value
             .parse()
             .with_context(|| format!("invalid {name} value {value:?}"))
+    }
+
+    fn f64_opt(&mut self, name: &'static str, default: f64) -> anyhow::Result<f64> {
+        let Some(value) = self.opt(name)? else {
+            return Ok(default);
+        };
+        let parsed: f64 = value
+            .parse()
+            .with_context(|| format!("invalid {name} value {value:?}"))?;
+        if !(0.0..=1.0).contains(&parsed) {
+            bail!("{name} must be between 0.0 and 1.0 inclusive, got {parsed}");
+        }
+        Ok(parsed)
     }
 
     fn bool_opt(&mut self, name: &'static str, default: bool) -> anyhow::Result<bool> {
@@ -382,9 +406,24 @@ async fn run_all(mut options: AllOptions) -> anyhow::Result<()> {
 
     println!("# Sandboxwich Benchmark Report");
     println!();
-    println!("- profile: debug");
+    println!(
+        "- profile: {}",
+        if options.api_bin.to_string_lossy().contains("/release/") {
+            "release"
+        } else {
+            "debug"
+        }
+    );
     println!("- database: SQLite");
     println!("- seeded sandboxes: {}", options.seed.sandboxes);
+    println!(
+        "- allowlist fraction: {:.2}",
+        options.seed.allowlist_fraction
+    );
+    println!(
+        "- allowlist rules per sandbox: {}",
+        options.seed.allowlist_rules_per_sandbox
+    );
     println!(
         "- commands per sandbox: {}",
         options.seed.commands_per_sandbox
@@ -1248,6 +1287,23 @@ async fn seed_sandboxes(pool: &AnyPool, options: &SeedOptions) -> anyhow::Result
         placeholders(&options.database_url, 22)
     );
 
+    // Floor so fraction 0.0 is exactly zero and 1.0 covers every sandbox.
+    let allowlist_count = ((options.sandboxes as f64) * options.allowlist_fraction)
+        .floor()
+        .clamp(0.0, options.sandboxes as f64) as usize;
+    let rule_sql = format!(
+        "insert into sandbox_network_egress_rules (id, sandbox_id, kind, value, created_at)
+         values ({})",
+        placeholders(&options.database_url, 5)
+    );
+    let mode_sql = if options.database_url.starts_with("postgres:")
+        || options.database_url.starts_with("postgresql:")
+    {
+        "update sandboxes set network_egress_mode = $1 where id = $2".to_string()
+    } else {
+        "update sandboxes set network_egress_mode = ? where id = ?".to_string()
+    };
+
     for sandbox_index in 0..options.sandboxes {
         let sandbox_id = Uuid::now_v7().to_string();
         sqlx::query(&sandbox_sql)
@@ -1262,6 +1318,25 @@ async fn seed_sandboxes(pool: &AnyPool, options: &SeedOptions) -> anyhow::Result
             .bind(Option::<String>::None)
             .execute(pool)
             .await?;
+
+        if sandbox_index < allowlist_count {
+            sqlx::query(&mode_sql)
+                .bind("allowlist")
+                .bind(&sandbox_id)
+                .execute(pool)
+                .await?;
+            let rules = options.allowlist_rules_per_sandbox.max(1);
+            for rule_index in 0..rules {
+                sqlx::query(&rule_sql)
+                    .bind(Uuid::now_v7().to_string())
+                    .bind(&sandbox_id)
+                    .bind("cidr")
+                    .bind(format!("10.{rule_index}.0.0/16"))
+                    .bind(&now)
+                    .execute(pool)
+                    .await?;
+            }
+        }
 
         for event_index in 0..options.events_per_sandbox {
             sqlx::query(&event_sql)
