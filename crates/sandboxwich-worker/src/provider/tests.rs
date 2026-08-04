@@ -5544,6 +5544,70 @@ esac
 }
 
 #[test]
+fn slow_reconciliation_discovery_does_not_consume_the_delete_budget() {
+    let dir = std::env::temp_dir().join(format!(
+        "sandboxwich-reconciliation-budget-{}",
+        SandboxId::new()
+    ));
+    std::fs::create_dir_all(&dir).expect("create reconciliation budget fake dir");
+    let script_path = dir.join("kubectl");
+    let orphan = SandboxId::new();
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+sleep 1
+printf '%s\n' '{{"items":[{{"kind":"PersistentVolumeClaim","metadata":{{"namespace":"sandboxwich-ci","name":"sandboxwich-pvc-{orphan}","uid":"uid-orphan","creationTimestamp":"2020-01-01T00:00:00Z","labels":{{"sandboxwich.dev/sandbox-id":"{orphan}"}}}},"status":{{"phase":"Pending"}}}}]}}'
+"#,
+    );
+    std::fs::write(&script_path, script).expect("write reconciliation budget fake kubectl");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("stat reconciliation budget fake kubectl")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).expect("chmod fake kubectl");
+    }
+    let provider = apply_provider_with_fake_kubectl(&script_path);
+    let inventory = RuntimeResourceInventoryResponse {
+        ok: true,
+        provider: "kubernetes".to_string(),
+        cluster: Some("k3s-ci".to_string()),
+        namespace: "sandboxwich-ci".to_string(),
+        sandbox_ids: vec![orphan],
+        complete: true,
+        resources: Vec::new(),
+        active_resident_lease_ids: Vec::new(),
+        next_cursor: None,
+    };
+    let mut delete_budget = None;
+    let outcome = provider
+        .reconcile_orphans_with_delete(
+            Ok(inventory),
+            ReconciliationLimits {
+                max_scanned: 10,
+                max_deleted: 1,
+                max_elapsed: Duration::from_millis(1500),
+            },
+            true,
+            &CancelSignal::never_cancelled(),
+            |_, timeout, _| {
+                delete_budget = Some(timeout);
+                Ok(())
+            },
+        )
+        .expect("slow discovery reconciliation");
+
+    assert_eq!(outcome.deleted, 1);
+    assert!(
+        delete_budget.expect("eligible resource reached deletion") >= Duration::from_millis(1200),
+        "deletion must receive its own bounded budget after discovery"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn provision_rolls_back_applied_resources_when_pod_never_becomes_ready() {
     let (kubectl, log_path) = write_fake_kubectl(Some("wait"));
     let provider = apply_provider_with_fake_kubectl(&kubectl);

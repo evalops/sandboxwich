@@ -1342,6 +1342,24 @@ fn desired_stop_cancellation_uses_the_typed_api_error_code() {
     assert!(!is_resident_desired_stop(&prose_only));
 }
 
+#[test]
+fn resident_observation_trace_extracts_only_the_stable_api_code() {
+    let error = anyhow::Error::new(WorkerRequestError::Status {
+        status: reqwest::StatusCode::CONFLICT,
+        body: serde_json::to_string(&ErrorEnvelope {
+            ok: false,
+            code: "placement_attestation_not_live".to_string(),
+            message: "pod identity does not match".to_string(),
+        })
+        .unwrap(),
+    });
+
+    assert_eq!(
+        worker_request_error_code(&error).as_deref(),
+        Some("placement_attestation_not_live")
+    );
+}
+
 #[tokio::test]
 async fn resident_observation_retries_transient_failures_under_the_existing_lease() {
     let cancellation = LeaseCancellation::new();

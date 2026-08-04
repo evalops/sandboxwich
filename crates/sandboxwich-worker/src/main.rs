@@ -6,7 +6,7 @@ use std::{
     future::Future,
     net::{IpAddr, SocketAddr},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -21,10 +21,11 @@ use provider::{
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, ApexTaskInstructionsCallbackRequest,
     ApexTaskInstructionsCallbackResponse, ClaimLeaseRequest, ClaimLeaseResponse,
-    CompleteLeaseRequest, ErrorEnvelope, FailLeaseRequest, GuestTokenResponse, HomeId, JobKind,
-    LeaseResponse, MAESTRO_HOSTED_RUNNER_IMAGE_LABEL, MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME,
-    MintGuestTokenRequest, NetworkAllowRule, NetworkAllowRuleKind, NetworkEgress,
-    ORB_SIDECAR_RESIDENT_PROCESS_NAME, PROVIDER_ISOLATED_RESIDENT_PROCESS_IMAGE_LABEL,
+    CompleteLeaseRequest, DbVariant, ErrorEnvelope, FailLeaseRequest, GuestTokenResponse, HomeId,
+    JobKind, LeaseResponse, MAESTRO_HOSTED_RUNNER_IMAGE_LABEL,
+    MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME, MintGuestTokenRequest, NetworkAllowRule,
+    NetworkAllowRuleKind, NetworkEgress, ORB_SIDECAR_RESIDENT_PROCESS_NAME,
+    PROVIDER_ISOLATED_RESIDENT_PROCESS_IMAGE_LABEL,
     PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL,
     PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE, PROVIDER_SECRET_DELIVERY_LABEL,
     PROVIDER_SECRET_DELIVERY_LABEL_VALUE, ProvisioningOperationResponse,
@@ -37,6 +38,7 @@ use sandboxwich_core::{
 };
 use serde_json::json;
 use sha2::Digest;
+use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
@@ -842,6 +844,10 @@ fn orphan_reconciliation_success_line(scanned: usize, deleted: usize, apply: boo
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .init();
+
     let cli = Cli::parse();
     let api = cli.api.trim_end_matches('/').to_string();
     let client = build_api_client(cli.api_token.as_deref(), cli.tenant.as_deref())?;
@@ -1695,6 +1701,20 @@ fn is_resident_desired_stop(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Extract the stable API error code for structured resident-process traces.
+/// Keep the full response body out of fields so a future API error cannot leak
+/// bootstrap material or other unbounded request data into Cloud Logging.
+fn worker_request_error_code(error: &anyhow::Error) -> Option<String> {
+    error.chain().find_map(|cause| {
+        let WorkerRequestError::Status { body, .. } = cause.downcast_ref()? else {
+            return None;
+        };
+        serde_json::from_str::<ErrorEnvelope>(body)
+            .ok()
+            .map(|envelope| envelope.code)
+    })
+}
+
 fn is_retryable_worker_request(error: &anyhow::Error) -> bool {
     error
         .chain()
@@ -2326,6 +2346,85 @@ async fn reconcile_resident_task_result(
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct JobTraceContext {
+    traceparent: String,
+    tracestate: String,
+    trace_id: String,
+}
+
+fn job_trace_context(job: &sandboxwich_core::Job) -> JobTraceContext {
+    let traceparent = job
+        .payload
+        .get("_traceparent")
+        .and_then(serde_json::Value::as_str)
+        .and_then(normalize_job_traceparent)
+        .unwrap_or_default();
+    let tracestate = if traceparent.is_empty() {
+        String::new()
+    } else {
+        job.payload
+            .get("_tracestate")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| value.len() <= 512)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let trace_id = traceparent
+        .split('-')
+        .nth(1)
+        .unwrap_or_default()
+        .to_string();
+    JobTraceContext {
+        traceparent,
+        tracestate,
+        trace_id,
+    }
+}
+
+fn normalize_job_traceparent(value: &str) -> Option<String> {
+    let value = value.trim();
+    let mut parts = value.split('-');
+    let version = parts.next()?;
+    let trace_id = parts.next()?;
+    let span_id = parts.next()?;
+    let flags = parts.next()?;
+    if parts.next().is_some()
+        || version.len() != 2
+        || version.eq_ignore_ascii_case("ff")
+        || trace_id.len() != 32
+        || span_id.len() != 16
+        || flags.len() != 2
+        || !trace_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !span_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !flags.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || trace_id.bytes().all(|byte| byte == b'0')
+        || span_id.bytes().all(|byte| byte == b'0')
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn job_sandbox_id(job: &sandboxwich_core::Job) -> String {
+    ["sandboxId", "childSandboxId", "parentSandboxId"]
+        .into_iter()
+        .find_map(|field| job.payload.get(field).and_then(serde_json::Value::as_str))
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn worker_job_outcome_label(outcome: &Result<WorkerJobOutcome, anyhow::Error>) -> &'static str {
+    match outcome {
+        Ok(WorkerJobOutcome::Complete(_)) => "complete",
+        Ok(WorkerJobOutcome::ApexTaskInstructions { .. }) => "apex_task_instructions",
+        Ok(WorkerJobOutcome::Fail { retry: true, .. }) => "failed_retryable",
+        Ok(WorkerJobOutcome::Fail { retry: false, .. }) => "failed_terminal",
+        Err(_) => "error",
+    }
+}
+
 async fn handle_lease<P>(
     client: &reqwest::Client,
     api: &str,
@@ -2476,6 +2575,24 @@ where
     // blocking-pool thread so it can't stall the async runtime (and the heartbeat/
     // renewal tasks running alongside it).
     let job = lease.job.clone();
+    let job_trace = job_trace_context(&job);
+    let traced_sandbox_id = job_sandbox_id(&job);
+    let job_span = tracing::info_span!(
+        "sandboxwich.worker.job",
+        job_id = %job.id,
+        lease_id = %lease_id,
+        job_kind = %job.kind.as_db_str(),
+        sandbox_id = %traced_sandbox_id,
+        attempt = job.attempts,
+        trace_id = %job_trace.trace_id,
+        w3c.traceparent = %job_trace.traceparent,
+        w3c.tracestate = %job_trace.tracestate,
+        duration_ms = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+        error_code = tracing::field::Empty,
+    );
+    tracing::info!(parent: &job_span, "sandboxwich_job_claimed");
+    let execution_started = Instant::now();
     let provider = if job.kind == JobKind::ProvisionSandbox {
         let sandbox_id = sandbox_id_from_payload(&job.payload)?;
         let response = with_retries("mint guest token", API_RETRY_ATTEMPTS, || async {
@@ -2507,78 +2624,93 @@ where
     let reporter_api = api.to_string();
     let reporter_runtime = tokio::runtime::Handle::current();
     let terminal_cancellation = cancellation.clone();
+    let execution_span = job_span.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        let mut reporter = |update| {
-            let (method, url, request) =
-                provisioning_stage_request(&reporter_api, lease_id, lease_attempt, update);
-            reporter_runtime.block_on(with_retries(
-                "report provisioning stage",
-                API_RETRY_ATTEMPTS,
-                || async {
-                    let response = reporter_client
-                        .request(method.clone(), &url)
-                        .json(&request)
-                        .send()
-                        .await?;
-                    decode_json::<ProvisioningOperationResponse>(response).await
-                },
-            ))?;
-            Ok(())
-        };
-        if provider_isolated_resident {
-            let observer_runtime = reporter_runtime.clone();
-            let observer_client = reporter_client.clone();
-            let observer_api = reporter_api.clone();
-            let process_id = uuid_from_payload(&job.payload, "residentProcessId")?;
-            let generation = job
-                .payload
-                .get("generation")
-                .and_then(serde_json::Value::as_u64)
-                .context("resident-process generation is missing")?;
-            let mut observer = |observation: IsolatedResidentProcessObservation| {
-                if cancellation.reason() == LeaseCancellationReason::DesiredStop {
-                    return observer_runtime.block_on(report_desired_stop_resident_observation(
-                        &observer_client,
-                        &observer_api,
-                        process_id,
-                        generation,
-                        lease_id,
-                        observation,
-                    ));
-                }
-                observer_runtime.block_on(retry_resident_observation_until_acknowledged_with(
-                    &cancellation,
-                    RESIDENT_OBSERVATION_RETRY_DELAY,
-                    || {
-                        report_resident_observation(
-                            &observer_client,
-                            &observer_api,
-                            process_id,
-                            generation,
-                            lease_id,
-                            observation.clone(),
-                        )
+        execution_span.in_scope(|| {
+            let mut previous_stage_at = Instant::now();
+            let mut reporter = |update: ProvisioningStageUpdateRequest| {
+                let stage = update.stage.as_db_str().to_string();
+                let stage_duration_ms = previous_stage_at.elapsed().as_millis() as u64;
+                previous_stage_at = Instant::now();
+                tracing::info!(
+                    stage = %stage,
+                    attempt = lease_attempt,
+                    stage_duration_ms,
+                    "sandboxwich_provision_stage_reported"
+                );
+                let (method, url, request) =
+                    provisioning_stage_request(&reporter_api, lease_id, lease_attempt, update);
+                reporter_runtime.block_on(with_retries(
+                    "report provisioning stage",
+                    API_RETRY_ATTEMPTS,
+                    || async {
+                        let response = reporter_client
+                            .request(method.clone(), &url)
+                            .json(&request)
+                            .send()
+                            .await?;
+                        decode_json::<ProvisioningOperationResponse>(response).await
                     },
-                ))
+                ))?;
+                Ok(())
             };
-            execute_isolated_resident_process_job(
-                &job,
-                lease_id,
-                resident_bootstrap,
-                exec_provider.as_ref(),
-                &exec_cancelled,
-                &cancellation,
-                &mut observer,
-            )
-        } else {
-            execute_job_with_reporter(
-                &job,
-                materialization.as_deref(),
-                exec_provider.as_ref(),
-                &exec_cancelled,
-                &mut reporter,
-            )
-        }
+            if provider_isolated_resident {
+                let observer_runtime = reporter_runtime.clone();
+                let observer_client = reporter_client.clone();
+                let observer_api = reporter_api.clone();
+                let process_id = uuid_from_payload(&job.payload, "residentProcessId")?;
+                let generation = job
+                    .payload
+                    .get("generation")
+                    .and_then(serde_json::Value::as_u64)
+                    .context("resident-process generation is missing")?;
+                let mut observer = |observation: IsolatedResidentProcessObservation| {
+                    if cancellation.reason() == LeaseCancellationReason::DesiredStop {
+                        return observer_runtime.block_on(
+                            report_desired_stop_resident_observation(
+                                &observer_client,
+                                &observer_api,
+                                process_id,
+                                generation,
+                                lease_id,
+                                observation,
+                            ),
+                        );
+                    }
+                    observer_runtime.block_on(retry_resident_observation_until_acknowledged_with(
+                        &cancellation,
+                        RESIDENT_OBSERVATION_RETRY_DELAY,
+                        || {
+                            report_resident_observation(
+                                &observer_client,
+                                &observer_api,
+                                process_id,
+                                generation,
+                                lease_id,
+                                observation.clone(),
+                            )
+                        },
+                    ))
+                };
+                execute_isolated_resident_process_job(
+                    &job,
+                    lease_id,
+                    resident_bootstrap,
+                    exec_provider.as_ref(),
+                    &exec_cancelled,
+                    &cancellation,
+                    &mut observer,
+                )
+            } else {
+                execute_job_with_reporter(
+                    &job,
+                    materialization.as_deref(),
+                    exec_provider.as_ref(),
+                    &exec_cancelled,
+                    &mut reporter,
+                )
+            }
+        })
     })
     .await
     .unwrap_or_else(|join_error| {
@@ -2586,6 +2718,26 @@ where
             "job execution task panicked or was cancelled: {join_error}"
         ))
     });
+
+    job_span.record(
+        "duration_ms",
+        execution_started.elapsed().as_millis() as u64,
+    );
+    job_span.record("outcome", worker_job_outcome_label(&outcome));
+    if let Err(error) = &outcome {
+        let error_code = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ProviderError>())
+            .map(ProviderError::reason_code)
+            .unwrap_or("worker_job_error");
+        job_span.record("error_code", error_code);
+    }
+    tracing::info!(
+        parent: &job_span,
+        outcome = worker_job_outcome_label(&outcome),
+        duration_ms = execution_started.elapsed().as_millis() as u64,
+        "sandboxwich_job_execution_completed"
+    );
 
     let response = match outcome {
         Ok(WorkerJobOutcome::Complete(result)) => {
@@ -2827,13 +2979,15 @@ async fn report_resident_observation(
     lease_id: sandboxwich_core::LeaseId,
     observation: IsolatedResidentProcessObservation,
 ) -> anyhow::Result<()> {
-    let observed_state = match observation.state {
+    let observed_state = match &observation.state {
         IsolatedResidentProcessState::Starting => ResidentProcessObservedState::Starting,
         IsolatedResidentProcessState::Running => ResidentProcessObservedState::Running,
         IsolatedResidentProcessState::Succeeded => ResidentProcessObservedState::Stopped,
         IsolatedResidentProcessState::Failed => ResidentProcessObservedState::Failed,
     };
-    with_retries(
+    let observed_state_label = observed_state.as_db_str();
+    let started = Instant::now();
+    let result = with_retries(
         "report resident-process observation",
         API_RETRY_ATTEMPTS,
         || async {
@@ -2857,8 +3011,32 @@ async fn report_resident_observation(
             decode_json::<sandboxwich_core::ResidentProcessResponse>(response).await
         },
     )
-    .await?;
-    Ok(())
+    .await;
+    match &result {
+        Ok(_) => tracing::debug!(
+            process_id = %process_id,
+            generation,
+            lease_id = %lease_id.0,
+            observed_state = observed_state_label,
+            provider_pod_name = ?observation.pod_name,
+            provider_pod_uid = ?observation.pod_uid,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "sandboxwich_resident_observation_reported"
+        ),
+        Err(error) => tracing::warn!(
+            process_id = %process_id,
+            generation,
+            lease_id = %lease_id.0,
+            observed_state = observed_state_label,
+            provider_pod_name = ?observation.pod_name,
+            provider_pod_uid = ?observation.pod_uid,
+            error_code = ?worker_request_error_code(error),
+            duration_ms = started.elapsed().as_millis() as u64,
+            error = %error,
+            "sandboxwich_resident_observation_rejected"
+        ),
+    }
+    result.map(|_| ())
 }
 
 async fn report_desired_stop_resident_observation(

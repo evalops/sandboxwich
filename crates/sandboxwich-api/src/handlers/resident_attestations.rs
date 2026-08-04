@@ -660,6 +660,15 @@ pub(crate) async fn record_provider_pod_identity(
         .execute(&db.pool)
         .await?;
     if process_result.rows_affected() != 1 {
+        tracing::warn!(
+            tenant_id,
+            process_id = %process_id.0,
+            generation,
+            lease_id = %lease_id,
+            provider_pod_name = %pod_name,
+            provider_pod_uid = %pod_uid,
+            "sandboxwich_resident_placement_fence_rejected"
+        );
         return Err(not_live(
             "provider Pod identity does not match the active placement fence",
         ));
@@ -698,6 +707,15 @@ pub(crate) async fn record_provider_pod_identity(
         .execute(&db.pool)
         .await?;
     if result.rows_affected() > 1 {
+        tracing::warn!(
+            tenant_id,
+            process_id = %process_id.0,
+            generation,
+            lease_id = %lease_id,
+            provider_pod_name = %pod_name,
+            provider_pod_uid = %pod_uid,
+            "sandboxwich_resident_placement_attestation_corrupt"
+        );
         return Err(not_live(
             "provider Pod identity does not match the issued placement fence",
         ));

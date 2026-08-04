@@ -2608,6 +2608,8 @@ fn redacted_job_payload(payload: &serde_json::Value) -> serde_json::Value {
     let mut redacted = payload.clone();
     if let Some(object) = redacted.as_object_mut() {
         object.remove("stdin");
+        object.remove("_traceparent");
+        object.remove("_tracestate");
     }
     redacted
 }
@@ -3842,6 +3844,24 @@ impl SandboxSecretMount {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_job_payload_redacts_durable_trace_context() {
+        let payload = serde_json::json!({
+            "sandboxId": "sandbox-1",
+            "stdin": "sensitive",
+            "_traceparent":
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "_tracestate": "vendor=value",
+        });
+
+        let redacted = redacted_job_payload(&payload);
+
+        assert_eq!(redacted["sandboxId"], "sandbox-1");
+        assert!(redacted.get("stdin").is_none());
+        assert!(redacted.get("_traceparent").is_none());
+        assert!(redacted.get("_tracestate").is_none());
+    }
 
     #[test]
     fn resident_placement_attestation_is_additive_and_debug_redacted() {
