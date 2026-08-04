@@ -1150,10 +1150,7 @@ async fn test_sqlite_db() -> Database {
         .connect("sqlite::memory:")
         .await
         .expect("connect in-memory sqlite");
-    let db = Database {
-        pool,
-        dialect: SqlDialect::Sqlite,
-    };
+    let db = Database::from_test_pool(pool, SqlDialect::Sqlite);
     sqlx::migrate!("./migrations")
         .run(&db.pool)
         .await
@@ -3691,10 +3688,7 @@ async fn parent_snapshot_fk_migration_nulls_pre_existing_orphans_before_enforcin
             .unwrap_or_else(|error| panic!("apply migration {}: {error}", migration.version));
     }
 
-    let db = Database {
-        pool,
-        dialect: SqlDialect::Sqlite,
-    };
+    let db = Database::from_test_pool(pool, SqlDialect::Sqlite);
     ensure_database_constraints(&db)
         .await
         .expect("reconcile constraints, including the new parent_snapshot_id foreign key");
@@ -3787,10 +3781,7 @@ async fn apex_execution_class_migration_backfills_legacy_rows() {
         .run(&pool)
         .await
         .expect("migrate to pre-backfill schema");
-    let db = Database {
-        pool,
-        dialect: SqlDialect::Sqlite,
-    };
+    let db = Database::from_test_pool(pool, SqlDialect::Sqlite);
     let now = Utc::now();
     let sandbox = Sandbox {
         id: SandboxId::new(),

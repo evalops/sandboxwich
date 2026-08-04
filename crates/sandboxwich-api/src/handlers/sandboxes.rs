@@ -15,9 +15,11 @@ use crate::state::*;
 use crate::util::*;
 use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use sandboxwich_core::*;
+use serde::Serialize;
 use serde_json::json;
 use sqlx::AnyConnection;
 use sqlx::Row;
@@ -360,7 +362,7 @@ pub(crate) async fn list_sandboxes(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
     Query(page): Query<PageParams>,
-) -> Result<Json<SandboxListResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let limit = resolve_page_limit(page.limit)?;
     let cursor = resolve_page_cursor(&page)?;
 
@@ -371,8 +373,9 @@ pub(crate) async fn list_sandboxes(
          where tenant_id = {}",
         state.db.placeholder(1)
     );
-    let (mut sandboxes, next_cursor) = fetch_keyset_page(
+    let (mut sandboxes, next_cursor) = fetch_keyset_page_from_pool(
         &state.db,
+        state.db.sandbox_list_pool(),
         &base_sql,
         std::slice::from_ref(&ctx.tenant_id),
         limit,
@@ -382,11 +385,37 @@ pub(crate) async fn list_sandboxes(
     .await?;
     hydrate_sandboxes_network_egress(&state.db, &mut sandboxes).await?;
 
-    Ok(Json(SandboxListResponse {
+    Ok(sandbox_list_response(SandboxListResponse {
         ok: true,
         sandboxes,
         next_cursor,
     }))
+}
+
+/// Rough upper bound for one sandbox object in the list JSON body. Used only to
+/// size the response buffer so a full page avoids repeated Vec growth copies.
+const SANDBOX_LIST_JSON_BYTES_PER_ITEM: usize = 512;
+
+fn sandbox_list_response(response: SandboxListResponse) -> Response {
+    let capacity = 128usize.saturating_add(
+        response
+            .sandboxes
+            .len()
+            .saturating_mul(SANDBOX_LIST_JSON_BYTES_PER_ITEM),
+    );
+    json_response_with_capacity(response, capacity)
+}
+
+fn json_response_with_capacity<T>(value: T, capacity: usize) -> Response
+where
+    T: Serialize,
+{
+    let mut body = Vec::with_capacity(capacity);
+    if serde_json::to_writer(&mut body, &value).is_err() {
+        // Keep Axum's serialization-error status, headers, and body authoritative.
+        return Json(value).into_response();
+    }
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
 pub(crate) async fn get_sandbox(
@@ -1620,12 +1649,13 @@ pub(crate) async fn list_network_allow_rules_for_sandboxes(
         }
     }
     query.push(") order by sandbox_id asc, kind asc, value asc");
-    let rows = query.build().fetch_all(&db.pool).await?;
+    let rows = query.build().fetch_all(db.sandbox_list_pool()).await?;
 
-    let mut grouped: HashMap<SandboxId, Vec<NetworkAllowRule>> = HashMap::new();
+    let mut grouped: HashMap<SandboxId, Vec<NetworkAllowRule>> =
+        HashMap::with_capacity(sandbox_ids.len());
     for row in rows {
-        let sandbox_id: String = row.try_get("sandbox_id")?;
-        let sandbox_id = SandboxId(parse_uuid(&sandbox_id)?);
+        let sandbox_id: &str = row.try_get("sandbox_id")?;
+        let sandbox_id = SandboxId(parse_uuid(sandbox_id)?);
         let rule = row_to_network_allow_rule(row)?;
         grouped.entry(sandbox_id).or_default().push(rule);
     }
@@ -1692,4 +1722,81 @@ pub(crate) async fn list_network_allow_rules_on_connection(
         .fetch_all(&mut *connection)
         .await?;
     rows.into_iter().map(row_to_network_allow_rule).collect()
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use serde::Serializer;
+
+    async fn assert_response_equivalent(expected: Response, actual: Response) {
+        assert_eq!(actual.status(), expected.status());
+        assert_eq!(actual.headers(), expected.headers());
+        let expected = to_bytes(expected.into_body(), usize::MAX).await.unwrap();
+        let actual = to_bytes(actual.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn sandbox_list_response_matches_axum_json_bytes_and_headers() {
+        let now = Utc::now();
+        let response = SandboxListResponse {
+            ok: true,
+            sandboxes: vec![Sandbox {
+                id: SandboxId::new(),
+                tenant_id: "tenant-with-\"quotes\"".to_string(),
+                name: "sandbox\nname".to_string(),
+                state: SandboxState::Ready,
+                template: "ubuntu-dev".to_string(),
+                memory_limit: MemoryLimit::FourG,
+                network_egress: NetworkEgress::Allowlist {
+                    rules: vec![NetworkAllowRule {
+                        kind: NetworkAllowRuleKind::Host,
+                        value: "*.example.test".to_string(),
+                    }],
+                },
+                workspace_mode: WorkspaceMode::Ephemeral,
+                runtime_profile: SandboxRuntimeProfile::Unprivileged,
+                execution_class: ExecutionClass::DevelopmentContainer,
+                created_at: now,
+                updated_at: now,
+                ttl_seconds: Some(3600),
+                max_lifetime_seconds: None,
+                idle_ttl_seconds: Some(300),
+                last_activity_at: Some(now),
+                parent_snapshot_id: None,
+            }],
+            next_cursor: Some("cursor+/=".to_string()),
+        };
+
+        assert_response_equivalent(
+            Json(response.clone()).into_response(),
+            sandbox_list_response(response),
+        )
+        .await;
+    }
+
+    #[derive(Clone, Copy)]
+    struct SerializationFailure;
+
+    impl Serialize for SerializationFailure {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            Err(serde::ser::Error::custom(
+                "intentional serialization failure",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn presized_json_response_delegates_errors_to_axum_json() {
+        assert_response_equivalent(
+            Json(SerializationFailure).into_response(),
+            json_response_with_capacity(SerializationFailure, 1024),
+        )
+        .await;
+    }
 }

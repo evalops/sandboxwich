@@ -51,16 +51,44 @@ pub(crate) async fn runtime_resource_inventory(
     // shared Kubernetes namespace. Its expected inventory must therefore span
     // every tenant using that provider+cluster, or one tenant's worker would
     // misclassify another tenant's live resources as orphans.
+    // Scope only through workers that can contribute live reconciliation
+    // evidence. Worker logical identities are pod names and therefore grow
+    // without bound across rollouts; pre-filtering the first 201 historical
+    // workers made every inventory permanently incomplete once production
+    // crossed that count, even when almost all rows were unrelated history.
     let scope_sql = format!(
-        "select id, labels from workers
-         where provider = {}
-         order by id asc limit 201",
+        "select w.id, w.labels from workers w
+         where w.provider = {}
+           and (
+             w.id = {}
+             or exists (
+               select 1 from job_leases jl
+               join provisioning_operations po on po.lease_id = jl.id
+               join provisioning_operation_resources por on por.sandbox_id = po.sandbox_id
+               join sandboxes s on s.id = por.sandbox_id
+               where jl.worker_id = w.id
+                 and por.resource_namespace = {}
+                 and s.state != 'archived'
+             )
+             or exists (
+               select 1 from job_leases jl
+               join jobs j on j.id = jl.job_id
+               where jl.worker_id = w.id
+                 and jl.status = 'active'
+                 and j.kind = 'run_resident_process'
+             )
+           )
+         order by w.id asc limit 201",
         state.db.placeholder(1),
+        state.db.placeholder(2),
+        state.db.placeholder(3),
     );
     let worker_cluster = worker.labels.get("cluster");
     let mut scope_worker_ids = Vec::new();
     let scope_rows = sqlx::query(&scope_sql)
         .bind(&worker.provider)
+        .bind(worker.id.to_string())
+        .bind(&query.namespace)
         .fetch_all(&state.db.pool)
         .await?;
     let scope_complete = scope_rows.len() <= 200;

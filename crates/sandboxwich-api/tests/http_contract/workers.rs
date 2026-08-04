@@ -290,6 +290,31 @@ pub(crate) async fn runtime_resource_inventory_is_worker_scoped_and_bounded() {
         .unwrap();
     let worker = worker_client(&registered);
 
+    // Historical worker registrations in unrelated clusters must not make a
+    // complete inventory impossible. Production crossed the old global
+    // 200-worker pre-filter cap because pod names are logical identities; the
+    // endpoint then returned `complete=false` forever even though this
+    // cluster's live resource scope was small.
+    for index in 0..201 {
+        client
+            .post(format!("{}/workers/register", server.base_url))
+            .json(&RegisterWorkerRequest {
+                name: format!("irrelevant-history-{index}"),
+                provider: "kubernetes".to_string(),
+                capabilities: vec![WorkerCapability::ProvisionSandbox],
+                max_concurrent_jobs: Some(1),
+                labels: std::collections::BTreeMap::from([(
+                    "cluster".to_string(),
+                    format!("irrelevant-cluster-{index}"),
+                )]),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+
     let response = worker
         .get(format!(
             "{}/workers/{}/runtime-resource-inventory?namespace=sandboxwich-sandboxes&limit=1",

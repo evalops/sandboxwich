@@ -16,6 +16,7 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 #[derive(Clone)]
 pub(crate) struct Database {
     pub(crate) pool: AnyPool,
+    sandbox_list_pool: AnyPool,
     pub(crate) dialect: SqlDialect,
 }
 
@@ -200,7 +201,53 @@ pub(crate) async fn connect_database(
     }
 
     let pool = pool_options.connect(database_url).await?;
-    Ok(Database { pool, dialect })
+    let sandbox_list_pool =
+        if matches!(dialect, SqlDialect::Sqlite) && !sqlite_url_is_memory(database_url) {
+            // Keep control-plane mutations on the single FIFO connection above,
+            // while allowing the one proven read-heavy endpoint to fan out under
+            // WAL. `query_only` makes this isolation fail closed if a mutation is
+            // ever accidentally routed through the list pool.
+            AnyPoolOptions::new()
+                .max_connections(max_connections)
+                .acquire_timeout(Duration::from_secs(10))
+                .idle_timeout(Some(Duration::from_secs(5 * 60)))
+                .after_connect(|conn, _meta| {
+                    Box::pin(async move {
+                        sqlx::query("PRAGMA busy_timeout = 5000;")
+                            .execute(&mut *conn)
+                            .await?;
+                        sqlx::query("PRAGMA foreign_keys = ON;")
+                            .execute(&mut *conn)
+                            .await?;
+                        sqlx::query("PRAGMA query_only = ON;")
+                            .execute(&mut *conn)
+                            .await?;
+                        Ok(())
+                    })
+                })
+                .connect(database_url)
+                .await?
+        } else {
+            // `AnyPool::clone` shares the same inner pool. PostgreSQL keeps its
+            // existing configured-width pool without redundant connections, and
+            // anonymous in-memory SQLite stays on one pool because a second pool
+            // would point at a different database.
+            pool.clone()
+        };
+    Ok(Database {
+        pool,
+        sandbox_list_pool,
+        dialect,
+    })
+}
+
+fn sqlite_url_is_memory(database_url: &str) -> bool {
+    database_url == "sqlite::memory:"
+        || database_url.starts_with("sqlite::memory:?")
+        || database_url.starts_with("sqlite://:memory:")
+        || database_url
+            .split_once('?')
+            .is_some_and(|(_, query)| query.split('&').any(|pair| pair == "mode=memory"))
 }
 
 pub(crate) async fn ensure_database_constraints(db: &Database) -> anyhow::Result<()> {
@@ -1008,6 +1055,19 @@ impl SqlDialect {
 }
 
 impl Database {
+    #[cfg(test)]
+    pub(crate) fn from_test_pool(pool: AnyPool, dialect: SqlDialect) -> Self {
+        Self {
+            sandbox_list_pool: pool.clone(),
+            pool,
+            dialect,
+        }
+    }
+
+    pub(crate) fn sandbox_list_pool(&self) -> &AnyPool {
+        &self.sandbox_list_pool
+    }
+
     /// Starts a database-portable query whose values are bound as SQL is assembled.
     ///
     /// Unlike `sqlx::QueryBuilder<Any>`, this formats dialect-correct placeholders
@@ -1153,21 +1213,100 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_pool_serializes_connections() {
+    async fn sqlite_list_pool_is_independent_read_only_and_configured_width() {
         let data_dir = tempfile::tempdir().unwrap();
         let database_url = format!(
             "sqlite://{}",
-            data_dir.path().join("serialized-pool.db").display()
+            data_dir.path().join("configured-pool.db").display()
         );
-        let db = connect_database(&database_url, 5).await.unwrap();
-        let _connection = db.pool.acquire().await.unwrap();
+        let db = connect_database(&database_url, 3).await.unwrap();
+        migrate_database(&db).await.unwrap();
 
+        let _writer = db.pool.acquire().await.unwrap();
         assert!(
             timeout(Duration::from_millis(50), db.pool.acquire())
                 .await
                 .is_err(),
-            "SQLite must expose only one pooled connection so deferred read transactions cannot race writer transactions"
+            "SQLite control-plane operations must remain serialized"
         );
+
+        let mut first_reader = db.sandbox_list_pool().acquire().await.unwrap();
+        assert!(
+            sqlx::query("create table list_pool_must_be_read_only (id integer)")
+                .execute(&mut *first_reader)
+                .await
+                .is_err(),
+            "the sandbox list pool must reject accidental writes"
+        );
+        let _second_reader = db.sandbox_list_pool().acquire().await.unwrap();
+        let _third_reader = db.sandbox_list_pool().acquire().await.unwrap();
+
+        assert!(
+            timeout(Duration::from_millis(50), db.sandbox_list_pool().acquire())
+                .await
+                .is_err(),
+            "the sandbox list pool must honor the configured connection limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_database_shares_the_control_plane_pool_for_lists() {
+        let db = connect_database("sqlite::memory:", 3).await.unwrap();
+        migrate_database(&db).await.unwrap();
+        let _writer = db.pool.acquire().await.unwrap();
+
+        assert!(
+            timeout(Duration::from_millis(50), db.sandbox_list_pool().acquire())
+                .await
+                .is_err(),
+            "anonymous in-memory SQLite must not open a list pool backed by a different database"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_wal_allows_writes_while_a_read_transaction_is_open() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}",
+            data_dir.path().join("concurrent-read-write.db").display()
+        );
+        let db = connect_database(&database_url, 2).await.unwrap();
+        sqlx::query("create table counters (value integer not null)")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("insert into counters (value) values (0)")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let mut reader = db.sandbox_list_pool().acquire().await.unwrap();
+        sqlx::query("begin").execute(&mut *reader).await.unwrap();
+        let initial: i64 = sqlx::query_scalar("select value from counters")
+            .fetch_one(&mut *reader)
+            .await
+            .unwrap();
+        assert_eq!(initial, 0);
+
+        timeout(
+            Duration::from_secs(1),
+            sqlx::query("update counters set value = value + 1").execute(&db.pool),
+        )
+        .await
+        .expect("WAL must let a writer proceed while another connection is reading")
+        .unwrap();
+
+        let snapshot: i64 = sqlx::query_scalar("select value from counters")
+            .fetch_one(&mut *reader)
+            .await
+            .unwrap();
+        assert_eq!(snapshot, 0, "the open read transaction keeps its snapshot");
+        sqlx::query("commit").execute(&mut *reader).await.unwrap();
+        let updated: i64 = sqlx::query_scalar("select value from counters")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(updated, 1);
     }
 
     #[test]
