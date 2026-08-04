@@ -27,15 +27,13 @@ class RepositoryRulesTest(unittest.TestCase):
                 "service image (sandboxwich-api)",
                 "service image (sandboxwich-worker)",
                 "runtime image (ubuntu-dev)",
-                "kind",
             },
         )
 
-    def test_protected_workflows_run_for_every_pull_request(self) -> None:
+    def test_pr_workflows_run_for_every_pull_request(self) -> None:
         for relative in (
             ".github/workflows/ci.yml",
             ".github/workflows/containers.yml",
-            ".github/workflows/kubernetes-conformance.yml",
         ):
             text = (ROOT / relative).read_text()
             pull_request = text.split("pull_request:", 1)[1].split("push:", 1)[0]
@@ -52,19 +50,16 @@ class RepositoryRulesTest(unittest.TestCase):
             self.assertIn("cancel-in-progress: true", text, relative)
             self.assertIn("github.event.pull_request.number || github.ref", text, relative)
 
-    def test_kind_required_context_reports_without_running_for_unrelated_changes(
-        self,
-    ) -> None:
+    def test_kubernetes_conformance_runs_after_merge(self) -> None:
         workflow = (
             ROOT / ".github/workflows/kubernetes-conformance.yml"
         ).read_text()
-        self.assertIn("conformance-scope:", workflow)
-        self.assertIn("needs: conformance-scope", workflow)
-        self.assertIn(
-            "needs.conformance-scope.outputs.required == 'true'", workflow
-        )
-        self.assertIn("deploy/kubernetes/", workflow)
-        self.assertIn("crates/", workflow)
+        triggers = workflow.split("permissions:", 1)[0]
+        self.assertNotIn("pull_request:", triggers)
+        self.assertIn("push:", triggers)
+        self.assertIn("branches: [main]", triggers)
+        self.assertIn("workflow_dispatch:", triggers)
+        self.assertIn("kind:", workflow)
 
     def test_ruleset_requires_pull_requests_and_blocks_force_pushes(self) -> None:
         ruleset = json.loads((ROOT / ".github/rulesets/main.json").read_text())
