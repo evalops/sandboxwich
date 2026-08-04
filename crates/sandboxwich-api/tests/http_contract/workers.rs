@@ -1,6 +1,7 @@
 use crate::common::*;
 use reqwest::StatusCode;
 use sandboxwich_core::*;
+use sqlx::any::AnyPoolOptions;
 
 async fn register_execution_worker(
     client: &reqwest::Client,
@@ -452,6 +453,50 @@ pub(crate) async fn runtime_resource_inventory_is_worker_scoped_and_bounded() {
         replacement_inventory.resources[0]
             .cleanup_deadline
             .is_none()
+    );
+
+    // Provisioning-operation rows are immutable evidence and intentionally
+    // outlive the runtime. Once the sandbox is archived they must stop being
+    // advertised as expected live Kubernetes inventory; otherwise every
+    // worker downloads and materializes the same historical rows forever.
+    // A physically surviving resource remains safe to reap because provider
+    // discovery still observes it and an archived sandbox is not in
+    // `sandbox_ids`, so the worker classifies it as orphaned.
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&server.database_url)
+        .await
+        .unwrap();
+    for state in ["archiving", "archived"] {
+        sqlx::query("update sandboxes set state = ? where id = ?")
+            .bind(state)
+            .bind(sandbox.sandbox.id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    pool.close().await;
+    let archived_inventory: RuntimeResourceInventoryResponse = worker_client(&replacement)
+        .get(format!(
+            "{}/workers/{}/runtime-resource-inventory?namespace=sandboxwich-sandboxes",
+            server.base_url, replacement.worker.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!archived_inventory.sandbox_ids.contains(&sandbox.sandbox.id));
+    assert!(
+        archived_inventory
+            .resources
+            .iter()
+            .all(|resource| resource.uid != "uid-inventory-workspace"),
+        "archived provisioning evidence must not remain expected live inventory"
     );
 
     let tenant_b = reqwest::Client::builder()
