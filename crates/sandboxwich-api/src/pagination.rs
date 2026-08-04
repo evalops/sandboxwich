@@ -79,12 +79,14 @@ pub(crate) fn resolve_page_cursor(
     }
 }
 
-/// Run a keyset-paginated query against a table ordered by `(created_at, id)`.
+/// Run a keyset-paginated pure-read query on the query-only [`Database::read_pool`].
 ///
 /// `base_sql` must already contain a `select ... from ... where <fixed predicate>` clause using
-/// `db.placeholder(1..=fixed_binds.len())` for its own bind values (mirroring the existing
-/// non-paginated queries in this file); this helper appends the cursor predicate, `order by`, and
-/// `limit` clauses, and binds `fixed_binds` followed by the single cursor bind (if any).
+/// `db.placeholder(1..=fixed_binds.len())` for its own bind values; this helper appends the
+/// cursor predicate, `order by`, and `limit` clauses.
+///
+/// Mutations must not go through this helper. Callers that need the control-plane pool can use
+/// [`fetch_keyset_page_from_pool`] with `&db.pool`.
 pub(crate) async fn fetch_keyset_page<T>(
     db: &Database,
     base_sql: &str,
@@ -93,11 +95,20 @@ pub(crate) async fn fetch_keyset_page<T>(
     cursor: &Option<(PageDirection, PageCursor)>,
     row_map: impl Fn(AnyRow) -> Result<T, ApiError>,
 ) -> Result<(Vec<T>, Option<String>), ApiError> {
-    fetch_keyset_page_from_pool(db, &db.pool, base_sql, fixed_binds, limit, cursor, row_map).await
+    fetch_keyset_page_from_pool(
+        db,
+        db.read_pool(),
+        base_sql,
+        fixed_binds,
+        limit,
+        cursor,
+        row_map,
+    )
+    .await
 }
 
-/// Variant used by read-isolated endpoints. All existing callers continue to
-/// use [`fetch_keyset_page`] and the control-plane pool by default.
+/// Keyset pagination against an explicit pool. Prefer [`fetch_keyset_page`] for
+/// ordinary HTTP list handlers so they stay on the query-only read pool.
 pub(crate) async fn fetch_keyset_page_from_pool<T>(
     db: &Database,
     pool: &AnyPool,
