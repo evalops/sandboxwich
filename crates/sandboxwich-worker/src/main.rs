@@ -42,6 +42,7 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
+const IDLE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 #[derive(Debug, Parser)]
 #[command(name = "sandboxwich-worker")]
 #[command(about = "Host-side worker for sandbox orchestration")]
@@ -840,6 +841,10 @@ fn orphan_reconciliation_success_line(scanned: usize, deleted: usize, apply: boo
     format!(
         "worker: orphan reconciliation completed scanned={scanned} deleted={deleted} apply={apply}"
     )
+}
+
+fn idle_heartbeat_due(last_heartbeat: Option<Instant>, now: Instant) -> bool {
+    last_heartbeat.is_none_or(|last| now.saturating_duration_since(last) >= IDLE_HEARTBEAT_INTERVAL)
 }
 
 #[tokio::main]
@@ -2059,6 +2064,7 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
     let shutdown = spawn_shutdown_listener();
     let mut iterations = 0_u64;
     let mut last_reconciliation = None;
+    let mut last_idle_heartbeat = None;
     let mut resident_tasks: tokio::task::JoinSet<anyhow::Result<LeaseResponse>> =
         tokio::task::JoinSet::new();
     let mut resident_tasks_by_id = std::collections::HashMap::new();
@@ -2166,14 +2172,15 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
         };
 
         let Some(lease) = response.lease else {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "ok": true,
-                    "iteration": iterations,
-                    "idle": true
-                }))?
-            );
+            let now = Instant::now();
+            if idle_heartbeat_due(last_idle_heartbeat, now) {
+                tracing::info!(
+                    iteration = iterations,
+                    idle = true,
+                    "sandboxwich_worker_idle"
+                );
+                last_idle_heartbeat = Some(now);
+            }
             if args
                 .max_iterations
                 .map(|max_iterations| iterations < max_iterations)
