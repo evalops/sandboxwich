@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## 0.1.9 - 2026-08-04
+### Fixed
+
+- Make isolation, capacity, and lifecycle guarantees hold under failure
+- *(api)* Scope reconciliation to relevant workers
+
+### Other
+
+- *(api)* Claim placement fast-path and SQL metrics aggregation
+- Integrate main into keyed list decode branch
+- *(api)* Keyed list decode, broader read-pool pure reads, join get
+- Merge branch 'main' into perf/generalize-read-pool
+- *(api)* Route all keyset lists through the query-only read pool
+- *(api)* Serve pure-read point lookups from the query-only pool
+- Merge origin/main into fix/p0-lifecycle-isolation-guarantees
+- Merge origin/main into fix/p0-lifecycle-isolation-guarantees
+- *(api)* Cut list-path String copies and pre-size JSON
+- Merge remote-tracking branch 'origin/main' into fix/out-of-band-reconciler
+- Merge remote-tracking branch 'origin/main' into fix/out-of-band-reconciler
+- Merge branch 'main' of https://github.com/evalops/sandboxwich into perf/deep-hot-paths
+- Bound database hot paths
+
+### Security
+
+- Reject hardlinked cache sources and bind tenant identity
+
 ## 0.1.8 - 2026-08-04
 ### Fixed
 
