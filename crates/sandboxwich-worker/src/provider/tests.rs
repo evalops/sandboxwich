@@ -1,5 +1,5 @@
 use super::*;
-use sandboxwich_core::{MAX_COMMAND_STDIN_BYTES, NetworkAllowRule};
+use sandboxwich_core::{MAX_COMMAND_STDIN_BYTES, NetworkAllowRule, RuntimeResourceInventoryItem};
 use sandboxwich_core::{SandboxSecretMount, SecretRef, SecretRefId, SecretRefState, SecretSource};
 
 #[test]
@@ -5230,6 +5230,98 @@ esac
     assert!(
         !log.contains("get pod,persistentvolumeclaim,service,secret,networkpolicy"),
         "reconciliation must not rebuild the oversized combined JSON inventory: {log}"
+    );
+}
+
+#[test]
+fn orphan_reconciliation_deletes_inventory_resources_past_their_sandbox_ttl() {
+    let dir = std::env::temp_dir().join(format!("sandboxwich-expired-{}", SandboxId::new()));
+    std::fs::create_dir_all(&dir).expect("create expired reconciliation fake dir");
+    let log_path = dir.join("log.txt");
+    let script_path = dir.join("kubectl");
+    let sandbox_id = SandboxId::new();
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "{log}"
+case " $* " in
+  *" get secret "*)
+    printf '%s\n' 'Secret {sandbox_id} sandboxwich-ci sandboxwich-guest-token-{sandbox_id} uid-expired <none> 2020-01-01T00:00:00Z <none>'
+    ;;
+  *" delete "*)
+    cat >> "{log}"
+    ;;
+esac
+"#,
+        log = log_path.display(),
+    );
+    std::fs::write(&script_path, script).expect("write expired reconciliation fake kubectl");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("stat expired reconciliation fake kubectl")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).expect("chmod fake kubectl");
+    }
+    let provider = apply_provider_with_fake_kubectl(&script_path);
+    let inventory = RuntimeResourceInventoryResponse {
+        ok: true,
+        provider: "kubernetes".to_string(),
+        cluster: Some("k3s-ci".to_string()),
+        namespace: "sandboxwich-ci".to_string(),
+        sandbox_ids: vec![sandbox_id],
+        complete: true,
+        resources: vec![RuntimeResourceInventoryItem {
+            sandbox_id,
+            resource_kind: RuntimeResourceKind::Secret,
+            namespace: "sandboxwich-ci".to_string(),
+            name: format!("sandboxwich-guest-token-{sandbox_id}"),
+            uid: "uid-expired".to_string(),
+            expires_at: Some(Utc::now() - chrono::Duration::minutes(1)),
+            cleanup_deadline: None,
+        }],
+        active_resident_lease_ids: Vec::new(),
+        next_cursor: None,
+    };
+
+    let mut deleted_resources = Vec::new();
+    let outcome = provider
+        .reconcile_orphans_with_delete(
+            Ok(inventory),
+            ReconciliationLimits {
+                max_scanned: 20,
+                max_deleted: 1,
+                max_elapsed: Duration::from_secs(5),
+            },
+            true,
+            &CancelSignal::never_cancelled(),
+            |resource, _, _| {
+                deleted_resources.push(resource.clone());
+                Ok(())
+            },
+        )
+        .expect("expired reconciliation");
+
+    assert_eq!(outcome.deleted, 1);
+    assert!(outcome.decisions.iter().any(|decision| {
+        decision.classification == ReconciliationClassification::Expired
+            && decision
+                .resource
+                .as_ref()
+                .is_some_and(|resource| resource.resource_kind == RuntimeResourceKind::Secret)
+    }));
+    assert_eq!(deleted_resources.len(), 1);
+    assert_eq!(
+        deleted_resources[0].resource_kind,
+        RuntimeResourceKind::Secret
+    );
+    assert_eq!(
+        outcome.classification_counts(),
+        ReconciliationClassificationCounts {
+            expired: 1,
+            ..ReconciliationClassificationCounts::default()
+        }
     );
 }
 

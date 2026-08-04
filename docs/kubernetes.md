@@ -191,9 +191,35 @@ The double opt-in (`--confirm-apply` plus `SANDBOXWICH_K8S_ENABLE_MUTATION=1`) e
 
 ### Orphan reconciliation
 
-Apply-mode workers compare labeled Pods, PVCs, Services, Secrets, and NetworkPolicies with `GET /workers/{worker_id}/runtime-resource-inventory`. The loop runs every 60 seconds in the checked-in Deployment, scans at most 200 resources, spends at most 10 seconds, and permits at most 20 deletes per pass. Inventory, discovery, scope, UID, pagination, or deadline uncertainty produces no deletes. Resources for a live sandbox that have not yet been acknowledged are also indeterminate and survive the pass.
+Orphan cleanup is not part of the worker claim loop. The checked-in
+`sandboxwich-reconciler` CronJob runs the one-shot `sandboxwich-worker
+reconcile` command every five minutes with `concurrencyPolicy: Forbid`. It
+compares labeled Pods, PVCs, Services, Secrets, and NetworkPolicies with
+`GET /workers/{worker_id}/runtime-resource-inventory`, then exits and marks its
+stable logical worker identity draining. Its separate ServiceAccount can only
+get, list, and UID-fenced-delete those resource kinds; it cannot create or
+patch workloads, exec into Pods, or read logs.
 
-Reconciliation is dry-run unless both `--orphan-reconciliation-apply` and `SANDBOXWICH_ORPHAN_RECONCILIATION_APPLY=1` are set. Apply mode sends a Kubernetes `DeleteOptions` request with the observed UID as a precondition. Roll back immediately by removing either opt-in; use `--orphan-reconciliation-interval-secs`, `--orphan-reconciliation-max-scanned`, `--orphan-reconciliation-max-deleted`, and `--orphan-reconciliation-max-elapsed-secs` to tune the bounded loop.
+Each run scans at most 20,000 resources, spends at most 120 seconds, and
+permits at most 500 deletes. Inventory, discovery, scope, UID, pagination, or
+deadline uncertainty produces no deletes. Resources for a live sandbox that
+have not yet been acknowledged are also indeterminate and survive the pass.
+Past sandbox TTL and archive cleanup deadlines are both honored.
+
+Reconciliation is dry-run unless both `--orphan-reconciliation-apply` and
+`SANDBOXWICH_ORPHAN_RECONCILIATION_APPLY=1` are set. Apply mode sends a
+Kubernetes `DeleteOptions` request with the observed UID as a precondition.
+Suspend the CronJob or remove either opt-in for immediate rollback. Operators
+can trigger the exact production boundary manually without involving a worker:
+
+```sh
+kubectl -n sandboxwich create job sandboxwich-reconcile-manual-$(date +%s) \
+  --from=cronjob/sandboxwich-reconciler
+```
+
+The Job's final JSON record reports `reconcilerId`, `scanned`, `deleted`, and
+`apply`; failed runs retain their Job and logs according to the CronJob history
+limits.
 
 Sandbox creation carries a typed provision spec: memory tier (`1g`, `4g`, `16g`, `64g`), network egress (`deny_all`, `allow_all`, or `allowlist`), and execution class (`development_container`, `sandboxed_container`, or `virtual_machine`). The Kubernetes provider maps tiers to CPU/memory requests and PVC size, renders deny-by-default egress with explicit CIDR allow rules, sets `runAsNonRoot`, drops all container capabilities, and uses `RuntimeDefault` seccomp.
 

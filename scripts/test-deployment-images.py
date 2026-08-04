@@ -128,11 +128,22 @@ class DeploymentImagesTest(unittest.TestCase):
         self.assertIn("kubernetes.io/metadata.name: sandboxwich-sandboxes", api_text)
         self.assertIn("port: 3217", api_text)
 
-    def test_worker_enables_fenced_orphan_cleanup(self) -> None:
+    def test_orphan_cleanup_runs_only_in_a_non_overlapping_cronjob(self) -> None:
         worker_text = (ROOT / "deploy/kubernetes/worker.yaml").read_text()
         self.assertEqual(worker_text.count("- --orphan-reconciliation-apply"), 1)
         self.assertEqual(
             worker_text.count("name: SANDBOXWICH_ORPHAN_RECONCILIATION_APPLY"), 1
+        )
+        self.assertIn("kind: CronJob", worker_text)
+        self.assertIn("name: sandboxwich-reconciler", worker_text)
+        self.assertIn("concurrencyPolicy: Forbid", worker_text)
+        self.assertIn("- reconcile", worker_text)
+        worker_deployment = worker_text.split("kind: Deployment", 1)[1].split(
+            "kind: CronJob", 1
+        )[0]
+        self.assertNotIn("--orphan-reconciliation", worker_deployment)
+        self.assertNotIn(
+            "SANDBOXWICH_ORPHAN_RECONCILIATION_APPLY", worker_deployment
         )
         self.assertIn('value: "1"', worker_text)
         self.assertIn(
