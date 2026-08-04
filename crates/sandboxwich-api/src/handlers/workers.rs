@@ -854,6 +854,17 @@ pub(crate) async fn fetch_worker(db: &Database, worker_id: WorkerId) -> Result<W
     row_to_worker(row)
 }
 
+/// Pure-read active lease count for claim saturation short-circuit. Uses the
+/// query-only pool so claim polls do not take a writer connection just to
+/// learn the worker is already full.
+pub(crate) async fn active_lease_count_for_worker(
+    db: &Database,
+    worker_id: WorkerId,
+) -> Result<u32, ApiError> {
+    let mut connection = db.read_pool().acquire().await?;
+    active_lease_count_for_worker_on_connection(db, &mut connection, worker_id).await
+}
+
 pub(crate) async fn active_lease_count_for_worker_on_connection(
     db: &Database,
     connection: &mut AnyConnection,

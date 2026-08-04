@@ -8,13 +8,18 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 const LATENCY_BUCKETS: &[f64] = &[1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 900.0];
+/// Millisecond ceilings matching [`LATENCY_BUCKETS`] for SQL-side histogram
+/// aggregation of `duration_ms` observation columns.
+const LATENCY_BUCKETS_MS: &[i64] = &[
+    1_000, 5_000, 15_000, 30_000, 60_000, 120_000, 300_000, 900_000,
+];
 /// `/metrics` only materializes raw observations from this recent window.
 /// Older rows remain durable for later rollup work (#262); scrapes must stay
 /// O(recent) rather than O(lifetime history).
 const METRICS_RAW_RETENTION: ChronoDuration = ChronoDuration::days(14);
-/// Hard safety cap on rows examined per observation family. When exceeded the
-/// scrape still succeeds but reports truncation so operators can see budget
-/// pressure before latency collapses.
+/// Hard safety cap on rows examined per observation family for families that
+/// still load individual samples (claim join, provisioning stages). Terminal
+/// families aggregate in SQL and never pull one row per event.
 const METRICS_MAX_ROWS_PER_FAMILY: i64 = 50_000;
 
 #[derive(Clone)]
@@ -29,6 +34,22 @@ struct ObservationBatch {
     truncated: bool,
 }
 
+/// Pre-aggregated histogram series (one row per label set). Terminal SLO
+/// families are reduced in SQL so scrapes stay O(cardinality) not O(events).
+struct HistogramSeries {
+    labels: Vec<String>,
+    count: u64,
+    sum_seconds: f64,
+    /// Cumulative counts for each [`LATENCY_BUCKETS`] entry, then +Inf is count.
+    cumulative_buckets: Vec<u64>,
+}
+
+struct HistogramBatch {
+    series: Vec<HistogramSeries>,
+    rows_examined: u64,
+    truncated: bool,
+}
+
 pub(crate) async fn append_slo_metrics(
     body: &mut String,
     db: &Database,
@@ -38,38 +59,44 @@ pub(crate) async fn append_slo_metrics(
     let since = Utc::now() - METRICS_RAW_RETENTION;
     let since = since.to_rfc3339();
 
-    let creation = fetch_creation_observations(db, tenant_id, &since).await?;
-    append_histogram(
+    // Independent family scrapes: run concurrently so /metrics latency is
+    // dominated by the slowest query, not the sum of five sequential ones.
+    let (creation, command, cleanup, claim, stage) = tokio::try_join!(
+        fetch_creation_histogram(db, tenant_id, &since),
+        fetch_simple_terminal_histogram(db, tenant_id, "command", &since),
+        fetch_simple_terminal_histogram(db, tenant_id, "cleanup", &since),
+        fetch_claim_observations(db, tenant_id, &since),
+        fetch_stage_observations(db, tenant_id, &since),
+    )?;
+
+    append_histogram_series(
         body,
         "sandboxwich_sandbox_creation_seconds",
         "Sandbox creation latency from scheduling to terminal provisioning outcome.",
         &["workspace_mode", "start_type", "outcome"],
-        &creation.observations,
+        &creation.series,
     );
-    append_counter_from_observations(
+    append_counter_from_series(
         body,
         "sandboxwich_sandbox_creation_total",
         "Terminal sandbox creation outcomes.",
         &["workspace_mode", "start_type", "outcome"],
-        &creation.observations,
+        &creation.series,
     );
-    let command = fetch_simple_terminal_observations(db, tenant_id, "command", &since).await?;
-    append_histogram(
+    append_histogram_series(
         body,
         "sandboxwich_command_duration_seconds",
         "Terminal command latency.",
         &["outcome"],
-        &command.observations,
+        &command.series,
     );
-    let cleanup = fetch_simple_terminal_observations(db, tenant_id, "cleanup", &since).await?;
-    append_histogram(
+    append_histogram_series(
         body,
         "sandboxwich_cleanup_duration_seconds",
         "Sandbox cleanup job latency.",
         &["outcome"],
-        &cleanup.observations,
+        &cleanup.series,
     );
-    let claim = fetch_claim_observations(db, tenant_id, &since).await?;
     append_histogram(
         body,
         "sandboxwich_worker_claim_seconds",
@@ -77,7 +104,6 @@ pub(crate) async fn append_slo_metrics(
         &["job_kind"],
         &claim.observations,
     );
-    let stage = fetch_stage_observations(db, tenant_id, &since).await?;
     append_histogram(
         body,
         "sandboxwich_provisioning_stage_seconds",
@@ -133,123 +159,149 @@ pub(crate) async fn append_slo_metrics(
     Ok(())
 }
 
-async fn fetch_creation_observations(
+fn duration_bucket_selects(db: &Database) -> String {
+    // Placeholder indices are unused; these are bare expressions over duration_ms.
+    let _ = db;
+    LATENCY_BUCKETS_MS
+        .iter()
+        .enumerate()
+        .map(|(index, ms)| {
+            format!("sum(case when duration_ms <= {ms} then 1 else 0 end) as b{index}")
+        })
+        .collect::<Vec<_>>()
+        .join(",\n                        ")
+}
+
+async fn fetch_creation_histogram(
     db: &Database,
     tenant_id: Option<&str>,
     since: &str,
-) -> Result<ObservationBatch, ApiError> {
+) -> Result<HistogramBatch, ApiError> {
+    let buckets = duration_bucket_selects(db);
     let (sql, binds) = if let Some(tenant_id) = tenant_id {
         (
             format!(
-                "select outcome, workspace_mode, start_type, duration_ms
+                "select outcome, workspace_mode, start_type,
+                        count(*) as n,
+                        coalesce(sum(duration_ms), 0) as sum_ms,
+                        {buckets}
                  from terminal_slo_observations
                  where metric_kind = 'sandbox_creation'
                    and observed_at >= {}
                    and tenant_id = {}
-                 order by observed_at desc
-                 limit {}",
+                 group by outcome, workspace_mode, start_type",
                 db.placeholder(1),
-                db.placeholder(2),
-                db.placeholder(3)
+                db.placeholder(2)
             ),
             vec![since, tenant_id],
         )
     } else {
         (
             format!(
-                "select outcome, workspace_mode, start_type, duration_ms
+                "select outcome, workspace_mode, start_type,
+                        count(*) as n,
+                        coalesce(sum(duration_ms), 0) as sum_ms,
+                        {buckets}
                  from terminal_slo_observations
                  where metric_kind = 'sandbox_creation'
                    and observed_at >= {}
-                 order by observed_at desc
-                 limit {}",
-                db.placeholder(1),
-                db.placeholder(2)
+                 group by outcome, workspace_mode, start_type",
+                db.placeholder(1)
             ),
             vec![since],
         )
     };
-    let rows = fetch_rows_with_limit(db, &sql, &binds).await?;
-    let truncated = rows.len() as i64 >= METRICS_MAX_ROWS_PER_FAMILY;
-    let rows_examined = rows.len() as u64;
-    let observations = rows
-        .into_iter()
-        .map(|row| {
-            let duration_ms: i64 = row.try_get("duration_ms")?;
-            Ok(Observation {
-                labels: vec![
-                    row.try_get("workspace_mode")?,
-                    row.try_get("start_type")?,
-                    row.try_get("outcome")?,
-                ],
-                seconds: duration_ms.max(0) as f64 / 1000.0,
-            })
-        })
-        .collect::<Result<Vec<_>, ApiError>>()?;
-    Ok(ObservationBatch {
-        observations,
-        rows_examined,
-        truncated,
-    })
+    let rows = fetch_rows(db, &sql, &binds).await?;
+    map_histogram_rows(
+        rows,
+        &["workspace_mode", "start_type", "outcome"],
+        &["workspace_mode", "start_type", "outcome"],
+    )
 }
 
-async fn fetch_simple_terminal_observations(
+async fn fetch_simple_terminal_histogram(
     db: &Database,
     tenant_id: Option<&str>,
     family: &str,
     since: &str,
-) -> Result<ObservationBatch, ApiError> {
+) -> Result<HistogramBatch, ApiError> {
     let metric_kind = match family {
         "command" => "command",
         "cleanup" => "cleanup",
         _ => unreachable!("bounded metric family"),
     };
+    let buckets = duration_bucket_selects(db);
     let (sql, binds) = if let Some(tenant_id) = tenant_id {
         (
             format!(
-                "select outcome, duration_ms from terminal_slo_observations
+                "select outcome,
+                        count(*) as n,
+                        coalesce(sum(duration_ms), 0) as sum_ms,
+                        {buckets}
+                 from terminal_slo_observations
                  where metric_kind = '{metric_kind}'
                    and observed_at >= {}
                    and tenant_id = {}
-                 order by observed_at desc
-                 limit {}",
+                 group by outcome",
                 db.placeholder(1),
-                db.placeholder(2),
-                db.placeholder(3)
+                db.placeholder(2)
             ),
             vec![since, tenant_id],
         )
     } else {
         (
             format!(
-                "select outcome, duration_ms from terminal_slo_observations
+                "select outcome,
+                        count(*) as n,
+                        coalesce(sum(duration_ms), 0) as sum_ms,
+                        {buckets}
+                 from terminal_slo_observations
                  where metric_kind = '{metric_kind}'
                    and observed_at >= {}
-                 order by observed_at desc
-                 limit {}",
-                db.placeholder(1),
-                db.placeholder(2)
+                 group by outcome",
+                db.placeholder(1)
             ),
             vec![since],
         )
     };
-    let rows = fetch_rows_with_limit(db, &sql, &binds).await?;
-    let truncated = rows.len() as i64 >= METRICS_MAX_ROWS_PER_FAMILY;
-    let rows_examined = rows.len() as u64;
-    let observations = rows
-        .into_iter()
-        .map(|row| {
-            let duration_ms: i64 = row.try_get("duration_ms")?;
-            Ok(Observation {
-                labels: vec![row.try_get("outcome")?],
-                seconds: duration_ms.max(0) as f64 / 1000.0,
-            })
-        })
-        .collect::<Result<Vec<_>, ApiError>>()?;
-    Ok(ObservationBatch {
-        observations,
+    let rows = fetch_rows(db, &sql, &binds).await?;
+    map_histogram_rows(rows, &["outcome"], &["outcome"])
+}
+
+fn map_histogram_rows(
+    rows: Vec<sqlx::any::AnyRow>,
+    _label_names: &[&str],
+    label_columns: &[&str],
+) -> Result<HistogramBatch, ApiError> {
+    let mut series = Vec::with_capacity(rows.len());
+    let mut rows_examined = 0_u64;
+    for row in rows {
+        let n: i64 = row.try_get("n")?;
+        let count = u64::try_from(n.max(0)).unwrap_or(0);
+        rows_examined = rows_examined.saturating_add(count);
+        let sum_ms: i64 = row.try_get("sum_ms")?;
+        let mut labels = Vec::with_capacity(label_columns.len());
+        for column in label_columns {
+            labels.push(row.try_get(*column)?);
+        }
+        let mut cumulative_buckets = Vec::with_capacity(LATENCY_BUCKETS_MS.len());
+        for index in 0..LATENCY_BUCKETS_MS.len() {
+            let bucket: i64 = row.try_get(format!("b{index}").as_str())?;
+            cumulative_buckets.push(u64::try_from(bucket.max(0)).unwrap_or(0));
+        }
+        series.push(HistogramSeries {
+            labels,
+            count,
+            sum_seconds: sum_ms.max(0) as f64 / 1000.0,
+            cumulative_buckets,
+        });
+    }
+    Ok(HistogramBatch {
+        series,
         rows_examined,
-        truncated,
+        // SQL aggregation never loads one row per event; group cardinality is
+        // the bound. Truncation is reserved for sample-loading families.
+        truncated: false,
     })
 }
 
@@ -391,6 +443,18 @@ async fn fetch_stage_observations(
     })
 }
 
+async fn fetch_rows(
+    db: &Database,
+    sql: &str,
+    string_binds: &[&str],
+) -> Result<Vec<sqlx::any::AnyRow>, ApiError> {
+    let mut query = sqlx::query(sql);
+    for value in string_binds {
+        query = query.bind(*value);
+    }
+    Ok(query.fetch_all(db.read_pool()).await?)
+}
+
 async fn fetch_rows_with_limit(
     db: &Database,
     sql: &str,
@@ -416,20 +480,74 @@ fn elapsed_seconds(start: DateTime<Utc>, end: DateTime<Utc>) -> f64 {
     (end - start).num_milliseconds().max(0) as f64 / 1000.0
 }
 
-fn append_counter_from_observations(
+fn append_counter_from_series(
     body: &mut String,
     name: &str,
     help: &str,
     label_names: &[&str],
-    observations: &[Observation],
+    series: &[HistogramSeries],
 ) {
-    let mut counts = BTreeMap::<Vec<String>, u64>::new();
-    for observation in observations {
-        *counts.entry(observation.labels.clone()).or_default() += 1;
-    }
     body.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
-    for (labels, count) in counts {
-        append_sample(body, name, label_names, &labels, None, count as f64);
+    for entry in series {
+        append_sample(
+            body,
+            name,
+            label_names,
+            &entry.labels,
+            None,
+            entry.count as f64,
+        );
+    }
+}
+
+fn append_histogram_series(
+    body: &mut String,
+    name: &str,
+    help: &str,
+    label_names: &[&str],
+    series: &[HistogramSeries],
+) {
+    body.push_str(&format!("# HELP {name} {help}\n# TYPE {name} histogram\n"));
+    for entry in series {
+        for (bucket_index, le) in LATENCY_BUCKETS.iter().enumerate() {
+            let cumulative = entry
+                .cumulative_buckets
+                .get(bucket_index)
+                .copied()
+                .unwrap_or(0);
+            append_sample(
+                body,
+                &format!("{name}_bucket"),
+                label_names,
+                &entry.labels,
+                Some(*le),
+                cumulative as f64,
+            );
+        }
+        append_sample(
+            body,
+            &format!("{name}_bucket"),
+            label_names,
+            &entry.labels,
+            Some(f64::INFINITY),
+            entry.count as f64,
+        );
+        append_sample(
+            body,
+            &format!("{name}_sum"),
+            label_names,
+            &entry.labels,
+            None,
+            entry.sum_seconds,
+        );
+        append_sample(
+            body,
+            &format!("{name}_count"),
+            label_names,
+            &entry.labels,
+            None,
+            entry.count as f64,
+        );
     }
 }
 
@@ -574,5 +692,37 @@ mod tests {
         assert!(body.contains("le=\"+Inf\"} 3\n"));
         assert!(body.contains("sandboxwich_test_seconds_count{outcome=\"ok\"} 3\n"));
         assert!(body.contains("sandboxwich_test_seconds_sum{outcome=\"ok\"} 1020.5\n"));
+    }
+
+    #[test]
+    fn histogram_series_emits_cumulative_sql_buckets() {
+        let series = vec![HistogramSeries {
+            labels: vec!["ok".into()],
+            count: 3,
+            sum_seconds: 1020.5,
+            // SQL returns cumulative le= counts already.
+            cumulative_buckets: vec![1, 1, 1, 2, 2, 2, 2, 2],
+        }];
+        let mut body = String::new();
+        append_histogram_series(
+            &mut body,
+            "sandboxwich_test_seconds",
+            "test",
+            &["outcome"],
+            &series,
+        );
+        assert!(body.contains("le=\"1\"} 1\n"));
+        assert!(body.contains("le=\"30\"} 2\n"));
+        assert!(body.contains("le=\"+Inf\"} 3\n"));
+        assert!(body.contains("sandboxwich_test_seconds_count{outcome=\"ok\"} 3\n"));
+        assert!(body.contains("sandboxwich_test_seconds_sum{outcome=\"ok\"} 1020.5\n"));
+    }
+
+    #[test]
+    fn placement_match_bucket_ms_aligns_with_second_buckets() {
+        assert_eq!(LATENCY_BUCKETS.len(), LATENCY_BUCKETS_MS.len());
+        for (seconds, ms) in LATENCY_BUCKETS.iter().zip(LATENCY_BUCKETS_MS.iter()) {
+            assert_eq!((*seconds * 1000.0) as i64, *ms);
+        }
     }
 }
