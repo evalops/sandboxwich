@@ -404,7 +404,7 @@ async fn fetch_rows_with_limit(
     if sql.contains("limit ") {
         query = query.bind(METRICS_MAX_ROWS_PER_FAMILY);
     }
-    Ok(query.fetch_all(&db.pool).await?)
+    Ok(query.fetch_all(db.read_pool()).await?)
 }
 
 fn timestamp(row: &sqlx::any::AnyRow, column: &str) -> Result<DateTime<Utc>, ApiError> {

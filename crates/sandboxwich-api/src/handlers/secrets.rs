@@ -341,7 +341,9 @@ pub(crate) async fn fetch_sandbox_secret_mounts(
     db: &Database,
     sandbox_id: SandboxId,
 ) -> Result<Vec<SandboxSecretMount>, ApiError> {
-    let mut connection = db.pool.acquire().await?;
+    // Pure read used on claim enrichment and provision-spec assembly; prefer
+    // the query-only pool so claim scans do not compete for the writer.
+    let mut connection = db.read_pool().acquire().await?;
     fetch_sandbox_secret_mounts_on_connection(db, &mut connection, sandbox_id).await
 }
 

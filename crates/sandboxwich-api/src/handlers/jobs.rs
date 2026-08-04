@@ -200,9 +200,24 @@ pub(crate) async fn get_job(
     }))
 }
 
+/// Per-claim-poll cache of sandbox placement inputs so a 200-candidate scan
+/// does not re-fetch the same sandbox + secret mounts for every job that
+/// points at one sandbox (common when many stop/command jobs share a pool).
+pub(crate) type PlacementEnrichmentCache =
+    std::collections::HashMap<SandboxId, (Sandbox, Vec<SandboxSecretMount>)>;
+
 pub(crate) async fn enrich_job_payload_with_provision_spec(
     db: &Database,
     job: &mut Job,
+) -> Result<(), ApiError> {
+    let mut cache = PlacementEnrichmentCache::new();
+    enrich_job_payload_with_provision_spec_cached(db, job, &mut cache).await
+}
+
+pub(crate) async fn enrich_job_payload_with_provision_spec_cached(
+    db: &Database,
+    job: &mut Job,
+    cache: &mut PlacementEnrichmentCache,
 ) -> Result<(), ApiError> {
     match job.kind {
         JobKind::ProvisionSandbox
@@ -214,20 +229,35 @@ pub(crate) async fn enrich_job_payload_with_provision_spec(
         | JobKind::ResumeSandbox
         | JobKind::MaterializeFile
         | JobKind::ApexTaskInstructions => {
-            let sandbox = fetch_sandbox(db, sandbox_id_from_job(job)?).await?;
+            let sandbox_id = sandbox_id_from_job(job)?;
+            let (sandbox, secret_mounts) =
+                load_sandbox_placement_inputs(db, sandbox_id, cache).await?;
             job.required_execution_class = sandbox.execution_class.clone();
-            let secret_mounts = fetch_sandbox_secret_mounts(db, sandbox.id).await?;
             add_provision_spec_to_payload(job, &sandbox, &secret_mounts)?;
         }
         JobKind::ForkSandbox => {
-            let child = fetch_sandbox(db, child_sandbox_id_from_job(job)?).await?;
+            let child_id = child_sandbox_id_from_job(job)?;
+            let (child, secret_mounts) = load_sandbox_placement_inputs(db, child_id, cache).await?;
             job.required_execution_class = child.execution_class.clone();
-            let secret_mounts = fetch_sandbox_secret_mounts(db, child.id).await?;
             add_provision_spec_to_payload(job, &child, &secret_mounts)?;
         }
         JobKind::DeleteHome => {}
     }
     Ok(())
+}
+
+async fn load_sandbox_placement_inputs(
+    db: &Database,
+    sandbox_id: SandboxId,
+    cache: &mut PlacementEnrichmentCache,
+) -> Result<(Sandbox, Vec<SandboxSecretMount>), ApiError> {
+    if let Some(entry) = cache.get(&sandbox_id) {
+        return Ok(entry.clone());
+    }
+    let sandbox = fetch_sandbox(db, sandbox_id).await?;
+    let secret_mounts = fetch_sandbox_secret_mounts(db, sandbox.id).await?;
+    cache.insert(sandbox_id, (sandbox.clone(), secret_mounts.clone()));
+    Ok((sandbox, secret_mounts))
 }
 
 pub(crate) fn add_provision_spec_to_payload(
