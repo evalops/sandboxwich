@@ -86,10 +86,10 @@ const LIST_COL_MAX_LIFETIME_SECONDS: usize = 13;
 const LIST_COL_IDLE_TTL_SECONDS: usize = 14;
 const LIST_COL_LAST_ACTIVITY_AT: usize = 15;
 const LIST_COL_PARENT_SNAPSHOT_ID: usize = 16;
-const LIST_COL_ALLOW_RULES_JSON: usize = 17;
 
-/// List-path decoder: ordinal column access (avoids repeated named lookups) plus
-/// optional in-row allowlist JSON so the handler needs no second round trip.
+/// List-path decoder: ordinal column access avoids repeated named lookups on the
+/// hot GET /sandboxes path. Allowlist rules are attached by a single batched
+/// follow-up query (cheaper than per-row JSON aggregates under allowlist seeds).
 pub(crate) fn sandbox_list_page_item(row: AnyRow) -> Result<(PageCursor, Sandbox), ApiError> {
     let id: &str = row.try_get(LIST_COL_ID)?;
     let tenant_id: String = row.try_get(LIST_COL_TENANT_ID)?;
@@ -108,14 +108,11 @@ pub(crate) fn sandbox_list_page_item(row: AnyRow) -> Result<(PageCursor, Sandbox
     let idle_ttl_seconds: Option<i64> = row.try_get(LIST_COL_IDLE_TTL_SECONDS)?;
     let last_activity_at: Option<&str> = row.try_get(LIST_COL_LAST_ACTIVITY_AT)?;
     let parent_snapshot_id: Option<&str> = row.try_get(LIST_COL_PARENT_SNAPSHOT_ID)?;
-    let allow_rules_json: Option<&str> = row.try_get(LIST_COL_ALLOW_RULES_JSON)?;
     let page_cursor = PageCursor::new(created_at, id);
     let network_egress = match parse_network_egress_mode(network_egress_mode)? {
         NetworkEgressMode::DenyAll => NetworkEgress::DenyAll,
         NetworkEgressMode::AllowAll => NetworkEgress::AllowAll,
-        NetworkEgressMode::Allowlist => NetworkEgress::Allowlist {
-            rules: parse_allow_rules_json(allow_rules_json.unwrap_or("[]"))?,
-        },
+        NetworkEgressMode::Allowlist => NetworkEgress::Allowlist { rules: Vec::new() },
     };
 
     Ok((
@@ -145,29 +142,6 @@ pub(crate) fn sandbox_list_page_item(row: AnyRow) -> Result<(PageCursor, Sandbox
                 .transpose()?,
         },
     ))
-}
-
-#[derive(serde::Deserialize)]
-struct AllowRuleJson {
-    kind: String,
-    value: String,
-}
-
-pub(crate) fn parse_allow_rules_json(raw: &str) -> Result<Vec<NetworkAllowRule>, ApiError> {
-    if raw.is_empty() || raw == "null" {
-        return Ok(Vec::new());
-    }
-    let parsed: Vec<AllowRuleJson> = serde_json::from_str(raw)
-        .map_err(|_| ApiError::internal("database contains invalid network allow rules json"))?;
-    parsed
-        .into_iter()
-        .map(|rule| {
-            Ok(NetworkAllowRule {
-                kind: parse_network_allow_rule_kind(&rule.kind)?,
-                value: rule.value,
-            })
-        })
-        .collect()
 }
 
 pub(crate) fn row_to_resident_process(row: AnyRow) -> Result<ResidentProcess, ApiError> {
