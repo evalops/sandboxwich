@@ -371,17 +371,19 @@ pub(crate) async fn list_sandboxes(
     let limit = resolve_page_limit(page.limit)?;
     let cursor = resolve_page_cursor(&page)?;
 
-    // Lightweight page SELECT (ordinal decode) + one batched allowlist query when
-    // needed. Correlated per-row JSON aggregates were measured slower under a
-    // 100% allowlist seed (see scripts/perf-harness.py matrix).
+    // List embeds denormalized allowlist rules (`network_egress_rules_json`) so
+    // the page needs one SELECT. Correlated per-row JSON aggregates and a second
+    // batched IN query were both measured slower under 100% allowlist seeds
+    // (see scripts/perf-harness.py matrix / allowlist).
     let base_sql = format!(
         "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
-                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, last_activity_at, parent_snapshot_id
+                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, last_activity_at, parent_snapshot_id,
+                network_egress_rules_json
          from sandboxes
          where tenant_id = {}",
         state.db.placeholder(1)
     );
-    let (mut sandboxes, next_cursor) = fetch_keyset_page(
+    let (sandboxes, next_cursor) = fetch_keyset_page(
         &state.db,
         &base_sql,
         std::slice::from_ref(&ctx.tenant_id),
@@ -390,7 +392,6 @@ pub(crate) async fn list_sandboxes(
         sandbox_list_page_item,
     )
     .await?;
-    hydrate_sandboxes_network_egress(&state.db, &mut sandboxes).await?;
 
     Ok(sandbox_list_response(SandboxListResponse {
         ok: true,
@@ -1596,12 +1597,14 @@ pub(crate) async fn insert_sandbox_on_connection(
     connection: &mut AnyConnection,
     sandbox: &Sandbox,
 ) -> Result<(), ApiError> {
+    let rules_json = network_egress_rules_json(&sandbox.network_egress)?;
     let sql = format!(
         "insert into sandboxes
          (id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
-          created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, last_activity_at, parent_snapshot_id)
+          created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, last_activity_at, parent_snapshot_id,
+          network_egress_rules_json)
          values ({})",
-        db.placeholders(17)
+        db.placeholders(18)
     );
     sqlx::query(&sql)
         .bind(sandbox.id.to_string())
@@ -1625,9 +1628,24 @@ pub(crate) async fn insert_sandbox_on_connection(
                 .parent_snapshot_id
                 .map(|snapshot| snapshot.0.to_string()),
         )
+        .bind(rules_json)
         .execute(&mut *connection)
         .await?;
     Ok(())
+}
+
+/// Serialize allowlist rules for the denormalized list column. Deny/allow-all
+/// store null so the list decoder can skip JSON parse. Allowlist always stores
+/// a JSON array (possibly empty).
+pub(crate) fn network_egress_rules_json(
+    network_egress: &NetworkEgress,
+) -> Result<Option<String>, ApiError> {
+    match network_egress {
+        NetworkEgress::Allowlist { rules } => serde_json::to_string(rules)
+            .map(Some)
+            .map_err(|_| ApiError::internal("failed to serialize network egress allowlist rules")),
+        NetworkEgress::DenyAll | NetworkEgress::AllowAll => Ok(None),
+    }
 }
 
 pub(crate) async fn replace_sandbox_network_rules_on_connection(
@@ -1661,6 +1679,22 @@ pub(crate) async fn replace_sandbox_network_rules_on_connection(
             .await?;
     }
 
+    // Keep the denormalized list column in lockstep with the normalized table.
+    // Empty allowlist stores "[]" (not null) so list never confuses "no rules"
+    // with "column not backfilled".
+    let rules_json = serde_json::to_string(rules)
+        .map_err(|_| ApiError::internal("failed to serialize network egress allowlist rules"))?;
+    let update_sql = format!(
+        "update sandboxes set network_egress_rules_json = {} where id = {}",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    sqlx::query(&update_sql)
+        .bind(Some(rules_json))
+        .bind(sandbox_id.to_string())
+        .execute(&mut *connection)
+        .await?;
+
     Ok(())
 }
 
@@ -1684,66 +1718,6 @@ pub(crate) fn child_sandbox_id_from_job(job: &Job) -> Result<SandboxId, ApiError
         "fork job is missing child sandbox id",
     )
     .map(SandboxId)
-}
-
-/// Hydrate every `Allowlist` sandbox's network egress rules with a single batched query instead
-/// of one `select` per sandbox, so listing a full page (up to `MAX_PAGE_LIMIT` sandboxes) never
-/// issues more than one extra round-trip regardless of how many of them are on the allowlist tier.
-/// Batched allowlist hydration for multi-row responses that do not embed rules
-/// in the primary SELECT (list embeds rules; other surfaces still use this).
-pub(crate) async fn hydrate_sandboxes_network_egress(
-    db: &Database,
-    sandboxes: &mut [Sandbox],
-) -> Result<(), ApiError> {
-    let allowlist_ids: Vec<SandboxId> = sandboxes
-        .iter()
-        .filter(|sandbox| matches!(sandbox.network_egress, NetworkEgress::Allowlist { .. }))
-        .map(|sandbox| sandbox.id)
-        .collect();
-    if allowlist_ids.is_empty() {
-        return Ok(());
-    }
-
-    let mut rules_by_sandbox = list_network_allow_rules_for_sandboxes(db, &allowlist_ids).await?;
-    for sandbox in sandboxes {
-        if matches!(sandbox.network_egress, NetworkEgress::Allowlist { .. }) {
-            let rules = rules_by_sandbox.remove(&sandbox.id).unwrap_or_default();
-            sandbox.network_egress = NetworkEgress::Allowlist { rules };
-        }
-    }
-    Ok(())
-}
-
-/// Batched counterpart to [`list_network_allow_rules`]: fetches rules for every id in
-/// `sandbox_ids` with a single `sandbox_id in (...)` query and groups them in memory, rather than
-/// issuing one query per sandbox.
-pub(crate) async fn list_network_allow_rules_for_sandboxes(
-    db: &Database,
-    sandbox_ids: &[SandboxId],
-) -> Result<HashMap<SandboxId, Vec<NetworkAllowRule>>, ApiError> {
-    let mut query = db.query_builder(
-        "select sandbox_id, kind, value
-         from sandbox_network_egress_rules
-         where sandbox_id in (",
-    );
-    {
-        let mut ids = query.separated(", ");
-        for sandbox_id in sandbox_ids {
-            ids.push_bind(sandbox_id.to_string());
-        }
-    }
-    query.push(") order by sandbox_id asc, kind asc, value asc");
-    let rows = query.build().fetch_all(db.read_pool()).await?;
-
-    let mut grouped: HashMap<SandboxId, Vec<NetworkAllowRule>> =
-        HashMap::with_capacity(sandbox_ids.len());
-    for row in rows {
-        let sandbox_id: &str = row.try_get("sandbox_id")?;
-        let sandbox_id = SandboxId(parse_uuid(sandbox_id)?);
-        let rule = row_to_network_allow_rule(row)?;
-        grouped.entry(sandbox_id).or_default().push(rule);
-    }
-    Ok(grouped)
 }
 
 pub(crate) async fn hydrate_sandbox_network_egress(
