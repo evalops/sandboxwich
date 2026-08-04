@@ -1,6 +1,8 @@
 use crate::common::*;
+use crate::types::{insert_job_lease_sql, insert_job_sql, insert_worker_sql};
 use sandboxwich_core::*;
 use sqlx::AnyPool;
+use uuid::Uuid;
 
 /// Regression test: `/metrics` aggregated sandbox/worker/job/lease counts across every tenant and
 /// served them to any authenticated tenant token, an information leak across the tenant boundary.
@@ -245,6 +247,117 @@ pub(crate) async fn metrics_are_scoped_to_the_authenticated_tenant() {
         planning_sandbox_gauge(&wrong_operator_metrics),
         DEFAULT_TENANT_SANDBOXES as i64,
         "a wrong operator token must not unlock the cross-tenant view:\n{wrong_operator_metrics}"
+    );
+}
+
+/// Resident-process leases are long-lived control-plane state and do not consume
+/// the ordinary scheduler slots. Keep the aggregate metric aligned with the
+/// worker claim and capacity endpoints so an operator does not diagnose a false
+/// capacity exhaustion from `/metrics`.
+#[tokio::test]
+async fn metrics_available_capacity_excludes_resident_process_leases() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("sandboxwich-metrics-capacity-test.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    sqlx::any::install_default_drivers();
+    let pool = AnyPool::connect(&server.database_url).await.unwrap();
+    let timestamp = "2026-08-04T00:00:00Z";
+    let worker_id = Uuid::now_v7().to_string();
+    sqlx::query(&insert_worker_sql(&server.database_url))
+        .bind(&worker_id)
+        .bind("metrics-capacity-worker")
+        .bind("online")
+        .bind("kubernetes")
+        .bind("[\"provision_sandbox\"]")
+        .bind("{}")
+        .bind(timestamp)
+        .bind(timestamp)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("update workers set max_concurrent_jobs = ? where id = ?")
+        .bind(2_i64)
+        .bind(&worker_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for (job_id, kind, capability) in [
+        (
+            "00000000-0000-0000-0000-000000000801",
+            "run_command",
+            "run_command",
+        ),
+        (
+            "00000000-0000-0000-0000-000000000802",
+            "run_resident_process",
+            "uid_isolated_resident_process",
+        ),
+    ] {
+        sqlx::query(&insert_job_sql(&server.database_url))
+            .bind(job_id)
+            .bind(kind)
+            .bind("leased")
+            .bind("{}")
+            .bind(capability)
+            .bind("development_container")
+            .bind(0_i64)
+            .bind(1_i64)
+            .bind(3_i64)
+            .bind(timestamp)
+            .bind(timestamp)
+            .bind(timestamp)
+            .bind(Option::<String>::None)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    for (lease_id, job_id) in [
+        (
+            "00000000-0000-0000-0000-000000000811",
+            "00000000-0000-0000-0000-000000000801",
+        ),
+        (
+            "00000000-0000-0000-0000-000000000812",
+            "00000000-0000-0000-0000-000000000802",
+        ),
+    ] {
+        sqlx::query(&insert_job_lease_sql(&server.database_url))
+            .bind(lease_id)
+            .bind(job_id)
+            .bind(&worker_id)
+            .bind("active")
+            .bind(1_i64)
+            .bind(timestamp)
+            .bind("2026-08-04T01:00:00Z")
+            .bind(Option::<String>::None)
+            .bind(Option::<String>::None)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let metrics = server
+        .client()
+        .get(format!("{}/metrics", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        labeled_metric_value(&metrics, "sandboxwich_worker_available_slots "),
+        1,
+        "resident-process leases must not consume ordinary worker capacity:\n{metrics}"
     );
 }
 
