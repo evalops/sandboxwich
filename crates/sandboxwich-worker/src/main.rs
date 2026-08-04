@@ -1059,18 +1059,20 @@ async fn main() -> anyhow::Result<()> {
             );
             let mut labels: BTreeMap<_, _> = args.label.into_iter().collect();
             add_placement_proof_labels(&mut labels, args.provider_mode, None, false);
-            let response = register_worker(
-                &client,
-                &api,
-                args.name,
-                args.provider,
-                capabilities,
-                labels,
-                // Standalone registration may be consumed by multiple
-                // work-once/work-loop processes, so preserve the operator's
-                // declared aggregate capacity.
-                args.max_concurrent_jobs,
-            )
+            let response = with_retries("register worker", API_RETRY_ATTEMPTS, || {
+                register_worker(
+                    &client,
+                    &api,
+                    args.name.clone(),
+                    args.provider.clone(),
+                    capabilities.clone(),
+                    labels.clone(),
+                    // Standalone registration may be consumed by multiple
+                    // work-once/work-loop processes, so preserve the operator's
+                    // declared aggregate capacity.
+                    args.max_concurrent_jobs,
+                )
+            })
             .await?;
             println!("{}", serde_json::to_string_pretty(&response)?);
         }
@@ -1196,15 +1198,17 @@ async fn main() -> anyhow::Result<()> {
             {
                 labels.insert(MAESTRO_HOSTED_RUNNER_IMAGE_LABEL.into(), image.into());
             }
-            let response = register_worker(
-                &client,
-                &api,
-                args.name,
-                args.worker_provider,
-                capabilities,
-                labels.clone(),
-                args.max_concurrent_jobs,
-            )
+            let response = with_retries("register worker", API_RETRY_ATTEMPTS, || {
+                register_worker(
+                    &client,
+                    &api,
+                    args.name.clone(),
+                    args.worker_provider.clone(),
+                    capabilities.clone(),
+                    labels.clone(),
+                    args.max_concurrent_jobs,
+                )
+            })
             .await?;
             println!(
                 "{}",
@@ -1255,15 +1259,22 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(|| args.provider.namespace.clone()),
             );
             labels.insert("role".into(), "reconciler".into());
-            let response = register_worker(
-                &client,
-                &api,
-                args.name,
-                args.worker_provider,
-                vec![WorkerCapability::K8sPod],
-                labels,
-                Some(1),
-            )
+            // Registration is the only gate before orphan reaping. A single
+            // connect timeout (as seen in production CronJobs) previously
+            // aborted the whole run and left Pending workspace PVCs to
+            // accumulate under quota pressure. Reuse the same recoverable
+            // transport/5xx/429 policy as heartbeat and claim.
+            let response = with_retries("register reconciler", API_RETRY_ATTEMPTS, || {
+                register_worker(
+                    &client,
+                    &api,
+                    args.name.clone(),
+                    args.worker_provider.clone(),
+                    vec![WorkerCapability::K8sPod],
+                    labels.clone(),
+                    Some(1),
+                )
+            })
             .await?;
             let worker_token = response.worker_token.context(
                 "registration response did not include a worker-scoped token; is \
