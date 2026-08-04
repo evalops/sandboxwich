@@ -339,6 +339,14 @@ async fn run_all(mut options: AllOptions) -> anyhow::Result<()> {
         concurrency: options.concurrency,
     })
     .await?;
+    let metrics = benchmark_http(&HttpOptions {
+        api_url: server.base_url.clone(),
+        method: HttpMethod::Get,
+        path: "/metrics".to_string(),
+        requests: options.requests,
+        concurrency: options.concurrency,
+    })
+    .await?;
     // POST /sandboxes creates real rows, so it's deliberately capped well
     // below the other read-only benchmarks. Keep the actual (post-cap)
     // numbers around so the report can state them explicitly instead of
@@ -394,6 +402,7 @@ async fn run_all(mut options: AllOptions) -> anyhow::Result<()> {
     println!("{}", healthz.markdown("GET /healthz"));
     println!("{}", readyz.markdown("GET /readyz"));
     println!("{}", sandboxes.markdown("GET /sandboxes"));
+    println!("{}", metrics.markdown("GET /metrics"));
     println!(
         "{}",
         creates.markdown(&format!(

@@ -1104,6 +1104,9 @@ async fn test_sqlite_db() -> Database {
         .run(&db.pool)
         .await
         .expect("run migrations");
+    backfill_command_output_counters(&db)
+        .await
+        .expect("backfill command output counters");
     ensure_database_constraints(&db)
         .await
         .expect("reconcile enum constraints");
@@ -1133,6 +1136,66 @@ async fn schema_verification_requires_the_latest_compiled_migration() {
         .expect_err("missing latest migration must fail schema verification");
     assert!(error.to_string().contains(&expected.version.to_string()));
     assert!(error.to_string().contains("has not been applied"));
+}
+
+#[tokio::test]
+async fn sandbox_list_pagination_index_covers_tenant_cursor_order() {
+    let db = test_sqlite_db().await;
+    let indexes = sqlx::query("pragma index_list(sandboxes)")
+        .fetch_all(&db.pool)
+        .await
+        .expect("inspect sandbox indexes");
+    for required in [
+        "idx_sandboxes_tenant_created_id",
+        "idx_sandboxes_reap_candidates",
+    ] {
+        assert!(
+            indexes
+                .iter()
+                .any(|row| { row.try_get::<String, _>("name").ok().as_deref() == Some(required) }),
+            "the sandbox performance index {required} must be migrated"
+        );
+    }
+
+    let plan = sqlx::query(
+        "explain query plan
+         select id, created_at
+         from sandboxes
+         where tenant_id = 'default'
+         order by created_at, id
+         limit 200",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("explain sandbox list query");
+    let details = plan
+        .iter()
+        .filter_map(|row| row.try_get::<String, _>("detail").ok())
+        .collect::<Vec<_>>();
+    assert!(
+        details
+            .iter()
+            .any(|detail| detail.contains("idx_sandboxes_tenant_created_id")),
+        "the list query should seek through the composite cursor index: {details:?}"
+    );
+    assert!(
+        details
+            .iter()
+            .all(|detail| !detail.contains("USE TEMP B-TREE FOR ORDER BY")),
+        "the list query should not sort into a temporary B-tree: {details:?}"
+    );
+
+    let terminal_indexes = sqlx::query("pragma index_list(terminal_slo_observations)")
+        .fetch_all(&db.pool)
+        .await
+        .expect("inspect terminal SLO indexes");
+    assert!(
+        terminal_indexes.iter().any(|row| {
+            row.try_get::<String, _>("name").ok().as_deref()
+                == Some("idx_terminal_slo_observations_kind_tenant")
+        }),
+        "the terminal SLO metric-family filter index must be migrated"
+    );
 }
 
 #[tokio::test]
@@ -2477,6 +2540,38 @@ async fn reap_cas_miss_skips_instead_of_enqueuing_a_redundant_stop_job() {
     );
 }
 
+/// A non-due allowlist candidate must return before loading its network rules.
+/// Dropping the rules table in this isolated fixture turns an accidental
+/// hydration query into a deterministic failure, so this protects the
+/// reaper's hot-path ordering without needing a database query tracer.
+#[tokio::test]
+async fn reap_does_not_hydrate_network_rules_for_a_non_due_candidate() {
+    let db = test_sqlite_db().await;
+    let sandbox = seed_sandbox_with_state(&db, SandboxState::Ready).await;
+    sqlx::query("drop table sandbox_network_egress_rules")
+        .execute(&db.pool)
+        .await
+        .expect("drop the isolated allowlist table");
+
+    let mut candidate = sandbox;
+    candidate.network_egress = NetworkEgress::Allowlist { rules: Vec::new() };
+    candidate.idle_ttl_seconds = Some(3_600);
+    let outcome = attempt_reap_candidate(
+        &db,
+        &ResidentBootstrapStore::default(),
+        candidate,
+        None,
+        Utc::now(),
+    )
+    .await
+    .expect("non-due candidates must not query the dropped rules table");
+
+    assert!(
+        matches!(outcome, CandidateOutcome::NotDue),
+        "a candidate within its idle TTL must not be reaped: {outcome:?}"
+    );
+}
+
 #[tokio::test]
 async fn snapshot_restore_claim_rejects_expired_ready_source() {
     let db = test_sqlite_db().await;
@@ -3195,6 +3290,150 @@ fn command_output_bounds_cap_bytes_chunks_and_individual_payloads() {
     assert!(validate_command_output_bounds(MAX_COMMAND_OUTPUT_CHUNKS, 0, 1).is_err());
     assert!(validate_command_output_bounds(0, MAX_COMMAND_OUTPUT_BYTES as i64, 1).is_err());
     assert!(validate_command_output_bounds(0, 0, MAX_COMMAND_OUTPUT_CHUNK_BYTES + 1).is_err());
+}
+
+#[tokio::test]
+async fn command_output_counters_track_appends_replacements_and_retries() {
+    let db = test_sqlite_db().await;
+    let sandbox = seed_sandbox_with_state(&db, SandboxState::Ready).await;
+    let command = CommandRun {
+        id: CommandId::new(),
+        sandbox_id: sandbox.id,
+        status: CommandStatus::Running,
+        argv: vec!["printf".to_string()],
+        cwd: None,
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        created_at: Utc::now(),
+        finished_at: None,
+    };
+    let mut tx = db.pool.begin().await.expect("begin command insert");
+    insert_command_on_connection(&db, &mut tx, &command)
+        .await
+        .expect("insert command");
+    tx.commit().await.expect("commit command insert");
+
+    append_command_output_chunk(
+        &db,
+        command.id,
+        sandbox.id,
+        CommandOutputStream::Stdout,
+        "héllo".to_string(),
+        Vec::new(),
+        None,
+    )
+    .await
+    .expect("append stdout chunk");
+    append_command_output_chunk(
+        &db,
+        command.id,
+        sandbox.id,
+        CommandOutputStream::Stdout,
+        " world".to_string(),
+        Vec::new(),
+        None,
+    )
+    .await
+    .expect("append second stdout chunk");
+    append_command_output_chunk(
+        &db,
+        command.id,
+        sandbox.id,
+        CommandOutputStream::Stderr,
+        "err".to_string(),
+        Vec::new(),
+        None,
+    )
+    .await
+    .expect("append stderr chunk");
+
+    let counters = sqlx::query(
+        "select output_chunk_count, output_byte_count,
+                stdout_output_sequence, stderr_output_sequence
+         from commands where id = ?",
+    )
+    .bind(command.id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .expect("read output counters");
+    assert_eq!(counters.try_get::<i64, _>("output_chunk_count").unwrap(), 3);
+    assert_eq!(counters.try_get::<i64, _>("output_byte_count").unwrap(), 15);
+    assert_eq!(
+        counters
+            .try_get::<i64, _>("stdout_output_sequence")
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        counters
+            .try_get::<i64, _>("stderr_output_sequence")
+            .unwrap(),
+        1
+    );
+
+    let mut tx = db.pool.begin().await.expect("begin stream replacement");
+    replace_command_output_stream_on_connection(
+        &db,
+        &mut tx,
+        command.id,
+        &CommandOutputStream::Stdout,
+    )
+    .await
+    .expect("replace stdout");
+    tx.commit().await.expect("commit stream replacement");
+
+    let counters = sqlx::query(
+        "select output_chunk_count, output_byte_count,
+                stdout_output_sequence, stderr_output_sequence
+         from commands where id = ?",
+    )
+    .bind(command.id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .expect("read counters after replacement");
+    assert_eq!(counters.try_get::<i64, _>("output_chunk_count").unwrap(), 1);
+    assert_eq!(counters.try_get::<i64, _>("output_byte_count").unwrap(), 3);
+    assert_eq!(
+        counters
+            .try_get::<i64, _>("stdout_output_sequence")
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        counters
+            .try_get::<i64, _>("stderr_output_sequence")
+            .unwrap(),
+        1
+    );
+
+    let mut tx = db.pool.begin().await.expect("begin command retry reset");
+    reset_command_for_retry_on_connection(&db, &mut tx, command.id)
+        .await
+        .expect("reset command");
+    tx.commit().await.expect("commit command retry reset");
+
+    let counters = sqlx::query(
+        "select output_chunk_count, output_byte_count,
+                stdout_output_sequence, stderr_output_sequence
+         from commands where id = ?",
+    )
+    .bind(command.id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .expect("read counters after retry reset");
+    for column in [
+        "output_chunk_count",
+        "output_byte_count",
+        "stdout_output_sequence",
+        "stderr_output_sequence",
+    ] {
+        assert_eq!(
+            counters.try_get::<i64, _>(column).unwrap(),
+            0,
+            "retry reset must clear {column}"
+        );
+    }
 }
 
 #[tokio::test]

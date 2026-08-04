@@ -27,7 +27,46 @@ pub(crate) enum SqlDialect {
 
 pub(crate) async fn migrate_database(db: &Database) -> anyhow::Result<()> {
     MIGRATOR.run(&db.pool).await?;
+    backfill_command_output_counters(db).await?;
     ensure_database_constraints(db).await?;
+    Ok(())
+}
+
+/// Reconcile the counters introduced for command-output appends with legacy
+/// chunks. This runs after migrations, before the API serves traffic. The
+/// `output_chunk_count = 0` guard makes repeat migrate invocations cheap for
+/// commands already reconciled while still repairing every pre-counter row
+/// that actually has output.
+pub(crate) async fn backfill_command_output_counters(db: &Database) -> anyhow::Result<()> {
+    let byte_length = match db.dialect {
+        SqlDialect::Postgres => "octet_length(c.chunk)",
+        SqlDialect::Sqlite => "length(cast(c.chunk as blob))",
+    };
+    let sql = format!(
+        "update commands
+         set output_chunk_count = (
+                 select count(*) from command_output_chunks c where c.command_id = commands.id
+             ),
+             output_byte_count = (
+                 select coalesce(sum({byte_length}), 0)
+                 from command_output_chunks c where c.command_id = commands.id
+             ),
+             stdout_output_sequence = (
+                 select coalesce(max(c.sequence), 0)
+                 from command_output_chunks c
+                 where c.command_id = commands.id and c.stream = 'stdout'
+             ),
+             stderr_output_sequence = (
+                 select coalesce(max(c.sequence), 0)
+                 from command_output_chunks c
+                 where c.command_id = commands.id and c.stream = 'stderr'
+             )
+         where output_chunk_count = 0
+           and exists (
+               select 1 from command_output_chunks c where c.command_id = commands.id
+           )"
+    );
+    sqlx::query(&sql).execute(&db.pool).await?;
     Ok(())
 }
 
@@ -812,6 +851,8 @@ pub(crate) async fn sqlite_rebuild_sandboxes_with_parent_snapshot_fk(
         "create index if not exists idx_sandboxes_state on sandboxes(state)",
         "create index if not exists idx_sandboxes_created_at on sandboxes(created_at)",
         "create index if not exists idx_sandboxes_tenant_state on sandboxes(tenant_id, state)",
+        "create index if not exists idx_sandboxes_tenant_created_id on sandboxes(tenant_id, created_at, id)",
+        "create index if not exists idx_sandboxes_reap_candidates on sandboxes(state, created_at, id) where max_lifetime_seconds is not null or idle_ttl_seconds is not null",
         "create index if not exists idx_sandboxes_workspace_mode on sandboxes(workspace_mode)",
         "create index if not exists idx_sandboxes_parent_snapshot_id on sandboxes(parent_snapshot_id)",
         "create index if not exists idx_sandboxes_runtime_profile on sandboxes(runtime_profile)",
