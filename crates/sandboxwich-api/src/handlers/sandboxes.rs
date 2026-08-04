@@ -4,6 +4,7 @@ use crate::error::*;
 use crate::handlers::commands::*;
 use crate::handlers::homes::claim_home_mount_on_connection;
 use crate::handlers::jobs::*;
+use crate::handlers::leases::provisioning_operation_from_row;
 use crate::handlers::operations::operation_from_job;
 use crate::handlers::secrets::*;
 use crate::handlers::snapshots::*;
@@ -358,6 +359,7 @@ pub(crate) async fn create_sandbox_with_home(
             ok: true,
             sandbox,
             operation: Some(operation_from_job(&job)?),
+            provisioning: None,
             placement: None,
         }),
     ))
@@ -432,10 +434,12 @@ pub(crate) async fn get_sandbox(
     let (sandbox, placement) =
         fetch_sandbox_with_placement_proof(&state.db, SandboxId(sandbox_id)).await?;
     ensure_tenant(&sandbox.tenant_id, &ctx)?;
+    let provisioning = fetch_provisioning_operation(&state.db, sandbox.id).await?;
     Ok(Json(SandboxResponse {
         ok: true,
         sandbox,
         operation: None,
+        provisioning,
         placement,
     }))
 }
@@ -492,6 +496,25 @@ async fn fetch_sandbox_with_placement_proof(
         }
     };
     Ok((sandbox, placement))
+}
+
+async fn fetch_provisioning_operation(
+    db: &Database,
+    sandbox_id: SandboxId,
+) -> Result<Option<ProvisioningOperation>, ApiError> {
+    let sql = format!(
+        "select lease_id, lease_attempt, stage, stage_index, resource_kind,
+                resource_namespace, resource_name, resource_uid, observed_generation,
+                attempt_count, last_error_class, last_error_code, last_error, updated_at
+         from provisioning_operations where sandbox_id = {}",
+        db.placeholder(1)
+    );
+    let row = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .fetch_optional(db.read_pool())
+        .await?;
+    row.map(|row| provisioning_operation_from_row(sandbox_id, &row))
+        .transpose()
 }
 
 fn placement_proof_from_parts(
@@ -854,6 +877,7 @@ pub(crate) async fn stop_sandbox(
             ok: true,
             sandbox,
             operation: Some(operation_from_job(&job)?),
+            provisioning: None,
             placement: None,
         }),
     ))
@@ -991,6 +1015,7 @@ pub(crate) async fn resume_sandbox(
             ok: true,
             sandbox,
             operation: Some(operation_from_job(&job)?),
+            provisioning: None,
             placement: None,
         }),
     ))
@@ -1198,6 +1223,7 @@ pub(crate) async fn fork_sandbox(
             ok: true,
             sandbox: child,
             operation: Some(operation_from_job(&job)?),
+            provisioning: None,
             placement: None,
         }),
     ))
@@ -1241,6 +1267,7 @@ pub(crate) async fn transition_sandbox(
         ok: true,
         sandbox,
         operation: None,
+        provisioning: None,
         placement: None,
     }))
 }

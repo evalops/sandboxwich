@@ -1,5 +1,5 @@
 use crate::db::Database;
-use crate::error::ApiError;
+use crate::error::*;
 use crate::identity_mtls::IdentityServiceContext;
 use crate::rows::{parse_timestamp, parse_uuid};
 use crate::state::{AppState, TenantContext};
@@ -59,6 +59,116 @@ fn unavailable() -> ApiError {
 
 fn not_live(message: impl Into<String>) -> ApiError {
     ApiError::conflict_code("placement_attestation_not_live", message)
+}
+
+fn placement_pending() -> ApiError {
+    ApiError::conflict_code(
+        "placement_attestation_pending",
+        "Maestro hosted runner placement is still being materialized",
+    )
+}
+
+fn resident_not_ready_error(
+    observed_state: &str,
+    error_class: Option<ProvisioningErrorClass>,
+    error_code: Option<String>,
+    last_error: Option<String>,
+) -> ApiError {
+    let terminal = observed_state == ResidentProcessObservedState::Failed.as_db_str()
+        || observed_state == ResidentProcessObservedState::Lost.as_db_str()
+        || observed_state == ResidentProcessObservedState::Stopped.as_db_str();
+    let has_error = last_error.is_some() || error_class.is_some() || error_code.is_some();
+    let message = last_error
+        .unwrap_or_else(|| "resident process has not reported a provider error".to_string());
+    let code = error_code.as_deref();
+
+    if !terminal {
+        if error_class.as_ref() == Some(&ProvisioningErrorClass::RetryableCapacity)
+            || code == Some("workspace_capacity_pending")
+        {
+            return ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "workspace_capacity_pending",
+                message,
+            };
+        }
+        if has_error {
+            return ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "resident_materialization_pending",
+                message,
+            };
+        }
+        return placement_pending();
+    }
+
+    if error_class.as_ref() == Some(&ProvisioningErrorClass::RetryableCapacity)
+        || code == Some("workspace_capacity_pending")
+    {
+        return ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "workspace_capacity_exhausted",
+            message,
+        };
+    }
+    if code == Some("identity_exchange_failed") {
+        return ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            code: "identity_exchange_failed",
+            message,
+        };
+    }
+    if error_class.as_ref() == Some(&ProvisioningErrorClass::TerminalSecurity) {
+        if code == Some("kubernetes_policy_denied") {
+            return ApiError {
+                status: StatusCode::FORBIDDEN,
+                code: "kubernetes_policy_denied",
+                message,
+            };
+        }
+        if code == Some("runtime_class_boundary_unverified") {
+            return ApiError {
+                status: StatusCode::FORBIDDEN,
+                code: "runtime_class_boundary_unverified",
+                message,
+            };
+        }
+    }
+    if error_class.as_ref() == Some(&ProvisioningErrorClass::TerminalContract) {
+        if code == Some("kubernetes_contract_invalid") {
+            return ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "kubernetes_contract_invalid",
+                message,
+            };
+        }
+        if code == Some("resource_contract_conflict") {
+            return ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "resource_contract_conflict",
+                message,
+            };
+        }
+        if code == Some("resource_identity_conflict") {
+            return ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "resource_identity_conflict",
+                message,
+            };
+        }
+        if code == Some("pod_unschedulable") {
+            return ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "pod_unschedulable",
+                message,
+            };
+        }
+    }
+    ApiError {
+        status: StatusCode::BAD_GATEWAY,
+        code: "resident_materialization_failed",
+        message,
+    }
 }
 
 fn maestro_identity_observation_is_eligible(observed_state: &str) -> bool {
@@ -293,7 +403,11 @@ fn maestro_expected_server_uri_san(binding: &MaestroUriComponents<'_>) -> Result
     responses(
         (status = 200, description = "Live tenant-scoped Maestro connection and exact server certificate binding", body = MaestroHostedRunnerConnectionBindingResponse),
         (status = 404, description = "No tenant-scoped Maestro hosted runner exists", body = ErrorEnvelope),
-        (status = 409, description = "The Maestro placement is not live", body = ErrorEnvelope)
+        (status = 409, description = "The Maestro placement is pending or not live", body = ErrorEnvelope),
+        (status = 403, description = "Resident provider policy rejected materialization", body = ErrorEnvelope),
+        (status = 422, description = "Resident provider contract rejected materialization", body = ErrorEnvelope),
+        (status = 502, description = "Resident process materialization failed", body = ErrorEnvelope),
+        (status = 503, description = "Resident process capacity or materialization is pending", body = ErrorEnvelope)
     )
 )]
 pub(crate) async fn get_maestro_connection_binding(
@@ -304,7 +418,8 @@ pub(crate) async fn get_maestro_connection_binding(
     let sandbox_id = SandboxId(sandbox_id);
     let sql = format!(
         "select rp.id, rp.generation, rp.active_lease_id, rp.env,
-                rp.desired_state, rp.observed_state, rp.provider_pod_uid, w.labels
+                rp.desired_state, rp.observed_state, rp.provider_pod_uid,
+                rp.last_error_class, rp.last_error_code, rp.last_error, w.labels
          from resident_processes rp
          join sandbox_placements sp on sp.sandbox_id = rp.sandbox_id
          join workers w on w.id = sp.worker_id
@@ -322,10 +437,22 @@ pub(crate) async fn get_maestro_connection_binding(
         .ok_or_else(|| ApiError::not_found("Maestro hosted runner not found"))?;
     if row.try_get::<String, _>("desired_state")?
         != ResidentProcessDesiredState::Running.as_db_str()
-        || row.try_get::<String, _>("observed_state")?
-            != ResidentProcessObservedState::Running.as_db_str()
     {
         return Err(not_live("Maestro hosted runner is not running"));
+    }
+    let observed_state: String = row.try_get("observed_state")?;
+    if observed_state != ResidentProcessObservedState::Running.as_db_str() {
+        let error_class = row
+            .try_get::<Option<String>, _>("last_error_class")?
+            .map(|value| ProvisioningErrorClass::parse_db_str(&value))
+            .transpose()
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        return Err(resident_not_ready_error(
+            &observed_state,
+            error_class,
+            row.try_get("last_error_code")?,
+            row.try_get("last_error")?,
+        ));
     }
     let process_id = ResidentProcessId(parse_uuid(&row.try_get::<String, _>("id")?)?);
     let process_generation = parse_u64(row.try_get("generation")?, "resident generation")?;
@@ -1157,5 +1284,58 @@ mod tests {
                 observed_state.as_db_str()
             ));
         }
+    }
+
+    #[test]
+    fn resident_capacity_status_is_typed_while_queued_and_terminal() {
+        let queued = resident_not_ready_error(
+            ResidentProcessObservedState::Starting.as_db_str(),
+            Some(ProvisioningErrorClass::RetryableCapacity),
+            Some("workspace_capacity_pending".into()),
+            Some("workspace_capacity_pending: exceeded quota".into()),
+        );
+        assert_eq!(queued.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(queued.code, "workspace_capacity_pending");
+
+        let terminal = resident_not_ready_error(
+            ResidentProcessObservedState::Failed.as_db_str(),
+            Some(ProvisioningErrorClass::RetryableCapacity),
+            Some("workspace_capacity_pending".into()),
+            Some("workspace_capacity_pending: exceeded quota".into()),
+        );
+        assert_eq!(terminal.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(terminal.code, "workspace_capacity_exhausted");
+    }
+
+    #[test]
+    fn terminal_resident_materialization_never_maps_to_attestation_not_live() {
+        for (error_class, error_code) in [
+            (Some(ProvisioningErrorClass::RetryableProvider), None),
+            (None, None),
+            (
+                Some(ProvisioningErrorClass::TerminalSecurity),
+                Some("kubernetes_policy_denied"),
+            ),
+        ] {
+            let error = resident_not_ready_error(
+                ResidentProcessObservedState::Failed.as_db_str(),
+                error_class,
+                error_code.map(str::to_string),
+                Some("provider failed to materialize the resident process".into()),
+            );
+            assert_ne!(error.code, "placement_attestation_not_live");
+        }
+    }
+
+    #[test]
+    fn live_progress_without_an_error_keeps_pending_distinct_from_materialization_failure() {
+        let error = resident_not_ready_error(
+            ResidentProcessObservedState::Starting.as_db_str(),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "placement_attestation_pending");
     }
 }

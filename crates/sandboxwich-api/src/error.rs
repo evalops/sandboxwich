@@ -4,6 +4,49 @@ use axum::response::{IntoResponse, Response};
 use sandboxwich_core::*;
 use sqlx::error::ErrorKind;
 
+/// Decode the stable prefix emitted by the worker's `ProviderError` display.
+/// The worker keeps the original Kubernetes detail after the colon; the API
+/// stores that detail unchanged while recovering the already-established
+/// provisioning taxonomy for resident-process status reads.
+pub(crate) fn provider_error_fields(
+    error: &str,
+) -> (Option<ProvisioningErrorClass>, Option<String>) {
+    let code = error
+        .split_once(':')
+        .map(|(code, _)| code.trim())
+        .filter(|code| {
+            !code.is_empty()
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        });
+    let class = provisioning_error_class_for_code(code);
+    (class, code.map(str::to_string))
+}
+
+pub(crate) fn provisioning_error_class_for_code(
+    code: Option<&str>,
+) -> Option<ProvisioningErrorClass> {
+    match code {
+        Some("workspace_capacity_pending") | Some("resource_quota") => {
+            Some(ProvisioningErrorClass::RetryableCapacity)
+        }
+        Some("provider_transient")
+        | Some("kubernetes_provider_transient")
+        | Some("resource_observation_missing")
+        | Some("resource_observation_invalid")
+        | Some("resource_identity_missing") => Some(ProvisioningErrorClass::RetryableProvider),
+        Some("kubernetes_contract_invalid")
+        | Some("pod_unschedulable")
+        | Some("resource_contract_conflict")
+        | Some("resource_identity_conflict") => Some(ProvisioningErrorClass::TerminalContract),
+        Some("kubernetes_policy_denied") | Some("runtime_class_boundary_unverified") => {
+            Some(ProvisioningErrorClass::TerminalSecurity)
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ApiError {
     pub(crate) status: StatusCode,

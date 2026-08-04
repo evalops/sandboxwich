@@ -235,6 +235,7 @@ pub(crate) async fn fork_snapshot(
             ok: true,
             sandbox: child,
             operation: Some(operation_from_job(&job)?),
+            provisioning: None,
             placement: None,
         }),
     ))

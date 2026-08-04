@@ -2,6 +2,7 @@ use crate::common::*;
 use reqwest::StatusCode;
 use sandboxwich_core::*;
 use sha2::{Digest, Sha256};
+use sqlx::any::AnyPoolOptions;
 
 #[tokio::test]
 async fn unprivileged_compiler_cache_job_is_reachable_with_separate_identity() {
@@ -1013,6 +1014,19 @@ pub(crate) async fn provisioning_stage_route_is_put_only_and_worker_fenced() {
     let client = server.client();
     let sandbox = create_sandbox(&client, &server, "stage-route").await;
     let worker = register_claim_filter_worker(&client, &server).await;
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new()
+        .connect(&server.database_url)
+        .await
+        .unwrap();
+    sqlx::query("update workers set labels = ? where id = ?")
+        .bind(
+            "{\"provider_mode\":\"apply\",\"runtime_image\":\"image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+        )
+        .bind(worker.worker.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
     let worker_client = worker_client(&worker);
     let claim: ClaimLeaseResponse = worker_client
         .post(format!(
@@ -1079,6 +1093,35 @@ pub(crate) async fn provisioning_stage_route_is_put_only_and_worker_fenced() {
         .unwrap()
         .error_for_status()
         .unwrap();
+
+    let fetched: SandboxResponse = client
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let provisioning = fetched
+        .provisioning
+        .expect("GET sandbox must expose durable provisioning status");
+    assert_eq!(
+        provisioning.last_error_class,
+        Some(ProvisioningErrorClass::RetryableProvider)
+    );
+    assert_eq!(
+        provisioning.last_error_code.as_deref(),
+        Some("pod_ready_timeout")
+    );
+    assert_eq!(
+        provisioning.last_error.as_deref(),
+        Some("pod readiness timed out")
+    );
 
     let wrong_method = worker_client
         .post(format!(

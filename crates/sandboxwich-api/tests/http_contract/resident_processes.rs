@@ -473,16 +473,14 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
         "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}/connection-binding",
         server.base_url
     );
+    let pending = client.get(&connection_binding_url).send().await.unwrap();
     assert_eq!(
-        client
-            .get(&connection_binding_url)
-            .send()
-            .await
-            .unwrap()
-            .status(),
+        pending.status(),
         reqwest::StatusCode::CONFLICT,
         "a pending process must not expose a connection binding"
     );
+    let pending_error: ErrorEnvelope = pending.json().await.unwrap();
+    assert_eq!(pending_error.code, "placement_attestation_pending");
 
     let worker_http = worker_client(&worker);
     let claimed: ClaimLeaseResponse = worker_http
@@ -646,6 +644,166 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
         reqwest::StatusCode::CONFLICT,
         "an expired lease must not expose a connection binding"
     );
+}
+
+#[tokio::test]
+async fn maestro_connection_binding_reports_terminal_provider_capacity() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("maestro-capacity.db").display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let (sandbox_id, worker, _) =
+        provisioned_sandbox_with_guest(&server, "maestro-capacity", true).await;
+    let client = server.client();
+    let created: ResidentProcessResponse = client
+        .put(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url
+        ))
+        .json(&maestro_hosted_runner_request(
+            sandbox_id,
+            "workspace-capacity",
+            "runner-capacity",
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let worker_http = worker_client(&worker);
+    let claimed: ClaimLeaseResponse = worker_http
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox_id),
+            kinds: Some(vec![JobKind::RunResidentProcess]),
+            wait_ms: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claimed.lease.expect("Maestro lease");
+    worker_http
+        .post(format!("{}/leases/{}/fail", server.base_url, lease.id))
+        .json(&FailLeaseRequest {
+            error: "workspace_capacity_pending: Error from server (Forbidden): exceeded quota: sandbox-capacity, requested: pods=1, used: pods=12, limited: pods=12".into(),
+            retry: true,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let queued_binding = client
+        .get(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}/connection-binding",
+            server.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        queued_binding.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let queued_error: ErrorEnvelope = queued_binding.json().await.unwrap();
+    assert_eq!(queued_error.code, "workspace_capacity_pending");
+
+    let reclaimed: ClaimLeaseResponse = worker_http
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox_id),
+            kinds: Some(vec![JobKind::RunResidentProcess]),
+            wait_ms: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let terminal_lease = reclaimed.lease.expect("reclaimed Maestro lease");
+    worker_http
+        .post(format!(
+            "{}/leases/{}/fail",
+            server.base_url, terminal_lease.id
+        ))
+        .json(&FailLeaseRequest {
+            error: "workspace_capacity_pending: Error from server (Forbidden): exceeded quota: sandbox-capacity, requested: pods=1, used: pods=12, limited: pods=12".into(),
+            retry: false,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let binding = client
+        .get(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}/connection-binding",
+            server.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(binding.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let binding_error: ErrorEnvelope = binding.json().await.unwrap();
+    assert_eq!(binding_error.code, "workspace_capacity_exhausted");
+    assert!(binding_error.message.contains("exceeded quota"));
+    assert_ne!(binding_error.code, "placement_attestation_not_live");
+
+    let resident: ResidentProcessResponse = client
+        .get(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        resident.resident_process.last_error_class,
+        Some(ProvisioningErrorClass::RetryableCapacity)
+    );
+    assert_eq!(
+        resident.resident_process.last_error_code.as_deref(),
+        Some("workspace_capacity_pending")
+    );
+    assert!(
+        resident
+            .resident_process
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("exceeded quota"))
+    );
+    assert_eq!(created.resident_process.generation, 1);
 }
 
 async fn set_provider_isolation_version(

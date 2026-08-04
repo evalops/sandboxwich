@@ -656,6 +656,13 @@ pub(crate) const DB_ENUM_COLUMNS: &[DbEnumColumn] = &[
         "invalid provisioning error class",
     ),
     DbEnumColumn::new(
+        "resident_processes",
+        "last_error_class",
+        "resident_processes_error_class_check",
+        <ProvisioningErrorClass as DbVariant>::VALUES,
+        "invalid resident process error class",
+    ),
+    DbEnumColumn::new(
         "provisioning_operation_resources",
         "stage",
         "provisioning_operation_resources_stage_check",

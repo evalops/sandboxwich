@@ -1230,7 +1230,7 @@ pub(crate) async fn update_provisioning_stage_in_transaction(
     }
 }
 
-fn provisioning_operation_from_row(
+pub(crate) fn provisioning_operation_from_row(
     sandbox_id: SandboxId,
     row: &sqlx::any::AnyRow,
 ) -> Result<ProvisioningOperation, ApiError> {
@@ -2211,7 +2211,8 @@ pub(crate) async fn apply_completed_job_on_connection(
             let sql = format!(
                 "update resident_processes
                  set observed_state = {}, exit_code = {}, exited_at = {}, updated_at = {},
-                     active_lease_id = null
+                     active_lease_id = null, last_error_class = null,
+                     last_error_code = null, last_error = null
                  where id = {} and generation = {}",
                 db.placeholder(1),
                 db.placeholder(2),
@@ -2866,9 +2867,39 @@ pub(crate) async fn apply_retryable_job_on_connection(
             )
             .await?;
         }
+        JobKind::RunResidentProcess => {
+            let process_id = resident_process_id_from_job(job)?;
+            let generation = job
+                .payload
+                .get("generation")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| ApiError::internal("resident process job is missing generation"))?;
+            let (error_class, error_code) = provider_error_fields(error);
+            let sql = format!(
+                "update resident_processes
+                 set last_error_class = {}, last_error_code = {}, last_error = {}, updated_at = {}
+                 where id = {} and generation = {} and desired_state = 'running'",
+                db.placeholder(1),
+                db.placeholder(2),
+                db.placeholder(3),
+                db.placeholder(4),
+                db.placeholder(5),
+                db.placeholder(6)
+            );
+            sqlx::query(&sql)
+                .bind(error_class.as_ref().map(DbVariant::as_db_str))
+                .bind(error_code)
+                .bind(error)
+                .bind(Utc::now().to_rfc3339())
+                .bind(process_id.to_string())
+                .bind(i64::try_from(generation).map_err(|_| {
+                    ApiError::internal("resident process generation exceeds database range")
+                })?)
+                .execute(&mut *connection)
+                .await?;
+        }
         JobKind::ProvisionSandbox
         | JobKind::StopSandbox
-        | JobKind::RunResidentProcess
         | JobKind::MaterializeFile
         | JobKind::ApexTaskInstructions
         | JobKind::DeleteHome => {}
@@ -2981,18 +3012,24 @@ pub(crate) async fn apply_failed_job_on_connection(
                 .get("generation")
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| ApiError::internal("resident process job is missing generation"))?;
+            let (error_class, error_code) = provider_error_fields(error);
             let sql = format!(
                 "update resident_processes
                  set observed_state = 'failed', active_lease_id = null, pid = null,
-                     exit_code = null, last_error = {}, updated_at = {}
+                     exit_code = null, last_error_class = {}, last_error_code = {},
+                     last_error = {}, updated_at = {}
                  where id = {} and generation = {}
                    and observed_state != 'stopped'",
                 db.placeholder(1),
                 db.placeholder(2),
                 db.placeholder(3),
-                db.placeholder(4)
+                db.placeholder(4),
+                db.placeholder(5),
+                db.placeholder(6)
             );
             sqlx::query(&sql)
+                .bind(error_class.as_ref().map(DbVariant::as_db_str))
+                .bind(error_code)
                 .bind(error)
                 .bind(Utc::now().to_rfc3339())
                 .bind(process_id)

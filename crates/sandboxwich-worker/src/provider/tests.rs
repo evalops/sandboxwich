@@ -1086,6 +1086,38 @@ fn isolated_sidecar_run_observes_terminal_state_and_always_cleans_up() {
 }
 
 #[test]
+fn isolated_sidecar_apply_failure_preserves_typed_kubernetes_output() {
+    let (kubectl, _log_path) = write_isolated_sidecar_fake_kubectl(true);
+    let provider = isolated_sidecar_apply_provider(&kubectl);
+    let error = provider
+        .run_isolated_resident_process(
+            &isolated_sidecar_spec(b"apply-failure-canary"),
+            &CancelSignal::never_cancelled(),
+            &mut |_| Ok(()),
+        )
+        .expect_err("fake kubectl apply must fail");
+    let provider_error = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ProviderError>())
+        .expect("isolated apply failures must retain provider classification");
+    assert_eq!(
+        provider_error.error_class(),
+        ProvisioningErrorClass::RetryableProvider
+    );
+    assert_eq!(
+        provider_error.reason_code(),
+        "kubernetes_provider_transient"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("kubectl apply isolated resident-process manifests failed")
+    );
+    assert!(error.to_string().contains("synthetic apply failure"));
+    let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+#[test]
 fn isolated_sidecar_pending_publishes_identity_and_times_out_retryably() {
     let (kubectl, log_path) = write_pending_isolated_sidecar_fake_kubectl();
     let provider = isolated_sidecar_apply_provider(&kubectl)

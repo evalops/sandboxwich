@@ -743,6 +743,10 @@
         ],
         "type": "string"
       },
+      "LeaseId": {
+        "format": "uuid",
+        "type": "string"
+      },
       "MaestroHostedRunnerConnectionBindingResponse": {
         "description": "Non-secret connection and certificate binding for a live, tenant-scoped\nMaestro hosted runner. Callers use the exact URI SAN to authenticate the\nserver certificate issued by Identity; every component is fenced to the\nsame live provider placement and lease.",
         "properties": {
@@ -1099,6 +1103,118 @@
         ],
         "type": "string"
       },
+      "ProvisioningErrorClass": {
+        "enum": [
+          "retryable_provider",
+          "retryable_capacity",
+          "terminal_contract",
+          "terminal_security"
+        ],
+        "type": "string"
+      },
+      "ProvisioningOperation": {
+        "properties": {
+          "attempt_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error_class": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProvisioningErrorClass"
+              }
+            ]
+          },
+          "last_error_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lease_attempt": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "lease_id": {
+            "$ref": "#/components/schemas/LeaseId"
+          },
+          "observed_generation": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "resource_kind": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RuntimeResourceKind"
+              }
+            ]
+          },
+          "resource_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resource_namespace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resource_uid": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sandbox_id": {
+            "$ref": "#/components/schemas/SandboxId"
+          },
+          "stage": {
+            "$ref": "#/components/schemas/ProvisioningStage"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sandbox_id",
+          "lease_id",
+          "lease_attempt",
+          "stage",
+          "attempt_count",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "ProvisioningStage": {
+        "enum": [
+          "workspace_planned",
+          "workspace_ready",
+          "network_policy_ready",
+          "credentials_ready",
+          "pod_ready",
+          "service_ready",
+          "sandbox_ready"
+        ],
+        "type": "string"
+      },
       "PutTenantLimitPolicy": {
         "additionalProperties": false,
         "properties": {
@@ -1425,6 +1541,22 @@
               "null"
             ]
           },
+          "lastErrorClass": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProvisioningErrorClass"
+              }
+            ]
+          },
+          "lastErrorCode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "name": {
             "type": "string"
           },
@@ -1730,6 +1862,17 @@
         ],
         "type": "string"
       },
+      "RuntimeResourceKind": {
+        "enum": [
+          "pod",
+          "persistent_volume_claim",
+          "service",
+          "secret",
+          "volume_snapshot",
+          "network_policy"
+        ],
+        "type": "string"
+      },
       "Sandbox": {
         "properties": {
           "created_at": {
@@ -1931,6 +2074,16 @@
               },
               {
                 "$ref": "#/components/schemas/SandboxPlacementProof"
+              }
+            ]
+          },
+          "provisioning": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProvisioningOperation"
               }
             ]
           },
@@ -3518,6 +3671,16 @@
             },
             "description": "Live tenant-scoped Maestro connection and exact server certificate binding"
           },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Resident provider policy rejected materialization"
+          },
           "404": {
             "content": {
               "application/json": {
@@ -3536,7 +3699,37 @@
                 }
               }
             },
-            "description": "The Maestro placement is not live"
+            "description": "The Maestro placement is pending or not live"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Resident provider contract rejected materialization"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Resident process materialization failed"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Resident process capacity or materialization is pending"
           }
         },
         "tags": [

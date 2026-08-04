@@ -54,6 +54,7 @@ use sandboxwich_core::{
         sandboxwich_core::ForkSnapshotRequest,
         sandboxwich_core::SnapshotResponse,
         sandboxwich_core::SandboxResponse,
+        sandboxwich_core::ProvisioningOperation,
         ErrorEnvelope,
         Operation,
         OperationResponse,
