@@ -37,19 +37,30 @@ python3 scripts/perf-harness.py matrix --profile release --repeats 3
 | Name | Primary | Notes |
 |------|---------|--------|
 | `default` | list p95 | deny_all seed, full suite + TTFT |
-| `allowlist` | list p95 | 100% allowlist seed with 5 rules (JSON-fold path) |
+| `allowlist` | list p95 | 100% allowlist seed with 5 rules; batch hydration |
 | `allowlist_mixed` | list p95 | 50% allowlist |
 | `create` | create p95 | create-weighted |
 | `ttft` | TTFT total p95 | dry-run k8s worker |
 | `full` | budget-normalized % | broad regression surface |
 
+## How to use this for finding wins
+
+1. `matrix` — rank scenarios by primary median. High + stable = best target.
+2. Implement a change on a branch.
+3. `ab --baseline-ref origin/main --candidate-ref HEAD --scenario <name> --pairs 5 --profile release`
+4. Only keep if verdict is `KEEP`.
+
+Example finding (debug matrix): allowlist list p95 ~59 ms vs default ~49 ms.
+That gap is allowlist hydration. Correlated per-row JSON aggregates were not
+faster than a single batched `IN` query under a 100% allowlist seed.
+
 ## Artifacts
 
-JSON runs land in `.perf/runs/` (gitignored if not already).
+JSON runs land in `.perf/runs/` (gitignored).
 
 ## Bench flags used under the hood
 
-`sandboxwich-bench all` now accepts:
+`sandboxwich-bench all` / `seed` accept:
 
 - `--allowlist-fraction 0.0..1.0`
 - `--allowlist-rules-per-sandbox N`
