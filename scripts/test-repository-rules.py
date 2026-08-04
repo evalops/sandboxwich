@@ -56,7 +56,10 @@ class RepositoryRulesTest(unittest.TestCase):
         ).read_text()
         triggers = workflow.split("permissions:", 1)[0]
         self.assertNotIn("pull_request:", triggers)
-        self.assertIn("push:", triggers)
+        self.assertNotIn("push:", triggers)
+        self.assertIn("workflow_run:", triggers)
+        self.assertIn("workflows: [containers]", triggers)
+        self.assertIn("types: [completed]", triggers)
         self.assertIn("branches: [main]", triggers)
         self.assertIn("workflow_dispatch:", triggers)
         self.assertIn("kind:", workflow)
@@ -93,7 +96,10 @@ class RepositoryRulesTest(unittest.TestCase):
             "provenance-summary.json",
         ):
             self.assertIn(marker, workflow)
-        self.assertEqual(workflow.count("provenance: mode=max,version=v1"), 2)
+        self.assertEqual(workflow.count("mode=max,version=v1"), 2)
+        self.assertEqual(
+            workflow.count("sbom: ${{ github.event_name != 'pull_request' }}"), 2
+        )
         for marker in (
             "{{json .Provenance}}",
             "{{json .SBOM}}",
@@ -105,6 +111,13 @@ class RepositoryRulesTest(unittest.TestCase):
             self.assertIn(marker, verifier)
         self.assertNotIn("qemu", workflow.lower())
         self.assertNotIn("binfmt", workflow.lower())
+
+    def test_expensive_pr_jobs_are_scoped_and_benchmark_is_post_merge_only(self) -> None:
+        ci = (ROOT / ".github/workflows/ci.yml").read_text()
+        containers = (ROOT / ".github/workflows/containers.yml").read_text()
+        self.assertIn("name: ci scope", ci)
+        self.assertIn("name: container scope", containers)
+        self.assertIn("if: github.event_name != 'pull_request'", ci)
 
 
 if __name__ == "__main__":
