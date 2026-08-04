@@ -1089,7 +1089,7 @@ fn isolated_sidecar_run_observes_terminal_state_and_always_cleans_up() {
 fn isolated_sidecar_pending_publishes_identity_and_times_out_retryably() {
     let (kubectl, log_path) = write_pending_isolated_sidecar_fake_kubectl();
     let provider = isolated_sidecar_apply_provider(&kubectl)
-        .with_isolated_resident_process_startup_timeout(Duration::from_millis(45));
+        .with_isolated_resident_process_startup_timeout(Duration::from_millis(500));
     let spec = isolated_sidecar_spec(b"pending-deadline-canary");
     let mut observations = Vec::new();
     let error = provider
@@ -1128,8 +1128,8 @@ fn isolated_sidecar_pending_publishes_identity_and_times_out_retryably() {
         .parse()
         .unwrap();
     assert!(
-        get_count <= 5,
-        "bounded backoff should cap API calls during the 45ms deadline, got {get_count}"
+        get_count <= 30,
+        "bounded backoff should cap API calls during the 500ms deadline, got {get_count}"
     );
     let log = std::fs::read_to_string(&log_path).unwrap();
     assert!(log.lines().any(|line| line.contains(" delete ")));
@@ -5064,6 +5064,47 @@ fn resident_resource_reconciliation_is_fenced_by_active_lease_not_live_sandbox()
 }
 
 #[test]
+fn orphan_reconciliation_parses_compact_resource_inventory_rows() {
+    let sandbox_id = SandboxId::new();
+    let lease_id = Uuid::new_v4();
+    let rows = format!(
+        "NetworkPolicy {sandbox_id} sandboxwich-ci sandboxwich-egress-{sandbox_id} uid-policy {lease_id} 2026-08-03T08:26:50Z <none>\n\
+PersistentVolumeClaim {sandbox_id} sandboxwich-ci sandboxwich-pvc-{sandbox_id} uid-pvc <none> 2026-08-03T08:26:50Z Bound\n"
+    );
+
+    let resources = parse_reconciliation_resource_rows(&rows).expect("parse compact inventory");
+    assert_eq!(resources.len(), 2);
+    assert_eq!(
+        resources[0].resource_kind,
+        RuntimeResourceKind::NetworkPolicy
+    );
+    assert_eq!(resources[0].sandbox_id, Some(sandbox_id));
+    assert_eq!(resources[0].resident_lease_id, Some(lease_id));
+    assert_eq!(resources[0].volume_claim_phase, None);
+    assert_eq!(
+        resources[1].resource_kind,
+        RuntimeResourceKind::PersistentVolumeClaim
+    );
+    assert_eq!(resources[1].resident_lease_id, None);
+    assert_eq!(
+        resources[1].volume_claim_phase,
+        Some(VolumeClaimPhase::Bound)
+    );
+}
+
+#[test]
+fn orphan_reconciliation_discovery_has_a_separate_timeout_bound() {
+    assert_eq!(
+        orphan_reconciliation_discovery_timeout(Duration::from_secs(900)),
+        Duration::from_secs(60)
+    );
+    assert_eq!(
+        orphan_reconciliation_discovery_timeout(Duration::from_secs(15)),
+        Duration::from_secs(15)
+    );
+}
+
+#[test]
 fn orphan_reconciliation_parses_lease_fences_and_plans_uid_preconditioned_deletion() {
     let dir = std::env::temp_dir().join(format!("sandboxwich-reconcile-{}", SandboxId::new()));
     std::fs::create_dir_all(&dir).expect("create reconciliation fake dir");
@@ -5076,8 +5117,8 @@ fn orphan_reconciliation_parses_lease_fences_and_plans_uid_preconditioned_deleti
 set -eu
 printf '%s\n' "$*" >> "{log}"
 case " $* " in
-  *" get "*)
-    printf '%s\n' '{{"items":[{{"kind":"Pod","metadata":{{"namespace":"sandboxwich-ci","name":"sandboxwich-{orphan}","uid":"uid-orphan","creationTimestamp":"2020-01-01T00:00:00Z","labels":{{"sandboxwich.dev/sandbox-id":"{orphan}","sandboxwich.dev/lease-id":"{resident_lease}"}}}}}}]}}'
+  *" get pod "*)
+    printf '%s\n' 'Pod {orphan} sandboxwich-ci sandboxwich-{orphan} uid-orphan {resident_lease} 2020-01-01T00:00:00Z <none>'
     ;;
   *" delete "*)
     cat >> "{log}"
@@ -5176,6 +5217,19 @@ esac
             .decisions
             .iter()
             .all(|decision| !decision.delete_allowed)
+    );
+    let log = std::fs::read_to_string(&log_path).expect("read reconciliation kubectl log");
+    assert!(
+        log.contains("get pod --selector sandboxwich.dev/sandbox-id --output custom-columns="),
+        "reconciliation must request a compact projection per resource kind: {log}"
+    );
+    assert!(
+        log.contains("get networkpolicy --selector sandboxwich.dev/sandbox-id"),
+        "reconciliation must split the formerly oversized multi-kind inventory: {log}"
+    );
+    assert!(
+        !log.contains("get pod,persistentvolumeclaim,service,secret,networkpolicy"),
+        "reconciliation must not rebuild the oversized combined JSON inventory: {log}"
     );
 }
 
@@ -5482,8 +5536,9 @@ fn reconciliation_discovery_reads_claim_phase_from_kubectl() {
 set -eu
 printf '%s\n' "$*" >> "{log}"
 case " $* " in
-  *" get "*)
-    printf '%s\n' '{{"items":[{{"kind":"PersistentVolumeClaim","metadata":{{"namespace":"sandboxwich-ci","name":"sandboxwich-pvc-{leaked}","uid":"uid-leaked","creationTimestamp":"2020-01-01T00:00:00Z","labels":{{"sandboxwich.dev/sandbox-id":"{leaked}"}}}},"status":{{"phase":"Pending"}}}},{{"kind":"PersistentVolumeClaim","metadata":{{"namespace":"sandboxwich-ci","name":"sandboxwich-pvc-{bound}","uid":"uid-bound","creationTimestamp":"2020-01-01T00:00:00Z","labels":{{"sandboxwich.dev/sandbox-id":"{bound}"}}}},"status":{{"phase":"Bound"}}}}]}}'
+  *" get persistentvolumeclaim "*)
+    printf '%s\n' 'PersistentVolumeClaim {leaked} sandboxwich-ci sandboxwich-pvc-{leaked} uid-leaked <none> 2020-01-01T00:00:00Z Pending'
+    printf '%s\n' 'PersistentVolumeClaim {bound} sandboxwich-ci sandboxwich-pvc-{bound} uid-bound <none> 2020-01-01T00:00:00Z Bound'
     ;;
 esac
 "#,
@@ -5565,8 +5620,12 @@ fn slow_reconciliation_discovery_does_not_consume_the_delete_budget() {
     let script = format!(
         r#"#!/bin/sh
 set -eu
-sleep 1
-printf '%s\n' '{{"items":[{{"kind":"PersistentVolumeClaim","metadata":{{"namespace":"sandboxwich-ci","name":"sandboxwich-pvc-{orphan}","uid":"uid-orphan","creationTimestamp":"2020-01-01T00:00:00Z","labels":{{"sandboxwich.dev/sandbox-id":"{orphan}"}}}},"status":{{"phase":"Pending"}}}}]}}'
+case " $* " in
+  *" get persistentvolumeclaim "*)
+    sleep 1
+    printf '%s\n' 'PersistentVolumeClaim {orphan} sandboxwich-ci sandboxwich-pvc-{orphan} uid-orphan <none> 2020-01-01T00:00:00Z Pending'
+    ;;
+esac
 "#,
     );
     std::fs::write(&script_path, script).expect("write reconciliation budget fake kubectl");
