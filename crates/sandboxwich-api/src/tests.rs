@@ -2365,6 +2365,27 @@ async fn stop_returns_conflict_on_double_stop() {
     assert_eq!(error.status, StatusCode::CONFLICT);
 }
 
+#[tokio::test]
+async fn stop_cas_conflict_uses_stable_idempotent_code_only_after_teardown_wins() {
+    let db = test_sqlite_db().await;
+
+    for state in [SandboxState::Archiving, SandboxState::Archived] {
+        let sandbox = seed_sandbox_with_state(&db, state).await;
+        let error = sandbox_state_http_conflict(&db, sandbox.id)
+            .await
+            .expect("reading the concurrent stop state");
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "sandbox_stop_already_in_progress");
+    }
+
+    let sandbox = seed_sandbox_with_state(&db, SandboxState::Ready).await;
+    let error = sandbox_state_http_conflict(&db, sandbox.id)
+        .await
+        .expect("reading a non-idempotent stop conflict state");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(error.code, "conflict");
+}
+
 /// Regression test for evalops/sandboxwich#172: a reaper sweep tick racing a
 /// manual stop (or another sweep tick) used to fall through past a
 /// compare-and-swap miss and enqueue a second, redundant `StopSandbox` job
