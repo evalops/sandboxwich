@@ -2,8 +2,8 @@ use crate::db::*;
 use crate::error::*;
 use base64::{Engine as _, engine::general_purpose};
 use serde::Deserialize;
+use sqlx::AnyPool;
 use sqlx::any::AnyRow;
-use sqlx::{AnyPool, Row};
 
 // ---- List pagination helpers ----
 //
@@ -35,6 +35,13 @@ pub(crate) struct PageCursor {
 }
 
 impl PageCursor {
+    pub(crate) fn new(created_at: impl Into<String>, id: impl Into<String>) -> Self {
+        Self {
+            created_at: created_at.into(),
+            id: id.into(),
+        }
+    }
+
     pub(crate) fn encode(&self) -> String {
         general_purpose::URL_SAFE_NO_PAD
             .encode(format!("{}{PAGE_CURSOR_SEP}{}", self.created_at, self.id))
@@ -81,9 +88,9 @@ pub(crate) fn resolve_page_cursor(
 
 /// Run a keyset-paginated pure-read query on the query-only [`Database::read_pool`].
 ///
-/// `base_sql` must already contain a `select ... from ... where <fixed predicate>` clause using
-/// `db.placeholder(1..=fixed_binds.len())` for its own bind values; this helper appends the
-/// cursor predicate, `order by`, and `limit` clauses.
+/// `row_map` must extract the keyset columns once and return both the opaque
+/// [`PageCursor`] and the domain item so list paths do not re-decode `id` /
+/// `created_at` after the cursor was materialised.
 ///
 /// Mutations must not go through this helper. Callers that need the control-plane pool can use
 /// [`fetch_keyset_page_from_pool`] with `&db.pool`.
@@ -93,7 +100,7 @@ pub(crate) async fn fetch_keyset_page<T>(
     fixed_binds: &[String],
     limit: u32,
     cursor: &Option<(PageDirection, PageCursor)>,
-    row_map: impl Fn(AnyRow) -> Result<T, ApiError>,
+    row_map: impl Fn(AnyRow) -> Result<(PageCursor, T), ApiError>,
 ) -> Result<(Vec<T>, Option<String>), ApiError> {
     fetch_keyset_page_from_pool(
         db,
@@ -116,7 +123,7 @@ pub(crate) async fn fetch_keyset_page_from_pool<T>(
     fixed_binds: &[String],
     limit: u32,
     cursor: &Option<(PageDirection, PageCursor)>,
-    row_map: impl Fn(AnyRow) -> Result<T, ApiError>,
+    row_map: impl Fn(AnyRow) -> Result<(PageCursor, T), ApiError>,
 ) -> Result<(Vec<T>, Option<String>), ApiError> {
     // Keep the cursor predicate sargable.  Concatenating the two key columns
     // (`created_at || '|' || id`) forces PostgreSQL to materialize and sort all
@@ -167,10 +174,7 @@ pub(crate) async fn fetch_keyset_page_from_pool<T>(
 
     let mut keyed_items = Vec::with_capacity(rows.len());
     for row in rows {
-        let created_at: String = row.try_get("created_at")?;
-        let id: String = row.try_get("id")?;
-        let item = row_map(row)?;
-        keyed_items.push((created_at, id, item));
+        keyed_items.push(row_map(row)?);
     }
 
     if matches!(cursor, Some((PageDirection::Before, _))) {
@@ -181,20 +185,11 @@ pub(crate) async fn fetch_keyset_page_from_pool<T>(
     // item we return, so a forward cursor is always safe to hand back. For the default/`after`
     // direction, only advertise a next page when the peeked extra row confirmed one exists.
     let is_before = matches!(cursor, Some((PageDirection::Before, _)));
-    let next_cursor = keyed_items.last().and_then(|(created_at, id, _)| {
-        if is_before || has_more {
-            Some(
-                PageCursor {
-                    created_at: created_at.clone(),
-                    id: id.clone(),
-                }
-                .encode(),
-            )
-        } else {
-            None
-        }
-    });
+    let next_cursor = keyed_items
+        .last()
+        .filter(|_| is_before || has_more)
+        .map(|(page_cursor, _)| page_cursor.encode());
 
-    let items = keyed_items.into_iter().map(|(_, _, item)| item).collect();
+    let items = keyed_items.into_iter().map(|(_, item)| item).collect();
     Ok((items, next_cursor))
 }
