@@ -104,7 +104,9 @@ pub(crate) async fn runtime_resource_inventory(
          join provisioning_operations po on po.sandbox_id = por.sandbox_id
          join job_leases jl on jl.id = po.lease_id
          join sandboxes s on s.id = por.sandbox_id
-         where jl.worker_id in ({scope_placeholders}) and por.resource_namespace = {}
+         where jl.worker_id in ({scope_placeholders})
+           and por.resource_namespace = {}
+           and s.state != 'archived'
          ) inventory where 1 = 1",
         state.db.placeholder(scope_worker_ids.len() + 1),
     );
