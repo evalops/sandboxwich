@@ -3,12 +3,9 @@
 # digest with:
 #   docker buildx imagetools inspect rust:1-bookworm
 #   docker buildx imagetools inspect debian:bookworm-slim
-# and update both the tag comment and the digest below together. Pulled via
-# the Docker Hub mirror (mirror.gcr.io) -- which serves identical content by
-# digest -- to avoid docker.io's anonymous-pull rate limit on shared
-# self-hosted runners; the imagetools inspect commands above still target
-# docker.io directly since that's the upstream source of truth for new tags.
-FROM mirror.gcr.io/library/rust:1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS builder
+# and update both the tag comment and the digest below together. Pull directly
+# from Docker Hub, the upstream source of truth for these digest pins.
+FROM docker.io/library/rust:1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS builder
 
 ARG BIN
 WORKDIR /src
@@ -29,7 +26,7 @@ RUN cargo build --release -p "${BIN}" \
 # twice. containers.yml does NOT use this stage -- each service image there
 # is still an independent native per-arch job built from `builder`/`runtime`
 # above, unchanged.
-FROM mirror.gcr.io/library/rust:1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS builder-shared
+FROM docker.io/library/rust:1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS builder-shared
 
 WORKDIR /src
 
@@ -39,7 +36,7 @@ COPY crates ./crates
 RUN cargo build --release -p sandboxwich-api -p sandboxwich-worker
 
 # debian:bookworm-slim, see digest-refresh instructions above.
-FROM mirror.gcr.io/library/debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df AS runtime-base
+FROM docker.io/library/debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df AS runtime-base
 
 ARG KUBECTL_VERSION=v1.34.7
 ARG TARGETARCH

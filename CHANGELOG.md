@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.1.8 - 2026-08-04
+### Fixed
+
+- *(identity)* Separate API tenant from Maestro binding
+- *(identity)* Allow fenced Maestro startup exchange
+- *(worker)* Bound orphan discovery at production scale
+- *(worker)* Publish resident pod identity before startup
+
+### Other
+
+- *(worker)* Bound idle heartbeat logs
+- *(worker)* Stabilize sidecar deadline coverage
+
 ## 0.1.7 - 2026-08-04
 ### Added
 
