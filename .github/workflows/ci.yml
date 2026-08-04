@@ -167,7 +167,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - run: |
-          cargo build --locked \
+          cargo build --locked --release \
             -p sandboxwich-api \
             -p sandboxwich-worker \
             -p sandboxwich-bench
@@ -175,9 +175,10 @@ jobs:
         env:
           SANDBOXWICH_ALLOW_INSECURE_NO_AUTH: "true"
         run: |
-          cargo run -p sandboxwich-bench -- all \
-            --api-bin target/debug/sandboxwich-api \
-            --worker-bin target/debug/sandboxwich-worker \
+          # Release binaries so list decode/serialize cost is production-shaped.
+          cargo run --release -p sandboxwich-bench -- all \
+            --api-bin target/release/sandboxwich-api \
+            --worker-bin target/release/sandboxwich-worker \
             --runs 5 \
             --ttft-runs 10 \
             --requests 300 \
