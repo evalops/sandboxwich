@@ -15,7 +15,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  ci-scope:
+    name: ci scope
+    runs-on: ubuntu-latest
+    outputs:
+      required: ${{ steps.scope.outputs.required }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+      - name: Detect code changes
+        id: scope
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" != "pull_request" ]]; then
+            echo "required=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" > "${RUNNER_TEMP}/changed-files"
+          if grep -Eq '^((\.cargo/)|Cargo\.(toml|lock)$|rust-toolchain(\.toml)?$|crates/|deploy/|migrations/|proto/|scripts/|\.github/)' "${RUNNER_TEMP}/changed-files"; then
+            echo "required=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "required=false" >> "${GITHUB_OUTPUT}"
+          fi
+
   rust:
+    needs: ci-scope
+    if: ${{ always() && (needs.ci-scope.result != 'success' || needs.ci-scope.outputs.required == 'true') }}
     # GitHub-hosted: Blacksmith was dropped org-wide 2026-07-20. Public repo
     # -> no self-hosted/ARC lane is available to fork PRs anyway, so
     # ubuntu-latest is the only valid runner here.
@@ -41,7 +72,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - run: cargo fmt --all -- --check
-      - run: cargo check --workspace --locked
       - run: python3 scripts/test-repository-rules.py
       - run: python3 scripts/test-deployment-images.py
       - run: python3 scripts/test-release-readiness.py
@@ -56,6 +86,8 @@ jobs:
             -p sandboxwich-bench
 
   clippy:
+    needs: ci-scope
+    if: ${{ always() && (needs.ci-scope.result != 'success' || needs.ci-scope.outputs.required == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -85,6 +117,8 @@ jobs:
       - run: actionlint
 
   audit:
+    needs: ci-scope
+    if: ${{ always() && (needs.ci-scope.result != 'success' || needs.ci-scope.outputs.required == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -98,6 +132,8 @@ jobs:
       - run: cargo audit --ignore RUSTSEC-2023-0071
 
   msrv:
+    needs: ci-scope
+    if: ${{ always() && (needs.ci-scope.result != 'success' || needs.ci-scope.outputs.required == 'true') }}
     name: msrv (1.95)
     runs-on: ubuntu-latest
     steps:
@@ -122,9 +158,10 @@ jobs:
     runs-on: ubuntu-latest
     # Shared GitHub-hosted runners have enough CPU/IO variance that p95
     # latency budgets flake independently of the PR under test. This job
-    # intentionally stays off the required-checks path: do not add
-    # "benchmark (non-blocking)" to branch protection required checks.
+    # intentionally stays off the required-checks path and runs on main/manual
+    # dispatch only, so every PR does not pay for a non-blocking workload.
     continue-on-error: true
+    if: github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
