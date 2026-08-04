@@ -154,9 +154,8 @@ pub(crate) fn parse_network_egress_rules_json(
     let Some(raw) = raw.filter(|value| !value.is_empty()) else {
         return Ok(Vec::new());
     };
-    serde_json::from_str(raw).map_err(|_| {
-        ApiError::internal("database contains invalid network egress rules json")
-    })
+    serde_json::from_str(raw)
+        .map_err(|_| ApiError::internal("database contains invalid network egress rules json"))
 }
 
 pub(crate) fn row_to_resident_process(row: AnyRow) -> Result<ResidentProcess, ApiError> {

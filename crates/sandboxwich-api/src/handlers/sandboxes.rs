@@ -1641,9 +1641,9 @@ pub(crate) fn network_egress_rules_json(
     network_egress: &NetworkEgress,
 ) -> Result<Option<String>, ApiError> {
     match network_egress {
-        NetworkEgress::Allowlist { rules } => serde_json::to_string(rules).map(Some).map_err(|_| {
-            ApiError::internal("failed to serialize network egress allowlist rules")
-        }),
+        NetworkEgress::Allowlist { rules } => serde_json::to_string(rules)
+            .map(Some)
+            .map_err(|_| ApiError::internal("failed to serialize network egress allowlist rules")),
         NetworkEgress::DenyAll | NetworkEgress::AllowAll => Ok(None),
     }
 }
@@ -1682,9 +1682,8 @@ pub(crate) async fn replace_sandbox_network_rules_on_connection(
     // Keep the denormalized list column in lockstep with the normalized table.
     // Empty allowlist stores "[]" (not null) so list never confuses "no rules"
     // with "column not backfilled".
-    let rules_json = serde_json::to_string(rules).map_err(|_| {
-        ApiError::internal("failed to serialize network egress allowlist rules")
-    })?;
+    let rules_json = serde_json::to_string(rules)
+        .map_err(|_| ApiError::internal("failed to serialize network egress allowlist rules"))?;
     let update_sql = format!(
         "update sandboxes set network_egress_rules_json = {} where id = {}",
         db.placeholder(1),
