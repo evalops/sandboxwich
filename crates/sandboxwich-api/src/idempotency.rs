@@ -487,10 +487,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .expect("connect in-memory sqlite");
-        let db = Database {
-            pool,
-            dialect: SqlDialect::Sqlite,
-        };
+        let db = Database::from_test_pool(pool, SqlDialect::Sqlite);
         sqlx::migrate!("./migrations")
             .run(&db.pool)
             .await
