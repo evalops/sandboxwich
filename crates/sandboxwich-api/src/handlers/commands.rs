@@ -23,6 +23,13 @@ pub(crate) const MAX_COMMAND_OUTPUT_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const MATERIALIZED_OUTPUT_CHUNKS: i64 = 64;
 pub(crate) const MATERIALIZED_CHUNK_CHARS: usize = 64 * 1024;
 
+struct CommandOutputCounters {
+    chunk_count: i64,
+    byte_count: i64,
+    stdout_sequence: i64,
+    stderr_sequence: i64,
+}
+
 pub(crate) fn validate_command_output_bounds(
     existing_chunks: i64,
     existing_bytes: i64,
@@ -460,26 +467,33 @@ pub(crate) async fn append_command_output_chunk_on_connection(
     annotations: Vec<CommandOutputAnnotation>,
 ) -> Result<CommandOutputChunk, ApiError> {
     lock_command_output_for_append_on_connection(db, connection, command_id).await?;
-    let byte_length = match db.dialect {
-        SqlDialect::Postgres => "octet_length(chunk)",
-        SqlDialect::Sqlite => "length(cast(chunk as blob))",
-    };
-    let bounds_sql = format!(
-        "select count(*) as chunk_count, coalesce(sum({byte_length}), 0) as byte_count
-         from command_output_chunks where command_id = {}",
+    let counters_sql = format!(
+        "select output_chunk_count, output_byte_count,
+                stdout_output_sequence, stderr_output_sequence
+         from commands where id = {}",
         db.placeholder(1)
     );
-    let bounds = sqlx::query(&bounds_sql)
+    let counters = sqlx::query(&counters_sql)
         .bind(command_id.to_string())
         .fetch_one(&mut *connection)
         .await?;
-    validate_command_output_bounds(
-        bounds.try_get("chunk_count")?,
-        bounds.try_get("byte_count")?,
-        chunk.len(),
-    )?;
-    let sequence =
-        next_command_output_sequence_on_connection(db, connection, command_id, &stream).await?;
+    let counters = CommandOutputCounters {
+        chunk_count: counters.try_get("output_chunk_count")?,
+        byte_count: counters.try_get("output_byte_count")?,
+        stdout_sequence: counters.try_get("stdout_output_sequence")?,
+        stderr_sequence: counters.try_get("stderr_output_sequence")?,
+    };
+    validate_command_output_bounds(counters.chunk_count, counters.byte_count, chunk.len())?;
+    let last_sequence = match &stream {
+        CommandOutputStream::Stdout => counters.stdout_sequence,
+        CommandOutputStream::Stderr => counters.stderr_sequence,
+    };
+    let sequence = u64::try_from(
+        last_sequence
+            .checked_add(1)
+            .ok_or_else(|| ApiError::internal("command output sequence overflow"))?,
+    )
+    .map_err(|_| ApiError::internal("database contains invalid command output sequence"))?;
     let now = Utc::now();
     let output_chunk = CommandOutputChunk {
         id: CommandOutputChunkId::new(),
@@ -503,6 +517,28 @@ pub(crate) async fn append_command_output_chunk_on_connection(
         .bind(&output_chunk.chunk)
         .bind(serde_json::to_string(&output_chunk.annotations)?)
         .bind(output_chunk.created_at.to_rfc3339())
+        .execute(&mut *connection)
+        .await?;
+
+    let sequence_column = match &output_chunk.stream {
+        CommandOutputStream::Stdout => "stdout_output_sequence",
+        CommandOutputStream::Stderr => "stderr_output_sequence",
+    };
+    let counter_sql = format!(
+        "update commands
+         set output_chunk_count = output_chunk_count + 1,
+             output_byte_count = output_byte_count + {},
+             {sequence_column} = {sequence_column} + 1
+         where id = {}",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    sqlx::query(&counter_sql)
+        .bind(
+            i64::try_from(output_chunk.chunk.len())
+                .map_err(|_| ApiError::internal("command output chunk byte count overflow"))?,
+        )
+        .bind(command_id.to_string())
         .execute(&mut *connection)
         .await?;
 
@@ -543,37 +579,12 @@ pub(crate) async fn lock_command_output_for_append_on_connection(
     Ok(())
 }
 
-pub(crate) async fn next_command_output_sequence_on_connection(
-    db: &Database,
-    connection: &mut AnyConnection,
-    command_id: CommandId,
-    stream: &CommandOutputStream,
-) -> Result<u64, ApiError> {
-    let sql = format!(
-        "select coalesce(max(sequence), 0) as max_sequence
-         from command_output_chunks
-         where command_id = {} and stream = {}",
-        db.placeholder(1),
-        db.placeholder(2)
-    );
-    let row = sqlx::query(&sql)
-        .bind(command_id.to_string())
-        .bind(command_output_stream_to_str(stream))
-        .fetch_one(&mut *connection)
-        .await?;
-    let max_sequence: i64 = row.try_get("max_sequence")?;
-    let next = max_sequence
-        .checked_add(1)
-        .ok_or_else(|| ApiError::internal("command output sequence overflow"))?;
-    u64::try_from(next)
-        .map_err(|_| ApiError::internal("database contains invalid command output sequence"))
-}
-
 pub(crate) async fn reset_command_for_retry_on_connection(
     db: &Database,
     connection: &mut AnyConnection,
     command_id: CommandId,
 ) -> Result<(), ApiError> {
+    lock_command_output_for_append_on_connection(db, connection, command_id).await?;
     let delete_sql = format!(
         "delete from command_output_chunks
          where command_id = {}",
@@ -586,7 +597,9 @@ pub(crate) async fn reset_command_for_retry_on_connection(
 
     let update_sql = format!(
         "update commands
-         set status = {}, stdout = '', stderr = '', exit_code = {}, finished_at = {}
+         set status = {}, stdout = '', stderr = '', exit_code = {}, finished_at = {},
+             output_chunk_count = 0, output_byte_count = 0,
+             stdout_output_sequence = 0, stderr_output_sequence = 0
          where id = {}",
         db.placeholder(1),
         db.placeholder(2),

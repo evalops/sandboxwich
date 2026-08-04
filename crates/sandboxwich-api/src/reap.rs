@@ -202,10 +202,13 @@ pub(crate) async fn attempt_reap_candidate(
     last_command_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> Result<CandidateOutcome, ApiError> {
-    hydrate_sandbox_network_egress(db, &mut sandbox).await?;
     let Some((trigger, deadline)) = expired_deadline(&sandbox, last_command_at, now) else {
         return Ok(CandidateOutcome::NotDue);
     };
+    // Deadline evaluation only uses columns from the candidate query. Avoid
+    // loading allowlist rules for the common non-due case; the provider-facing
+    // stop path still receives the fully hydrated sandbox when a reap is due.
+    hydrate_sandbox_network_egress(db, &mut sandbox).await?;
     let stop = stop_sandbox_via_job(
         db,
         resident_bootstraps,

@@ -257,15 +257,35 @@ fn append_histogram(
     }
     body.push_str(&format!("# HELP {name} {help}\n# TYPE {name} histogram\n"));
     for (labels, values) in groups {
-        for bucket in LATENCY_BUCKETS {
-            let count = values.iter().filter(|value| **value <= *bucket).count();
+        let mut bucket_counts = [0_u64; LATENCY_BUCKETS.len()];
+        let mut sum = 0.0;
+        for value in values.iter().copied() {
+            // LATENCY_BUCKETS is sorted ascending. Classifying each sample
+            // once and then accumulating the bucket counts avoids scanning
+            // the entire group once per bucket (the old path did eight full
+            // passes for every label group).
+            let bucket = if value.is_nan() {
+                // Preserve the old behavior for invalid observations: NaN is
+                // included in the +Inf count but never in a finite bucket.
+                LATENCY_BUCKETS.len()
+            } else {
+                LATENCY_BUCKETS.partition_point(|limit| *limit < value)
+            };
+            if let Some(count) = bucket_counts.get_mut(bucket) {
+                *count += 1;
+            }
+            sum += value;
+        }
+        let mut cumulative = 0_u64;
+        for (index, bucket) in LATENCY_BUCKETS.iter().enumerate() {
+            cumulative += bucket_counts[index];
             append_sample(
                 body,
                 &format!("{name}_bucket"),
                 label_names,
                 &labels,
                 Some(&bucket.to_string()),
-                count as f64,
+                cumulative as f64,
             );
         }
         append_sample(
@@ -282,7 +302,7 @@ fn append_histogram(
             label_names,
             &labels,
             None,
-            values.iter().sum(),
+            sum,
         );
         append_sample(
             body,
@@ -327,4 +347,48 @@ fn append_sample(
     body.push_str("} ");
     body.push_str(&value.to_string());
     body.push('\n');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn histogram_classifies_each_observation_once_and_keeps_cumulative_buckets() {
+        let observations = vec![
+            Observation {
+                labels: vec!["success".to_string()],
+                seconds: 1.0,
+            },
+            Observation {
+                labels: vec!["success".to_string()],
+                seconds: 5.0,
+            },
+            Observation {
+                labels: vec!["success".to_string()],
+                seconds: 15.0,
+            },
+            Observation {
+                labels: vec!["success".to_string()],
+                seconds: 16.0,
+            },
+        ];
+        let mut body = String::new();
+
+        append_histogram(
+            &mut body,
+            "sandboxwich_test_seconds",
+            "Test latency.",
+            &["outcome"],
+            &observations,
+        );
+
+        assert!(body.contains("le=\"1\"} 1\n"));
+        assert!(body.contains("le=\"5\"} 2\n"));
+        assert!(body.contains("le=\"15\"} 3\n"));
+        assert!(body.contains("le=\"30\"} 4\n"));
+        assert!(body.contains("le=\"+Inf\"} 4\n"));
+        assert!(body.contains("sandboxwich_test_seconds_sum{outcome=\"success\"} 37\n"));
+        assert!(body.contains("sandboxwich_test_seconds_count{outcome=\"success\"} 4\n"));
+    }
 }

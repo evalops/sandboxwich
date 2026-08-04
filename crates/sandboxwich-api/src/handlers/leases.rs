@@ -1938,7 +1938,31 @@ pub(crate) async fn replace_command_output_stream_on_connection(
     command_id: CommandId,
     stream: &CommandOutputStream,
 ) -> Result<(), ApiError> {
+    lock_command_output_for_append_on_connection(db, connection, command_id).await?;
     let column = stream.as_db_str();
+    let sequence_column = match stream {
+        CommandOutputStream::Stdout => "stdout_output_sequence",
+        CommandOutputStream::Stderr => "stderr_output_sequence",
+    };
+    let byte_length = match db.dialect {
+        SqlDialect::Postgres => "octet_length(chunk)",
+        SqlDialect::Sqlite => "length(cast(chunk as blob))",
+    };
+    let removed_sql = format!(
+        "select count(*) as chunk_count,
+                coalesce(sum({byte_length}), 0) as byte_count
+         from command_output_chunks
+         where command_id = {} and stream = {}",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    let removed = sqlx::query(&removed_sql)
+        .bind(command_id.to_string())
+        .bind(command_output_stream_to_str(stream))
+        .fetch_one(&mut *connection)
+        .await?;
+    let removed_chunks: i64 = removed.try_get("chunk_count")?;
+    let removed_bytes: i64 = removed.try_get("byte_count")?;
     let delete_sql = format!(
         "delete from command_output_chunks
          where command_id = {} and stream = {}",
@@ -1953,11 +1977,18 @@ pub(crate) async fn replace_command_output_stream_on_connection(
 
     let update_sql = format!(
         "update commands
-         set {column} = ''
+         set {column} = '',
+             output_chunk_count = output_chunk_count - {},
+             output_byte_count = output_byte_count - {},
+             {sequence_column} = 0
          where id = {}",
-        db.placeholder(1)
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3)
     );
     let result = sqlx::query(&update_sql)
+        .bind(removed_chunks)
+        .bind(removed_bytes)
         .bind(command_id.to_string())
         .execute(&mut *connection)
         .await?;
