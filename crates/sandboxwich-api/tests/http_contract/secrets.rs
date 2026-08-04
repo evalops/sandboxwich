@@ -528,6 +528,7 @@ async fn claim_provision(
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_id),
             kinds: Some(vec![JobKind::ProvisionSandbox]),
+            wait_ms: None,
         })
         .send()
         .await

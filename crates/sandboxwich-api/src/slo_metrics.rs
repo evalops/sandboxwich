@@ -2,7 +2,7 @@ use crate::db::Database;
 use crate::error::ApiError;
 use crate::health::escape_prometheus_label;
 use crate::rows::parse_timestamp;
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
 use sqlx::Row;
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -13,10 +13,15 @@ const LATENCY_BUCKETS: &[f64] = &[1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 900.
 const LATENCY_BUCKETS_MS: &[i64] = &[
     1_000, 5_000, 15_000, 30_000, 60_000, 120_000, 300_000, 900_000,
 ];
-/// `/metrics` only materializes raw observations from this recent window.
-/// Older rows remain durable for later rollup work (#262); scrapes must stay
-/// O(recent) rather than O(lifetime history).
-const METRICS_RAW_RETENTION: ChronoDuration = ChronoDuration::days(14);
+/// Raw terminal observations kept for scrape + late rollup. Older raw rows are
+/// folded into [`slo_histogram_rollups`] by the expiry sweeper (#262).
+const METRICS_RAW_RETENTION: ChronoDuration = ChronoDuration::hours(2);
+/// Rollup + raw history retained for scrape windows (rollups cover the bulk).
+const METRICS_HISTORY_RETENTION: ChronoDuration = ChronoDuration::days(14);
+/// Observations older than this are eligible to fold into hourly rollups.
+const METRICS_ROLLUP_AGE: ChronoDuration = ChronoDuration::hours(1);
+/// Max raw terminal rows processed per rollup sweep tick.
+const METRICS_ROLLUP_BATCH: i64 = 5_000;
 /// Hard safety cap on rows examined per observation family for families that
 /// still load individual samples (claim join, provisioning stages). Terminal
 /// families aggregate in SQL and never pull one row per event.
@@ -56,18 +61,37 @@ pub(crate) async fn append_slo_metrics(
     tenant_id: Option<&str>,
 ) -> Result<(), ApiError> {
     let scrape_started = Instant::now();
-    let since = Utc::now() - METRICS_RAW_RETENTION;
-    let since = since.to_rfc3339();
+    let now = Utc::now();
+    let raw_since = (now - METRICS_RAW_RETENTION).to_rfc3339();
+    let history_since = (now - METRICS_HISTORY_RETENTION).to_rfc3339();
+    // Claim/stage families still load samples; keep them on the short raw window.
+    let sample_since = raw_since.clone();
 
+    // Terminal families: recent raw aggregates + hourly rollups for history.
     // Independent family scrapes: run concurrently so /metrics latency is
     // dominated by the slowest query, not the sum of five sequential ones.
-    let (creation, command, cleanup, claim, stage) = tokio::try_join!(
-        fetch_creation_histogram(db, tenant_id, &since),
-        fetch_simple_terminal_histogram(db, tenant_id, "command", &since),
-        fetch_simple_terminal_histogram(db, tenant_id, "cleanup", &since),
-        fetch_claim_observations(db, tenant_id, &since),
-        fetch_stage_observations(db, tenant_id, &since),
+    let (
+        creation_raw,
+        command_raw,
+        cleanup_raw,
+        creation_roll,
+        command_roll,
+        cleanup_roll,
+        claim,
+        stage,
+    ) = tokio::try_join!(
+        fetch_creation_histogram(db, tenant_id, &raw_since),
+        fetch_simple_terminal_histogram(db, tenant_id, "command", &raw_since),
+        fetch_simple_terminal_histogram(db, tenant_id, "cleanup", &raw_since),
+        fetch_creation_rollups(db, tenant_id, &history_since, &raw_since),
+        fetch_simple_terminal_rollups(db, tenant_id, "command", &history_since, &raw_since),
+        fetch_simple_terminal_rollups(db, tenant_id, "cleanup", &history_since, &raw_since),
+        fetch_claim_observations(db, tenant_id, &sample_since),
+        fetch_stage_observations(db, tenant_id, &sample_since),
     )?;
+    let creation = merge_histogram_batches(creation_raw, creation_roll);
+    let command = merge_histogram_batches(command_raw, command_roll);
+    let cleanup = merge_histogram_batches(cleanup_raw, cleanup_roll);
 
     append_histogram_series(
         body,
@@ -443,6 +467,288 @@ async fn fetch_stage_observations(
     })
 }
 
+fn merge_histogram_batches(mut left: HistogramBatch, right: HistogramBatch) -> HistogramBatch {
+    let mut by_labels: BTreeMap<Vec<String>, HistogramSeries> = BTreeMap::new();
+    for series in left.series.drain(..).chain(right.series) {
+        by_labels
+            .entry(series.labels.clone())
+            .and_modify(|existing| {
+                existing.count = existing.count.saturating_add(series.count);
+                existing.sum_seconds += series.sum_seconds;
+                for (index, value) in series.cumulative_buckets.iter().enumerate() {
+                    if let Some(slot) = existing.cumulative_buckets.get_mut(index) {
+                        *slot = slot.saturating_add(*value);
+                    }
+                }
+            })
+            .or_insert(series);
+    }
+    HistogramBatch {
+        series: by_labels.into_values().collect(),
+        rows_examined: left.rows_examined.saturating_add(right.rows_examined),
+        truncated: left.truncated || right.truncated,
+    }
+}
+
+async fn fetch_creation_rollups(
+    db: &Database,
+    tenant_id: Option<&str>,
+    history_since: &str,
+    raw_since: &str,
+) -> Result<HistogramBatch, ApiError> {
+    fetch_rollup_histogram(
+        db,
+        tenant_id,
+        "sandbox_creation",
+        history_since,
+        raw_since,
+        &["label_a", "label_b", "label_c"],
+    )
+    .await
+}
+
+async fn fetch_simple_terminal_rollups(
+    db: &Database,
+    tenant_id: Option<&str>,
+    family: &str,
+    history_since: &str,
+    raw_since: &str,
+) -> Result<HistogramBatch, ApiError> {
+    let metric_kind = match family {
+        "command" => "command",
+        "cleanup" => "cleanup",
+        _ => unreachable!("bounded metric family"),
+    };
+    fetch_rollup_histogram(
+        db,
+        tenant_id,
+        metric_kind,
+        history_since,
+        raw_since,
+        &["label_a"],
+    )
+    .await
+}
+
+async fn fetch_rollup_histogram(
+    db: &Database,
+    tenant_id: Option<&str>,
+    metric_kind: &str,
+    history_since: &str,
+    raw_since: &str,
+    label_columns: &[&str],
+) -> Result<HistogramBatch, ApiError> {
+    let p1 = db.placeholder(1);
+    let p2 = db.placeholder(2);
+    let p3 = db.placeholder(3);
+    let p4 = db.placeholder(4);
+    let (sql, binds) = if let Some(tenant_id) = tenant_id {
+        (
+            format!(
+                "select label_a, label_b, label_c,
+                        coalesce(sum(sample_count), 0) as n,
+                        coalesce(sum(sum_ms), 0) as sum_ms,
+                        coalesce(sum(b0), 0) as b0,
+                        coalesce(sum(b1), 0) as b1,
+                        coalesce(sum(b2), 0) as b2,
+                        coalesce(sum(b3), 0) as b3,
+                        coalesce(sum(b4), 0) as b4,
+                        coalesce(sum(b5), 0) as b5,
+                        coalesce(sum(b6), 0) as b6,
+                        coalesce(sum(b7), 0) as b7
+                 from slo_histogram_rollups
+                 where metric_kind = {p1}
+                   and bucket_start >= {p2}
+                   and bucket_start < {p3}
+                   and tenant_id = {p4}
+                 group by label_a, label_b, label_c"
+            ),
+            vec![metric_kind, history_since, raw_since, tenant_id],
+        )
+    } else {
+        (
+            format!(
+                "select label_a, label_b, label_c,
+                        coalesce(sum(sample_count), 0) as n,
+                        coalesce(sum(sum_ms), 0) as sum_ms,
+                        coalesce(sum(b0), 0) as b0,
+                        coalesce(sum(b1), 0) as b1,
+                        coalesce(sum(b2), 0) as b2,
+                        coalesce(sum(b3), 0) as b3,
+                        coalesce(sum(b4), 0) as b4,
+                        coalesce(sum(b5), 0) as b5,
+                        coalesce(sum(b6), 0) as b6,
+                        coalesce(sum(b7), 0) as b7
+                 from slo_histogram_rollups
+                 where metric_kind = {p1}
+                   and bucket_start >= {p2}
+                   and bucket_start < {p3}
+                 group by label_a, label_b, label_c"
+            ),
+            vec![metric_kind, history_since, raw_since],
+        )
+    };
+    let rows = fetch_rows(db, &sql, &binds).await?;
+    map_histogram_rows(rows, label_columns, label_columns)
+}
+
+/// Fold aged raw terminal observations into hourly histogram rollups and drop
+/// the raw rows. Called from the expiry sweeper so scrapes stay O(recent+rollups).
+pub(crate) async fn rollup_terminal_slo_observations(db: &Database) -> Result<u64, ApiError> {
+    let cutoff = (Utc::now() - METRICS_ROLLUP_AGE).to_rfc3339();
+    let sql = format!(
+        "select source_id, tenant_id, metric_kind, outcome, workspace_mode, start_type,
+                duration_ms, observed_at
+         from terminal_slo_observations
+         where observed_at < {}
+         order by observed_at asc
+         limit {}",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(&cutoff)
+        .bind(METRICS_ROLLUP_BATCH)
+        .fetch_all(&db.pool)
+        .await?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    #[derive(Default)]
+    struct Agg {
+        count: i64,
+        sum_ms: i64,
+        buckets: [i64; 8],
+    }
+    let mut groups: BTreeMap<(String, String, String, String, String, String), Agg> =
+        BTreeMap::new();
+    let mut delete_keys: Vec<(String, String)> = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let source_id: String = row.try_get("source_id")?;
+        let tenant_id: String = row.try_get("tenant_id")?;
+        let metric_kind: String = row.try_get("metric_kind")?;
+        let outcome: String = row.try_get("outcome")?;
+        let workspace_mode: Option<String> = row.try_get("workspace_mode")?;
+        let start_type: Option<String> = row.try_get("start_type")?;
+        let duration_ms: i64 = row.try_get("duration_ms")?;
+        let observed_at: String = row.try_get("observed_at")?;
+        let observed = parse_timestamp(&observed_at)?;
+        let bucket_start = hour_floor(observed).to_rfc3339();
+        let (label_a, label_b, label_c) = match metric_kind.as_str() {
+            "sandbox_creation" => (
+                workspace_mode.unwrap_or_default(),
+                start_type.unwrap_or_default(),
+                outcome,
+            ),
+            "command" | "cleanup" => (outcome, String::new(), String::new()),
+            _ => continue,
+        };
+        let key = (
+            bucket_start,
+            tenant_id,
+            metric_kind.clone(),
+            label_a,
+            label_b,
+            label_c,
+        );
+        let entry = groups.entry(key).or_default();
+        entry.count += 1;
+        entry.sum_ms += duration_ms.max(0);
+        let seconds = duration_ms.max(0) as f64 / 1000.0;
+        for (index, le) in LATENCY_BUCKETS.iter().enumerate() {
+            if seconds <= *le {
+                entry.buckets[index] += 1;
+            }
+        }
+        // Cumulative: b_i = count of samples with seconds <= LATENCY_BUCKETS[i]
+        // Above loop already counts per-bucket non-cumulative - need cumulative
+        // for storage. Fix: store non-cumulative then convert, or accumulate.
+        delete_keys.push((source_id, metric_kind));
+    }
+
+    // Convert non-cumulative per-le counts: we counted "<= le" already so buckets
+    // are already cumulative. Good.
+
+    let mut rolled = 0_u64;
+    for ((bucket_start, tenant_id, metric_kind, label_a, label_b, label_c), agg) in groups {
+        let upsert = format!(
+            "insert into slo_histogram_rollups
+             (bucket_start, tenant_id, metric_kind, label_a, label_b, label_c,
+              sample_count, sum_ms, b0, b1, b2, b3, b4, b5, b6, b7)
+             values ({})
+             on conflict (bucket_start, tenant_id, metric_kind, label_a, label_b, label_c)
+             do update set
+               sample_count = slo_histogram_rollups.sample_count + excluded.sample_count,
+               sum_ms = slo_histogram_rollups.sum_ms + excluded.sum_ms,
+               b0 = slo_histogram_rollups.b0 + excluded.b0,
+               b1 = slo_histogram_rollups.b1 + excluded.b1,
+               b2 = slo_histogram_rollups.b2 + excluded.b2,
+               b3 = slo_histogram_rollups.b3 + excluded.b3,
+               b4 = slo_histogram_rollups.b4 + excluded.b4,
+               b5 = slo_histogram_rollups.b5 + excluded.b5,
+               b6 = slo_histogram_rollups.b6 + excluded.b6,
+               b7 = slo_histogram_rollups.b7 + excluded.b7",
+            db.placeholders(16)
+        );
+        sqlx::query(&upsert)
+            .bind(&bucket_start)
+            .bind(&tenant_id)
+            .bind(&metric_kind)
+            .bind(&label_a)
+            .bind(&label_b)
+            .bind(&label_c)
+            .bind(agg.count)
+            .bind(agg.sum_ms)
+            .bind(agg.buckets[0])
+            .bind(agg.buckets[1])
+            .bind(agg.buckets[2])
+            .bind(agg.buckets[3])
+            .bind(agg.buckets[4])
+            .bind(agg.buckets[5])
+            .bind(agg.buckets[6])
+            .bind(agg.buckets[7])
+            .execute(&db.pool)
+            .await?;
+        rolled = rolled.saturating_add(u64::try_from(agg.count.max(0)).unwrap_or(0));
+    }
+
+    for (source_id, metric_kind) in delete_keys {
+        let delete = format!(
+            "delete from terminal_slo_observations
+             where source_id = {} and metric_kind = {}",
+            db.placeholder(1),
+            db.placeholder(2)
+        );
+        sqlx::query(&delete)
+            .bind(source_id)
+            .bind(metric_kind)
+            .execute(&db.pool)
+            .await?;
+    }
+
+    // Drop rollups past the history window so the table stays bounded.
+    let history_cutoff = (Utc::now() - METRICS_HISTORY_RETENTION).to_rfc3339();
+    let purge = format!(
+        "delete from slo_histogram_rollups where bucket_start < {}",
+        db.placeholder(1)
+    );
+    sqlx::query(&purge)
+        .bind(history_cutoff)
+        .execute(&db.pool)
+        .await?;
+
+    Ok(rolled)
+}
+
+fn hour_floor(ts: DateTime<Utc>) -> DateTime<Utc> {
+    ts.with_minute(0)
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))
+        .unwrap_or(ts)
+}
+
 async fn fetch_rows(
     db: &Database,
     sql: &str,
@@ -724,5 +1030,44 @@ mod tests {
         for (seconds, ms) in LATENCY_BUCKETS.iter().zip(LATENCY_BUCKETS_MS.iter()) {
             assert_eq!((*seconds * 1000.0) as i64, *ms);
         }
+    }
+
+    #[test]
+    fn hour_floor_zeros_minute_second() {
+        let ts = DateTime::parse_from_rfc3339("2026-08-04T15:37:42.123Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let floor = hour_floor(ts);
+        assert_eq!(floor.to_rfc3339(), "2026-08-04T15:00:00+00:00");
+    }
+
+    #[test]
+    fn merge_histogram_batches_adds_matching_labels() {
+        let left = HistogramBatch {
+            series: vec![HistogramSeries {
+                labels: vec!["ok".into()],
+                count: 2,
+                sum_seconds: 3.0,
+                cumulative_buckets: vec![1, 2, 2, 2, 2, 2, 2, 2],
+            }],
+            rows_examined: 2,
+            truncated: false,
+        };
+        let right = HistogramBatch {
+            series: vec![HistogramSeries {
+                labels: vec!["ok".into()],
+                count: 3,
+                sum_seconds: 4.0,
+                cumulative_buckets: vec![0, 1, 3, 3, 3, 3, 3, 3],
+            }],
+            rows_examined: 3,
+            truncated: false,
+        };
+        let merged = merge_histogram_batches(left, right);
+        assert_eq!(merged.rows_examined, 5);
+        assert_eq!(merged.series.len(), 1);
+        assert_eq!(merged.series[0].count, 5);
+        assert!((merged.series[0].sum_seconds - 7.0).abs() < f64::EPSILON);
+        assert_eq!(merged.series[0].cumulative_buckets[1], 3);
     }
 }

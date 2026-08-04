@@ -259,6 +259,11 @@ struct ClaimArgs {
 
     #[arg(skip)]
     kinds: Option<Vec<JobKind>>,
+
+    /// Forwarded as claim `wait_ms` so the API long-polls instead of the
+    /// client spinning. Usually a fraction of the work-loop idle sleep.
+    #[arg(skip)]
+    wait_ms: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -1302,6 +1307,7 @@ async fn main() -> anyhow::Result<()> {
                     lease_seconds: args.lease_seconds,
                     operation_id: Some(Uuid::now_v7()),
                     kinds: claim_kinds,
+                    wait_ms: None,
                 },
             )
             .await?;
@@ -1647,6 +1653,9 @@ async fn claim(
             // destination and must not consume its staged source.
             sandbox_id: None,
             kinds: args.kinds,
+            // Server-side wait absorbs empty-queue lag so the work loop does not
+            // need a full client-side sleep after every empty claim.
+            wait_ms: args.wait_ms,
         })
         .send()
         .await?;
@@ -2289,6 +2298,9 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
                 provider_mode,
                 resident_tasks.len() < max_resident_processes,
             ),
+            // Cap at the API wait ceiling; short client idle sleep after empty
+            // claim still applies for fairness when the wait expires empty.
+            wait_ms: Some(args.idle_sleep_ms.clamp(1, 5_000)),
         };
         let response = match with_retries("claim lease", API_RETRY_ATTEMPTS, || {
             claim(client, api, claim_args.clone())

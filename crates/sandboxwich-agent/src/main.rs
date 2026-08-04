@@ -1403,6 +1403,7 @@ async fn claim_lease(
             lease_seconds,
             sandbox_id: Some(sandbox_id),
             kinds: Some(guest_claim_kinds(include_resident_processes)),
+            wait_ms: None,
         })
         .send()
         .await?;

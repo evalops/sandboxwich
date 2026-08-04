@@ -376,11 +376,53 @@ pub(crate) async fn claim_lease(
         }
     }
 
-    Ok(Json(ClaimLeaseResponse {
-        ok: true,
-        lease: None,
-    }))
+    // Long-poll: when the queue is empty, wait and retry instead of forcing
+    // the client into a tight poll loop (TTFT queue→claim lag). Cap the wait
+    // so a saturated control plane cannot pin request tasks indefinitely.
+    let wait_ms = request.wait_ms.unwrap_or(0).min(MAX_CLAIM_WAIT_MS);
+    if wait_ms == 0 {
+        return Ok(Json(ClaimLeaseResponse {
+            ok: true,
+            lease: None,
+        }));
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(Json(ClaimLeaseResponse {
+                ok: true,
+                lease: None,
+            }));
+        }
+        let slice = remaining.min(std::time::Duration::from_millis(CLAIM_WAIT_SLICE_MS));
+        tokio::time::sleep(slice).await;
+        // Re-check saturation cheaply before walking candidates again.
+        let active =
+            crate::handlers::workers::active_lease_count_for_worker(&state.db, worker.id).await?;
+        if active >= worker.max_concurrent_jobs {
+            continue;
+        }
+        let mut retry_request = request.clone();
+        retry_request.wait_ms = None;
+        let Json(response) = Box::pin(claim_lease(
+            State(state.clone()),
+            Extension(ctx.clone()),
+            Path(worker_id.0),
+            headers.clone(),
+            Json(retry_request),
+        ))
+        .await?;
+        if response.lease.is_some() {
+            return Ok(Json(response));
+        }
+    }
 }
+
+/// Ceiling for claim `wait_ms` long-polls.
+const MAX_CLAIM_WAIT_MS: u64 = 5_000;
+/// Sleep slice between empty claim retries during a long-poll.
+const CLAIM_WAIT_SLICE_MS: u64 = 50;
 
 /// When a worker has reported an observed resource envelope, refuse to claim
 /// provision/resume/fork jobs whose provisionSpec.memory_limit exceeds that

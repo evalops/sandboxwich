@@ -239,6 +239,7 @@ pub(crate) async fn apex_snapshot_claim_requires_exact_profile_and_runtime_image
             lease_seconds: Some(60),
             sandbox_id: Some(created.sandbox.id),
             kinds: Some(vec![JobKind::ProvisionSandbox]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -316,6 +317,7 @@ pub(crate) async fn apex_snapshot_claim_requires_exact_profile_and_runtime_image
             lease_seconds: Some(60),
             sandbox_id: Some(created.sandbox.id),
             kinds: Some(vec![JobKind::CreateSnapshot]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -336,6 +338,7 @@ pub(crate) async fn apex_snapshot_claim_requires_exact_profile_and_runtime_image
             lease_seconds: Some(60),
             sandbox_id: Some(created.sandbox.id),
             kinds: Some(vec![JobKind::CreateSnapshot]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -458,6 +461,7 @@ async fn snapshot_fork_preserves_vm_execution_class_and_requires_vm_worker() {
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: Some(vec![JobKind::CreateSnapshot]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -562,6 +566,7 @@ async fn snapshot_fork_preserves_vm_execution_class_and_requires_vm_worker() {
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: Some(vec![JobKind::ForkSandbox]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -585,6 +590,7 @@ async fn snapshot_fork_preserves_vm_execution_class_and_requires_vm_worker() {
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: Some(vec![JobKind::ForkSandbox]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -641,6 +647,7 @@ pub(crate) async fn assert_provision_job_persists_runtime_resources(
                 lease_seconds: Some(60),
                 sandbox_id: None,
                 kinds: None,
+                wait_ms: None,
             })
             .send()
             .await
@@ -924,6 +931,7 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: None,
+            wait_ms: None,
         })
         .send()
         .await
@@ -1119,6 +1127,7 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: None,
+            wait_ms: None,
         })
         .send()
         .await
@@ -1272,6 +1281,7 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: None,
+            wait_ms: None,
         })
         .send()
         .await
@@ -1360,6 +1370,7 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: None,
+            wait_ms: None,
         })
         .send()
         .await
@@ -1502,6 +1513,7 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: None,
+            wait_ms: None,
         })
         .send()
         .await
@@ -1698,6 +1710,7 @@ pub(crate) async fn assert_snapshot_backed_resume_lifecycle(
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: Some(vec![JobKind::ResumeSandbox]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -1834,6 +1847,7 @@ pub(crate) async fn assert_snapshot_backed_resume_lifecycle(
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox.sandbox.id),
             kinds: Some(vec![JobKind::StopSandbox]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -2009,6 +2023,7 @@ async fn resume_fails_closed_without_a_restorable_snapshot_and_rewinds_on_failur
             lease_seconds: Some(60),
             sandbox_id: Some(other.sandbox.id),
             kinds: Some(vec![JobKind::ResumeSandbox]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -2142,6 +2157,7 @@ async fn ready_snapshot(
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox.sandbox.id),
             kinds: Some(vec![JobKind::CreateSnapshot]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -2198,6 +2214,7 @@ async fn archive_sandbox(
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox.sandbox.id),
             kinds: Some(vec![JobKind::StopSandbox]),
+            wait_ms: None,
         })
         .send()
         .await

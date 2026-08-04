@@ -1,0 +1,93 @@
+# Nightly performance regression gate (#259).
+#
+# Shared GitHub-hosted runners are noisy, so PR benchmarks stay non-blocking
+# (ci.yml). This scheduled job is the dependable lane: structured JSON via
+# perf-evaluate.py, absolute budgets + baseline comparison via perf-gate.py,
+# and an artifact baseline for the next run.
+#
+# When a self-hosted runner with a stable machine label becomes available,
+# switch runs-on and tighten ABSOLUTE_P95_BUDGETS / regression threshold.
+
+name: perf-nightly
+
+on:
+  schedule:
+    # 06:15 UTC daily
+    - cron: "15 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: perf-nightly
+  cancel-in-progress: false
+
+jobs:
+  nightly-benchmark:
+    name: nightly performance gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Build release binaries
+        run: |
+          cargo build --locked --release \
+            -p sandboxwich-api \
+            -p sandboxwich-worker \
+            -p sandboxwich-bench
+      - name: Load prior baseline artifact (best-effort)
+        id: baseline
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p perf-baseline
+          # Prefer an artifact from the most recent successful run of this workflow.
+          run_id="$(gh api \
+            "repos/${{ github.repository }}/actions/workflows/perf-nightly.yml/runs?status=success&per_page=10" \
+            --jq '.workflow_runs[] | select(.id != ${{ github.run_id }}) | .id' \
+            | head -n1 || true)"
+          if [[ -n "${run_id}" ]]; then
+            gh run download "${run_id}" \
+              --name sandboxwich-perf-baseline \
+              --dir perf-baseline \
+              || true
+          fi
+          # Artifact may nest baseline.json under a subdirectory depending on upload shape.
+          found="$(find perf-baseline -name baseline.json -type f | head -n1 || true)"
+          if [[ -n "${found}" ]]; then
+            echo "path=${found}" >> "${GITHUB_OUTPUT}"
+            echo "found prior baseline from run ${run_id:-unknown}: ${found}"
+          else
+            echo "path=" >> "${GITHUB_OUTPUT}"
+            echo "no prior baseline; absolute budgets only"
+          fi
+      - name: Run structured benchmark
+        env:
+          SANDBOXWICH_ALLOW_INSECURE_NO_AUTH: "true"
+          SANDBOXWICH_PERF_PROFILE: release
+        run: |
+          python3 scripts/perf-evaluate.py > perf-current.json
+          cat perf-current.json
+      - name: Enforce budgets and baseline regression
+        run: |
+          mkdir -p perf-out
+          args=(--current perf-current.json --write-baseline perf-out/baseline.json)
+          if [[ -n "${{ steps.baseline.outputs.path }}" ]]; then
+            args+=(--baseline "${{ steps.baseline.outputs.path }}")
+          fi
+          python3 scripts/perf-gate.py "${args[@]}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: sandboxwich-perf-baseline
+          path: |
+            perf-current.json
+            perf-out/baseline.json
+          if-no-files-found: warn
+          retention-days: 30

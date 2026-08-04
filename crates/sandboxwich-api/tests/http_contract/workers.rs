@@ -74,6 +74,7 @@ async fn claim_execution_job(
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_id),
             kinds: Some(vec![JobKind::ProvisionSandbox]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -381,6 +382,7 @@ pub(crate) async fn runtime_resource_inventory_is_worker_scoped_and_bounded() {
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox.sandbox.id),
             kinds: Some(vec![JobKind::ProvisionSandbox]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -588,6 +590,7 @@ pub(crate) async fn runtime_resource_inventory_is_worker_scoped_and_bounded() {
             lease_seconds: Some(60),
             sandbox_id: Some(tenant_b_sandbox.sandbox.id),
             kinds: Some(vec![JobKind::ProvisionSandbox]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -773,6 +776,7 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
                 lease_seconds: Some(60),
                 sandbox_id: None,
                 kinds: None,
+                wait_ms: None,
             })
             .send()
             .await
@@ -886,6 +890,7 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_b.sandbox.id),
             kinds: Some(vec![JobKind::RunCommand]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -917,6 +922,7 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_a.sandbox.id),
             kinds: Some(vec![JobKind::RunCommand]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -955,6 +961,7 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: None,
+            wait_ms: None,
         })
         .send()
         .await
@@ -970,6 +977,7 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_a.sandbox.id),
             kinds: Some(vec![JobKind::RunCommand]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -994,6 +1002,7 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: None,
+            wait_ms: None,
         })
         .send()
         .await
@@ -1081,6 +1090,7 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
             lease_seconds: Some(60),
             sandbox_id: None,
             kinds: None,
+            wait_ms: None,
         })
         .send()
         .await
@@ -1386,6 +1396,7 @@ pub(crate) async fn guest_tokens_are_scoped_to_their_own_sandbox_within_one_work
                 lease_seconds: Some(60),
                 sandbox_id: None,
                 kinds: None,
+                wait_ms: None,
             })
             .send()
             .await
@@ -1491,6 +1502,7 @@ pub(crate) async fn guest_tokens_are_scoped_to_their_own_sandbox_within_one_work
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_2.sandbox.id),
             kinds: Some(vec![JobKind::RunCommand]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -1511,6 +1523,7 @@ pub(crate) async fn guest_tokens_are_scoped_to_their_own_sandbox_within_one_work
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_1.sandbox.id),
             kinds: Some(vec![JobKind::RunCommand]),
+            wait_ms: None,
         })
         .send()
         .await

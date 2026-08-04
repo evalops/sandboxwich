@@ -253,6 +253,7 @@ async fn provision_for_real(server: &TestServer, worker: &WorkerResponse, sandbo
             lease_seconds: Some(60),
             sandbox_id: Some(sandbox_id),
             kinds: Some(vec![JobKind::ProvisionSandbox]),
+            wait_ms: None,
         })
         .send()
         .await
@@ -411,6 +412,7 @@ async fn resident_process_observation_resets_the_idle_clock() {
             lease_seconds: Some(60),
             sandbox_id: Some(kept_alive_by_resident.sandbox.id),
             kinds: Some(vec![JobKind::RunResidentProcess]),
+            wait_ms: None,
         })
         .send()
         .await
