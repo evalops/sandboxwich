@@ -137,6 +137,24 @@ pub(crate) async fn claim_lease(
             lease: None,
         }));
     }
+    // Saturated workers must not walk the 200-candidate window (and re-enrich
+    // every job) only to learn at try_claim that no ordinary slot is free.
+    // Resident process leases are excluded from this count, matching try_claim.
+    {
+        let mut connection = state.db.pool.acquire().await?;
+        let active = crate::handlers::workers::active_lease_count_for_worker_on_connection(
+            &state.db,
+            &mut connection,
+            worker.id,
+        )
+        .await?;
+        if active >= worker.max_concurrent_jobs {
+            return Ok(Json(ClaimLeaseResponse {
+                ok: true,
+                lease: None,
+            }));
+        }
+    }
     let mut query = state.db.query_builder(
         "select id, tenant_id, kind, status, payload, required_capability, required_execution_class, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
