@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 0.1.11 - 2026-08-04
+### Fixed
+
+- *(worker)* Retry control-plane registration for reconciler
+
+### Other
+
+- Claim wait_ms long-poll, hourly SLO rollups, nightly gate
+- Rustfmt allowlist rules json helpers
+- *(api)* Embed allowlist rules JSON on sandboxes for list
+- Add scenario A/B harness and allowlist seed support
+- Main
+- Main into lifecycle v2
+- Lifecycle completion upsert, set-based stop retire, claim/sweep
+
 ## 0.1.10 - 2026-08-04
 ### Other
 
