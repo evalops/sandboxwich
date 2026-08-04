@@ -2124,6 +2124,20 @@ fn orphan_reconciliation_success_line_is_stable_for_info_logging() {
 }
 
 #[test]
+fn idle_heartbeat_is_immediate_then_bounded_to_once_per_minute() {
+    let started = Instant::now();
+    assert!(idle_heartbeat_due(None, started));
+    assert!(!idle_heartbeat_due(
+        Some(started),
+        started + IDLE_HEARTBEAT_INTERVAL - Duration::from_millis(1)
+    ));
+    assert!(idle_heartbeat_due(
+        Some(started),
+        started + IDLE_HEARTBEAT_INTERVAL
+    ));
+}
+
+#[test]
 fn resolv_conf_nameservers_capture_the_cluster_dns_endpoints() {
     let resolvers = resolver_ips_from_resolv_conf(
         r#"
