@@ -234,11 +234,15 @@ fn capture_with_limits(
             if !source.matches(&before) {
                 bail!("compiler cache entry changed while capturing");
             }
+            ensure_single_link(&before)?;
             let mut file = open_source(&root_handle, source)?;
             let opened = file.metadata()?;
             if !source.matches(&opened) {
                 bail!("compiler cache entry changed while capturing");
             }
+            // Recheck after open so a hardlink raced in between enumeration and
+            // open cannot smuggle a second link into the archive.
+            ensure_single_link(&opened)?;
             let header = deterministic_header(&source.relative, source.size)?;
             builder.append(&header, &mut file)?;
             if !source.matches(&file.metadata()?) {
@@ -777,6 +781,10 @@ fn collect_sources(root: &Path, directory: &Path, output: &mut Vec<SourceFile>) 
             if canonical != path || !canonical.starts_with(root) {
                 bail!("compiler cache entry escapes its root");
             }
+            // Reject hardlinks so a workload cannot pull unrelated inodes into a
+            // redistributed cache archive by linking them into the capture tree.
+            // Rechecked after open in capture (via SourceFile::matches).
+            ensure_single_link(&metadata)?;
             output.push(SourceFile {
                 absolute: path.clone(),
                 relative: normalized_relative(root, &path)?,
@@ -790,11 +798,40 @@ fn collect_sources(root: &Path, directory: &Path, output: &mut Vec<SourceFile>) 
     Ok(())
 }
 
+fn ensure_single_link(metadata: &fs::Metadata) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            bail!("compiler cache entry must not be hardlinked");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+    }
+    Ok(())
+}
+
 impl SourceFile {
     fn matches(&self, metadata: &fs::Metadata) -> bool {
         metadata.file_type().is_file()
             && metadata.len() == self.size
             && metadata.modified().ok() == self.modified
+            && single_link(metadata)
+    }
+}
+
+fn single_link(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink() == 1
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        true
     }
 }
 
@@ -1340,6 +1377,29 @@ mod tests {
         assert_eq!(fs::read(restored.join("nested/a")).unwrap(), b"first");
         assert_eq!(fs::read(restored.join("z")).unwrap(), b"last");
         assert!(!restored.join(IDENTITY_ENTRY).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_rejects_hardlinked_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let object = cache.join("object");
+        let alias = cache.join("alias");
+        fs::write(&object, b"secret-from-elsewhere").unwrap();
+        fs::hard_link(&object, &alias).unwrap();
+        let archive = root.path().join("out.tar.gz");
+
+        let error = capture(&cache, FOAM_IDENTITY, &archive).unwrap_err();
+        assert!(
+            error.to_string().contains("hardlinked")
+                || error
+                    .chain()
+                    .any(|cause| cause.to_string().contains("hardlinked")),
+            "expected hardlink rejection, got {error:#}"
+        );
+        assert!(!archive.exists());
     }
 
     #[test]

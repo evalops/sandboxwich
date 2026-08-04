@@ -160,6 +160,29 @@ async fn compiler_cache_materialization_is_unprivileged_only_while_apex_destinat
             .is_err()
     );
 
+    let matching_tenant_identity = format!(
+        r#"{{"schemaVersion":1,"namespace":{{"visibility":{{"kind":"tenant_repository_private","tenant":"{}"}}}}}}"#,
+        sandbox.tenant_id
+    );
+    validate_job_payload_tenant(
+        &db,
+        &job("compiler_cache_archive", Some(&matching_tenant_identity)),
+        &ctx,
+    )
+    .await
+    .expect("matching tenant_repository_private identity is accepted");
+
+    let foreign_tenant_identity = r#"{"schemaVersion":1,"namespace":{"visibility":{"kind":"tenant_repository_private","tenant":"other-tenant"}}}"#;
+    let mismatch = validate_job_payload_tenant(
+        &db,
+        &job("compiler_cache_archive", Some(foreign_tenant_identity)),
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(mismatch.status, StatusCode::BAD_REQUEST);
+    assert_eq!(mismatch.code, "compiler_cache_identity_tenant_mismatch");
+
     sqlx::query("update sandboxes set runtime_profile = ? where id = ?")
         .bind(SandboxRuntimeProfile::ApexTrustedSupervisorV1.as_db_str())
         .bind(sandbox.id.to_string())
@@ -178,6 +201,36 @@ async fn compiler_cache_materialization_is_unprivileged_only_while_apex_destinat
     validate_job_payload_tenant(&db, &job("apex_task", None), &ctx)
         .await
         .expect("existing APEX materialization destinations must remain reachable");
+}
+
+#[test]
+fn compiler_cache_identity_tenant_binding_rejects_foreign_and_empty_claims() {
+    bind_compiler_cache_identity_tenant(
+        r#"{"namespace":{"visibility":{"kind":"repository_shared"}}}"#,
+        "tenant-a",
+    )
+    .expect("repository_shared does not claim a tenant");
+    bind_compiler_cache_identity_tenant(r#"{"schemaVersion":1}"#, "tenant-a")
+        .expect("partial identities without visibility remain size-gated only");
+    bind_compiler_cache_identity_tenant(
+        r#"{"namespace":{"visibility":{"kind":"tenant_repository_private","tenant":"tenant-a"}}}"#,
+        "tenant-a",
+    )
+    .expect("matching tenant is accepted");
+
+    let mismatch = bind_compiler_cache_identity_tenant(
+        r#"{"namespace":{"visibility":{"kind":"tenant_repository_private","tenant":"tenant-b"}}}"#,
+        "tenant-a",
+    )
+    .unwrap_err();
+    assert_eq!(mismatch.code, "compiler_cache_identity_tenant_mismatch");
+
+    let empty = bind_compiler_cache_identity_tenant(
+        r#"{"namespace":{"visibility":{"kind":"tenant_repository_private","tenant":""}}}"#,
+        "tenant-a",
+    )
+    .unwrap_err();
+    assert_eq!(empty.status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
