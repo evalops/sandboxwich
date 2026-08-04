@@ -2,7 +2,9 @@
 
 The `main` branch accepts changes through pull requests and merge commits. Its
 ruleset requires the Rust, Clippy, dependency audit, Rust 1.95, service image,
-runtime image, and Kubernetes conformance jobs from this repository.
+and runtime image jobs as pull request checks. Kubernetes conformance runs on
+the push to `main` after a pull request merges and is intentionally not a
+required pull request check.
 
 The source-controlled payload is `.github/rulesets/main.json`. Apply it with a
 repository administration token after the payload's pull request has merged:
