@@ -61,6 +61,11 @@ fn not_live(message: impl Into<String>) -> ApiError {
     ApiError::conflict_code("placement_attestation_not_live", message)
 }
 
+fn maestro_identity_observation_is_eligible(observed_state: &str) -> bool {
+    observed_state == ResidentProcessObservedState::Starting.as_db_str()
+        || observed_state == ResidentProcessObservedState::Running.as_db_str()
+}
+
 fn maestro_workload_stale_generation() -> ApiError {
     ApiError::conflict_code(
         "maestro_workload_stale_generation",
@@ -994,10 +999,15 @@ pub(crate) async fn validate_maestro_workload_identity(
         .fetch_optional(&state.db.pool)
         .await?
         .ok_or_else(unavailable)?;
-    if row.try_get::<String, _>("desired_state")?
-        != ResidentProcessDesiredState::Running.as_db_str()
-        || row.try_get::<String, _>("observed_state")?
-            != ResidentProcessObservedState::Running.as_db_str()
+    let desired_state = row.try_get::<String, _>("desired_state")?;
+    let observed_state = row.try_get::<String, _>("observed_state")?;
+    // The internal identity exchange is the startup handoff: Maestro cannot
+    // become Running until this request succeeds. Canonical binding, Pod UID,
+    // and placement-fence checks below still fail closed while Starting is
+    // allowed only for this fenced internal route. The public connection
+    // binding remains Running-only.
+    if desired_state != ResidentProcessDesiredState::Running.as_db_str()
+        || !maestro_identity_observation_is_eligible(&observed_state)
     {
         return Err(not_live("Maestro hosted runner is not running"));
     }
@@ -1117,5 +1127,29 @@ mod tests {
 
         assert_eq!(error.status, StatusCode::CONFLICT);
         assert_eq!(error.code, "placement_attestation_not_live");
+    }
+
+    #[test]
+    fn maestro_identity_exchange_accepts_fenced_starting_workloads() {
+        assert!(maestro_identity_observation_is_eligible(
+            ResidentProcessObservedState::Starting.as_db_str()
+        ));
+        assert!(maestro_identity_observation_is_eligible(
+            ResidentProcessObservedState::Running.as_db_str()
+        ));
+    }
+
+    #[test]
+    fn maestro_identity_exchange_rejects_non_live_workloads() {
+        for observed_state in [
+            ResidentProcessObservedState::Pending,
+            ResidentProcessObservedState::Failed,
+            ResidentProcessObservedState::Stopped,
+            ResidentProcessObservedState::Lost,
+        ] {
+            assert!(!maestro_identity_observation_is_eligible(
+                observed_state.as_db_str()
+            ));
+        }
     }
 }
