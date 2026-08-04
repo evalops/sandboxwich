@@ -110,6 +110,22 @@ pub(crate) async fn upsert_provider_runtime_resources_on_connection(
     resources: &[ProviderRuntimeResource],
     tenant_id: &str,
 ) -> Result<(), ApiError> {
+    if resources.is_empty() {
+        return Ok(());
+    }
+    // Provision/stop completions hand a single-sandbox batch. Gate tenant
+    // ownership once, then skip the per-resource ensure (each used to re-fetch
+    // the full sandbox + allowlist on the write connection).
+    let sandbox_id = resources[0].sandbox_id;
+    if resources
+        .iter()
+        .any(|resource| resource.sandbox_id != sandbox_id)
+    {
+        return Err(ApiError::bad_request(
+            "runtime resource batch must belong to a single sandbox",
+        ));
+    }
+    ensure_sandbox_tenant_on_connection(db, connection, sandbox_id, tenant_id).await?;
     let observed_at = Utc::now();
     for resource in resources {
         upsert_provider_runtime_resource_on_connection(
@@ -118,7 +134,7 @@ pub(crate) async fn upsert_provider_runtime_resources_on_connection(
             resource,
             Some(observed_at),
             None,
-            Some(tenant_id),
+            None,
         )
         .await?;
     }
@@ -763,38 +779,52 @@ pub(crate) async fn mark_runtime_resources_deleted_for_sandbox_on_connection(
             " and snapshot_id is null and purpose <> 'snapshot'"
         }
     };
-    let sql = format!(
+    // One set-based UPDATE for the whole sandbox generation, then a single
+    // SELECT of the rows just retired. Stop/cleanup used to pay UPDATE+SELECT
+    // per resource while holding the write transaction.
+    let update_sql = format!(
+        "update runtime_resources
+         set status = {}, updated_at = {}, last_reconciled_at = {}, deleted_at = {}, error = {}
+         where sandbox_id = {} and status not in ('deleted', 'destroyed'){generation_filter}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4),
+        db.placeholder(5),
+        db.placeholder(6)
+    );
+    let deleted_at_text = deleted_at.to_rfc3339();
+    let result = sqlx::query(&update_sql)
+        .bind(runtime_resource_status_to_str(
+            &RuntimeResourceStatus::Destroyed,
+        ))
+        .bind(&deleted_at_text)
+        .bind(&deleted_at_text)
+        .bind(&deleted_at_text)
+        .bind(error)
+        .bind(sandbox_id.to_string())
+        .execute(&mut *connection)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Ok(Vec::new());
+    }
+    let select_sql = format!(
         "select id, sandbox_id, snapshot_id, provider, resource_kind, purpose, resource_name,
                 namespace, status, cluster, storage_class, snapshot_class, storage_size,
                 runtime_image, service_port, target_port, source_snapshot_id, created_at,
                 updated_at, observed_at, last_reconciled_at, ready_at, deleted_at, error
          from runtime_resources
-         where sandbox_id = {} and status not in ('deleted', 'destroyed'){generation_filter}
+         where sandbox_id = {} and status = 'destroyed' and deleted_at = {}{generation_filter}
          order by updated_at asc, id asc",
-        db.placeholder(1)
+        db.placeholder(1),
+        db.placeholder(2)
     );
-    let rows = sqlx::query(&sql)
+    let rows = sqlx::query(&select_sql)
         .bind(sandbox_id.to_string())
+        .bind(&deleted_at_text)
         .fetch_all(&mut *connection)
         .await?;
-
-    let mut deleted = Vec::new();
-    for row in rows {
-        let resource = row_to_runtime_resource(row)?;
-        deleted.push(
-            mark_runtime_resource_deleted_on_connection(
-                db,
-                connection,
-                resource.id,
-                deleted_at,
-                RuntimeResourceStatus::Destroyed,
-                error,
-            )
-            .await?,
-        );
-    }
-
-    Ok(deleted)
+    rows.into_iter().map(row_to_runtime_resource).collect()
 }
 
 pub(crate) async fn insert_runtime_resource_tombstone_on_connection(

@@ -1478,9 +1478,27 @@ pub(crate) async fn reject_if_memory_exceeds_all_envelopes(
     tenant_id: &str,
     memory_limit: &MemoryLimit,
 ) -> Result<(), ApiError> {
+    // Fail-open if any online worker has not reported an envelope yet (rolling
+    // upgrade). Cheap existence probe before loading every JSON blob.
+    let unknown_sql = format!(
+        "select 1 as present from workers
+         where tenant_id = {} and status = 'online'
+           and (resource_envelope is null or resource_envelope = '')
+         limit 1",
+        db.placeholder(1)
+    );
+    if sqlx::query(&unknown_sql)
+        .bind(tenant_id)
+        .fetch_optional(db.read_pool())
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
     let sql = format!(
         "select resource_envelope from workers
-         where tenant_id = {} and status = 'online'",
+         where tenant_id = {} and status = 'online'
+           and resource_envelope is not null and resource_envelope <> ''",
         db.placeholder(1)
     );
     let rows = sqlx::query(&sql)
@@ -1490,31 +1508,23 @@ pub(crate) async fn reject_if_memory_exceeds_all_envelopes(
     if rows.is_empty() {
         return Ok(());
     }
-    let mut saw_envelope = false;
+    let requested = memory_limit.memory_bytes();
     let mut max_ceiling: Option<u64> = None;
     let mut evidence_age: Option<String> = None;
     for row in rows {
-        let raw: Option<String> = row.try_get("resource_envelope")?;
-        let Some(raw) = raw.filter(|value| !value.is_empty()) else {
-            // At least one online worker has no envelope → do not fail closed.
-            return Ok(());
-        };
-        saw_envelope = true;
-        let envelope: WorkerResourceEnvelope = serde_json::from_str(&raw).map_err(|_| {
+        let raw: String = row.try_get("resource_envelope")?;
+        // Only need ceiling + evidence for admission; skip full envelope decode.
+        let envelope: CapacityEnvelopeView = serde_json::from_str(&raw).map_err(|_| {
             ApiError::internal("database contains invalid worker resource envelope")
         })?;
-        if envelope.can_schedule_memory(memory_limit) {
-            return Ok(());
+        match envelope.max_memory_bytes {
+            Some(ceiling) if ceiling >= requested => return Ok(()),
+            Some(ceiling) => {
+                max_ceiling = Some(max_ceiling.unwrap_or(0).max(ceiling));
+            }
+            None => {}
         }
-        max_ceiling = Some(
-            max_ceiling
-                .unwrap_or(0)
-                .max(envelope.max_memory_bytes.unwrap_or(0)),
-        );
-        evidence_age = Some(envelope.evidence_at.to_rfc3339());
-    }
-    if !saw_envelope {
-        return Ok(());
+        evidence_age = Some(envelope.evidence_at);
     }
     Err(ApiError {
         status: StatusCode::CONFLICT,
@@ -1522,11 +1532,20 @@ pub(crate) async fn reject_if_memory_exceeds_all_envelopes(
         message: format!(
             "requested memory tier {} ({} bytes) exceeds observed worker capacity (ceiling={} bytes, evidence_at={})",
             memory_limit.as_db_str(),
-            memory_limit.memory_bytes(),
+            requested,
             max_ceiling.unwrap_or(0),
             evidence_age.unwrap_or_else(|| "unknown".into()),
         ),
     })
+}
+
+/// Thin parse of the worker envelope JSON for create-time capacity admission.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CapacityEnvelopeView {
+    #[serde(default)]
+    max_memory_bytes: Option<u64>,
+    evidence_at: String,
 }
 
 pub(crate) async fn ensure_sandbox_tenant_on_connection(

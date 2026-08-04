@@ -155,7 +155,9 @@ struct RunArgs {
     #[arg(long)]
     lease_seconds: Option<u64>,
 
-    #[arg(long, default_value_t = 1000)]
+    /// Backoff after an empty claim poll. Kept low so provision/stop queue lag
+    /// does not dominate dry-run TTFT; raise via flag for quiet clusters.
+    #[arg(long, default_value_t = 100)]
     idle_sleep_ms: u64,
 
     #[arg(long)]
@@ -277,7 +279,9 @@ struct WorkLoopArgs {
     #[arg(long)]
     lease_seconds: Option<u64>,
 
-    #[arg(long, default_value_t = 1000)]
+    /// Backoff after an empty claim poll. Default 100ms keeps queue→claim lag
+    /// off the TTFT critical path without spinning the control plane.
+    #[arg(long, default_value_t = 100)]
     idle_sleep_ms: u64,
 
     #[arg(long)]

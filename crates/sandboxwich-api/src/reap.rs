@@ -277,6 +277,10 @@ pub(crate) async fn attempt_reap_candidate(
 /// per sweep tick regardless of how many sandboxes have `idle_ttl_seconds`
 /// configured, portable across both the SQLite and Postgres backends since
 /// a correlated scalar subquery is standard SQL on both.
+/// Max candidates considered per sweep tick. Oldest first; the next tick
+/// drains the remainder so a large fleet cannot monopolize the writer.
+const REAP_CANDIDATE_BATCH_SIZE: i64 = 100;
+
 pub(crate) async fn reap_expired_active_sandboxes(
     db: &Database,
     resident_bootstraps: &ResidentBootstrapStore,
@@ -288,10 +292,15 @@ pub(crate) async fn reap_expired_active_sandboxes(
                 (select max(c.created_at) from commands c where c.sandbox_id = s.id) as last_command_at
          from sandboxes s
          where s.state in ({}) and (s.max_lifetime_seconds is not null or s.idle_ttl_seconds is not null)
-         order by s.created_at asc, s.id asc",
-        sql_literal_list(&reapable)
+         order by s.created_at asc, s.id asc
+         limit {}",
+        sql_literal_list(&reapable),
+        db.placeholder(1)
     );
-    let rows = sqlx::query(&sql).fetch_all(&db.pool).await?;
+    let rows = sqlx::query(&sql)
+        .bind(REAP_CANDIDATE_BATCH_SIZE)
+        .fetch_all(db.read_pool())
+        .await?;
 
     let now = Utc::now();
     let mut reaped = Vec::new();

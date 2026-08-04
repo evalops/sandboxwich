@@ -203,8 +203,19 @@ pub(crate) async fn get_job(
 /// Per-claim-poll cache of sandbox placement inputs so a 200-candidate scan
 /// does not re-fetch the same sandbox + secret mounts for every job that
 /// points at one sandbox (common when many stop/command jobs share a pool).
+///
+/// `expected_provision_spec` is the control-plane JSON that
+/// [`add_provision_spec_to_payload`] would write, so match checks are a Value
+/// equality rather than deserializing full specs per candidate.
+#[derive(Clone)]
+pub(crate) struct PlacementCacheEntry {
+    pub sandbox: Sandbox,
+    pub secret_mounts: Vec<SandboxSecretMount>,
+    pub expected_provision_spec: serde_json::Value,
+}
+
 pub(crate) type PlacementEnrichmentCache =
-    std::collections::HashMap<SandboxId, (Sandbox, Vec<SandboxSecretMount>)>;
+    std::collections::HashMap<SandboxId, PlacementCacheEntry>;
 
 pub(crate) async fn enrich_job_payload_with_provision_spec(
     db: &Database,
@@ -235,42 +246,33 @@ pub(crate) async fn enrich_job_payload_with_provision_spec_cached(
         | JobKind::MaterializeFile
         | JobKind::ApexTaskInstructions => {
             let sandbox_id = sandbox_id_from_job(job)?;
-            let (sandbox, secret_mounts) =
-                load_sandbox_placement_inputs(db, sandbox_id, cache).await?;
-            Ok(apply_sandbox_placement(job, &sandbox, &secret_mounts)?)
+            let entry = load_sandbox_placement_inputs(db, sandbox_id, cache).await?;
+            Ok(apply_sandbox_placement(job, &entry)?)
         }
         JobKind::ForkSandbox => {
             let child_id = child_sandbox_id_from_job(job)?;
-            let (child, secret_mounts) = load_sandbox_placement_inputs(db, child_id, cache).await?;
-            Ok(apply_sandbox_placement(job, &child, &secret_mounts)?)
+            let entry = load_sandbox_placement_inputs(db, child_id, cache).await?;
+            Ok(apply_sandbox_placement(job, &entry)?)
         }
         JobKind::DeleteHome => Ok(false),
     }
 }
 
 /// Returns `true` when payload or execution class needed repair.
-fn apply_sandbox_placement(
-    job: &mut Job,
-    sandbox: &Sandbox,
-    secret_mounts: &[SandboxSecretMount],
-) -> Result<bool, ApiError> {
-    if placement_matches_sandbox(job, sandbox, secret_mounts) {
+fn apply_sandbox_placement(job: &mut Job, entry: &PlacementCacheEntry) -> Result<bool, ApiError> {
+    if placement_matches_sandbox(job, entry) {
         return Ok(false);
     }
-    job.required_execution_class = sandbox.execution_class.clone();
-    add_provision_spec_to_payload(job, sandbox, secret_mounts)?;
+    job.required_execution_class = entry.sandbox.execution_class.clone();
+    add_provision_spec_to_payload(job, &entry.sandbox, &entry.secret_mounts)?;
     Ok(true)
 }
 
 /// True when the job already carries the control-plane placement that would
 /// be written for this sandbox. Forged or partial payloads fail this check
 /// and are repaired by [`apply_sandbox_placement`].
-pub(crate) fn placement_matches_sandbox(
-    job: &Job,
-    sandbox: &Sandbox,
-    secret_mounts: &[SandboxSecretMount],
-) -> bool {
-    if job.required_execution_class != sandbox.execution_class {
+pub(crate) fn placement_matches_sandbox(job: &Job, entry: &PlacementCacheEntry) -> bool {
+    if job.required_execution_class != entry.sandbox.execution_class {
         return false;
     }
     let Some(image) = job
@@ -280,35 +282,64 @@ pub(crate) fn placement_matches_sandbox(
     else {
         return false;
     };
-    if image != sandbox.template {
+    if image != entry.sandbox.template {
         return false;
     }
-    let Some(spec_value) = job.payload.get("provisionSpec") else {
+    job.payload.get("provisionSpec") == Some(&entry.expected_provision_spec)
+}
+
+/// Test helper: build a cache entry and check placement without a DB.
+#[cfg(test)]
+pub(crate) fn placement_matches_sandbox_parts(
+    job: &Job,
+    sandbox: &Sandbox,
+    secret_mounts: &[SandboxSecretMount],
+) -> bool {
+    let Ok(expected) = expected_provision_spec_value(sandbox, secret_mounts) else {
         return false;
     };
-    let Ok(spec) = serde_json::from_value::<SandboxProvisionSpec>(spec_value.clone()) else {
-        return false;
-    };
-    spec.memory_limit == sandbox.memory_limit
-        && spec.network_egress == sandbox.network_egress
-        && spec.workspace_mode == sandbox.workspace_mode
-        && spec.runtime_profile == sandbox.runtime_profile
-        && spec.execution_class == sandbox.execution_class
-        && spec.secret_mounts == secret_mounts
+    placement_matches_sandbox(
+        job,
+        &PlacementCacheEntry {
+            sandbox: sandbox.clone(),
+            secret_mounts: secret_mounts.to_vec(),
+            expected_provision_spec: expected,
+        },
+    )
+}
+
+fn expected_provision_spec_value(
+    sandbox: &Sandbox,
+    secret_mounts: &[SandboxSecretMount],
+) -> Result<serde_json::Value, ApiError> {
+    Ok(serde_json::to_value(SandboxProvisionSpec {
+        secret_mounts: secret_mounts.to_vec(),
+        execution_class: sandbox.execution_class.clone(),
+        memory_limit: sandbox.memory_limit.clone(),
+        network_egress: sandbox.network_egress.clone(),
+        workspace_mode: sandbox.workspace_mode.clone(),
+        runtime_profile: sandbox.runtime_profile.clone(),
+    })?)
 }
 
 async fn load_sandbox_placement_inputs(
     db: &Database,
     sandbox_id: SandboxId,
     cache: &mut PlacementEnrichmentCache,
-) -> Result<(Sandbox, Vec<SandboxSecretMount>), ApiError> {
+) -> Result<PlacementCacheEntry, ApiError> {
     if let Some(entry) = cache.get(&sandbox_id) {
         return Ok(entry.clone());
     }
     let sandbox = fetch_sandbox(db, sandbox_id).await?;
     let secret_mounts = fetch_sandbox_secret_mounts(db, sandbox.id).await?;
-    cache.insert(sandbox_id, (sandbox.clone(), secret_mounts.clone()));
-    Ok((sandbox, secret_mounts))
+    let expected_provision_spec = expected_provision_spec_value(&sandbox, &secret_mounts)?;
+    let entry = PlacementCacheEntry {
+        sandbox,
+        secret_mounts,
+        expected_provision_spec,
+    };
+    cache.insert(sandbox_id, entry.clone());
+    Ok(entry)
 }
 
 pub(crate) fn add_provision_spec_to_payload(
@@ -1214,11 +1245,20 @@ mod placement_match_tests {
         }
     }
 
+    fn entry_for(sandbox: &Sandbox) -> PlacementCacheEntry {
+        PlacementCacheEntry {
+            expected_provision_spec: expected_provision_spec_value(sandbox, &[]).unwrap(),
+            sandbox: sandbox.clone(),
+            secret_mounts: vec![],
+        }
+    }
+
     #[test]
     fn placement_matches_when_payload_is_authoritative() {
         let sandbox = sample_sandbox();
         let job = base_job(&sandbox);
-        assert!(placement_matches_sandbox(&job, &sandbox, &[]));
+        assert!(placement_matches_sandbox(&job, &entry_for(&sandbox)));
+        assert!(placement_matches_sandbox_parts(&job, &sandbox, &[]));
     }
 
     #[test]
@@ -1229,24 +1269,25 @@ mod placement_match_tests {
             "runtimeImage".into(),
             json!("ghcr.io/attacker/root@sha256:ff"),
         );
-        assert!(!placement_matches_sandbox(&job, &sandbox, &[]));
+        assert!(!placement_matches_sandbox(&job, &entry_for(&sandbox)));
     }
 
     #[test]
     fn apply_sandbox_placement_is_idempotent_for_matching_jobs() {
         let sandbox = sample_sandbox();
+        let entry = entry_for(&sandbox);
         let mut job = base_job(&sandbox);
-        assert!(!apply_sandbox_placement(&mut job, &sandbox, &[]).unwrap());
+        assert!(!apply_sandbox_placement(&mut job, &entry).unwrap());
         // Forged image is repaired and reports a mutation.
         job.payload
             .as_object_mut()
             .unwrap()
             .insert("runtimeImage".into(), json!("evil:latest"));
-        assert!(apply_sandbox_placement(&mut job, &sandbox, &[]).unwrap());
+        assert!(apply_sandbox_placement(&mut job, &entry).unwrap());
         assert_eq!(
             job.payload.get("runtimeImage").and_then(|v| v.as_str()),
             Some(sandbox.template.as_str())
         );
-        assert!(!apply_sandbox_placement(&mut job, &sandbox, &[]).unwrap());
+        assert!(!apply_sandbox_placement(&mut job, &entry).unwrap());
     }
 }

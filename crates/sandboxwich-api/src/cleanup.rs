@@ -13,6 +13,9 @@ use sqlx::Row;
 use uuid::Uuid;
 
 const ARCHIVED_RUNTIME_RECONCILIATION_BATCH_SIZE: u32 = 100;
+/// Cap retention deletes per sweep tick so a large archived set cannot hold
+/// the write FIFO for an entire TTL backlog (mirrors archived-runtime repair).
+const ARCHIVED_SANDBOX_CLEANUP_BATCH_SIZE: i64 = 100;
 
 /// Finds archived sandboxes that still have provider-owned runtime rows and
 /// queues an idempotent label-scoped stop job for each one. This is a repair
@@ -317,23 +320,28 @@ pub(crate) async fn mark_cleanup_run_failed(
 pub(crate) async fn cleanup_archived_sandboxes(
     db: &Database,
 ) -> Result<ArchivedSandboxCleanupResult, ApiError> {
-    let rows = sqlx::query(
+    // Oldest first, bounded batch. Deletion does not need allowlist rules, so
+    // skip network hydration that every archived row previously paid for.
+    let sql = format!(
         "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
                 created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, last_activity_at, parent_snapshot_id
          from sandboxes
          where state = 'archived' and ttl_seconds is not null
-         order by updated_at asc, id asc",
-    )
-    .fetch_all(&db.pool)
-    .await?;
+         order by updated_at asc, id asc
+         limit {}",
+        db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(ARCHIVED_SANDBOX_CLEANUP_BATCH_SIZE)
+        .fetch_all(db.read_pool())
+        .await?;
 
     let now = Utc::now();
     let mut deleted = Vec::new();
     let mut skipped = Vec::new();
     let mut runtime_resources_deleted = Vec::new();
     for row in rows {
-        let mut sandbox = row_to_sandbox(row)?;
-        hydrate_sandbox_network_egress(db, &mut sandbox).await?;
+        let sandbox = row_to_sandbox(row)?;
         let Some(ttl_seconds) = sandbox.ttl_seconds else {
             continue;
         };
