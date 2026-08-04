@@ -251,6 +251,7 @@ pub const WORKSPACE_CLAIM_NAME_PREFIX: &str = "sandboxwich-pvc-";
 /// above the five-minute grace `classify_reconciliation` already applies to
 /// resident-process pods.
 const UNBOUND_WORKSPACE_CLAIM_REAP_AFTER_MINUTES: i64 = 60;
+const ORPHAN_RECONCILIATION_DISCOVERY_TIMEOUT_SECS: u64 = 60;
 
 /// Name prefix for the per-sandbox guest-token Secret (see
 /// `guest_token_secret_name`). Also used by the Secret adoption contract to
@@ -2702,6 +2703,65 @@ impl VolumeClaimPhase {
     }
 }
 
+fn reconciliation_optional_field(value: &str) -> Option<&str> {
+    (value != "<none>").then_some(value)
+}
+
+fn orphan_reconciliation_discovery_timeout(kubectl_timeout: Duration) -> Duration {
+    kubectl_timeout.min(Duration::from_secs(
+        ORPHAN_RECONCILIATION_DISCOVERY_TIMEOUT_SECS,
+    ))
+}
+
+fn parse_reconciliation_resource_rows(
+    output: &str,
+) -> anyhow::Result<Vec<ObservedKubernetesResource>> {
+    output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+        .map(|(index, line)| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() != 8 {
+                bail!(
+                    "kubectl reconciliation inventory row {} had {} fields instead of 8",
+                    index + 1,
+                    fields.len()
+                );
+            }
+            let kind = fields[0];
+            let required = |value: &str, field: &str| -> anyhow::Result<String> {
+                if value == "<none>" {
+                    bail!("observed Kubernetes resource omitted {field}");
+                }
+                Ok(value.to_string())
+            };
+            let created_at = reconciliation_optional_field(fields[6])
+                .map(|value| {
+                    chrono::DateTime::parse_from_rfc3339(value)
+                        .map(|value| value.with_timezone(&Utc))
+                        .context("observed Kubernetes resource has invalid creationTimestamp")
+                })
+                .transpose()?;
+            Ok(ObservedKubernetesResource {
+                volume_claim_phase: (kind == "PersistentVolumeClaim")
+                    .then(|| reconciliation_optional_field(fields[7]).map(VolumeClaimPhase::parse))
+                    .flatten(),
+                sandbox_id: reconciliation_optional_field(fields[1])
+                    .and_then(|value| Uuid::parse_str(value).ok())
+                    .map(SandboxId),
+                resource_kind: runtime_resource_kind_for_kubernetes_kind(kind)?,
+                namespace: required(fields[2], "namespace")?,
+                name: required(fields[3], "name")?,
+                uid: required(fields[4], "uid")?,
+                resident_lease_id: reconciliation_optional_field(fields[5])
+                    .and_then(|value| Uuid::parse_str(value).ok()),
+                created_at,
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ReconciliationInventory {
     sandbox_ids: std::collections::HashSet<SandboxId>,
@@ -3671,91 +3731,40 @@ impl KubernetesApplyProvider {
     fn discover_reconciliation_resources(
         &self,
         max_scanned: usize,
-        max_elapsed: Duration,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<Vec<ObservedKubernetesResource>> {
-        let mut args = self.kubectl_base_args();
-        args.extend([
-            "get".to_string(),
-            self.dry_run.reconciliation_resource_kinds(),
-            "--selector".to_string(),
-            "sandboxwich.dev/sandbox-id".to_string(),
-            "--output".to_string(),
-            "json".to_string(),
-        ]);
-        let output = run_kubectl_command(
-            &self.kubectl,
-            &args,
-            "discover sandbox resources for reconciliation",
-            self.kubectl_command_timeout.min(max_elapsed),
-            Some(cancelled),
-            self.max_captured_output_bytes,
-        )?;
-        if !output.success {
-            return Err(anyhow::Error::new(classified_kubectl_failure(
-                "sandbox resource discovery failed",
-                &output.stderr,
-            )));
+        let mut resources = Vec::new();
+        for resource_kind in self.dry_run.reconciliation_resource_kinds().split(',') {
+            let mut args = self.kubectl_base_args();
+            args.extend([
+                "get".to_string(),
+                resource_kind.to_string(),
+                "--selector".to_string(),
+                "sandboxwich.dev/sandbox-id".to_string(),
+                "--output".to_string(),
+                "custom-columns=KIND:.kind,SANDBOX:.metadata.labels.sandboxwich\\.dev/sandbox-id,NAMESPACE:.metadata.namespace,NAME:.metadata.name,UID:.metadata.uid,LEASE:.metadata.labels.sandboxwich\\.dev/lease-id,CREATED:.metadata.creationTimestamp,PHASE:.status.phase".to_string(),
+                "--no-headers".to_string(),
+            ]);
+            let output = run_kubectl_command(
+                &self.kubectl,
+                &args,
+                "discover sandbox resources for reconciliation",
+                orphan_reconciliation_discovery_timeout(self.kubectl_command_timeout),
+                Some(cancelled),
+                self.max_captured_output_bytes,
+            )?;
+            if !output.success {
+                return Err(anyhow::Error::new(classified_kubectl_failure(
+                    "sandbox resource discovery failed",
+                    &output.stderr,
+                )));
+            }
+            resources.extend(parse_reconciliation_resource_rows(&output.stdout)?);
+            if resources.len() > max_scanned {
+                bail!("Kubernetes inventory exceeded max_scanned={max_scanned}");
+            }
         }
-        let list: Value = serde_json::from_str(&output.stdout)
-            .context("kubectl reconciliation inventory was not valid JSON")?;
-        let items = list["items"]
-            .as_array()
-            .context("kubectl reconciliation inventory omitted items")?;
-        if items.len() > max_scanned {
-            bail!("Kubernetes inventory exceeded max_scanned={max_scanned}");
-        }
-        items
-            .iter()
-            .map(|item| {
-                let kind = item["kind"]
-                    .as_str()
-                    .context("observed Kubernetes resource omitted kind")?;
-                let label = item["metadata"]["labels"]["sandboxwich.dev/sandbox-id"].as_str();
-                // Only claims carry a bind phase that matters here, and an
-                // unreported phase must stay `None` so the unbound-claim
-                // backstop fails closed rather than guessing `Pending`.
-                let volume_claim_phase = (kind == "PersistentVolumeClaim")
-                    .then(|| {
-                        item["status"]["phase"]
-                            .as_str()
-                            .map(VolumeClaimPhase::parse)
-                    })
-                    .flatten();
-                Ok(ObservedKubernetesResource {
-                    volume_claim_phase,
-                    sandbox_id: label
-                        .and_then(|value| Uuid::parse_str(value).ok())
-                        .map(SandboxId),
-                    resource_kind: runtime_resource_kind_for_kubernetes_kind(kind)?,
-                    namespace: item["metadata"]["namespace"]
-                        .as_str()
-                        .context("observed Kubernetes resource omitted namespace")?
-                        .to_string(),
-                    name: item["metadata"]["name"]
-                        .as_str()
-                        .context("observed Kubernetes resource omitted name")?
-                        .to_string(),
-                    uid: item["metadata"]["uid"]
-                        .as_str()
-                        .context("observed Kubernetes resource omitted uid")?
-                        .to_string(),
-                    resident_lease_id: item["metadata"]["labels"]["sandboxwich.dev/lease-id"]
-                        .as_str()
-                        .and_then(|value| Uuid::parse_str(value).ok()),
-                    created_at: item["metadata"]["creationTimestamp"]
-                        .as_str()
-                        .map(|value| {
-                            chrono::DateTime::parse_from_rfc3339(value)
-                                .map(|value| value.with_timezone(&Utc))
-                                .context(
-                                    "observed Kubernetes resource has invalid creationTimestamp",
-                                )
-                        })
-                        .transpose()?,
-                })
-            })
-            .collect()
+        Ok(resources)
     }
 
     fn delete_reconciled_resource(
@@ -3848,13 +3857,14 @@ impl KubernetesApplyProvider {
     where
         F: FnMut(&ObservedKubernetesResource, Duration, &CancelSignal) -> anyhow::Result<()>,
     {
-        let observed = match self.discover_reconciliation_resources(
-            limits.max_scanned,
-            limits.max_elapsed,
-            cancelled,
-        ) {
+        let observed = match self.discover_reconciliation_resources(limits.max_scanned, cancelled) {
             Ok(resources) => resources,
-            Err(_error) => {
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    max_scanned = limits.max_scanned,
+                    "sandboxwich_orphan_reconciliation_discovery_failed"
+                );
                 let decisions = inventory
                     .ok()
                     .map(|inventory| inventory.resources)
