@@ -68,6 +68,108 @@ pub(crate) fn sandbox_page_item(row: AnyRow) -> Result<(PageCursor, Sandbox), Ap
     ))
 }
 
+/// Column order for the `GET /sandboxes` list select (must match `list_sandboxes`).
+const LIST_COL_ID: usize = 0;
+const LIST_COL_TENANT_ID: usize = 1;
+const LIST_COL_NAME: usize = 2;
+const LIST_COL_STATE: usize = 3;
+const LIST_COL_TEMPLATE: usize = 4;
+const LIST_COL_MEMORY_LIMIT: usize = 5;
+const LIST_COL_NETWORK_EGRESS_MODE: usize = 6;
+const LIST_COL_WORKSPACE_MODE: usize = 7;
+const LIST_COL_RUNTIME_PROFILE: usize = 8;
+const LIST_COL_EXECUTION_CLASS: usize = 9;
+const LIST_COL_CREATED_AT: usize = 10;
+const LIST_COL_UPDATED_AT: usize = 11;
+const LIST_COL_TTL_SECONDS: usize = 12;
+const LIST_COL_MAX_LIFETIME_SECONDS: usize = 13;
+const LIST_COL_IDLE_TTL_SECONDS: usize = 14;
+const LIST_COL_LAST_ACTIVITY_AT: usize = 15;
+const LIST_COL_PARENT_SNAPSHOT_ID: usize = 16;
+const LIST_COL_ALLOW_RULES_JSON: usize = 17;
+
+/// List-path decoder: ordinal column access (avoids repeated named lookups) plus
+/// optional in-row allowlist JSON so the handler needs no second round trip.
+pub(crate) fn sandbox_list_page_item(row: AnyRow) -> Result<(PageCursor, Sandbox), ApiError> {
+    let id: &str = row.try_get(LIST_COL_ID)?;
+    let tenant_id: String = row.try_get(LIST_COL_TENANT_ID)?;
+    let name: String = row.try_get(LIST_COL_NAME)?;
+    let state: &str = row.try_get(LIST_COL_STATE)?;
+    let template: String = row.try_get(LIST_COL_TEMPLATE)?;
+    let memory_limit: &str = row.try_get(LIST_COL_MEMORY_LIMIT)?;
+    let network_egress_mode: &str = row.try_get(LIST_COL_NETWORK_EGRESS_MODE)?;
+    let workspace_mode: &str = row.try_get(LIST_COL_WORKSPACE_MODE)?;
+    let runtime_profile: &str = row.try_get(LIST_COL_RUNTIME_PROFILE)?;
+    let execution_class: &str = row.try_get(LIST_COL_EXECUTION_CLASS)?;
+    let created_at: &str = row.try_get(LIST_COL_CREATED_AT)?;
+    let updated_at: &str = row.try_get(LIST_COL_UPDATED_AT)?;
+    let ttl_seconds: Option<i64> = row.try_get(LIST_COL_TTL_SECONDS)?;
+    let max_lifetime_seconds: Option<i64> = row.try_get(LIST_COL_MAX_LIFETIME_SECONDS)?;
+    let idle_ttl_seconds: Option<i64> = row.try_get(LIST_COL_IDLE_TTL_SECONDS)?;
+    let last_activity_at: Option<&str> = row.try_get(LIST_COL_LAST_ACTIVITY_AT)?;
+    let parent_snapshot_id: Option<&str> = row.try_get(LIST_COL_PARENT_SNAPSHOT_ID)?;
+    let allow_rules_json: Option<&str> = row.try_get(LIST_COL_ALLOW_RULES_JSON)?;
+    let page_cursor = PageCursor::new(created_at, id);
+    let network_egress = match parse_network_egress_mode(network_egress_mode)? {
+        NetworkEgressMode::DenyAll => NetworkEgress::DenyAll,
+        NetworkEgressMode::AllowAll => NetworkEgress::AllowAll,
+        NetworkEgressMode::Allowlist => NetworkEgress::Allowlist {
+            rules: parse_allow_rules_json(allow_rules_json.unwrap_or("[]"))?,
+        },
+    };
+
+    Ok((
+        page_cursor,
+        Sandbox {
+            execution_class: ExecutionClass::parse_db_str(execution_class)
+                .map_err(|_| ApiError::internal("database contains invalid execution class"))?,
+            id: SandboxId(parse_uuid(id)?),
+            tenant_id,
+            name,
+            state: parse_state(state)?,
+            template,
+            memory_limit: parse_memory_limit(memory_limit)?,
+            network_egress,
+            workspace_mode: WorkspaceMode::parse_db_str(workspace_mode)
+                .map_err(|_| ApiError::internal("database contains invalid workspace mode"))?,
+            runtime_profile: SandboxRuntimeProfile::parse_db_str(runtime_profile)
+                .map_err(|_| ApiError::internal("database contains invalid runtime profile"))?,
+            created_at: parse_timestamp(created_at)?,
+            updated_at: parse_timestamp(updated_at)?,
+            ttl_seconds: ttl_seconds.map(|ttl| ttl as u64),
+            max_lifetime_seconds: max_lifetime_seconds.map(|ttl| ttl as u64),
+            idle_ttl_seconds: idle_ttl_seconds.map(|ttl| ttl as u64),
+            last_activity_at: last_activity_at.map(parse_timestamp).transpose()?,
+            parent_snapshot_id: parent_snapshot_id
+                .map(|snapshot| parse_uuid(snapshot).map(SnapshotId))
+                .transpose()?,
+        },
+    ))
+}
+
+#[derive(serde::Deserialize)]
+struct AllowRuleJson {
+    kind: String,
+    value: String,
+}
+
+pub(crate) fn parse_allow_rules_json(raw: &str) -> Result<Vec<NetworkAllowRule>, ApiError> {
+    if raw.is_empty() || raw == "null" {
+        return Ok(Vec::new());
+    }
+    let parsed: Vec<AllowRuleJson> = serde_json::from_str(raw)
+        .map_err(|_| ApiError::internal("database contains invalid network allow rules json"))?;
+    parsed
+        .into_iter()
+        .map(|rule| {
+            Ok(NetworkAllowRule {
+                kind: parse_network_allow_rule_kind(&rule.kind)?,
+                value: rule.value,
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn row_to_resident_process(row: AnyRow) -> Result<ResidentProcess, ApiError> {
     let id: &str = row.try_get("id")?;
     let sandbox_id: &str = row.try_get("sandbox_id")?;
