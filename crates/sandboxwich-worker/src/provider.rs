@@ -2799,6 +2799,43 @@ pub struct ReconciliationOutcome {
     pub(crate) apply: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReconciliationClassificationCounts {
+    pub expected: usize,
+    pub missing: usize,
+    pub orphaned: usize,
+    pub expired: usize,
+    pub indeterminate: usize,
+}
+
+impl ReconciliationOutcome {
+    pub fn scanned(&self) -> usize {
+        self.decisions.len()
+    }
+
+    pub fn deleted(&self) -> usize {
+        self.deleted
+    }
+
+    pub fn apply(&self) -> bool {
+        self.apply
+    }
+
+    pub fn classification_counts(&self) -> ReconciliationClassificationCounts {
+        let mut counts = ReconciliationClassificationCounts::default();
+        for decision in &self.decisions {
+            match decision.classification {
+                ReconciliationClassification::Expected => counts.expected += 1,
+                ReconciliationClassification::Missing => counts.missing += 1,
+                ReconciliationClassification::Orphaned => counts.orphaned += 1,
+                ReconciliationClassification::Expired => counts.expired += 1,
+                ReconciliationClassification::Indeterminate => counts.indeterminate += 1,
+            }
+        }
+        counts
+    }
+}
+
 /// True when `resource` is a workspace PersistentVolumeClaim that a failed
 /// provision left behind and that is safe to delete on the evidence available.
 ///
@@ -3904,7 +3941,7 @@ impl KubernetesApplyProvider {
                         namespace: resource.namespace,
                         name: resource.name,
                         uid: resource.uid,
-                        expires_at: resource.cleanup_deadline,
+                        expires_at: resource.cleanup_deadline.or(resource.expires_at),
                     })
                     .collect(),
             })

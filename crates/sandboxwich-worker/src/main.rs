@@ -16,7 +16,8 @@ use provider::{
     CancelSignal, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES, IsolatedResidentProcessBootstrap,
     IsolatedResidentProcessObservation, IsolatedResidentProcessSpec, IsolatedResidentProcessState,
     IsolationProfile, KUBERNETES_MUTATION_ENV, KubernetesApplyProvider, KubernetesDryRunProvider,
-    ProviderError, ReconciliationLimits, RetryDisposition, SandboxProvider, image_is_digest_pinned,
+    ProviderError, ReconciliationLimits, ReconciliationOutcome, RetryDisposition, SandboxProvider,
+    image_is_digest_pinned,
 };
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, ApexTaskInstructionsCallbackRequest,
@@ -86,6 +87,7 @@ enum Command {
     Complete(CompleteArgs),
     Fail(FailArgs),
     Run(RunArgs),
+    Reconcile(ReconcileArgs),
     WorkOnce(WorkOnceArgs),
     WorkLoop(WorkLoopArgs),
 }
@@ -166,6 +168,70 @@ struct RunArgs {
 
     #[command(flatten)]
     provider: RuntimeProviderArgs,
+}
+
+#[derive(Debug, Args)]
+struct ReconcileArgs {
+    /// Stable logical identity for the out-of-band reconciler. Repeated
+    /// one-shot runs rotate the scoped token on this same worker row.
+    #[arg(long)]
+    name: String,
+
+    #[arg(long = "provider", default_value = "kubernetes")]
+    worker_provider: String,
+
+    #[arg(long = "label", value_parser = parse_label)]
+    label: Vec<(String, String)>,
+
+    #[command(flatten)]
+    provider: ReconcileProviderArgs,
+}
+
+#[derive(Debug, Args)]
+struct ReconcileProviderArgs {
+    #[arg(long, default_value = "k3s-dev")]
+    cluster: String,
+
+    #[arg(long, default_value = "sandboxwich")]
+    namespace: String,
+
+    #[arg(long, env = "SANDBOXWICH_SANDBOX_NAMESPACE")]
+    sandbox_namespace: Option<String>,
+
+    #[arg(long, default_value = "kubectl")]
+    kubectl: String,
+
+    #[arg(long)]
+    kubectl_context: Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    confirm_apply: bool,
+
+    #[arg(
+        long,
+        env = "SANDBOXWICH_KUBECTL_COMMAND_TIMEOUT_SECS",
+        default_value_t = provider::DEFAULT_KUBECTL_COMMAND_TIMEOUT_SECS
+    )]
+    kubectl_command_timeout_secs: u64,
+
+    #[arg(
+        long,
+        env = "SANDBOXWICH_MAX_CAPTURED_OUTPUT_BYTES",
+        default_value_t = DEFAULT_MAX_CAPTURED_OUTPUT_BYTES
+    )]
+    max_captured_output_bytes: u64,
+
+    #[arg(long, default_value_t = 20_000)]
+    orphan_reconciliation_max_scanned: usize,
+
+    #[arg(long, default_value_t = 100)]
+    orphan_reconciliation_max_deleted: usize,
+
+    #[arg(long, default_value_t = 120)]
+    orphan_reconciliation_max_elapsed_secs: u64,
+
+    #[arg(long, default_value_t = false)]
+    orphan_reconciliation_apply: bool,
 }
 
 #[derive(Debug, Args)]
@@ -616,22 +682,12 @@ impl RuntimeProvider {
         inventory: anyhow::Result<RuntimeResourceInventoryResponse>,
         limits: ReconciliationLimits,
         apply: bool,
-    ) -> anyhow::Result<Option<(usize, usize, bool)>> {
+    ) -> anyhow::Result<Option<ReconciliationOutcome>> {
         match self {
             Self::DryRun(_) => Ok(None),
-            Self::Apply(provider) => {
-                let outcome = provider.reconcile_orphans(
-                    inventory,
-                    limits,
-                    apply,
-                    &CancelSignal::never_cancelled(),
-                )?;
-                Ok(Some((
-                    outcome.decisions.len(),
-                    outcome.deleted,
-                    outcome.apply,
-                )))
-            }
+            Self::Apply(provider) => provider
+                .reconcile_orphans(inventory, limits, apply, &CancelSignal::never_cancelled())
+                .map(Some),
         }
     }
 }
@@ -835,12 +891,6 @@ impl SandboxProvider for RuntimeProvider {
             Self::Apply(provider) => provider.delete_home(home_id, cancelled),
         }
     }
-}
-
-fn orphan_reconciliation_success_line(scanned: usize, deleted: usize, apply: bool) -> String {
-    format!(
-        "worker: orphan reconciliation completed scanned={scanned} deleted={deleted} apply={apply}"
-    )
 }
 
 fn idle_heartbeat_due(last_heartbeat: Option<Instant>, now: Instant) -> bool {
@@ -1175,6 +1225,58 @@ async fn main() -> anyhow::Result<()> {
                 },
             )
             .await?;
+        }
+        Command::Reconcile(args) => {
+            let mut labels: BTreeMap<_, _> = args.label.into_iter().collect();
+            labels.insert("cluster".into(), args.provider.cluster.clone());
+            labels.insert(
+                "sandbox_namespace".into(),
+                args.provider
+                    .sandbox_namespace
+                    .clone()
+                    .unwrap_or_else(|| args.provider.namespace.clone()),
+            );
+            labels.insert("role".into(), "reconciler".into());
+            let response = register_worker(
+                &client,
+                &api,
+                args.name,
+                args.worker_provider,
+                vec![WorkerCapability::K8sPod],
+                labels,
+                Some(1),
+            )
+            .await?;
+            let worker_token = response.worker_token.context(
+                "registration response did not include a worker-scoped token; is \
+                 sandboxwich-api up to date? (see GH-64)",
+            )?;
+            let worker_client = build_api_client(Some(&worker_token), cli.tenant.as_deref())
+                .context("failed to build reconciler-scoped API client")?;
+            let worker_id = response.worker.id.0;
+            let result = reconcile_once(&worker_client, &api, worker_id, args.provider).await;
+            if let Err(error) = drain_worker(&worker_client, &api, worker_id).await {
+                eprintln!("warning: failed to mark reconciler draining after run: {error:#}");
+            }
+            let outcome = result?;
+            let counts = outcome.classification_counts();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "reconcilerId": worker_id,
+                    "scanned": outcome.scanned(),
+                    "deleted": outcome.deleted(),
+                    "apply": outcome.apply(),
+                    "classifications": {
+                        "expected": counts.expected,
+                        "missing": counts.missing,
+                        "orphaned": counts.orphaned,
+                        "expired": counts.expired,
+                        "indeterminate": counts.indeterminate,
+                    },
+                }))?
+            );
         }
         Command::WorkOnce(args) => {
             let claim_kinds = claim_kinds_for_provider_mode(args.provider.provider_mode);
@@ -2035,27 +2137,6 @@ async fn fetch_runtime_resource_inventory(
 }
 
 async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> anyhow::Result<()> {
-    let reconciliation_namespace = args
-        .provider
-        .provider
-        .sandbox_namespace
-        .clone()
-        .unwrap_or_else(|| args.provider.provider.namespace.clone());
-    let reconciliation_interval =
-        Duration::from_secs(args.provider.orphan_reconciliation_interval_secs.max(1));
-    let reconciliation_limits = ReconciliationLimits {
-        max_scanned: args.provider.orphan_reconciliation_max_scanned.max(1),
-        max_deleted: args.provider.orphan_reconciliation_max_deleted,
-        max_elapsed: Duration::from_secs(
-            args.provider.orphan_reconciliation_max_elapsed_secs.max(1),
-        ),
-    };
-    let reconciliation_apply = orphan_reconciliation_apply_enabled(
-        args.provider.orphan_reconciliation_apply,
-        std::env::var("SANDBOXWICH_ORPHAN_RECONCILIATION_APPLY")
-            .ok()
-            .as_deref(),
-    );
     let provider_mode = args.provider.provider_mode;
     let max_resident_processes = args.max_resident_processes.max(1);
     let provider = Arc::new(runtime_provider_from_args(args.provider)?);
@@ -2063,7 +2144,6 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
     let drain_timeout = Duration::from_secs(args.drain_timeout_secs);
     let shutdown = spawn_shutdown_listener();
     let mut iterations = 0_u64;
-    let mut last_reconciliation = None;
     let mut last_idle_heartbeat = None;
     let mut resident_tasks: tokio::task::JoinSet<anyhow::Result<LeaseResponse>> =
         tokio::task::JoinSet::new();
@@ -2100,42 +2180,6 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
             );
             sleep_or_shutdown(Duration::from_millis(args.idle_sleep_ms), &shutdown).await;
             continue;
-        }
-
-        if last_reconciliation
-            .is_none_or(|last: std::time::Instant| last.elapsed() >= reconciliation_interval)
-        {
-            let inventory = fetch_runtime_resource_inventory(
-                client,
-                api,
-                args.worker_id,
-                &reconciliation_namespace,
-                reconciliation_limits.max_scanned,
-            )
-            .await;
-            let reconciliation_provider = provider.clone();
-            let reconciliation = tokio::task::spawn_blocking(move || {
-                reconciliation_provider.reconcile_orphans(
-                    inventory,
-                    reconciliation_limits,
-                    reconciliation_apply,
-                )
-            })
-            .await
-            .unwrap_or_else(|error| {
-                Err(anyhow::anyhow!(
-                    "orphan reconciliation task panicked or was cancelled: {error}"
-                ))
-            });
-            match reconciliation {
-                Ok(Some((scanned, deleted, apply))) => println!(
-                    "{}",
-                    orphan_reconciliation_success_line(scanned, deleted, apply)
-                ),
-                Ok(None) => {}
-                Err(error) => eprintln!("error: orphan reconciliation failed closed: {error:#}"),
-            }
-            last_reconciliation = Some(std::time::Instant::now());
         }
 
         // Re-check right before claiming: a signal received during the heartbeat
@@ -2311,6 +2355,90 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
     {
         eprintln!("warning: failed to mark worker draining before exit: {error:#}");
     }
+    Ok(())
+}
+
+async fn reconcile_once(
+    client: &reqwest::Client,
+    api: &str,
+    worker_id: Uuid,
+    args: ReconcileProviderArgs,
+) -> anyhow::Result<ReconciliationOutcome> {
+    let expected_cluster = args.cluster.clone();
+    let namespace = args
+        .sandbox_namespace
+        .clone()
+        .unwrap_or_else(|| args.namespace.clone());
+    let limits = ReconciliationLimits {
+        max_scanned: args.orphan_reconciliation_max_scanned.max(1),
+        max_deleted: args.orphan_reconciliation_max_deleted,
+        max_elapsed: Duration::from_secs(args.orphan_reconciliation_max_elapsed_secs.max(1)),
+    };
+    let apply = orphan_reconciliation_apply_enabled(
+        args.orphan_reconciliation_apply,
+        std::env::var("SANDBOXWICH_ORPHAN_RECONCILIATION_APPLY")
+            .ok()
+            .as_deref(),
+    );
+    let inventory =
+        fetch_runtime_resource_inventory(client, api, worker_id, &namespace, limits.max_scanned)
+            .await
+            .context("fetch complete runtime resource inventory")?;
+    validate_reconciliation_inventory_scope(&inventory, &expected_cluster, &namespace)?;
+    let dry_run =
+        KubernetesDryRunProvider::with_snapshot_class(args.cluster, args.namespace, None, None)
+            .with_sandbox_namespace(Some(namespace));
+    let mutation_enabled = KubernetesApplyProvider::mutation_enabled_from_env();
+    if let Some(warning) = mutation_gate_force_enabled_warning(
+        args.confirm_apply,
+        mutation_enabled,
+        dry_run.effective_sandbox_namespace(),
+    ) {
+        eprintln!("{warning}");
+    }
+    let provider = RuntimeProvider::Apply(
+        KubernetesApplyProvider::new(dry_run, args.kubectl)
+            .with_kubectl_context(args.kubectl_context)
+            .with_mutation_gate(args.confirm_apply, mutation_enabled)
+            .with_kubectl_command_timeout(kubectl_command_timeout(
+                args.kubectl_command_timeout_secs,
+            ))
+            .with_max_captured_output_bytes(args.max_captured_output_bytes),
+    );
+    tokio::task::spawn_blocking(move || provider.reconcile_orphans(Ok(inventory), limits, apply))
+        .await
+        .context("orphan reconciliation task panicked or was cancelled")??
+        .context("apply provider did not perform orphan reconciliation")
+}
+
+fn validate_reconciliation_inventory_scope(
+    inventory: &RuntimeResourceInventoryResponse,
+    expected_cluster: &str,
+    expected_namespace: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        inventory.provider == "kubernetes",
+        "runtime resource inventory provider mismatch: expected kubernetes, got {}",
+        inventory.provider
+    );
+    anyhow::ensure!(
+        inventory.cluster.as_deref() == Some(expected_cluster),
+        "runtime resource inventory cluster mismatch: expected {expected_cluster}, got {}",
+        inventory.cluster.as_deref().unwrap_or("<none>")
+    );
+    anyhow::ensure!(
+        inventory.namespace == expected_namespace,
+        "runtime resource inventory namespace mismatch: expected {expected_namespace}, got {}",
+        inventory.namespace
+    );
+    anyhow::ensure!(
+        inventory.complete,
+        "runtime resource inventory was incomplete"
+    );
+    anyhow::ensure!(
+        inventory.next_cursor.is_none(),
+        "runtime resource inventory retained a pagination cursor after aggregation"
+    );
     Ok(())
 }
 

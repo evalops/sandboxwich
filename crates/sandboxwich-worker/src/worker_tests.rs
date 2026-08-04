@@ -1604,6 +1604,42 @@ fn standalone_work_paths_filter_dry_run_materialization_claims() {
 }
 
 #[test]
+fn reconcile_command_is_a_one_shot_path_separate_from_worker_claiming() {
+    let cli = Cli::try_parse_from([
+        "sandboxwich-worker",
+        "reconcile",
+        "--name",
+        "sandboxwich-reconciler",
+        "--confirm-apply",
+        "--orphan-reconciliation-apply",
+    ]);
+
+    assert!(cli.is_ok(), "the out-of-band reconcile command must parse");
+}
+
+#[test]
+fn reconcile_scope_validation_names_the_incomplete_boundary() {
+    let mut inventory = RuntimeResourceInventoryResponse {
+        ok: true,
+        provider: "kubernetes".to_string(),
+        cluster: Some("cluster-a".to_string()),
+        namespace: "sandboxes".to_string(),
+        sandbox_ids: Vec::new(),
+        complete: true,
+        resources: Vec::new(),
+        active_resident_lease_ids: Vec::new(),
+        next_cursor: None,
+    };
+    validate_reconciliation_inventory_scope(&inventory, "cluster-a", "sandboxes")
+        .expect("matching complete scope");
+
+    inventory.complete = false;
+    let error = validate_reconciliation_inventory_scope(&inventory, "cluster-a", "sandboxes")
+        .expect_err("incomplete scope must fail the one-shot Job");
+    assert!(error.to_string().contains("inventory was incomplete"));
+}
+
+#[test]
 fn full_resident_supervisor_excludes_only_resident_claims() {
     let dry_run = claim_kinds_for_work_loop(ProviderModeArg::DryRun, false)
         .expect("dry-run claim is explicitly filtered");
@@ -2113,14 +2149,6 @@ fn orphan_reconciliation_apply_requires_both_opt_ins() {
     assert!(!orphan_reconciliation_apply_enabled(false, Some("1")));
     assert!(!orphan_reconciliation_apply_enabled(true, Some("true")));
     assert!(orphan_reconciliation_apply_enabled(true, Some("1")));
-}
-
-#[test]
-fn orphan_reconciliation_success_line_is_stable_for_info_logging() {
-    assert_eq!(
-        orphan_reconciliation_success_line(183, 0, false),
-        "worker: orphan reconciliation completed scanned=183 deleted=0 apply=false"
-    );
 }
 
 #[test]
