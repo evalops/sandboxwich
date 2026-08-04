@@ -1,5 +1,6 @@
 use crate::error::*;
 use crate::handlers::files::*;
+use crate::pagination::PageCursor;
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Utc};
 use sandboxwich_core::*;
@@ -9,6 +10,12 @@ use sqlx::any::AnyRow;
 use uuid::Uuid;
 
 pub(crate) fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
+    Ok(sandbox_page_item(row)?.1)
+}
+
+/// Decode a sandbox row once for keyset list pages, sharing the keyset columns
+/// with the opaque page cursor so list paths do not re-read `id` / `created_at`.
+pub(crate) fn sandbox_page_item(row: AnyRow) -> Result<(PageCursor, Sandbox), ApiError> {
     // Parse-only text fields are borrowed from the row buffer so list/get paths
     // do not allocate a String for every enum/uuid/timestamp conversion.
     let id: &str = row.try_get("id")?;
@@ -25,36 +32,40 @@ pub(crate) fn row_to_sandbox(row: AnyRow) -> Result<Sandbox, ApiError> {
     let idle_ttl_seconds: Option<i64> = row.try_get("idle_ttl_seconds")?;
     let last_activity_at: Option<&str> = row.try_get("last_activity_at")?;
     let parent_snapshot_id: Option<&str> = row.try_get("parent_snapshot_id")?;
+    let page_cursor = PageCursor::new(created_at, id);
     let network_egress = match parse_network_egress_mode(network_egress_mode)? {
         NetworkEgressMode::DenyAll => NetworkEgress::DenyAll,
         NetworkEgressMode::Allowlist => NetworkEgress::Allowlist { rules: Vec::new() },
         NetworkEgressMode::AllowAll => NetworkEgress::AllowAll,
     };
 
-    Ok(Sandbox {
-        execution_class: ExecutionClass::parse_db_str(execution_class)
-            .map_err(|_| ApiError::internal("database contains invalid execution class"))?,
-        id: SandboxId(parse_uuid(id)?),
-        tenant_id: row.try_get("tenant_id")?,
-        name: row.try_get("name")?,
-        state: parse_state(state)?,
-        template: row.try_get("template")?,
-        memory_limit: parse_memory_limit(memory_limit)?,
-        network_egress,
-        workspace_mode: WorkspaceMode::parse_db_str(workspace_mode)
-            .map_err(|_| ApiError::internal("database contains invalid workspace mode"))?,
-        runtime_profile: SandboxRuntimeProfile::parse_db_str(runtime_profile)
-            .map_err(|_| ApiError::internal("database contains invalid runtime profile"))?,
-        created_at: parse_timestamp(created_at)?,
-        updated_at: parse_timestamp(updated_at)?,
-        ttl_seconds: ttl_seconds.map(|ttl| ttl as u64),
-        max_lifetime_seconds: max_lifetime_seconds.map(|ttl| ttl as u64),
-        idle_ttl_seconds: idle_ttl_seconds.map(|ttl| ttl as u64),
-        last_activity_at: last_activity_at.map(parse_timestamp).transpose()?,
-        parent_snapshot_id: parent_snapshot_id
-            .map(|snapshot| parse_uuid(snapshot).map(SnapshotId))
-            .transpose()?,
-    })
+    Ok((
+        page_cursor,
+        Sandbox {
+            execution_class: ExecutionClass::parse_db_str(execution_class)
+                .map_err(|_| ApiError::internal("database contains invalid execution class"))?,
+            id: SandboxId(parse_uuid(id)?),
+            tenant_id: row.try_get("tenant_id")?,
+            name: row.try_get("name")?,
+            state: parse_state(state)?,
+            template: row.try_get("template")?,
+            memory_limit: parse_memory_limit(memory_limit)?,
+            network_egress,
+            workspace_mode: WorkspaceMode::parse_db_str(workspace_mode)
+                .map_err(|_| ApiError::internal("database contains invalid workspace mode"))?,
+            runtime_profile: SandboxRuntimeProfile::parse_db_str(runtime_profile)
+                .map_err(|_| ApiError::internal("database contains invalid runtime profile"))?,
+            created_at: parse_timestamp(created_at)?,
+            updated_at: parse_timestamp(updated_at)?,
+            ttl_seconds: ttl_seconds.map(|ttl| ttl as u64),
+            max_lifetime_seconds: max_lifetime_seconds.map(|ttl| ttl as u64),
+            idle_ttl_seconds: idle_ttl_seconds.map(|ttl| ttl as u64),
+            last_activity_at: last_activity_at.map(parse_timestamp).transpose()?,
+            parent_snapshot_id: parent_snapshot_id
+                .map(|snapshot| parse_uuid(snapshot).map(SnapshotId))
+                .transpose()?,
+        },
+    ))
 }
 
 pub(crate) fn row_to_resident_process(row: AnyRow) -> Result<ResidentProcess, ApiError> {
@@ -212,32 +223,40 @@ pub(crate) fn row_to_runtime_resource(row: AnyRow) -> Result<RuntimeResource, Ap
 }
 
 pub(crate) fn row_to_snapshot(row: AnyRow) -> Result<Snapshot, ApiError> {
+    Ok(snapshot_page_item(row)?.1)
+}
+
+pub(crate) fn snapshot_page_item(row: AnyRow) -> Result<(PageCursor, Snapshot), ApiError> {
     let id: &str = row.try_get("id")?;
     let sandbox_id: &str = row.try_get("sandbox_id")?;
     let status: &str = row.try_get("status")?;
     let inventory: &str = row.try_get("inventory")?;
     let provider_metadata: &str = row.try_get("provider_metadata")?;
     let created_at: &str = row.try_get("created_at")?;
+    let page_cursor = PageCursor::new(created_at, id);
     let ready_at: Option<&str> = row.try_get("ready_at")?;
     let expires_at: Option<&str> = row.try_get("expires_at")?;
 
-    Ok(Snapshot {
-        id: SnapshotId(parse_uuid(id)?),
-        sandbox_id: SandboxId(parse_uuid(sandbox_id)?),
-        status: parse_snapshot_status(status)?,
-        label: row.try_get("label")?,
-        inventory: serde_json::from_str(inventory)?,
-        provider_metadata: serde_json::from_str(provider_metadata)?,
-        runtime_image: row.try_get("runtime_image")?,
-        provision_spec: row
-            .try_get::<Option<&str>, _>("provision_spec")?
-            .map(serde_json::from_str)
-            .transpose()?,
-        created_at: parse_timestamp(created_at)?,
-        ready_at: ready_at.map(parse_timestamp).transpose()?,
-        expires_at: expires_at.map(parse_timestamp).transpose()?,
-        error: row.try_get("error")?,
-    })
+    Ok((
+        page_cursor,
+        Snapshot {
+            id: SnapshotId(parse_uuid(id)?),
+            sandbox_id: SandboxId(parse_uuid(sandbox_id)?),
+            status: parse_snapshot_status(status)?,
+            label: row.try_get("label")?,
+            inventory: serde_json::from_str(inventory)?,
+            provider_metadata: serde_json::from_str(provider_metadata)?,
+            runtime_image: row.try_get("runtime_image")?,
+            provision_spec: row
+                .try_get::<Option<&str>, _>("provision_spec")?
+                .map(serde_json::from_str)
+                .transpose()?,
+            created_at: parse_timestamp(created_at)?,
+            ready_at: ready_at.map(parse_timestamp).transpose()?,
+            expires_at: expires_at.map(parse_timestamp).transpose()?,
+            error: row.try_get("error")?,
+        },
+    ))
 }
 
 pub(crate) fn row_to_desktop_session(row: AnyRow) -> Result<DesktopSession, ApiError> {
@@ -337,45 +356,61 @@ pub(crate) fn row_to_ssh_key(row: AnyRow) -> Result<SshKey, ApiError> {
     })
 }
 
-pub(crate) fn row_to_event(row: AnyRow) -> Result<SandboxEvent, ApiError> {
+pub(crate) fn event_page_item(row: AnyRow) -> Result<(PageCursor, SandboxEvent), ApiError> {
     let id: &str = row.try_get("id")?;
     let sandbox_id: &str = row.try_get("sandbox_id")?;
     let kind: &str = row.try_get("kind")?;
     let data: &str = row.try_get("data")?;
     let created_at: &str = row.try_get("created_at")?;
+    let page_cursor = PageCursor::new(created_at, id);
 
-    Ok(SandboxEvent {
-        id: EventId(parse_uuid(id)?),
-        sandbox_id: SandboxId(parse_uuid(sandbox_id)?),
-        kind: parse_event_kind(kind)?,
-        data: serde_json::from_str(data)?,
-        created_at: parse_timestamp(created_at)?,
-    })
+    Ok((
+        page_cursor,
+        SandboxEvent {
+            id: EventId(parse_uuid(id)?),
+            sandbox_id: SandboxId(parse_uuid(sandbox_id)?),
+            kind: parse_event_kind(kind)?,
+            data: serde_json::from_str(data)?,
+            created_at: parse_timestamp(created_at)?,
+        },
+    ))
 }
 
 pub(crate) fn row_to_command(row: AnyRow) -> Result<CommandRun, ApiError> {
+    Ok(command_page_item(row)?.1)
+}
+
+pub(crate) fn command_page_item(row: AnyRow) -> Result<(PageCursor, CommandRun), ApiError> {
     let id: &str = row.try_get("id")?;
     let sandbox_id: &str = row.try_get("sandbox_id")?;
     let status: &str = row.try_get("status")?;
     let argv: &str = row.try_get("argv")?;
     let created_at: &str = row.try_get("created_at")?;
+    let page_cursor = PageCursor::new(created_at, id);
     let finished_at: Option<&str> = row.try_get("finished_at")?;
 
-    Ok(CommandRun {
-        id: CommandId(parse_uuid(id)?),
-        sandbox_id: SandboxId(parse_uuid(sandbox_id)?),
-        status: parse_command_status(status)?,
-        argv: serde_json::from_str(argv)?,
-        cwd: row.try_get("cwd")?,
-        exit_code: row.try_get("exit_code")?,
-        stdout: row.try_get("stdout")?,
-        stderr: row.try_get("stderr")?,
-        created_at: parse_timestamp(created_at)?,
-        finished_at: finished_at.map(parse_timestamp).transpose()?,
-    })
+    Ok((
+        page_cursor,
+        CommandRun {
+            id: CommandId(parse_uuid(id)?),
+            sandbox_id: SandboxId(parse_uuid(sandbox_id)?),
+            status: parse_command_status(status)?,
+            argv: serde_json::from_str(argv)?,
+            cwd: row.try_get("cwd")?,
+            exit_code: row.try_get("exit_code")?,
+            stdout: row.try_get("stdout")?,
+            stderr: row.try_get("stderr")?,
+            created_at: parse_timestamp(created_at)?,
+            finished_at: finished_at.map(parse_timestamp).transpose()?,
+        },
+    ))
 }
 
 pub(crate) fn row_to_job(row: AnyRow) -> Result<Job, ApiError> {
+    Ok(job_page_item(row)?.1)
+}
+
+pub(crate) fn job_page_item(row: AnyRow) -> Result<(PageCursor, Job), ApiError> {
     let id: &str = row.try_get("id")?;
     let kind: &str = row.try_get("kind")?;
     let status: &str = row.try_get("status")?;
@@ -384,47 +419,62 @@ pub(crate) fn row_to_job(row: AnyRow) -> Result<Job, ApiError> {
     let required_execution_class: &str = row.try_get("required_execution_class")?;
     let scheduled_at: &str = row.try_get("scheduled_at")?;
     let created_at: &str = row.try_get("created_at")?;
+    let page_cursor = PageCursor::new(created_at, id);
     let updated_at: &str = row.try_get("updated_at")?;
 
-    Ok(Job {
-        id: JobId(parse_uuid(id)?),
-        tenant_id: row.try_get("tenant_id")?,
-        kind: parse_job_kind(kind)?,
-        status: parse_job_status(status)?,
-        payload: serde_json::from_str(payload)?,
-        required_capability: parse_worker_capability(required_capability)?,
-        required_execution_class: ExecutionClass::parse_db_str(required_execution_class).map_err(
-            |_| ApiError::internal("database contains invalid required execution class"),
-        )?,
-        priority: row.try_get("priority")?,
-        attempts: row.try_get("attempts")?,
-        max_attempts: row.try_get("max_attempts")?,
-        scheduled_at: parse_timestamp(scheduled_at)?,
-        created_at: parse_timestamp(created_at)?,
-        updated_at: parse_timestamp(updated_at)?,
-        last_error: row.try_get("last_error")?,
-    })
+    Ok((
+        page_cursor,
+        Job {
+            id: JobId(parse_uuid(id)?),
+            tenant_id: row.try_get("tenant_id")?,
+            kind: parse_job_kind(kind)?,
+            status: parse_job_status(status)?,
+            payload: serde_json::from_str(payload)?,
+            required_capability: parse_worker_capability(required_capability)?,
+            required_execution_class: ExecutionClass::parse_db_str(required_execution_class)
+                .map_err(|_| {
+                    ApiError::internal("database contains invalid required execution class")
+                })?,
+            priority: row.try_get("priority")?,
+            attempts: row.try_get("attempts")?,
+            max_attempts: row.try_get("max_attempts")?,
+            scheduled_at: parse_timestamp(scheduled_at)?,
+            created_at: parse_timestamp(created_at)?,
+            updated_at: parse_timestamp(updated_at)?,
+            last_error: row.try_get("last_error")?,
+        },
+    ))
 }
 
 pub(crate) fn row_to_command_output_chunk(row: AnyRow) -> Result<CommandOutputChunk, ApiError> {
+    Ok(command_output_chunk_page_item(row)?.1)
+}
+
+pub(crate) fn command_output_chunk_page_item(
+    row: AnyRow,
+) -> Result<(PageCursor, CommandOutputChunk), ApiError> {
     let id: &str = row.try_get("id")?;
     let command_id: &str = row.try_get("command_id")?;
     let stream: &str = row.try_get("stream")?;
     let sequence: i64 = row.try_get("sequence")?;
     let annotations: &str = row.try_get("annotations")?;
     let created_at: &str = row.try_get("created_at")?;
+    let page_cursor = PageCursor::new(created_at, id);
 
-    Ok(CommandOutputChunk {
-        id: CommandOutputChunkId(parse_uuid(id)?),
-        command_id: CommandId(parse_uuid(command_id)?),
-        stream: parse_command_output_stream(stream)?,
-        sequence: u64::try_from(sequence)
-            .map_err(|_| ApiError::internal("database contains invalid output sequence"))?,
-        chunk: row.try_get("chunk")?,
-        annotations: serde_json::from_str(annotations)
-            .map_err(|_| ApiError::internal("database contains invalid output annotations"))?,
-        created_at: parse_timestamp(created_at)?,
-    })
+    Ok((
+        page_cursor,
+        CommandOutputChunk {
+            id: CommandOutputChunkId(parse_uuid(id)?),
+            command_id: CommandId(parse_uuid(command_id)?),
+            stream: parse_command_output_stream(stream)?,
+            sequence: u64::try_from(sequence)
+                .map_err(|_| ApiError::internal("database contains invalid output sequence"))?,
+            chunk: row.try_get("chunk")?,
+            annotations: serde_json::from_str(annotations)
+                .map_err(|_| ApiError::internal("database contains invalid output annotations"))?,
+            created_at: parse_timestamp(created_at)?,
+        },
+    ))
 }
 
 pub(crate) fn row_to_lease_without_job(row: AnyRow) -> Result<JobLease, ApiError> {
@@ -652,4 +702,64 @@ pub(crate) fn parse_worker_status(value: &str) -> Result<WorkerStatus, ApiError>
 
 pub(crate) fn parse_event_kind(value: &str) -> Result<SandboxEventKind, ApiError> {
     parse_db_variant(value, "database contains invalid event kind")
+}
+
+#[cfg(test)]
+mod page_item_tests {
+    use super::*;
+    use crate::db::{Database, SqlDialect, migrate_database};
+    use crate::handlers::sandboxes::insert_sandbox;
+    use chrono::Utc;
+    use sandboxwich_core::{
+        ExecutionClass, MemoryLimit, NetworkEgress, Sandbox, SandboxId, SandboxRuntimeProfile,
+        SandboxState, WorkspaceMode,
+    };
+    use sqlx::any::AnyPoolOptions;
+
+    #[tokio::test]
+    async fn sandbox_page_item_cursor_matches_row_keys() {
+        sqlx::any::install_default_drivers();
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let db = Database::from_test_pool(pool, SqlDialect::Sqlite);
+        migrate_database(&db).await.unwrap();
+        let now = Utc::now();
+        let sandbox = Sandbox {
+            id: SandboxId::new(),
+            tenant_id: "tenant-a".into(),
+            name: "page-item".into(),
+            state: SandboxState::Ready,
+            template: "ubuntu-dev".into(),
+            memory_limit: MemoryLimit::FourG,
+            network_egress: NetworkEgress::DenyAll,
+            workspace_mode: WorkspaceMode::Ephemeral,
+            runtime_profile: SandboxRuntimeProfile::Unprivileged,
+            execution_class: ExecutionClass::DevelopmentContainer,
+            created_at: now,
+            updated_at: now,
+            ttl_seconds: Some(3600),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+            last_activity_at: None,
+            parent_snapshot_id: None,
+        };
+        insert_sandbox(&db, &sandbox).await.unwrap();
+        let row = sqlx::query(
+            "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
+                    created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, last_activity_at, parent_snapshot_id
+             from sandboxes where id = ?",
+        )
+        .bind(sandbox.id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let (cursor, decoded) = sandbox_page_item(row).unwrap();
+        assert_eq!(cursor.id, decoded.id.to_string());
+        // Cursor keeps the exact DB timestamp text used for keyset comparison.
+        assert!(!cursor.created_at.is_empty());
+        assert_eq!(decoded.tenant_id, "tenant-a");
+    }
 }

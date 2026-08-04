@@ -207,7 +207,7 @@ pub(crate) async fn list_commands(
         &[sandbox_id.to_string()],
         limit,
         &cursor,
-        row_to_command,
+        command_page_item,
     )
     .await?;
 
@@ -290,7 +290,7 @@ pub(crate) async fn list_events(
         &[sandbox_id.to_string()],
         limit,
         &cursor,
-        row_to_event,
+        event_page_item,
     )
     .await?;
 
@@ -367,7 +367,7 @@ pub(crate) async fn list_command_output_chunks(
         &[command_id.to_string()],
         limit,
         cursor,
-        row_to_command_output_chunk,
+        command_output_chunk_page_item,
     )
     .await
 }

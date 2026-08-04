@@ -78,7 +78,7 @@ pub(crate) async fn metrics(
 }
 
 pub(crate) async fn check_database_health(db: &Database) -> Result<HealthComponent, ApiError> {
-    sqlx::query("select 1").execute(&db.pool).await?;
+    sqlx::query("select 1").execute(db.read_pool()).await?;
     Ok(HealthComponent {
         ok: true,
         message: None,
@@ -373,7 +373,7 @@ pub(crate) async fn fetch_prometheus_metrics(
             query = query.bind(tenant_id.to_string());
         }
     }
-    let rows = query.fetch_all(&db.pool).await?;
+    let rows = query.fetch_all(db.read_pool()).await?;
 
     let mut values = BTreeMap::new();
     for row in rows {
@@ -444,7 +444,7 @@ async fn fetch_resident_observability_metrics(
         resident_query = resident_query.bind(tenant_id);
     }
     let mut resident_counts = Vec::new();
-    for row in resident_query.fetch_all(&db.pool).await? {
+    for row in resident_query.fetch_all(db.read_pool()).await? {
         let state: String = row.try_get("label")?;
         // Keep the label domain bounded even if a database constraint is
         // bypassed during an operator repair.
@@ -475,7 +475,7 @@ async fn fetch_resident_observability_metrics(
         block_query = block_query.bind(tenant_id);
     }
     let mut block_counts = Vec::new();
-    for row in block_query.fetch_all(&db.pool).await? {
+    for row in block_query.fetch_all(db.read_pool()).await? {
         let reason: String = row.try_get("label")?;
         // The schema constrains this domain; retain a read-side guard so an
         // operator repair cannot introduce an unbounded Prometheus label.
