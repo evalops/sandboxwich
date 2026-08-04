@@ -35,8 +35,7 @@
           {"context": "msrv (1.95)"},
           {"context": "service image (sandboxwich-api)"},
           {"context": "service image (sandboxwich-worker)"},
-          {"context": "runtime image (ubuntu-dev)"},
-          {"context": "kind"}
+          {"context": "runtime image (ubuntu-dev)"}
         ]
       }
     }
