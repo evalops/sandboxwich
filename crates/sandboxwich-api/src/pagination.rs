@@ -144,10 +144,10 @@ pub(crate) async fn fetch_keyset_page_from_pool<T>(
 
     let mut query = sqlx::query(&sql);
     for bind in fixed_binds {
-        query = query.bind(bind.clone());
+        query = query.bind(bind.as_str());
     }
     if let Some((created_at, id)) = cursor_bind {
-        query = query.bind(created_at).bind(id);
+        query = query.bind(created_at.as_str()).bind(id.as_str());
     }
 
     let mut rows = query.fetch_all(pool).await?;
