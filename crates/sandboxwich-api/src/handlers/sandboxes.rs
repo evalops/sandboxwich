@@ -1291,7 +1291,7 @@ pub(crate) async fn fetch_sandbox_state(
     );
     let Some(row) = sqlx::query(&sql)
         .bind(sandbox_id.to_string())
-        .fetch_optional(&db.pool)
+        .fetch_optional(db.sandbox_list_pool())
         .await?
     else {
         return Ok(None);
@@ -1375,7 +1375,7 @@ pub(crate) async fn fetch_sandbox(
     );
     let row = sqlx::query(&sql)
         .bind(sandbox_id.to_string())
-        .fetch_optional(&db.pool)
+        .fetch_optional(db.sandbox_list_pool())
         .await?
         .ok_or_else(|| ApiError::not_found("sandbox not found"))?;
 
@@ -1700,7 +1700,7 @@ pub(crate) async fn list_network_allow_rules(
     );
     let rows = sqlx::query(&sql)
         .bind(sandbox_id.to_string())
-        .fetch_all(&db.pool)
+        .fetch_all(db.sandbox_list_pool())
         .await?;
     rows.into_iter().map(row_to_network_allow_rule).collect()
 }
