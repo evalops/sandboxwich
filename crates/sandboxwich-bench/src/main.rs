@@ -1299,9 +1299,11 @@ async fn seed_sandboxes(pool: &AnyPool, options: &SeedOptions) -> anyhow::Result
     let mode_sql = if options.database_url.starts_with("postgres:")
         || options.database_url.starts_with("postgresql:")
     {
-        "update sandboxes set network_egress_mode = $1 where id = $2".to_string()
+        "update sandboxes set network_egress_mode = $1, network_egress_rules_json = $2 where id = $3"
+            .to_string()
     } else {
-        "update sandboxes set network_egress_mode = ? where id = ?".to_string()
+        "update sandboxes set network_egress_mode = ?, network_egress_rules_json = ? where id = ?"
+            .to_string()
     };
 
     for sandbox_index in 0..options.sandboxes {
@@ -1320,12 +1322,25 @@ async fn seed_sandboxes(pool: &AnyPool, options: &SeedOptions) -> anyhow::Result
             .await?;
 
         if sandbox_index < allowlist_count {
+            let rules = options.allowlist_rules_per_sandbox.max(1);
+            // Keep denormalized list JSON in lockstep with the rules table so
+            // GET /sandboxes does not need a second round-trip.
+            let mut rules_json = String::from("[");
+            for rule_index in 0..rules {
+                if rule_index > 0 {
+                    rules_json.push(',');
+                }
+                rules_json.push_str(&format!(
+                    r#"{{"kind":"cidr","value":"10.{rule_index}.0.0/16"}}"#
+                ));
+            }
+            rules_json.push(']');
             sqlx::query(&mode_sql)
                 .bind("allowlist")
+                .bind(&rules_json)
                 .bind(&sandbox_id)
                 .execute(pool)
                 .await?;
-            let rules = options.allowlist_rules_per_sandbox.max(1);
             for rule_index in 0..rules {
                 sqlx::query(&rule_sql)
                     .bind(Uuid::now_v7().to_string())

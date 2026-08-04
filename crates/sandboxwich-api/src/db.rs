@@ -33,7 +33,53 @@ pub(crate) enum SqlDialect {
 pub(crate) async fn migrate_database(db: &Database) -> anyhow::Result<()> {
     MIGRATOR.run(&db.pool).await?;
     backfill_command_output_counters(db).await?;
+    backfill_sandbox_network_egress_rules_json(db).await?;
     ensure_database_constraints(db).await?;
+    Ok(())
+}
+
+/// Populate `sandboxes.network_egress_rules_json` from the normalized rules
+/// table for rows that still have a null denormalized blob (post-migration or
+/// legacy seeds). Idempotent: only touches null columns on allowlist rows.
+pub(crate) async fn backfill_sandbox_network_egress_rules_json(
+    db: &Database,
+) -> anyhow::Result<()> {
+    let sql = match db.dialect {
+        SqlDialect::Sqlite => {
+            "update sandboxes
+             set network_egress_rules_json = (
+                 select coalesce(
+                     json_group_array(json_object('kind', kind, 'value', value)),
+                     '[]'
+                 )
+                 from (
+                     select kind, value
+                     from sandbox_network_egress_rules r
+                     where r.sandbox_id = sandboxes.id
+                     order by kind asc, value asc
+                 )
+             )
+             where network_egress_mode = 'allowlist'
+               and network_egress_rules_json is null"
+        }
+        SqlDialect::Postgres => {
+            "update sandboxes
+             set network_egress_rules_json = (
+                 select coalesce(
+                     json_agg(
+                         json_build_object('kind', kind, 'value', value)
+                         order by kind asc, value asc
+                     )::text,
+                     '[]'
+                 )
+                 from sandbox_network_egress_rules r
+                 where r.sandbox_id = sandboxes.id
+             )
+             where network_egress_mode = 'allowlist'
+               and network_egress_rules_json is null"
+        }
+    };
+    sqlx::query(sql).execute(&db.pool).await?;
     Ok(())
 }
 
@@ -885,17 +931,18 @@ pub(crate) async fn sqlite_rebuild_sandboxes_with_parent_snapshot_fk(
                 check (runtime_profile in ('unprivileged', 'apex_trusted_supervisor_v1')),
             max_lifetime_seconds integer,
             idle_ttl_seconds integer,
-            last_activity_at text
+            last_activity_at text,
+            network_egress_rules_json text
         )",
         "insert into sandboxes_new
             (id, name, state, template, created_at, updated_at, ttl_seconds,
              parent_snapshot_id, tenant_id, memory_limit, network_egress_mode, workspace_mode,
              execution_class, runtime_profile, max_lifetime_seconds, idle_ttl_seconds,
-             last_activity_at)
+             last_activity_at, network_egress_rules_json)
          select id, name, state, template, created_at, updated_at, ttl_seconds,
                 parent_snapshot_id, tenant_id, memory_limit, network_egress_mode, workspace_mode,
                 execution_class, runtime_profile, max_lifetime_seconds, idle_ttl_seconds,
-                last_activity_at
+                last_activity_at, network_egress_rules_json
          from sandboxes",
         "drop table sandboxes",
         "alter table sandboxes_new rename to sandboxes",

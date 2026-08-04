@@ -86,10 +86,11 @@ const LIST_COL_MAX_LIFETIME_SECONDS: usize = 13;
 const LIST_COL_IDLE_TTL_SECONDS: usize = 14;
 const LIST_COL_LAST_ACTIVITY_AT: usize = 15;
 const LIST_COL_PARENT_SNAPSHOT_ID: usize = 16;
+const LIST_COL_NETWORK_EGRESS_RULES_JSON: usize = 17;
 
 /// List-path decoder: ordinal column access avoids repeated named lookups on the
-/// hot GET /sandboxes path. Allowlist rules are attached by a single batched
-/// follow-up query (cheaper than per-row JSON aggregates under allowlist seeds).
+/// hot GET /sandboxes path. Allowlist rules come from the denormalized
+/// `network_egress_rules_json` column (single SELECT, no second round-trip).
 pub(crate) fn sandbox_list_page_item(row: AnyRow) -> Result<(PageCursor, Sandbox), ApiError> {
     let id: &str = row.try_get(LIST_COL_ID)?;
     let tenant_id: String = row.try_get(LIST_COL_TENANT_ID)?;
@@ -108,11 +109,14 @@ pub(crate) fn sandbox_list_page_item(row: AnyRow) -> Result<(PageCursor, Sandbox
     let idle_ttl_seconds: Option<i64> = row.try_get(LIST_COL_IDLE_TTL_SECONDS)?;
     let last_activity_at: Option<&str> = row.try_get(LIST_COL_LAST_ACTIVITY_AT)?;
     let parent_snapshot_id: Option<&str> = row.try_get(LIST_COL_PARENT_SNAPSHOT_ID)?;
+    let rules_json: Option<&str> = row.try_get(LIST_COL_NETWORK_EGRESS_RULES_JSON)?;
     let page_cursor = PageCursor::new(created_at, id);
     let network_egress = match parse_network_egress_mode(network_egress_mode)? {
         NetworkEgressMode::DenyAll => NetworkEgress::DenyAll,
         NetworkEgressMode::AllowAll => NetworkEgress::AllowAll,
-        NetworkEgressMode::Allowlist => NetworkEgress::Allowlist { rules: Vec::new() },
+        NetworkEgressMode::Allowlist => NetworkEgress::Allowlist {
+            rules: parse_network_egress_rules_json(rules_json)?,
+        },
     };
 
     Ok((
@@ -142,6 +146,17 @@ pub(crate) fn sandbox_list_page_item(row: AnyRow) -> Result<(PageCursor, Sandbox
                 .transpose()?,
         },
     ))
+}
+
+pub(crate) fn parse_network_egress_rules_json(
+    raw: Option<&str>,
+) -> Result<Vec<NetworkAllowRule>, ApiError> {
+    let Some(raw) = raw.filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str(raw).map_err(|_| {
+        ApiError::internal("database contains invalid network egress rules json")
+    })
 }
 
 pub(crate) fn row_to_resident_process(row: AnyRow) -> Result<ResidentProcess, ApiError> {
