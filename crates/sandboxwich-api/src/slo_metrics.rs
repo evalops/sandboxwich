@@ -2,16 +2,31 @@ use crate::db::Database;
 use crate::error::ApiError;
 use crate::health::escape_prometheus_label;
 use crate::rows::parse_timestamp;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sqlx::Row;
 use std::collections::BTreeMap;
 use std::time::Instant;
 
 const LATENCY_BUCKETS: &[f64] = &[1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 900.0];
+/// `/metrics` only materializes raw observations from this recent window.
+/// Older rows remain durable for later rollup work (#262); scrapes must stay
+/// O(recent) rather than O(lifetime history).
+const METRICS_RAW_RETENTION: ChronoDuration = ChronoDuration::days(14);
+/// Hard safety cap on rows examined per observation family. When exceeded the
+/// scrape still succeeds but reports truncation so operators can see budget
+/// pressure before latency collapses.
+const METRICS_MAX_ROWS_PER_FAMILY: i64 = 50_000;
+
 #[derive(Clone)]
 struct Observation {
     labels: Vec<String>,
     seconds: f64,
+}
+
+struct ObservationBatch {
+    observations: Vec<Observation>,
+    rows_examined: u64,
+    truncated: bool,
 }
 
 pub(crate) async fn append_slo_metrics(
@@ -19,66 +34,146 @@ pub(crate) async fn append_slo_metrics(
     db: &Database,
     tenant_id: Option<&str>,
 ) -> Result<(), ApiError> {
-    let creation = fetch_creation_observations(db, tenant_id).await?;
+    let scrape_started = Instant::now();
+    let since = Utc::now() - METRICS_RAW_RETENTION;
+    let since = since.to_rfc3339();
+
+    let creation = fetch_creation_observations(db, tenant_id, &since).await?;
     append_histogram(
         body,
         "sandboxwich_sandbox_creation_seconds",
         "Sandbox creation latency from scheduling to terminal provisioning outcome.",
         &["workspace_mode", "start_type", "outcome"],
-        &creation,
+        &creation.observations,
     );
     append_counter_from_observations(
         body,
         "sandboxwich_sandbox_creation_total",
         "Terminal sandbox creation outcomes.",
         &["workspace_mode", "start_type", "outcome"],
-        &creation,
+        &creation.observations,
     );
+    let command = fetch_simple_terminal_observations(db, tenant_id, "command", &since).await?;
     append_histogram(
         body,
         "sandboxwich_command_duration_seconds",
         "Terminal command latency.",
         &["outcome"],
-        &fetch_simple_terminal_observations(db, tenant_id, "command").await?,
+        &command.observations,
     );
+    let cleanup = fetch_simple_terminal_observations(db, tenant_id, "cleanup", &since).await?;
     append_histogram(
         body,
         "sandboxwich_cleanup_duration_seconds",
         "Sandbox cleanup job latency.",
         &["outcome"],
-        &fetch_simple_terminal_observations(db, tenant_id, "cleanup").await?,
+        &cleanup.observations,
     );
+    let claim = fetch_claim_observations(db, tenant_id, &since).await?;
     append_histogram(
         body,
         "sandboxwich_worker_claim_seconds",
         "Delay from job scheduling to the first worker lease.",
         &["job_kind"],
-        &fetch_claim_observations(db, tenant_id).await?,
+        &claim.observations,
     );
+    let stage = fetch_stage_observations(db, tenant_id, &since).await?;
     append_histogram(
         body,
         "sandboxwich_provisioning_stage_seconds",
         "Elapsed time between durable provisioning stages.",
         &["stage", "workspace_mode", "error_class"],
-        &fetch_stage_observations(db, tenant_id).await?,
+        &stage.observations,
     );
+
+    let rows_examined = creation.rows_examined
+        + command.rows_examined
+        + cleanup.rows_examined
+        + claim.rows_examined
+        + stage.rows_examined;
+    let truncated = creation.truncated
+        || command.truncated
+        || cleanup.truncated
+        || claim.truncated
+        || stage.truncated;
+    let scrape_seconds = scrape_started.elapsed().as_secs_f64();
+    // Result bytes are measured by the caller after the body is fully built;
+    // here we only emit scrape-side cost that this module controls.
+    body.push_str(
+        "# HELP sandboxwich_metrics_scrape_duration_seconds Wall time to build SLO histograms from recent observations.\n",
+    );
+    body.push_str("# TYPE sandboxwich_metrics_scrape_duration_seconds gauge\n");
+    body.push_str(&format!(
+        "sandboxwich_metrics_scrape_duration_seconds {scrape_seconds:.6}\n"
+    ));
+    body.push_str(
+        "# HELP sandboxwich_metrics_rows_examined Observation rows loaded while building the last /metrics scrape.\n",
+    );
+    body.push_str("# TYPE sandboxwich_metrics_rows_examined gauge\n");
+    body.push_str(&format!(
+        "sandboxwich_metrics_rows_examined {rows_examined}\n"
+    ));
+    body.push_str(
+        "# HELP sandboxwich_metrics_scrape_truncated 1 when a family hit METRICS_MAX_ROWS_PER_FAMILY during the last scrape.\n",
+    );
+    body.push_str("# TYPE sandboxwich_metrics_scrape_truncated gauge\n");
+    body.push_str(&format!(
+        "sandboxwich_metrics_scrape_truncated {}\n",
+        if truncated { 1 } else { 0 }
+    ));
+    if scrape_seconds >= 0.5 || truncated {
+        tracing::warn!(
+            tenant_id = tenant_id.unwrap_or("operator"),
+            rows_examined,
+            truncated,
+            scrape_seconds,
+            "sandboxwich_metrics_scrape_slow"
+        );
+    }
     Ok(())
 }
 
 async fn fetch_creation_observations(
     db: &Database,
     tenant_id: Option<&str>,
-) -> Result<Vec<Observation>, ApiError> {
-    let tenant_filter = tenant_id
-        .map(|_| format!(" and tenant_id = {}", db.placeholder(1)))
-        .unwrap_or_default();
-    let sql = format!(
-        "select outcome, workspace_mode, start_type, duration_ms
-         from terminal_slo_observations
-         where metric_kind = 'sandbox_creation'{tenant_filter}"
-    );
-    let rows = fetch_rows(db, &sql, tenant_id).await?;
-    rows.into_iter()
+    since: &str,
+) -> Result<ObservationBatch, ApiError> {
+    let (sql, binds) = if let Some(tenant_id) = tenant_id {
+        (
+            format!(
+                "select outcome, workspace_mode, start_type, duration_ms
+                 from terminal_slo_observations
+                 where metric_kind = 'sandbox_creation'
+                   and observed_at >= {}
+                   and tenant_id = {}
+                 order by observed_at desc
+                 limit {}",
+                db.placeholder(1),
+                db.placeholder(2),
+                db.placeholder(3)
+            ),
+            vec![since, tenant_id],
+        )
+    } else {
+        (
+            format!(
+                "select outcome, workspace_mode, start_type, duration_ms
+                 from terminal_slo_observations
+                 where metric_kind = 'sandbox_creation'
+                   and observed_at >= {}
+                 order by observed_at desc
+                 limit {}",
+                db.placeholder(1),
+                db.placeholder(2)
+            ),
+            vec![since],
+        )
+    };
+    let rows = fetch_rows_with_limit(db, &sql, &binds).await?;
+    let truncated = rows.len() as i64 >= METRICS_MAX_ROWS_PER_FAMILY;
+    let rows_examined = rows.len() as u64;
+    let observations = rows
+        .into_iter()
         .map(|row| {
             let duration_ms: i64 = row.try_get("duration_ms")?;
             Ok(Observation {
@@ -90,29 +185,58 @@ async fn fetch_creation_observations(
                 seconds: duration_ms.max(0) as f64 / 1000.0,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok(ObservationBatch {
+        observations,
+        rows_examined,
+        truncated,
+    })
 }
 
 async fn fetch_simple_terminal_observations(
     db: &Database,
     tenant_id: Option<&str>,
     family: &str,
-) -> Result<Vec<Observation>, ApiError> {
+    since: &str,
+) -> Result<ObservationBatch, ApiError> {
     let metric_kind = match family {
         "command" => "command",
         "cleanup" => "cleanup",
         _ => unreachable!("bounded metric family"),
     };
-    let base = format!(
-        "select outcome, duration_ms from terminal_slo_observations where metric_kind = '{metric_kind}'"
-    );
-    let sql = if tenant_id.is_some() {
-        format!("{base} and tenant_id = {}", db.placeholder(1))
+    let (sql, binds) = if let Some(tenant_id) = tenant_id {
+        (
+            format!(
+                "select outcome, duration_ms from terminal_slo_observations
+                 where metric_kind = '{metric_kind}'
+                   and observed_at >= {}
+                   and tenant_id = {}
+                 order by observed_at desc
+                 limit {}",
+                db.placeholder(1),
+                db.placeholder(2),
+                db.placeholder(3)
+            ),
+            vec![since, tenant_id],
+        )
     } else {
-        base.to_string()
+        (
+            format!(
+                "select outcome, duration_ms from terminal_slo_observations
+                 where metric_kind = '{metric_kind}'
+                   and observed_at >= {}
+                 order by observed_at desc
+                 limit {}",
+                db.placeholder(1),
+                db.placeholder(2)
+            ),
+            vec![since],
+        )
     };
-    fetch_rows(db, &sql, tenant_id)
-        .await?
+    let rows = fetch_rows_with_limit(db, &sql, &binds).await?;
+    let truncated = rows.len() as i64 >= METRICS_MAX_ROWS_PER_FAMILY;
+    let rows_examined = rows.len() as u64;
+    let observations = rows
         .into_iter()
         .map(|row| {
             let duration_ms: i64 = row.try_get("duration_ms")?;
@@ -121,23 +245,54 @@ async fn fetch_simple_terminal_observations(
                 seconds: duration_ms.max(0) as f64 / 1000.0,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok(ObservationBatch {
+        observations,
+        rows_examined,
+        truncated,
+    })
 }
 
 async fn fetch_claim_observations(
     db: &Database,
     tenant_id: Option<&str>,
-) -> Result<Vec<Observation>, ApiError> {
-    let filter = tenant_id
-        .map(|_| format!(" where j.tenant_id = {}", db.placeholder(1)))
-        .unwrap_or_default();
-    let sql = format!(
-        "select j.kind, j.scheduled_at, min(l.leased_at) as leased_at
-         from jobs j join job_leases l on l.job_id = j.id{filter}
-         group by j.id, j.kind, j.scheduled_at"
-    );
-    fetch_rows(db, &sql, tenant_id)
-        .await?
+    since: &str,
+) -> Result<ObservationBatch, ApiError> {
+    let (sql, binds) = if let Some(tenant_id) = tenant_id {
+        (
+            format!(
+                "select j.kind, j.scheduled_at, min(l.leased_at) as leased_at
+                 from jobs j join job_leases l on l.job_id = j.id
+                 where j.tenant_id = {}
+                   and l.leased_at >= {}
+                 group by j.id, j.kind, j.scheduled_at
+                 order by min(l.leased_at) desc
+                 limit {}",
+                db.placeholder(1),
+                db.placeholder(2),
+                db.placeholder(3)
+            ),
+            vec![tenant_id, since],
+        )
+    } else {
+        (
+            format!(
+                "select j.kind, j.scheduled_at, min(l.leased_at) as leased_at
+                 from jobs j join job_leases l on l.job_id = j.id
+                 where l.leased_at >= {}
+                 group by j.id, j.kind, j.scheduled_at
+                 order by min(l.leased_at) desc
+                 limit {}",
+                db.placeholder(1),
+                db.placeholder(2)
+            ),
+            vec![since],
+        )
+    };
+    let rows = fetch_rows_with_limit(db, &sql, &binds).await?;
+    let truncated = rows.len() as i64 >= METRICS_MAX_ROWS_PER_FAMILY;
+    let rows_examined = rows.len() as u64;
+    let observations = rows
         .into_iter()
         .map(|row| {
             Ok(Observation {
@@ -148,25 +303,52 @@ async fn fetch_claim_observations(
                 ),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok(ObservationBatch {
+        observations,
+        rows_examined,
+        truncated,
+    })
 }
 
 async fn fetch_stage_observations(
     db: &Database,
     tenant_id: Option<&str>,
-) -> Result<Vec<Observation>, ApiError> {
-    let filter = tenant_id
-        .map(|_| format!(" and o.tenant_id = {}", db.placeholder(1)))
-        .unwrap_or_default();
-    let sql = format!(
-        "select o.lease_id, o.stage, o.error_class, o.started_at, o.observed_at,
-                o.workspace_mode
-         from provisioning_stage_observations o
-         where 1 = 1{filter}
-         order by o.lease_id, o.observed_at, o.stage_index"
-    );
+    since: &str,
+) -> Result<ObservationBatch, ApiError> {
+    let (sql, binds) = if let Some(tenant_id) = tenant_id {
+        (
+            format!(
+                "select o.lease_id, o.stage, o.error_class, o.started_at, o.observed_at,
+                        o.workspace_mode
+                 from provisioning_stage_observations o
+                 where o.observed_at >= {}
+                   and o.tenant_id = {}
+                 order by o.lease_id, o.observed_at, o.stage_index
+                 limit {}",
+                db.placeholder(1),
+                db.placeholder(2),
+                db.placeholder(3)
+            ),
+            vec![since, tenant_id],
+        )
+    } else {
+        (
+            format!(
+                "select o.lease_id, o.stage, o.error_class, o.started_at, o.observed_at,
+                        o.workspace_mode
+                 from provisioning_stage_observations o
+                 where o.observed_at >= {}
+                 order by o.lease_id, o.observed_at, o.stage_index
+                 limit {}",
+                db.placeholder(1),
+                db.placeholder(2)
+            ),
+            vec![since],
+        )
+    };
     let started = Instant::now();
-    let rows = fetch_rows(db, &sql, tenant_id).await?;
+    let rows = fetch_rows_with_limit(db, &sql, &binds).await?;
     let duration_ms = started.elapsed().as_millis() as u64;
     if duration_ms >= 500 {
         tracing::warn!(
@@ -183,13 +365,15 @@ async fn fetch_stage_observations(
             "sandboxwich_provisioning_stage_metrics_completed"
         );
     }
+    let truncated = rows.len() as i64 >= METRICS_MAX_ROWS_PER_FAMILY;
+    let rows_examined = rows.len() as u64;
     let mut previous = BTreeMap::<String, DateTime<Utc>>::new();
     let mut observations = Vec::with_capacity(rows.len());
     for row in rows {
         let lease_id: String = row.try_get("lease_id")?;
         let observed = timestamp(&row, "observed_at")?;
-        let started = timestamp(&row, "started_at")?;
-        let prior = previous.insert(lease_id, observed).unwrap_or(started);
+        let started_at = timestamp(&row, "started_at")?;
+        let prior = previous.insert(lease_id, observed).unwrap_or(started_at);
         let error_class: Option<String> = row.try_get("error_class")?;
         observations.push(Observation {
             labels: vec![
@@ -200,17 +384,25 @@ async fn fetch_stage_observations(
             seconds: elapsed_seconds(prior, observed),
         });
     }
-    Ok(observations)
+    Ok(ObservationBatch {
+        observations,
+        rows_examined,
+        truncated,
+    })
 }
 
-async fn fetch_rows(
+async fn fetch_rows_with_limit(
     db: &Database,
     sql: &str,
-    tenant_id: Option<&str>,
+    string_binds: &[&str],
 ) -> Result<Vec<sqlx::any::AnyRow>, ApiError> {
     let mut query = sqlx::query(sql);
-    if let Some(tenant_id) = tenant_id {
-        query = query.bind(tenant_id);
+    for value in string_binds {
+        query = query.bind(*value);
+    }
+    // Limit is always the last bind when present in the SQL.
+    if sql.contains("limit ") {
+        query = query.bind(METRICS_MAX_ROWS_PER_FAMILY);
     }
     Ok(query.fetch_all(&db.pool).await?)
 }
@@ -248,53 +440,51 @@ fn append_histogram(
     label_names: &[&str],
     observations: &[Observation],
 ) {
-    let mut groups = BTreeMap::<Vec<String>, Vec<f64>>::new();
+    // One pass: count per (labels, first bucket index that contains the sample).
+    // Cumulative le= buckets and +Inf are derived from those per-bucket counts.
+    let mut bucket_counts = BTreeMap::<(Vec<String>, usize), u64>::new();
+    let mut sums = BTreeMap::<Vec<String>, f64>::new();
+    let mut counts = BTreeMap::<Vec<String>, u64>::new();
     for observation in observations {
-        groups
-            .entry(observation.labels.clone())
-            .or_default()
-            .push(observation.seconds);
+        let index = LATENCY_BUCKETS
+            .partition_point(|limit| *limit < observation.seconds)
+            .min(LATENCY_BUCKETS.len());
+        *bucket_counts
+            .entry((observation.labels.clone(), index))
+            .or_default() += 1;
+        *sums.entry(observation.labels.clone()).or_default() += observation.seconds;
+        *counts.entry(observation.labels.clone()).or_default() += 1;
     }
+
     body.push_str(&format!("# HELP {name} {help}\n# TYPE {name} histogram\n"));
-    for (labels, values) in groups {
-        let mut bucket_counts = [0_u64; LATENCY_BUCKETS.len()];
-        let mut sum = 0.0;
-        for value in values.iter().copied() {
-            // LATENCY_BUCKETS is sorted ascending. Classifying each sample
-            // once and then accumulating the bucket counts avoids scanning
-            // the entire group once per bucket (the old path did eight full
-            // passes for every label group).
-            let bucket = if value.is_nan() {
-                // Preserve the old behavior for invalid observations: NaN is
-                // included in the +Inf count but never in a finite bucket.
-                LATENCY_BUCKETS.len()
-            } else {
-                LATENCY_BUCKETS.partition_point(|limit| *limit < value)
-            };
-            if let Some(count) = bucket_counts.get_mut(bucket) {
-                *count += 1;
-            }
-            sum += value;
-        }
+    let label_sets: Vec<Vec<String>> = counts.keys().cloned().collect();
+    for labels in label_sets {
         let mut cumulative = 0_u64;
-        for (index, bucket) in LATENCY_BUCKETS.iter().enumerate() {
-            cumulative += bucket_counts[index];
+        for (bucket_index, le) in LATENCY_BUCKETS.iter().enumerate() {
+            cumulative += bucket_counts
+                .get(&(labels.clone(), bucket_index))
+                .copied()
+                .unwrap_or(0);
             append_sample(
                 body,
                 &format!("{name}_bucket"),
                 label_names,
                 &labels,
-                Some(&bucket.to_string()),
+                Some(*le),
                 cumulative as f64,
             );
         }
+        cumulative += bucket_counts
+            .get(&(labels.clone(), LATENCY_BUCKETS.len()))
+            .copied()
+            .unwrap_or(0);
         append_sample(
             body,
             &format!("{name}_bucket"),
             label_names,
             &labels,
-            Some("+Inf"),
-            values.len() as f64,
+            Some(f64::INFINITY),
+            cumulative as f64,
         );
         append_sample(
             body,
@@ -302,7 +492,7 @@ fn append_histogram(
             label_names,
             &labels,
             None,
-            sum,
+            sums.get(&labels).copied().unwrap_or(0.0),
         );
         append_sample(
             body,
@@ -310,7 +500,7 @@ fn append_histogram(
             label_names,
             &labels,
             None,
-            values.len() as f64,
+            counts.get(&labels).copied().unwrap_or(0) as f64,
         );
     }
 }
@@ -320,20 +510,20 @@ fn append_sample(
     name: &str,
     label_names: &[&str],
     label_values: &[String],
-    le: Option<&str>,
+    le: Option<f64>,
     value: f64,
 ) {
     body.push_str(name);
     body.push('{');
     let mut first = true;
-    for (label_name, label_value) in label_names.iter().zip(label_values) {
+    for (name, value) in label_names.iter().zip(label_values.iter()) {
         if !first {
             body.push(',');
         }
         first = false;
-        body.push_str(label_name);
+        body.push_str(name);
         body.push_str("=\"");
-        body.push_str(&escape_prometheus_label(label_value));
+        body.push_str(&escape_prometheus_label(value));
         body.push('"');
     }
     if let Some(le) = le {
@@ -341,12 +531,14 @@ fn append_sample(
             body.push(',');
         }
         body.push_str("le=\"");
-        body.push_str(le);
+        if le.is_infinite() {
+            body.push_str("+Inf");
+        } else {
+            body.push_str(&format!("{le}"));
+        }
         body.push('"');
     }
-    body.push_str("} ");
-    body.push_str(&value.to_string());
-    body.push('\n');
+    body.push_str(&format!("}} {value}\n"));
 }
 
 #[cfg(test)]
@@ -357,38 +549,30 @@ mod tests {
     fn histogram_classifies_each_observation_once_and_keeps_cumulative_buckets() {
         let observations = vec![
             Observation {
-                labels: vec!["success".to_string()],
-                seconds: 1.0,
+                labels: vec!["ok".into()],
+                seconds: 0.5,
             },
             Observation {
-                labels: vec!["success".to_string()],
-                seconds: 5.0,
+                labels: vec!["ok".into()],
+                seconds: 20.0,
             },
             Observation {
-                labels: vec!["success".to_string()],
-                seconds: 15.0,
-            },
-            Observation {
-                labels: vec!["success".to_string()],
-                seconds: 16.0,
+                labels: vec!["ok".into()],
+                seconds: 1_000.0,
             },
         ];
         let mut body = String::new();
-
         append_histogram(
             &mut body,
             "sandboxwich_test_seconds",
-            "Test latency.",
+            "test",
             &["outcome"],
             &observations,
         );
-
         assert!(body.contains("le=\"1\"} 1\n"));
-        assert!(body.contains("le=\"5\"} 2\n"));
-        assert!(body.contains("le=\"15\"} 3\n"));
-        assert!(body.contains("le=\"30\"} 4\n"));
-        assert!(body.contains("le=\"+Inf\"} 4\n"));
-        assert!(body.contains("sandboxwich_test_seconds_sum{outcome=\"success\"} 37\n"));
-        assert!(body.contains("sandboxwich_test_seconds_count{outcome=\"success\"} 4\n"));
+        assert!(body.contains("le=\"30\"} 2\n"));
+        assert!(body.contains("le=\"+Inf\"} 3\n"));
+        assert!(body.contains("sandboxwich_test_seconds_count{outcome=\"ok\"} 3\n"));
+        assert!(body.contains("sandboxwich_test_seconds_sum{outcome=\"ok\"} 1020.5\n"));
     }
 }
