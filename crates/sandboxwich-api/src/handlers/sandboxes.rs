@@ -736,17 +736,28 @@ pub(crate) async fn stop_sandbox(
 /// unit tests exercising one transition at a time), whereas this one only
 /// needs to report "someone else already moved it" for the one live route
 /// that calls [`stop_sandbox_via_job`] directly.
-async fn sandbox_state_http_conflict(
+pub(crate) async fn sandbox_state_http_conflict(
     db: &Database,
     sandbox_id: SandboxId,
 ) -> Result<ApiError, ApiError> {
     Ok(match fetch_sandbox_state(db, sandbox_id).await? {
         None => ApiError::not_found("sandbox not found"),
-        Some(actual) => ApiError::conflict(format!(
-            "cannot stop sandbox {sandbox_id}: it was concurrently stopped or archived \
-             already (currently {})",
-            state_to_str(&actual)
-        )),
+        Some(actual) => {
+            let message = format!(
+                "cannot stop sandbox {sandbox_id}: it was concurrently stopped or archived \
+                 already (currently {})",
+                state_to_str(&actual)
+            );
+            if matches!(actual, SandboxState::Archiving | SandboxState::Archived) {
+                // Stop is an idempotent cleanup operation once teardown has
+                // already won the state CAS. Keep the stable code narrow:
+                // every other 409 still means the caller attempted an
+                // invalid transition and must not be swallowed by a worker.
+                ApiError::conflict_code("sandbox_stop_already_in_progress", message)
+            } else {
+                ApiError::conflict(message)
+            }
+        }
     })
 }
 
