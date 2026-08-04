@@ -1086,14 +1086,15 @@ fn isolated_sidecar_run_observes_terminal_state_and_always_cleans_up() {
 }
 
 #[test]
-fn isolated_sidecar_pending_is_not_acknowledged_and_times_out_retryably() {
+fn isolated_sidecar_pending_publishes_identity_and_times_out_retryably() {
     let (kubectl, log_path) = write_pending_isolated_sidecar_fake_kubectl();
     let provider = isolated_sidecar_apply_provider(&kubectl)
         .with_isolated_resident_process_startup_timeout(Duration::from_millis(45));
+    let spec = isolated_sidecar_spec(b"pending-deadline-canary");
     let mut observations = Vec::new();
     let error = provider
         .run_isolated_resident_process(
-            &isolated_sidecar_spec(b"pending-deadline-canary"),
+            &spec,
             &CancelSignal::never_cancelled(),
             &mut |observation| {
                 observations.push(observation);
@@ -1108,9 +1109,18 @@ fn isolated_sidecar_pending_is_not_acknowledged_and_times_out_retryably() {
             .find_map(|cause| cause.downcast_ref::<ProviderError>())
             .is_some_and(|error| error.disposition() == RetryDisposition::Retryable)
     );
-    assert_eq!(observations.len(), 1);
-    assert_eq!(observations[0].state, IsolatedResidentProcessState::Failed);
+    assert_eq!(observations.len(), 2);
+    assert_eq!(
+        observations[0].state,
+        IsolatedResidentProcessState::Starting
+    );
+    assert_eq!(
+        observations[0].pod_name,
+        isolated_resident_process_pod_name(&spec)
+    );
     assert_eq!(observations[0].pod_uid.as_deref(), Some("pending-pod-uid"));
+    assert_eq!(observations[1].state, IsolatedResidentProcessState::Failed);
+    assert_eq!(observations[1].pod_uid.as_deref(), Some("pending-pod-uid"));
 
     let dir = kubectl.parent().expect("pending fake kubectl parent");
     let get_count: usize = std::fs::read_to_string(dir.join("get.count"))
