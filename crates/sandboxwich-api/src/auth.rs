@@ -144,7 +144,7 @@ pub(crate) async fn resolve_guest_token(
     );
     let Some(row) = sqlx::query(&sql)
         .bind(hash)
-        .fetch_optional(&db.pool)
+        .fetch_optional(db.read_pool())
         .await?
     else {
         return Ok(None);
@@ -200,7 +200,7 @@ pub(crate) async fn resolve_worker_token(
     );
     let Some(row) = sqlx::query(&sql)
         .bind(hash)
-        .fetch_optional(&db.pool)
+        .fetch_optional(db.read_pool())
         .await?
     else {
         return Ok(None);
@@ -358,7 +358,7 @@ pub(crate) async fn ensure_lease_worker_scope(
         );
         let Some(process) = sqlx::query(&sql)
             .bind(process_id)
-            .fetch_optional(&db.pool)
+            .fetch_optional(db.read_pool())
             .await?
         else {
             return Err(ApiError::not_found("resource not found"));
@@ -521,7 +521,7 @@ pub(crate) async fn worker_owns_sandbox(
     let exists = sqlx::query(&sql)
         .bind(sandbox_id.to_string())
         .bind(worker_id.to_string())
-        .fetch_optional(&db.pool)
+        .fetch_optional(db.read_pool())
         .await?;
     Ok(exists.is_some())
 }

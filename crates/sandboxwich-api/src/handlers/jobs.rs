@@ -527,7 +527,7 @@ pub(crate) async fn list_jobs(
         std::slice::from_ref(&ctx.tenant_id),
         limit,
         &cursor,
-        row_to_job,
+        job_page_item,
     )
     .await?;
 
