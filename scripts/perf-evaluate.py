@@ -20,9 +20,14 @@ from typing import Final
 
 
 ROOT: Final = Path(__file__).resolve().parent.parent
-API_BIN: Final = ROOT / "target/debug/sandboxwich-api"
-WORKER_BIN: Final = ROOT / "target/debug/sandboxwich-worker"
-BENCH_BIN: Final = ROOT / "target/debug/sandboxwich-bench"
+PERF_PROFILE: Final = os.environ.get("SANDBOXWICH_PERF_PROFILE", "debug")
+if PERF_PROFILE not in {"debug", "release"}:
+    raise SystemExit(
+        f"SANDBOXWICH_PERF_PROFILE must be debug or release, got {PERF_PROFILE!r}"
+    )
+API_BIN: Final = ROOT / f"target/{PERF_PROFILE}/sandboxwich-api"
+WORKER_BIN: Final = ROOT / f"target/{PERF_PROFILE}/sandboxwich-worker"
+BENCH_BIN: Final = ROOT / f"target/{PERF_PROFILE}/sandboxwich-bench"
 
 HTTP_SECTIONS: Final = {
     "warm startup": ("warm_startup", 2_000.0),
@@ -146,18 +151,21 @@ def parse_report(report: str, wall_seconds: float) -> dict[str, float | int]:
 def ensure_binaries() -> None:
     if all(binary.is_file() for binary in (API_BIN, WORKER_BIN, BENCH_BIN)):
         return
+    command = [
+        "cargo",
+        "build",
+        "--locked",
+        "-p",
+        "sandboxwich-api",
+        "-p",
+        "sandboxwich-worker",
+        "-p",
+        "sandboxwich-bench",
+    ]
+    if PERF_PROFILE == "release":
+        command.append("--release")
     subprocess.run(
-        [
-            "cargo",
-            "build",
-            "--locked",
-            "-p",
-            "sandboxwich-api",
-            "-p",
-            "sandboxwich-worker",
-            "-p",
-            "sandboxwich-bench",
-        ],
+        command,
         cwd=ROOT,
         check=True,
         stdout=sys.stderr,

@@ -371,29 +371,62 @@ pub(crate) async fn list_sandboxes(
     let limit = resolve_page_limit(page.limit)?;
     let cursor = resolve_page_cursor(&page)?;
 
+    // Fold allowlist rule hydration into the page query so allowlist-heavy pages
+    // pay one round trip. DenyAll/AllowAll short-circuit the subquery via CASE.
+    let allow_rules_sql = sandbox_list_allow_rules_json_sql(state.db.dialect);
     let base_sql = format!(
         "select id, tenant_id, name, state, template, memory_limit, network_egress_mode, workspace_mode, runtime_profile, execution_class,
-                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, last_activity_at, parent_snapshot_id
+                created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, last_activity_at, parent_snapshot_id,
+                {allow_rules_sql} as allow_rules_json
          from sandboxes
          where tenant_id = {}",
         state.db.placeholder(1)
     );
-    let (mut sandboxes, next_cursor) = fetch_keyset_page(
+    let (sandboxes, next_cursor) = fetch_keyset_page(
         &state.db,
         &base_sql,
         std::slice::from_ref(&ctx.tenant_id),
         limit,
         &cursor,
-        sandbox_page_item,
+        sandbox_list_page_item,
     )
     .await?;
-    hydrate_sandboxes_network_egress(&state.db, &mut sandboxes).await?;
 
     Ok(sandbox_list_response(SandboxListResponse {
         ok: true,
         sandboxes,
         next_cursor,
     }))
+}
+
+/// Portable correlated subquery that embeds allowlist rules as JSON for the list page.
+/// Non-allowlist rows evaluate the CASE to NULL so the subquery does not run.
+pub(crate) fn sandbox_list_allow_rules_json_sql(dialect: SqlDialect) -> &'static str {
+    match dialect {
+        SqlDialect::Sqlite => {
+            "case when sandboxes.network_egress_mode = 'allowlist' then (
+                select coalesce(json_group_array(json_object('kind', kind, 'value', value)), '[]')
+                from (
+                    select kind, value
+                    from sandbox_network_egress_rules r
+                    where r.sandbox_id = sandboxes.id
+                    order by kind asc, value asc
+                )
+             ) else null end"
+        }
+        SqlDialect::Postgres => {
+            "case when sandboxes.network_egress_mode = 'allowlist' then (
+                select coalesce(
+                    (
+                        select json_agg(json_build_object('kind', kind, 'value', value) order by kind, value)::text
+                        from sandbox_network_egress_rules r
+                        where r.sandbox_id = sandboxes.id
+                    ),
+                    '[]'
+                )
+             ) else null end"
+        }
+    }
 }
 
 /// Rough upper bound for one sandbox object in the list JSON body. Used only to
@@ -1688,6 +1721,9 @@ pub(crate) fn child_sandbox_id_from_job(job: &Job) -> Result<SandboxId, ApiError
 /// Hydrate every `Allowlist` sandbox's network egress rules with a single batched query instead
 /// of one `select` per sandbox, so listing a full page (up to `MAX_PAGE_LIMIT` sandboxes) never
 /// issues more than one extra round-trip regardless of how many of them are on the allowlist tier.
+/// Batched allowlist hydration for multi-row responses that do not embed rules
+/// in the primary SELECT (list embeds rules; other surfaces still use this).
+#[allow(dead_code)]
 pub(crate) async fn hydrate_sandboxes_network_egress(
     db: &Database,
     sandboxes: &mut [Sandbox],
@@ -1714,6 +1750,7 @@ pub(crate) async fn hydrate_sandboxes_network_egress(
 /// Batched counterpart to [`list_network_allow_rules`]: fetches rules for every id in
 /// `sandbox_ids` with a single `sandbox_id in (...)` query and groups them in memory, rather than
 /// issuing one query per sandbox.
+#[allow(dead_code)]
 pub(crate) async fn list_network_allow_rules_for_sandboxes(
     db: &Database,
     sandbox_ids: &[SandboxId],
