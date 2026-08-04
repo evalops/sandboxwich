@@ -235,6 +235,9 @@ pub(crate) async fn claim_lease(
     query.push_bind(CLAIM_SCAN_BUDGET);
     let rows = query.build().fetch_all(&state.db.pool).await?;
 
+    // Shared across the candidate window so many jobs for the same sandbox only
+    // pay one sandbox + secret-mounts read during placement refresh.
+    let mut placement_cache = crate::handlers::jobs::PlacementEnrichmentCache::new();
     for row in rows {
         let mut job = row_to_job(row)?;
         // Defense in depth: SQL is the efficient scheduling filter, but keep the typed
@@ -243,7 +246,9 @@ pub(crate) async fn claim_lease(
         if !worker.capabilities.contains(&job.required_capability) {
             continue;
         }
-        if !authoritatively_refresh_job_placement(&state.db, &mut job).await? {
+        if !authoritatively_refresh_job_placement_cached(&state.db, &mut job, &mut placement_cache)
+            .await?
+        {
             continue;
         }
         if !worker_supports_runtime_profile(&worker, &job) {
@@ -415,17 +420,38 @@ fn authoritative_placement(job: &Job) -> Option<(SandboxProvisionSpec, &str)> {
     Some((spec, requested_image))
 }
 
+/// Convenience wrapper for single-job callers (unit tests and one-shot repair).
+/// Claim polls should use [`authoritatively_refresh_job_placement_cached`] with
+/// a shared cache across the candidate window.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn authoritatively_refresh_job_placement(
     db: &Database,
     job: &mut Job,
 ) -> Result<bool, ApiError> {
+    let mut cache = crate::handlers::jobs::PlacementEnrichmentCache::new();
+    authoritatively_refresh_job_placement_cached(db, job, &mut cache).await
+}
+
+pub(crate) async fn authoritatively_refresh_job_placement_cached(
+    db: &Database,
+    job: &mut Job,
+    cache: &mut crate::handlers::jobs::PlacementEnrichmentCache,
+) -> Result<bool, ApiError> {
     if job.kind == JobKind::DeleteHome {
         return Ok(true);
     }
+    // Snapshot pre-enrichment so we can skip a no-op writer UPDATE. Claim polls
+    // walk up to 200 candidates; rewriting an unchanged payload each time
+    // serializes the whole claim path on the SQLite FIFO and amplifies WAL
+    // traffic even when placement is already authoritative.
+    let before_payload = job.payload.clone();
+    let before_class = job.required_execution_class.clone();
     let reference_error = validate_authoritative_placement_reference(job).err();
     let enrichment_error = match reference_error {
         Some(error) => Some(error),
-        None => enrich_job_payload_with_provision_spec(db, job).await.err(),
+        None => enrich_job_payload_with_provision_spec_cached(db, job, cache)
+            .await
+            .err(),
     };
     if let Some(error) = enrichment_error {
         if !matches!(
@@ -449,6 +475,9 @@ pub(crate) async fn authoritatively_refresh_job_placement(
             .execute(&db.pool)
             .await?;
         return Ok(false);
+    }
+    if job.payload == before_payload && job.required_execution_class == before_class {
+        return Ok(true);
     }
     let sql = format!(
         "update jobs

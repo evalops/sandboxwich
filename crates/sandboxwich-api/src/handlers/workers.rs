@@ -715,7 +715,7 @@ pub(crate) async fn list_workers(
     );
     let rows = sqlx::query(&sql)
         .bind(&ctx.tenant_id)
-        .fetch_all(&state.db.pool)
+        .fetch_all(state.db.read_pool())
         .await?;
 
     let workers = rows
@@ -889,7 +889,7 @@ pub(crate) async fn list_worker_capacities(
     );
     let rows = sqlx::query(&sql)
         .bind(tenant_id)
-        .fetch_all(&db.pool)
+        .fetch_all(db.read_pool())
         .await?;
 
     let mut capacities = Vec::new();
@@ -1011,12 +1011,37 @@ pub(crate) async fn insert_worker(
     Ok(())
 }
 
+/// Minimum spacing between append-only heartbeat history rows for one worker.
+/// Liveness still updates `workers.last_heartbeat_at` on every beat; this only
+/// throttles the history table that scrapers and offline-reconciliation bound.
+const WORKER_HEARTBEAT_HISTORY_INTERVAL_SECS: i64 = 30;
+
 pub(crate) async fn insert_worker_heartbeat(
     db: &Database,
     worker_id: WorkerId,
     labels: &str,
     created_at: DateTime<Utc>,
 ) -> Result<(), ApiError> {
+    // Skip history write when a recent sample already exists for this worker.
+    // Workers heartbeat every ~15s; writing history every beat doubles write
+    // traffic on the SQLite FIFO for no liveness benefit.
+    let recent_sql = format!(
+        "select 1 from worker_heartbeats
+         where worker_id = {} and created_at >= {}
+         limit 1",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    let cutoff = created_at - chrono::Duration::seconds(WORKER_HEARTBEAT_HISTORY_INTERVAL_SECS);
+    if sqlx::query(&recent_sql)
+        .bind(worker_id.to_string())
+        .bind(cutoff.to_rfc3339())
+        .fetch_optional(db.read_pool())
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
     let sql = format!(
         "insert into worker_heartbeats (id, worker_id, labels, created_at)
          values ({})",
