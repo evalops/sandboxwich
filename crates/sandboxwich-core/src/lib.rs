@@ -374,7 +374,7 @@ impl fmt::Display for JobId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(transparent)]
 pub struct LeaseId(pub Uuid);
 
@@ -1155,6 +1155,8 @@ pub struct SandboxResponse {
     pub sandbox: Sandbox,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation: Option<Operation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provisioning: Option<ProvisioningOperation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<SandboxPlacementProof>,
 }
@@ -2290,6 +2292,10 @@ pub struct ResidentProcess {
     pub ready_at: Option<DateTime<Utc>>,
     pub exited_at: Option<DateTime<Utc>>,
     pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_class: Option<ProvisioningErrorClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_code: Option<String>,
     pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -2964,7 +2970,7 @@ pub struct ProvisioningStageUpdateRequest {
     pub last_error: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ProvisioningOperation {
     pub sandbox_id: SandboxId,
     pub lease_id: LeaseId,

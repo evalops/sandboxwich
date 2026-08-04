@@ -175,6 +175,7 @@ pub(crate) fn row_to_resident_process(row: AnyRow) -> Result<ResidentProcess, Ap
     let ready_at: Option<&str> = row.try_get("ready_at")?;
     let exited_at: Option<&str> = row.try_get("exited_at")?;
     let exit_code: Option<i64> = row.try_get("exit_code")?;
+    let last_error_class: Option<String> = row.try_get("last_error_class")?;
     let created_at: &str = row.try_get("created_at")?;
     let updated_at: &str = row.try_get("updated_at")?;
 
@@ -218,6 +219,11 @@ pub(crate) fn row_to_resident_process(row: AnyRow) -> Result<ResidentProcess, Ap
             .map(i32::try_from)
             .transpose()
             .map_err(|_| ApiError::internal("database contains invalid resident exit code"))?,
+        last_error_class: last_error_class
+            .map(|value| ProvisioningErrorClass::parse_db_str(&value))
+            .transpose()
+            .map_err(|error| ApiError::internal(error.to_string()))?,
+        last_error_code: row.try_get("last_error_code")?,
         last_error: row.try_get("last_error")?,
         created_at: parse_timestamp(created_at)?,
         updated_at: parse_timestamp(updated_at)?,

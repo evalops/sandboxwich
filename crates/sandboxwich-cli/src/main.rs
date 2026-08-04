@@ -550,6 +550,7 @@ async fn main() -> anyhow::Result<()> {
                     ok: true,
                     sandbox,
                     operation: None,
+                    provisioning: None,
                     placement: None,
                 })?;
             } else {

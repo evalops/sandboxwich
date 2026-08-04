@@ -985,7 +985,9 @@ pub(crate) async fn try_claim_job(
             let sql = format!(
                 "update resident_processes
                  set active_lease_id = {}, observed_state = 'starting',
-                     provider_pod_name = null, provider_pod_uid = null, updated_at = {}
+                     provider_pod_name = null, provider_pod_uid = null,
+                     last_error_class = null, last_error_code = null, last_error = null,
+                     updated_at = {}
                  where id = {} and generation = {} and desired_state = 'running'",
                 db.placeholder(1),
                 db.placeholder(2),

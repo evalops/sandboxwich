@@ -1,7 +1,7 @@
 use crate::activity::bump_sandbox_activity_best_effort;
 use crate::auth::{ensure_lease_worker_scope, ensure_resident_lease_scope, ensure_sandbox_tenant};
 use crate::db::Database;
-use crate::error::ApiError;
+use crate::error::*;
 use crate::handlers::commands::{insert_event, insert_event_on_connection};
 use crate::handlers::jobs::{add_provision_spec_to_payload, insert_job_on_connection};
 use crate::handlers::resident_attestations::{
@@ -721,6 +721,8 @@ pub(crate) async fn put_resident_process(
         ready_at: None,
         exited_at: None,
         exit_code: None,
+        last_error_class: None,
+        last_error_code: None,
         last_error: None,
         created_at: now,
         updated_at: now,
@@ -1380,7 +1382,9 @@ pub(crate) async fn observe_resident_process(
             | ResidentProcessObservedState::Lost
     )
     .then(|| now.to_rfc3339());
-    let last_error = request.error_message.or(request.error_code);
+    let error_code = request.error_code;
+    let last_error_class = provisioning_error_class_for_code(error_code.as_deref());
+    let last_error = request.error_message.or_else(|| error_code.clone());
     let sql = format!(
         "update resident_processes
          set bootstrap_acknowledged_at = case
@@ -1392,7 +1396,8 @@ pub(crate) async fn observe_resident_process(
                then coalesce(bootstrap_acknowledged_at, {})
                else bootstrap_acknowledged_at
              end,
-             observed_state = {}, pid = {}, exit_code = {}, last_error = {},
+             observed_state = {}, pid = {}, exit_code = {}, last_error_class = {},
+             last_error_code = {}, last_error = {},
              started_at = coalesce(started_at, {}), ready_at = coalesce(ready_at, {}),
              exited_at = {}, updated_at = {}
          where id = {} and generation = {} and active_lease_id = {}",
@@ -1410,7 +1415,9 @@ pub(crate) async fn observe_resident_process(
         state.db.placeholder(12),
         state.db.placeholder(13),
         state.db.placeholder(14),
-        state.db.placeholder(15)
+        state.db.placeholder(15),
+        state.db.placeholder(16),
+        state.db.placeholder(17)
     );
     let result = sqlx::query(&sql)
         .bind(request.observed_state.as_db_str())
@@ -1420,6 +1427,8 @@ pub(crate) async fn observe_resident_process(
         .bind(request.observed_state.as_db_str())
         .bind(request.pid.map(i64::from))
         .bind(request.exit_code.map(i64::from))
+        .bind(last_error_class.as_ref().map(DbVariant::as_db_str))
+        .bind(error_code)
         .bind(last_error)
         .bind(started_at)
         .bind(ready_at)

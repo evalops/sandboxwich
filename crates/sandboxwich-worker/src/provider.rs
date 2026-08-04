@@ -6675,11 +6675,16 @@ impl SandboxProvider for KubernetesApplyProvider {
                 Some(cancelled),
                 self.max_captured_output_bytes,
             )?;
-            anyhow::ensure!(
-                apply.success,
-                "kubectl apply isolated resident-process manifests failed with {}",
-                apply.status
-            );
+            if !apply.success {
+                let context = format!(
+                    "kubectl apply isolated resident-process manifests failed with {}",
+                    apply.status
+                );
+                return Err(anyhow::Error::new(classified_kubectl_failure(
+                    &context,
+                    &apply.stderr,
+                )));
+            }
 
             let started_at = Instant::now();
             let mut previous = None;
