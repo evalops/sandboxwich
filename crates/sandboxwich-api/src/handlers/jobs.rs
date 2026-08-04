@@ -1025,7 +1025,7 @@ pub(crate) async fn fetch_job(db: &Database, job_id: JobId) -> Result<Job, ApiEr
     );
     let row = sqlx::query(&sql)
         .bind(job_id.to_string())
-        .fetch_optional(db.sandbox_list_pool())
+        .fetch_optional(db.read_pool())
         .await?
         .ok_or_else(|| ApiError::not_found("job not found"))?;
     row_to_job(row)

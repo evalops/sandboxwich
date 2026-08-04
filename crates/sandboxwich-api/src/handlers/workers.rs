@@ -839,7 +839,7 @@ pub(crate) async fn fetch_worker(db: &Database, worker_id: WorkerId) -> Result<W
     );
     let row = sqlx::query(&sql)
         .bind(worker_id.to_string())
-        .fetch_optional(db.sandbox_list_pool())
+        .fetch_optional(db.read_pool())
         .await?
         .ok_or_else(|| ApiError::not_found("worker not found"))?;
 

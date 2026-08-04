@@ -601,7 +601,7 @@ pub(crate) async fn fetch_snapshot(
     );
     let row = sqlx::query(&sql)
         .bind(snapshot_id.to_string())
-        .fetch_optional(db.sandbox_list_pool())
+        .fetch_optional(db.read_pool())
         .await?
         .ok_or_else(|| ApiError::not_found("snapshot not found"))?;
 

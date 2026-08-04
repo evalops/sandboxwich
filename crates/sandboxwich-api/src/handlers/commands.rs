@@ -313,7 +313,7 @@ pub(crate) async fn fetch_command(
     );
     let row = sqlx::query(&sql)
         .bind(command_id.0.to_string())
-        .fetch_optional(db.sandbox_list_pool())
+        .fetch_optional(db.read_pool())
         .await?
         .ok_or_else(|| ApiError::not_found("command not found"))?;
 
@@ -332,7 +332,7 @@ pub(crate) async fn fetch_command(
     );
     let rows = sqlx::query(&sql)
         .bind(command_id.to_string())
-        .fetch_all(db.sandbox_list_pool())
+        .fetch_all(db.read_pool())
         .await?;
     if !rows.is_empty() {
         command.stdout.clear();

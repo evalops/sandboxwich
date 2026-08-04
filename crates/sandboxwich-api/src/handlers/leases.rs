@@ -1777,7 +1777,7 @@ pub(crate) async fn fetch_lease(db: &Database, lease_id: LeaseId) -> Result<JobL
     );
     let row = sqlx::query(&sql)
         .bind(lease_id.to_string())
-        .fetch_optional(db.sandbox_list_pool())
+        .fetch_optional(db.read_pool())
         .await?
         .ok_or_else(|| ApiError::not_found("lease not found"))?;
     let lease = row_to_lease_without_job(row)?;
