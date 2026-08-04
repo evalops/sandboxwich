@@ -349,7 +349,11 @@ spec:
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
-      activeDeadlineSeconds: 180
+      # Register retries (up to 5 × ~10s connect timeout + backoff) plus
+      # --orphan-reconciliation-max-elapsed-secs must fit inside this budget.
+      # 180s was tight once control-plane connect blips burned the first
+      # attempt and left no room for discovery/delete of large PVC residue.
+      activeDeadlineSeconds: 360
       backoffLimit: 1
       ttlSecondsAfterFinished: 600
       template:
