@@ -2,6 +2,7 @@ use crate::auth::*;
 use crate::db::*;
 use crate::error::*;
 use crate::handlers::commands::*;
+use crate::handlers::sandboxes::fetch_sandbox;
 use crate::pagination::*;
 use crate::rows::*;
 use crate::state::*;
@@ -221,27 +222,88 @@ pub(crate) async fn mint_guest_token(
     let sandbox_id = SandboxId(sandbox_id);
     ensure_worker_scope(&ctx, worker_id)?;
     ensure_sandbox_worker_scope(&state.db, sandbox_id, &ctx).await?;
-    let ttl_seconds = request.ttl_seconds.unwrap_or(3600);
+    let response = issue_guest_token(
+        &state.db,
+        &ctx.tenant_id,
+        worker_id,
+        sandbox_id,
+        request.ttl_seconds,
+        /* revalidate_lifecycle */ false,
+    )
+    .await?;
+    Ok(Json(response))
+}
+
+/// Guest-principal refresh: re-mints a sandbox-bound guest token after
+/// revalidating that the sandbox is still active, still placed on the token's
+/// worker, and has not crossed its hard lifetime. Used by long-running guest
+/// daemons so a 3600s default TTL is not a deterministic death mode.
+pub(crate) async fn refresh_guest_token(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path(sandbox_id): Path<Uuid>,
+    Json(request): Json<RefreshGuestTokenRequest>,
+) -> Result<Json<GuestTokenResponse>, ApiError> {
+    let sandbox_id = SandboxId(sandbox_id);
+    let Some(bound_sandbox) = ctx.guest_sandbox_id() else {
+        return Err(ApiError::unauthorized(
+            "guest token refresh requires a guest bearer token",
+        ));
+    };
+    if bound_sandbox != sandbox_id {
+        return Err(ApiError::unauthorized(
+            "guest token is not bound to this sandbox",
+        ));
+    }
+    let Some(worker_id) = ctx.worker_id() else {
+        return Err(ApiError::unauthorized(
+            "guest token refresh requires a guest bearer token",
+        ));
+    };
+    let response = issue_guest_token(
+        &state.db,
+        &ctx.tenant_id,
+        worker_id,
+        sandbox_id,
+        request.ttl_seconds,
+        /* revalidate_lifecycle */ true,
+    )
+    .await?;
+    Ok(Json(response))
+}
+
+async fn issue_guest_token(
+    db: &Database,
+    tenant_id: &str,
+    worker_id: WorkerId,
+    sandbox_id: SandboxId,
+    ttl_seconds: Option<u64>,
+    revalidate_lifecycle: bool,
+) -> Result<GuestTokenResponse, ApiError> {
+    let ttl_seconds = ttl_seconds.unwrap_or(3600);
     if !(1..=86_400).contains(&ttl_seconds) {
         return Err(ApiError::bad_request(
             "guest token ttl_seconds must be between 1 and 86400",
         ));
     }
     let now = Utc::now();
+    if revalidate_lifecycle {
+        revalidate_guest_token_lifecycle(db, tenant_id, worker_id, sandbox_id, now).await?;
+    }
     let expires_at = now + chrono::Duration::seconds(ttl_seconds as i64);
     let token = generate_guest_token();
     let token_hash = hash_worker_token(&token);
-    let mut tx = state.db.pool.begin().await?;
+    let mut tx = db.pool.begin().await?;
     let revoke_sql = format!(
         "update guest_tokens set revoked_at = {}
          where tenant_id = {} and sandbox_id = {} and revoked_at is null",
-        state.db.placeholder(1),
-        state.db.placeholder(2),
-        state.db.placeholder(3)
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3)
     );
     sqlx::query(&revoke_sql)
         .bind(now.to_rfc3339())
-        .bind(&ctx.tenant_id)
+        .bind(tenant_id)
         .bind(sandbox_id.to_string())
         .execute(&mut *tx)
         .await?;
@@ -249,11 +311,11 @@ pub(crate) async fn mint_guest_token(
         "insert into guest_tokens
          (id, tenant_id, worker_id, sandbox_id, token_hash, expires_at, revoked_at, created_at)
          values ({})",
-        state.db.placeholders(8)
+        db.placeholders(8)
     );
     sqlx::query(&insert_sql)
         .bind(Uuid::now_v7().to_string())
-        .bind(&ctx.tenant_id)
+        .bind(tenant_id)
         .bind(worker_id.to_string())
         .bind(sandbox_id.to_string())
         .bind(token_hash)
@@ -263,14 +325,81 @@ pub(crate) async fn mint_guest_token(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(Json(GuestTokenResponse {
+    Ok(GuestTokenResponse {
         ok: true,
         token,
-        tenant_id: ctx.tenant_id,
+        tenant_id: tenant_id.to_string(),
         worker_id,
         sandbox_id,
         expires_at,
-    }))
+    })
+}
+
+async fn revalidate_guest_token_lifecycle(
+    db: &Database,
+    tenant_id: &str,
+    worker_id: WorkerId,
+    sandbox_id: SandboxId,
+    now: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    let sandbox = fetch_sandbox(db, sandbox_id).await?;
+    if sandbox.tenant_id != tenant_id {
+        return Err(ApiError {
+            status: axum::http::StatusCode::UNAUTHORIZED,
+            code: "guest_token_revoked",
+            message: "guest token sandbox is no longer authorized".into(),
+        });
+    }
+    if !matches!(
+        sandbox.state,
+        SandboxState::Ready
+            | SandboxState::Provisioning
+            | SandboxState::Running
+            | SandboxState::Idle
+    ) {
+        return Err(ApiError {
+            status: axum::http::StatusCode::UNAUTHORIZED,
+            code: "guest_token_revoked",
+            message: format!(
+                "sandbox is not active for guest token refresh (state={:?})",
+                sandbox.state
+            ),
+        });
+    }
+    if let Some(max_lifetime) = sandbox.max_lifetime_seconds {
+        let deadline = sandbox.created_at + chrono::Duration::seconds(max_lifetime as i64);
+        if now >= deadline {
+            return Err(ApiError {
+                status: axum::http::StatusCode::UNAUTHORIZED,
+                code: "guest_token_revoked",
+                message: "sandbox hard lifetime has elapsed".into(),
+            });
+        }
+    }
+    let placement_sql = format!(
+        "select worker_id from sandbox_placements where sandbox_id = {}",
+        db.placeholder(1)
+    );
+    let placement = sqlx::query(&placement_sql)
+        .bind(sandbox_id.to_string())
+        .fetch_optional(&db.pool)
+        .await?;
+    let Some(row) = placement else {
+        return Err(ApiError {
+            status: axum::http::StatusCode::UNAUTHORIZED,
+            code: "guest_token_revoked",
+            message: "sandbox has no active placement".into(),
+        });
+    };
+    let placed_worker: String = row.try_get("worker_id")?;
+    if placed_worker != worker_id.to_string() {
+        return Err(ApiError {
+            status: axum::http::StatusCode::UNAUTHORIZED,
+            code: "guest_token_revoked",
+            message: "sandbox placement no longer matches this guest token".into(),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) async fn register_worker(
@@ -312,6 +441,7 @@ pub(crate) async fn register_worker(
         capabilities: request.capabilities,
         max_concurrent_jobs,
         labels: request.labels,
+        resource_envelope: None,
         registered_at: now,
         last_heartbeat_at: None,
     };
@@ -384,7 +514,7 @@ async fn fetch_worker_by_logical_identity(
     let sql =
         format!(
         "select id, tenant_id, name, status, provider, capabilities, max_concurrent_jobs, labels,
-                registered_at, last_heartbeat_at from workers
+                resource_envelope, registered_at, last_heartbeat_at from workers
          where tenant_id = {} and name = {} and provider = {}",
         db.placeholder(1), db.placeholder(2), db.placeholder(3)
     );
@@ -432,46 +562,104 @@ pub(crate) async fn heartbeat_worker(
     ensure_worker_tenant(&state.db, worker_id, &ctx).await?;
     let now = Utc::now();
     let labels = serde_json::to_string(&request.labels)?;
-    let result = if let Some(max_concurrent_jobs) = request.max_concurrent_jobs {
-        let max_concurrent_jobs = validate_max_concurrent_jobs(max_concurrent_jobs)?;
-        let sql = format!(
-            "update workers
-             set status = {}, last_heartbeat_at = {}, labels = {}, max_concurrent_jobs = {}
-             where id = {}",
-            state.db.placeholder(1),
-            state.db.placeholder(2),
-            state.db.placeholder(3),
-            state.db.placeholder(4),
-            state.db.placeholder(5)
-        );
-        sqlx::query(&sql)
-            .bind(worker_status_to_str(&WorkerStatus::Online))
-            .bind(now.to_rfc3339())
-            .bind(labels.clone())
-            .bind(i64::from(max_concurrent_jobs))
-            .bind(worker_id.to_string())
-            .execute(&state.db.pool)
-            .await?
-    } else {
-        let sql = format!(
-            "update workers
-             set status = {}, last_heartbeat_at = {}, labels = {}
-             where id = {}",
-            state.db.placeholder(1),
-            state.db.placeholder(2),
-            state.db.placeholder(3),
-            state.db.placeholder(4)
-        );
-        sqlx::query(&sql)
-            .bind(worker_status_to_str(&WorkerStatus::Online))
-            .bind(now.to_rfc3339())
-            .bind(labels.clone())
-            .bind(worker_id.to_string())
-            .execute(&state.db.pool)
-            .await?
+    let envelope_json = request
+        .resource_envelope
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let max_concurrent_jobs = request
+        .max_concurrent_jobs
+        .map(validate_max_concurrent_jobs)
+        .transpose()?;
+
+    // Always touch heartbeat/status/labels. max_concurrent_jobs and the
+    // resource envelope update only when the worker supplies them so a partial
+    // heartbeat cannot wipe observed capacity evidence.
+    let sql = match (max_concurrent_jobs, envelope_json.as_ref()) {
+        (Some(max_concurrent_jobs), Some(envelope)) => {
+            let sql = format!(
+                "update workers
+                 set status = {}, last_heartbeat_at = {}, labels = {},
+                     max_concurrent_jobs = {}, resource_envelope = {}
+                 where id = {}",
+                state.db.placeholder(1),
+                state.db.placeholder(2),
+                state.db.placeholder(3),
+                state.db.placeholder(4),
+                state.db.placeholder(5),
+                state.db.placeholder(6)
+            );
+            sqlx::query(&sql)
+                .bind(worker_status_to_str(&WorkerStatus::Online))
+                .bind(now.to_rfc3339())
+                .bind(labels.clone())
+                .bind(i64::from(max_concurrent_jobs))
+                .bind(envelope)
+                .bind(worker_id.to_string())
+                .execute(&state.db.pool)
+                .await?
+        }
+        (Some(max_concurrent_jobs), None) => {
+            let sql = format!(
+                "update workers
+                 set status = {}, last_heartbeat_at = {}, labels = {}, max_concurrent_jobs = {}
+                 where id = {}",
+                state.db.placeholder(1),
+                state.db.placeholder(2),
+                state.db.placeholder(3),
+                state.db.placeholder(4),
+                state.db.placeholder(5)
+            );
+            sqlx::query(&sql)
+                .bind(worker_status_to_str(&WorkerStatus::Online))
+                .bind(now.to_rfc3339())
+                .bind(labels.clone())
+                .bind(i64::from(max_concurrent_jobs))
+                .bind(worker_id.to_string())
+                .execute(&state.db.pool)
+                .await?
+        }
+        (None, Some(envelope)) => {
+            let sql = format!(
+                "update workers
+                 set status = {}, last_heartbeat_at = {}, labels = {}, resource_envelope = {}
+                 where id = {}",
+                state.db.placeholder(1),
+                state.db.placeholder(2),
+                state.db.placeholder(3),
+                state.db.placeholder(4),
+                state.db.placeholder(5)
+            );
+            sqlx::query(&sql)
+                .bind(worker_status_to_str(&WorkerStatus::Online))
+                .bind(now.to_rfc3339())
+                .bind(labels.clone())
+                .bind(envelope)
+                .bind(worker_id.to_string())
+                .execute(&state.db.pool)
+                .await?
+        }
+        (None, None) => {
+            let sql = format!(
+                "update workers
+                 set status = {}, last_heartbeat_at = {}, labels = {}
+                 where id = {}",
+                state.db.placeholder(1),
+                state.db.placeholder(2),
+                state.db.placeholder(3),
+                state.db.placeholder(4)
+            );
+            sqlx::query(&sql)
+                .bind(worker_status_to_str(&WorkerStatus::Online))
+                .bind(now.to_rfc3339())
+                .bind(labels.clone())
+                .bind(worker_id.to_string())
+                .execute(&state.db.pool)
+                .await?
+        }
     };
 
-    if result.rows_affected() == 0 {
+    if sql.rows_affected() == 0 {
         return Err(ApiError::not_found("worker not found"));
     }
 
@@ -490,7 +678,8 @@ pub(crate) async fn list_workers(
     Extension(ctx): Extension<TenantContext>,
 ) -> Result<Json<WorkerListResponse>, ApiError> {
     let sql = format!(
-        "select id, tenant_id, name, status, provider, capabilities, max_concurrent_jobs, labels, registered_at, last_heartbeat_at
+        "select id, tenant_id, name, status, provider, capabilities, max_concurrent_jobs, labels,
+                resource_envelope, registered_at, last_heartbeat_at
          from workers
          where tenant_id = {}
          order by registered_at asc, id asc",
@@ -614,7 +803,8 @@ pub(crate) async fn maybe_insert_guest_failure_event(
 
 pub(crate) async fn fetch_worker(db: &Database, worker_id: WorkerId) -> Result<Worker, ApiError> {
     let sql = format!(
-        "select id, tenant_id, name, status, provider, capabilities, max_concurrent_jobs, labels, registered_at, last_heartbeat_at
+        "select id, tenant_id, name, status, provider, capabilities, max_concurrent_jobs, labels,
+                resource_envelope, registered_at, last_heartbeat_at
          from workers
          where id = {}",
         db.placeholder(1)
@@ -657,7 +847,7 @@ pub(crate) async fn list_worker_capacities(
     let sql = format!(
         "select workers.id, workers.tenant_id, workers.name, workers.status, workers.provider,
                 workers.capabilities, workers.max_concurrent_jobs, workers.labels,
-                workers.registered_at, workers.last_heartbeat_at,
+                workers.resource_envelope, workers.registered_at, workers.last_heartbeat_at,
                 coalesce(sum(case when jobs.kind != 'run_resident_process' then 1 else 0 end), 0) as active_leases
          from workers
          left join job_leases on job_leases.worker_id = workers.id and job_leases.status = 'active'
@@ -665,7 +855,7 @@ pub(crate) async fn list_worker_capacities(
          where workers.tenant_id = {}
          group by workers.id, workers.tenant_id, workers.name, workers.status, workers.provider,
                   workers.capabilities, workers.max_concurrent_jobs, workers.labels,
-                  workers.registered_at, workers.last_heartbeat_at
+                  workers.resource_envelope, workers.registered_at, workers.last_heartbeat_at
          order by workers.registered_at asc, workers.id asc",
         db.placeholder(1)
     );

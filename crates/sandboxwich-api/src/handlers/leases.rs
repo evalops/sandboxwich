@@ -223,11 +223,16 @@ pub(crate) async fn claim_lease(
         }
         query.push(")");
     }
+    // Historical hard limit of 25 candidates meant a blocked head-of-queue could
+    // starve a later eligible job forever. Scan a bounded window large enough to
+    // cover common transient ineligibility clusters, still O(1) per claim.
+    const CLAIM_SCAN_BUDGET: i64 = 200;
     query.push(
         "
          order by priority desc, scheduled_at asc, created_at asc, id asc
-         limit 25",
+         limit ",
     );
+    query.push_bind(CLAIM_SCAN_BUDGET);
     let rows = query.build().fetch_all(&state.db.pool).await?;
 
     for row in rows {
@@ -248,6 +253,9 @@ pub(crate) async fn claim_lease(
             continue;
         }
         if !worker_supports_secret_delivery(&worker, &job) {
+            continue;
+        }
+        if !worker_can_schedule_job_memory(&worker, &job) {
             continue;
         }
         // Defense in depth: re-check the caller's sandbox/kind filters (if any) against
@@ -349,6 +357,30 @@ pub(crate) async fn claim_lease(
         ok: true,
         lease: None,
     }))
+}
+
+/// When a worker has reported an observed resource envelope, refuse to claim
+/// provision/resume/fork jobs whose provisionSpec.memory_limit exceeds that
+/// ceiling. Workers without an envelope keep the prior accept-then-fail path.
+fn worker_can_schedule_job_memory(worker: &Worker, job: &Job) -> bool {
+    let Some(envelope) = worker.resource_envelope.as_ref() else {
+        return true;
+    };
+    if !matches!(
+        job.kind,
+        JobKind::ProvisionSandbox | JobKind::ResumeSandbox | JobKind::ForkSandbox
+    ) {
+        return true;
+    }
+    let Some(limit) = job
+        .payload
+        .get("provisionSpec")
+        .and_then(|spec| spec.get("memory_limit"))
+        .and_then(|value| serde_json::from_value::<MemoryLimit>(value.clone()).ok())
+    else {
+        return true;
+    };
+    envelope.can_schedule_memory(&limit)
 }
 
 fn authoritative_placement(job: &Job) -> Option<(SandboxProvisionSpec, &str)> {
@@ -570,13 +602,31 @@ pub(crate) async fn renew_lease(
     // GH-64: guest-facing route -- only the worker holding this lease may
     // renew it; tenant-wide tokens are rejected.
     let lease = ensure_lease_worker_scope(&state.db, lease_id, &ctx).await?;
+    let cancel_sql = format!(
+        "select cancel_requested_at, cancel_reason from job_leases where id = {}",
+        state.db.placeholder(1)
+    );
+    if let Some(row) = sqlx::query(&cancel_sql)
+        .bind(lease_id.to_string())
+        .fetch_optional(&state.db.pool)
+        .await?
+    {
+        let cancel_requested_at: Option<String> = row.try_get("cancel_requested_at")?;
+        if cancel_requested_at.is_some() {
+            let reason: Option<String> = row.try_get("cancel_reason")?;
+            return Err(ApiError::conflict_code(
+                "lease_cancelled",
+                reason.unwrap_or_else(|| "lease cancellation was requested".into()),
+            ));
+        }
+    }
     let now = Utc::now();
     let expires_at =
         now + chrono::Duration::seconds(effective_lease_seconds(request.lease_seconds) as i64);
     let sql = format!(
         "update job_leases
          set expires_at = {}
-         where id = {} and status = 'active' and {}",
+         where id = {} and status = 'active' and cancel_requested_at is null and {}",
         state.db.placeholder(1),
         state.db.placeholder(2),
         state.db.timestamp_is_future("expires_at")
@@ -587,6 +637,24 @@ pub(crate) async fn renew_lease(
         .execute(&state.db.pool)
         .await?;
     if result.rows_affected() == 0 {
+        // Distinguish cancellation (race with stop) from ordinary expiry.
+        let cancel_sql = format!(
+            "select cancel_requested_at from job_leases where id = {}",
+            state.db.placeholder(1)
+        );
+        if let Some(row) = sqlx::query(&cancel_sql)
+            .bind(lease_id.to_string())
+            .fetch_optional(&state.db.pool)
+            .await?
+        {
+            let cancel_requested_at: Option<String> = row.try_get("cancel_requested_at")?;
+            if cancel_requested_at.is_some() {
+                return Err(ApiError::conflict_code(
+                    "lease_cancelled",
+                    "lease cancellation was requested",
+                ));
+            }
+        }
         return Err(ApiError::not_found("active lease not found"));
     }
     if lease.job.kind == JobKind::RunResidentProcess {

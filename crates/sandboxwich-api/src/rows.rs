@@ -277,6 +277,7 @@ pub(crate) fn row_to_worker(row: AnyRow) -> Result<Worker, ApiError> {
     let capabilities: String = row.try_get("capabilities")?;
     let max_concurrent_jobs: i64 = row.try_get("max_concurrent_jobs")?;
     let labels: String = row.try_get("labels")?;
+    let resource_envelope: Option<String> = row.try_get("resource_envelope").unwrap_or(None);
     let registered_at: String = row.try_get("registered_at")?;
     let last_heartbeat_at: Option<String> = row.try_get("last_heartbeat_at")?;
 
@@ -290,6 +291,14 @@ pub(crate) fn row_to_worker(row: AnyRow) -> Result<Worker, ApiError> {
         max_concurrent_jobs: u32::try_from(max_concurrent_jobs)
             .map_err(|_| ApiError::internal("database contains invalid worker capacity"))?,
         labels: serde_json::from_str(&labels)?,
+        resource_envelope: resource_envelope
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                serde_json::from_str(&value).map_err(|_| {
+                    ApiError::internal("database contains invalid worker resource envelope")
+                })
+            })
+            .transpose()?,
         registered_at: parse_timestamp(&registered_at)?,
         last_heartbeat_at: last_heartbeat_at
             .map(|time| parse_timestamp(&time))

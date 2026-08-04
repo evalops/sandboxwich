@@ -830,6 +830,16 @@ impl MemoryLimit {
         }
     }
 
+    /// Requested memory ceiling in bytes for capacity admission matching.
+    pub fn memory_bytes(&self) -> u64 {
+        match self {
+            Self::OneG => 1 << 30,
+            Self::FourG => 4 << 30,
+            Self::SixteenG => 16 << 30,
+            Self::SixtyFourG => 64 << 30,
+        }
+    }
+
     pub fn disk_limit(&self) -> &'static str {
         match self {
             Self::OneG => "2Gi",
@@ -1926,6 +1936,38 @@ pub const PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_V1: u32 = 1;
 pub const PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION: u32 = 2;
 pub const PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE: &str = "2";
 
+/// Observed schedulable capacity reported by a worker heartbeat. This is
+/// evidence from the provider boundary (node allocatable after reservations,
+/// RuntimeClass readiness, etc.), not the API's configured tier catalogue.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerResourceEnvelope {
+    /// Largest single sandbox memory request this worker believes it can place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_memory_bytes: Option<u64>,
+    /// Largest single sandbox CPU request in millicores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cpu_millis: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible_node_count: Option<u32>,
+    /// When the envelope was measured.
+    pub evidence_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_failure_reason: Option<String>,
+}
+
+impl WorkerResourceEnvelope {
+    /// Whether this envelope can host a sandbox requesting `memory_limit`.
+    /// Unknown memory ceiling is treated as "cannot certify", so callers that
+    /// require evidence must not treat a missing ceiling as unlimited capacity.
+    pub fn can_schedule_memory(&self, memory_limit: &MemoryLimit) -> bool {
+        match self.max_memory_bytes {
+            Some(ceiling) => ceiling >= memory_limit.memory_bytes(),
+            None => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Worker {
     pub id: WorkerId,
@@ -1938,6 +1980,9 @@ pub struct Worker {
     pub max_concurrent_jobs: u32,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// Last observed resource envelope from heartbeat, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_envelope: Option<WorkerResourceEnvelope>,
     pub registered_at: DateTime<Utc>,
     pub last_heartbeat_at: Option<DateTime<Utc>>,
 }
@@ -1956,11 +2001,14 @@ pub struct RegisterWorkerRequest {
     pub labels: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorkerHeartbeatRequest {
     pub max_concurrent_jobs: Option<u32>,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// Observed capacity evidence. When present, replaces the prior envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_envelope: Option<WorkerResourceEnvelope>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1980,6 +2028,15 @@ pub struct WorkerResponse {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MintGuestTokenRequest {
+    pub ttl_seconds: Option<u64>,
+}
+
+/// Request body for guest-principal token refresh. Empty object today; the
+/// authenticated guest token supplies sandbox/worker identity.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RefreshGuestTokenRequest {
+    /// Optional TTL override for the replacement token (seconds). Defaults to
+    /// the same range as mint (1..=86400, default 3600).
     pub ttl_seconds: Option<u64>,
 }
 

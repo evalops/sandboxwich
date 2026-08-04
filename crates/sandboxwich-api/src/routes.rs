@@ -208,6 +208,8 @@ pub(crate) fn app(state: AppState) -> Router {
             "/workers/{worker_id}/sandboxes/{sandbox_id}/guest-token",
             post(mint_guest_token),
         )
+        // Guest-token refresh is mounted on guest_routes below so a live guest
+        // credential can rotate without holding the worker token.
         .route(
             "/workers/{worker_id}/apex-instruction-callbacks/{callback_nonce}",
             post(deliver_apex_task_instructions)
@@ -240,6 +242,10 @@ pub(crate) fn app(state: AppState) -> Router {
         .route(
             "/sandboxes/{sandbox_id}/guest-health",
             post(update_guest_health),
+        )
+        .route(
+            "/sandboxes/{sandbox_id}/guest-token/refresh",
+            post(refresh_guest_token),
         )
         .route_layer(middleware::from_fn(require_guest_route_principal));
 

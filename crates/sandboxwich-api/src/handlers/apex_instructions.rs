@@ -679,6 +679,7 @@ mod tests {
             capabilities: vec![WorkerCapability::ApexTaskInstructions],
             max_concurrent_jobs: 4,
             labels: BTreeMap::new(),
+            resource_envelope: None,
             registered_at: now,
             last_heartbeat_at: Some(now),
         };
@@ -1586,6 +1587,7 @@ mod tests {
             capabilities: worker.capabilities.clone(),
             max_concurrent_jobs: 4,
             labels: worker.labels.clone(),
+            resource_envelope: None,
             registered_at: Utc::now(),
             last_heartbeat_at: Some(Utc::now()),
         };

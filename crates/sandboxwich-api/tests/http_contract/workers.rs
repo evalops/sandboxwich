@@ -845,6 +845,7 @@ pub(crate) async fn worker_scoped_tokens_enforce_guest_route_boundaries() {
         .json(&WorkerHeartbeatRequest {
             max_concurrent_jobs: None,
             labels: Default::default(),
+            resource_envelope: None,
         })
         .send()
         .await

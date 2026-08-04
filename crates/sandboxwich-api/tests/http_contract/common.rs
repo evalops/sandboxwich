@@ -242,6 +242,7 @@ pub(crate) async fn run_contract(server: TestServer) {
                 ),
             ]
             .into(),
+            resource_envelope: None,
         })
         .send()
         .await
