@@ -646,7 +646,7 @@ pub(crate) async fn list_snapshots_for_sandbox(
         &[sandbox_id.to_string()],
         limit,
         cursor,
-        row_to_snapshot,
+        snapshot_page_item,
     )
     .await
 }

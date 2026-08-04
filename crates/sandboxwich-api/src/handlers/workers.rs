@@ -89,7 +89,7 @@ pub(crate) async fn runtime_resource_inventory(
         .bind(&worker.provider)
         .bind(worker.id.to_string())
         .bind(&query.namespace)
-        .fetch_all(&state.db.pool)
+        .fetch_all(state.db.read_pool())
         .await?;
     let scope_complete = scope_rows.len() <= 200;
     for row in scope_rows {
@@ -112,7 +112,7 @@ pub(crate) async fn runtime_resource_inventory(
          where state != 'archived'
          order by id asc limit 201";
     let mut sandbox_ids = sqlx::query(sandbox_sql)
-        .fetch_all(&state.db.pool)
+        .fetch_all(state.db.read_pool())
         .await?
         .into_iter()
         .map(|row| {
@@ -151,7 +151,7 @@ pub(crate) async fn runtime_resource_inventory(
         resident_lease_query = resident_lease_query.bind(worker_id);
     }
     let mut active_resident_lease_ids = resident_lease_query
-        .fetch_all(&state.db.pool)
+        .fetch_all(state.db.read_pool())
         .await?
         .into_iter()
         .map(|row| {
@@ -166,32 +166,40 @@ pub(crate) async fn runtime_resource_inventory(
     let inventory_started = Instant::now();
     let (resources, next_cursor) =
         fetch_keyset_page(&state.db, &sql, &fixed_binds, limit, &cursor, |row| {
-            let created_at: String = row.try_get("sandbox_created_at")?;
-            let updated_at: String = row.try_get("sandbox_updated_at")?;
+            // Keyset columns are aliased as created_at/id on the inventory subquery.
+            let page_created_at: &str = row.try_get("created_at")?;
+            let page_id: &str = row.try_get("id")?;
+            let page_cursor = PageCursor::new(page_created_at, page_id);
+            let created_at: &str = row.try_get("sandbox_created_at")?;
+            let updated_at: &str = row.try_get("sandbox_updated_at")?;
             let ttl_seconds: Option<i64> = row.try_get("ttl_seconds")?;
             let expires_at = ttl_seconds
                 .map(|ttl| {
-                    parse_timestamp(&created_at)
+                    parse_timestamp(created_at)
                         .map(|created| created + chrono::Duration::seconds(ttl))
                 })
                 .transpose()?;
-            let state: String = row.try_get("state")?;
-            let cleanup_deadline = if matches!(state.as_str(), "archiving" | "archived") {
-                Some(parse_timestamp(&updated_at)?)
+            let state: &str = row.try_get("state")?;
+            let cleanup_deadline = if matches!(state, "archiving" | "archived") {
+                Some(parse_timestamp(updated_at)?)
             } else {
                 None
             };
-            let resource_kind: String = row.try_get("resource_kind")?;
-            Ok(RuntimeResourceInventoryItem {
-                sandbox_id: SandboxId(parse_uuid(&row.try_get::<String, _>("sandbox_id")?)?),
-                resource_kind: RuntimeResourceKind::parse_db_str(&resource_kind)
-                    .map_err(|_| ApiError::internal("invalid runtime resource kind"))?,
-                namespace: row.try_get("resource_namespace")?,
-                name: row.try_get("resource_name")?,
-                uid: row.try_get("resource_uid")?,
-                expires_at,
-                cleanup_deadline,
-            })
+            let resource_kind: &str = row.try_get("resource_kind")?;
+            let sandbox_id: &str = row.try_get("sandbox_id")?;
+            Ok((
+                page_cursor,
+                RuntimeResourceInventoryItem {
+                    sandbox_id: SandboxId(parse_uuid(sandbox_id)?),
+                    resource_kind: RuntimeResourceKind::parse_db_str(resource_kind)
+                        .map_err(|_| ApiError::internal("invalid runtime resource kind"))?,
+                    namespace: row.try_get("resource_namespace")?,
+                    name: row.try_get("resource_name")?,
+                    uid: row.try_get("resource_uid")?,
+                    expires_at,
+                    cleanup_deadline,
+                },
+            ))
         })
         .await?;
     let inventory_duration_ms = inventory_started.elapsed().as_millis() as u64;
@@ -844,6 +852,17 @@ pub(crate) async fn fetch_worker(db: &Database, worker_id: WorkerId) -> Result<W
         .ok_or_else(|| ApiError::not_found("worker not found"))?;
 
     row_to_worker(row)
+}
+
+/// Pure-read active lease count for claim saturation short-circuit. Uses the
+/// query-only pool so claim polls do not take a writer connection just to
+/// learn the worker is already full.
+pub(crate) async fn active_lease_count_for_worker(
+    db: &Database,
+    worker_id: WorkerId,
+) -> Result<u32, ApiError> {
+    let mut connection = db.read_pool().acquire().await?;
+    active_lease_count_for_worker_on_connection(db, &mut connection, worker_id).await
 }
 
 pub(crate) async fn active_lease_count_for_worker_on_connection(

@@ -1,7 +1,8 @@
-// Bake definition for the kind conformance workflow
-// (.github/workflows/kubernetes-conformance.yml). Building all four
-// conformance images through one `docker buildx bake` invocation instead of
-// four serial `docker buildx build` calls buys two things:
+// Optional local bake definition for kind conformance image development.
+// The post-merge workflow consumes the exact images published by containers.yml
+// and does not run this build on its hosted runner. When a local image build is
+// useful, building all four conformance images through one `docker buildx bake`
+// invocation instead of four serial `docker buildx build` calls buys two things:
 //
 //   1. The `api` and `worker` targets both build from Dockerfile's
 //      `runtime-shared` stage, which in turn copies its binary out of the

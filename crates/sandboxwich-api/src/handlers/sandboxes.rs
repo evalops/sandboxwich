@@ -379,7 +379,7 @@ pub(crate) async fn list_sandboxes(
         std::slice::from_ref(&ctx.tenant_id),
         limit,
         &cursor,
-        row_to_sandbox,
+        sandbox_page_item,
     )
     .await?;
     hydrate_sandboxes_network_egress(&state.db, &mut sandboxes).await?;
@@ -422,8 +422,9 @@ pub(crate) async fn get_sandbox(
     Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<SandboxResponse>, ApiError> {
-    let sandbox = ensure_sandbox_tenant(&state.db, SandboxId(sandbox_id), &ctx).await?;
-    let placement = fetch_sandbox_placement_proof(&state.db, sandbox.id, &sandbox.state).await?;
+    let (sandbox, placement) =
+        fetch_sandbox_with_placement_proof(&state.db, SandboxId(sandbox_id)).await?;
+    ensure_tenant(&sandbox.tenant_id, &ctx)?;
     Ok(Json(SandboxResponse {
         ok: true,
         sandbox,
@@ -432,38 +433,68 @@ pub(crate) async fn get_sandbox(
     }))
 }
 
-async fn fetch_sandbox_placement_proof(
+/// Load a sandbox and its placement proof in one read-pool round trip.
+///
+/// Placement is left-joined so planning/archiving/archived sandboxes can still
+/// return without a placement row; other states without placement fail closed.
+async fn fetch_sandbox_with_placement_proof(
     db: &Database,
     sandbox_id: SandboxId,
-    sandbox_state: &SandboxState,
-) -> Result<Option<SandboxPlacementProof>, ApiError> {
+) -> Result<(Sandbox, Option<SandboxPlacementProof>), ApiError> {
     let sql = format!(
-        "select p.worker_id, p.provider, w.labels
-           from sandbox_placements p
-           join workers w on w.id = p.worker_id
-          where p.sandbox_id = {}",
+        "select s.id, s.tenant_id, s.name, s.state, s.template, s.memory_limit, s.network_egress_mode,
+                s.workspace_mode, s.runtime_profile, s.execution_class, s.created_at, s.updated_at,
+                s.ttl_seconds, s.max_lifetime_seconds, s.idle_ttl_seconds, s.last_activity_at,
+                s.parent_snapshot_id, p.worker_id as placement_worker_id, p.provider as placement_provider,
+                w.labels as placement_labels
+           from sandboxes s
+           left join sandbox_placements p on p.sandbox_id = s.id
+           left join workers w on w.id = p.worker_id
+          where s.id = {}",
         db.placeholder(1)
     );
-    let Some(row) = sqlx::query(&sql)
+    let row = sqlx::query(&sql)
         .bind(sandbox_id.to_string())
-        .fetch_optional(&db.pool)
+        .fetch_optional(db.read_pool())
         .await?
-    else {
-        return if matches!(
-            sandbox_state,
-            SandboxState::Planning | SandboxState::Archiving | SandboxState::Archived
-        ) {
-            Ok(None)
-        } else {
-            Err(ApiError::internal("sandbox placement proof is missing"))
-        };
+        .ok_or_else(|| ApiError::not_found("sandbox not found"))?;
+
+    // Read placement columns before `row_to_sandbox` consumes the row buffer.
+    let placement_worker_id: Option<String> = row.try_get("placement_worker_id")?;
+    let placement_provider: Option<String> = row.try_get("placement_provider")?;
+    let placement_labels: Option<String> = row.try_get("placement_labels")?;
+
+    let mut sandbox = row_to_sandbox(row)?;
+    hydrate_sandbox_network_egress(db, &mut sandbox).await?;
+
+    let placement = match placement_worker_id {
+        None => {
+            if matches!(
+                sandbox.state,
+                SandboxState::Planning | SandboxState::Archiving | SandboxState::Archived
+            ) {
+                None
+            } else {
+                return Err(ApiError::internal("sandbox placement proof is missing"));
+            }
+        }
+        Some(worker_id) => {
+            let provider = placement_provider.unwrap_or_default();
+            let labels = placement_labels.unwrap_or_default();
+            Some(placement_proof_from_parts(worker_id, provider, labels)?)
+        }
     };
-    let worker_id: String = row.try_get("worker_id")?;
-    let provider: String = row.try_get("provider")?;
+    Ok((sandbox, placement))
+}
+
+fn placement_proof_from_parts(
+    worker_id: String,
+    provider: String,
+    labels: String,
+) -> Result<SandboxPlacementProof, ApiError> {
     if provider.is_empty() {
         return Err(ApiError::internal("worker placement provider is missing"));
     }
-    let labels: String = row.try_get("labels")?;
     let labels: HashMap<String, String> = serde_json::from_str(&labels)
         .map_err(|_| ApiError::internal("worker placement labels are invalid"))?;
     let provider_mode = labels
@@ -476,13 +507,13 @@ async fn fetch_sandbox_placement_proof(
         .filter(|value| immutable_sha256_image(value))
         .cloned()
         .ok_or_else(|| ApiError::internal("worker placement runtime image is not digest-pinned"))?;
-    Ok(Some(SandboxPlacementProof {
+    Ok(SandboxPlacementProof {
         worker_id: Uuid::parse_str(&worker_id)
             .map_err(|_| ApiError::internal("worker placement id is invalid"))?,
         provider,
         provider_mode,
         runtime_image,
-    }))
+    })
 }
 
 fn immutable_sha256_image(image: &str) -> bool {
@@ -1422,7 +1453,7 @@ pub(crate) async fn reject_if_memory_exceeds_all_envelopes(
     );
     let rows = sqlx::query(&sql)
         .bind(tenant_id)
-        .fetch_all(&db.pool)
+        .fetch_all(db.read_pool())
         .await?;
     if rows.is_empty() {
         return Ok(());

@@ -3,7 +3,12 @@ name: kubernetes-conformance
 # This live suite is intentionally post-merge only: it is too slow to run on
 # every pull request, and the protected PR checks remain in ci.yml/containers.yml.
 on:
-  push:
+  # The containers workflow publishes the exact commit's signed images. Wait
+  # for that workflow so this suite can pull those images instead of rebuilding
+  # the same four images a second time on a separate runner.
+  workflow_run:
+    workflows: [containers]
+    types: [completed]
     branches: [main]
   workflow_dispatch:
 
@@ -23,26 +28,28 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 0
-      - name: Detect conformance-relevant changes
+      - name: Require a successful container build
         id: scope
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
         run: |
           set -euo pipefail
-          if [[ "${EVENT_NAME}" != "pull_request" ]]; then
+          if [[ "${EVENT_NAME}" == "workflow_run" && "${CONCLUSION}" != "success" ]]; then
+            echo "required=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
             echo "required=true" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
-          git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" > "${RUNNER_TEMP}/changed-files"
-          if grep -Eq '^(\.cargo/|Cargo\.(toml|lock)$|Dockerfile$|crates/|deploy/kubernetes/|migrations/|proto/|scripts/test-(cilium|deployment-images|recovery-conformance)\.py$|\.github/workflows/kubernetes-conformance\.yml$)' "${RUNNER_TEMP}/changed-files"; then
-            echo "required=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "required=false" >> "${GITHUB_OUTPUT}"
-          fi
+          # workflow_run is intentionally fed by a successful main-branch
+          # container build. A main commit is the unit of conformance here;
+          # the image pull below is keyed to this exact HEAD_SHA.
+          echo "required=true" >> "${GITHUB_OUTPUT}"
 
   kind:
     needs: conformance-scope
@@ -58,11 +65,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        # Main-branch runs need authenticated read access to the private,
-        # digest-pinned Orb executor base.
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        # The exact commit's service/runtime images were published by the
+        # completed containers workflow immediately before this run.
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -74,27 +81,49 @@ jobs:
           curl -fsSLo kind https://kind.sigs.k8s.io/dl/v0.29.0/kind-linux-amd64
           echo c72eda46430f065fb45c5f70e7c957cc9209402ef309294821978677c8fb3284  kind | sha256sum --check
           sudo install -m 0755 kind /usr/local/bin/kind
-      - name: Build conformance binaries and images
+      - name: Pull published images and build the conformance binary
+        env:
+          CONTAINER_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
         run: |
+          set -euo pipefail
           # This debug binary runs directly on the runner (see
           # deploy/kubernetes/kind-conformance.sh's provider-apply-plan step)
-          # rather than in a container, so it can't come from any of the
+          # rather than in a container, so it can't come from the published
           # (glibc-mismatched, --release) image builds below.
           cargo build -p sandboxwich-worker
-          # All four conformance images build concurrently from one bake
-          # invocation; see deploy/kubernetes/kind-bake.hcl for the shared
-          # builder-stage and cache-scope rationale.
-          docker buildx bake --load --file deploy/kubernetes/kind-bake.hcl
-          # kind imports the completed images into containerd, temporarily storing a
-          # second copy of every layer. The intermediate BuildKit cache is no longer
-          # needed after these builds and can exhaust the runner during that import.
-          docker builder prune --all --force
+          short_sha="${CONTAINER_SHA::12}"
+          postgres_digest="$(sed -n 's/^FROM postgres:17@//p' deploy/kubernetes/postgres.Dockerfile)"
+          images=(
+            "ghcr.io/evalops/sandboxwich/sandboxwich-api:sha-${short_sha}"
+            "ghcr.io/evalops/sandboxwich/sandboxwich-worker:sha-${short_sha}"
+            "ghcr.io/evalops/sandboxwich/sandboxwich-ubuntu-dev:sha-${short_sha}"
+            "mirror.gcr.io/library/postgres@${postgres_digest}"
+          )
+          pull_pids=()
+          for image in "${images[@]}"; do
+            docker pull "${image}" &
+            pull_pids+=("$!")
+          done
+          pull_status=0
+          for pid in "${pull_pids[@]}"; do
+            wait "${pid}" || pull_status=1
+          done
+          test "${pull_status}" -eq 0
+          docker tag "${images[0]}" sandboxwich-api:conformance
+          docker tag "${images[1]}" sandboxwich-worker:conformance
+          docker tag "${images[2]}" sandboxwich-runtime:conformance
+          docker tag "${images[3]}" postgres:conformance
       - name: Create disposable cluster
         run: >-
           kind create cluster --name sandboxwich-conformance
           --config deploy/kubernetes/kind-conformance.yaml --wait 120s
       - name: Publish digest-pinned runtime images to the disposable registry
+        env:
+          CONTAINER_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
         run: |
+          set -euo pipefail
+          short_sha="${CONTAINER_SHA::12}"
+          postgres_digest="$(sed -n 's/^FROM postgres:17@//p' deploy/kubernetes/postgres.Dockerfile)"
           # Pulled via the Docker Hub mirror to avoid docker.io's anonymous-pull
           # rate limit.
           docker run -d --restart=always -p 127.0.0.1:5001:5000 \
@@ -118,7 +147,8 @@ jobs:
             --format '{{range .RepoDigests}}{{println .}}{{end}}' | head -n1)"
           [[ "${runtime_image}" == *@sha256:* ]]
           docker image rm -f sandboxwich-runtime:conformance \
-            localhost:5001/sandboxwich-runtime:conformance
+            localhost:5001/sandboxwich-runtime:conformance \
+            "ghcr.io/evalops/sandboxwich/sandboxwich-ubuntu-dev:sha-${short_sha}"
           docker image prune --force
 
           docker tag sandboxwich-worker:conformance \
@@ -128,7 +158,8 @@ jobs:
             --format '{{range .RepoDigests}}{{println .}}{{end}}' | head -n1)"
           [[ "${gateway_image}" == *@sha256:* ]]
           docker image rm -f sandboxwich-worker:conformance \
-            localhost:5001/sandboxwich-worker:conformance
+            localhost:5001/sandboxwich-worker:conformance \
+            "ghcr.io/evalops/sandboxwich/sandboxwich-worker:sha-${short_sha}"
           docker image prune --force
 
           docker tag sandboxwich-api:conformance \
@@ -138,7 +169,8 @@ jobs:
             --format '{{range .RepoDigests}}{{println .}}{{end}}' | head -n1)"
           [[ "${api_image}" == *@sha256:* ]]
           docker image rm -f sandboxwich-api:conformance \
-            localhost:5001/sandboxwich-api:conformance
+            localhost:5001/sandboxwich-api:conformance \
+            "ghcr.io/evalops/sandboxwich/sandboxwich-api:sha-${short_sha}"
           docker image prune --force
 
           docker tag postgres:conformance localhost:5001/postgres:conformance
@@ -146,7 +178,8 @@ jobs:
           postgres_image="$(docker image inspect localhost:5001/postgres:conformance \
             --format '{{range .RepoDigests}}{{println .}}{{end}}' | head -n1)"
           [[ "${postgres_image}" == *@sha256:* ]]
-          docker image rm -f postgres:conformance localhost:5001/postgres:conformance
+          docker image rm -f postgres:conformance localhost:5001/postgres:conformance \
+            "mirror.gcr.io/library/postgres@${postgres_digest}"
           docker image prune --force
 
           for node in $(kind get nodes --name sandboxwich-conformance); do
@@ -185,6 +218,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Install pinned kind

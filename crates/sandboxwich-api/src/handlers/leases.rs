@@ -140,14 +140,11 @@ pub(crate) async fn claim_lease(
     // Saturated workers must not walk the 200-candidate window (and re-enrich
     // every job) only to learn at try_claim that no ordinary slot is free.
     // Resident process leases are excluded from this count, matching try_claim.
+    // Count on the query-only pool: this is a pure read gate before the
+    // candidate scan.
     {
-        let mut connection = state.db.pool.acquire().await?;
-        let active = crate::handlers::workers::active_lease_count_for_worker_on_connection(
-            &state.db,
-            &mut connection,
-            worker.id,
-        )
-        .await?;
+        let active =
+            crate::handlers::workers::active_lease_count_for_worker(&state.db, worker.id).await?;
         if active >= worker.max_concurrent_jobs {
             return Ok(Json(ClaimLeaseResponse {
                 ok: true,
@@ -251,7 +248,10 @@ pub(crate) async fn claim_lease(
          limit ",
     );
     query.push_bind(CLAIM_SCAN_BUDGET);
-    let rows = query.build().fetch_all(&state.db.pool).await?;
+    // Candidate inventory is a pure read; try_claim alone mutates. Keep the
+    // scan off the SQLite write FIFO so concurrent list/metrics/heartbeat
+    // traffic is not serialized behind every claim poll.
+    let rows = query.build().fetch_all(state.db.read_pool()).await?;
 
     // Shared across the candidate window so many jobs for the same sandbox only
     // pay one sandbox + secret-mounts read during placement refresh.
@@ -458,43 +458,41 @@ pub(crate) async fn authoritatively_refresh_job_placement_cached(
     if job.kind == JobKind::DeleteHome {
         return Ok(true);
     }
-    // Snapshot pre-enrichment so we can skip a no-op writer UPDATE. Claim polls
-    // walk up to 200 candidates; rewriting an unchanged payload each time
-    // serializes the whole claim path on the SQLite FIFO and amplifies WAL
-    // traffic even when placement is already authoritative.
-    let before_payload = job.payload.clone();
-    let before_class = job.required_execution_class.clone();
+    // Enrich returns whether the payload/class changed. That avoids cloning
+    // the full job JSON for equality on every candidate (common when a dense
+    // queue is already authoritatively placed).
     let reference_error = validate_authoritative_placement_reference(job).err();
-    let enrichment_error = match reference_error {
-        Some(error) => Some(error),
-        None => enrich_job_payload_with_provision_spec_cached(db, job, cache)
-            .await
-            .err(),
+    let enrichment = match reference_error {
+        Some(error) => Err(error),
+        None => enrich_job_payload_with_provision_spec_cached(db, job, cache).await,
     };
-    if let Some(error) = enrichment_error {
-        if !matches!(
-            error.status,
-            StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND
-        ) {
-            return Err(error);
+    let changed = match enrichment {
+        Ok(changed) => changed,
+        Err(error) => {
+            if !matches!(
+                error.status,
+                StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND
+            ) {
+                return Err(error);
+            }
+            let sql = format!(
+                "update jobs
+                 set status = 'dead', last_error = {}, updated_at = {}
+                 where id = {} and status = 'queued'",
+                db.placeholder(1),
+                db.placeholder(2),
+                db.placeholder(3)
+            );
+            sqlx::query(&sql)
+                .bind("authoritative_placement_unavailable")
+                .bind(Utc::now().to_rfc3339())
+                .bind(job.id.to_string())
+                .execute(&db.pool)
+                .await?;
+            return Ok(false);
         }
-        let sql = format!(
-            "update jobs
-             set status = 'dead', last_error = {}, updated_at = {}
-             where id = {} and status = 'queued'",
-            db.placeholder(1),
-            db.placeholder(2),
-            db.placeholder(3)
-        );
-        sqlx::query(&sql)
-            .bind("authoritative_placement_unavailable")
-            .bind(Utc::now().to_rfc3339())
-            .bind(job.id.to_string())
-            .execute(&db.pool)
-            .await?;
-        return Ok(false);
-    }
-    if job.payload == before_payload && job.required_execution_class == before_class {
+    };
+    if !changed {
         return Ok(true);
     }
     let sql = format!(
@@ -626,7 +624,7 @@ async fn fetch_claim_operation(
     let row = sqlx::query(&sql)
         .bind(worker_id.to_string())
         .bind(operation_id.to_string())
-        .fetch_optional(&db.pool)
+        .fetch_optional(db.read_pool())
         .await?;
     match row {
         Some(row) => {

@@ -209,16 +209,21 @@ pub(crate) type PlacementEnrichmentCache =
 pub(crate) async fn enrich_job_payload_with_provision_spec(
     db: &Database,
     job: &mut Job,
-) -> Result<(), ApiError> {
+) -> Result<bool, ApiError> {
     let mut cache = PlacementEnrichmentCache::new();
     enrich_job_payload_with_provision_spec_cached(db, job, &mut cache).await
 }
 
+/// Authoritatively align `job` placement fields with the live sandbox.
+///
+/// Returns `true` when the job was mutated. Claim polls use that signal to
+/// skip a no-op writer UPDATE without cloning the full payload JSON for
+/// equality (the previous hot path when scanning up to 200 candidates).
 pub(crate) async fn enrich_job_payload_with_provision_spec_cached(
     db: &Database,
     job: &mut Job,
     cache: &mut PlacementEnrichmentCache,
-) -> Result<(), ApiError> {
+) -> Result<bool, ApiError> {
     match job.kind {
         JobKind::ProvisionSandbox
         | JobKind::RunCommand
@@ -232,18 +237,64 @@ pub(crate) async fn enrich_job_payload_with_provision_spec_cached(
             let sandbox_id = sandbox_id_from_job(job)?;
             let (sandbox, secret_mounts) =
                 load_sandbox_placement_inputs(db, sandbox_id, cache).await?;
-            job.required_execution_class = sandbox.execution_class.clone();
-            add_provision_spec_to_payload(job, &sandbox, &secret_mounts)?;
+            Ok(apply_sandbox_placement(job, &sandbox, &secret_mounts)?)
         }
         JobKind::ForkSandbox => {
             let child_id = child_sandbox_id_from_job(job)?;
             let (child, secret_mounts) = load_sandbox_placement_inputs(db, child_id, cache).await?;
-            job.required_execution_class = child.execution_class.clone();
-            add_provision_spec_to_payload(job, &child, &secret_mounts)?;
+            Ok(apply_sandbox_placement(job, &child, &secret_mounts)?)
         }
-        JobKind::DeleteHome => {}
+        JobKind::DeleteHome => Ok(false),
     }
-    Ok(())
+}
+
+/// Returns `true` when payload or execution class needed repair.
+fn apply_sandbox_placement(
+    job: &mut Job,
+    sandbox: &Sandbox,
+    secret_mounts: &[SandboxSecretMount],
+) -> Result<bool, ApiError> {
+    if placement_matches_sandbox(job, sandbox, secret_mounts) {
+        return Ok(false);
+    }
+    job.required_execution_class = sandbox.execution_class.clone();
+    add_provision_spec_to_payload(job, sandbox, secret_mounts)?;
+    Ok(true)
+}
+
+/// True when the job already carries the control-plane placement that would
+/// be written for this sandbox. Forged or partial payloads fail this check
+/// and are repaired by [`apply_sandbox_placement`].
+pub(crate) fn placement_matches_sandbox(
+    job: &Job,
+    sandbox: &Sandbox,
+    secret_mounts: &[SandboxSecretMount],
+) -> bool {
+    if job.required_execution_class != sandbox.execution_class {
+        return false;
+    }
+    let Some(image) = job
+        .payload
+        .get("runtimeImage")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    if image != sandbox.template {
+        return false;
+    }
+    let Some(spec_value) = job.payload.get("provisionSpec") else {
+        return false;
+    };
+    let Ok(spec) = serde_json::from_value::<SandboxProvisionSpec>(spec_value.clone()) else {
+        return false;
+    };
+    spec.memory_limit == sandbox.memory_limit
+        && spec.network_egress == sandbox.network_egress
+        && spec.workspace_mode == sandbox.workspace_mode
+        && spec.runtime_profile == sandbox.runtime_profile
+        && spec.execution_class == sandbox.execution_class
+        && spec.secret_mounts == secret_mounts
 }
 
 async fn load_sandbox_placement_inputs(
@@ -527,7 +578,7 @@ pub(crate) async fn list_jobs(
         std::slice::from_ref(&ctx.tenant_id),
         limit,
         &cursor,
-        row_to_job,
+        job_page_item,
     )
     .await?;
 
@@ -1092,4 +1143,100 @@ pub(crate) fn uuid_from_job_payload(
         .and_then(|value| value.as_str())
         .ok_or_else(|| ApiError::internal(missing))?;
     parse_uuid(value)
+}
+
+#[cfg(test)]
+mod placement_match_tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn sample_sandbox() -> Sandbox {
+        let now = Utc::now();
+        Sandbox {
+            id: SandboxId::new(),
+            tenant_id: "t1".into(),
+            name: "s".into(),
+            state: SandboxState::Running,
+            template: "ghcr.io/evalops/ubuntu@sha256:abc".into(),
+            memory_limit: MemoryLimit::default(),
+            network_egress: NetworkEgress::default(),
+            workspace_mode: WorkspaceMode::default(),
+            runtime_profile: SandboxRuntimeProfile::default(),
+            execution_class: ExecutionClass::DevelopmentContainer,
+            created_at: now,
+            updated_at: now,
+            ttl_seconds: None,
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+            last_activity_at: None,
+            parent_snapshot_id: None,
+        }
+    }
+
+    fn base_job(sandbox: &Sandbox) -> Job {
+        let now = Utc::now();
+        Job {
+            id: JobId::new(),
+            tenant_id: sandbox.tenant_id.clone(),
+            kind: JobKind::RunCommand,
+            status: JobStatus::Queued,
+            payload: json!({
+                "sandboxId": sandbox.id.to_string(),
+                "runtimeImage": sandbox.template,
+                "provisionSpec": SandboxProvisionSpec {
+                    memory_limit: sandbox.memory_limit.clone(),
+                    network_egress: sandbox.network_egress.clone(),
+                    workspace_mode: sandbox.workspace_mode.clone(),
+                    runtime_profile: sandbox.runtime_profile.clone(),
+                    execution_class: sandbox.execution_class.clone(),
+                    secret_mounts: vec![],
+                },
+            }),
+            required_capability: WorkerCapability::RunCommand,
+            required_execution_class: sandbox.execution_class.clone(),
+            priority: 0,
+            attempts: 0,
+            max_attempts: 3,
+            scheduled_at: now,
+            created_at: now,
+            updated_at: now,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn placement_matches_when_payload_is_authoritative() {
+        let sandbox = sample_sandbox();
+        let job = base_job(&sandbox);
+        assert!(placement_matches_sandbox(&job, &sandbox, &[]));
+    }
+
+    #[test]
+    fn placement_rejects_forged_runtime_image() {
+        let sandbox = sample_sandbox();
+        let mut job = base_job(&sandbox);
+        job.payload.as_object_mut().unwrap().insert(
+            "runtimeImage".into(),
+            json!("ghcr.io/attacker/root@sha256:ff"),
+        );
+        assert!(!placement_matches_sandbox(&job, &sandbox, &[]));
+    }
+
+    #[test]
+    fn apply_sandbox_placement_is_idempotent_for_matching_jobs() {
+        let sandbox = sample_sandbox();
+        let mut job = base_job(&sandbox);
+        assert!(!apply_sandbox_placement(&mut job, &sandbox, &[]).unwrap());
+        // Forged image is repaired and reports a mutation.
+        job.payload
+            .as_object_mut()
+            .unwrap()
+            .insert("runtimeImage".into(), json!("evil:latest"));
+        assert!(apply_sandbox_placement(&mut job, &sandbox, &[]).unwrap());
+        assert_eq!(
+            job.payload.get("runtimeImage").and_then(|v| v.as_str()),
+            Some(sandbox.template.as_str())
+        );
+        assert!(!apply_sandbox_placement(&mut job, &sandbox, &[]).unwrap());
+    }
 }
