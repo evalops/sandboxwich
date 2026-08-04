@@ -17,18 +17,19 @@ use cap_std::{
     ambient_authority,
     fs::{Dir, OpenOptions},
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, AgentFileReadResponse, AgentFileWriteRequest,
     AgentHealthResponse, AppendCommandOutputRequest, ClaimLeaseRequest, ClaimLeaseResponse,
     CommandOutputStream, CompleteLeaseRequest, DEFAULT_COMMAND_TIMEOUT_SECS, ErrorEnvelope,
     FailLeaseRequest, GUEST_AGENT_CAPABILITY_REPORT_CHECK, GuestAgentCapabilityReport, GuestStatus,
-    GuestTokenResponse, JobKind, LeaseId, LeaseResponse, MintGuestTokenRequest, RenewLeaseRequest,
-    ResidentProcessBootstrapReadRequest, ResidentProcessBootstrapReadResponse, ResidentProcessId,
-    ResidentProcessObservationRequest, ResidentProcessObservedState, ResidentProcessRestartPolicy,
-    SandboxId, UpdateGuestHealthRequest, WorkerJobResult, build_api_client,
-    resident_process_run_as_uid, validate_agent_command_request,
+    GuestTokenResponse, JobKind, LeaseId, LeaseResponse, MintGuestTokenRequest,
+    RefreshGuestTokenRequest, RenewLeaseRequest, ResidentProcessBootstrapReadRequest,
+    ResidentProcessBootstrapReadResponse, ResidentProcessId, ResidentProcessObservationRequest,
+    ResidentProcessObservedState, ResidentProcessRestartPolicy, SandboxId,
+    UpdateGuestHealthRequest, WorkerJobResult, build_api_client, resident_process_run_as_uid,
+    validate_agent_command_request,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -77,6 +78,9 @@ const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// (`mint_guest_token`'s `ttl_seconds.unwrap_or(3600)`) so leaving both sides
 /// at their defaults produces one consistent lifetime.
 const DEFAULT_GUEST_TOKEN_TTL_SECS: u64 = 3600;
+/// Refresh the guest credential at this fraction of its TTL so long-lived
+/// daemons never hit a deterministic 401 after the default 3600s mint.
+const GUEST_TOKEN_REFRESH_FRACTION: f64 = 0.65;
 /// Initial delay for retrying a resident observation after a bootstrap has
 /// been delivered. The delay uses [`Backoff`], so it remains bounded even
 /// during a long control-plane outage.
@@ -429,12 +433,12 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
     let mut claim_budget = HeartbeatFailureBudget::new(args.claim_failure_threshold.max(1));
     let mut claim_backoff = Backoff::new(Duration::from_millis(args.idle_sleep_ms.max(1)));
 
-    let guest_client = with_retry(
+    let mut guest_session = with_retry(
         &mut claim_budget,
         &mut claim_backoff,
-        "resolve_guest_client",
+        "resolve_guest_session",
         || {
-            resolve_guest_client(
+            resolve_guest_session(
                 &client,
                 &api,
                 args.tenant.as_deref(),
@@ -444,12 +448,25 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
         },
     )
     .await?;
+    // Provided tokens lack expires_at; schedule first refresh from now+TTL so
+    // the mounted secret cannot silently die at the API's 3600s default.
+    if guest_session.expires_at.is_none() && guest_session.can_refresh {
+        guest_session.expires_at =
+            Some(Utc::now() + chrono::Duration::seconds(guest_session.ttl_seconds as i64));
+    }
 
     let mut iterations = 0_u64;
     let heartbeat_interval = Duration::from_millis(args.heartbeat_interval_ms.max(1));
-    post_guest_health(&guest_client, &api, sandbox_id, GuestStatus::Ready, None).await?;
+    post_guest_health(
+        &guest_session.client,
+        &api,
+        sandbox_id,
+        GuestStatus::Ready,
+        None,
+    )
+    .await?;
     let heartbeat_task = tokio::spawn(heartbeat_loop(
-        guest_client.clone(),
+        guest_session.client.clone(),
         api.clone(),
         sandbox_id,
         heartbeat_interval,
@@ -465,7 +482,7 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
         loop {
             while let Some(completion) = resident_processes.try_reap() {
                 reconcile_resident_completion(
-                    &guest_client,
+                    &guest_session.client,
                     &api,
                     sandbox_id,
                     completion,
@@ -485,11 +502,34 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
             }
             iterations += 1;
 
+            match guest_session.ensure_fresh(&api).await {
+                Ok(()) => {
+                    claim_budget.record_success();
+                    claim_backoff.reset();
+                }
+                Err(error) if error.is_terminal_auth_failure() => {
+                    bail!(
+                        "sandboxwich-agent: terminal guest auth failure during refresh_guest_token: {error}"
+                    );
+                }
+                Err(error) if error.is_recoverable() => {
+                    // Soft-fail refresh: keep the existing credential until the
+                    // next loop; claim will still surface a terminal 401 if the
+                    // token is already dead.
+                    eprintln!(
+                        "sandboxwich-agent: refresh_guest_token failed (recoverable): {error}"
+                    );
+                }
+                Err(error) => {
+                    bail!("sandboxwich-agent: refresh_guest_token failed: {error}");
+                }
+            }
+
             if let Some(worker_id) = args.worker_id {
                 let claim_response =
                     with_retry(&mut claim_budget, &mut claim_backoff, "claim_lease", || {
                         claim_lease(
-                            &guest_client,
+                            &guest_session.client,
                             &api,
                             worker_id,
                             sandbox_id,
@@ -505,7 +545,7 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
                             Ok(metadata) => metadata,
                             Err(error) => {
                                 fail_resident_lease_and_report(
-                                    &guest_client,
+                                    &guest_session.client,
                                     &api,
                                     sandbox_id,
                                     lease.id,
@@ -522,7 +562,7 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
                         };
                         if resident_processes.is_full() {
                             fail_resident_lease_and_report(
-                                &guest_client,
+                                &guest_session.client,
                                 &api,
                                 sandbox_id,
                                 lease.id,
@@ -537,7 +577,7 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
                             .await?;
                             continue;
                         }
-                        let client = guest_client.clone();
+                        let client = guest_session.client.clone();
                         let api = api.clone();
                         resident_processes.spawn(metadata, async move {
                             handle_lease(
@@ -550,7 +590,7 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
                             .await
                         })?;
                     } else if let Err(error) = handle_lease(
-                        &guest_client,
+                        &guest_session.client,
                         &api,
                         sandbox_id,
                         lease,
@@ -564,7 +604,7 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
                             "post_guest_health",
                             || {
                                 post_guest_health(
-                                    &guest_client,
+                                    &guest_session.client,
                                     &api,
                                     sandbox_id,
                                     GuestStatus::Unhealthy,
@@ -592,7 +632,7 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
 
     for completion in resident_processes.shutdown().await {
         if let Err(shutdown_error) = reconcile_resident_completion(
-            &guest_client,
+            &guest_session.client,
             &api,
             sandbox_id,
             completion,
@@ -860,6 +900,9 @@ impl From<reqwest::Error> for AgentRequestError {
 impl AgentRequestError {
     /// Whether this failure looks transient (worth retrying) rather than a durable rejection.
     fn is_recoverable(&self) -> bool {
+        if self.is_terminal_auth_failure() {
+            return false;
+        }
         match self {
             AgentRequestError::Transport(error) => {
                 error.is_timeout() || error.is_connect() || error.is_request()
@@ -872,6 +915,27 @@ impl AgentRequestError {
             AgentRequestError::Decode(_) => false,
             AgentRequestError::Configuration(_) => false,
         }
+    }
+
+    /// Guest-token expiry/revocation (and plain 401) will not heal by retrying.
+    /// The daemon must exit so the control plane can archive the sandbox rather
+    /// than CrashLoop on a permanent auth failure.
+    fn is_terminal_auth_failure(&self) -> bool {
+        let Self::Status { status, body } = self else {
+            return false;
+        };
+        if *status == reqwest::StatusCode::UNAUTHORIZED {
+            return true;
+        }
+        if *status != reqwest::StatusCode::CONFLICT && *status != reqwest::StatusCode::FORBIDDEN {
+            return false;
+        }
+        serde_json::from_str::<ErrorEnvelope>(body).is_ok_and(|envelope| {
+            matches!(
+                envelope.code.as_str(),
+                "guest_token_expired" | "guest_token_revoked" | "lease_cancelled"
+            )
+        })
     }
 
     fn is_resident_desired_stop(&self) -> bool {
@@ -901,6 +965,11 @@ where
                 budget.record_success();
                 backoff.reset();
                 return Ok(value);
+            }
+            Err(error) if error.is_terminal_auth_failure() => {
+                bail!(
+                    "sandboxwich-agent: terminal guest auth failure during {operation_name}: {error}"
+                );
             }
             Err(error) if error.is_recoverable() => {
                 let warning = format!(
@@ -1133,6 +1202,71 @@ fn guest_credential_source(
     }
 }
 
+/// Live guest credential held by the daemon, with TTL-driven refresh so a
+/// fixed 3600s mint is not a deterministic death mode for long-lived sandboxes.
+struct GuestAuthSession {
+    client: reqwest::Client,
+    expires_at: Option<DateTime<Utc>>,
+    ttl_seconds: u64,
+    sandbox_id: SandboxId,
+    tenant: Option<String>,
+    /// When set, initial mint used the worker credential; refresh uses the
+    /// guest-principal refresh endpoint once a guest token exists.
+    worker_client: reqwest::Client,
+    worker_id: Option<Uuid>,
+    can_refresh: bool,
+}
+
+impl GuestAuthSession {
+    fn needs_refresh(&self, now: DateTime<Utc>) -> bool {
+        if !self.can_refresh {
+            return false;
+        }
+        let Some(expires_at) = self.expires_at else {
+            return false;
+        };
+        let lifetime = chrono::Duration::seconds(self.ttl_seconds.max(1) as i64);
+        let refresh_after = expires_at
+            - chrono::Duration::milliseconds(
+                (lifetime.num_milliseconds() as f64 * (1.0 - GUEST_TOKEN_REFRESH_FRACTION)) as i64,
+            );
+        now >= refresh_after
+    }
+
+    async fn ensure_fresh(&mut self, api: &str) -> Result<(), AgentRequestError> {
+        if !self.needs_refresh(Utc::now()) {
+            return Ok(());
+        }
+        let minted =
+            refresh_guest_token(&self.client, api, self.sandbox_id, self.ttl_seconds).await;
+        let minted = match minted {
+            Ok(response) => response,
+            Err(error) if error.is_terminal_auth_failure() => return Err(error),
+            Err(error) => {
+                // Fall back to re-mint via worker credential when available
+                // (e.g. self-mint daemons before the refresh route is reachable).
+                let Some(worker_id) = self.worker_id else {
+                    return Err(error);
+                };
+                mint_guest_token(
+                    &self.worker_client,
+                    api,
+                    worker_id,
+                    self.sandbox_id,
+                    self.ttl_seconds,
+                )
+                .await?
+            }
+        };
+        self.client = build_api_client(Some(&minted.token), self.tenant.as_deref())
+            .map_err(|error| AgentRequestError::Configuration(error.to_string()))?;
+        self.expires_at = Some(minted.expires_at);
+        let ttl = (minted.expires_at - Utc::now()).num_seconds().max(1) as u64;
+        self.ttl_seconds = ttl.min(86_400);
+        Ok(())
+    }
+}
+
 /// Resolves the credential this daemon uses for every guest-facing call
 /// (claim/renew/complete/fail/output, guest-health): a pre-provisioned,
 /// sandbox-scoped guest token if one was supplied (`--guest-token`/
@@ -1147,39 +1281,68 @@ fn guest_credential_source(
 /// returned to the daemon's bounded retry loop instead of falling back to the
 /// worker credential, which would permanently pin the daemon to broader
 /// authority after one transient outage.
-async fn resolve_guest_client(
+async fn resolve_guest_session(
     worker_client: &reqwest::Client,
     api: &str,
     tenant: Option<&str>,
     sandbox_id: SandboxId,
     credential: GuestCredentialSource,
-) -> Result<reqwest::Client, AgentRequestError> {
-    let token = match credential {
-        GuestCredentialSource::Provided(token) => Some(token),
+) -> Result<GuestAuthSession, AgentRequestError> {
+    match credential {
+        GuestCredentialSource::Provided(token) => {
+            // Mounted/static guest tokens have no known expires_at. Refresh
+            // still works once the token is live (guest-principal refresh).
+            let client = build_api_client(Some(&token), tenant)
+                .map_err(|error| AgentRequestError::Configuration(error.to_string()))?;
+            Ok(GuestAuthSession {
+                client,
+                expires_at: None,
+                ttl_seconds: DEFAULT_GUEST_TOKEN_TTL_SECS,
+                sandbox_id,
+                tenant: tenant.map(str::to_owned),
+                worker_client: worker_client.clone(),
+                worker_id: None,
+                // Provided tokens can refresh once they have an expires_at
+                // after the first successful refresh, or we bootstrap refresh
+                // by treating them as immediately refreshable at start+TTL.
+                can_refresh: true,
+            })
+        }
         GuestCredentialSource::SelfMint {
             worker_id,
             ttl_seconds,
-        } => Some(
-            mint_guest_token(worker_client, api, worker_id, sandbox_id, ttl_seconds)
-                .await?
-                .token,
-        ),
-        GuestCredentialSource::None => None,
-    };
-
-    let Some(token) = token else {
-        // Without a worker id there is no claim loop, so this preserves the
-        // heartbeat/one-shot command behavior without granting executor work.
-        return Ok(worker_client.clone());
-    };
-
-    build_api_client(Some(&token), tenant)
-        .map_err(|error| AgentRequestError::Configuration(error.to_string()))
+        } => {
+            let minted =
+                mint_guest_token(worker_client, api, worker_id, sandbox_id, ttl_seconds).await?;
+            let client = build_api_client(Some(&minted.token), tenant)
+                .map_err(|error| AgentRequestError::Configuration(error.to_string()))?;
+            Ok(GuestAuthSession {
+                client,
+                expires_at: Some(minted.expires_at),
+                ttl_seconds,
+                sandbox_id,
+                tenant: tenant.map(str::to_owned),
+                worker_client: worker_client.clone(),
+                worker_id: Some(worker_id),
+                can_refresh: true,
+            })
+        }
+        GuestCredentialSource::None => Ok(GuestAuthSession {
+            client: worker_client.clone(),
+            expires_at: None,
+            ttl_seconds: DEFAULT_GUEST_TOKEN_TTL_SECS,
+            sandbox_id,
+            tenant: tenant.map(str::to_owned),
+            worker_client: worker_client.clone(),
+            worker_id: None,
+            can_refresh: false,
+        }),
+    }
 }
 
 /// Mints a sandbox-scoped guest token (`sbw_gtok_...`) bound to exactly
 /// `(worker_id, sandbox_id)`, using `client` (the worker-scoped credential)
-/// to authenticate the mint call itself. See `resolve_guest_client`.
+/// to authenticate the mint call itself. See `resolve_guest_session`.
 async fn mint_guest_token(
     client: &reqwest::Client,
     api: &str,
@@ -1192,6 +1355,22 @@ async fn mint_guest_token(
             "{api}/workers/{worker_id}/sandboxes/{sandbox_id}/guest-token"
         ))
         .json(&MintGuestTokenRequest {
+            ttl_seconds: Some(ttl_seconds),
+        })
+        .send()
+        .await?;
+    decode_json(response).await
+}
+
+async fn refresh_guest_token(
+    client: &reqwest::Client,
+    api: &str,
+    sandbox_id: SandboxId,
+    ttl_seconds: u64,
+) -> Result<GuestTokenResponse, AgentRequestError> {
+    let response = client
+        .post(format!("{api}/sandboxes/{sandbox_id}/guest-token/refresh"))
+        .json(&RefreshGuestTokenRequest {
             ttl_seconds: Some(ttl_seconds),
         })
         .send()

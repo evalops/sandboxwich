@@ -293,6 +293,11 @@ pub(crate) async fn create_sandbox_with_home(
     };
     trace.add_to_payload(&mut job.payload);
     add_provision_spec_to_payload(&mut job, &sandbox, &provision_spec.secret_mounts)?;
+    // Capacity admission: when every online worker has reported an envelope and
+    // none can schedule this tier, reject immediately instead of creating a Pod
+    // that will only fail after the readiness window.
+    reject_if_memory_exceeds_all_envelopes(&state.db, &ctx.tenant_id, &sandbox.memory_limit)
+        .await?;
     let mut tx = state.db.pool.begin().await?;
     insert_sandbox_on_connection(&state.db, &mut tx, &sandbox).await?;
     insert_sandbox_secret_bindings_on_connection(
@@ -671,6 +676,68 @@ pub(crate) async fn stop_sandbox_via_job(
         .bind(now.to_rfc3339())
         .bind(sandbox_id.to_string())
         .bind(&sandbox.tenant_id)
+        .execute(&mut *tx)
+        .await?;
+    // Cancel queued non-provision work for this sandbox before inserting the
+    // stop job. Provision jobs stay queued so a stop-before-first-claim path can
+    // still drain them (they complete into the already-archiving sandbox and
+    // enqueue teardown). In-flight *leased* work is fenced via
+    // cancel_requested_at so renew returns lease_cancelled and workers abort
+    // kubectl waits immediately.
+    let cancel_jobs_sql = format!(
+        "update jobs
+         set status = {}, updated_at = {}, last_error = {},
+             cancel_requested_at = {}, cancel_reason = {}
+         where tenant_id = {}
+           and status = 'queued'
+           and kind not in ('stop_sandbox', 'provision_sandbox')
+           and (sandbox_id = {} or parent_sandbox_id = {} or child_sandbox_id = {})",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4),
+        db.placeholder(5),
+        db.placeholder(6),
+        db.placeholder(7),
+        db.placeholder(8),
+        db.placeholder(9)
+    );
+    sqlx::query(&cancel_jobs_sql)
+        .bind(job_status_to_str(&JobStatus::Cancelled))
+        .bind(now.to_rfc3339())
+        .bind("sandbox_stopped")
+        .bind(now.to_rfc3339())
+        .bind("sandbox_stopped")
+        .bind(&sandbox.tenant_id)
+        .bind(sandbox_id.to_string())
+        .bind(sandbox_id.to_string())
+        .bind(sandbox_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    let cancel_leases_sql = format!(
+        "update job_leases
+         set cancel_requested_at = {}, cancel_reason = {}
+         where status = 'active'
+           and cancel_requested_at is null
+           and job_id in (
+             select id from jobs
+             where tenant_id = {}
+               and (sandbox_id = {} or parent_sandbox_id = {} or child_sandbox_id = {})
+           )",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4),
+        db.placeholder(5),
+        db.placeholder(6)
+    );
+    sqlx::query(&cancel_leases_sql)
+        .bind(now.to_rfc3339())
+        .bind("sandbox_stopped")
+        .bind(&sandbox.tenant_id)
+        .bind(sandbox_id.to_string())
+        .bind(sandbox_id.to_string())
+        .bind(sandbox_id.to_string())
         .execute(&mut *tx)
         .await?;
     insert_job_on_connection(db, &mut tx, &job).await?;
@@ -1338,6 +1405,66 @@ pub(crate) async fn fetch_sandbox_on_connection(
     let mut sandbox = row_to_sandbox(row)?;
     hydrate_sandbox_network_egress_on_connection(db, connection, &mut sandbox).await?;
     Ok(sandbox)
+}
+
+/// Reject create when every online worker has reported a resource envelope and
+/// none of those envelopes can schedule `memory_limit`. Workers that have not
+/// reported an envelope are treated as "unknown" so rolling upgrades do not
+/// brick admission before all workers start heartbeating capacity evidence.
+pub(crate) async fn reject_if_memory_exceeds_all_envelopes(
+    db: &Database,
+    tenant_id: &str,
+    memory_limit: &MemoryLimit,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "select resource_envelope from workers
+         where tenant_id = {} and status = 'online'",
+        db.placeholder(1)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(tenant_id)
+        .fetch_all(&db.pool)
+        .await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut saw_envelope = false;
+    let mut max_ceiling: Option<u64> = None;
+    let mut evidence_age: Option<String> = None;
+    for row in rows {
+        let raw: Option<String> = row.try_get("resource_envelope")?;
+        let Some(raw) = raw.filter(|value| !value.is_empty()) else {
+            // At least one online worker has no envelope → do not fail closed.
+            return Ok(());
+        };
+        saw_envelope = true;
+        let envelope: WorkerResourceEnvelope = serde_json::from_str(&raw).map_err(|_| {
+            ApiError::internal("database contains invalid worker resource envelope")
+        })?;
+        if envelope.can_schedule_memory(memory_limit) {
+            return Ok(());
+        }
+        max_ceiling = Some(
+            max_ceiling
+                .unwrap_or(0)
+                .max(envelope.max_memory_bytes.unwrap_or(0)),
+        );
+        evidence_age = Some(envelope.evidence_at.to_rfc3339());
+    }
+    if !saw_envelope {
+        return Ok(());
+    }
+    Err(ApiError {
+        status: StatusCode::CONFLICT,
+        code: "capacity_insufficient",
+        message: format!(
+            "requested memory tier {} ({} bytes) exceeds observed worker capacity (ceiling={} bytes, evidence_at={})",
+            memory_limit.as_db_str(),
+            memory_limit.memory_bytes(),
+            max_ceiling.unwrap_or(0),
+            evidence_age.unwrap_or_else(|| "unknown".into()),
+        ),
+    })
 }
 
 pub(crate) async fn ensure_sandbox_tenant_on_connection(

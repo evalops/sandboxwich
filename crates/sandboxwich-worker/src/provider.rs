@@ -1670,9 +1670,20 @@ impl KubernetesDryRunProvider {
                 }]),
             ),
             ("volumes".to_string(), json!(volumes)),
+            // Guest auth/token failures are terminal for the pod; never
+            // CrashLoopBackOff a permanently unauthorized runtime.
+            ("restartPolicy".to_string(), json!("Never")),
         ]);
         if let Some(runtime_class_name) = &self.runtime_class_name {
             pod_spec.insert("runtimeClassName".to_string(), json!(runtime_class_name));
+        }
+        // Outer safety bound when the operator configures a hard sandbox lifetime
+        // on the worker (the provisionSpec does not yet carry max_lifetime).
+        if let Ok(deadline) = std::env::var("SANDBOXWICH_SANDBOX_ACTIVE_DEADLINE_SECONDS")
+            && let Ok(deadline) = deadline.parse::<i64>()
+            && deadline > 0
+        {
+            pod_spec.insert("activeDeadlineSeconds".to_string(), json!(deadline));
         }
 
         let mut manifest = json!({

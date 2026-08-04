@@ -125,6 +125,7 @@ pub(crate) async fn worker_tokens_are_role_scoped_and_never_reserialized() {
         .json(&WorkerHeartbeatRequest {
             max_concurrent_jobs: None,
             labels: Default::default(),
+            resource_envelope: None,
         })
         .send()
         .await
@@ -140,6 +141,7 @@ pub(crate) async fn worker_tokens_are_role_scoped_and_never_reserialized() {
         .json(&WorkerHeartbeatRequest {
             max_concurrent_jobs: None,
             labels: Default::default(),
+            resource_envelope: None,
         })
         .send()
         .await

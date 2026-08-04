@@ -751,6 +751,7 @@ fn apex_profile_bound_jobs_only_match_the_exact_profile_worker_image() {
             "runtime_image".to_string(),
             image.to_string(),
         )]),
+        resource_envelope: None,
         registered_at: now,
         last_heartbeat_at: Some(now),
     };
@@ -1893,6 +1894,7 @@ async fn seed_worker(db: &Database) -> WorkerId {
         capabilities: vec![WorkerCapability::ProvisionSandbox],
         max_concurrent_jobs: 1,
         labels: BTreeMap::new(),
+        resource_envelope: None,
         registered_at: now,
         last_heartbeat_at: Some(now),
     };

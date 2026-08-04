@@ -34,8 +34,8 @@ use sandboxwich_core::{
     ResidentProcessBootstrapReadRequest, ResidentProcessBootstrapReadResponse, ResidentProcessId,
     ResidentProcessObservationRequest, ResidentProcessObservedState, ResidentProcessRestartPolicy,
     RuntimeResourceInventoryResponse, SandboxId, SandboxProvisionSpec, WorkerCapability,
-    WorkerHeartbeatRequest, WorkerJobResult, WorkerResponse, build_api_client,
-    validate_agent_command_request,
+    WorkerHeartbeatRequest, WorkerJobResult, WorkerResourceEnvelope, WorkerResponse,
+    build_api_client, validate_agent_command_request,
 };
 use serde_json::json;
 use sha2::Digest;
@@ -285,6 +285,13 @@ struct WorkLoopArgs {
 
     #[arg(long, env = "SANDBOXWICH_MAX_RESIDENT_PROCESSES", default_value_t = 8)]
     max_resident_processes: usize,
+
+    /// Local execution concurrency for ordinary (non-resident) leases. Mirrors
+    /// the API registration field so `max_concurrent_jobs` is real rather than
+    /// only a claim gate. At least one slot is reserved for control work
+    /// (stop/delete) so teardown cannot queue behind a stuck provision.
+    #[arg(long, env = "SANDBOXWICH_MAX_CONCURRENT_JOBS", default_value_t = 1)]
+    max_concurrent_jobs: u32,
 
     #[arg(long = "label", value_parser = parse_label)]
     label: Vec<(String, String)>,
@@ -1064,6 +1071,7 @@ async fn main() -> anyhow::Result<()> {
                 .json(&WorkerHeartbeatRequest {
                     max_concurrent_jobs: args.max_concurrent_jobs,
                     labels: args.label.into_iter().collect(),
+                    resource_envelope: env_resource_envelope(),
                 })
                 .send()
                 .await?;
@@ -1219,6 +1227,7 @@ async fn main() -> anyhow::Result<()> {
                     idle_sleep_ms: args.idle_sleep_ms,
                     max_iterations: args.max_iterations,
                     max_resident_processes: args.max_resident_processes,
+                    max_concurrent_jobs: args.max_concurrent_jobs.unwrap_or(1).max(1),
                     drain_timeout_secs: args.drain_timeout_secs,
                     label: labels.into_iter().collect(),
                     provider: args.provider,
@@ -1674,10 +1683,36 @@ async fn heartbeat_worker(
         .json(&WorkerHeartbeatRequest {
             max_concurrent_jobs: None,
             labels,
+            resource_envelope: env_resource_envelope(),
         })
         .send()
         .await?;
     decode_json::<WorkerResponse>(response).await
+}
+
+/// Optional observed capacity envelope from the environment so operators and
+/// tests can advertise a real ceiling without requiring a live node probe in
+/// every worker path. Production workers should set this from a cluster probe.
+fn env_resource_envelope() -> Option<WorkerResourceEnvelope> {
+    let max_memory_bytes = std::env::var("SANDBOXWICH_OBSERVED_MAX_MEMORY_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok());
+    let max_cpu_millis = std::env::var("SANDBOXWICH_OBSERVED_MAX_CPU_MILLIS")
+        .ok()
+        .and_then(|value| value.parse().ok());
+    let eligible_node_count = std::env::var("SANDBOXWICH_OBSERVED_ELIGIBLE_NODES")
+        .ok()
+        .and_then(|value| value.parse().ok());
+    if max_memory_bytes.is_none() && max_cpu_millis.is_none() && eligible_node_count.is_none() {
+        return None;
+    }
+    Some(WorkerResourceEnvelope {
+        max_memory_bytes,
+        max_cpu_millis,
+        eligible_node_count,
+        evidence_at: chrono::Utc::now(),
+        probe_failure_reason: None,
+    })
 }
 
 async fn drain_worker(
@@ -2139,6 +2174,10 @@ async fn fetch_runtime_resource_inventory(
 async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> anyhow::Result<()> {
     let provider_mode = args.provider.provider_mode;
     let max_resident_processes = args.max_resident_processes.max(1);
+    // One slot is reserved for control/teardown so stop cannot queue forever
+    // behind a stuck provision. Ordinary work uses the remaining slots.
+    let max_concurrent_jobs = args.max_concurrent_jobs.max(1) as usize;
+    let ordinary_slots = max_concurrent_jobs.saturating_sub(1).max(1);
     let provider = Arc::new(runtime_provider_from_args(args.provider)?);
     let labels: BTreeMap<_, _> = args.label.into_iter().collect();
     let drain_timeout = Duration::from_secs(args.drain_timeout_secs);
@@ -2148,12 +2187,69 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
     let mut resident_tasks: tokio::task::JoinSet<anyhow::Result<LeaseResponse>> =
         tokio::task::JoinSet::new();
     let mut resident_tasks_by_id = std::collections::HashMap::new();
+    let mut ordinary_tasks: tokio::task::JoinSet<(
+        sandboxwich_core::LeaseId,
+        anyhow::Result<LeaseResponse>,
+    )> = tokio::task::JoinSet::new();
     let worker_id = args.worker_id;
+
+    // Independent heartbeat so a long provision cannot starve liveness and a
+    // heartbeat failure cannot skip claim for an entire iteration.
+    let heartbeat_client = client.clone();
+    let heartbeat_api = api.to_string();
+    let heartbeat_labels = labels.clone();
+    let heartbeat_shutdown = shutdown.clone();
+    let heartbeat_task = tokio::spawn(async move {
+        let interval = Duration::from_secs(15);
+        loop {
+            if heartbeat_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            if let Err(error) = with_retries("worker heartbeat", API_RETRY_ATTEMPTS, || {
+                heartbeat_worker(
+                    &heartbeat_client,
+                    &heartbeat_api,
+                    worker_id,
+                    heartbeat_labels.clone(),
+                )
+            })
+            .await
+            {
+                eprintln!(
+                    "error: independent heartbeat failed after {API_RETRY_ATTEMPTS} attempts: {error:#}"
+                );
+            }
+            sleep_or_shutdown(interval, &heartbeat_shutdown).await;
+            if heartbeat_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+        }
+    });
 
     loop {
         while let Some(result) = resident_tasks.try_join_next_with_id() {
             reconcile_resident_task_result(client, api, result, &mut resident_tasks_by_id, false)
                 .await;
+        }
+        while let Some(joined) = ordinary_tasks.try_join_next() {
+            match joined {
+                Ok((lease_id, Ok(response))) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "ok": true,
+                            "lease": response.lease,
+                            "lease_id": lease_id,
+                        }))?
+                    );
+                }
+                Ok((lease_id, Err(error))) => {
+                    eprintln!("error: concurrent lease {lease_id} failed, continuing: {error:#}");
+                }
+                Err(error) => {
+                    eprintln!("error: concurrent lease task join failed: {error:#}");
+                }
+            }
         }
         if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
             eprintln!(
@@ -2170,20 +2266,10 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
         }
         iterations += 1;
 
-        if let Err(error) = with_retries("worker heartbeat", API_RETRY_ATTEMPTS, || {
-            heartbeat_worker(client, api, args.worker_id, labels.clone())
-        })
-        .await
-        {
-            eprintln!(
-                "error: heartbeat failed after {API_RETRY_ATTEMPTS} attempts, skipping this iteration: {error:#}"
-            );
-            sleep_or_shutdown(Duration::from_millis(args.idle_sleep_ms), &shutdown).await;
-            continue;
-        }
-
-        // Re-check right before claiming: a signal received during the heartbeat
-        // call/sleep above must still stop us from picking up new work.
+        // Orphan reconciliation lives out-of-band (#267). Heartbeat runs on its
+        // own task above so claim is never gated on heartbeat success.
+        // Re-check right before claiming: a signal received during concurrent
+        // work reaping above must still stop us from picking up new work.
         if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
             eprintln!(
                 "worker: shutdown requested, exiting work loop before claiming further leases"
@@ -2296,6 +2382,60 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
                 ),
             }
         }
+        let is_control = matches!(lease.job.kind, JobKind::StopSandbox | JobKind::DeleteHome);
+        let is_provision_like = matches!(
+            lease.job.kind,
+            JobKind::ProvisionSandbox | JobKind::ResumeSandbox | JobKind::ForkSandbox
+        );
+        // Provision-like work stays serial so one cold start cannot multiply
+        // cluster pressure. Everything else (including control/stop) runs on the
+        // concurrent set; control always gets a slot even when ordinary work is
+        // full (reserved teardown capacity).
+        if !is_provision_like {
+            while !is_control && ordinary_tasks.len() >= ordinary_slots {
+                if let Some(joined) = ordinary_tasks.join_next().await {
+                    match joined {
+                        Ok((done_id, Ok(response))) => {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&json!({
+                                    "ok": true,
+                                    "lease": response.lease,
+                                    "lease_id": done_id,
+                                }))?
+                            );
+                        }
+                        Ok((done_id, Err(error))) => {
+                            eprintln!(
+                                "error: concurrent lease {done_id} failed, continuing: {error:#}"
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!("error: concurrent lease task join failed: {error:#}");
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+            let concurrent_client = client.clone();
+            let concurrent_api = api.to_string();
+            let concurrent_provider = provider.clone();
+            ordinary_tasks.spawn(async move {
+                let result = handle_lease(
+                    &concurrent_client,
+                    &concurrent_api,
+                    worker_id,
+                    lease,
+                    concurrent_provider,
+                    None,
+                )
+                .await;
+                (lease_id, result)
+            });
+            continue;
+        }
+
         let handle_future =
             handle_lease(client, api, args.worker_id, lease, provider.clone(), None);
         let outcome = tokio::select! {
@@ -2330,6 +2470,8 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
         }
     }
 
+    heartbeat_task.abort();
+
     for metadata in resident_tasks_by_id.values() {
         metadata
             .cancellation
@@ -2346,6 +2488,19 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
         .is_err()
     {
         eprintln!("warning: provider-isolated resident leases exceeded the drain timeout");
+    }
+    let drain_ordinary = async {
+        while let Some(joined) = ordinary_tasks.join_next().await {
+            if let Ok((lease_id, Err(error))) = joined {
+                eprintln!("error: concurrent lease {lease_id} failed during drain: {error:#}");
+            }
+        }
+    };
+    if tokio::time::timeout(drain_timeout, drain_ordinary)
+        .await
+        .is_err()
+    {
+        eprintln!("warning: ordinary concurrent leases exceeded the drain timeout");
     }
 
     if let Err(error) = with_retries("mark worker draining", API_RETRY_ATTEMPTS, || {
