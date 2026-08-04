@@ -6649,7 +6649,31 @@ impl SandboxProvider for KubernetesApplyProvider {
                                 ),
                             )));
                         }
-                        false
+                        // The resident workload performs its own startup handshake (Maestro's
+                        // workload-identity exchange is the first thing its container does).
+                        // Publish the provider Pod identity as soon as Kubernetes has created
+                        // the Pod, before waiting for the container to report Running. This
+                        // breaks the circular dependency where Identity needs the placement
+                        // fence before the workload can finish starting, while the worker used
+                        // to wait for that same start before recording the fence.
+                        match pod_uid {
+                            Some(pod_uid) => {
+                                let observation = IsolatedResidentProcessObservation {
+                                    state: IsolatedResidentProcessState::Starting,
+                                    pod_name,
+                                    pod_uid: Some(pod_uid),
+                                    ready: false,
+                                    exit_code: None,
+                                };
+                                let changed = previous.as_ref() != Some(&observation);
+                                if changed {
+                                    observe(observation.clone())?;
+                                    previous = Some(observation);
+                                }
+                                changed
+                            }
+                            None => false,
+                        }
                     }
                     IsolatedResidentProcessPodObservation::Started(observation) => {
                         let changed = previous.as_ref() != Some(&observation);
