@@ -609,6 +609,43 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
         .json(&ResidentProcessObservationRequest {
             generation: created.resident_process.generation,
             lease_id: lease.id.0,
+            observed_state: ResidentProcessObservedState::Starting,
+            pid: None,
+            exit_code: None,
+            error_code: None,
+            error_message: None,
+            provider_pod_name: Some("maestro-hosted-runner-pod".into()),
+            provider_pod_uid: Some(pod_uid.to_string()),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let starting_connection: MaestroHostedRunnerConnectionBindingResponse = client
+        .get(&connection_binding_url)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        starting_connection.pod_uid, pod_uid,
+        "the binding becomes available once the provider Pod identity is fenced"
+    );
+
+    worker_http
+        .post(format!(
+            "{}/resident-processes/{}/observations",
+            server.base_url, created.resident_process.id
+        ))
+        .json(&ResidentProcessObservationRequest {
+            generation: created.resident_process.generation,
+            lease_id: lease.id.0,
             observed_state: ResidentProcessObservedState::Running,
             pid: None,
             exit_code: None,
