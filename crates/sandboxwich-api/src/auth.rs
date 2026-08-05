@@ -130,6 +130,10 @@ pub(crate) async fn auth_and_tenant(
         "authorization_decision_id",
         authorization.decision_id.as_str(),
     );
+    span.record(
+        "authorization_fingerprint",
+        authorization.authorization_fingerprint.as_str(),
+    );
     span.record("authorization_policy_id", authorization.policy_id);
     span.record("authorization_policy_version", authorization.policy_version);
     span.record(
@@ -144,6 +148,7 @@ pub(crate) async fn auth_and_tenant(
         target: "sandboxwich.authorization",
         request_id = %authorization.request_id,
         decision_id = %authorization.decision_id,
+        authorization_fingerprint = %authorization.authorization_fingerprint,
         policy_id = authorization.policy_id,
         policy_version = authorization.policy_version,
         trace_id = authorization.trace_id.as_deref().unwrap_or_default(),

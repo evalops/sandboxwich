@@ -23,6 +23,7 @@ pub(crate) static AUTHORIZATION_DECISION_ID_HEADER: HeaderName =
 pub(crate) struct AuthorizationContext {
     pub(crate) request_id: String,
     pub(crate) decision_id: String,
+    pub(crate) authorization_fingerprint: String,
     pub(crate) trace_id: Option<String>,
     pub(crate) policy_id: &'static str,
     pub(crate) policy_version: &'static str,
@@ -67,7 +68,10 @@ impl AuthorizationContext {
     ) -> Self {
         Self {
             request_id: request_id.to_owned(),
-            decision_id: decision_id(request_id, trace_id, method, path, tenant_id, principal),
+            decision_id: decision_id(request_id, method, path, tenant_id, principal),
+            authorization_fingerprint: authorization_fingerprint(
+                method, path, tenant_id, principal,
+            ),
             trace_id: trace_id.map(str::to_owned),
             policy_id: AUTHORIZATION_POLICY_ID,
             policy_version: AUTHORIZATION_POLICY_VERSION,
@@ -117,7 +121,40 @@ fn update_field(hasher: &mut Sha256, name: &str, value: &str) {
 
 fn decision_id(
     request_id: &str,
-    trace_id: Option<&str>,
+    method: &str,
+    path: &str,
+    tenant_id: &str,
+    principal: Principal,
+) -> String {
+    digest_id(
+        "authz_decision_v1_",
+        Some(request_id),
+        method,
+        path,
+        tenant_id,
+        principal,
+    )
+}
+
+fn authorization_fingerprint(
+    method: &str,
+    path: &str,
+    tenant_id: &str,
+    principal: Principal,
+) -> String {
+    digest_id(
+        "authz_fingerprint_v1_",
+        None,
+        method,
+        path,
+        tenant_id,
+        principal,
+    )
+}
+
+fn digest_id(
+    prefix: &str,
+    request_id: Option<&str>,
     method: &str,
     path: &str,
     tenant_id: &str,
@@ -128,8 +165,9 @@ fn decision_id(
     let mut hasher = Sha256::new();
     update_field(&mut hasher, "policy_id", AUTHORIZATION_POLICY_ID);
     update_field(&mut hasher, "policy_version", AUTHORIZATION_POLICY_VERSION);
-    update_field(&mut hasher, "request_id", request_id);
-    update_field(&mut hasher, "trace_id", trace_id.unwrap_or_default());
+    if let Some(request_id) = request_id {
+        update_field(&mut hasher, "request_id", request_id);
+    }
     update_field(&mut hasher, "method", method);
     update_field(&mut hasher, "path", path);
     update_field(&mut hasher, "tenant_id", tenant_id);
@@ -141,7 +179,7 @@ fn decision_id(
     for byte in digest {
         encoded.push_str(&format!("{byte:02x}"));
     }
-    format!("authz_decision_v1_{encoded}")
+    format!("{prefix}{encoded}")
 }
 
 #[cfg(test)]
@@ -192,9 +230,26 @@ mod tests {
 
         assert_eq!(first, repeat);
         assert_ne!(first.decision_id, changed_request.decision_id);
-        assert_ne!(first.decision_id, changed_trace.decision_id);
+        assert_eq!(first.decision_id, changed_trace.decision_id);
+        assert_eq!(
+            first.authorization_fingerprint,
+            changed_request.authorization_fingerprint
+        );
+        assert_eq!(
+            first.authorization_fingerprint,
+            changed_trace.authorization_fingerprint
+        );
         assert!(first.decision_id.starts_with("authz_decision_v1_"));
         assert_eq!(first.decision_id.len(), "authz_decision_v1_".len() + 64);
+        assert!(
+            first
+                .authorization_fingerprint
+                .starts_with("authz_fingerprint_v1_")
+        );
+        assert_eq!(
+            first.authorization_fingerprint.len(),
+            "authz_fingerprint_v1_".len() + 64
+        );
         assert!(!first.decision_id.contains("tenant-private"));
         assert_eq!(first.principal_class, "guest");
         assert_eq!(first.policy_id, AUTHORIZATION_POLICY_ID);
