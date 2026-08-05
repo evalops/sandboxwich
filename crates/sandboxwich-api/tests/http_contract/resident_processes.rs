@@ -282,7 +282,12 @@ fn maestro_hosted_runner_request_for_organization(
             ("MAESTRO_EVALOPS_PROVIDER".into(), "openrouter".into()),
             ("MAESTRO_EVALOPS_ENVIRONMENT".into(), "production".into()),
             ("MAESTRO_EVALOPS_CREDENTIAL_NAME".into(), "dex".into()),
+            ("MAESTRO_MODEL".into(), "evalops/gpt-5.5".into()),
             ("MAESTRO_DEFAULT_MODEL".into(), "evalops/gpt-5.5".into()),
+            (
+                "MAESTRO_RESIDENT_CONTRACT_REVISION".into(),
+                "maestro-resident-model-ready-v2".into(),
+            ),
             (
                 "MAESTRO_LLM_GATEWAY_URL".into(),
                 MAESTRO_HOSTED_RUNNER_GATEWAY_BASE_URL.into(),
