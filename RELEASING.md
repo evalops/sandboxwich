@@ -14,8 +14,8 @@ no manual version bump command to run; cutting a release is merging a PR.
    merge** — release-plz can tag the wrong SHA after squash merges
    ([release-plz#2759](https://github.com/release-plz/release-plz/issues/2759)).
 3. On the next `main` push, `release-plz release` pushes the `vX.Y.Z` tag.
-   All six crates render the same tag name and release-plz skips tags that
-   already exist, so exactly one tag is created per release.
+   Only `sandboxwich-core` creates that tag (`release = false` on the other
+   crates); the workspace version still bumps every crate together.
 4. The tag push triggers `release.yml`, which builds the cross-platform CLI
    binaries (with provenance attestation), the OpenAPI contract, and the
    image digest inventory, and creates the GitHub release.

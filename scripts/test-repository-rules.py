@@ -85,6 +85,42 @@ class RepositoryRulesTest(unittest.TestCase):
             self.assertIn(published_ref, conformance)
         self.assertNotIn("ghcr.io/evalops/sandboxwich/", conformance)
 
+    def test_kubernetes_conformance_pins_kind_images_to_local_registry(self) -> None:
+        # kind nodes have no GHCR credentials. RepoDigests after a private
+        # GHCR pull still lists ghcr.io first; head -n1 would make crictl
+        # pull that digest and 401. The workflow must select localhost:5001.
+        conformance = (
+            ROOT / ".github/workflows/kubernetes-conformance.yml"
+        ).read_text()
+        self.assertIn("local_repo_digest()", conformance)
+        self.assertIn('grep -F "${prefix}@"', conformance)
+        self.assertIn(
+            '[[ "${digest}" == "${prefix}"@sha256:* ]]',
+            conformance,
+        )
+        # No unfiltered RepoDigests | head -n1 selection remains.
+        self.assertNotRegex(
+            conformance,
+            r"RepoDigests\}\{\{println \.\}\}\{\{end\}\}' \| head -n1",
+        )
+
+    def test_release_plz_tags_only_sandboxwich_core(self) -> None:
+        # Shared vX.Y.Z tags must be created once. Releasing every workspace
+        # package tries a second create and fails with Reference already exists.
+        config = (ROOT / "release-plz.toml").read_text()
+        self.assertIn('name = "sandboxwich-core"', config)
+        for package in (
+            "sandboxwich-agent",
+            "sandboxwich-api",
+            "sandboxwich-bench",
+            "sandboxwich-cli",
+            "sandboxwich-worker",
+        ):
+            self.assertRegex(
+                config,
+                rf'name = "{package}"\s*\nrelease = false',
+            )
+
     def test_ruleset_requires_pull_requests_and_blocks_force_pushes(self) -> None:
         ruleset = json.loads((ROOT / ".github/rulesets/main.json").read_text())
         types = {rule["type"] for rule in ruleset["rules"]}

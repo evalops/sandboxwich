@@ -11,10 +11,12 @@ publish = false
 # inventory and creates the GitHub release when the tag lands, so release-plz
 # must not create a GitHub release of its own.
 git_release_enable = false
-# All crates share one version via `version.workspace = true`, so every
-# package renders this same tag. release-plz skips tag creation when the tag
-# already exists, which collapses the six packages to a single vX.Y.Z tag
-# per release.
+# All crates share one version via `version.workspace = true`. Only
+# sandboxwich-core creates the tag (see package.release below); the other
+# crates still bump via the workspace version but do not run a second tag
+# create. release-plz otherwise tries to tag each package at a different
+# resolved SHA and fails with "Reference already exists" after the first
+# package succeeds.
 git_tag_name = "v{{ version }}"
 # Semver checks compare against the crates.io baseline, which does not exist
 # for these unpublished crates.
@@ -25,7 +27,8 @@ dependencies_update = true
 
 # Keep the single root CHANGELOG.md instead of per-crate changelogs.
 # sandboxwich-core owns it and absorbs commits touching every other crate so
-# workspace-wide changes all land in one place.
+# workspace-wide changes all land in one place. It is also the sole package
+# that creates the shared vX.Y.Z git tag.
 [[package]]
 name = "sandboxwich-core"
 changelog_path = "CHANGELOG.md"
@@ -39,22 +42,27 @@ changelog_include = [
 
 [[package]]
 name = "sandboxwich-agent"
+release = false
 changelog_update = false
 
 [[package]]
 name = "sandboxwich-api"
+release = false
 changelog_update = false
 
 [[package]]
 name = "sandboxwich-bench"
+release = false
 changelog_update = false
 
 [[package]]
 name = "sandboxwich-cli"
+release = false
 changelog_update = false
 
 [[package]]
 name = "sandboxwich-worker"
+release = false
 changelog_update = false
 
 # Match the existing changelog's heading style (`## X.Y.Z - YYYY-MM-DD`
