@@ -533,9 +533,17 @@ pub(crate) async fn put_resident_process(
         ));
     }
     if name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME {
-        if request.bootstrap.is_some() {
+        let Some(bootstrap) = request.bootstrap.as_ref() else {
             return Err(ApiError::bad_request(
-                "maestro-hosted-runner forbids static bootstrap material",
+                "maestro-hosted-runner requires the managed gateway bootstrap",
+            ));
+        };
+        if bootstrap.content.is_empty()
+            || bootstrap.target_file != MAESTRO_HOSTED_RUNNER_GATEWAY_TOKEN_FILE
+            || bootstrap.mode != 0o400
+        {
+            return Err(ApiError::bad_request(
+                "maestro-hosted-runner requires the fixed managed gateway bootstrap path",
             ));
         }
         if request.argv
@@ -562,6 +570,16 @@ pub(crate) async fn put_resident_process(
             "MAESTRO_WORKSPACE_ID",
             "MAESTRO_SANDBOX_ID",
             "MAESTRO_RUNNER_SESSION_ID",
+            "MAESTRO_EVALOPS_ACCESS_TOKEN_FILE",
+            "MAESTRO_EVALOPS_BASE_URL",
+            "MAESTRO_EVALOPS_ORG_ID",
+            "MAESTRO_EVALOPS_WORKSPACE_ID",
+            "MAESTRO_EVALOPS_PROVIDER",
+            "MAESTRO_EVALOPS_ENVIRONMENT",
+            "MAESTRO_EVALOPS_CREDENTIAL_NAME",
+            "MAESTRO_DEFAULT_MODEL",
+            "MAESTRO_LLM_GATEWAY_URL",
+            "MAESTRO_LLM_GATEWAY_ORG_ID",
         ];
         // Platform-managed EvalOps llm-gateway routing (and dual-name aliases
         // Maestro also reads). Tokens may be short-lived JWTs > 512 bytes.
@@ -612,6 +630,11 @@ pub(crate) async fn put_resident_process(
                 .map(String::as_str)
                 == Some(MAESTRO_HOSTED_RUNNER_IDENTITY_CA_FILE)
             && request
+                .env
+                .get("MAESTRO_EVALOPS_ACCESS_TOKEN_FILE")
+                .map(String::as_str)
+                != Some(MAESTRO_HOSTED_RUNNER_GATEWAY_TOKEN_FILE)
+            || request
                 .env
                 .get("MAESTRO_SANDBOX_ID")
                 .and_then(|value| Uuid::parse_str(value).ok())

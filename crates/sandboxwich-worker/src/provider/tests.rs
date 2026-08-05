@@ -300,8 +300,50 @@ fn maestro_hosted_runner_spec() -> IsolatedResidentProcessSpec {
                 "MAESTRO_RUNNER_SESSION_ID".to_string(),
                 "runner-session-1".to_string(),
             ),
+            (
+                "MAESTRO_EVALOPS_ACCESS_TOKEN_FILE".to_string(),
+                sandboxwich_core::MAESTRO_HOSTED_RUNNER_GATEWAY_TOKEN_FILE.to_string(),
+            ),
+            (
+                "MAESTRO_EVALOPS_BASE_URL".to_string(),
+                sandboxwich_core::MAESTRO_HOSTED_RUNNER_GATEWAY_BASE_URL.to_string(),
+            ),
+            ("MAESTRO_EVALOPS_ORG_ID".to_string(), "org-1".to_string()),
+            (
+                "MAESTRO_EVALOPS_WORKSPACE_ID".to_string(),
+                "workspace-1".to_string(),
+            ),
+            (
+                "MAESTRO_EVALOPS_PROVIDER".to_string(),
+                "openrouter".to_string(),
+            ),
+            (
+                "MAESTRO_EVALOPS_ENVIRONMENT".to_string(),
+                "production".to_string(),
+            ),
+            (
+                "MAESTRO_EVALOPS_CREDENTIAL_NAME".to_string(),
+                "dex".to_string(),
+            ),
+            (
+                "MAESTRO_DEFAULT_MODEL".to_string(),
+                "evalops/gpt-5.5".to_string(),
+            ),
+            (
+                "MAESTRO_LLM_GATEWAY_URL".to_string(),
+                sandboxwich_core::MAESTRO_HOSTED_RUNNER_GATEWAY_BASE_URL.to_string(),
+            ),
+            (
+                "MAESTRO_LLM_GATEWAY_ORG_ID".to_string(),
+                "org-1".to_string(),
+            ),
         ]),
-        bootstrap: None,
+        bootstrap: Some(IsolatedResidentProcessBootstrap {
+            content: b"managed-gateway-token".to_vec(),
+            target_file: sandboxwich_core::MAESTRO_HOSTED_RUNNER_GATEWAY_TOKEN_FILE.to_string(),
+            mode: 0o400,
+            placement_attestation: None,
+        }),
     }
 }
 
@@ -377,13 +419,15 @@ fn maestro_hosted_runner_uses_only_projected_identity_in_an_isolated_pod() {
         .isolated_resident_process_manifests(&spec)
         .expect("projected-identity Maestro sidecar should render");
 
-    assert_eq!(manifests.len(), 3, "no Secret manifest may be rendered");
-    assert_eq!(manifests[0]["kind"], "NetworkPolicy");
-    assert_eq!(manifests[1]["kind"], "Service");
-    assert_eq!(manifests[2]["kind"], "Pod");
-    let policy = &manifests[0];
-    let service = &manifests[1];
-    let pod = &manifests[2];
+    assert_eq!(manifests.len(), 4, "managed gateway bootstrap is a Secret");
+    assert_eq!(manifests[0]["kind"], "Secret");
+    assert_eq!(manifests[1]["kind"], "NetworkPolicy");
+    assert_eq!(manifests[2]["kind"], "Service");
+    assert_eq!(manifests[3]["kind"], "Pod");
+    let secret = &manifests[0];
+    let policy = &manifests[1];
+    let service = &manifests[2];
+    let pod = &manifests[3];
     assert_eq!(
         pod["spec"]["serviceAccountName"],
         sandboxwich_core::MAESTRO_HOSTED_RUNNER_SERVICE_ACCOUNT
@@ -512,8 +556,12 @@ fn maestro_hosted_runner_uses_only_projected_identity_in_an_isolated_pod() {
             }),
         "Maestro residents must reach the managed EvalOps llm-gateway (stable + canary)"
     );
+    assert_eq!(
+        secret["data"]["bootstrap"],
+        general_purpose::STANDARD.encode(b"managed-gateway-token")
+    );
     let rendered = serde_json::to_string(&manifests).expect("render manifests");
-    assert!(!rendered.contains("\"kind\":\"Secret\""));
+    assert!(rendered.contains("\"kind\":\"Secret\""));
     assert!(!rendered.contains("\"cidr\":\"0.0.0.0/0\""));
     assert!(!rendered.contains("MAESTRO_HOSTED_RUNNER_AUTH_TOKEN"));
 
@@ -530,7 +578,7 @@ fn maestro_hosted_runner_uses_only_projected_identity_in_an_isolated_pod() {
 }
 
 #[test]
-fn maestro_hosted_runner_rejects_static_bootstrap_material() {
+fn maestro_hosted_runner_rejects_unapproved_bootstrap_path() {
     let provider = KubernetesApplyProvider::new(
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
             .with_isolation_profile(IsolationProfile::Gvisor)
@@ -551,9 +599,35 @@ fn maestro_hosted_runner_rejects_static_bootstrap_material() {
     assert!(
         provider
             .isolated_resident_process_manifests(&spec)
-            .expect_err("static Maestro bootstrap must fail closed")
+            .expect_err("Maestro bootstrap path must fail closed")
             .to_string()
-            .contains("forbids static bootstrap")
+            .contains("path or mode is invalid")
+    );
+}
+
+#[test]
+fn maestro_hosted_runner_rejects_bearer_values_in_resident_environment() {
+    let provider = KubernetesApplyProvider::new(
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Gvisor)
+            .with_runtime_class_name(Some("gvisor".to_string())),
+        "kubectl",
+    )
+    .with_maestro_hosted_runner_image(Some(format!(
+        "ghcr.io/evalops/maestro@sha256:{}",
+        "a".repeat(64)
+    )));
+    let mut spec = maestro_hosted_runner_spec();
+    spec.env.insert(
+        "MAESTRO_EVALOPS_ACCESS_TOKEN".into(),
+        "must-not-be-persisted".into(),
+    );
+    assert!(
+        provider
+            .isolated_resident_process_manifests(&spec)
+            .expect_err("Maestro resident env must not carry a bearer value")
+            .to_string()
+            .contains("forbids bearer values in resident environment")
     );
 }
 

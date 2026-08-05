@@ -2850,7 +2850,10 @@ where
             resident_process_name,
             Some(ORB_SIDECAR_RESIDENT_PROCESS_NAME | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME)
         );
-    let resident_bootstrap = if resident_process_name == Some(ORB_SIDECAR_RESIDENT_PROCESS_NAME) {
+    let resident_bootstrap = if matches!(
+        resident_process_name,
+        Some(ORB_SIDECAR_RESIDENT_PROCESS_NAME | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME)
+    ) {
         match fetch_resident_bootstrap(client, api, &lease).await {
             Ok(bootstrap) if !cancelled.is_cancelled() => Some(bootstrap),
             Ok(_) => {
@@ -3948,9 +3951,14 @@ fn execute_isolated_resident_process_job(
         ),
         "only explicit provider-isolated process kinds may use this execution path"
     );
+    let provision_spec = if process_name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME {
+        required_provision_spec_from_payload(&job.payload)?
+    } else {
+        provision_spec_from_payload(&job.payload)?
+    };
     anyhow::ensure!(
-        (process_name == ORB_SIDECAR_RESIDENT_PROCESS_NAME) == bootstrap.is_some(),
-        "static bootstrap material is required only for orb-sidecar"
+        bootstrap.is_some(),
+        "provider-isolated resident process bootstrap material is required"
     );
     let sandbox_id = sandbox_id_from_payload(&job.payload)?;
     let process_id = ResidentProcessId(uuid_from_payload(&job.payload, "residentProcessId")?);
@@ -3982,11 +3990,6 @@ fn execute_isolated_resident_process_job(
             .context("resident-process restart policy is missing")?,
     )
     .context("resident-process restart policy is invalid")?;
-    let provision_spec = if process_name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME {
-        required_provision_spec_from_payload(&job.payload)?
-    } else {
-        provision_spec_from_payload(&job.payload)?
-    };
     let workspace_claim_name = job
         .payload
         .get("workspaceClaimName")
