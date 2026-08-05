@@ -64,6 +64,27 @@ class RepositoryRulesTest(unittest.TestCase):
         self.assertIn("workflow_dispatch:", triggers)
         self.assertIn("kind:", workflow)
 
+    def test_kubernetes_conformance_pulls_the_published_container_paths(self) -> None:
+        containers = (ROOT / ".github/workflows/containers.yml").read_text()
+        conformance = (
+            ROOT / ".github/workflows/kubernetes-conformance.yml"
+        ).read_text()
+        self.assertIn("REGISTRY: ghcr.io", containers)
+        self.assertIn("IMAGE_NAMESPACE: evalops", containers)
+        self.assertIn("REGISTRY: ghcr.io", conformance)
+        self.assertIn("IMAGE_NAMESPACE: evalops", conformance)
+        for image in (
+            "sandboxwich-api",
+            "sandboxwich-worker",
+            "sandboxwich-ubuntu-dev",
+        ):
+            published_ref = (
+                "${REGISTRY}/${IMAGE_NAMESPACE}/"
+                f"{image}:sha-${{short_sha}}"
+            )
+            self.assertIn(published_ref, conformance)
+        self.assertNotIn("ghcr.io/evalops/sandboxwich/", conformance)
+
     def test_ruleset_requires_pull_requests_and_blocks_force_pushes(self) -> None:
         ruleset = json.loads((ROOT / ".github/rulesets/main.json").read_text())
         types = {rule["type"] for rule in ruleset["rules"]}
