@@ -662,6 +662,12 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
     // 512-byte cap used for ordinary env values, so the bootstrap file carries
     // the token instead.
     let mut with_gateway = request.clone();
+    assert!(
+        !with_gateway
+            .env
+            .contains_key("MAESTRO_PLACEMENT_GENERATION"),
+        "the caller must not own Sandboxwich's placement generation"
+    );
     let long_token = format!("eyJ.{}", "a".repeat(700));
     with_gateway.bootstrap = Some(ResidentProcessBootstrap {
         content: long_token.into_bytes(),
@@ -826,11 +832,37 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
         created.resident_process.generation,
         lease.id.0,
     );
+    assert_eq!(connection.organization_id, organization_id);
+    assert_eq!(connection.workspace_id, workspace_id);
+    assert_eq!(connection.sandbox_id, sandbox_id);
+    assert_eq!(connection.pod_uid, pod_uid);
+    assert_eq!(connection.placement_generation, 1);
+    assert_eq!(connection.runner_session_id, runner_session_id);
+    assert_eq!(
+        connection.runtime_image,
+        format!("ghcr.io/evalops/maestro@sha256:{}", "b".repeat(64))
+    );
+    assert_eq!(connection.service_namespace, "sandboxwich-sandboxes");
     assert_eq!(connection.service_name, service_name);
     assert_eq!(
         connection.service_host,
         format!("{service_name}.sandboxwich-sandboxes.svc.cluster.local")
     );
+    assert_eq!(
+        connection.service_port,
+        MAESTRO_HOSTED_RUNNER_CONTAINER_PORT
+    );
+    assert_eq!(
+        connection.resident_process_generation,
+        created.resident_process.generation
+    );
+    assert_eq!(connection.lease_id, lease.id.0);
+    assert_eq!(
+        connection.lease_attempt,
+        u64::try_from(lease.attempt).unwrap()
+    );
+    assert!(connection.lease_expires_at_epoch_seconds > 0);
+    assert_eq!(connection.worker_id, worker.worker.id);
     let organization_id_uri = organization_id;
     assert_eq!(
         connection.expected_server_uri_san,
@@ -879,6 +911,26 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
 
     sqlx::any::install_default_drivers();
     let pool = AnyPool::connect(&server.database_url).await.unwrap();
+    sqlx::query("update sandbox_placements set generation = generation + 1 where sandbox_id = ?")
+        .bind(sandbox_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .get(&connection_binding_url)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::CONFLICT,
+        "a connection binding with an injected stale placement generation must fail closed"
+    );
+    sqlx::query("update sandbox_placements set generation = generation - 1 where sandbox_id = ?")
+        .bind(sandbox_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query("update resident_processes set generation = ? where id = ?")
         .bind(2_i64)
         .bind(created.resident_process.id.to_string())
@@ -1243,6 +1295,36 @@ pub(crate) async fn resident_process_create_is_idempotent_tenant_scoped_and_reda
     assert!(!first_body.contains("resident-canary-secret"));
     let first: ResidentProcessResponse = serde_json::from_str(&first_body).unwrap();
     assert_eq!(first.resident_process.generation, 1);
+
+    let stale_expected_generation = client
+        .put(&url)
+        .header("Idempotency-Key", "resident-process-stale-generation")
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        stale_expected_generation.status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    let error: ErrorEnvelope = stale_expected_generation.json().await.unwrap();
+    assert_eq!(error.code, "resident_process_generation_conflict");
+
+    let mut current_generation = request.clone();
+    current_generation.expected_generation = first.resident_process.generation;
+    let exact_replay: ResidentProcessResponse = client
+        .put(&url)
+        .header("Idempotency-Key", "resident-process-current-generation")
+        .json(&current_generation)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(exact_replay.resident_process.id, first.resident_process.id);
 
     let replay: ResidentProcessResponse = client
         .put(&url)

@@ -391,6 +391,33 @@ mod tests {
     }
 
     #[test]
+    fn maestro_activation_fields_match_connection_binding_schema() {
+        use sandboxwich_core::lifecycle_contract::MAESTRO_HOSTED_RUNNER_ACTIVATION;
+        use std::collections::BTreeSet;
+
+        let document = serde_json::to_value(super::openapi_document()).unwrap();
+        let properties = document["components"]["schemas"]
+            ["MaestroHostedRunnerConnectionBindingResponse"]["properties"]
+            .as_object()
+            .expect("Maestro connection binding must be an object schema");
+        let documented = properties
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let required = MAESTRO_HOSTED_RUNNER_ACTIVATION
+            .required_binding_fields
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        assert!(
+            required.is_subset(&documented),
+            "activation requires fields missing from the connection binding schema: {:?}",
+            required.difference(&documented).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn resident_put_documents_typed_body_and_sidecar_bootstrap_requirement() {
         let document = serde_json::to_value(super::openapi_document()).unwrap();
         let operation =
