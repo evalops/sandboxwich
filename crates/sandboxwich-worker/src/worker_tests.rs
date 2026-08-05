@@ -140,6 +140,7 @@ struct ResidentTestProvider {
     inner: KubernetesDryRunProvider,
     calls: std::sync::atomic::AtomicUsize,
     fail_with_error: bool,
+    capacity_failures_remaining: std::sync::atomic::AtomicUsize,
 }
 
 impl ResidentTestProvider {
@@ -148,6 +149,7 @@ impl ResidentTestProvider {
             inner: provider(),
             calls: std::sync::atomic::AtomicUsize::new(0),
             fail_with_error: false,
+            capacity_failures_remaining: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -156,6 +158,16 @@ impl ResidentTestProvider {
             inner: provider(),
             calls: std::sync::atomic::AtomicUsize::new(0),
             fail_with_error: true,
+            capacity_failures_remaining: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn capacity_then_terminal(failures: usize) -> Self {
+        Self {
+            inner: provider(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_with_error: false,
+            capacity_failures_remaining: std::sync::atomic::AtomicUsize::new(failures),
         }
     }
 }
@@ -196,6 +208,21 @@ impl SandboxProvider for ResidentTestProvider {
         observe: &mut dyn FnMut(IsolatedResidentProcessObservation) -> anyhow::Result<()>,
     ) -> anyhow::Result<provider::IsolatedResidentProcessResult> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .capacity_failures_remaining
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(anyhow::Error::new(ProviderError::classified(
+                sandboxwich_core::ProvisioningErrorClass::RetryableCapacity,
+                LifecycleReasonCode::WorkspaceCapacityPending,
+                anyhow::anyhow!("injected ResourceQuota pressure"),
+            )));
+        }
         if self.fail_with_error {
             anyhow::bail!("injected cancellation")
         }
@@ -1190,6 +1217,58 @@ fn provider_isolated_sidecar_restart_policy_is_bounded_like_the_guest_supervisor
     else {
         panic!("expected terminal failed resident result")
     };
+}
+
+#[test]
+fn provider_isolated_resident_retains_bootstrap_and_lease_across_capacity_pressure() {
+    let provider = ResidentTestProvider::capacity_then_terminal(1);
+    let cancellation = LeaseCancellation::new();
+    let mut observations = Vec::new();
+    let outcome = execute_isolated_resident_process_job(
+        &resident_job(ResidentProcessRestartPolicy::Never),
+        sandboxwich_core::LeaseId::new(),
+        Some(resident_bootstrap()),
+        &provider,
+        &cancellation.signal,
+        &cancellation,
+        &mut |observation| {
+            observations.push(observation);
+            Ok(())
+        },
+    )
+    .expect("capacity pressure should retry inside the original resident lease");
+
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(
+        observations.len(),
+        1,
+        "capacity rejection must not publish a premature bootstrap acknowledgement"
+    );
+    let WorkerJobResult::RunResidentProcess {
+        exit_code: Some(1), ..
+    } = completed_result(outcome)
+    else {
+        panic!("expected the post-capacity resident execution result")
+    };
+}
+
+#[test]
+fn provider_isolated_resident_does_not_retry_untyped_failures() {
+    let provider = ResidentTestProvider::cancelled_error();
+    let cancellation = LeaseCancellation::new();
+    let error = execute_isolated_resident_process_job(
+        &resident_job(ResidentProcessRestartPolicy::Never),
+        sandboxwich_core::LeaseId::new(),
+        Some(resident_bootstrap()),
+        &provider,
+        &cancellation.signal,
+        &cancellation,
+        &mut |_| Ok(()),
+    )
+    .expect_err("an untyped failure must remain fail closed");
+
+    assert!(error.to_string().contains("injected cancellation"));
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[test]
