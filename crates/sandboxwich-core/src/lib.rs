@@ -2123,6 +2123,13 @@ pub const MAESTRO_HOSTED_RUNNER_IDENTITY_CA_FILE: &str =
     "/var/run/secrets/evalops.dev/identity/ca.crt";
 pub const MAESTRO_HOSTED_RUNNER_IDENTITY_CA_SECRET: &str = "maestro-identity-server-ca";
 pub const MAESTRO_HOSTED_RUNNER_IDENTITY_EXCHANGE_URL: &str = "https://identity-service.evalops.svc.cluster.local:8080/internal/v1/kubernetes-workload-certificates/exchange";
+/// Fixed, memory-backed bootstrap path for the short-lived managed gateway
+/// token. The token never belongs in the resident-process environment because
+/// Sandboxwich persists that map in the resident row and queued job payload.
+pub const MAESTRO_HOSTED_RUNNER_GATEWAY_TOKEN_FILE: &str =
+    "/run/sandboxwich/bootstrap/evalops-access-token";
+pub const MAESTRO_HOSTED_RUNNER_GATEWAY_BASE_URL: &str =
+    "http://llm-gateway-service.evalops.svc.cluster.local:8080/v1";
 pub const MAESTRO_HOSTED_RUNNER_IMAGE_LABEL: &str = "maestro_hosted_runner_image";
 
 pub fn maestro_hosted_runner_service_name(

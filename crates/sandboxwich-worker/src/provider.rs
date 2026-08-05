@@ -18,15 +18,15 @@ use ipnet::IpNet;
 use sandboxwich_core::lifecycle_contract::LifecycleReasonCode;
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, DbVariant, ExecutionClass, HomeId,
-    MAESTRO_HOSTED_RUNNER_CONTAINER_PORT, MAESTRO_HOSTED_RUNNER_IDENTITY_CA_FILE,
-    MAESTRO_HOSTED_RUNNER_IDENTITY_CA_SECRET, MAESTRO_HOSTED_RUNNER_IDENTITY_EXCHANGE_URL,
-    MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME, MAESTRO_HOSTED_RUNNER_SERVICE_ACCOUNT,
-    MAESTRO_HOSTED_RUNNER_TOKEN_AUDIENCE, MAESTRO_HOSTED_RUNNER_TOKEN_DIRECTORY,
-    MAESTRO_HOSTED_RUNNER_TOKEN_FILE, MAESTRO_HOSTED_RUNNER_UID,
-    MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT, MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES,
-    MAX_SANDBOX_FILE_BYTES, MaterializeFileDestination, MaterializeFileObservation, MemoryLimit,
-    NetworkAllowRuleKind, NetworkEgress, ORB_SIDECAR_RESIDENT_PROCESS_UID,
-    PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL,
+    MAESTRO_HOSTED_RUNNER_CONTAINER_PORT, MAESTRO_HOSTED_RUNNER_GATEWAY_TOKEN_FILE,
+    MAESTRO_HOSTED_RUNNER_IDENTITY_CA_FILE, MAESTRO_HOSTED_RUNNER_IDENTITY_CA_SECRET,
+    MAESTRO_HOSTED_RUNNER_IDENTITY_EXCHANGE_URL, MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME,
+    MAESTRO_HOSTED_RUNNER_SERVICE_ACCOUNT, MAESTRO_HOSTED_RUNNER_TOKEN_AUDIENCE,
+    MAESTRO_HOSTED_RUNNER_TOKEN_DIRECTORY, MAESTRO_HOSTED_RUNNER_TOKEN_FILE,
+    MAESTRO_HOSTED_RUNNER_UID, MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT,
+    MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES, MAX_SANDBOX_FILE_BYTES, MaterializeFileDestination,
+    MaterializeFileObservation, MemoryLimit, NetworkAllowRuleKind, NetworkEgress,
+    ORB_SIDECAR_RESIDENT_PROCESS_UID, PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL,
     PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE, ProviderCapabilityReport,
     ProviderForkHandle, ProviderHealthReport, ProviderHealthStatus, ProviderResumeHandle,
     ProviderRuntimeResource, ProviderSandboxHandle, ProviderSnapshotHandle, ProvisioningErrorClass,
@@ -5025,8 +5025,22 @@ impl KubernetesApplyProvider {
         );
         if maestro {
             anyhow::ensure!(
-                spec.bootstrap.is_none(),
-                "Maestro workload identity forbids static bootstrap material"
+                spec.bootstrap.is_some(),
+                "Maestro managed gateway bootstrap is required"
+            );
+            let bootstrap = spec
+                .bootstrap
+                .as_ref()
+                .expect("Maestro bootstrap was validated above");
+            anyhow::ensure!(
+                !bootstrap.content.is_empty()
+                    && bootstrap.content.len() <= MAX_RESIDENT_PROCESS_BOOTSTRAP_BYTES,
+                "Maestro managed gateway bootstrap must be between 1 byte and 64 KiB"
+            );
+            anyhow::ensure!(
+                bootstrap.target_file == MAESTRO_HOSTED_RUNNER_GATEWAY_TOKEN_FILE
+                    && bootstrap.mode == 0o400,
+                "Maestro managed gateway bootstrap path or mode is invalid"
             );
             anyhow::ensure!(
                 spec.argv
@@ -5058,6 +5072,36 @@ impl KubernetesApplyProvider {
                     .map(String::as_str)
                     == Some(MAESTRO_HOSTED_RUNNER_IDENTITY_CA_FILE),
                 "Maestro hosted runner requires the canonical Identity CA path"
+            );
+            anyhow::ensure!(
+                spec.env
+                    .get("MAESTRO_EVALOPS_ACCESS_TOKEN_FILE")
+                    .map(String::as_str)
+                    == Some(MAESTRO_HOSTED_RUNNER_GATEWAY_TOKEN_FILE),
+                "Maestro hosted runner requires the fixed managed gateway token path"
+            );
+            for key in [
+                "MAESTRO_EVALOPS_BASE_URL",
+                "MAESTRO_EVALOPS_ORG_ID",
+                "MAESTRO_EVALOPS_WORKSPACE_ID",
+                "MAESTRO_EVALOPS_PROVIDER",
+                "MAESTRO_EVALOPS_ENVIRONMENT",
+                "MAESTRO_EVALOPS_CREDENTIAL_NAME",
+                "MAESTRO_DEFAULT_MODEL",
+                "MAESTRO_LLM_GATEWAY_URL",
+                "MAESTRO_LLM_GATEWAY_ORG_ID",
+            ] {
+                anyhow::ensure!(
+                    spec.env
+                        .get(key)
+                        .is_some_and(|value| !value.trim().is_empty()),
+                    "Maestro hosted runner requires managed gateway environment {key}"
+                );
+            }
+            anyhow::ensure!(
+                !spec.env.contains_key("MAESTRO_EVALOPS_ACCESS_TOKEN")
+                    && !spec.env.contains_key("MAESTRO_LLM_GATEWAY_TOKEN"),
+                "Maestro hosted runner forbids bearer values in resident environment"
             );
             anyhow::ensure!(
                 spec.workspace_mode == WorkspaceMode::Persistent,
@@ -5320,6 +5364,11 @@ impl KubernetesApplyProvider {
                         "name": "workspace",
                         "mountPath": MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT,
                     }),
+                    json!({
+                        "name": "managed-gateway-bootstrap",
+                        "mountPath": RESIDENT_PROCESS_BOOTSTRAP_PREFIX,
+                        "readOnly": true,
+                    }),
                 ]);
         } else {
             container["volumeMounts"]
@@ -5340,6 +5389,29 @@ impl KubernetesApplyProvider {
         let mut init_containers = Vec::new();
         let mut manifests = Vec::new();
         if maestro {
+            let bootstrap = spec
+                .bootstrap
+                .as_ref()
+                .expect("validated Maestro managed gateway bootstrap");
+            let relative_target = std::path::Path::new(&bootstrap.target_file)
+                .strip_prefix(RESIDENT_PROCESS_BOOTSTRAP_PREFIX)
+                .expect("validated Maestro bootstrap target")
+                .to_string_lossy()
+                .into_owned();
+            manifests.push(json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {
+                    "name": secret_name,
+                    "namespace": self.dry_run.effective_sandbox_namespace(),
+                    "labels": labels,
+                },
+                "type": "Opaque",
+                "immutable": true,
+                "data": {
+                    "bootstrap": general_purpose::STANDARD.encode(&bootstrap.content),
+                },
+            }));
             volumes.extend([
                 json!({
                     "name": "tmp",
@@ -5375,6 +5447,18 @@ impl KubernetesApplyProvider {
                         "claimName": spec.workspace_claim_name
                             .as_deref()
                             .expect("validated Maestro workspace PVC"),
+                    },
+                }),
+                json!({
+                    "name": "managed-gateway-bootstrap",
+                    "secret": {
+                        "secretName": secret_name,
+                        "defaultMode": 0o400,
+                        "items": [{
+                            "key": "bootstrap",
+                            "path": relative_target,
+                            "mode": 0o400,
+                        }],
                     },
                 }),
             ]);
