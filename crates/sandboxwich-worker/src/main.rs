@@ -919,6 +919,8 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
+    sandboxwich_core::lifecycle_contract::verify_configured_lifecycle_contract()?;
+
     let cli = Cli::parse();
     let api = cli.api.trim_end_matches('/').to_string();
     let client = build_api_client(cli.api_token.as_deref(), cli.tenant.as_deref())?;

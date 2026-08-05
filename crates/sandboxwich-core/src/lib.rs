@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod lifecycle_contract;
+
 #[derive(Debug, Error)]
 pub enum ApiClientBuildError {
     #[error("invalid SANDBOXWICH_API_TOKEN")]

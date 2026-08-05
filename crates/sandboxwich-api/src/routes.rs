@@ -18,6 +18,7 @@ use crate::handlers::ssh::*;
 use crate::handlers::workers::*;
 use crate::health::*;
 use crate::idempotency::enforce_idempotency;
+use crate::lifecycle_contract::attach_lifecycle_contract;
 use crate::limits::*;
 use crate::reconcile::*;
 use crate::rejection_log::log_mutation_rejections;
@@ -322,4 +323,5 @@ pub(crate) fn app(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(state, auth_and_tenant))
         .layer(middleware::from_fn(normalize_framework_errors))
         .layer(middleware::from_fn(attach_request_id))
+        .layer(middleware::from_fn(attach_lifecycle_contract))
 }

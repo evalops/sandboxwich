@@ -15,6 +15,7 @@ use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use clap::ValueEnum;
 use ipnet::IpNet;
+use sandboxwich_core::lifecycle_contract::LifecycleReasonCode;
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, DbVariant, ExecutionClass, HomeId,
     MAESTRO_HOSTED_RUNNER_CONTAINER_PORT, MAESTRO_HOSTED_RUNNER_IDENTITY_CA_FILE,
@@ -76,7 +77,7 @@ impl IsolationProfile {
 pub struct ProviderError {
     disposition: RetryDisposition,
     error_class: ProvisioningErrorClass,
-    reason_code: &'static str,
+    reason_code: LifecycleReasonCode,
     source: anyhow::Error,
 }
 
@@ -85,16 +86,22 @@ impl ProviderError {
         Self {
             disposition: RetryDisposition::Retryable,
             error_class: ProvisioningErrorClass::RetryableProvider,
-            reason_code: "provider_transient",
+            reason_code: LifecycleReasonCode::ProviderTransient,
             source: source.into(),
         }
     }
 
     pub fn classified(
         error_class: ProvisioningErrorClass,
-        reason_code: &'static str,
+        reason_code: LifecycleReasonCode,
         source: impl Into<anyhow::Error>,
     ) -> Self {
+        assert!(
+            reason_code.allows_provisioning_error_class(&error_class),
+            "{} cannot be emitted with provisioning class {:?}",
+            reason_code.as_str(),
+            error_class
+        );
         let disposition = match error_class {
             ProvisioningErrorClass::RetryableProvider
             | ProvisioningErrorClass::RetryableCapacity => RetryDisposition::Retryable,
@@ -119,7 +126,7 @@ impl ProviderError {
     }
 
     pub fn reason_code(&self) -> &'static str {
-        self.reason_code
+        self.reason_code.as_str()
     }
 }
 
@@ -3187,7 +3194,7 @@ fn validate_adoption_contract(desired: &Value, observed: &Value) -> anyhow::Resu
         };
         return Err(anyhow::Error::new(ProviderError::classified(
             error_class,
-            "resource_contract_conflict",
+            LifecycleReasonCode::ResourceContractConflict,
             anyhow::anyhow!("existing Kubernetes {kind} does not match the desired contract"),
         )));
     }
@@ -3206,7 +3213,7 @@ pub(crate) fn execution_class_requires_runtime_class(execution_class: &Execution
 fn runtime_class_boundary_failure(message: String) -> ProviderError {
     ProviderError::classified(
         ProvisioningErrorClass::TerminalSecurity,
-        "runtime_class_boundary_unverified",
+        LifecycleReasonCode::RuntimeClassBoundaryUnverified,
         anyhow::anyhow!(message),
     )
 }
@@ -3232,7 +3239,7 @@ fn classified_kubectl_failure(context: &str, stderr: &str) -> ProviderError {
     {
         return ProviderError::classified(
             ProvisioningErrorClass::RetryableCapacity,
-            "workspace_capacity_pending",
+            LifecycleReasonCode::WorkspaceCapacityPending,
             anyhow::anyhow!(message),
         );
     }
@@ -3243,7 +3250,7 @@ fn classified_kubectl_failure(context: &str, stderr: &str) -> ProviderError {
     {
         return ProviderError::classified(
             ProvisioningErrorClass::TerminalSecurity,
-            "kubernetes_policy_denied",
+            LifecycleReasonCode::KubernetesPolicyDenied,
             anyhow::anyhow!(message),
         );
     }
@@ -3253,13 +3260,13 @@ fn classified_kubectl_failure(context: &str, stderr: &str) -> ProviderError {
     {
         return ProviderError::classified(
             ProvisioningErrorClass::TerminalContract,
-            "kubernetes_contract_invalid",
+            LifecycleReasonCode::KubernetesContractInvalid,
             anyhow::anyhow!(message),
         );
     }
     ProviderError::classified(
         ProvisioningErrorClass::RetryableProvider,
-        "kubernetes_provider_transient",
+        LifecycleReasonCode::KubernetesProviderTransient,
         anyhow::anyhow!(message),
     )
 }
@@ -3294,7 +3301,7 @@ fn unschedulable_pod_failure(context: &str, pod: &Value) -> Option<ProviderError
         .unwrap_or("scheduler reported no matching node");
     Some(ProviderError::classified(
         ProvisioningErrorClass::TerminalContract,
-        "pod_unschedulable",
+        LifecycleReasonCode::PodUnschedulable,
         anyhow::anyhow!(
             "{context}: pod is still unschedulable after the readiness window, so \
              retrying the same spec will not place it: {detail}"
@@ -4086,7 +4093,7 @@ impl KubernetesApplyProvider {
         .ok_or_else(|| {
             anyhow::Error::new(ProviderError::classified(
                 ProvisioningErrorClass::RetryableProvider,
-                "resource_observation_missing",
+                LifecycleReasonCode::ResourceObservationMissing,
                 anyhow::anyhow!("staged Kubernetes resource was not observable after apply"),
             ))
         })
@@ -4139,14 +4146,14 @@ impl KubernetesApplyProvider {
         let observed: Value = serde_json::from_str(&output.stdout).map_err(|error| {
             anyhow::Error::new(ProviderError::classified(
                 ProvisioningErrorClass::RetryableProvider,
-                "resource_observation_invalid",
+                LifecycleReasonCode::ResourceObservationInvalid,
                 anyhow::Error::new(error).context("kubectl returned invalid resource JSON"),
             ))
         })?;
         if observed["metadata"]["labels"][identity_label] != json!(identity_value) {
             return Err(anyhow::Error::new(ProviderError::classified(
                 ProvisioningErrorClass::TerminalContract,
-                "resource_identity_conflict",
+                LifecycleReasonCode::ResourceIdentityConflict,
                 anyhow::anyhow!(
                     "existing Kubernetes resource has a conflicting {identity_name} identity"
                 ),
@@ -4156,7 +4163,7 @@ impl KubernetesApplyProvider {
         let uid = observed["metadata"]["uid"].as_str().ok_or_else(|| {
             anyhow::Error::new(ProviderError::classified(
                 ProvisioningErrorClass::RetryableProvider,
-                "resource_identity_missing",
+                LifecycleReasonCode::ResourceIdentityMissing,
                 anyhow::anyhow!("observed Kubernetes resource UID is required"),
             ))
         })?;

@@ -234,6 +234,9 @@ pub(crate) fn identity_app(state: AppState) -> Router {
         .layer(middleware::from_fn(log_mutation_rejections))
         .layer(middleware::from_fn(normalize_framework_errors))
         .layer(middleware::from_fn(attach_request_id))
+        .layer(middleware::from_fn(
+            crate::lifecycle_contract::attach_lifecycle_contract,
+        ))
 }
 
 #[cfg(test)]

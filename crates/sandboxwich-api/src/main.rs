@@ -10,6 +10,7 @@ mod handlers;
 mod health;
 mod idempotency;
 mod identity_mtls;
+mod lifecycle_contract;
 mod limits;
 mod pagination;
 mod reap;
@@ -47,6 +48,9 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+
+    sandboxwich_core::lifecycle_contract::verify_configured_lifecycle_contract()?;
+    lifecycle_contract::configure_lifecycle_contract_header()?;
 
     let config = load_api_config()?;
     if matches!(config.command, ApiCommand::OpenApi) {

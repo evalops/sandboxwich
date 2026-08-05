@@ -9,6 +9,7 @@ use axum::http::StatusCode;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, Mac};
+use sandboxwich_core::lifecycle_contract::LifecycleReasonCode;
 use sandboxwich_core::*;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -52,18 +53,21 @@ struct AttestationRecord {
 fn unavailable() -> ApiError {
     ApiError {
         status: StatusCode::NOT_FOUND,
-        code: "placement_attestation_not_found",
+        code: LifecycleReasonCode::PlacementAttestationNotFound.as_str(),
         message: "placement attestation was not found".into(),
     }
 }
 
 fn not_live(message: impl Into<String>) -> ApiError {
-    ApiError::conflict_code("placement_attestation_not_live", message)
+    ApiError::conflict_code(
+        LifecycleReasonCode::PlacementAttestationNotLive.as_str(),
+        message,
+    )
 }
 
 fn placement_pending() -> ApiError {
     ApiError::conflict_code(
-        "placement_attestation_pending",
+        LifecycleReasonCode::PlacementAttestationPending.as_str(),
         "Maestro hosted runner placement is still being materialized",
     )
 }
@@ -84,18 +88,18 @@ fn resident_not_ready_error(
 
     if !terminal {
         if error_class.as_ref() == Some(&ProvisioningErrorClass::RetryableCapacity)
-            || code == Some("workspace_capacity_pending")
+            || code == Some(LifecycleReasonCode::WorkspaceCapacityPending.as_str())
         {
             return ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
-                code: "workspace_capacity_pending",
+                code: LifecycleReasonCode::WorkspaceCapacityPending.as_str(),
                 message,
             };
         }
         if has_error {
             return ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
-                code: "resident_materialization_pending",
+                code: LifecycleReasonCode::ResidentMaterializationPending.as_str(),
                 message,
             };
         }
@@ -103,70 +107,70 @@ fn resident_not_ready_error(
     }
 
     if error_class.as_ref() == Some(&ProvisioningErrorClass::RetryableCapacity)
-        || code == Some("workspace_capacity_pending")
+        || code == Some(LifecycleReasonCode::WorkspaceCapacityPending.as_str())
     {
         return ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "workspace_capacity_exhausted",
+            code: LifecycleReasonCode::WorkspaceCapacityExhausted.as_str(),
             message,
         };
     }
-    if code == Some("identity_exchange_failed") {
+    if code == Some(LifecycleReasonCode::IdentityExchangeFailed.as_str()) {
         return ApiError {
             status: StatusCode::BAD_GATEWAY,
-            code: "identity_exchange_failed",
+            code: LifecycleReasonCode::IdentityExchangeFailed.as_str(),
             message,
         };
     }
     if error_class.as_ref() == Some(&ProvisioningErrorClass::TerminalSecurity) {
-        if code == Some("kubernetes_policy_denied") {
+        if code == Some(LifecycleReasonCode::KubernetesPolicyDenied.as_str()) {
             return ApiError {
                 status: StatusCode::FORBIDDEN,
-                code: "kubernetes_policy_denied",
+                code: LifecycleReasonCode::KubernetesPolicyDenied.as_str(),
                 message,
             };
         }
-        if code == Some("runtime_class_boundary_unverified") {
+        if code == Some(LifecycleReasonCode::RuntimeClassBoundaryUnverified.as_str()) {
             return ApiError {
                 status: StatusCode::FORBIDDEN,
-                code: "runtime_class_boundary_unverified",
+                code: LifecycleReasonCode::RuntimeClassBoundaryUnverified.as_str(),
                 message,
             };
         }
     }
     if error_class.as_ref() == Some(&ProvisioningErrorClass::TerminalContract) {
-        if code == Some("kubernetes_contract_invalid") {
+        if code == Some(LifecycleReasonCode::KubernetesContractInvalid.as_str()) {
             return ApiError {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
-                code: "kubernetes_contract_invalid",
+                code: LifecycleReasonCode::KubernetesContractInvalid.as_str(),
                 message,
             };
         }
-        if code == Some("resource_contract_conflict") {
+        if code == Some(LifecycleReasonCode::ResourceContractConflict.as_str()) {
             return ApiError {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
-                code: "resource_contract_conflict",
+                code: LifecycleReasonCode::ResourceContractConflict.as_str(),
                 message,
             };
         }
-        if code == Some("resource_identity_conflict") {
+        if code == Some(LifecycleReasonCode::ResourceIdentityConflict.as_str()) {
             return ApiError {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
-                code: "resource_identity_conflict",
+                code: LifecycleReasonCode::ResourceIdentityConflict.as_str(),
                 message,
             };
         }
-        if code == Some("pod_unschedulable") {
+        if code == Some(LifecycleReasonCode::PodUnschedulable.as_str()) {
             return ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
-                code: "pod_unschedulable",
+                code: LifecycleReasonCode::PodUnschedulable.as_str(),
                 message,
             };
         }
     }
     ApiError {
         status: StatusCode::BAD_GATEWAY,
-        code: "resident_materialization_failed",
+        code: LifecycleReasonCode::ResidentMaterializationFailed.as_str(),
         message,
     }
 }
@@ -178,7 +182,7 @@ fn maestro_identity_observation_is_eligible(observed_state: &str) -> bool {
 
 fn maestro_workload_stale_generation() -> ApiError {
     ApiError::conflict_code(
-        "maestro_workload_stale_generation",
+        LifecycleReasonCode::MaestroWorkloadStaleGeneration.as_str(),
         "Maestro workload placement generation is stale",
     )
 }
