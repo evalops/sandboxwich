@@ -578,10 +578,7 @@ pub(crate) async fn put_resident_process(
             "MAESTRO_LLM_GATEWAY_URL",
             "MAESTRO_LLM_GATEWAY_ORG_ID",
         ];
-        const TOKEN_ENV: &[&str] = &[
-            "MAESTRO_EVALOPS_ACCESS_TOKEN",
-            "MAESTRO_LLM_GATEWAY_TOKEN",
-        ];
+        const TOKEN_ENV: &[&str] = &["MAESTRO_EVALOPS_ACCESS_TOKEN", "MAESTRO_LLM_GATEWAY_TOKEN"];
         const MAX_ENV_VALUE_BYTES: usize = 512;
         const MAX_TOKEN_ENV_VALUE_BYTES: usize = 8_192;
         let env_ok = request.env.iter().all(|(key, value)| {
@@ -596,7 +593,9 @@ pub(crate) async fn put_resident_process(
                 && !value.is_empty()
                 && value.len() <= max_len
                 && !value.chars().any(char::is_control)
-        }) && REQUIRED_ENV.iter().all(|key| request.env.contains_key(*key))
+        }) && REQUIRED_ENV
+            .iter()
+            .all(|key| request.env.contains_key(*key))
             && request
                 .env
                 .get("MAESTRO_KUBERNETES_TOKEN_FILE")

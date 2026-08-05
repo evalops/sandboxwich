@@ -454,10 +454,9 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
     // 512-byte cap used for ordinary env values.
     let mut with_gateway = request.clone();
     let long_token = format!("eyJ.{}", "a".repeat(700));
-    with_gateway.env.insert(
-        "MAESTRO_EVALOPS_ACCESS_TOKEN".into(),
-        long_token.clone(),
-    );
+    with_gateway
+        .env
+        .insert("MAESTRO_EVALOPS_ACCESS_TOKEN".into(), long_token.clone());
     with_gateway
         .env
         .insert("MAESTRO_LLM_GATEWAY_TOKEN".into(), long_token);
