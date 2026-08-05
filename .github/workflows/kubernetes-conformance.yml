@@ -128,6 +128,23 @@ jobs:
           set -euo pipefail
           short_sha="${CONTAINER_SHA::12}"
           postgres_digest="$(sed -n 's/^FROM postgres:17@//p' deploy/kubernetes/postgres.Dockerfile)"
+          # RepoDigests lists every registry that has this image ID. After a
+          # pull from private GHCR plus a retag/push to the kind registry, that
+          # list includes ghcr.io/...@sha256:... first. kind nodes have no GHCR
+          # credentials, so crictl pull of a ghcr digest returns 401. Always
+          # select the localhost:5001 digest the disposable registry just
+          # published.
+          local_repo_digest() {
+            local ref="$1"
+            local prefix="${ref%:*}"
+            local digest
+            digest="$(docker image inspect "${ref}" \
+              --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+              | grep -F "${prefix}@" \
+              | head -n1)"
+            [[ "${digest}" == "${prefix}"@sha256:* ]]
+            printf '%s\n' "${digest}"
+          }
           # Pulled via the Docker Hub mirror to avoid docker.io's anonymous-pull
           # rate limit.
           docker run -d --restart=always -p 127.0.0.1:5001:5000 \
@@ -147,9 +164,7 @@ jobs:
           docker tag sandboxwich-runtime:conformance \
             localhost:5001/sandboxwich-runtime:conformance
           docker push localhost:5001/sandboxwich-runtime:conformance
-          runtime_image="$(docker image inspect localhost:5001/sandboxwich-runtime:conformance \
-            --format '{{range .RepoDigests}}{{println .}}{{end}}' | head -n1)"
-          [[ "${runtime_image}" == *@sha256:* ]]
+          runtime_image="$(local_repo_digest localhost:5001/sandboxwich-runtime:conformance)"
           docker image rm -f sandboxwich-runtime:conformance \
             localhost:5001/sandboxwich-runtime:conformance \
             "${REGISTRY}/${IMAGE_NAMESPACE}/sandboxwich-ubuntu-dev:sha-${short_sha}"
@@ -158,9 +173,7 @@ jobs:
           docker tag sandboxwich-worker:conformance \
             localhost:5001/sandboxwich-worker:conformance
           docker push localhost:5001/sandboxwich-worker:conformance
-          gateway_image="$(docker image inspect localhost:5001/sandboxwich-worker:conformance \
-            --format '{{range .RepoDigests}}{{println .}}{{end}}' | head -n1)"
-          [[ "${gateway_image}" == *@sha256:* ]]
+          gateway_image="$(local_repo_digest localhost:5001/sandboxwich-worker:conformance)"
           docker image rm -f sandboxwich-worker:conformance \
             localhost:5001/sandboxwich-worker:conformance \
             "${REGISTRY}/${IMAGE_NAMESPACE}/sandboxwich-worker:sha-${short_sha}"
@@ -169,9 +182,7 @@ jobs:
           docker tag sandboxwich-api:conformance \
             localhost:5001/sandboxwich-api:conformance
           docker push localhost:5001/sandboxwich-api:conformance
-          api_image="$(docker image inspect localhost:5001/sandboxwich-api:conformance \
-            --format '{{range .RepoDigests}}{{println .}}{{end}}' | head -n1)"
-          [[ "${api_image}" == *@sha256:* ]]
+          api_image="$(local_repo_digest localhost:5001/sandboxwich-api:conformance)"
           docker image rm -f sandboxwich-api:conformance \
             localhost:5001/sandboxwich-api:conformance \
             "${REGISTRY}/${IMAGE_NAMESPACE}/sandboxwich-api:sha-${short_sha}"
@@ -179,9 +190,7 @@ jobs:
 
           docker tag postgres:conformance localhost:5001/postgres:conformance
           docker push localhost:5001/postgres:conformance
-          postgres_image="$(docker image inspect localhost:5001/postgres:conformance \
-            --format '{{range .RepoDigests}}{{println .}}{{end}}' | head -n1)"
-          [[ "${postgres_image}" == *@sha256:* ]]
+          postgres_image="$(local_repo_digest localhost:5001/postgres:conformance)"
           docker image rm -f postgres:conformance localhost:5001/postgres:conformance \
             "mirror.gcr.io/library/postgres@${postgres_digest}"
           docker image prune --force
