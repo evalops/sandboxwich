@@ -540,7 +540,7 @@ pub(crate) async fn put_resident_process(
         tracing::info!(
             event = "maestro_resident_contract",
             stage = "resident.put.validate",
-            contract_revision = "maestro-resident-gateway-bootstrap-v1",
+            contract_revision = "maestro-resident-model-ready-v2",
             sandbox_id = %sandbox_id,
             bootstrap_present = request.bootstrap.is_some(),
             bootstrap_target = request
@@ -615,7 +615,11 @@ pub(crate) async fn put_resident_process(
             "MAESTRO_EVALOPS_PROVIDER",
             "MAESTRO_EVALOPS_ENVIRONMENT",
             "MAESTRO_EVALOPS_CREDENTIAL_NAME",
+            // Platform runner-host emits the canonical model selector and a
+            // low-cardinality contract fingerprint during the v2 rollout.
+            "MAESTRO_MODEL",
             "MAESTRO_DEFAULT_MODEL",
+            "MAESTRO_RESIDENT_CONTRACT_REVISION",
             "MAESTRO_LLM_GATEWAY_URL",
             "MAESTRO_LLM_GATEWAY_ORG_ID",
         ];
