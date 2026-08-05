@@ -533,8 +533,30 @@ pub(crate) async fn put_resident_process(
         ));
     }
     if name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME {
+        // Contract fingerprint for cross-service triage. Keys only; never
+        // env values or bootstrap content. Revision bumps when the allowlist
+        // or bootstrap path rule changes (see platform runner-host same event).
+        let env_keys = request.env.keys().cloned().collect::<Vec<_>>().join(",");
+        tracing::info!(
+            event = "maestro_resident_contract",
+            stage = "resident.put.validate",
+            contract_revision = "maestro-resident-gateway-bootstrap-v1",
+            sandbox_id = %sandbox_id,
+            bootstrap_present = request.bootstrap.is_some(),
+            bootstrap_target = request
+                .bootstrap
+                .as_ref()
+                .map(|b| b.target_file.as_str())
+                .unwrap_or(""),
+            bootstrap_mode = request.bootstrap.as_ref().map(|b| b.mode).unwrap_or(0),
+            env_key_count = request.env.len(),
+            env_keys = %env_keys,
+            argv = ?request.argv,
+            "Maestro resident contract admission check"
+        );
         let Some(bootstrap) = request.bootstrap.as_ref() else {
-            return Err(ApiError::bad_request(
+            return Err(ApiError::bad_request_code(
+                "maestro_bootstrap_required",
                 "maestro-hosted-runner requires the managed gateway bootstrap",
             ));
         };
@@ -542,7 +564,8 @@ pub(crate) async fn put_resident_process(
             || bootstrap.target_file != MAESTRO_HOSTED_RUNNER_GATEWAY_TOKEN_FILE
             || bootstrap.mode != 0o400
         {
-            return Err(ApiError::bad_request(
+            return Err(ApiError::bad_request_code(
+                "maestro_bootstrap_path_invalid",
                 "maestro-hosted-runner requires the fixed managed gateway bootstrap path",
             ));
         }
@@ -554,7 +577,8 @@ pub(crate) async fn put_resident_process(
                 "0.0.0.0:8443",
             ]
         {
-            return Err(ApiError::bad_request(
+            return Err(ApiError::bad_request_code(
+                "maestro_entrypoint_invalid",
                 "maestro-hosted-runner requires the fixed mTLS entrypoint",
             ));
         }
@@ -634,7 +658,8 @@ pub(crate) async fn put_resident_process(
                 .and_then(|value| Uuid::parse_str(value).ok())
                 == Some(sandbox_id);
         if !env_ok {
-            return Err(ApiError::bad_request(
+            return Err(ApiError::bad_request_code(
+                "maestro_env_bindings_invalid",
                 "maestro-hosted-runner requires exact bounded workload identity bindings",
             ));
         }
@@ -643,7 +668,8 @@ pub(crate) async fn put_resident_process(
     let sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
     let workspace_claim_name = if name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME {
         if sandbox.workspace_mode != WorkspaceMode::Persistent {
-            return Err(ApiError::bad_request(
+            return Err(ApiError::bad_request_code(
+                "maestro_workspace_mode_invalid",
                 "maestro-hosted-runner requires workspace_mode=persistent",
             ));
         }
