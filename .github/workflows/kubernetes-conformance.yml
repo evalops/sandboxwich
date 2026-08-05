@@ -16,6 +16,10 @@ permissions:
   contents: read
   packages: read
 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: evalops
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -94,9 +98,9 @@ jobs:
           short_sha="${CONTAINER_SHA::12}"
           postgres_digest="$(sed -n 's/^FROM postgres:17@//p' deploy/kubernetes/postgres.Dockerfile)"
           images=(
-            "ghcr.io/evalops/sandboxwich/sandboxwich-api:sha-${short_sha}"
-            "ghcr.io/evalops/sandboxwich/sandboxwich-worker:sha-${short_sha}"
-            "ghcr.io/evalops/sandboxwich/sandboxwich-ubuntu-dev:sha-${short_sha}"
+            "${REGISTRY}/${IMAGE_NAMESPACE}/sandboxwich-api:sha-${short_sha}"
+            "${REGISTRY}/${IMAGE_NAMESPACE}/sandboxwich-worker:sha-${short_sha}"
+            "${REGISTRY}/${IMAGE_NAMESPACE}/sandboxwich-ubuntu-dev:sha-${short_sha}"
             "mirror.gcr.io/library/postgres@${postgres_digest}"
           )
           pull_pids=()
@@ -148,7 +152,7 @@ jobs:
           [[ "${runtime_image}" == *@sha256:* ]]
           docker image rm -f sandboxwich-runtime:conformance \
             localhost:5001/sandboxwich-runtime:conformance \
-            "ghcr.io/evalops/sandboxwich/sandboxwich-ubuntu-dev:sha-${short_sha}"
+            "${REGISTRY}/${IMAGE_NAMESPACE}/sandboxwich-ubuntu-dev:sha-${short_sha}"
           docker image prune --force
 
           docker tag sandboxwich-worker:conformance \
@@ -159,7 +163,7 @@ jobs:
           [[ "${gateway_image}" == *@sha256:* ]]
           docker image rm -f sandboxwich-worker:conformance \
             localhost:5001/sandboxwich-worker:conformance \
-            "ghcr.io/evalops/sandboxwich/sandboxwich-worker:sha-${short_sha}"
+            "${REGISTRY}/${IMAGE_NAMESPACE}/sandboxwich-worker:sha-${short_sha}"
           docker image prune --force
 
           docker tag sandboxwich-api:conformance \
@@ -170,7 +174,7 @@ jobs:
           [[ "${api_image}" == *@sha256:* ]]
           docker image rm -f sandboxwich-api:conformance \
             localhost:5001/sandboxwich-api:conformance \
-            "ghcr.io/evalops/sandboxwich/sandboxwich-api:sha-${short_sha}"
+            "${REGISTRY}/${IMAGE_NAMESPACE}/sandboxwich-api:sha-${short_sha}"
           docker image prune --force
 
           docker tag postgres:conformance localhost:5001/postgres:conformance

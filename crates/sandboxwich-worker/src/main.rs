@@ -1775,7 +1775,10 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// `expires_at`/`leased_at` pair is somehow non-positive.
 const FALLBACK_LEASE_DURATION: Duration = Duration::from_secs(30);
 const MAX_RESIDENT_PROCESS_ATTEMPTS: u32 = 3;
-const RESIDENT_OBSERVATION_RETRY_DELAY: Duration = Duration::from_millis(250);
+// Hosted Maestro identity exchange fails closed until observed_state is
+// Starting/Running. Poll observations aggressively so the first validate
+// succeeds as soon as the Pod identity is known.
+const RESIDENT_OBSERVATION_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]

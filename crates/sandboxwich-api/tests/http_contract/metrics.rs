@@ -1,5 +1,6 @@
 use crate::common::*;
 use crate::types::{insert_job_lease_sql, insert_job_sql, insert_worker_sql};
+use chrono::{Duration, Utc};
 use sandboxwich_core::*;
 use sqlx::AnyPool;
 use uuid::Uuid;
@@ -425,6 +426,75 @@ async fn operator_global_rollup_decodes_postgres_bigint_sum_when_configured() {
         ),
         42,
         "operator/global metrics must decode PostgreSQL sum(bigint) as an i64 gauge"
+    );
+}
+
+#[tokio::test]
+async fn metrics_decode_postgres_slo_rollup_bigint_sums_when_configured() {
+    let Ok(database_url) = std::env::var("SANDBOXWICH_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let server = TestServer::start(database_url, None).await;
+    sqlx::any::install_default_drivers();
+    let pool = AnyPool::connect(&server.database_url).await.unwrap();
+    let bucket_start = (Utc::now() - Duration::hours(3)).to_rfc3339();
+    sqlx::query(
+        "insert into slo_histogram_rollups
+         (bucket_start, tenant_id, metric_kind, label_a, label_b, label_c,
+          sample_count, sum_ms, b0, b1, b2, b3, b4, b5, b6, b7)
+         values ($1, $2, 'command', 'success', '', '', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+    )
+    .bind(bucket_start)
+    .bind("default")
+    .bind(2_i64)
+    .bind(300_i64)
+    .bind(1_i64)
+    .bind(1_i64)
+    .bind(2_i64)
+    .bind(2_i64)
+    .bind(2_i64)
+    .bind(2_i64)
+    .bind(2_i64)
+    .bind(2_i64)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let tenant_metrics = server
+        .client()
+        .get(format!("{}/metrics", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        tenant_metrics
+            .contains("sandboxwich_command_duration_seconds_count{outcome=\"success\"} 2\n")
+    );
+    assert!(
+        tenant_metrics
+            .contains("sandboxwich_command_duration_seconds_sum{outcome=\"success\"} 0.3\n")
+    );
+
+    let operator_metrics = server
+        .client()
+        .get(format!("{}/metrics", server.base_url))
+        .header(OPERATOR_TOKEN_HEADER, TEST_OPERATOR_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        operator_metrics
+            .contains("sandboxwich_command_duration_seconds_count{outcome=\"success\"} 2\n")
     );
 }
 
