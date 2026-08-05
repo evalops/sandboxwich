@@ -341,11 +341,19 @@ kubectl -n sandboxwich-sandboxes label secret "sandboxwich-orphan-${orphan_id}" 
 kubectl -n sandboxwich-sandboxes create secret generic sandboxwich-foreign-secret \
   --from-literal=value=foreign >/dev/null
 kubectl -n sandboxwich delete job sandboxwich-reconcile-conformance --ignore-not-found --wait=true
+# Reconciler register needs the API Service endpoints and the api-client
+# NetworkPolicy allow. Wait for both before starting the one-shot Job so a
+# brief endpoint gap after the API restart case does not burn the Job budget.
+kubectl -n sandboxwich rollout status deployment/sandboxwich-api --timeout=60s
+kubectl -n sandboxwich get endpoints sandboxwich-api -o jsonpath='{.subsets[*].addresses[*].ip}' \
+  | grep -Eq '[0-9]' || fail "sandboxwich-api Service has no ready endpoints"
 kubectl -n sandboxwich create job sandboxwich-reconcile-conformance \
   --from=cronjob/sandboxwich-reconciler
 if ! kubectl -n sandboxwich wait --for=condition=complete \
-  job/sandboxwich-reconcile-conformance --timeout=180s; then
+  job/sandboxwich-reconcile-conformance --timeout=300s; then
+  kubectl -n sandboxwich describe job/sandboxwich-reconcile-conformance >&2 || true
   kubectl -n sandboxwich logs job/sandboxwich-reconcile-conformance --all-containers >&2 || true
+  kubectl -n sandboxwich get networkpolicy,endpoints,svc -o wide >&2 || true
   fail "out-of-band orphan reconciliation Job did not complete"
 fi
 for _ in $(seq 1 60); do
