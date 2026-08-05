@@ -2200,6 +2200,71 @@ async fn fetch_runtime_resource_inventory(
     })
 }
 
+/// Starts a provider-isolated resident lease without consuming the ordinary
+/// work queue. Sandboxwich creates the placement row when the provision lease
+/// is claimed, so this task is safe to launch while the base runtime Pod is
+/// still Pending; its required Pod affinity keeps it fenced to that runtime.
+fn spawn_provider_isolated_resident_lease(
+    client: &reqwest::Client,
+    api: &str,
+    worker_id: Uuid,
+    lease: &sandboxwich_core::JobLease,
+    provider: Arc<RuntimeProvider>,
+    resident_tasks: &mut tokio::task::JoinSet<anyhow::Result<LeaseResponse>>,
+    resident_tasks_by_id: &mut std::collections::HashMap<tokio::task::Id, ResidentTaskMetadata>,
+) -> anyhow::Result<bool> {
+    if lease.job.kind != JobKind::RunResidentProcess
+        || !matches!(
+            lease
+                .job
+                .payload
+                .get("name")
+                .and_then(serde_json::Value::as_str),
+            Some(ORB_SIDECAR_RESIDENT_PROCESS_NAME | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME)
+        )
+    {
+        return Ok(false);
+    }
+    let lease_id = lease.id;
+    let resident_identity =
+        uuid_from_payload(&lease.job.payload, "residentProcessId").and_then(|process_id| {
+            lease
+                .job
+                .payload
+                .get("generation")
+                .and_then(serde_json::Value::as_u64)
+                .context("resident-process generation is missing")
+                .map(|generation| (process_id, generation))
+        })?;
+    let (process_id, generation) = resident_identity;
+    let lease = lease.clone();
+    let resident_client = client.clone();
+    let resident_api = api.to_string();
+    let resident_cancellation = LeaseCancellation::new();
+    let task_cancellation = resident_cancellation.clone();
+    let task = resident_tasks.spawn(async move {
+        handle_lease(
+            &resident_client,
+            &resident_api,
+            worker_id,
+            lease,
+            provider,
+            Some(task_cancellation),
+        )
+        .await
+    });
+    resident_tasks_by_id.insert(
+        task.id(),
+        ResidentTaskMetadata {
+            lease_id,
+            process_id,
+            generation,
+            cancellation: resident_cancellation,
+        },
+    );
+    Ok(true)
+}
+
 async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> anyhow::Result<()> {
     let provider_mode = args.provider.provider_mode;
     let max_resident_processes = args.max_resident_processes.max(1);
@@ -2358,61 +2423,20 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
         // happened, so not finishing it just delays the job until the lease
         // expires and gets reclaimed by another worker.
         let lease_id = lease.id;
-        if lease.job.kind == JobKind::RunResidentProcess
-            && matches!(
-                lease
-                    .job
-                    .payload
-                    .get("name")
-                    .and_then(serde_json::Value::as_str),
-                Some(
-                    ORB_SIDECAR_RESIDENT_PROCESS_NAME | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
-                )
-            )
-        {
-            let resident_identity = uuid_from_payload(&lease.job.payload, "residentProcessId")
-                .and_then(|process_id| {
-                    lease
-                        .job
-                        .payload
-                        .get("generation")
-                        .and_then(serde_json::Value::as_u64)
-                        .context("resident-process generation is missing")
-                        .map(|generation| (process_id, generation))
-                });
-            match resident_identity {
-                Ok((process_id, generation)) => {
-                    let resident_client = client.clone();
-                    let resident_api = api.to_string();
-                    let resident_provider = provider.clone();
-                    let resident_cancellation = LeaseCancellation::new();
-                    let task_cancellation = resident_cancellation.clone();
-                    let task = resident_tasks.spawn(async move {
-                        handle_lease(
-                            &resident_client,
-                            &resident_api,
-                            worker_id,
-                            lease,
-                            resident_provider,
-                            Some(task_cancellation),
-                        )
-                        .await
-                    });
-                    resident_tasks_by_id.insert(
-                        task.id(),
-                        ResidentTaskMetadata {
-                            lease_id,
-                            process_id,
-                            generation,
-                            cancellation: resident_cancellation,
-                        },
-                    );
-                    continue;
-                }
-                Err(error) => eprintln!(
-                    "warning: resident lease {lease_id} lacks supervision metadata; handling it inline: {error:#}"
-                ),
-            }
+        match spawn_provider_isolated_resident_lease(
+            client,
+            api,
+            worker_id,
+            &lease,
+            provider.clone(),
+            &mut resident_tasks,
+            &mut resident_tasks_by_id,
+        ) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => eprintln!(
+                "warning: resident lease {lease_id} lacks supervision metadata; handling it inline: {error:#}"
+            ),
         }
         let is_control = matches!(lease.job.kind, JobKind::StopSandbox | JobKind::DeleteHome);
         let is_provision_like = matches!(
@@ -2468,11 +2492,102 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
             continue;
         }
 
-        let handle_future =
-            handle_lease(client, api, args.worker_id, lease, provider.clone(), None);
-        let outcome = tokio::select! {
-            result = handle_future => Some(result),
-            _ = drain_watchdog(shutdown.clone(), drain_timeout) => None,
+        // With an explicitly registered second lease slot, keep the resident
+        // control path moving while the base sandbox provision is in flight.
+        // The API's placement fence and the resident Pod's required affinity
+        // provide the cross-resource safety boundary; this worker-side filter
+        // keeps every ordinary/provision-like job out of the overlap.
+        let resident_fast_lane_enabled =
+            provider_mode == ProviderModeArg::Apply && max_concurrent_jobs >= 2;
+        let mut handle_future = Box::pin(handle_lease(
+            client,
+            api,
+            args.worker_id,
+            lease,
+            provider.clone(),
+            None,
+        ));
+        let mut drain_future = Box::pin(drain_watchdog(shutdown.clone(), drain_timeout));
+        let outcome = loop {
+            while let Some(result) = resident_tasks.try_join_next_with_id() {
+                reconcile_resident_task_result(
+                    client,
+                    api,
+                    result,
+                    &mut resident_tasks_by_id,
+                    false,
+                )
+                .await;
+            }
+            let resident_fast_lane_has_capacity = resident_fast_lane_enabled
+                && resident_tasks.len() < max_resident_processes
+                && !shutdown.load(std::sync::atomic::Ordering::SeqCst);
+            let resident_claim_args = ClaimArgs {
+                worker_id,
+                lease_seconds: args.lease_seconds,
+                operation_id: Some(Uuid::now_v7()),
+                kinds: claim_kinds_during_provision(provider_mode),
+                wait_ms: Some(args.idle_sleep_ms.clamp(1, 5_000)),
+            };
+            tokio::select! {
+                result = &mut handle_future => break Some(result),
+                _ = &mut drain_future => break None,
+                response = with_retries("claim resident fast-lane lease", API_RETRY_ATTEMPTS, || {
+                    claim(client, api, resident_claim_args.clone())
+                }), if resident_fast_lane_has_capacity => {
+                    match response {
+                        Ok(response) => {
+                            let Some(resident_lease) = response.lease else {
+                                continue;
+                            };
+                            let resident_lease_id = resident_lease.id;
+                            let fallback_reason = match spawn_provider_isolated_resident_lease(
+                                client,
+                                api,
+                                worker_id,
+                                &resident_lease,
+                                provider.clone(),
+                                &mut resident_tasks,
+                                &mut resident_tasks_by_id,
+                            ) {
+                                Ok(true) => None,
+                                Ok(false) => Some(
+                                    "lease did not match the provider-isolated supervision contract"
+                                        .to_string(),
+                                ),
+                                Err(error) => Some(format!(
+                                    "provider-isolated supervision metadata was invalid: {error:#}"
+                                )),
+                            };
+                            if let Some(fallback_reason) = fallback_reason {
+                                eprintln!(
+                                    "warning: resident fast-lane lease {resident_lease_id} {fallback_reason}; handling it on the ordinary path"
+                                );
+                                let fallback_client = client.clone();
+                                let fallback_api = api.to_string();
+                                let fallback_provider = provider.clone();
+                                ordinary_tasks.spawn(async move {
+                                    let result = handle_lease(
+                                        &fallback_client,
+                                        &fallback_api,
+                                        worker_id,
+                                        resident_lease,
+                                        fallback_provider,
+                                        None,
+                                    )
+                                    .await;
+                                    (resident_lease_id, result)
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "warning: resident fast-lane claim failed after {API_RETRY_ATTEMPTS} attempts; continuing provision: {error:#}"
+                            );
+                        }
+                    }
+                }
+            }
         };
         let Some(outcome) = outcome else {
             eprintln!(
@@ -4397,6 +4512,18 @@ fn claim_kinds_for_work_loop(
         JobKind::CreateSnapshot,
         JobKind::ForkSandbox,
     ])
+}
+
+/// The only work admitted beside an in-flight provision is a resident
+/// process. A second API lease slot is required before the work loop enables
+/// this path; returning an explicit empty filter keeps dry-run workers from
+/// accidentally claiming anything through this helper.
+fn claim_kinds_during_provision(provider_mode: ProviderModeArg) -> Option<Vec<JobKind>> {
+    if provider_mode == ProviderModeArg::Apply {
+        Some(vec![JobKind::RunResidentProcess])
+    } else {
+        Some(Vec::new())
+    }
 }
 
 fn validate_isolation_configuration(
