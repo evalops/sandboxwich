@@ -6,6 +6,7 @@ pub(crate) mod files;
 pub(crate) mod homes;
 pub(crate) mod jobs;
 pub(crate) mod leases;
+pub(crate) mod maestro_activations;
 pub(crate) mod operations;
 pub(crate) mod resident_attestations;
 pub(crate) mod resident_processes;

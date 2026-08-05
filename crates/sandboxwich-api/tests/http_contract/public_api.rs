@@ -70,6 +70,10 @@ async fn openapi_covers_every_public_v1_operation() {
         ),
         (
             "POST",
+            "/v1/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/activations/validate",
+        ),
+        (
+            "POST",
             "/v1/sandboxes/{sandbox_id}/resident-processes/{name}/stop",
         ),
         (

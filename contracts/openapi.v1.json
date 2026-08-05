@@ -747,6 +747,130 @@
         "format": "uuid",
         "type": "string"
       },
+      "MaestroHostedRunnerActivationValidationRequest": {
+        "additionalProperties": false,
+        "description": "Authenticated Maestro rendezvous activation presented by Platform for\nvalidation against Sandboxwich's current resident, placement, and lease\nauthority. `activation_id` is the idempotency/replay fence; every remaining\nfield must exactly equal the live connection binding.",
+        "properties": {
+          "activationId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "expectedServerUriSan": {
+            "type": "string"
+          },
+          "leaseAttempt": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "leaseExpiresAtEpochSeconds": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "leaseId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "organizationId": {
+            "type": "string"
+          },
+          "placementGeneration": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "podUid": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "residentProcessGeneration": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "runnerSessionId": {
+            "type": "string"
+          },
+          "runtimeImage": {
+            "type": "string"
+          },
+          "sandboxId": {
+            "$ref": "#/components/schemas/SandboxId"
+          },
+          "serviceHost": {
+            "type": "string"
+          },
+          "serviceName": {
+            "type": "string"
+          },
+          "serviceNamespace": {
+            "type": "string"
+          },
+          "servicePort": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "workerId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "workspaceId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "activationId",
+          "organizationId",
+          "workspaceId",
+          "sandboxId",
+          "podUid",
+          "placementGeneration",
+          "runnerSessionId",
+          "runtimeImage",
+          "serviceNamespace",
+          "serviceName",
+          "serviceHost",
+          "servicePort",
+          "expectedServerUriSan",
+          "residentProcessGeneration",
+          "leaseId",
+          "leaseAttempt",
+          "leaseExpiresAtEpochSeconds",
+          "workerId"
+        ],
+        "type": "object"
+      },
+      "MaestroHostedRunnerActivationValidationResponse": {
+        "description": "Durable point-in-time receipt that Sandboxwich accepted one exact Maestro\nactivation tuple while its authoritative generation and lease were live.",
+        "properties": {
+          "activationId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "replayed": {
+            "type": "boolean"
+          },
+          "tupleSha256": {
+            "type": "string"
+          },
+          "validatedAt": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "activationId",
+          "tupleSha256",
+          "validatedAt",
+          "replayed"
+        ],
+        "type": "object"
+      },
       "MaestroHostedRunnerConnectionBindingResponse": {
         "description": "Non-secret connection and certificate binding for a live, tenant-scoped\nMaestro hosted runner. Callers use the exact URI SAN to authenticate the\nserver certificate issued by Identity; every component is fenced to the\nsame live provider placement and lease.",
         "properties": {
@@ -3643,6 +3767,67 @@
         },
         "tags": [
           "crate::handlers::commands"
+        ]
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/activations/validate": {
+      "post": {
+        "operationId": "validate_maestro_activation",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MaestroHostedRunnerActivationValidationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MaestroHostedRunnerActivationValidationResponse"
+                }
+              }
+            },
+            "description": "Durable proof of an exact live Maestro activation tuple"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No tenant-scoped activation authority exists"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Activation tuple is stale, expired, replayed with different material, or mismatched"
+          }
+        },
+        "tags": [
+          "crate::handlers::maestro_activations"
         ]
       }
     },

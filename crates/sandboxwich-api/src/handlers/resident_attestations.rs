@@ -13,7 +13,7 @@ use sandboxwich_core::lifecycle_contract::LifecycleReasonCode;
 use sandboxwich_core::*;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::Row;
+use sqlx::{AnyConnection, Row};
 use std::collections::BTreeMap;
 use subtle::ConstantTimeEq;
 use url::Url;
@@ -233,8 +233,9 @@ fn label<'a>(labels: &'a Value, name: &str) -> Result<&'a str, ApiError> {
         .ok_or_else(|| ApiError::internal(format!("worker is missing required {name} label")))
 }
 
-async fn placement_fence(
+async fn placement_fence_on(
     db: &Database,
+    connection: &mut AnyConnection,
     tenant_id: &str,
     process_id: ResidentProcessId,
     generation: u64,
@@ -269,7 +270,7 @@ async fn placement_fence(
         .bind(lease_id.to_string())
         .bind(ORB_SIDECAR_RESIDENT_PROCESS_NAME)
         .bind(MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME)
-        .fetch_optional(&db.pool)
+        .fetch_optional(&mut *connection)
         .await?
         .ok_or_else(|| not_live("resident placement fence is no longer active"))?;
     let status: String = row.try_get("status")?;
@@ -332,6 +333,25 @@ async fn placement_fence(
         provider_pod_name: row.try_get("provider_pod_name")?,
         provider_pod_uid: row.try_get("provider_pod_uid")?,
     })
+}
+
+async fn placement_fence(
+    db: &Database,
+    tenant_id: &str,
+    process_id: ResidentProcessId,
+    generation: u64,
+    lease_id: Uuid,
+) -> Result<PlacementFence, ApiError> {
+    let mut connection = db.pool.acquire().await?;
+    placement_fence_on(
+        db,
+        &mut connection,
+        tenant_id,
+        process_id,
+        generation,
+        lease_id,
+    )
+    .await
 }
 
 struct MaestroUriComponents<'a> {
@@ -419,7 +439,23 @@ pub(crate) async fn get_maestro_connection_binding(
     Extension(ctx): Extension<TenantContext>,
     axum::extract::Path(sandbox_id): axum::extract::Path<Uuid>,
 ) -> Result<Json<MaestroHostedRunnerConnectionBindingResponse>, ApiError> {
-    let sandbox_id = SandboxId(sandbox_id);
+    let mut connection = state.db.pool.acquire().await?;
+    let binding = authoritative_maestro_connection_binding(
+        &state.db,
+        &mut connection,
+        &ctx.tenant_id,
+        SandboxId(sandbox_id),
+    )
+    .await?;
+    Ok(Json(binding))
+}
+
+pub(crate) async fn authoritative_maestro_connection_binding(
+    db: &Database,
+    connection: &mut AnyConnection,
+    tenant_id: &str,
+    sandbox_id: SandboxId,
+) -> Result<MaestroHostedRunnerConnectionBindingResponse, ApiError> {
     let sql = format!(
         "select rp.id, rp.generation, rp.active_lease_id, rp.env,
                 rp.desired_state, rp.observed_state, rp.provider_pod_uid,
@@ -428,15 +464,15 @@ pub(crate) async fn get_maestro_connection_binding(
          join sandbox_placements sp on sp.sandbox_id = rp.sandbox_id
          join workers w on w.id = sp.worker_id
          where rp.sandbox_id = {} and rp.tenant_id = {} and rp.name = {}",
-        state.db.placeholder(1),
-        state.db.placeholder(2),
-        state.db.placeholder(3),
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
     );
     let row = sqlx::query(&sql)
         .bind(sandbox_id.to_string())
-        .bind(&ctx.tenant_id)
+        .bind(tenant_id)
         .bind(MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME)
-        .fetch_optional(&state.db.pool)
+        .fetch_optional(&mut *connection)
         .await?
         .ok_or_else(|| ApiError::not_found("Maestro hosted runner not found"))?;
     if row.try_get::<String, _>("desired_state")?
@@ -508,9 +544,10 @@ pub(crate) async fn get_maestro_connection_binding(
     {
         return Err(not_live("Maestro sandbox binding is invalid"));
     }
-    let fence = placement_fence(
-        &state.db,
-        &ctx.tenant_id,
+    let fence = placement_fence_on(
+        db,
+        connection,
+        tenant_id,
         process_id,
         process_generation,
         lease_id,
@@ -546,7 +583,7 @@ pub(crate) async fn get_maestro_connection_binding(
         lease_id,
         fence: &fence,
     })?;
-    Ok(Json(MaestroHostedRunnerConnectionBindingResponse {
+    Ok(MaestroHostedRunnerConnectionBindingResponse {
         ok: true,
         organization_id: organization_id.clone(),
         workspace_id: workspace_id.clone(),
@@ -565,7 +602,7 @@ pub(crate) async fn get_maestro_connection_binding(
         lease_attempt: fence.lease_attempt,
         lease_expires_at_epoch_seconds: fence.lease_expires_at.timestamp(),
         worker_id: fence.worker_id,
-    }))
+    })
 }
 
 fn token_for(key: &str, record: &AttestationRecord) -> String {

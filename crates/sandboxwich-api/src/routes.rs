@@ -8,6 +8,7 @@ use crate::handlers::files::*;
 use crate::handlers::homes::*;
 use crate::handlers::jobs::*;
 use crate::handlers::leases::*;
+use crate::handlers::maestro_activations::*;
 use crate::handlers::operations::*;
 use crate::handlers::resident_attestations::*;
 use crate::handlers::resident_processes::*;
@@ -77,6 +78,10 @@ pub(crate) fn app(state: AppState) -> Router {
         .route(
             "/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/connection-binding",
             get(get_maestro_connection_binding),
+        )
+        .route(
+            "/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/activations/validate",
+            post(validate_maestro_activation),
         )
         .route(
             "/sandboxes/{sandbox_id}/resident-processes/{name}/stop",

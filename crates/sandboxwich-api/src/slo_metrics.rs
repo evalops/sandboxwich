@@ -90,6 +90,8 @@ pub(crate) async fn append_slo_metrics(
         cleanup_roll,
         claim,
         stage,
+        activation_duration,
+        activation_total,
     ) = tokio::try_join!(
         fetch_creation_histogram(db, tenant_id, &raw_since),
         fetch_simple_terminal_histogram(db, tenant_id, "command", &raw_since),
@@ -99,6 +101,8 @@ pub(crate) async fn append_slo_metrics(
         fetch_simple_terminal_rollups(db, tenant_id, "cleanup", &history_since, &raw_since),
         fetch_claim_observations(db, tenant_id, &sample_since),
         fetch_stage_observations(db, tenant_id, &sample_since),
+        fetch_activation_histogram(db, tenant_id, false),
+        fetch_activation_histogram(db, tenant_id, true),
     )?;
     let creation = merge_histogram_batches(creation_raw, creation_roll);
     let command = merge_histogram_batches(command_raw, command_roll);
@@ -146,17 +150,35 @@ pub(crate) async fn append_slo_metrics(
         &["stage", "workspace_mode", "error_class"],
         &stage.observations,
     );
+    append_histogram_series(
+        body,
+        "sandboxwich_maestro_activation_validation_duration_seconds",
+        "Sandboxwich validation latency for authenticated Maestro activation tuples.",
+        &["outcome"],
+        &activation_duration.series,
+    );
+    append_counter_from_series(
+        body,
+        "sandboxwich_maestro_activation_total",
+        "Authenticated Maestro activation validation outcomes in the retained observation window.",
+        &["outcome", "reason"],
+        &activation_total.series,
+    );
 
     let rows_examined = creation.rows_examined
         + command.rows_examined
         + cleanup.rows_examined
         + claim.rows_examined
-        + stage.rows_examined;
+        + stage.rows_examined
+        + activation_duration.rows_examined
+        + activation_total.rows_examined;
     let truncated = creation.truncated
         || command.truncated
         || cleanup.truncated
         || claim.truncated
-        || stage.truncated;
+        || stage.truncated
+        || activation_duration.truncated
+        || activation_total.truncated;
     let scrape_seconds = scrape_started.elapsed().as_secs_f64();
     // Result bytes are measured by the caller after the body is fully built;
     // here we only emit scrape-side cost that this module controls.
@@ -303,6 +325,53 @@ async fn fetch_simple_terminal_histogram(
     };
     let rows = fetch_rows(db, &sql, &binds).await?;
     map_histogram_rows(rows, &["outcome"], &["outcome"])
+}
+
+async fn fetch_activation_histogram(
+    db: &Database,
+    tenant_id: Option<&str>,
+    include_reason: bool,
+) -> Result<HistogramBatch, ApiError> {
+    let count = coalesced_sum_i64(db, "sample_count");
+    let sum_ms = coalesced_sum_i64(db, "sum_ms");
+    let buckets = (0..LATENCY_BUCKETS_MS.len())
+        .map(|index| {
+            format!(
+                "{} as b{index}",
+                coalesced_sum_i64(db, &format!("b{index}"))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let reason_select = if include_reason { ", reason" } else { "" };
+    let reason_group = if include_reason { ", reason" } else { "" };
+    let (sql, binds) = if let Some(tenant_id) = tenant_id {
+        (
+            format!(
+                "select outcome{reason_select}, {count} as n, {sum_ms} as sum_ms, {buckets}
+                 from maestro_activation_validation_metrics
+                 where tenant_id = {}
+                 group by outcome{reason_group}",
+                db.placeholder(1),
+            ),
+            vec![tenant_id],
+        )
+    } else {
+        (
+            format!(
+                "select outcome{reason_select}, {count} as n, {sum_ms} as sum_ms, {buckets}
+                 from maestro_activation_validation_metrics
+                 group by outcome{reason_group}",
+            ),
+            vec![],
+        )
+    };
+    let rows = fetch_rows(db, &sql, &binds).await?;
+    if include_reason {
+        map_histogram_rows(rows, &["outcome", "reason"], &["outcome", "reason"])
+    } else {
+        map_histogram_rows(rows, &["outcome"], &["outcome"])
+    }
 }
 
 fn map_histogram_rows(
