@@ -491,7 +491,26 @@ fn maestro_hosted_runner_uses_only_projected_identity_in_an_isolated_pod() {
             .any(|rule| {
                 rule["to"][0]["podSelector"]["matchLabels"]["app"] == "identity"
                     && rule["ports"][0]["port"] == 8080
-            })
+            }),
+        "Maestro residents must reach identity for workload-certificate exchange"
+    );
+    assert!(
+        policy["spec"]["egress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| {
+                let apps: Vec<_> = rule["to"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry["podSelector"]["matchLabels"]["app"].as_str())
+                    .collect();
+                apps.contains(&"llm-gateway")
+                    && apps.contains(&"llm-gateway-canary")
+                    && rule["ports"][0]["port"] == 8080
+            }),
+        "Maestro residents must reach the managed EvalOps llm-gateway (stable + canary)"
     );
     let rendered = serde_json::to_string(&manifests).expect("render manifests");
     assert!(!rendered.contains("\"kind\":\"Secret\""));

@@ -5173,6 +5173,7 @@ impl KubernetesApplyProvider {
                 "ports": [{ "protocol": "TCP", "port": 443 }],
             }));
         } else {
+            // Workload-identity certificate exchange (mTLS with runner-host).
             network_egress.push(json!({
                 "to": [{
                     "namespaceSelector": {
@@ -5186,6 +5187,40 @@ impl KubernetesApplyProvider {
                         }
                     }
                 }],
+                "ports": [{
+                    "protocol": "TCP",
+                    "port": 8080
+                }]
+            }));
+            // Managed EvalOps llm-gateway (workspace BYOK via provider_ref).
+            // Stable + canary so canary promotions do not black-hole residents.
+            network_egress.push(json!({
+                "to": [
+                    {
+                        "namespaceSelector": {
+                            "matchLabels": {
+                                "kubernetes.io/metadata.name": self.dry_run.effective_ingress_namespace()
+                            }
+                        },
+                        "podSelector": {
+                            "matchLabels": {
+                                "app": "llm-gateway"
+                            }
+                        }
+                    },
+                    {
+                        "namespaceSelector": {
+                            "matchLabels": {
+                                "kubernetes.io/metadata.name": self.dry_run.effective_ingress_namespace()
+                            }
+                        },
+                        "podSelector": {
+                            "matchLabels": {
+                                "app": "llm-gateway-canary"
+                            }
+                        }
+                    }
+                ],
                 "ports": [{
                     "protocol": "TCP",
                     "port": 8080
