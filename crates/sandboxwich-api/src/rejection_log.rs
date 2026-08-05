@@ -23,6 +23,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use std::time::Instant;
 
+use crate::authz::AuthorizationContext;
 use crate::state::TenantContext;
 
 /// Largest rejection body buffered to read its `code`. Every rejection this
@@ -87,6 +88,10 @@ pub(crate) async fn log_mutation_rejections(request: Request, next: Next) -> Res
         .extensions()
         .get::<TenantContext>()
         .map(|ctx| ctx.tenant_id.clone());
+    let authorization_decision_id = request
+        .extensions()
+        .get::<AuthorizationContext>()
+        .map(|context| context.decision_id.clone());
 
     let started = Instant::now();
     let response = next.run(request).await;
@@ -104,6 +109,7 @@ pub(crate) async fn log_mutation_rejections(request: Request, next: Next) -> Res
         code = rejection.code.as_deref().unwrap_or(UNKNOWN_CODE),
         detail = rejection.detail.as_deref().unwrap_or(""),
         tenant = tenant.as_deref().unwrap_or(UNKNOWN_TENANT),
+        authorization_decision_id = authorization_decision_id.as_deref().unwrap_or("<none>"),
         latency_ms,
         "mutation rejected"
     );
