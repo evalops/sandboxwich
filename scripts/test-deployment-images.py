@@ -128,6 +128,26 @@ class DeploymentImagesTest(unittest.TestCase):
         self.assertIn("kubernetes.io/metadata.name: sandboxwich-sandboxes", api_text)
         self.assertIn("port: 3217", api_text)
 
+    def test_control_plane_network_policy_allows_worker_and_reconciler(self) -> None:
+        # Default-deny plus a narrow allow. Both the worker Deployment and the
+        # reconciler CronJob must carry sandboxwich.dev/api-client=true so
+        # register/reconcile can reach the API on policy-enforcing CNIs.
+        api_text = (ROOT / "deploy/kubernetes/api.yaml").read_text()
+        worker_text = (ROOT / "deploy/kubernetes/worker.yaml").read_text()
+        self.assertIn("name: sandboxwich-api-allow-worker", api_text)
+        self.assertIn('sandboxwich.dev/api-client: "true"', api_text)
+        self.assertGreaterEqual(
+            worker_text.count('sandboxwich.dev/api-client: "true"'), 2
+        )
+        # Name-only allow for sandboxwich-worker is insufficient after the
+        # reconciler CronJob split; the shared api-client label is required.
+        allow_section = api_text.split("name: sandboxwich-api-allow-worker", 1)[1]
+        self.assertIn('sandboxwich.dev/api-client: "true"', allow_section)
+        self.assertNotIn(
+            "app.kubernetes.io/name: sandboxwich-worker",
+            allow_section.split("sandboxwich-sandboxes", 1)[0],
+        )
+
     def test_orphan_cleanup_runs_only_in_a_non_overlapping_cronjob(self) -> None:
         worker_text = (ROOT / "deploy/kubernetes/worker.yaml").read_text()
         self.assertEqual(worker_text.count("- --orphan-reconciliation-apply"), 1)

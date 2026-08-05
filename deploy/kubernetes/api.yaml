@@ -208,12 +208,12 @@ spec:
 ---
 # Narrow allow carved out of the default-deny above via a second NetworkPolicy
 # (NetworkPolicies selecting the same pod are additive, so this only adds an
-# allowance rather than reopening everything): the worker Deployment
-# (worker.yaml, same namespace) and explicitly labeled metrics scrapers may
-# reach the api Deployment on port 3217.
-# The migrate Job and the worker Deployment itself take no inbound traffic at
-# all, so they are covered by the default-deny policy above and get no
-# corresponding allow rule here.
+# allowance rather than reopening everything): control-plane clients in this
+# namespace (the worker Deployment and the reconciler CronJob in worker.yaml)
+# and explicitly labeled metrics scrapers may reach the api Deployment on
+# port 3217. Both clients set sandboxwich.dev/api-client=true.
+# The migrate Job takes no inbound traffic at all, so it is covered by the
+# default-deny policy above and gets no corresponding allow rule here.
 #
 # kubelet liveness/readiness probes (defined on the api Deployment above) are
 # not affected by this: they originate from the kubelet process on the node
@@ -244,9 +244,15 @@ spec:
     - Ingress
   ingress:
     - from:
+        # Worker Deployment and reconciler CronJob (worker.yaml). After
+        # reconciliation moved out of the worker claim loop, the CronJob pods
+        # use app.kubernetes.io/name=sandboxwich-reconciler; matching only
+        # sandboxwich-worker left every reconciler register call stuck at
+        # connect timeout on policy-enforcing CNIs (and in kind once the
+        # suite exercised the CronJob path).
         - podSelector:
             matchLabels:
-              app.kubernetes.io/name: sandboxwich-worker
+              sandboxwich.dev/api-client: "true"
         - podSelector:
             matchLabels:
               sandboxwich.dev/metrics-access: "true"
