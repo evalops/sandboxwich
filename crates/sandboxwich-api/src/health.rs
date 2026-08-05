@@ -238,8 +238,11 @@ pub(crate) async fn fetch_prometheus_metrics(
     db: &Database,
     tenant_id: Option<&str>,
 ) -> Result<PrometheusMetrics, ApiError> {
+    let worker_capacity_sum = coalesced_sum_i64(db, "max_concurrent_jobs");
+    let job_attempts_sum = coalesced_sum_i64(db, "attempts");
     let sql = match tenant_id {
-        None => "select 'sandbox' as family, state as label, count(*) as value
+        None => format!(
+            "select 'sandbox' as family, state as label, count(*) as value
              from sandboxes
              group by state
              union all
@@ -267,12 +270,12 @@ pub(crate) async fn fetch_prometheus_metrics(
              from job_leases
              where status = 'active'
              union all
-             select 'worker_capacity_slots' as family, '' as label, coalesce(sum(max_concurrent_jobs), 0) as value
+             select 'worker_capacity_slots' as family, '' as label, {worker_capacity_sum} as value
              from workers
              where status = 'online'
              union all
              select 'worker_available_slots' as family, '' as label,
-                    coalesce((select sum(max_concurrent_jobs) from workers where status = 'online'), 0)
+                    (select {worker_capacity_sum} from workers where status = 'online')
                       - (select count(*) from job_leases
                          join jobs on jobs.id = job_leases.job_id
                          where job_leases.status = 'active'
@@ -281,7 +284,7 @@ pub(crate) async fn fetch_prometheus_metrics(
              select 'job_lease' as family, status as label, count(*) as value
              from job_leases group by status
              union all
-             select 'job_attempts' as family, '' as label, coalesce(sum(attempts), 0) as value
+             select 'job_attempts' as family, '' as label, {job_attempts_sum} as value
              from jobs
              union all
              select 'idempotency_record' as family, state as label, count(*) as value
@@ -295,7 +298,7 @@ pub(crate) async fn fetch_prometheus_metrics(
              select 'cleanup_run' as family, status as label, count(*) as value
              from cleanup_runs group by status
              order by family asc, label asc"
-            .to_string(),
+        ),
         Some(_) => format!(
             "select 'sandbox' as family, state as label, count(*) as value
              from sandboxes
@@ -332,12 +335,13 @@ pub(crate) async fn fetch_prometheus_metrics(
              join jobs on jobs.id = job_leases.job_id
              where job_leases.status = 'active' and jobs.tenant_id = {p6}
              union all
-             select 'worker_capacity_slots' as family, '' as label, coalesce(sum(max_concurrent_jobs), 0) as value
+             select 'worker_capacity_slots' as family, '' as label, {worker_capacity_sum} as value
              from workers
              where status = 'online' and tenant_id = {p7}
              union all
              select 'worker_available_slots' as family, '' as label,
-                    coalesce((select sum(max_concurrent_jobs) from workers where status = 'online' and tenant_id = {p8}), 0)
+                    (select {worker_capacity_sum} from workers
+                     where status = 'online' and tenant_id = {p8})
                       - (select count(*) from job_leases join jobs on jobs.id = job_leases.job_id
                          where job_leases.status = 'active'
                            and jobs.tenant_id = {p9}
@@ -347,7 +351,7 @@ pub(crate) async fn fetch_prometheus_metrics(
              from job_leases join jobs on jobs.id = job_leases.job_id
              where jobs.tenant_id = {p10} group by job_leases.status
              union all
-             select 'job_attempts' as family, '' as label, coalesce(sum(attempts), 0) as value
+             select 'job_attempts' as family, '' as label, {job_attempts_sum} as value
              from jobs where tenant_id = {p11}
              union all
              select 'idempotency_record' as family, state as label, count(*) as value
@@ -432,6 +436,16 @@ pub(crate) async fn fetch_prometheus_metrics(
         values.insert(family.to_string(), vec![(String::new(), age)]);
     }
     Ok(PrometheusMetrics { values })
+}
+
+/// PostgreSQL promotes `sum(bigint)` to `numeric`, which `sqlx::Any` cannot
+/// decode. Keep Prometheus aggregates on the i64 boundary explicitly.
+fn coalesced_sum_i64(db: &Database, expression: &str) -> String {
+    let aggregate = format!("coalesce(sum({expression}), 0)");
+    match db.dialect {
+        SqlDialect::Postgres => format!("{aggregate}::bigint"),
+        SqlDialect::Sqlite => aggregate,
+    }
 }
 
 async fn fetch_resident_observability_metrics(
