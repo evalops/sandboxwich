@@ -365,13 +365,70 @@ async fn maestro_hosted_runner_rejects_ephemeral_workspace_before_dispatch() {
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body = response.text().await.unwrap();
     assert!(
-        response
-            .text()
-            .await
-            .unwrap()
-            .contains("workspace_mode=persistent")
+        body.contains("workspace_mode=persistent"),
+        "body was {body}"
     );
+    assert!(
+        body.contains("maestro_workspace_mode_invalid"),
+        "typed code missing in {body}"
+    );
+}
+
+/// Bootstrap is required for managed-gateway Maestro residents. Missing
+/// bootstrap must return a stable machine code so runner-host provision
+/// summaries can name the class without reading free-text detail.
+#[tokio::test]
+async fn maestro_hosted_runner_missing_bootstrap_returns_typed_code() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("maestro-no-bootstrap.db").display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let client = server.client();
+    let sandbox: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
+            name: Some("maestro-no-bootstrap".into()),
+            template: Some("ubuntu-dev".into()),
+            memory_limit: None,
+            network_egress: Some(NetworkEgress::DenyAll),
+            workspace_mode: Some(WorkspaceMode::Persistent),
+            runtime_profile: None,
+            execution_class: None,
+            ttl_seconds: Some(3600),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut request =
+        maestro_hosted_runner_request(sandbox.sandbox.id, "workspace-1", "runner-session-1");
+    request.bootstrap = None;
+    let response = client
+        .put(format!(
+            "{}/sandboxes/{}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let error: ErrorEnvelope = response.json().await.unwrap();
+    assert_eq!(error.code, "maestro_bootstrap_required");
 }
 
 #[tokio::test]

@@ -52,6 +52,17 @@ impl ApiError {
         }
     }
 
+    /// 400 with a stable machine-readable `code` (not the generic
+    /// `bad_request`). Use for cross-service contracts where consumers
+    /// (runner-host) must classify the rejection without replaying the body.
+    pub(crate) fn bad_request_code(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code,
+            message: message.into(),
+        }
+    }
+
     pub(crate) fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
