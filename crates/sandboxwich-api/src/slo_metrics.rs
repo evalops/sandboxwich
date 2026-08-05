@@ -27,6 +27,17 @@ const METRICS_ROLLUP_BATCH: i64 = 5_000;
 /// families aggregate in SQL and never pull one row per event.
 const METRICS_MAX_ROWS_PER_FAMILY: i64 = 50_000;
 
+/// PostgreSQL promotes `sum(bigint)` to `numeric`, which `sqlx::Any` cannot
+/// decode. Keep every Prometheus aggregate on the i64 boundary explicitly;
+/// SQLite accepts the same expression without a cast.
+fn coalesced_sum_i64(db: &Database, expression: &str) -> String {
+    let aggregate = format!("coalesce(sum({expression}), 0)");
+    match db.dialect {
+        crate::db::SqlDialect::Postgres => format!("{aggregate}::bigint"),
+        crate::db::SqlDialect::Sqlite => aggregate,
+    }
+}
+
 #[derive(Clone)]
 struct Observation {
     labels: Vec<String>,
@@ -185,12 +196,12 @@ pub(crate) async fn append_slo_metrics(
 
 fn duration_bucket_selects(db: &Database) -> String {
     // Placeholder indices are unused; these are bare expressions over duration_ms.
-    let _ = db;
     LATENCY_BUCKETS_MS
         .iter()
         .enumerate()
         .map(|(index, ms)| {
-            format!("sum(case when duration_ms <= {ms} then 1 else 0 end) as b{index}")
+            let expression = format!("case when duration_ms <= {ms} then 1 else 0 end");
+            format!("{} as b{index}", coalesced_sum_i64(db, &expression))
         })
         .collect::<Vec<_>>()
         .join(",\n                        ")
@@ -202,12 +213,13 @@ async fn fetch_creation_histogram(
     since: &str,
 ) -> Result<HistogramBatch, ApiError> {
     let buckets = duration_bucket_selects(db);
+    let sum_ms = coalesced_sum_i64(db, "duration_ms");
     let (sql, binds) = if let Some(tenant_id) = tenant_id {
         (
             format!(
                 "select outcome, workspace_mode, start_type,
                         count(*) as n,
-                        coalesce(sum(duration_ms), 0) as sum_ms,
+                        {sum_ms} as sum_ms,
                         {buckets}
                  from terminal_slo_observations
                  where metric_kind = 'sandbox_creation'
@@ -224,7 +236,7 @@ async fn fetch_creation_histogram(
             format!(
                 "select outcome, workspace_mode, start_type,
                         count(*) as n,
-                        coalesce(sum(duration_ms), 0) as sum_ms,
+                        {sum_ms} as sum_ms,
                         {buckets}
                  from terminal_slo_observations
                  where metric_kind = 'sandbox_creation'
@@ -255,12 +267,13 @@ async fn fetch_simple_terminal_histogram(
         _ => unreachable!("bounded metric family"),
     };
     let buckets = duration_bucket_selects(db);
+    let sum_ms = coalesced_sum_i64(db, "duration_ms");
     let (sql, binds) = if let Some(tenant_id) = tenant_id {
         (
             format!(
                 "select outcome,
                         count(*) as n,
-                        coalesce(sum(duration_ms), 0) as sum_ms,
+                        {sum_ms} as sum_ms,
                         {buckets}
                  from terminal_slo_observations
                  where metric_kind = '{metric_kind}'
@@ -277,7 +290,7 @@ async fn fetch_simple_terminal_histogram(
             format!(
                 "select outcome,
                         count(*) as n,
-                        coalesce(sum(duration_ms), 0) as sum_ms,
+                        {sum_ms} as sum_ms,
                         {buckets}
                  from terminal_slo_observations
                  where metric_kind = '{metric_kind}'
@@ -542,20 +555,26 @@ async fn fetch_rollup_histogram(
     let p2 = db.placeholder(2);
     let p3 = db.placeholder(3);
     let p4 = db.placeholder(4);
+    let sample_count = coalesced_sum_i64(db, "sample_count");
+    let sum_ms = coalesced_sum_i64(db, "sum_ms");
+    let buckets = LATENCY_BUCKETS_MS
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            format!(
+                "{} as b{index}",
+                coalesced_sum_i64(db, &format!("b{index}"))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n                        ");
     let (sql, binds) = if let Some(tenant_id) = tenant_id {
         (
             format!(
                 "select label_a, label_b, label_c,
-                        coalesce(sum(sample_count), 0) as n,
-                        coalesce(sum(sum_ms), 0) as sum_ms,
-                        coalesce(sum(b0), 0) as b0,
-                        coalesce(sum(b1), 0) as b1,
-                        coalesce(sum(b2), 0) as b2,
-                        coalesce(sum(b3), 0) as b3,
-                        coalesce(sum(b4), 0) as b4,
-                        coalesce(sum(b5), 0) as b5,
-                        coalesce(sum(b6), 0) as b6,
-                        coalesce(sum(b7), 0) as b7
+                        {sample_count} as n,
+                        {sum_ms} as sum_ms,
+                        {buckets}
                  from slo_histogram_rollups
                  where metric_kind = {p1}
                    and bucket_start >= {p2}
@@ -569,16 +588,9 @@ async fn fetch_rollup_histogram(
         (
             format!(
                 "select label_a, label_b, label_c,
-                        coalesce(sum(sample_count), 0) as n,
-                        coalesce(sum(sum_ms), 0) as sum_ms,
-                        coalesce(sum(b0), 0) as b0,
-                        coalesce(sum(b1), 0) as b1,
-                        coalesce(sum(b2), 0) as b2,
-                        coalesce(sum(b3), 0) as b3,
-                        coalesce(sum(b4), 0) as b4,
-                        coalesce(sum(b5), 0) as b5,
-                        coalesce(sum(b6), 0) as b6,
-                        coalesce(sum(b7), 0) as b7
+                        {sample_count} as n,
+                        {sum_ms} as sum_ms,
+                        {buckets}
                  from slo_histogram_rollups
                  where metric_kind = {p1}
                    and bucket_start >= {p2}
