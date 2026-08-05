@@ -1,6 +1,7 @@
 mod activity;
 mod api_contract;
 mod auth;
+mod authz;
 mod bootstrap_handoff;
 mod cleanup;
 mod config;

@@ -1,3 +1,4 @@
+use crate::authz::AuthorizationContext;
 use crate::db::*;
 use crate::error::*;
 use crate::handlers::leases::*;
@@ -123,12 +124,44 @@ pub(crate) async fn auth_and_tenant(
         Principal::Tenant if is_operator_request(&state, request.headers()) => Principal::Operator,
         principal => principal,
     };
+    let authorization = AuthorizationContext::from_request(&request, &tenant_id, principal);
+    let span = tracing::Span::current();
+    span.record(
+        "authorization_decision_id",
+        authorization.decision_id.as_str(),
+    );
+    span.record("authorization_policy_id", authorization.policy_id);
+    span.record("authorization_policy_version", authorization.policy_version);
+    span.record(
+        "authorization_principal_class",
+        authorization.principal_class,
+    );
+    span.record(
+        "authorization_trace_id",
+        authorization.trace_id.as_deref().unwrap_or_default(),
+    );
+    tracing::debug!(
+        target: "sandboxwich.authorization",
+        request_id = %authorization.request_id,
+        decision_id = %authorization.decision_id,
+        policy_id = authorization.policy_id,
+        policy_version = authorization.policy_version,
+        trace_id = authorization.trace_id.as_deref().unwrap_or_default(),
+        principal_class = authorization.principal_class,
+        "authenticated principal at authorization boundary"
+    );
+    request.extensions_mut().insert(authorization.clone());
     request.extensions_mut().insert(TenantContext {
         tenant_id,
         principal,
     });
 
-    next.run(request).await
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        crate::authz::AUTHORIZATION_DECISION_ID_HEADER.clone(),
+        authorization.decision_header(),
+    );
+    response
 }
 
 pub(crate) async fn resolve_guest_token(
