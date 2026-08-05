@@ -92,6 +92,10 @@ pub(crate) async fn log_mutation_rejections(request: Request, next: Next) -> Res
         .extensions()
         .get::<AuthorizationContext>()
         .map(|context| context.decision_id.clone());
+    let authorization_fingerprint = request
+        .extensions()
+        .get::<AuthorizationContext>()
+        .map(|context| context.authorization_fingerprint.clone());
 
     let started = Instant::now();
     let response = next.run(request).await;
@@ -110,6 +114,7 @@ pub(crate) async fn log_mutation_rejections(request: Request, next: Next) -> Res
         detail = rejection.detail.as_deref().unwrap_or(""),
         tenant = tenant.as_deref().unwrap_or(UNKNOWN_TENANT),
         authorization_decision_id = authorization_decision_id.as_deref().unwrap_or("<none>"),
+        authorization_fingerprint = authorization_fingerprint.as_deref().unwrap_or("<none>"),
         latency_ms,
         "mutation rejected"
     );
