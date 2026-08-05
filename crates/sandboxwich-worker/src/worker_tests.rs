@@ -1658,6 +1658,18 @@ fn full_resident_supervisor_excludes_only_resident_claims() {
 }
 
 #[test]
+fn provision_fast_lane_claims_only_resident_processes() {
+    assert_eq!(
+        claim_kinds_during_provision(ProviderModeArg::Apply),
+        Some(vec![JobKind::RunResidentProcess])
+    );
+    assert_eq!(
+        claim_kinds_during_provision(ProviderModeArg::DryRun),
+        Some(Vec::new())
+    );
+}
+
+#[test]
 fn capabilities_from_args_report_only_the_typed_isolation_profile() {
     let gvisor = capabilities_from_args(
         Vec::new(),
