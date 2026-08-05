@@ -1,5 +1,6 @@
 use crate::db::Database;
 use crate::error::ApiError;
+use crate::error::provider_error_fields;
 use crate::handlers::commands::command_id_from_job;
 use crate::handlers::files::delete_sandbox_file_if_present_on_connection;
 use crate::handlers::jobs::{fetch_job, file_id_from_job, job_references};
@@ -75,10 +76,11 @@ pub(crate) fn operation_from_job(job: &Job) -> Result<Operation, ApiError> {
         }),
         created_at: job.created_at,
         updated_at: job.updated_at,
-        error_code: job
-            .last_error
-            .as_ref()
-            .map(|_| "operation_failed".to_string()),
+        error_code: job.last_error.as_deref().map(|error| {
+            provider_error_fields(error)
+                .1
+                .unwrap_or_else(|| "operation_failed".to_string())
+        }),
         error_message: job.last_error.clone(),
     })
 }

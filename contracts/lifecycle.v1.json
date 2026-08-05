@@ -1,0 +1,121 @@
+{
+  "schema": "sandboxwich.lifecycle.v1",
+  "generationAdvance": "confirmed_absence_only",
+  "unknownOutcomeDisposition": "terminal_same_generation",
+  "sandboxStates": [
+    {
+      "state": "planning",
+      "disposition": "pending"
+    },
+    {
+      "state": "provisioning",
+      "disposition": "pending"
+    },
+    {
+      "state": "ready",
+      "disposition": "active"
+    },
+    {
+      "state": "running",
+      "disposition": "active"
+    },
+    {
+      "state": "idle",
+      "disposition": "active"
+    },
+    {
+      "state": "archiving",
+      "disposition": "terminal"
+    },
+    {
+      "state": "archived",
+      "disposition": "terminal"
+    },
+    {
+      "state": "error",
+      "disposition": "terminal"
+    }
+  ],
+  "outcomes": [
+    {
+      "code": "provider_transient",
+      "disposition": "retry_same_generation"
+    },
+    {
+      "code": "kubernetes_provider_transient",
+      "disposition": "retry_same_generation"
+    },
+    {
+      "code": "workspace_capacity_pending",
+      "disposition": "queue_same_generation"
+    },
+    {
+      "code": "resource_observation_missing",
+      "disposition": "retry_same_generation"
+    },
+    {
+      "code": "placement_attestation_pending",
+      "disposition": "retry_same_generation"
+    },
+    {
+      "code": "placement_attestation_not_live",
+      "disposition": "retry_same_generation"
+    },
+    {
+      "code": "resident_materialization_pending",
+      "disposition": "retry_same_generation"
+    },
+    {
+      "code": "resource_contract_conflict",
+      "disposition": "terminal_same_generation"
+    },
+    {
+      "code": "runtime_class_boundary_unverified",
+      "disposition": "terminal_same_generation"
+    },
+    {
+      "code": "kubernetes_policy_denied",
+      "disposition": "terminal_same_generation"
+    },
+    {
+      "code": "kubernetes_contract_invalid",
+      "disposition": "terminal_same_generation"
+    },
+    {
+      "code": "pod_unschedulable",
+      "disposition": "terminal_same_generation"
+    },
+    {
+      "code": "resource_observation_invalid",
+      "disposition": "terminal_same_generation"
+    },
+    {
+      "code": "resource_identity_conflict",
+      "disposition": "terminal_same_generation"
+    },
+    {
+      "code": "resource_identity_missing",
+      "disposition": "terminal_same_generation"
+    },
+    {
+      "code": "placement_attestation_not_found",
+      "disposition": "terminal_same_generation"
+    },
+    {
+      "code": "workspace_capacity_exhausted",
+      "disposition": "terminal_same_generation"
+    },
+    {
+      "code": "identity_exchange_failed",
+      "disposition": "terminal_same_generation"
+    },
+    {
+      "code": "resident_materialization_failed",
+      "disposition": "terminal_same_generation"
+    },
+    {
+      "code": "maestro_workload_stale_generation",
+      "disposition": "terminal_same_generation"
+    }
+  ]
+}

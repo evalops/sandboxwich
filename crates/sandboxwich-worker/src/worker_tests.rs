@@ -2,6 +2,7 @@ use super::*;
 use crate::provider::SandboxTeardownSpec;
 use base64::engine::general_purpose;
 use chrono::Utc;
+use sandboxwich_core::lifecycle_contract::LifecycleReasonCode;
 use sandboxwich_core::{
     ExecutionClass, Job, JobId, JobStatus, MAX_COMMAND_STDIN_BYTES, RuntimeResourceKind,
     RuntimeResourcePurpose, SandboxId, SnapshotId,
@@ -396,7 +397,7 @@ fn provisioning_report_targets_the_lease_and_uses_its_attempt() {
 fn provider_errors_expose_typed_retry_class_and_reason_code() {
     let error = ProviderError::classified(
         sandboxwich_core::ProvisioningErrorClass::RetryableCapacity,
-        "workspace_capacity_pending",
+        LifecycleReasonCode::WorkspaceCapacityPending,
         anyhow::anyhow!("unbound immediate PersistentVolumeClaims"),
     );
 
@@ -451,7 +452,7 @@ impl SandboxProvider for FailingStagedProvider {
         })?;
         Err(anyhow::Error::new(ProviderError::classified(
             sandboxwich_core::ProvisioningErrorClass::RetryableCapacity,
-            "workspace_capacity_pending",
+            LifecycleReasonCode::WorkspaceCapacityPending,
             anyhow::anyhow!("volume remains unbound"),
         )))
     }
