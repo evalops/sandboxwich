@@ -550,7 +550,11 @@ pub(crate) async fn put_resident_process(
                 "maestro-hosted-runner requires the fixed mTLS entrypoint",
             ));
         }
-        const ALLOWED_ENV: &[&str] = &[
+        // Required WI bindings (fixed paths/URLs). Optional managed-gateway
+        // keys are injected by platform runner-host (evalops/ BYOK via
+        // llm-gateway). Without the optional set, platform#5717 resident put
+        // is rejected with this 400 after the full guest ready wait.
+        const REQUIRED_ENV: &[&str] = &[
             "MAESTRO_KUBERNETES_TOKEN_FILE",
             "MAESTRO_IDENTITY_EXCHANGE_URL",
             "MAESTRO_IDENTITY_TLS_CA_FILE",
@@ -559,34 +563,61 @@ pub(crate) async fn put_resident_process(
             "MAESTRO_SANDBOX_ID",
             "MAESTRO_RUNNER_SESSION_ID",
         ];
-        if request.env.len() != ALLOWED_ENV.len()
-            || request.env.iter().any(|(key, value)| {
-                !ALLOWED_ENV.contains(&key.as_str())
-                    || value.is_empty()
-                    || value.len() > 512
-                    || value.chars().any(char::is_control)
-            })
-            || request
+        // Platform-managed EvalOps llm-gateway routing (and dual-name aliases
+        // Maestro also reads). Tokens may be short-lived JWTs > 512 bytes.
+        const OPTIONAL_GATEWAY_ENV: &[&str] = &[
+            "MAESTRO_EVALOPS_ACCESS_TOKEN",
+            "MAESTRO_EVALOPS_BASE_URL",
+            "MAESTRO_EVALOPS_ORG_ID",
+            "MAESTRO_EVALOPS_WORKSPACE_ID",
+            "MAESTRO_EVALOPS_PROVIDER",
+            "MAESTRO_EVALOPS_ENVIRONMENT",
+            "MAESTRO_EVALOPS_CREDENTIAL_NAME",
+            "MAESTRO_DEFAULT_MODEL",
+            "MAESTRO_LLM_GATEWAY_TOKEN",
+            "MAESTRO_LLM_GATEWAY_URL",
+            "MAESTRO_LLM_GATEWAY_ORG_ID",
+        ];
+        const TOKEN_ENV: &[&str] = &[
+            "MAESTRO_EVALOPS_ACCESS_TOKEN",
+            "MAESTRO_LLM_GATEWAY_TOKEN",
+        ];
+        const MAX_ENV_VALUE_BYTES: usize = 512;
+        const MAX_TOKEN_ENV_VALUE_BYTES: usize = 8_192;
+        let env_ok = request.env.iter().all(|(key, value)| {
+            let allowed = REQUIRED_ENV.contains(&key.as_str())
+                || OPTIONAL_GATEWAY_ENV.contains(&key.as_str());
+            let max_len = if TOKEN_ENV.contains(&key.as_str()) {
+                MAX_TOKEN_ENV_VALUE_BYTES
+            } else {
+                MAX_ENV_VALUE_BYTES
+            };
+            allowed
+                && !value.is_empty()
+                && value.len() <= max_len
+                && !value.chars().any(char::is_control)
+        }) && REQUIRED_ENV.iter().all(|key| request.env.contains_key(*key))
+            && request
                 .env
                 .get("MAESTRO_KUBERNETES_TOKEN_FILE")
                 .map(String::as_str)
-                != Some(MAESTRO_HOSTED_RUNNER_TOKEN_FILE)
-            || request
+                == Some(MAESTRO_HOSTED_RUNNER_TOKEN_FILE)
+            && request
                 .env
                 .get("MAESTRO_IDENTITY_EXCHANGE_URL")
                 .map(String::as_str)
-                != Some(MAESTRO_HOSTED_RUNNER_IDENTITY_EXCHANGE_URL)
-            || request
+                == Some(MAESTRO_HOSTED_RUNNER_IDENTITY_EXCHANGE_URL)
+            && request
                 .env
                 .get("MAESTRO_IDENTITY_TLS_CA_FILE")
                 .map(String::as_str)
-                != Some(MAESTRO_HOSTED_RUNNER_IDENTITY_CA_FILE)
-            || request
+                == Some(MAESTRO_HOSTED_RUNNER_IDENTITY_CA_FILE)
+            && request
                 .env
                 .get("MAESTRO_SANDBOX_ID")
                 .and_then(|value| Uuid::parse_str(value).ok())
-                != Some(sandbox_id)
-        {
+                == Some(sandbox_id);
+        if !env_ok {
             return Err(ApiError::bad_request(
                 "maestro-hosted-runner requires exact bounded workload identity bindings",
             ));

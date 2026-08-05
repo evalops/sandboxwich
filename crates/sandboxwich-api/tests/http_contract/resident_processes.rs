@@ -433,12 +433,70 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
         .unwrap();
     assert_eq!(redirected.status(), reqwest::StatusCode::BAD_REQUEST);
 
+    // Unknown ambient credentials stay rejected.
+    let mut unknown_env = request.clone();
+    unknown_env
+        .env
+        .insert("MAESTRO_OPENAI_API_KEY".into(), "sk-attacker".into());
+    let unknown = client
+        .put(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url
+        ))
+        .json(&unknown_env)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Platform runner-host injects managed EvalOps gateway routing on top of
+    // the fixed WI bindings. Tokens are short-lived JWTs that often exceed the
+    // 512-byte cap used for ordinary env values.
+    let mut with_gateway = request.clone();
+    let long_token = format!("eyJ.{}", "a".repeat(700));
+    with_gateway.env.insert(
+        "MAESTRO_EVALOPS_ACCESS_TOKEN".into(),
+        long_token.clone(),
+    );
+    with_gateway
+        .env
+        .insert("MAESTRO_LLM_GATEWAY_TOKEN".into(), long_token);
+    with_gateway.env.insert(
+        "MAESTRO_EVALOPS_BASE_URL".into(),
+        "http://llm-gateway-service.evalops.svc.cluster.local:8080/v1".into(),
+    );
+    with_gateway
+        .env
+        .insert("MAESTRO_EVALOPS_ORG_ID".into(), organization_id.into());
+    with_gateway
+        .env
+        .insert("MAESTRO_EVALOPS_WORKSPACE_ID".into(), workspace_id.into());
+    with_gateway
+        .env
+        .insert("MAESTRO_EVALOPS_PROVIDER".into(), "openrouter".into());
+    with_gateway
+        .env
+        .insert("MAESTRO_EVALOPS_ENVIRONMENT".into(), "production".into());
+    with_gateway
+        .env
+        .insert("MAESTRO_EVALOPS_CREDENTIAL_NAME".into(), "dex".into());
+    with_gateway
+        .env
+        .insert("MAESTRO_DEFAULT_MODEL".into(), "evalops/gpt-5.5".into());
+    with_gateway.env.insert(
+        "MAESTRO_LLM_GATEWAY_URL".into(),
+        "http://llm-gateway-service.evalops.svc.cluster.local:8080/v1".into(),
+    );
+    with_gateway
+        .env
+        .insert("MAESTRO_LLM_GATEWAY_ORG_ID".into(), organization_id.into());
+
     let created: ResidentProcessResponse = client
         .put(format!(
             "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
             server.base_url
         ))
-        .json(&request)
+        .json(&with_gateway)
         .send()
         .await
         .unwrap()
