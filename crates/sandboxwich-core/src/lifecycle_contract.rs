@@ -8,7 +8,7 @@ pub const LIFECYCLE_CONTRACT_ENV: &str = "SANDBOXWICH_LIFECYCLE_CONTRACT_SHA256"
 pub const LIFECYCLE_SUPPORTED_CONTRACTS_ENV: &str =
     "SANDBOXWICH_SUPPORTED_LIFECYCLE_CONTRACT_SHA256";
 pub const LIFECYCLE_CONTRACT_SHA256: &str =
-    "839f24fff7a57cf997b0fc6a4064b1dcd0208a045c617dbefe1940562a477f35";
+    "38e04b718baeb4f0da9b18ae3d7ee9aa118c1da2d527a4eb45583cbb9b2c2d25";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -267,12 +267,87 @@ pub const SANDBOX_STATES: &[SandboxStateContract] = &[
     },
 ];
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerationAuthorityContract {
+    pub placement_generation: &'static str,
+    pub resident_expected_generation: &'static str,
+}
+
+pub const GENERATION_AUTHORITY: GenerationAuthorityContract = GenerationAuthorityContract {
+    placement_generation: "sandboxwich_injected_after_authoritative_placement_lookup",
+    resident_expected_generation: "zero_on_create_current_on_exact_replay",
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaestroHostedRunnerActivationContract {
+    pub event: &'static str,
+    pub authority: &'static str,
+    pub tenant_scope: &'static str,
+    pub replay: &'static str,
+    pub mismatch_disposition: &'static str,
+    pub resident_observation: &'static str,
+    pub live_validation: &'static str,
+    pub invalidations: &'static [&'static str],
+    pub non_authorities: &'static [&'static str],
+    pub required_binding_fields: &'static [&'static str],
+}
+
+pub const MAESTRO_HOSTED_RUNNER_ACTIVATION: MaestroHostedRunnerActivationContract =
+    MaestroHostedRunnerActivationContract {
+        event: "maestro_hosted_runner_activated.v1",
+        authority: "authenticated_reverse_callback_validated_against_live_connection_binding",
+        tenant_scope: "authenticated_sandboxwich_tenant_context",
+        replay: "exact_tuple_idempotent",
+        mismatch_disposition: "fail_closed_inactive",
+        resident_observation: "publishes_process_and_pod_identity_only_not_activation",
+        live_validation: "fresh_connection_binding_required_at_acceptance",
+        invalidations: &[
+            "tuple_mismatch",
+            "stale_generation",
+            "expired_lease",
+            "replayed_distinct_tuple",
+        ],
+        non_authorities: &[
+            "sandbox_ready",
+            "pod_running",
+            "pod_ready",
+            "resident_starting_observation",
+            "resident_running_observation",
+            "service_exists",
+            "inbound_listener_probe",
+            "connection_binding_available",
+        ],
+        required_binding_fields: &[
+            "organizationId",
+            "workspaceId",
+            "sandboxId",
+            "residentProcessGeneration",
+            "podUid",
+            "placementGeneration",
+            "runnerSessionId",
+            "leaseId",
+            "leaseAttempt",
+            "leaseExpiresAtEpochSeconds",
+            "runtimeImage",
+            "serviceNamespace",
+            "serviceName",
+            "serviceHost",
+            "servicePort",
+            "expectedServerUriSan",
+            "workerId",
+        ],
+    };
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LifecycleContract {
     pub schema: &'static str,
     pub generation_advance: &'static str,
+    pub generation_authority: GenerationAuthorityContract,
     pub unknown_outcome_disposition: LifecycleDisposition,
+    pub maestro_hosted_runner_activation: MaestroHostedRunnerActivationContract,
     pub sandbox_states: &'static [SandboxStateContract],
     pub outcomes: &'static [LifecycleOutcome],
 }
@@ -281,7 +356,9 @@ pub const fn lifecycle_contract() -> LifecycleContract {
     LifecycleContract {
         schema: LIFECYCLE_CONTRACT_SCHEMA,
         generation_advance: "confirmed_absence_only",
+        generation_authority: GENERATION_AUTHORITY,
         unknown_outcome_disposition: LifecycleDisposition::TerminalSameGeneration,
+        maestro_hosted_runner_activation: MAESTRO_HOSTED_RUNNER_ACTIVATION,
         sandbox_states: SANDBOX_STATES,
         outcomes: LIFECYCLE_OUTCOMES,
     }
@@ -354,6 +431,84 @@ mod tests {
                 .copied()
                 .collect::<BTreeSet<_>>(),
             "the lifecycle artifact must classify every typed sandbox state"
+        );
+    }
+
+    #[test]
+    fn lifecycle_contract_exports_reverse_activation_authority_and_exact_fence() {
+        let contract = lifecycle_contract();
+        let activation = contract.maestro_hosted_runner_activation;
+
+        assert_eq!(activation.event, "maestro_hosted_runner_activated.v1");
+        assert_eq!(
+            activation.authority,
+            "authenticated_reverse_callback_validated_against_live_connection_binding"
+        );
+        assert_eq!(
+            activation.tenant_scope,
+            "authenticated_sandboxwich_tenant_context"
+        );
+        assert_eq!(activation.replay, "exact_tuple_idempotent");
+        assert_eq!(activation.mismatch_disposition, "fail_closed_inactive");
+        assert_eq!(
+            activation.resident_observation,
+            "publishes_process_and_pod_identity_only_not_activation"
+        );
+        assert_eq!(
+            activation.live_validation,
+            "fresh_connection_binding_required_at_acceptance"
+        );
+        assert_eq!(
+            activation.invalidations,
+            [
+                "tuple_mismatch",
+                "stale_generation",
+                "expired_lease",
+                "replayed_distinct_tuple",
+            ]
+        );
+        assert_eq!(
+            activation.non_authorities,
+            [
+                "sandbox_ready",
+                "pod_running",
+                "pod_ready",
+                "resident_starting_observation",
+                "resident_running_observation",
+                "service_exists",
+                "inbound_listener_probe",
+                "connection_binding_available",
+            ]
+        );
+        assert_eq!(
+            activation.required_binding_fields,
+            [
+                "organizationId",
+                "workspaceId",
+                "sandboxId",
+                "residentProcessGeneration",
+                "podUid",
+                "placementGeneration",
+                "runnerSessionId",
+                "leaseId",
+                "leaseAttempt",
+                "leaseExpiresAtEpochSeconds",
+                "runtimeImage",
+                "serviceNamespace",
+                "serviceName",
+                "serviceHost",
+                "servicePort",
+                "expectedServerUriSan",
+                "workerId",
+            ]
+        );
+        assert_eq!(
+            contract.generation_authority.placement_generation,
+            "sandboxwich_injected_after_authoritative_placement_lookup"
+        );
+        assert_eq!(
+            contract.generation_authority.resident_expected_generation,
+            "zero_on_create_current_on_exact_replay"
         );
     }
 

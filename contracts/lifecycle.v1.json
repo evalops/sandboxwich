@@ -1,7 +1,55 @@
 {
   "schema": "sandboxwich.lifecycle.v1",
   "generationAdvance": "confirmed_absence_only",
+  "generationAuthority": {
+    "placementGeneration": "sandboxwich_injected_after_authoritative_placement_lookup",
+    "residentExpectedGeneration": "zero_on_create_current_on_exact_replay"
+  },
   "unknownOutcomeDisposition": "terminal_same_generation",
+  "maestroHostedRunnerActivation": {
+    "event": "maestro_hosted_runner_activated.v1",
+    "authority": "authenticated_reverse_callback_validated_against_live_connection_binding",
+    "tenantScope": "authenticated_sandboxwich_tenant_context",
+    "replay": "exact_tuple_idempotent",
+    "mismatchDisposition": "fail_closed_inactive",
+    "residentObservation": "publishes_process_and_pod_identity_only_not_activation",
+    "liveValidation": "fresh_connection_binding_required_at_acceptance",
+    "invalidations": [
+      "tuple_mismatch",
+      "stale_generation",
+      "expired_lease",
+      "replayed_distinct_tuple"
+    ],
+    "nonAuthorities": [
+      "sandbox_ready",
+      "pod_running",
+      "pod_ready",
+      "resident_starting_observation",
+      "resident_running_observation",
+      "service_exists",
+      "inbound_listener_probe",
+      "connection_binding_available"
+    ],
+    "requiredBindingFields": [
+      "organizationId",
+      "workspaceId",
+      "sandboxId",
+      "residentProcessGeneration",
+      "podUid",
+      "placementGeneration",
+      "runnerSessionId",
+      "leaseId",
+      "leaseAttempt",
+      "leaseExpiresAtEpochSeconds",
+      "runtimeImage",
+      "serviceNamespace",
+      "serviceName",
+      "serviceHost",
+      "servicePort",
+      "expectedServerUriSan",
+      "workerId"
+    ]
+  },
   "sandboxStates": [
     {
       "state": "planning",
