@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+## 0.1.13 - 2026-08-05
+### Fixed
+
+- *(worker)* Secure Maestro gateway bootstrap
+- *(lifecycle)* Publish one sandbox runtime contract
+- *(api)* Fence Maestro resident model cohort
+- *(api)* Accept current Maestro resident contract ([#303](https://github.com/evalops/sandboxwich/pull/303))
+- *(api)* Cast postgres metrics aggregates to bigint
+- *(api)* Enforce Maestro bootstrap boundary
+- *(api)* Admit managed EvalOps gateway env on Maestro residents
+- *(metrics)* Widen SLO rollup counters
+- *(worker)* Retain resident lease through capacity pressure
+- *(worker)* Allow Maestro residents egress to llm-gateway
+
+### Other
+
+- Expose typed resident materialization failures
+- Update Cargo.lock dependencies
+- Merge branch 'main' into fix/maestro-resident-contract-trace-codes
+- *(maestro)* Overlap binding with resident startup
+- Merge branch 'main' into agent/maestro-runtime-bootstrap-boundary
+- Rustfmt allowlist fix
+- *(worker)* Run residents beside sandbox provision
+- *(worker)* Poll resident observations every 50ms ([#302](https://github.com/evalops/sandboxwich/pull/302))
+
 ## 0.1.12 - 2026-08-05
 ### Fixed
 
