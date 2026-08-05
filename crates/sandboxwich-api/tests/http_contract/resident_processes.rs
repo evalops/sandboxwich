@@ -437,6 +437,95 @@ async fn maestro_hosted_runner_missing_bootstrap_returns_typed_code() {
 }
 
 #[tokio::test]
+async fn maestro_hosted_runner_rejects_drifted_model_cohort() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("maestro-model-cohort.db").display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let client = server.client();
+    let sandbox: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
+            name: Some("maestro-model-cohort".into()),
+            template: Some("ubuntu-dev".into()),
+            memory_limit: None,
+            network_egress: Some(NetworkEgress::DenyAll),
+            workspace_mode: Some(WorkspaceMode::Persistent),
+            runtime_profile: None,
+            execution_class: None,
+            ttl_seconds: Some(3600),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sandbox_id = sandbox.sandbox.id;
+    let endpoint = format!(
+        "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+        server.base_url
+    );
+    let request = maestro_hosted_runner_request(sandbox_id, "workspace-1", "runner-session-1");
+
+    let mut wrong_revision = request.clone();
+    wrong_revision.env.insert(
+        "MAESTRO_RESIDENT_CONTRACT_REVISION".into(),
+        "maestro-resident-model-ready-v3".into(),
+    );
+    let response = client
+        .put(&endpoint)
+        .json(&wrong_revision)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let error: ErrorEnvelope = response.json().await.unwrap();
+    assert_eq!(error.code, "maestro_env_bindings_invalid");
+
+    let mut mismatched_model = request.clone();
+    mismatched_model
+        .env
+        .insert("MAESTRO_MODEL".into(), "evalops/gpt-5.6".into());
+    let response = client
+        .put(&endpoint)
+        .json(&mismatched_model)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let error: ErrorEnvelope = response.json().await.unwrap();
+    assert_eq!(error.code, "maestro_env_bindings_invalid");
+
+    let mut unqualified_model = request;
+    unqualified_model
+        .env
+        .insert("MAESTRO_MODEL".into(), "gpt-5.5".into());
+    unqualified_model
+        .env
+        .insert("MAESTRO_DEFAULT_MODEL".into(), "gpt-5.5".into());
+    let response = client
+        .put(&endpoint)
+        .json(&unqualified_model)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let error: ErrorEnvelope = response.json().await.unwrap();
+    assert_eq!(error.code, "maestro_env_bindings_invalid");
+}
+
+#[tokio::test]
 async fn maestro_hosted_runner_reports_pending_placement_before_dispatch() {
     let data_dir = tempfile::tempdir().unwrap();
     let server = TestServer::start(
