@@ -582,9 +582,9 @@ pub(crate) async fn put_resident_process(
             "MAESTRO_LLM_GATEWAY_ORG_ID",
         ];
         // Platform-managed EvalOps llm-gateway routing (and dual-name aliases
-        // Maestro also reads). Tokens may be short-lived JWTs > 512 bytes.
-        const OPTIONAL_GATEWAY_ENV: &[&str] = &[
-            "MAESTRO_EVALOPS_ACCESS_TOKEN",
+        // Maestro also reads). The short-lived bearer is delivered through
+        // the fixed bootstrap file, never through resident environment state.
+        const MANAGED_GATEWAY_ENV: &[&str] = &[
             "MAESTRO_EVALOPS_BASE_URL",
             "MAESTRO_EVALOPS_ORG_ID",
             "MAESTRO_EVALOPS_WORKSPACE_ID",
@@ -592,24 +592,16 @@ pub(crate) async fn put_resident_process(
             "MAESTRO_EVALOPS_ENVIRONMENT",
             "MAESTRO_EVALOPS_CREDENTIAL_NAME",
             "MAESTRO_DEFAULT_MODEL",
-            "MAESTRO_LLM_GATEWAY_TOKEN",
             "MAESTRO_LLM_GATEWAY_URL",
             "MAESTRO_LLM_GATEWAY_ORG_ID",
         ];
-        const TOKEN_ENV: &[&str] = &["MAESTRO_EVALOPS_ACCESS_TOKEN", "MAESTRO_LLM_GATEWAY_TOKEN"];
         const MAX_ENV_VALUE_BYTES: usize = 512;
-        const MAX_TOKEN_ENV_VALUE_BYTES: usize = 8_192;
         let env_ok = request.env.iter().all(|(key, value)| {
-            let allowed = REQUIRED_ENV.contains(&key.as_str())
-                || OPTIONAL_GATEWAY_ENV.contains(&key.as_str());
-            let max_len = if TOKEN_ENV.contains(&key.as_str()) {
-                MAX_TOKEN_ENV_VALUE_BYTES
-            } else {
-                MAX_ENV_VALUE_BYTES
-            };
+            let allowed =
+                REQUIRED_ENV.contains(&key.as_str()) || MANAGED_GATEWAY_ENV.contains(&key.as_str());
             allowed
                 && !value.is_empty()
-                && value.len() <= max_len
+                && value.len() <= MAX_ENV_VALUE_BYTES
                 && !value.chars().any(char::is_control)
         }) && REQUIRED_ENV
             .iter()
@@ -633,8 +625,10 @@ pub(crate) async fn put_resident_process(
                 .env
                 .get("MAESTRO_EVALOPS_ACCESS_TOKEN_FILE")
                 .map(String::as_str)
-                != Some(MAESTRO_HOSTED_RUNNER_GATEWAY_TOKEN_FILE)
-            || request
+                == Some(MAESTRO_HOSTED_RUNNER_GATEWAY_TOKEN_FILE)
+            && !request.env.contains_key("MAESTRO_EVALOPS_ACCESS_TOKEN")
+            && !request.env.contains_key("MAESTRO_LLM_GATEWAY_TOKEN")
+            && request
                 .env
                 .get("MAESTRO_SANDBOX_ID")
                 .and_then(|value| Uuid::parse_str(value).ok())

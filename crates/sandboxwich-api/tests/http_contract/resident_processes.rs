@@ -269,10 +269,33 @@ fn maestro_hosted_runner_request_for_organization(
             ("MAESTRO_WORKSPACE_ID".into(), workspace_id.into()),
             ("MAESTRO_SANDBOX_ID".into(), sandbox_id.to_string()),
             ("MAESTRO_RUNNER_SESSION_ID".into(), runner_session_id.into()),
+            (
+                "MAESTRO_EVALOPS_ACCESS_TOKEN_FILE".into(),
+                MAESTRO_HOSTED_RUNNER_GATEWAY_TOKEN_FILE.into(),
+            ),
+            (
+                "MAESTRO_EVALOPS_BASE_URL".into(),
+                MAESTRO_HOSTED_RUNNER_GATEWAY_BASE_URL.into(),
+            ),
+            ("MAESTRO_EVALOPS_ORG_ID".into(), organization_id.into()),
+            ("MAESTRO_EVALOPS_WORKSPACE_ID".into(), workspace_id.into()),
+            ("MAESTRO_EVALOPS_PROVIDER".into(), "openrouter".into()),
+            ("MAESTRO_EVALOPS_ENVIRONMENT".into(), "production".into()),
+            ("MAESTRO_EVALOPS_CREDENTIAL_NAME".into(), "dex".into()),
+            ("MAESTRO_DEFAULT_MODEL".into(), "evalops/gpt-5.5".into()),
+            (
+                "MAESTRO_LLM_GATEWAY_URL".into(),
+                MAESTRO_HOSTED_RUNNER_GATEWAY_BASE_URL.into(),
+            ),
+            ("MAESTRO_LLM_GATEWAY_ORG_ID".into(), organization_id.into()),
         ]),
         restart_policy: ResidentProcessRestartPolicy::OnFailure,
         expected_generation: 0,
-        bootstrap: None,
+        bootstrap: Some(ResidentProcessBootstrap {
+            content: b"managed-gateway-token".to_vec(),
+            target_file: MAESTRO_HOSTED_RUNNER_GATEWAY_TOKEN_FILE.into(),
+            mode: 0o400,
+        }),
     }
 }
 
@@ -311,6 +334,23 @@ async fn maestro_hosted_runner_rejects_ephemeral_workspace_before_dispatch() {
         .json()
         .await
         .unwrap();
+    let mut incomplete =
+        maestro_hosted_runner_request(sandbox.sandbox.id, "workspace-1", "runner-session-1");
+    incomplete.env.remove("MAESTRO_EVALOPS_BASE_URL");
+    let incomplete_response = client
+        .put(format!(
+            "{}/sandboxes/{}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&incomplete)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        incomplete_response.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+
     let response = client
         .put(format!(
             "{}/sandboxes/{}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
@@ -449,46 +489,34 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
         .unwrap();
     assert_eq!(unknown.status(), reqwest::StatusCode::BAD_REQUEST);
 
+    // A tenant-scoped gateway bearer must stay in the fixed bootstrap file,
+    // never in persisted resident environment state.
+    let mut raw_token_env = request.clone();
+    raw_token_env
+        .env
+        .insert("MAESTRO_EVALOPS_ACCESS_TOKEN".into(), "sk-attacker".into());
+    let raw_token = client
+        .put(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url
+        ))
+        .json(&raw_token_env)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(raw_token.status(), reqwest::StatusCode::BAD_REQUEST);
+
     // Platform runner-host injects managed EvalOps gateway routing on top of
     // the fixed WI bindings. Tokens are short-lived JWTs that often exceed the
-    // 512-byte cap used for ordinary env values.
+    // 512-byte cap used for ordinary env values, so the bootstrap file carries
+    // the token instead.
     let mut with_gateway = request.clone();
     let long_token = format!("eyJ.{}", "a".repeat(700));
-    with_gateway
-        .env
-        .insert("MAESTRO_EVALOPS_ACCESS_TOKEN".into(), long_token.clone());
-    with_gateway
-        .env
-        .insert("MAESTRO_LLM_GATEWAY_TOKEN".into(), long_token);
-    with_gateway.env.insert(
-        "MAESTRO_EVALOPS_BASE_URL".into(),
-        "http://llm-gateway-service.evalops.svc.cluster.local:8080/v1".into(),
-    );
-    with_gateway
-        .env
-        .insert("MAESTRO_EVALOPS_ORG_ID".into(), organization_id.into());
-    with_gateway
-        .env
-        .insert("MAESTRO_EVALOPS_WORKSPACE_ID".into(), workspace_id.into());
-    with_gateway
-        .env
-        .insert("MAESTRO_EVALOPS_PROVIDER".into(), "openrouter".into());
-    with_gateway
-        .env
-        .insert("MAESTRO_EVALOPS_ENVIRONMENT".into(), "production".into());
-    with_gateway
-        .env
-        .insert("MAESTRO_EVALOPS_CREDENTIAL_NAME".into(), "dex".into());
-    with_gateway
-        .env
-        .insert("MAESTRO_DEFAULT_MODEL".into(), "evalops/gpt-5.5".into());
-    with_gateway.env.insert(
-        "MAESTRO_LLM_GATEWAY_URL".into(),
-        "http://llm-gateway-service.evalops.svc.cluster.local:8080/v1".into(),
-    );
-    with_gateway
-        .env
-        .insert("MAESTRO_LLM_GATEWAY_ORG_ID".into(), organization_id.into());
+    with_gateway.bootstrap = Some(ResidentProcessBootstrap {
+        content: long_token.into_bytes(),
+        target_file: MAESTRO_HOSTED_RUNNER_GATEWAY_TOKEN_FILE.into(),
+        mode: 0o400,
+    });
 
     let created: ResidentProcessResponse = client
         .put(format!(
@@ -504,7 +532,7 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
         .json()
         .await
         .unwrap();
-    assert!(created.resident_process.bootstrap_sha256.is_none());
+    assert!(created.resident_process.bootstrap_sha256.is_some());
     assert_eq!(
         created.resident_process.cwd.as_deref(),
         Some(MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT)
