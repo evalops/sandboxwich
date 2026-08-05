@@ -1775,6 +1775,12 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// `expires_at`/`leased_at` pair is somehow non-positive.
 const FALLBACK_LEASE_DURATION: Duration = Duration::from_secs(30);
 const MAX_RESIDENT_PROCESS_ATTEMPTS: u32 = 3;
+// A provider-isolated resident bootstrap is delivered once under the active
+// lease fence. After that delivery the API must not requeue the job under a
+// different lease, because doing so would make the bootstrap replayable. Keep
+// transient capacity failures inside the original, continuously renewed lease
+// long enough for bounded Kubernetes capacity pressure to clear instead.
+const MAX_RESIDENT_PROVIDER_ATTEMPTS: u32 = 30;
 // Hosted Maestro identity exchange fails closed until observed_state is
 // Starting/Running. Poll observations aggressively so the first validate
 // succeeds as soon as the Pod identity is known.
@@ -4139,7 +4145,44 @@ fn execute_isolated_resident_process_job(
         1
     };
     for attempt in 1..=max_attempts {
-        match provider.run_isolated_resident_process(&spec, cancelled, observe) {
+        let mut provider_attempt = 1;
+        let mut retry_delay = RETRY_BASE_DELAY;
+        let provider_result = loop {
+            match provider.run_isolated_resident_process(&spec, cancelled, observe) {
+                Err(error)
+                    if error
+                        .chain()
+                        .find_map(|cause| cause.downcast_ref::<ProviderError>())
+                        .is_some_and(|provider_error| {
+                            provider_error.error_class()
+                                == sandboxwich_core::ProvisioningErrorClass::RetryableCapacity
+                        })
+                        && provider_attempt < MAX_RESIDENT_PROVIDER_ATTEMPTS
+                        && !cancelled.is_cancelled() =>
+                {
+                    let provider_error = error
+                        .chain()
+                        .find_map(|cause| cause.downcast_ref::<ProviderError>())
+                        .expect("capacity retry requires a typed provider error");
+                    tracing::warn!(
+                        process_id = %process_id.0,
+                        generation,
+                        lease_id = %lease_id.0,
+                        provider_attempt,
+                        max_provider_attempts = MAX_RESIDENT_PROVIDER_ATTEMPTS,
+                        retry_delay_ms = retry_delay.as_millis() as u64,
+                        error_class = ?provider_error.error_class(),
+                        error_code = provider_error.reason_code(),
+                        "sandboxwich_resident_materialization_retrying"
+                    );
+                    sleep_resident_provider_retry(retry_delay, cancelled);
+                    provider_attempt += 1;
+                    retry_delay = (retry_delay * 2).min(RETRY_MAX_DELAY);
+                }
+                result => break result,
+            }
+        };
+        match provider_result {
             Ok(result) => {
                 let exit_code = result.final_observation.exit_code;
                 if result.final_observation.state == IsolatedResidentProcessState::Failed
@@ -4195,6 +4238,17 @@ fn execute_isolated_resident_process_job(
         }
     }
     unreachable!("resident-process attempt loop always returns")
+}
+
+fn sleep_resident_provider_retry(delay: Duration, cancelled: &CancelSignal) {
+    let deadline = Instant::now() + delay;
+    while !cancelled.is_cancelled() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        std::thread::sleep(remaining.min(RESIDENT_OBSERVATION_RETRY_DELAY));
+    }
 }
 
 fn parse_label(value: &str) -> Result<(String, String), String> {
