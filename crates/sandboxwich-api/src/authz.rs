@@ -15,9 +15,65 @@ use crate::request_id::{REQUEST_ID_HEADER, RequestTrace};
 use crate::state::Principal;
 
 pub(crate) const AUTHORIZATION_POLICY_ID: &str = "sandboxwich-api-authz";
-pub(crate) const AUTHORIZATION_POLICY_VERSION: &str = "v1";
+pub(crate) const AUTHORIZATION_POLICY_VERSION: &str = "v2";
 pub(crate) static AUTHORIZATION_DECISION_ID_HEADER: HeaderName =
     HeaderName::from_static("x-authorization-decision-id");
+
+pub(crate) const AUTHORIZATION_RECEIPT_SCHEMA: &str = "authz_receipt_v2";
+
+pub(crate) static AUTHORIZATION_RECEIPT_ID_HEADER: HeaderName =
+    HeaderName::from_static("x-authorization-receipt-id");
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PrincipalRequirement {
+    TenantOrOperator,
+    Operator,
+    Worker,
+    WorkerOrGuest,
+    Deny,
+}
+
+impl PrincipalRequirement {
+    fn allows(self, principal: Principal) -> bool {
+        matches!(
+            (self, principal),
+            (
+                Self::TenantOrOperator,
+                Principal::Tenant | Principal::Operator
+            ) | (Self::Operator, Principal::Operator)
+                | (Self::Worker, Principal::Worker(_))
+                | (
+                    Self::WorkerOrGuest,
+                    Principal::Worker(_) | Principal::Guest { .. }
+                )
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RoutePolicy {
+    pub(crate) resource_kind: &'static str,
+    pub(crate) action: &'static str,
+    pub(crate) requirement: PrincipalRequirement,
+}
+
+const AUTHORIZATION_POLICY_RULES: &[&str] = &[
+    "operator|operator|/operator/*",
+    "operator|cleanup|/snapshots/cleanup",
+    "worker|heartbeat|/workers/*/heartbeat",
+    "worker|drain|/workers/*/drain",
+    "worker|read|/workers/*/runtime-resource-inventory",
+    "worker|reconcile|/workers/*/runtime-resources/reconcile",
+    "worker|create|/workers/*/sandboxes/*/guest-token",
+    "worker|callback|/workers/*/apex-instruction-callbacks/*",
+    "worker_or_guest|claim|/workers/*/leases/claim",
+    "worker_or_guest|write|/resident-processes/*",
+    "worker_or_guest|write|/leases/*",
+    "worker_or_guest|write|/sandboxes/*/guest-health",
+    "worker_or_guest|refresh|/sandboxes/*/guest-token/refresh",
+    "deny|unknown_worker|/workers/*",
+    "default|tenant_or_operator|*",
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AuthorizationContext {
@@ -28,6 +84,12 @@ pub(crate) struct AuthorizationContext {
     pub(crate) policy_id: &'static str,
     pub(crate) policy_version: &'static str,
     pub(crate) principal_class: &'static str,
+    pub(crate) receipt_id: String,
+    pub(crate) policy_digest: String,
+    pub(crate) resource_kind: &'static str,
+    pub(crate) action: &'static str,
+    pub(crate) decision_reason: &'static str,
+    pub(crate) requirement: PrincipalRequirement,
 }
 
 impl AuthorizationContext {
@@ -66,22 +128,77 @@ impl AuthorizationContext {
         tenant_id: &str,
         principal: Principal,
     ) -> Self {
+        let policy = route_policy(method, path);
+        let policy_digest = authorization_policy_digest();
+        let decision_reason = if policy.requirement.allows(principal) {
+            "allowed"
+        } else {
+            "principal_class_not_allowed"
+        };
+        let decision_id = decision_id(
+            request_id,
+            method,
+            path,
+            tenant_id,
+            principal,
+            &policy,
+            &policy_digest,
+        );
+        let authorization_fingerprint =
+            authorization_fingerprint(method, path, tenant_id, principal, &policy, &policy_digest);
         Self {
             request_id: request_id.to_owned(),
-            decision_id: decision_id(request_id, method, path, tenant_id, principal),
-            authorization_fingerprint: authorization_fingerprint(
-                method, path, tenant_id, principal,
-            ),
+            decision_id: decision_id.clone(),
+            authorization_fingerprint,
             trace_id: trace_id.map(str::to_owned),
             policy_id: AUTHORIZATION_POLICY_ID,
             policy_version: AUTHORIZATION_POLICY_VERSION,
             principal_class: principal_class(principal),
+            receipt_id: receipt_id(&decision_id, &policy_digest),
+            policy_digest,
+            resource_kind: policy.resource_kind,
+            action: policy.action,
+            decision_reason,
+            requirement: policy.requirement,
         }
     }
 
     pub(crate) fn decision_header(&self) -> HeaderValue {
         HeaderValue::from_str(&self.decision_id)
             .expect("authorization decision id is a valid header value")
+    }
+
+    pub(crate) fn receipt_header(&self) -> HeaderValue {
+        HeaderValue::from_str(&self.receipt_id)
+            .expect("authorization receipt id is a valid header value")
+    }
+
+    pub(crate) fn principal_allowed(&self, principal: Principal) -> bool {
+        self.requirement.allows(principal)
+    }
+
+    pub(crate) fn add_to_payload(&self, payload: &mut serde_json::Value) {
+        let serde_json::Value::Object(fields) = payload else {
+            return;
+        };
+        fields.insert(
+            "_authorization".to_string(),
+            serde_json::json!({
+                "schema": AUTHORIZATION_RECEIPT_SCHEMA,
+                "requestId": self.request_id,
+                "decisionId": self.decision_id,
+                "receiptId": self.receipt_id,
+                "fingerprint": self.authorization_fingerprint,
+                "policyId": self.policy_id,
+                "policyVersion": self.policy_version,
+                "policyDigest": self.policy_digest,
+                "resourceKind": self.resource_kind,
+                "action": self.action,
+                "principalClass": self.principal_class,
+                "decision": "allow",
+                "reason": self.decision_reason,
+            }),
+        );
     }
 }
 
@@ -119,20 +236,174 @@ fn update_field(hasher: &mut Sha256, name: &str, value: &str) {
     hasher.update(value.as_bytes());
 }
 
+fn normalized_path(path: &str) -> &str {
+    let path = path.strip_prefix("/v1").unwrap_or(path);
+    if path.is_empty() { "/" } else { path }
+}
+
+pub(crate) fn route_policy(method: &str, path: &str) -> RoutePolicy {
+    let path = normalized_path(path);
+    let requirement = if path == "/workers/register" {
+        PrincipalRequirement::TenantOrOperator
+    } else if path == "/snapshots/cleanup" || path == "/operator" || path.starts_with("/operator/")
+    {
+        PrincipalRequirement::Operator
+    } else if worker_route(path) {
+        PrincipalRequirement::Worker
+    } else if worker_or_guest_route(method, path) {
+        PrincipalRequirement::WorkerOrGuest
+    } else if path.starts_with("/workers/") {
+        PrincipalRequirement::Deny
+    } else {
+        PrincipalRequirement::TenantOrOperator
+    };
+
+    RoutePolicy {
+        resource_kind: resource_kind(path),
+        action: action(method, path),
+        requirement,
+    }
+}
+
+fn worker_route(path: &str) -> bool {
+    path.starts_with("/workers/")
+        && (path.ends_with("/heartbeat")
+            || path.ends_with("/drain")
+            || path.ends_with("/runtime-resource-inventory")
+            || path.ends_with("/runtime-resources/reconcile")
+            || path.ends_with("/guest-token")
+            || path.contains("/apex-instruction-callbacks/"))
+}
+
+fn worker_or_guest_route(method: &str, path: &str) -> bool {
+    (path.starts_with("/workers/") && path.contains("/leases/claim"))
+        || path.starts_with("/resident-processes/")
+        || path.starts_with("/leases/")
+        || (method == "POST"
+            && (path.ends_with("/guest-health") || path.ends_with("/guest-token/refresh")))
+}
+
+fn resource_kind(path: &str) -> &'static str {
+    if path == "/operator" || path.starts_with("/operator/") {
+        "operator"
+    } else if path.contains("/sandboxes") {
+        "sandbox"
+    } else if path.starts_with("/workers") {
+        "worker"
+    } else if path.starts_with("/resident-processes") {
+        "resident_process"
+    } else if path.starts_with("/leases") {
+        "lease"
+    } else if path.starts_with("/snapshots") {
+        "snapshot"
+    } else if path.starts_with("/homes") {
+        "home"
+    } else if path.starts_with("/jobs") {
+        "job"
+    } else if path.starts_with("/operations") {
+        "operation"
+    } else if path.starts_with("/desktop") {
+        "desktop"
+    } else {
+        "platform"
+    }
+}
+
+fn action(method: &str, path: &str) -> &'static str {
+    if path == "/snapshots/cleanup" {
+        "cleanup"
+    } else if path.starts_with("/operator") {
+        "operator"
+    } else if path.ends_with("/stop") {
+        "stop"
+    } else if path.ends_with("/resume") {
+        "resume"
+    } else if path.ends_with("/fork") {
+        "fork"
+    } else if path.ends_with("/heartbeat") {
+        "heartbeat"
+    } else if path.ends_with("/drain") {
+        "drain"
+    } else if path.ends_with("/claim") {
+        "claim"
+    } else if path.ends_with("/refresh") {
+        "refresh"
+    } else if path.ends_with("/renew") {
+        "renew"
+    } else if path.ends_with("/complete") {
+        "complete"
+    } else if path.ends_with("/fail") {
+        "fail"
+    } else if path.ends_with("/reconcile") {
+        "reconcile"
+    } else if path.ends_with("/guest-health") {
+        "health"
+    } else if path.contains("/apex-instruction-callbacks/") {
+        "callback"
+    } else if path.ends_with("/guest-token") {
+        "create_token"
+    } else if path.ends_with("/bootstrap") {
+        "bootstrap"
+    } else if path.ends_with("/observations") {
+        "observe"
+    } else if path.ends_with("/materialization") {
+        "read_materialization"
+    } else if path.ends_with("/provisioning") {
+        "update_provisioning"
+    } else if path.ends_with("/output") {
+        "append_output"
+    } else {
+        match method {
+            "GET" | "HEAD" => "read",
+            "POST" => "create",
+            "PUT" | "PATCH" => "update",
+            "DELETE" => "delete",
+            _ => "unknown",
+        }
+    }
+}
+
+fn requirement_code(requirement: PrincipalRequirement) -> &'static str {
+    match requirement {
+        PrincipalRequirement::TenantOrOperator => "tenant_or_operator",
+        PrincipalRequirement::Operator => "operator",
+        PrincipalRequirement::Worker => "worker",
+        PrincipalRequirement::WorkerOrGuest => "worker_or_guest",
+        PrincipalRequirement::Deny => "deny",
+    }
+}
+
+fn authorization_policy_digest() -> String {
+    let mut hasher = Sha256::new();
+    update_field(&mut hasher, "policy_id", AUTHORIZATION_POLICY_ID);
+    update_field(&mut hasher, "policy_version", AUTHORIZATION_POLICY_VERSION);
+    for rule in AUTHORIZATION_POLICY_RULES {
+        update_field(&mut hasher, "rule", rule);
+    }
+    let digest = hasher.finalize();
+    format!("authz_policy_v1_{}", hex_digest(&digest))
+}
+
 fn decision_id(
     request_id: &str,
     method: &str,
     path: &str,
     tenant_id: &str,
     principal: Principal,
+    policy: &RoutePolicy,
+    policy_digest: &str,
 ) -> String {
     digest_id(
         "authz_decision_v1_",
-        Some(request_id),
-        method,
-        path,
-        tenant_id,
-        principal,
+        DigestMaterial {
+            request_id: Some(request_id),
+            method,
+            path,
+            tenant_id,
+            principal,
+            policy,
+            policy_digest,
+        },
     )
 }
 
@@ -141,30 +412,64 @@ fn authorization_fingerprint(
     path: &str,
     tenant_id: &str,
     principal: Principal,
+    policy: &RoutePolicy,
+    policy_digest: &str,
 ) -> String {
     digest_id(
         "authz_fingerprint_v1_",
-        None,
+        DigestMaterial {
+            request_id: None,
+            method,
+            path,
+            tenant_id,
+            principal,
+            policy,
+            policy_digest,
+        },
+    )
+}
+
+fn receipt_id(decision_id: &str, policy_digest: &str) -> String {
+    let mut hasher = Sha256::new();
+    update_field(&mut hasher, "policy_digest", policy_digest);
+    update_field(&mut hasher, "decision_id", decision_id);
+    let digest = hasher.finalize();
+    format!("authz_receipt_v2_{}", hex_digest(&digest))
+}
+
+struct DigestMaterial<'a> {
+    request_id: Option<&'a str>,
+    method: &'a str,
+    path: &'a str,
+    tenant_id: &'a str,
+    principal: Principal,
+    policy: &'a RoutePolicy,
+    policy_digest: &'a str,
+}
+
+fn digest_id(prefix: &str, material: DigestMaterial<'_>) -> String {
+    let DigestMaterial {
+        request_id,
         method,
         path,
         tenant_id,
         principal,
-    )
-}
-
-fn digest_id(
-    prefix: &str,
-    request_id: Option<&str>,
-    method: &str,
-    path: &str,
-    tenant_id: &str,
-    principal: Principal,
-) -> String {
+        policy,
+        policy_digest,
+    } = material;
     let principal_class = principal_class(principal);
     let principal_binding = principal_binding(principal);
     let mut hasher = Sha256::new();
     update_field(&mut hasher, "policy_id", AUTHORIZATION_POLICY_ID);
     update_field(&mut hasher, "policy_version", AUTHORIZATION_POLICY_VERSION);
+    update_field(&mut hasher, "policy_digest", policy_digest);
+    update_field(&mut hasher, "resource_kind", policy.resource_kind);
+    update_field(&mut hasher, "action", policy.action);
+    update_field(
+        &mut hasher,
+        "requirement",
+        requirement_code(policy.requirement),
+    );
     if let Some(request_id) = request_id {
         update_field(&mut hasher, "request_id", request_id);
     }
@@ -175,11 +480,15 @@ fn digest_id(
     update_field(&mut hasher, "principal_binding", &principal_binding);
 
     let digest = hasher.finalize();
+    format!("{prefix}{}", hex_digest(&digest))
+}
+
+fn hex_digest(digest: &[u8]) -> String {
     let mut encoded = String::with_capacity(digest.len() * 2);
     for byte in digest {
         encoded.push_str(&format!("{byte:02x}"));
     }
-    format!("{prefix}{encoded}")
+    encoded
 }
 
 #[cfg(test)]
@@ -310,5 +619,45 @@ mod tests {
         assert!(!valid_request_id("request\nwith-control"));
         assert!(!valid_request_id(&"x".repeat(257)));
         assert!(valid_request_id("request-1"));
+    }
+    #[test]
+    fn route_policy_matrix_fails_closed_for_unknown_worker_paths() {
+        let heartbeat = route_policy("POST", "/v1/workers/worker-1/heartbeat");
+        let claim = route_policy("POST", "/v1/workers/worker-1/leases/claim");
+        let registration = route_policy("POST", "/v1/workers/register");
+        let operator = route_policy("GET", "/v1/operator/tenant-policies/default");
+        let unknown_worker = route_policy("POST", "/v1/workers/worker-1/unknown");
+
+        assert_eq!(heartbeat.requirement, PrincipalRequirement::Worker);
+        assert_eq!(claim.requirement, PrincipalRequirement::WorkerOrGuest);
+        assert_eq!(
+            registration.requirement,
+            PrincipalRequirement::TenantOrOperator
+        );
+        assert_eq!(operator.requirement, PrincipalRequirement::Operator);
+        assert_eq!(unknown_worker.requirement, PrincipalRequirement::Deny);
+    }
+
+    #[test]
+    fn authorization_receipt_has_versioned_safe_durable_fields() {
+        let context = AuthorizationContext::new(
+            "request-1",
+            None,
+            "POST",
+            "/v1/sandboxes/sandbox-private/stop",
+            "tenant-private",
+            Principal::Tenant,
+        );
+        let mut payload = serde_json::json!({});
+
+        context.add_to_payload(&mut payload);
+
+        assert_eq!(payload["_authorization"]["schema"], "authz_receipt_v2");
+        assert_eq!(payload["_authorization"]["decision"], "allow");
+        assert_eq!(payload["_authorization"]["action"], "stop");
+        assert!(payload["_authorization"]["decisionId"].is_string());
+        assert!(payload["_authorization"]["receiptId"].is_string());
+        assert!(!payload.to_string().contains("tenant-private"));
+        assert!(!payload.to_string().contains("sandbox-private"));
     }
 }

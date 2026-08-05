@@ -125,6 +125,35 @@ pub(crate) async fn auth_and_tenant(
         principal => principal,
     };
     let authorization = AuthorizationContext::from_request(&request, &tenant_id, principal);
+    if !authorization.principal_allowed(principal) {
+        tracing::warn!(
+            target: "sandboxwich.authorization",
+            request_id = %authorization.request_id,
+            decision_id = %authorization.decision_id,
+            receipt_id = %authorization.receipt_id,
+            authorization_fingerprint = %authorization.authorization_fingerprint,
+            policy_digest = %authorization.policy_digest,
+            resource_kind = authorization.resource_kind,
+            action = authorization.action,
+            principal_class = authorization.principal_class,
+            requirement = ?authorization.requirement,
+            reason = authorization.decision_reason,
+            "authorization policy denied principal for route"
+        );
+        let mut response =
+            ApiError::forbidden("authenticated principal is not authorized for this route")
+                .into_response();
+        response.headers_mut().insert(
+            crate::authz::AUTHORIZATION_DECISION_ID_HEADER.clone(),
+            authorization.decision_header(),
+        );
+        response.headers_mut().insert(
+            crate::authz::AUTHORIZATION_RECEIPT_ID_HEADER.clone(),
+            authorization.receipt_header(),
+        );
+        return response;
+    }
+
     let span = tracing::Span::current();
     span.record(
         "authorization_decision_id",
@@ -143,6 +172,20 @@ pub(crate) async fn auth_and_tenant(
     span.record(
         "authorization_trace_id",
         authorization.trace_id.as_deref().unwrap_or_default(),
+    );
+    span.record(
+        "authorization_receipt_id",
+        authorization.receipt_id.as_str(),
+    );
+    span.record(
+        "authorization_policy_digest",
+        authorization.policy_digest.as_str(),
+    );
+    span.record("authorization_resource_kind", authorization.resource_kind);
+    span.record("authorization_action", authorization.action);
+    span.record(
+        "authorization_decision_reason",
+        authorization.decision_reason,
     );
     tracing::debug!(
         target: "sandboxwich.authorization",
@@ -165,6 +208,10 @@ pub(crate) async fn auth_and_tenant(
     response.headers_mut().insert(
         crate::authz::AUTHORIZATION_DECISION_ID_HEADER.clone(),
         authorization.decision_header(),
+    );
+    response.headers_mut().insert(
+        crate::authz::AUTHORIZATION_RECEIPT_ID_HEADER.clone(),
+        authorization.receipt_header(),
     );
     response
 }

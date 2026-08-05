@@ -96,6 +96,26 @@ pub(crate) async fn log_mutation_rejections(request: Request, next: Next) -> Res
         .extensions()
         .get::<AuthorizationContext>()
         .map(|context| context.authorization_fingerprint.clone());
+    let authorization_receipt_id = request
+        .extensions()
+        .get::<AuthorizationContext>()
+        .map(|context| context.receipt_id.clone());
+    let authorization_policy_digest = request
+        .extensions()
+        .get::<AuthorizationContext>()
+        .map(|context| context.policy_digest.clone());
+    let authorization_resource_kind = request
+        .extensions()
+        .get::<AuthorizationContext>()
+        .map(|context| context.resource_kind);
+    let authorization_action = request
+        .extensions()
+        .get::<AuthorizationContext>()
+        .map(|context| context.action);
+    let authorization_decision_reason = request
+        .extensions()
+        .get::<AuthorizationContext>()
+        .map(|context| context.decision_reason);
 
     let started = Instant::now();
     let response = next.run(request).await;
@@ -115,6 +135,11 @@ pub(crate) async fn log_mutation_rejections(request: Request, next: Next) -> Res
         tenant = tenant.as_deref().unwrap_or(UNKNOWN_TENANT),
         authorization_decision_id = authorization_decision_id.as_deref().unwrap_or("<none>"),
         authorization_fingerprint = authorization_fingerprint.as_deref().unwrap_or("<none>"),
+        authorization_receipt_id = authorization_receipt_id.as_deref().unwrap_or("<none>"),
+        authorization_policy_digest = authorization_policy_digest.as_deref().unwrap_or("<none>"),
+        authorization_resource_kind = authorization_resource_kind.unwrap_or("<none>"),
+        authorization_action = authorization_action.unwrap_or("<none>"),
+        authorization_decision_reason = authorization_decision_reason.unwrap_or("<none>"),
         latency_ms,
         "mutation rejected"
     );

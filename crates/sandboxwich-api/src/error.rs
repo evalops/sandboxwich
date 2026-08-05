@@ -79,6 +79,14 @@ impl ApiError {
         }
     }
 
+    pub(crate) fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "authorization_denied",
+            message: message.into(),
+        }
+    }
+
     pub(crate) fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
