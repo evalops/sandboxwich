@@ -445,18 +445,33 @@ pub(crate) async fn get_maestro_connection_binding(
         return Err(not_live("Maestro hosted runner is not running"));
     }
     let observed_state: String = row.try_get("observed_state")?;
-    if observed_state != ResidentProcessObservedState::Running.as_db_str() {
+    // The binding is safe to publish once the provider has reported the
+    // immutable Pod identity. The runner-host can perform the mTLS identity
+    // exchange while the resident is still Starting; transport and runtime
+    // identity readiness remain retryable there. Waiting for Running here
+    // serialized those two startup phases behind the resident's own boot.
+    if !maestro_identity_observation_is_eligible(&observed_state)
+        || observed_state == ResidentProcessObservedState::Starting.as_db_str()
+    {
         let error_class = row
             .try_get::<Option<String>, _>("last_error_class")?
             .map(|value| ProvisioningErrorClass::parse_db_str(&value))
             .transpose()
             .map_err(|error| ApiError::internal(error.to_string()))?;
-        return Err(resident_not_ready_error(
-            &observed_state,
-            error_class,
-            row.try_get("last_error_code")?,
-            row.try_get("last_error")?,
-        ));
+        let error_code: Option<String> = row.try_get("last_error_code")?;
+        let last_error: Option<String> = row.try_get("last_error")?;
+        if !maestro_identity_observation_is_eligible(&observed_state)
+            || error_class.is_some()
+            || error_code.is_some()
+            || last_error.is_some()
+        {
+            return Err(resident_not_ready_error(
+                &observed_state,
+                error_class,
+                error_code,
+                last_error,
+            ));
+        }
     }
     let process_id = ResidentProcessId(parse_uuid(&row.try_get::<String, _>("id")?)?);
     let process_generation = parse_u64(row.try_get("generation")?, "resident generation")?;
