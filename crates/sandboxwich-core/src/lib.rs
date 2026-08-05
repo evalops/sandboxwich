@@ -2510,6 +2510,46 @@ pub struct MaestroHostedRunnerConnectionBindingResponse {
     pub worker_id: WorkerId,
 }
 
+/// Authenticated Maestro rendezvous activation presented by Platform for
+/// validation against Sandboxwich's current resident, placement, and lease
+/// authority. `activation_id` is the idempotency/replay fence; every remaining
+/// field must exactly equal the live connection binding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MaestroHostedRunnerActivationValidationRequest {
+    pub activation_id: Uuid,
+    pub organization_id: String,
+    pub workspace_id: String,
+    pub sandbox_id: SandboxId,
+    pub pod_uid: Uuid,
+    pub placement_generation: u64,
+    pub runner_session_id: String,
+    pub runtime_image: String,
+    pub service_namespace: String,
+    pub service_name: String,
+    pub service_host: String,
+    pub service_port: u16,
+    pub expected_server_uri_san: String,
+    pub resident_process_generation: u64,
+    pub lease_id: Uuid,
+    pub lease_attempt: u64,
+    pub lease_expires_at_epoch_seconds: i64,
+    #[schema(value_type = Uuid)]
+    pub worker_id: WorkerId,
+}
+
+/// Durable point-in-time receipt that Sandboxwich accepted one exact Maestro
+/// activation tuple while its authoritative generation and lease were live.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MaestroHostedRunnerActivationValidationResponse {
+    pub ok: bool,
+    pub activation_id: Uuid,
+    pub tuple_sha256: String,
+    pub validated_at: DateTime<Utc>,
+    pub replayed: bool,
+}
+
 impl fmt::Debug for ResidentProcessRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

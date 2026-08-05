@@ -586,7 +586,7 @@ async fn maestro_hosted_runner_reports_pending_placement_before_dispatch() {
 #[tokio::test]
 async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
     let data_dir = tempfile::tempdir().unwrap();
-    let server = TestServer::start(
+    let mut server = TestServer::start(
         format!(
             "sqlite://{}",
             data_dir.path().join("maestro-workload.db").display()
@@ -711,7 +711,7 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
         Some("1"),
         "Sandboxwich must inject its canonical placement generation"
     );
-    let connection_binding_url = format!(
+    let mut connection_binding_url = format!(
         "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}/connection-binding",
         server.base_url
     );
@@ -794,6 +794,159 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
         starting_connection.pod_uid, pod_uid,
         "the binding becomes available once the provider Pod identity is fenced"
     );
+
+    let mut activation_url = format!(
+        "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}/activations/validate",
+        server.base_url
+    );
+    let activation_id = Uuid::now_v7();
+    let activation = MaestroHostedRunnerActivationValidationRequest {
+        activation_id,
+        organization_id: starting_connection.organization_id.clone(),
+        workspace_id: starting_connection.workspace_id.clone(),
+        sandbox_id: starting_connection.sandbox_id,
+        pod_uid: starting_connection.pod_uid,
+        placement_generation: starting_connection.placement_generation,
+        runner_session_id: starting_connection.runner_session_id.clone(),
+        runtime_image: starting_connection.runtime_image.clone(),
+        service_namespace: starting_connection.service_namespace.clone(),
+        service_name: starting_connection.service_name.clone(),
+        service_host: starting_connection.service_host.clone(),
+        service_port: starting_connection.service_port,
+        expected_server_uri_san: starting_connection.expected_server_uri_san.clone(),
+        resident_process_generation: starting_connection.resident_process_generation,
+        lease_id: starting_connection.lease_id,
+        lease_attempt: starting_connection.lease_attempt,
+        lease_expires_at_epoch_seconds: starting_connection.lease_expires_at_epoch_seconds,
+        worker_id: starting_connection.worker_id,
+    };
+    let proof: MaestroHostedRunnerActivationValidationResponse = client
+        .post(&activation_url)
+        .json(&activation)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(proof.ok);
+    assert_eq!(proof.activation_id, activation_id);
+    assert!(!proof.replayed);
+    assert_eq!(proof.tuple_sha256.len(), 64);
+
+    server.restart(false).await;
+    connection_binding_url = format!(
+        "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}/connection-binding",
+        server.base_url
+    );
+    activation_url = format!(
+        "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}/activations/validate",
+        server.base_url
+    );
+    let replay: MaestroHostedRunnerActivationValidationResponse = client
+        .post(&activation_url)
+        .json(&activation)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        replay.replayed,
+        "an exact retry must return the durable proof"
+    );
+    assert_eq!(replay.tuple_sha256, proof.tuple_sha256);
+
+    let concurrent_id = Uuid::now_v7();
+    let mut concurrent = activation.clone();
+    concurrent.activation_id = concurrent_id;
+    let left = client.post(&activation_url).json(&concurrent).send();
+    let right = client.post(&activation_url).json(&concurrent).send();
+    let (left, right) = tokio::join!(left, right);
+    let left: MaestroHostedRunnerActivationValidationResponse = left
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let right: MaestroHostedRunnerActivationValidationResponse = right
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(left.tuple_sha256, right.tuple_sha256);
+    assert_ne!(left.replayed, right.replayed);
+
+    let mut replay_mismatch = activation.clone();
+    replay_mismatch.pod_uid = Uuid::now_v7();
+    let replay_mismatch = client
+        .post(&activation_url)
+        .json(&replay_mismatch)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay_mismatch.status(), reqwest::StatusCode::CONFLICT);
+    let replay_mismatch: ErrorEnvelope = replay_mismatch.json().await.unwrap();
+    assert_eq!(replay_mismatch.code, "maestro_activation_replay_mismatch");
+
+    let mut tuple_mismatch = activation.clone();
+    tuple_mismatch.activation_id = Uuid::now_v7();
+    tuple_mismatch.expected_server_uri_san.push_str("-attacker");
+    let tuple_mismatch = client
+        .post(&activation_url)
+        .json(&tuple_mismatch)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tuple_mismatch.status(), reqwest::StatusCode::CONFLICT);
+    let tuple_mismatch: ErrorEnvelope = tuple_mismatch.json().await.unwrap();
+    assert_eq!(tuple_mismatch.code, "maestro_activation_binding_mismatch");
+
+    let activation_metrics = client
+        .get(format!("{}/metrics", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(activation_metrics.contains(
+        "sandboxwich_maestro_activation_validation_duration_seconds_bucket{outcome=\"accepted\""
+    ));
+    for series in [
+        "outcome=\"accepted\",reason=\"validated\"",
+        "outcome=\"accepted\",reason=\"replayed\"",
+        "outcome=\"rejected\",reason=\"binding_mismatch\"",
+        "outcome=\"rejected\",reason=\"replay_mismatch\"",
+    ] {
+        assert!(
+            activation_metrics.contains(series),
+            "missing bounded activation series {series}:\n{activation_metrics}"
+        );
+    }
+    for forbidden in [
+        organization_id,
+        workspace_id,
+        runner_session_id,
+        &sandbox_id.to_string(),
+        &pod_uid.to_string(),
+        &lease.id.to_string(),
+    ] {
+        assert!(
+            !activation_metrics.contains(forbidden),
+            "activation metrics leaked tuple material {forbidden}"
+        );
+    }
 
     worker_http
         .post(format!(
@@ -885,6 +1038,18 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
         reqwest::StatusCode::NOT_FOUND,
         "another tenant must not discover the binding"
     );
+    assert_eq!(
+        reqwest::Client::new()
+            .post(&activation_url)
+            .bearer_auth(TEST_TENANT_B_TOKEN)
+            .json(&activation)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "another tenant must not validate or discover the activation tuple"
+    );
 
     let binding = ValidateMaestroWorkloadIdentityRequest {
         organization_id: organization_id.into(),
@@ -916,6 +1081,17 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
         .execute(&pool)
         .await
         .unwrap();
+    let mut stale_activation = activation.clone();
+    stale_activation.activation_id = Uuid::now_v7();
+    let stale_activation = client
+        .post(&activation_url)
+        .json(&stale_activation)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale_activation.status(), reqwest::StatusCode::CONFLICT);
+    let stale_activation: ErrorEnvelope = stale_activation.json().await.unwrap();
+    assert_eq!(stale_activation.code, "maestro_activation_stale_generation");
     assert_eq!(
         client
             .get(&connection_binding_url)
@@ -959,6 +1135,17 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
         .execute(&pool)
         .await
         .unwrap();
+    let mut expired_activation = activation.clone();
+    expired_activation.activation_id = Uuid::now_v7();
+    let expired_activation = client
+        .post(&activation_url)
+        .json(&expired_activation)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(expired_activation.status(), reqwest::StatusCode::CONFLICT);
+    let expired_activation: ErrorEnvelope = expired_activation.json().await.unwrap();
+    assert_eq!(expired_activation.code, "maestro_activation_lease_expired");
     assert_eq!(
         client
             .get(&connection_binding_url)
