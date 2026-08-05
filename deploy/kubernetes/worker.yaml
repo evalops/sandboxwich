@@ -148,6 +148,8 @@ spec:
       labels:
         app.kubernetes.io/name: sandboxwich-worker
         app.kubernetes.io/part-of: sandboxwich
+        # Required by deploy/kubernetes/api.yaml sandboxwich-api-allow-worker.
+        sandboxwich.dev/api-client: "true"
     spec:
       serviceAccountName: sandboxwich-worker
       # Must exceed --drain-timeout-secs below so Kubernetes doesn't SIGKILL
@@ -361,6 +363,8 @@ spec:
           labels:
             app.kubernetes.io/name: sandboxwich-reconciler
             app.kubernetes.io/part-of: sandboxwich
+            # Required by deploy/kubernetes/api.yaml sandboxwich-api-allow-worker.
+            sandboxwich.dev/api-client: "true"
         spec:
           serviceAccountName: sandboxwich-reconciler
           restartPolicy: Never

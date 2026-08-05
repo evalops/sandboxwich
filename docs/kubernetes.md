@@ -466,13 +466,15 @@ The API exposes:
 - `/readyz` for database-backed readiness.
 - `/metrics` for Prometheus text metrics. If `SANDBOXWICH_API_TOKEN` is configured, scrape clients must send the bearer token.
 
-The control-plane NetworkPolicy permits in-cluster scrapes from pods in the
-`sandboxwich` namespace carrying the label
-`sandboxwich.dev/metrics-access: "true"`. Add that label to the Prometheus pod
-template (or the pod selected by your ServiceMonitor) and configure the bearer
-token there. Scrapers in another namespace require a deployment-specific
-companion NetworkPolicy with both namespace and pod selectors; the shipped
-policy does not grant cross-namespace ingress.
+The control-plane NetworkPolicy permits in-cluster traffic to the API on port
+3217 from pods in the `sandboxwich` namespace that carry
+`sandboxwich.dev/api-client: "true"` (the worker Deployment and the reconciler
+CronJob) or `sandboxwich.dev/metrics-access: "true"` (Prometheus scrapers).
+Add the metrics label to the Prometheus pod template (or the pod selected by
+your ServiceMonitor) and configure the bearer token there. Scrapers in another
+namespace require a deployment-specific companion NetworkPolicy with both
+namespace and pod selectors; the shipped policy does not grant cross-namespace
+ingress.
 
 Latency SLO series are derived from durable database timestamps, so API
 restarts or archived-sandbox deletion do not reset them. Terminal observations
