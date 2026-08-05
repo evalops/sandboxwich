@@ -27,6 +27,14 @@ use std::convert::Infallible;
 use std::time::Duration;
 use uuid::Uuid;
 
+const MAESTRO_RESIDENT_CONTRACT_REVISION_V2: &str = "maestro-resident-model-ready-v2";
+
+fn is_qualified_maestro_model(model: &str) -> bool {
+    model
+        .strip_prefix("evalops/")
+        .is_some_and(|name| !name.is_empty() && name.trim() == name)
+}
+
 #[derive(Clone, Copy)]
 enum SidecarBootstrapBlockReason {
     NotRunning,
@@ -656,6 +664,18 @@ pub(crate) async fn put_resident_process(
                 == Some(MAESTRO_HOSTED_RUNNER_GATEWAY_TOKEN_FILE)
             && !request.env.contains_key("MAESTRO_EVALOPS_ACCESS_TOKEN")
             && !request.env.contains_key("MAESTRO_LLM_GATEWAY_TOKEN")
+            && request
+                .env
+                .get("MAESTRO_RESIDENT_CONTRACT_REVISION")
+                .map(String::as_str)
+                == Some(MAESTRO_RESIDENT_CONTRACT_REVISION_V2)
+            && request
+                .env
+                .get("MAESTRO_MODEL")
+                .zip(request.env.get("MAESTRO_DEFAULT_MODEL"))
+                .is_some_and(|(model, default_model)| {
+                    model == default_model && is_qualified_maestro_model(model)
+                })
             && request
                 .env
                 .get("MAESTRO_SANDBOX_ID")
