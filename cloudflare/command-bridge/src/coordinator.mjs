@@ -141,8 +141,8 @@ function timeoutMilliseconds(seconds) {
 
 function commandFor(intent) {
   const command = intent.argv.map(shellQuote).join(" ");
-  if (typeof intent.stdin !== "string" || intent.stdin.length === 0) return command;
-  return `printf %s ${shellQuote(toBase64(intent.stdin))} | base64 -d | ${command}`;
+  if (typeof intent.stdinBase64 !== "string" || intent.stdinBase64.length === 0) return command;
+  return `printf %s ${shellQuote(intent.stdinBase64)} | base64 -d | ${command}`;
 }
 
 function shellQuote(value) {
