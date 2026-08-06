@@ -952,6 +952,48 @@ mod tests {
     }
 
     #[test]
+    fn cloudflare_http_bridge_keeps_runtime_alive_while_reading_response_body() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            let body = br#"{"id":"stable-cloudflare-sandbox"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            stream.write_all(body).unwrap();
+        });
+        let bridge = HttpCloudflareBridge::new(CloudflareConfig {
+            base_url: format!("http://{address}"),
+            api_token: "secret".into(),
+            request_timeout: Duration::from_secs(2),
+            readiness_timeout: Duration::from_secs(2),
+            replay_ledger_configured: true,
+        })
+        .unwrap();
+        let spec = SandboxProvisionSpec {
+            provider_preference: ProviderPreference::Cloudflare,
+            tenant_id: Some("org:workspace".into()),
+            ..Default::default()
+        };
+
+        let created = bridge
+            .create(SandboxId::new(), None, &spec, "stable-create-key")
+            .expect("response body must remain readable after response headers arrive");
+        assert_eq!(created.external_id, "stable-cloudflare-sandbox");
+        server.join().unwrap();
+    }
+
+    #[test]
     fn cloudflare_provision_exec_stop_uses_external_identity_and_tenant_scope() {
         let provider = CloudflareSandboxProvider::for_test_with_replay_ledger();
         let mut spec = SandboxProvisionSpec {
