@@ -53,6 +53,34 @@ async fn logical_home_creation_is_replayable_and_tenant_scoped() {
     let duplicate: HomeResponse = duplicate_response.json().await.unwrap();
     assert_eq!(duplicate.home.id, first.home.id);
 
+    let mounted: SandboxResponse = client
+        .post(format!(
+            "{}/homes/{}/sandboxes",
+            server.base_url, first.home.id
+        ))
+        .json(&persistent_sandbox("logical-home-runtime"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let after_mount: HomeResponse = client
+        .post(format!("{}/homes", server.base_url))
+        .header("idempotency-key", "logical-home-runtime-reconnect")
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after_mount.mounted_sandbox_id, Some(mounted.sandbox.id));
+
     let tenant_b = reqwest::Client::builder()
         .default_headers(
             [(
