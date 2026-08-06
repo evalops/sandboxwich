@@ -9,6 +9,8 @@ const MAX_BRIDGE_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SSE_LINE_BYTES: usize = 64 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_COMMAND_OUTPUT_BYTES: usize = 8 * 1024;
+pub(crate) const CLOUDFLARE_REPLAY_LEDGER_CONFIGURED_ENV: &str =
+    "SANDBOXWICH_CLOUDFLARE_REPLAY_LEDGER_CONFIGURED";
 
 pub(crate) fn create_idempotency_key(sandbox_id: SandboxId) -> String {
     format!("sandboxwich-create-{sandbox_id}")
@@ -38,9 +40,13 @@ impl std::fmt::Debug for CloudflareConfig {
 
 impl CloudflareConfig {
     pub fn from_env() -> anyhow::Result<Self> {
-        let base_url = std::env::var("SANDBOXWICH_CLOUDFLARE_SANDBOX_URL")
+        Self::from_map(|name| std::env::var(name).ok())
+    }
+
+    fn from_map(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        let base_url = get("SANDBOXWICH_CLOUDFLARE_SANDBOX_URL")
             .context("SANDBOXWICH_CLOUDFLARE_SANDBOX_URL is required")?;
-        let api_token = std::env::var("SANDBOXWICH_CLOUDFLARE_SANDBOX_TOKEN")
+        let api_token = get("SANDBOXWICH_CLOUDFLARE_SANDBOX_TOKEN")
             .context("SANDBOXWICH_CLOUDFLARE_SANDBOX_TOKEN is required")?;
         anyhow::ensure!(
             !base_url.trim().is_empty(),
@@ -50,12 +56,22 @@ impl CloudflareConfig {
             !api_token.trim().is_empty(),
             "Cloudflare Bridge token is empty"
         );
+        let replay_ledger_configured = match get(CLOUDFLARE_REPLAY_LEDGER_CONFIGURED_ENV)
+            .as_deref()
+            .map(str::trim)
+        {
+            None | Some("") | Some("false") => false,
+            Some("true") => true,
+            Some(_) => {
+                anyhow::bail!("{CLOUDFLARE_REPLAY_LEDGER_CONFIGURED_ENV} must be true or false")
+            }
+        };
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_token,
             request_timeout: Duration::from_secs(30),
             readiness_timeout: Duration::from_secs(60),
-            replay_ledger_configured: false,
+            replay_ledger_configured,
         })
     }
 }
@@ -900,6 +916,13 @@ mod tests {
         };
         let without_binding = CloudflareConfig::from_map(base).unwrap();
         assert!(!without_binding.replay_ledger_configured);
+        assert!(
+            !CloudflareSandboxProvider::new(without_binding)
+                .unwrap()
+                .capability_report()
+                .capabilities
+                .contains(&WorkerCapability::RunCommand)
+        );
 
         let with_binding = CloudflareConfig::from_map(|name| match name {
             "SANDBOXWICH_CLOUDFLARE_SANDBOX_URL" => Some("https://bridge.example".to_string()),
@@ -909,6 +932,13 @@ mod tests {
         })
         .unwrap();
         assert!(with_binding.replay_ledger_configured);
+        assert!(
+            CloudflareSandboxProvider::new(with_binding)
+                .unwrap()
+                .capability_report()
+                .capabilities
+                .contains(&WorkerCapability::RunCommand)
+        );
 
         assert!(
             CloudflareConfig::from_map(|name| match name {
