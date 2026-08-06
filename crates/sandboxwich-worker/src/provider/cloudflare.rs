@@ -555,14 +555,14 @@ impl CloudflareSandboxProvider {
     }
 
     fn provider_error(error: anyhow::Error) -> anyhow::Error {
-        if let Some(http) = error.downcast_ref::<CloudflareHttpError>() {
-            if http.code == "capacity_exceeded" || http.status == 429 {
-                return anyhow::Error::new(ProviderError::classified(
-                    ProvisioningErrorClass::RetryableCapacity,
-                    LifecycleReasonCode::WorkspaceCapacityPending,
-                    error,
-                ));
-            }
+        if let Some(http) = error.downcast_ref::<CloudflareHttpError>()
+            && (http.code == "capacity_exceeded" || http.status == 429)
+        {
+            return anyhow::Error::new(ProviderError::classified(
+                ProvisioningErrorClass::RetryableCapacity,
+                LifecycleReasonCode::WorkspaceCapacityPending,
+                error,
+            ));
         }
         anyhow::Error::new(ProviderError::retryable(error))
     }

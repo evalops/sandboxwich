@@ -449,7 +449,6 @@ fn add_provision_spec_to_payload_with_identity(
             tenant_id: Some(sandbox.tenant_id.clone()),
             provider_external_id,
             provider_routing_scope,
-            ..SandboxProvisionSpec::default()
         })?,
     );
     Ok(())
