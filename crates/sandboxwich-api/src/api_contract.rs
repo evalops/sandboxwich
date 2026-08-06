@@ -36,6 +36,7 @@ use sandboxwich_core::{
         crate::handlers::apex_instructions::read_apex_task_instructions,
         crate::handlers::resident_attestations::get_maestro_connection_binding,
         crate::handlers::maestro_activations::validate_maestro_activation,
+        crate::handlers::maestro_activations::validate_maestro_activation_identity,
         crate::handlers::resident_attestations::redeem_resident_placement_attestation,
         crate::handlers::resident_attestations::validate_resident_placement_attestation,
         crate::handlers::operations::get_operation,
@@ -85,6 +86,8 @@ use sandboxwich_core::{
         ,sandboxwich_core::MaestroHostedRunnerConnectionBindingResponse
         ,sandboxwich_core::MaestroHostedRunnerActivationValidationRequest
         ,sandboxwich_core::MaestroHostedRunnerActivationValidationResponse
+        ,sandboxwich_core::MaestroHostedRunnerActivationIdentityRequest
+        ,sandboxwich_core::MaestroHostedRunnerActivationValidationBundleResponse
         ,sandboxwich_core::SecretSource
         ,sandboxwich_core::SecretRef
         ,sandboxwich_core::CreateSecretRefRequest
@@ -125,6 +128,10 @@ const PUBLIC_V1_OPERATIONS: &[(&str, &str)] = &[
     (
         "post",
         "/v1/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/activations/validate",
+    ),
+    (
+        "post",
+        "/v1/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/activations/validate-identity",
     ),
     (
         "post",
@@ -374,6 +381,10 @@ mod tests {
                 "/v1/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/activations/validate",
                 "post",
             ),
+            (
+                "/v1/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/activations/validate-identity",
+                "post",
+            ),
             ("/v1/operations/{operation_id}", "get"),
         ] {
             let operation = &document["paths"][path][method];
@@ -445,6 +456,24 @@ mod tests {
         assert!(
             operation["requestBody"]["content"]["application/json"]["schema"].is_object(),
             "activation validation must publish its exact request schema"
+        );
+        let identity = document["components"]["schemas"]
+            ["MaestroHostedRunnerActivationIdentityRequest"]["properties"]
+            .as_object()
+            .expect("combined activation identity request must be an object schema");
+        assert!(identity.contains_key("runtimeImageDigest"));
+        assert!(identity.contains_key("serviceName"));
+        assert!(identity.contains_key("workerId"));
+        let identity_operation = &document["paths"]["/v1/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/activations/validate-identity"]
+            ["post"];
+        assert!(
+            identity_operation["requestBody"]["content"]["application/json"]["schema"].is_object(),
+            "combined activation validation must publish its identity request schema"
+        );
+        assert!(
+            identity_operation["responses"]["200"]["content"]["application/json"]["schema"]
+                .is_object(),
+            "combined activation validation must publish its binding and proof response schema"
         );
     }
 
