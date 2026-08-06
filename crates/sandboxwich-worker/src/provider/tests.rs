@@ -4566,7 +4566,7 @@ fn provision_staged_applies_the_guest_token_secret_before_the_pod() {
 }
 
 #[test]
-fn provision_staged_applies_gateway_policy_and_waits_for_gateway_before_runtime() {
+fn provision_staged_starts_runtime_before_waiting_for_gateway() {
     let (kubectl, log_path) = write_stateful_fake_kubectl();
     let dry_run =
         KubernetesDryRunProvider::with_snapshot_class("gke-ci", "sandboxwich-ci", None, None)
@@ -4595,12 +4595,12 @@ fn provision_staged_applies_gateway_policy_and_waits_for_gateway_before_runtime(
     let gateway_wait = log
         .find(&format!("pod/sandboxwich-egress-gateway-{sandbox_id}"))
         .expect("gateway readiness wait");
-    let runtime_apply = log
-        .rfind(&format!("sandboxwich-{sandbox_id}"))
-        .expect("runtime apply");
+    let runtime_start = log
+        .find(&format!("get Pod sandboxwich-{sandbox_id}"))
+        .expect("runtime start");
     assert!(
-        gateway_wait < runtime_apply,
-        "gateway must be ready first: {log}"
+        runtime_start < gateway_wait,
+        "runtime and gateway cold starts must overlap before readiness waits: {log}"
     );
     assert!(handle.resources.iter().any(|resource| {
         resource.resource_kind == sandboxwich_core::RuntimeResourceKind::Pod
