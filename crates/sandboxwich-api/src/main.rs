@@ -13,6 +13,7 @@ mod idempotency;
 mod identity_mtls;
 mod lifecycle_contract;
 mod limits;
+mod maestro_observation;
 mod pagination;
 mod reap;
 mod reconcile;
@@ -40,6 +41,7 @@ use crate::db::connect_database;
 use crate::db::migrate_database;
 use crate::db::verify_database_schema;
 use crate::identity_mtls::{identity_app, identity_tls_config};
+use crate::maestro_observation::ActivationObservationSink;
 use crate::routes::app;
 use crate::scheduler::spawn_expiry_sweeper;
 use crate::state::{AppState, ResidentBootstrapStore};
@@ -131,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("failed to bind SANDBOXWICH_BIND={}", config.bind))?;
     tracing::info!(addr = %config.bind, database_url = %config.database_url, "sandboxwich-api listening");
+    let maestro_observation_sink = ActivationObservationSink::new(db.clone());
     let state = AppState {
         db,
         auth: AuthConfig {
@@ -145,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
             .placement_attestation_derivation_key
             .map(Arc::<str>::from),
         apex_waiters: Default::default(),
+        maestro_observation_sink,
         resident_bootstraps,
         sandbox_lifetime: config.sandbox_lifetime,
         #[cfg(test)]
