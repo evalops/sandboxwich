@@ -1,0 +1,29 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "evalops-sandboxwich-cloudflare-bridge",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-06",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  "containers": [
+    {
+      "class_name": "Sandbox",
+      "image": "./Dockerfile",
+      "instance_type": "lite",
+      "max_instances": 10
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "Sandbox", "class_name": "Sandbox" },
+      { "name": "COMMAND_LEDGER", "class_name": "CommandLedger" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Sandbox", "CommandLedger"] }
+  ],
+  "r2_buckets": [
+    { "binding": "DEX_COMPUTER_HOME", "bucket_name": "evalops-dex-computer-homes" }
+  ]
+}
