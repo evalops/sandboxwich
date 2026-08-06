@@ -1185,7 +1185,12 @@ pub struct Home {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct CreateHomeRequest {}
+pub struct CreateHomeRequest {
+    /// Stable, opaque identity supplied by the authorized control plane.
+    /// Repeating it in the same tenant returns the existing home.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_key: Option<String>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct HomeResponse {

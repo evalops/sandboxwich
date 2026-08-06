@@ -90,7 +90,7 @@ async fn managed_home_is_tenant_scoped_and_single_mount() {
     let client = server.client();
     let created: HomeResponse = client
         .post(format!("{}/homes", server.base_url))
-        .json(&CreateHomeRequest {})
+        .json(&CreateHomeRequest::default())
         .send()
         .await
         .unwrap()
@@ -176,7 +176,7 @@ async fn managed_home_requires_persistent_workspace() {
     let client = server.client();
     let created: HomeResponse = client
         .post(format!("{}/homes", server.base_url))
-        .json(&CreateHomeRequest {})
+        .json(&CreateHomeRequest::default())
         .send()
         .await
         .unwrap()
@@ -210,7 +210,7 @@ async fn managed_home_delete_is_explicit_and_asynchronous() {
     let client = server.client();
     let created: HomeResponse = client
         .post(format!("{}/homes", server.base_url))
-        .json(&CreateHomeRequest {})
+        .json(&CreateHomeRequest::default())
         .send()
         .await
         .unwrap()

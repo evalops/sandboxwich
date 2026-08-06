@@ -18,8 +18,9 @@ use uuid::Uuid;
 pub(crate) async fn create_home(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
-    Json(_request): Json<CreateHomeRequest>,
+    Json(request): Json<CreateHomeRequest>,
 ) -> Result<(StatusCode, Json<HomeResponse>), ApiError> {
+    let logical_key = validate_logical_key(request.logical_key.as_deref())?;
     let now = Utc::now();
     let home = Home {
         id: HomeId::new(),
@@ -30,26 +31,57 @@ pub(crate) async fn create_home(
         error: None,
     };
     let sql = format!(
-        "insert into homes (id, tenant_id, state, created_at, updated_at, error) values ({})",
-        state.db.placeholders(6)
+        "insert into homes (id, tenant_id, logical_key, state, created_at, updated_at, error)
+         values ({}) on conflict (tenant_id, logical_key) do nothing",
+        state.db.placeholders(7)
     );
-    sqlx::query(&sql)
+    let inserted = sqlx::query(&sql)
         .bind(home.id.to_string())
         .bind(&home.tenant_id)
+        .bind(logical_key)
         .bind(home.state.as_db_str())
         .bind(home.created_at.to_rfc3339())
         .bind(home.updated_at.to_rfc3339())
         .bind(&home.error)
         .execute(&state.db.pool)
         .await?;
+    let (status, home) = if inserted.rows_affected() == 1 {
+        (StatusCode::CREATED, home)
+    } else {
+        let logical_key = logical_key.ok_or_else(|| {
+            ApiError::internal("home insert without a logical key did not create a row")
+        })?;
+        (
+            StatusCode::OK,
+            fetch_home_by_logical_key(&state.db, logical_key, &home.tenant_id).await?,
+        )
+    };
     Ok((
-        StatusCode::CREATED,
+        status,
         Json(HomeResponse {
             ok: true,
             home,
             operation: None,
         }),
     ))
+}
+
+fn validate_logical_key(logical_key: Option<&str>) -> Result<Option<&str>, ApiError> {
+    let Some(logical_key) = logical_key else {
+        return Ok(None);
+    };
+    if logical_key.is_empty()
+        || logical_key.len() > 128
+        || !logical_key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        return Err(ApiError::bad_request_code(
+            "invalid_home_logical_key",
+            "home logical_key must be 1-128 ASCII letters, digits, dots, underscores, colons, or hyphens",
+        ));
+    }
+    Ok(Some(logical_key))
 }
 
 #[utoipa::path(get, path = "/v1/homes/{home_id}", params(("home_id" = Uuid, Path)), responses((status = 200, body = HomeResponse), (status = 404)))]
@@ -226,6 +258,26 @@ pub(crate) async fn fetch_home(
         .fetch_optional(&db.pool)
         .await?
         .ok_or_else(|| ApiError::not_found("home not found"))?;
+    row_to_home(row)
+}
+
+async fn fetch_home_by_logical_key(
+    db: &Database,
+    logical_key: &str,
+    tenant_id: &str,
+) -> Result<Home, ApiError> {
+    let sql = format!(
+        "select id, tenant_id, state, created_at, updated_at, error from homes
+         where logical_key = {} and tenant_id = {}",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    let row = sqlx::query(&sql)
+        .bind(logical_key)
+        .bind(tenant_id)
+        .fetch_optional(&db.pool)
+        .await?
+        .ok_or_else(|| ApiError::internal("logical home conflict row was not found"))?;
     row_to_home(row)
 }
 
