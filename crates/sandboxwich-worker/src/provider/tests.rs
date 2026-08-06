@@ -4381,7 +4381,7 @@ esac
 }
 
 #[test]
-fn provision_staged_batches_post_ready_services_in_one_apply() {
+fn provision_staged_keeps_post_ready_services_on_separate_authority_fences() {
     let (kubectl, log_path) = write_stateful_fake_kubectl();
     let provider = apply_provider_with_fake_kubectl(&kubectl);
     let sandbox_id = SandboxId::new();
@@ -4398,11 +4398,56 @@ fn provision_staged_batches_post_ready_services_in_one_apply() {
     let log = std::fs::read_to_string(&log_path).expect("read staged kubectl log");
     assert_eq!(
         log.matches(" apply ").count(),
-        4,
-        "post-ready SSH and desktop Services should share one apply: {log}"
+        5,
+        "post-ready SSH and desktop Services must remain separate mutations: {log}"
     );
 
     let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+#[test]
+fn provision_staged_does_not_apply_desktop_service_after_ssh_report_rejection() {
+    let (kubectl, log_path) = write_stateful_fake_kubectl();
+    let provider = apply_provider_with_fake_kubectl(&kubectl);
+    let sandbox_id = SandboxId::new();
+
+    let error = provider
+        .provision_staged(
+            sandbox_id,
+            &SandboxProvisionSpec::default(),
+            &CancelSignal::never_cancelled(),
+            |report| {
+                if report.stage == sandboxwich_core::ProvisioningStage::ServiceReady {
+                    anyhow::bail!("lease authority moved before ServiceReady was accepted");
+                }
+                Ok(())
+            },
+        )
+        .expect_err("the first rejected ServiceReady report must stop provisioning");
+    assert!(
+        error.to_string().contains("lease authority moved"),
+        "the report rejection must remain the causal error: {error}"
+    );
+
+    let root = kubectl.parent().expect("fake kubectl parent");
+    assert!(
+        root.join(format!("service-sandboxwich-ssh-{sandbox_id}"))
+            .exists(),
+        "the SSH Service is applied before its readiness report"
+    );
+    assert!(
+        !root
+            .join(format!("service-sandboxwich-desktop-{sandbox_id}"))
+            .exists(),
+        "a rejected SSH readiness report must fence the later desktop Service mutation"
+    );
+    let log = std::fs::read_to_string(&log_path).expect("read staged kubectl log");
+    assert!(
+        !log.contains(" delete "),
+        "report rejection means lease authority may have moved, so this worker must not roll back: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4500,13 +4545,13 @@ fn provision_staged_applies_resources_in_durable_order_and_reports_uids() {
     let log = std::fs::read_to_string(&log_path).expect("read staged kubectl log");
     assert_eq!(
         log.matches(" get ").count(),
-        9,
-        "four stage-local pre/post reads plus runtime-class verification: {log}"
+        10,
+        "each authority-fenced stage must keep its own pre/post reads: {log}"
     );
     assert_eq!(
         log.matches(" apply ").count(),
-        4,
-        "workspace, network, pod, and service waves: {log}"
+        5,
+        "workspace, network, pod, and both authority-fenced Services: {log}"
     );
     assert!(log.contains(" wait --for=condition=Ready "));
 
@@ -4525,8 +4570,8 @@ fn provision_staged_applies_resources_in_durable_order_and_reports_uids() {
     let replay_log = std::fs::read_to_string(&log_path).expect("read replay kubectl log");
     assert_eq!(
         replay_log.matches(" apply ").count(),
-        4,
-        "replay must adopt the four apply waves: {replay_log}"
+        5,
+        "replay must adopt the five existing resources: {replay_log}"
     );
     assert_eq!(replay_reports.len(), 8);
 
@@ -4567,8 +4612,8 @@ fn managed_home_is_adopted_by_replacement_runtime_and_survives_runtime_stop() {
     let log = std::fs::read_to_string(&log_path).expect("read managed-home kubectl log");
     assert_eq!(
         log.matches(" apply ").count(),
-        7,
-        "the replacement must adopt the home PVC and apply only its three apply waves: {log}"
+        9,
+        "the replacement must adopt the home PVC and apply only its runtime resources: {log}"
     );
     assert!(
         log.contains(&format!(
@@ -4660,8 +4705,8 @@ fn provision_staged_applies_the_guest_token_secret_before_the_pod() {
     let log = std::fs::read_to_string(&log_path).expect("read staged kubectl log");
     assert_eq!(
         log.matches(" apply ").count(),
-        5,
-        "workspace, secret, policy, pod, and service wave: {log}"
+        6,
+        "workspace, secret, policy, pod, and both authority-fenced Services: {log}"
     );
 
     let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
@@ -4703,6 +4748,16 @@ fn provision_staged_starts_runtime_before_waiting_for_gateway() {
     assert!(
         runtime_start < gateway_wait,
         "runtime and gateway cold starts must overlap before readiness waits: {log}"
+    );
+    assert_eq!(
+        log.matches(" get ").count(),
+        12,
+        "the host-egress network wave must share one pre-apply and one post-apply read: {log}"
+    );
+    assert_eq!(
+        log.matches(" apply ").count(),
+        6,
+        "gateway Service, Pod, and base policy must share their report-free apply: {log}"
     );
     assert!(handle.resources.iter().any(|resource| {
         resource.resource_kind == sandboxwich_core::RuntimeResourceKind::Pod

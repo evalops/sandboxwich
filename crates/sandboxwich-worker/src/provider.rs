@@ -3664,6 +3664,7 @@ impl KubernetesApplyProvider {
             report(stage_update(ProvisioningStage::WorkspaceReady, None))?;
         }
 
+        let mut network_wave = Vec::new();
         let gateway_name = if let Some(gateway_policy) = self
             .dry_run
             .egress_gateway_network_policy_manifest(sandbox_id, &spec.network_egress)?
@@ -3682,17 +3683,12 @@ impl KubernetesApplyProvider {
                 .dry_run
                 .egress_gateway_service_manifest(sandbox_id, &spec.network_egress)
                 .context("gateway service missing for host policy")?;
-            self.apply_or_adopt_manifest(
-                &gateway_service,
-                sandbox_id,
-                cancelled,
-                resources_applied,
-            )?;
+            network_wave.push(gateway_service);
             let gateway_pod = self
                 .dry_run
                 .egress_gateway_pod_manifest(sandbox_id, &spec.network_egress)?
                 .context("gateway pod missing for host policy")?;
-            self.apply_or_adopt_manifest(&gateway_pod, sandbox_id, cancelled, resources_applied)?;
+            network_wave.push(gateway_pod);
             Some(format!("sandboxwich-egress-gateway-{sandbox_id}"))
         } else {
             None
@@ -3701,12 +3697,22 @@ impl KubernetesApplyProvider {
         let network_policy = self
             .dry_run
             .network_policy_manifest(sandbox_id, &spec.network_egress)?;
-        let network_identity = self.apply_or_adopt_manifest(
-            &network_policy,
-            sandbox_id,
+        network_wave.push(network_policy);
+        // These resources are one report-free network wave. Keep resources
+        // separated whenever a durable report can revoke this worker's
+        // authority before the next mutation.
+        let network_manifests = network_wave.iter().collect::<Vec<_>>();
+        let mut network_identities = self.apply_or_adopt_manifests_with_identity(
+            &network_manifests,
+            "sandboxwich.dev/sandbox-id",
+            &sandbox_id.to_string(),
+            "sandbox",
             cancelled,
             resources_applied,
         )?;
+        let network_identity = network_identities
+            .pop()
+            .context("base network policy identity is required")?;
         report(stage_update(
             ProvisioningStage::NetworkPolicyReady,
             Some(network_identity),
@@ -3771,29 +3777,19 @@ impl KubernetesApplyProvider {
         ))?;
 
         let ssh_service = self.dry_run.ssh_service_manifest(sandbox_id);
-        let desktop_service = self.dry_run.desktop_service_manifest(sandbox_id);
-        // These Services share the same post-ready stage and have no ordering
-        // dependency. Preflight both identities, then send one apply request
-        // for whichever resources are absent so each sandbox pays one API
-        // round trip instead of two while retaining fail-closed adoption.
-        let mut service_identities = self.apply_or_adopt_manifests_with_identity(
-            &[&ssh_service, &desktop_service],
-            "sandboxwich.dev/sandbox-id",
-            &sandbox_id.to_string(),
-            "sandbox",
-            cancelled,
-            resources_applied,
-        )?;
-        let desktop_service_identity = service_identities
-            .pop()
-            .context("desktop Service identity missing after staged apply")?;
-        let ssh_service_identity = service_identities
-            .pop()
-            .context("SSH Service identity missing after staged apply")?;
+        let ssh_service_identity =
+            self.apply_or_adopt_manifest(&ssh_service, sandbox_id, cancelled, resources_applied)?;
         report(stage_update(
             ProvisioningStage::ServiceReady,
             Some(ssh_service_identity),
         ))?;
+        let desktop_service = self.dry_run.desktop_service_manifest(sandbox_id);
+        let desktop_service_identity = self.apply_or_adopt_manifest(
+            &desktop_service,
+            sandbox_id,
+            cancelled,
+            resources_applied,
+        )?;
         report(stage_update(
             ProvisioningStage::ServiceReady,
             Some(desktop_service_identity),
@@ -4110,7 +4106,6 @@ impl KubernetesApplyProvider {
         cancelled: &CancelSignal,
         resources_applied: &mut bool,
     ) -> anyhow::Result<Vec<KubernetesResourceIdentity>> {
-        let mut resource_kinds = Vec::with_capacity(manifests.len());
         let mut missing = Vec::new();
 
         // Keep the established single-resource read path unchanged. Only
@@ -4140,15 +4135,10 @@ impl KubernetesApplyProvider {
             )?
         };
 
-        for (index, manifest) in manifests.iter().enumerate() {
-            let kind = manifest["kind"]
-                .as_str()
-                .context("Kubernetes manifest kind is required")?;
-            let resource_kind = runtime_resource_kind_for_kubernetes_kind(kind)?;
-            if identities[index].is_none() {
+        for (index, identity) in identities.iter().enumerate() {
+            if identity.is_none() {
                 missing.push(index);
             }
-            resource_kinds.push(resource_kind);
         }
 
         if !missing.is_empty() {
@@ -4173,16 +4163,29 @@ impl KubernetesApplyProvider {
                 )));
             }
 
-            for index in missing {
-                let manifest = manifests[index];
-                identities[index] = self.read_resource_identity(
+            if manifests.len() == 1 {
+                let manifest = manifests[0];
+                let kind = manifest["kind"]
+                    .as_str()
+                    .context("Kubernetes manifest kind is required")?;
+                identities[0] = self.read_resource_identity(
                     manifest,
                     identity_label,
                     identity_value,
                     identity_name,
-                    resource_kinds[index].clone(),
+                    runtime_resource_kind_for_kubernetes_kind(kind)?,
                     cancelled,
                 )?;
+            } else {
+                identities = self.read_resource_identities(
+                    manifests,
+                    identity_label,
+                    identity_value,
+                    identity_name,
+                    cancelled,
+                )?;
+            }
+            for index in missing {
                 if identities[index].is_none() {
                     return Err(anyhow::Error::new(ProviderError::classified(
                         ProvisioningErrorClass::RetryableProvider,
@@ -4223,7 +4226,7 @@ impl KubernetesApplyProvider {
 
         let mut args = self.kubectl_base_args();
         args.push("get".to_string());
-        let mut names = Vec::with_capacity(desired.len());
+        let mut resource_keys = Vec::with_capacity(desired.len());
         let mut resource_kinds = Vec::with_capacity(desired.len());
         for manifest in desired {
             let kind = manifest["kind"]
@@ -4232,8 +4235,11 @@ impl KubernetesApplyProvider {
             let name = manifest["metadata"]["name"]
                 .as_str()
                 .context("Kubernetes manifest metadata.name is required")?;
+            let namespace = manifest["metadata"]["namespace"]
+                .as_str()
+                .context("Kubernetes manifest metadata.namespace is required")?;
             args.push(format!("{kind}/{name}"));
-            names.push(name.to_string());
+            resource_keys.push((kind.to_string(), name.to_string(), namespace.to_string()));
             resource_kinds.push(runtime_resource_kind_for_kubernetes_kind(kind)?);
         }
         args.extend([
@@ -4267,7 +4273,7 @@ impl KubernetesApplyProvider {
                 anyhow::Error::new(error).context("kubectl returned invalid resource JSON"),
             ))
         })?;
-        let mut observed_by_name = BTreeMap::new();
+        let mut observed_by_key = BTreeMap::new();
         if observed["kind"] == json!("List") {
             let items = observed["items"].as_array().ok_or_else(|| {
                 anyhow::Error::new(ProviderError::classified(
@@ -4284,10 +4290,34 @@ impl KubernetesApplyProvider {
                         anyhow::anyhow!("kubectl resource List item has no name"),
                     ))
                 })?;
-                observed_by_name.insert(name.to_string(), item.clone());
+                let kind = item["kind"].as_str().ok_or_else(|| {
+                    anyhow::Error::new(ProviderError::classified(
+                        ProvisioningErrorClass::RetryableProvider,
+                        LifecycleReasonCode::ResourceObservationInvalid,
+                        anyhow::anyhow!("kubectl resource List item has no kind"),
+                    ))
+                })?;
+                let namespace = item["metadata"]["namespace"].as_str().ok_or_else(|| {
+                    anyhow::Error::new(ProviderError::classified(
+                        ProvisioningErrorClass::RetryableProvider,
+                        LifecycleReasonCode::ResourceObservationInvalid,
+                        anyhow::anyhow!("kubectl resource List item has no namespace"),
+                    ))
+                })?;
+                observed_by_key.insert(
+                    (kind.to_string(), name.to_string(), namespace.to_string()),
+                    item.clone(),
+                );
             }
-        } else if let Some(name) = observed["metadata"]["name"].as_str() {
-            observed_by_name.insert(name.to_string(), observed);
+        } else if let (Some(kind), Some(name), Some(namespace)) = (
+            observed["kind"].as_str(),
+            observed["metadata"]["name"].as_str(),
+            observed["metadata"]["namespace"].as_str(),
+        ) {
+            observed_by_key.insert(
+                (kind.to_string(), name.to_string(), namespace.to_string()),
+                observed,
+            );
         } else {
             return Err(anyhow::Error::new(ProviderError::classified(
                 ProvisioningErrorClass::RetryableProvider,
@@ -4300,7 +4330,7 @@ impl KubernetesApplyProvider {
             .iter()
             .enumerate()
             .map(|(index, manifest)| {
-                let Some(observed) = observed_by_name.remove(&names[index]) else {
+                let Some(observed) = observed_by_key.remove(&resource_keys[index]) else {
                     return Ok(None);
                 };
                 Self::resource_identity_from_observed(
