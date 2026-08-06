@@ -968,17 +968,37 @@ impl Default for ExecutionClass {
     }
 }
 
-db_variant_enum! {
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum ProviderPreference {
-    Any => "any",
-    Kubernetes => "kubernetes",
-    Cloudflare => "cloudflare",
-}
+    #[default]
+    Any,
+    Kubernetes,
+    Cloudflare,
 }
 
-impl Default for ProviderPreference {
-    fn default() -> Self {
-        Self::Any
+impl DbVariant for ProviderPreference {
+    const VALUES: &'static [&'static str] = &["any", "kubernetes", "cloudflare"];
+
+    fn as_db_str(&self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::Kubernetes => "kubernetes",
+            Self::Cloudflare => "cloudflare",
+        }
+    }
+
+    fn parse_db_str(value: &str) -> Result<Self, DbVariantError> {
+        match value {
+            "any" => Ok(Self::Any),
+            "kubernetes" => Ok(Self::Kubernetes),
+            "cloudflare" => Ok(Self::Cloudflare),
+            _ => Err(DbVariantError {
+                enum_name: "ProviderPreference",
+                value: value.to_string(),
+                expected: Self::VALUES,
+            }),
+        }
     }
 }
 

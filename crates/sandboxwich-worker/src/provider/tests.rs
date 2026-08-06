@@ -6528,15 +6528,24 @@ async fn cloudflare_http_body_cap_is_enforced_incrementally() {
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let _ = socket
-            .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
             .await;
         let chunk = vec![b'x'; 256 * 1024];
         for _ in 0..9 {
+            let size = format!("{:x}\r\n", chunk.len());
+            if socket.write_all(size.as_bytes()).await.is_err() {
+                return;
+            }
             if socket.write_all(&chunk).await.is_err() {
                 return;
             }
+            if socket.write_all(b"\r\n").await.is_err() {
+                return;
+            }
         }
-        let _ = socket.write_all(b"x").await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
     });
 
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -6548,8 +6557,12 @@ async fn cloudflare_http_body_cap_is_enforced_incrementally() {
     let error = crate::provider::cloudflare::bounded_response_bytes(&mut response)
         .await
         .expect_err("an oversized connection-delimited response must fail while streaming");
-    assert!(error.to_string().contains("bounded body limit"));
-    server.await.unwrap();
+    assert!(
+        error.to_string().contains("bounded body limit"),
+        "unexpected bounded response error: {error}"
+    );
+    server.abort();
+    let _ = server.await;
 }
 
 #[test]
