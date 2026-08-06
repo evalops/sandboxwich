@@ -567,6 +567,7 @@ pub(crate) async fn assert_desktop_brokered_transport(
             template: None,
             memory_limit: None,
             network_egress: None,
+            provider_preference: None,
             ttl_seconds: Some(120),
             max_lifetime_seconds: None,
             idle_ttl_seconds: None,

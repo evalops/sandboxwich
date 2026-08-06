@@ -40,6 +40,7 @@ async fn create_sandbox_with_idle_ttl(
             workspace_mode: Some(WorkspaceMode::Ephemeral),
             runtime_profile: None,
             execution_class: None,
+            provider_preference: None,
             ttl_seconds: None,
             max_lifetime_seconds: None,
             idle_ttl_seconds: Some(300),

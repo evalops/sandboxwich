@@ -13,10 +13,11 @@ use anyhow::Context;
 use base64::Engine as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use provider::{
-    CancelSignal, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES, IsolatedResidentProcessBootstrap,
-    IsolatedResidentProcessObservation, IsolatedResidentProcessSpec, IsolatedResidentProcessState,
-    IsolationProfile, KUBERNETES_MUTATION_ENV, KubernetesApplyProvider, KubernetesDryRunProvider,
-    ProviderError, ReconciliationLimits, ReconciliationOutcome, RetryDisposition, SandboxProvider,
+    CancelSignal, CloudflareConfig, CloudflareSandboxProvider, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
+    IsolatedResidentProcessBootstrap, IsolatedResidentProcessObservation,
+    IsolatedResidentProcessSpec, IsolatedResidentProcessState, IsolationProfile,
+    KUBERNETES_MUTATION_ENV, KubernetesApplyProvider, KubernetesDryRunProvider, ProviderError,
+    ReconciliationLimits, ReconciliationOutcome, RetryDisposition, SandboxProvider,
     image_is_digest_pinned,
 };
 use sandboxwich_core::{
@@ -492,6 +493,9 @@ struct RuntimeProviderArgs {
     #[arg(long, value_enum, default_value_t = ProviderModeArg::DryRun)]
     provider_mode: ProviderModeArg,
 
+    #[arg(long, env = "SANDBOXWICH_RUNTIME_PROVIDER", value_enum, default_value_t = RuntimeProviderKind::Kubernetes)]
+    runtime_provider: RuntimeProviderKind,
+
     #[arg(long, default_value = "kubectl")]
     kubectl: String,
 
@@ -669,10 +673,17 @@ enum ProviderModeArg {
     Apply,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum RuntimeProviderKind {
+    Kubernetes,
+    Cloudflare,
+}
+
 #[derive(Clone)]
 enum RuntimeProvider {
     DryRun(KubernetesDryRunProvider),
     Apply(KubernetesApplyProvider),
+    Cloudflare(CloudflareSandboxProvider),
 }
 
 impl RuntimeProvider {
@@ -690,6 +701,7 @@ impl RuntimeProvider {
             Self::Apply(provider) => {
                 Self::Apply(provider.with_guest_credentials(sandbox_id, worker_id, api, token))
             }
+            Self::Cloudflare(provider) => Self::Cloudflare(provider),
         }
     }
 
@@ -704,15 +716,25 @@ impl RuntimeProvider {
             Self::Apply(provider) => provider
                 .reconcile_orphans(inventory, limits, apply, &CancelSignal::never_cancelled())
                 .map(Some),
+            Self::Cloudflare(_) => Ok(None),
         }
     }
 }
 
 impl SandboxProvider for RuntimeProvider {
+    fn provider_name(&self) -> &'static str {
+        match self {
+            Self::DryRun(provider) => provider.provider_name(),
+            Self::Apply(provider) => provider.provider_name(),
+            Self::Cloudflare(provider) => provider.provider_name(),
+        }
+    }
+
     fn capability_report(&self) -> sandboxwich_core::ProviderCapabilityReport {
         match self {
             Self::DryRun(provider) => provider.capability_report(),
             Self::Apply(provider) => provider.capability_report(),
+            Self::Cloudflare(provider) => provider.capability_report(),
         }
     }
 
@@ -720,6 +742,7 @@ impl SandboxProvider for RuntimeProvider {
         match self {
             Self::DryRun(provider) => provider.health_report(),
             Self::Apply(provider) => provider.health_report(),
+            Self::Cloudflare(provider) => provider.health_report(),
         }
     }
 
@@ -732,6 +755,7 @@ impl SandboxProvider for RuntimeProvider {
         match self {
             Self::DryRun(provider) => provider.provision(sandbox_id, spec, cancelled),
             Self::Apply(provider) => provider.provision(sandbox_id, spec, cancelled),
+            Self::Cloudflare(provider) => provider.provision(sandbox_id, spec, cancelled),
         }
     }
 
@@ -747,6 +771,9 @@ impl SandboxProvider for RuntimeProvider {
                 provider.provision_staged(sandbox_id, spec, cancelled, report)
             }
             Self::Apply(provider) => provider.provision_staged(sandbox_id, spec, cancelled, report),
+            Self::Cloudflare(provider) => {
+                provider.provision_staged(sandbox_id, spec, cancelled, report)
+            }
         }
     }
 
@@ -765,6 +792,9 @@ impl SandboxProvider for RuntimeProvider {
             Self::Apply(provider) => {
                 provider.provision_home_staged(sandbox_id, home_id, spec, cancelled, report)
             }
+            Self::Cloudflare(provider) => {
+                provider.provision_home_staged(sandbox_id, home_id, spec, cancelled, report)
+            }
         }
     }
 
@@ -779,6 +809,30 @@ impl SandboxProvider for RuntimeProvider {
         match self {
             Self::DryRun(provider) => provider.exec_handoff(sandbox_id, spec, request, cancelled),
             Self::Apply(provider) => provider.exec_handoff(sandbox_id, spec, request, cancelled),
+            Self::Cloudflare(provider) => {
+                provider.exec_handoff(sandbox_id, spec, request, cancelled)
+            }
+        }
+    }
+
+    fn exec_handoff_with_job_id(
+        &self,
+        sandbox_id: sandboxwich_core::SandboxId,
+        job_id: sandboxwich_core::JobId,
+        spec: &SandboxProvisionSpec,
+        request: AgentCommandRequest,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<sandboxwich_core::AgentCommandResult> {
+        match self {
+            Self::DryRun(provider) => {
+                provider.exec_handoff_with_job_id(sandbox_id, job_id, spec, request, cancelled)
+            }
+            Self::Apply(provider) => {
+                provider.exec_handoff_with_job_id(sandbox_id, job_id, spec, request, cancelled)
+            }
+            Self::Cloudflare(provider) => {
+                provider.exec_handoff_with_job_id(sandbox_id, job_id, spec, request, cancelled)
+            }
         }
     }
 
@@ -793,6 +847,9 @@ impl SandboxProvider for RuntimeProvider {
                 provider.run_isolated_resident_process(spec, cancelled, observe)
             }
             Self::Apply(provider) => {
+                provider.run_isolated_resident_process(spec, cancelled, observe)
+            }
+            Self::Cloudflare(provider) => {
                 provider.run_isolated_resident_process(spec, cancelled, observe)
             }
         }
@@ -824,6 +881,14 @@ impl SandboxProvider for RuntimeProvider {
                 compiler_cache_identity,
                 cancelled,
             ),
+            Self::Cloudflare(provider) => provider.materialize_file(
+                sandbox_id,
+                destination,
+                expected_sha256,
+                content,
+                compiler_cache_identity,
+                cancelled,
+            ),
         }
     }
 
@@ -835,6 +900,9 @@ impl SandboxProvider for RuntimeProvider {
         match self {
             Self::DryRun(provider) => provider.read_apex_task_instructions(sandbox_id, cancelled),
             Self::Apply(provider) => provider.read_apex_task_instructions(sandbox_id, cancelled),
+            Self::Cloudflare(provider) => {
+                provider.read_apex_task_instructions(sandbox_id, cancelled)
+            }
         }
     }
 
@@ -847,6 +915,9 @@ impl SandboxProvider for RuntimeProvider {
         match self {
             Self::DryRun(provider) => provider.create_snapshot(sandbox_id, snapshot_id, cancelled),
             Self::Apply(provider) => provider.create_snapshot(sandbox_id, snapshot_id, cancelled),
+            Self::Cloudflare(provider) => {
+                provider.create_snapshot(sandbox_id, snapshot_id, cancelled)
+            }
         }
     }
 
@@ -873,6 +944,13 @@ impl SandboxProvider for RuntimeProvider {
                 spec,
                 cancelled,
             ),
+            Self::Cloudflare(provider) => provider.fork(
+                parent_sandbox_id,
+                child_sandbox_id,
+                snapshot_id,
+                spec,
+                cancelled,
+            ),
         }
     }
 
@@ -886,6 +964,7 @@ impl SandboxProvider for RuntimeProvider {
         match self {
             Self::DryRun(provider) => provider.resume(sandbox_id, snapshot_id, spec, cancelled),
             Self::Apply(provider) => provider.resume(sandbox_id, snapshot_id, spec, cancelled),
+            Self::Cloudflare(provider) => provider.resume(sandbox_id, snapshot_id, spec, cancelled),
         }
     }
 
@@ -898,6 +977,7 @@ impl SandboxProvider for RuntimeProvider {
         match self {
             Self::DryRun(provider) => provider.stop(sandbox_id, spec, cancelled),
             Self::Apply(provider) => provider.stop(sandbox_id, spec, cancelled),
+            Self::Cloudflare(provider) => provider.stop(sandbox_id, spec, cancelled),
         }
     }
 
@@ -905,6 +985,7 @@ impl SandboxProvider for RuntimeProvider {
         match self {
             Self::DryRun(provider) => provider.delete_home(home_id, cancelled),
             Self::Apply(provider) => provider.delete_home(home_id, cancelled),
+            Self::Cloudflare(provider) => provider.delete_home(home_id, cancelled),
         }
     }
 }
@@ -1059,6 +1140,7 @@ async fn main() -> anyhow::Result<()> {
                 )?,
                 args.provider_mode,
             );
+            let capabilities = capabilities_for_worker_provider(&capabilities, &args.provider);
             let mut labels: BTreeMap<_, _> = args.label.into_iter().collect();
             add_placement_proof_labels(&mut labels, args.provider_mode, None, false);
             let response = with_retries("register worker", API_RETRY_ATTEMPTS, || {
@@ -1135,6 +1217,17 @@ async fn main() -> anyhow::Result<()> {
             print_json::<LeaseResponse>(response).await?;
         }
         Command::Run(args) => {
+            anyhow::ensure!(
+                args.provider.runtime_provider != RuntimeProviderKind::Cloudflare
+                    || args.provider.provider_mode == ProviderModeArg::Apply,
+                "Cloudflare runtime provider requires --provider-mode apply"
+            );
+            let worker_provider =
+                if args.provider.runtime_provider == RuntimeProviderKind::Cloudflare {
+                    "cloudflare".to_string()
+                } else {
+                    args.worker_provider.clone()
+                };
             let isolation_profile = args.provider.provider.isolation_profile;
             let runtime_class_name = args.provider.provider.runtime_class_name.as_deref();
             let fqdn_egress_backend = args.provider.provider.cilium_fqdn_egress
@@ -1165,6 +1258,7 @@ async fn main() -> anyhow::Result<()> {
                 )?,
                 args.provider.provider_mode,
             );
+            let capabilities = capabilities_for_worker_provider(&capabilities, &worker_provider);
             let mut labels: BTreeMap<_, _> = args.label.into_iter().collect();
             labels.insert(
                 "sandbox_namespace".into(),
@@ -1205,7 +1299,7 @@ async fn main() -> anyhow::Result<()> {
                     &client,
                     &api,
                     args.name.clone(),
-                    args.worker_provider.clone(),
+                    worker_provider.clone(),
                     capabilities.clone(),
                     labels.clone(),
                     args.max_concurrent_jobs,
@@ -1535,6 +1629,15 @@ fn apply_provider_from_args(args: ProviderApplyArgs) -> anyhow::Result<Kubernete
 }
 
 fn runtime_provider_from_args(args: RuntimeProviderArgs) -> anyhow::Result<RuntimeProvider> {
+    if args.runtime_provider == RuntimeProviderKind::Cloudflare {
+        anyhow::ensure!(
+            args.provider_mode == ProviderModeArg::Apply,
+            "Cloudflare runtime provider requires --provider-mode apply"
+        );
+        return Ok(RuntimeProvider::Cloudflare(CloudflareSandboxProvider::new(
+            CloudflareConfig::from_env()?,
+        )?));
+    }
     validate_apex_trusted_supervisor_config(&args.provider)?;
     if matches!(args.provider_mode, ProviderModeArg::Apply) {
         require_explicit_runtime_image_for_apply(&args.provider)?;
@@ -3864,8 +3967,9 @@ fn execute_job_with_reporter(
             // missing, so a defaulted spec that drifts from what actually provisioned the
             // pod would apply against an immutable Pod field and hard-fail every command.
             let spec = required_provision_spec_from_payload(&job.payload)?;
-            let result = provider.exec_handoff(
+            let result = provider.exec_handoff_with_job_id(
                 sandbox_id,
+                job.id,
                 &spec,
                 agent_request_from_payload(&job.payload)?,
                 cancelled,
@@ -4015,7 +4119,7 @@ fn execute_job_with_reporter(
             // control plane recording a "stopped" sandbox that keeps running.
             provider.stop(sandbox_id, &teardown_spec, cancelled)?;
             Ok(WorkerJobOutcome::Complete(WorkerJobResult::StopSandbox {
-                provider: "kubernetes".to_string(),
+                provider: provider.provider_name().to_string(),
                 sandbox_id,
             }))
         }
@@ -4047,7 +4151,7 @@ fn execute_job_with_reporter(
                 })?;
             provider.delete_home(home_id, cancelled)?;
             Ok(WorkerJobOutcome::Complete(WorkerJobResult::DeleteHome {
-                provider: "kubernetes".to_string(),
+                provider: provider.provider_name().to_string(),
                 home_id,
             }))
         }
@@ -4371,6 +4475,16 @@ fn teardown_spec_from_payload(
     };
     Ok(provider::SandboxTeardownSpec {
         delete_gke_fqdn_policy,
+        provider_external_id: payload
+            .get("provisionSpec")
+            .and_then(|spec| spec.get("provider_external_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        provider_routing_scope: payload
+            .get("provisionSpec")
+            .and_then(|spec| spec.get("provider_routing_scope"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -4485,6 +4599,21 @@ fn capabilities_for_provider_mode(
         });
     }
     capabilities
+}
+
+fn capabilities_for_worker_provider(
+    capabilities: &[WorkerCapability],
+    provider: &str,
+) -> Vec<WorkerCapability> {
+    if provider.eq_ignore_ascii_case("cloudflare") {
+        capabilities
+            .iter()
+            .filter(|capability| matches!(capability, WorkerCapability::ProvisionSandbox))
+            .cloned()
+            .collect()
+    } else {
+        capabilities.to_vec()
+    }
 }
 
 fn add_provider_isolated_resident_process_label(

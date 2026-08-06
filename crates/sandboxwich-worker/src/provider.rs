@@ -45,6 +45,9 @@ use uuid::Uuid;
 
 use crate::egress_gateway::EgressGatewayPolicy;
 
+mod cloudflare;
+pub use cloudflare::{CloudflareConfig, CloudflareSandboxProvider};
+
 fn sha256_hex(content: &[u8]) -> String {
     format!("{:x}", Sha256::digest(content))
 }
@@ -276,9 +279,11 @@ const CILIUM_FQDN_RESOURCE_KIND: &str = "ciliumnetworkpolicy.cilium.io";
 /// enforced by the per-sandbox egress gateway or by Cilium `toFQDNs`.
 const FQDN_EGRESS_PORTS: [u16; 2] = [80, 443];
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct SandboxTeardownSpec {
     pub(crate) delete_gke_fqdn_policy: bool,
+    pub(crate) provider_external_id: Option<String>,
+    pub(crate) provider_routing_scope: Option<String>,
 }
 
 fn kubectl_optional_resource_type_is_missing(stderr: &str) -> bool {
@@ -462,6 +467,9 @@ pub struct IsolatedResidentProcessResult {
 }
 
 pub trait SandboxProvider {
+    fn provider_name(&self) -> &'static str {
+        "kubernetes"
+    }
     fn capability_report(&self) -> ProviderCapabilityReport;
     fn health_report(&self) -> ProviderHealthReport;
     fn provision(
@@ -499,6 +507,16 @@ pub trait SandboxProvider {
         request: AgentCommandRequest,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<AgentCommandResult>;
+    fn exec_handoff_with_job_id(
+        &self,
+        sandbox_id: SandboxId,
+        _job_id: sandboxwich_core::JobId,
+        spec: &SandboxProvisionSpec,
+        request: AgentCommandRequest,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<AgentCommandResult> {
+        self.exec_handoff(sandbox_id, spec, request, cancelled)
+    }
     fn run_isolated_resident_process(
         &self,
         spec: &IsolatedResidentProcessSpec,

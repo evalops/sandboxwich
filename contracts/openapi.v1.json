@@ -400,6 +400,16 @@
               }
             ]
           },
+          "provider_preference": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProviderPreference"
+              }
+            ]
+          },
           "runtime_profile": {
             "oneOf": [
               {
@@ -1245,6 +1255,14 @@
           "succeeded",
           "failed",
           "cancelled"
+        ],
+        "type": "string"
+      },
+      "ProviderPreference": {
+        "enum": [
+          "any",
+          "kubernetes",
+          "cloudflare"
         ],
         "type": "string"
       },
@@ -2148,11 +2166,29 @@
       },
       "SandboxPlacementProof": {
         "properties": {
+          "capabilities": {
+            "items": {
+              "$ref": "#/components/schemas/WorkerCapability"
+            },
+            "type": "array"
+          },
+          "external_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "provider": {
             "type": "string"
           },
           "provider_mode": {
             "type": "string"
+          },
+          "routing_scope": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "runtime_image": {
             "type": "string"
@@ -2181,6 +2217,21 @@
           "network_egress": {
             "$ref": "#/components/schemas/NetworkEgress"
           },
+          "provider_external_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_preference": {
+            "$ref": "#/components/schemas/ProviderPreference"
+          },
+          "provider_routing_scope": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "runtime_profile": {
             "$ref": "#/components/schemas/SandboxRuntimeProfile"
           },
@@ -2190,6 +2241,12 @@
               "$ref": "#/components/schemas/SandboxSecretMount"
             },
             "type": "array"
+          },
+          "tenant_id": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "workspace_mode": {
             "$ref": "#/components/schemas/WorkspaceMode"

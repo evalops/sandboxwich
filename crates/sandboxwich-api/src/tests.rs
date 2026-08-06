@@ -543,6 +543,8 @@ fn authoritative_job_enrichment_overwrites_caller_placement_metadata() {
             workspace_mode: sandbox.workspace_mode,
             runtime_profile: sandbox.runtime_profile,
             execution_class: ExecutionClass::SandboxedContainer,
+            tenant_id: Some("tenant".into()),
+            ..SandboxProvisionSpec::default()
         }
     );
 }
@@ -558,6 +560,7 @@ fn apex_runtime_profile_requires_pinned_image_and_deny_by_default_egress() {
         network_egress: Some(network_egress),
         workspace_mode: None,
         runtime_profile: Some(SandboxRuntimeProfile::ApexTrustedSupervisorV1),
+        provider_preference: None,
         ttl_seconds: None,
         max_lifetime_seconds: None,
         idle_ttl_seconds: None,
@@ -618,6 +621,7 @@ fn apex_runtime_profile_requires_pinned_image_and_deny_by_default_egress() {
         network_egress: None,
         workspace_mode: None,
         runtime_profile: None,
+        provider_preference: None,
         ttl_seconds: None,
         max_lifetime_seconds: None,
         idle_ttl_seconds: None,
@@ -639,6 +643,7 @@ fn snapshot_fork_request_rejects_placement_mismatches() {
             workspace_mode: WorkspaceMode::Persistent,
             runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
             execution_class: ExecutionClass::SandboxedContainer,
+            ..SandboxProvisionSpec::default()
         },
         execution_class: ExecutionClass::SandboxedContainer,
     };
@@ -727,6 +732,7 @@ fn apex_profile_bound_jobs_only_match_the_exact_profile_worker_image() {
                 workspace_mode: WorkspaceMode::Persistent,
                 runtime_profile: SandboxRuntimeProfile::ApexTrustedSupervisorV1,
                 execution_class: ExecutionClass::SandboxedContainer,
+                ..SandboxProvisionSpec::default()
             }
         }),
         required_capability: WorkerCapability::MaterializeFile,
@@ -2710,6 +2716,7 @@ async fn snapshot_restore_claim_rejects_expired_ready_source() {
             workspace_mode: sandbox.workspace_mode.clone(),
             runtime_profile: sandbox.runtime_profile.clone(),
             execution_class: ExecutionClass::DevelopmentContainer,
+            ..SandboxProvisionSpec::default()
         }),
         created_at: now,
         ready_at: Some(now),
@@ -2769,6 +2776,7 @@ async fn snapshot_restore_claim_retains_authoritative_placement_after_source_del
         workspace_mode: sandbox.workspace_mode.clone(),
         runtime_profile: sandbox.runtime_profile.clone(),
         execution_class: ExecutionClass::DevelopmentContainer,
+        ..SandboxProvisionSpec::default()
     };
     let snapshot = Snapshot {
         id: SnapshotId::new(),
