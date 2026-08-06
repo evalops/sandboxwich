@@ -286,13 +286,21 @@ fn maestro_hosted_runner_request_for_organization(
             ("MAESTRO_DEFAULT_MODEL".into(), "evalops/gpt-5.5".into()),
             (
                 "MAESTRO_RESIDENT_CONTRACT_REVISION".into(),
-                "maestro-resident-model-ready-v2".into(),
+                "maestro-resident-model-ready-v3".into(),
             ),
             (
                 "MAESTRO_LLM_GATEWAY_URL".into(),
                 MAESTRO_HOSTED_RUNNER_GATEWAY_BASE_URL.into(),
             ),
             ("MAESTRO_LLM_GATEWAY_ORG_ID".into(), organization_id.into()),
+            (
+                "MAESTRO_RENDEZVOUS_ACTIVATION_ID".into(),
+                "8c463649-1bd8-54d2-8fe4-0d84a4c6a434".into(),
+            ),
+            (
+                "MAESTRO_RENDEZVOUS_NONCE".into(),
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7_u8; 32]),
+            ),
         ]),
         restart_policy: ResidentProcessRestartPolicy::OnFailure,
         expected_generation: 0,
@@ -481,7 +489,7 @@ async fn maestro_hosted_runner_rejects_drifted_model_cohort() {
     let mut wrong_revision = request.clone();
     wrong_revision.env.insert(
         "MAESTRO_RESIDENT_CONTRACT_REVISION".into(),
-        "maestro-resident-model-ready-v3".into(),
+        "maestro-resident-model-ready-v4".into(),
     );
     let response = client
         .put(&endpoint)
@@ -517,6 +525,109 @@ async fn maestro_hosted_runner_rejects_drifted_model_cohort() {
     let response = client
         .put(&endpoint)
         .json(&unqualified_model)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let error: ErrorEnvelope = response.json().await.unwrap();
+    assert_eq!(error.code, "maestro_env_bindings_invalid");
+}
+
+#[tokio::test]
+async fn maestro_hosted_runner_rejects_drifted_rendezvous_cohort() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir
+                .path()
+                .join("maestro-rendezvous-cohort.db")
+                .display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let client = server.client();
+    let sandbox: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
+            name: Some("maestro-rendezvous-cohort".into()),
+            template: Some("ubuntu-dev".into()),
+            memory_limit: None,
+            network_egress: Some(NetworkEgress::DenyAll),
+            workspace_mode: Some(WorkspaceMode::Persistent),
+            runtime_profile: None,
+            execution_class: None,
+            ttl_seconds: Some(3600),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sandbox_id = sandbox.sandbox.id;
+    let endpoint = format!(
+        "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+        server.base_url
+    );
+    let request = maestro_hosted_runner_request(sandbox_id, "workspace-1", "runner-session-1");
+
+    let mut legacy_revision_with_activation = request.clone();
+    legacy_revision_with_activation.env.insert(
+        "MAESTRO_RESIDENT_CONTRACT_REVISION".into(),
+        "maestro-resident-model-ready-v2".into(),
+    );
+    let response = client
+        .put(&endpoint)
+        .json(&legacy_revision_with_activation)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let error: ErrorEnvelope = response.json().await.unwrap();
+    assert_eq!(error.code, "maestro_env_bindings_invalid");
+
+    let mut missing_nonce = request.clone();
+    missing_nonce.env.remove("MAESTRO_RENDEZVOUS_NONCE");
+    let response = client
+        .put(&endpoint)
+        .json(&missing_nonce)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let error: ErrorEnvelope = response.json().await.unwrap();
+    assert_eq!(error.code, "maestro_env_bindings_invalid");
+
+    let mut malformed_activation_id = request.clone();
+    malformed_activation_id.env.insert(
+        "MAESTRO_RENDEZVOUS_ACTIVATION_ID".into(),
+        "not-an-activation-id".into(),
+    );
+    let response = client
+        .put(&endpoint)
+        .json(&malformed_activation_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let error: ErrorEnvelope = response.json().await.unwrap();
+    assert_eq!(error.code, "maestro_env_bindings_invalid");
+
+    let mut wrong_nonce_size = request;
+    wrong_nonce_size.env.insert(
+        "MAESTRO_RENDEZVOUS_NONCE".into(),
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7_u8; 31]),
+    );
+    let response = client
+        .put(&endpoint)
+        .json(&wrong_nonce_size)
         .send()
         .await
         .unwrap();
@@ -563,6 +674,32 @@ async fn maestro_hosted_runner_reports_pending_placement_before_dispatch() {
         .json()
         .await
         .unwrap();
+
+    let mut legacy_request =
+        maestro_hosted_runner_request(sandbox.sandbox.id, "workspace-1", "runner-session-1");
+    legacy_request
+        .env
+        .remove("MAESTRO_RENDEZVOUS_ACTIVATION_ID");
+    legacy_request.env.remove("MAESTRO_RENDEZVOUS_NONCE");
+    legacy_request.env.insert(
+        "MAESTRO_RESIDENT_CONTRACT_REVISION".into(),
+        "maestro-resident-model-ready-v2".into(),
+    );
+    let legacy_response = client
+        .put(format!(
+            "{}/sandboxes/{}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&legacy_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        legacy_response.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let legacy_error: ErrorEnvelope = legacy_response.json().await.unwrap();
+    assert_eq!(legacy_error.code, "resident_sidecar_placement_pending");
 
     let response = client
         .put(format!(

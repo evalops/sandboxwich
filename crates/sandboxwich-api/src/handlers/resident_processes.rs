@@ -18,6 +18,7 @@ use axum::Json;
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use sandboxwich_core::*;
 use serde_json::json;
@@ -28,11 +29,37 @@ use std::time::Duration;
 use uuid::Uuid;
 
 const MAESTRO_RESIDENT_CONTRACT_REVISION_V2: &str = "maestro-resident-model-ready-v2";
+const MAESTRO_RESIDENT_CONTRACT_REVISION_V3: &str = "maestro-resident-model-ready-v3";
 
 fn is_qualified_maestro_model(model: &str) -> bool {
     model
         .strip_prefix("evalops/")
         .is_some_and(|name| !name.is_empty() && name.trim() == name)
+}
+
+fn valid_maestro_rendezvous_bindings(env: &std::collections::BTreeMap<String, String>) -> bool {
+    let activation = (
+        env.get("MAESTRO_RENDEZVOUS_ACTIVATION_ID"),
+        env.get("MAESTRO_RENDEZVOUS_NONCE"),
+    );
+    match env
+        .get("MAESTRO_RESIDENT_CONTRACT_REVISION")
+        .map(String::as_str)
+    {
+        Some(MAESTRO_RESIDENT_CONTRACT_REVISION_V2) => activation == (None, None),
+        Some(MAESTRO_RESIDENT_CONTRACT_REVISION_V3) => {
+            let (Some(activation_id), Some(nonce)) = activation else {
+                return false;
+            };
+            let activation_id_is_canonical = Uuid::parse_str(activation_id)
+                .is_ok_and(|parsed| parsed != Uuid::nil() && parsed.to_string() == *activation_id);
+            let nonce_is_canonical = URL_SAFE_NO_PAD.decode(nonce).is_ok_and(|decoded| {
+                decoded.len() == 32 && URL_SAFE_NO_PAD.encode(decoded) == *nonce
+            });
+            activation_id_is_canonical && nonce_is_canonical
+        }
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -630,6 +657,12 @@ pub(crate) async fn put_resident_process(
             "MAESTRO_RESIDENT_CONTRACT_REVISION",
             "MAESTRO_LLM_GATEWAY_URL",
             "MAESTRO_LLM_GATEWAY_ORG_ID",
+            // Runner Host supplies this one-time pair only after the
+            // activation nonce hash is durable. The values remain private to
+            // the resident environment and are validated as one exact cohort
+            // below; either key on its own fails closed.
+            "MAESTRO_RENDEZVOUS_ACTIVATION_ID",
+            "MAESTRO_RENDEZVOUS_NONCE",
         ];
         const MAX_ENV_VALUE_BYTES: usize = 512;
         let env_ok = request.env.iter().all(|(key, value)| {
@@ -666,16 +699,12 @@ pub(crate) async fn put_resident_process(
             && !request.env.contains_key("MAESTRO_LLM_GATEWAY_TOKEN")
             && request
                 .env
-                .get("MAESTRO_RESIDENT_CONTRACT_REVISION")
-                .map(String::as_str)
-                == Some(MAESTRO_RESIDENT_CONTRACT_REVISION_V2)
-            && request
-                .env
                 .get("MAESTRO_MODEL")
                 .zip(request.env.get("MAESTRO_DEFAULT_MODEL"))
                 .is_some_and(|(model, default_model)| {
                     model == default_model && is_qualified_maestro_model(model)
                 })
+            && valid_maestro_rendezvous_bindings(&request.env)
             && request
                 .env
                 .get("MAESTRO_SANDBOX_ID")
