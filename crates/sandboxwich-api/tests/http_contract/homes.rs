@@ -20,94 +20,6 @@ fn persistent_sandbox(name: &str) -> CreateSandboxRequest {
 }
 
 #[tokio::test]
-async fn logical_home_creation_is_replayable_and_tenant_scoped() {
-    let data_dir = tempfile::tempdir().unwrap();
-    let database_url = format!(
-        "sqlite://{}",
-        data_dir.path().join("logical-home.db").display()
-    );
-    let server = TestServer::start(database_url, Some(data_dir)).await;
-    let client = server.client();
-    let request = CreateHomeRequest {
-        logical_key: Some("dex-computer-v2:abc123".to_string()),
-    };
-
-    let first_response = client
-        .post(format!("{}/homes", server.base_url))
-        .header("idempotency-key", "logical-home-first")
-        .json(&request)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(first_response.status(), StatusCode::CREATED);
-    let first: HomeResponse = first_response.json().await.unwrap();
-
-    let duplicate_response = client
-        .post(format!("{}/homes", server.base_url))
-        .header("idempotency-key", "logical-home-lost-response-retry")
-        .json(&request)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(duplicate_response.status(), StatusCode::OK);
-    let duplicate: HomeResponse = duplicate_response.json().await.unwrap();
-    assert_eq!(duplicate.home.id, first.home.id);
-
-    let mounted: SandboxResponse = client
-        .post(format!(
-            "{}/homes/{}/sandboxes",
-            server.base_url, first.home.id
-        ))
-        .json(&persistent_sandbox("logical-home-runtime"))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let after_mount: HomeResponse = client
-        .post(format!("{}/homes", server.base_url))
-        .header("idempotency-key", "logical-home-runtime-reconnect")
-        .json(&request)
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(after_mount.mounted_sandbox_id, Some(mounted.sandbox.id));
-
-    let tenant_b = reqwest::Client::builder()
-        .default_headers(
-            [(
-                reqwest::header::AUTHORIZATION,
-                format!("Bearer {TEST_TENANT_B_TOKEN}").parse().unwrap(),
-            )]
-            .into_iter()
-            .collect(),
-        )
-        .build()
-        .unwrap();
-    let tenant_b_home: HomeResponse = tenant_b
-        .post(format!("{}/homes", server.base_url))
-        .header("idempotency-key", "logical-home-tenant-b")
-        .json(&request)
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_ne!(tenant_b_home.home.id, first.home.id);
-}
-
-#[tokio::test]
 async fn managed_home_is_tenant_scoped_and_single_mount() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!(
@@ -316,4 +228,145 @@ async fn managed_home_delete_is_explicit_and_asynchronous() {
             .status(),
         StatusCode::CONFLICT
     );
+}
+
+#[tokio::test]
+async fn home_external_key_resolves_the_same_home_and_reports_its_mount() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("home-external-key.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+    let request = CreateHomeRequest {
+        external_key: Some("dex-computer:0a1b2c3d4e5f6071".into()),
+    };
+
+    let first = client
+        .post(format!("{}/homes", server.base_url))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first: HomeResponse = first.json().await.unwrap();
+    assert_eq!(
+        first.home.external_key.as_deref(),
+        Some("dex-computer:0a1b2c3d4e5f6071")
+    );
+    assert!(first.mounted_sandbox.is_none());
+
+    // A repeat create with the same key is an upsert: 200 with the same home,
+    // never a duplicate.
+    let second = client
+        .post(format!("{}/homes", server.base_url))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let second: HomeResponse = second.json().await.unwrap();
+    assert_eq!(second.home.id, first.home.id);
+
+    // Another tenant using the identical key gets its own home.
+    let tenant_b = reqwest::Client::builder()
+        .default_headers(
+            [(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {TEST_TENANT_B_TOKEN}").parse().unwrap(),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .build()
+        .unwrap();
+    let other: HomeResponse = tenant_b
+        .post(format!("{}/homes", server.base_url))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_ne!(other.home.id, first.home.id);
+
+    // Once a sandbox claims the home's mount, both the upsert response and
+    // get_home report it, so a client that lost its own mapping can reattach.
+    let mounted: SandboxResponse = client
+        .post(format!(
+            "{}/homes/{}/sandboxes",
+            server.base_url, first.home.id
+        ))
+        .json(&persistent_sandbox("external-key-mount"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let resolved: HomeResponse = client
+        .post(format!("{}/homes", server.base_url))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mount = resolved
+        .mounted_sandbox
+        .expect("upsert response must report the live mount");
+    assert_eq!(mount.sandbox_id, mounted.sandbox.id);
+    let fetched: HomeResponse = client
+        .get(format!("{}/homes/{}", server.base_url, first.home.id))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        fetched.mounted_sandbox.map(|mount| mount.sandbox_id),
+        Some(mounted.sandbox.id)
+    );
+}
+
+#[tokio::test]
+async fn home_external_key_validation_fails_closed() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("home-external-key-invalid.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+    for bad in [
+        "has whitespace".to_string(),
+        "slash/es".to_string(),
+        String::new(),
+        "x".repeat(129),
+    ] {
+        let response = client
+            .post(format!("{}/homes", server.base_url))
+            .json(&CreateHomeRequest {
+                external_key: Some(bad),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 }

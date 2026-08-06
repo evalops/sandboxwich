@@ -1182,25 +1182,41 @@ pub struct Home {
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Caller-supplied stable identity for this home, unique per tenant.
+    /// Creating a home with an `external_key` that already exists returns
+    /// the existing home instead of minting a new one, so clients that lose
+    /// a create response (or their own state) always re-resolve the same
+    /// logical home.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CreateHomeRequest {
-    /// Stable, opaque identity supplied by the authorized control plane.
-    /// Repeating it in the same tenant returns the existing home.
+    /// See [`Home::external_key`]. Optional: omitted keeps today's
+    /// mint-a-new-home-per-request behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub logical_key: Option<String>,
+    pub external_key: Option<String>,
+}
+
+/// The sandbox currently mounted on a home, reported raw (mount row +
+/// sandbox state) so a client that lost its own mapping can decide whether
+/// to reattach (live states) or create a replacement (archived/error rows,
+/// which the next mount claim lazily cleans up).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct HomeMount {
+    pub sandbox_id: SandboxId,
+    pub sandbox_state: SandboxState,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct HomeResponse {
     pub ok: bool,
     pub home: Home,
-    /// The tenant-scoped live sandbox currently attached to this home, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mounted_sandbox_id: Option<SandboxId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation: Option<Operation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mounted_sandbox: Option<HomeMount>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]

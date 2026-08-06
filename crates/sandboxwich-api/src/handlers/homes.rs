@@ -14,76 +14,109 @@ use sandboxwich_core::*;
 use sqlx::{AnyConnection, Row};
 use uuid::Uuid;
 
-#[utoipa::path(post, path = "/v1/homes", request_body = CreateHomeRequest, responses((status = 201, body = HomeResponse)))]
+#[utoipa::path(post, path = "/v1/homes", request_body = CreateHomeRequest, responses((status = 201, body = HomeResponse), (status = 200, body = HomeResponse)))]
 pub(crate) async fn create_home(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
     Json(request): Json<CreateHomeRequest>,
 ) -> Result<(StatusCode, Json<HomeResponse>), ApiError> {
-    let logical_key = validate_logical_key(request.logical_key.as_deref())?;
+    let external_key = request
+        .external_key
+        .as_deref()
+        .map(validate_home_external_key)
+        .transpose()?;
+    if let Some(key) = external_key
+        && let Some(existing) = fetch_home_by_external_key(&state.db, key, &ctx.tenant_id).await?
+    {
+        let mounted_sandbox = fetch_home_mount(&state.db, existing.id, &ctx.tenant_id).await?;
+        return Ok((
+            StatusCode::OK,
+            Json(HomeResponse {
+                ok: true,
+                home: existing,
+                operation: None,
+                mounted_sandbox,
+            }),
+        ));
+    }
     let now = Utc::now();
     let home = Home {
         id: HomeId::new(),
-        tenant_id: ctx.tenant_id,
+        tenant_id: ctx.tenant_id.clone(),
         state: HomeState::Ready,
         created_at: now,
         updated_at: now,
         error: None,
+        external_key: external_key.map(str::to_string),
     };
     let sql = format!(
-        "insert into homes (id, tenant_id, logical_key, state, created_at, updated_at, error)
-         values ({}) on conflict (tenant_id, logical_key) do nothing",
+        "insert into homes (id, tenant_id, state, created_at, updated_at, error, external_key) values ({})",
         state.db.placeholders(7)
     );
     let inserted = sqlx::query(&sql)
         .bind(home.id.to_string())
         .bind(&home.tenant_id)
-        .bind(logical_key)
         .bind(home.state.as_db_str())
         .bind(home.created_at.to_rfc3339())
         .bind(home.updated_at.to_rfc3339())
         .bind(&home.error)
+        .bind(&home.external_key)
         .execute(&state.db.pool)
-        .await?;
-    let (status, home) = if inserted.rows_affected() == 1 {
-        (StatusCode::CREATED, home)
-    } else {
-        let logical_key = logical_key.ok_or_else(|| {
-            ApiError::internal("home insert without a logical key did not create a row")
-        })?;
-        (
-            StatusCode::OK,
-            fetch_home_by_logical_key(&state.db, logical_key, &home.tenant_id).await?,
-        )
-    };
-    let mounted_sandbox_id = fetch_mounted_sandbox_id(&state.db, home.id, &home.tenant_id).await?;
+        .await;
+    if let Err(insert_error) = inserted {
+        // Two concurrent creates with the same external key race on the
+        // unique index; the loser re-resolves the winner's home instead of
+        // surfacing the constraint violation. Any other insert failure (or a
+        // failure without an external key to re-resolve by) propagates.
+        if let Some(key) = &home.external_key
+            && let Some(existing) =
+                fetch_home_by_external_key(&state.db, key, &ctx.tenant_id).await?
+        {
+            let mounted_sandbox = fetch_home_mount(&state.db, existing.id, &ctx.tenant_id).await?;
+            return Ok((
+                StatusCode::OK,
+                Json(HomeResponse {
+                    ok: true,
+                    home: existing,
+                    operation: None,
+                    mounted_sandbox,
+                }),
+            ));
+        }
+        return Err(insert_error.into());
+    }
     Ok((
-        status,
+        StatusCode::CREATED,
         Json(HomeResponse {
             ok: true,
             home,
-            mounted_sandbox_id,
             operation: None,
+            mounted_sandbox: None,
         }),
     ))
 }
 
-fn validate_logical_key(logical_key: Option<&str>) -> Result<Option<&str>, ApiError> {
-    let Some(logical_key) = logical_key else {
-        return Ok(None);
-    };
-    if logical_key.is_empty()
-        || logical_key.len() > 128
-        || !logical_key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+const HOME_EXTERNAL_KEY_MAX_LEN: usize = 128;
+
+/// External keys are caller-derived identifiers (e.g. a hash of a tenant
+/// principal), not free text: bounded length, restricted charset, no
+/// whitespace. Fail-closed validation keeps them safe to index, log, and
+/// echo back verbatim.
+fn validate_home_external_key(raw: &str) -> Result<&str, ApiError> {
+    if raw.is_empty() || raw.len() > HOME_EXTERNAL_KEY_MAX_LEN {
+        return Err(ApiError::bad_request(format!(
+            "external_key must be 1..={HOME_EXTERNAL_KEY_MAX_LEN} characters"
+        )));
+    }
+    if !raw
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
     {
-        return Err(ApiError::bad_request_code(
-            "invalid_home_logical_key",
-            "home logical_key must be 1-128 ASCII letters, digits, dots, underscores, colons, or hyphens",
+        return Err(ApiError::bad_request(
+            "external_key may only contain ASCII alphanumerics, '.', '_', ':', and '-'",
         ));
     }
-    Ok(Some(logical_key))
+    Ok(raw)
 }
 
 #[utoipa::path(get, path = "/v1/homes/{home_id}", params(("home_id" = Uuid, Path)), responses((status = 200, body = HomeResponse), (status = 404)))]
@@ -93,12 +126,12 @@ pub(crate) async fn get_home(
     Path(home_id): Path<Uuid>,
 ) -> Result<Json<HomeResponse>, ApiError> {
     let home = fetch_home(&state.db, HomeId(home_id), &ctx.tenant_id).await?;
-    let mounted_sandbox_id = fetch_mounted_sandbox_id(&state.db, home.id, &ctx.tenant_id).await?;
+    let mounted_sandbox = fetch_home_mount(&state.db, home.id, &ctx.tenant_id).await?;
     Ok(Json(HomeResponse {
         ok: true,
         home,
-        mounted_sandbox_id,
         operation: None,
+        mounted_sandbox,
     }))
 }
 
@@ -207,8 +240,8 @@ pub(crate) async fn delete_home(
         Json(HomeResponse {
             ok: true,
             home,
-            mounted_sandbox_id: None,
             operation: Some(operation_from_job(&job)?),
+            mounted_sandbox: None,
         }),
     ))
 }
@@ -253,7 +286,7 @@ pub(crate) async fn fetch_home(
     tenant_id: &str,
 ) -> Result<Home, ApiError> {
     let sql = format!(
-        "select id, tenant_id, state, created_at, updated_at, error from homes where id = {} and tenant_id = {}",
+        "select id, tenant_id, state, created_at, updated_at, error, external_key from homes where id = {} and tenant_id = {}",
         db.placeholder(1),
         db.placeholder(2)
     );
@@ -266,52 +299,58 @@ pub(crate) async fn fetch_home(
     row_to_home(row)
 }
 
-async fn fetch_home_by_logical_key(
+async fn fetch_home_by_external_key(
     db: &Database,
-    logical_key: &str,
+    external_key: &str,
     tenant_id: &str,
-) -> Result<Home, ApiError> {
+) -> Result<Option<Home>, ApiError> {
     let sql = format!(
-        "select id, tenant_id, state, created_at, updated_at, error from homes
-         where logical_key = {} and tenant_id = {}",
+        "select id, tenant_id, state, created_at, updated_at, error, external_key from homes where tenant_id = {} and external_key = {}",
         db.placeholder(1),
         db.placeholder(2)
     );
-    let row = sqlx::query(&sql)
-        .bind(logical_key)
+    sqlx::query(&sql)
         .bind(tenant_id)
+        .bind(external_key)
         .fetch_optional(&db.pool)
         .await?
-        .ok_or_else(|| ApiError::internal("logical home conflict row was not found"))?;
-    row_to_home(row)
+        .map(row_to_home)
+        .transpose()
 }
 
-async fn fetch_mounted_sandbox_id(
+/// Reports the sandbox currently holding this home's mount, if any, with its
+/// live state. Deliberately unfiltered: an `archived`/`error` mount row that
+/// has not yet been lazily cleaned up (see `claim_home_mount_on_connection`)
+/// is still reported, so the client's view matches what a mount claim would
+/// actually encounter.
+async fn fetch_home_mount(
     db: &Database,
     home_id: HomeId,
     tenant_id: &str,
-) -> Result<Option<SandboxId>, ApiError> {
+) -> Result<Option<HomeMount>, ApiError> {
     let sql = format!(
-        "select mounts.sandbox_id from sandbox_home_mounts mounts
-         join sandboxes on sandboxes.id = mounts.sandbox_id
-         where mounts.home_id = {} and mounts.tenant_id = {}
-           and sandboxes.state not in ('archived', 'error')
-         limit 1",
+        "select m.sandbox_id, s.state from sandbox_home_mounts m join sandboxes s on s.id = m.sandbox_id where m.home_id = {} and m.tenant_id = {}",
         db.placeholder(1),
         db.placeholder(2)
     );
-    let row = sqlx::query(&sql)
+    let Some(row) = sqlx::query(&sql)
         .bind(home_id.to_string())
         .bind(tenant_id)
         .fetch_optional(&db.pool)
-        .await?;
-    row.map(|row| {
-        let value: String = row.try_get("sandbox_id")?;
-        let id = Uuid::parse_str(&value)
-            .map_err(|_| ApiError::internal("invalid mounted sandbox id"))?;
-        Ok(SandboxId(id))
-    })
-    .transpose()
+        .await?
+    else {
+        return Ok(None);
+    };
+    let sandbox_id: String = row.try_get("sandbox_id")?;
+    let state: String = row.try_get("state")?;
+    Ok(Some(HomeMount {
+        sandbox_id: SandboxId(
+            Uuid::parse_str(&sandbox_id)
+                .map_err(|_| ApiError::internal("invalid mounted sandbox id"))?,
+        ),
+        sandbox_state: SandboxState::parse_db_str(&state)
+            .map_err(|error| ApiError::internal(error.to_string()))?,
+    }))
 }
 
 fn row_to_home(row: sqlx::any::AnyRow) -> Result<Home, ApiError> {
@@ -331,6 +370,7 @@ fn row_to_home(row: sqlx::any::AnyRow) -> Result<Home, ApiError> {
             .parse()
             .map_err(|_| ApiError::internal("invalid home updated_at"))?,
         error: row.try_get("error")?,
+        external_key: row.try_get("external_key")?,
     })
 }
 
