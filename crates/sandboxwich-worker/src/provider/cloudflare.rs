@@ -823,6 +823,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cloudflare_managed_home_is_attached_to_replacement_runtime() {
+        let provider = CloudflareSandboxProvider::for_test_with_replay_ledger();
+        let sandbox_id = SandboxId::new();
+        let home_id = HomeId::new();
+        let spec = SandboxProvisionSpec {
+            provider_preference: ProviderPreference::Cloudflare,
+            tenant_id: Some("org:workspace".into()),
+            workspace_mode: WorkspaceMode::Persistent,
+            ..Default::default()
+        };
+        let mut stages = Vec::new();
+
+        let handle = provider
+            .provision_home_staged(
+                sandbox_id,
+                home_id,
+                &spec,
+                &CancelSignal::never_cancelled(),
+                &mut |update| {
+                    stages.push(update.stage);
+                    Ok(())
+                },
+            )
+            .expect("Cloudflare must attach a managed home to a replacement runtime");
+
+        assert_eq!(handle.sandbox_id, sandbox_id);
+        assert_eq!(handle.metadata["homeId"], home_id.to_string());
+        assert_eq!(stages.last(), Some(&ProvisioningStage::SandboxReady));
+    }
+
+    #[test]
     fn cloudflare_provision_exec_stop_uses_external_identity_and_tenant_scope() {
         let provider = CloudflareSandboxProvider::for_test_with_replay_ledger();
         let mut spec = SandboxProvisionSpec {
