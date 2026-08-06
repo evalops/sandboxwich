@@ -127,24 +127,30 @@ trait CloudflareBridge: Send + Sync {
 struct HttpCloudflareBridge {
     config: CloudflareConfig,
     client: reqwest::Client,
+    runtime: Arc<tokio::runtime::Runtime>,
 }
 
 impl HttpCloudflareBridge {
     fn new(config: CloudflareConfig) -> anyhow::Result<Self> {
+        let runtime = Arc::new(
+            tokio::runtime::Runtime::new().context("failed to create Cloudflare Bridge runtime")?,
+        );
         let client = reqwest::Client::builder()
             .timeout(config.request_timeout)
             .build()
             .context("failed to build Cloudflare Bridge client")?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            runtime,
+        })
     }
 
     fn block_on<T>(
         &self,
         future: impl std::future::Future<Output = anyhow::Result<T>>,
     ) -> anyhow::Result<T> {
-        tokio::runtime::Runtime::new()
-            .context("failed to create Cloudflare Bridge runtime")?
-            .block_on(future)
+        self.runtime.block_on(future)
     }
 
     fn request(
