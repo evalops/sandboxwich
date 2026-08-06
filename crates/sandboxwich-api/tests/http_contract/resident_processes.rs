@@ -835,6 +835,19 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
     assert_eq!(proof.activation_id, activation_id);
     assert!(!proof.replayed);
     assert_eq!(proof.tuple_sha256.len(), 64);
+    assert_eq!(proof.resident_process_id, created.resident_process.id);
+    assert_eq!(proof.job_id, lease.job.id);
+    assert_eq!(
+        proof.authority_revision,
+        format!(
+            "maestro-authority:v1:{}:{}:{}",
+            starting_connection.placement_generation,
+            starting_connection.resident_process_generation,
+            starting_connection.lease_attempt,
+        )
+    );
+    assert!(proof.tuple_digest.starts_with("sha256:v1:"));
+    assert_eq!(proof.tuple_digest.len(), "sha256:v1:".len() + 64);
 
     server.restart(false).await;
     connection_binding_url = format!(
@@ -861,6 +874,10 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
         "an exact retry must return the durable proof"
     );
     assert_eq!(replay.tuple_sha256, proof.tuple_sha256);
+    assert_eq!(replay.resident_process_id, proof.resident_process_id);
+    assert_eq!(replay.job_id, proof.job_id);
+    assert_eq!(replay.authority_revision, proof.authority_revision);
+    assert_eq!(replay.tuple_digest, proof.tuple_digest);
 
     let concurrent_id = Uuid::now_v7();
     let mut concurrent = activation.clone();
@@ -883,6 +900,8 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
         .await
         .unwrap();
     assert_eq!(left.tuple_sha256, right.tuple_sha256);
+    assert_eq!(left.tuple_digest, right.tuple_digest);
+    assert_eq!(left.authority_revision, right.authority_revision);
     assert_ne!(left.replayed, right.replayed);
 
     let mut replay_mismatch = activation.clone();

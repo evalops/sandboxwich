@@ -2545,6 +2545,16 @@ pub struct MaestroHostedRunnerActivationValidationRequest {
 pub struct MaestroHostedRunnerActivationValidationResponse {
     pub ok: bool,
     pub activation_id: Uuid,
+    pub resident_process_id: ResidentProcessId,
+    pub job_id: JobId,
+    /// Versioned digest of the exact authoritative tuple consumed by
+    /// Platform's activation CAS.
+    #[schema(pattern = "^sha256:v1:[0-9a-f]{64}$")]
+    pub tuple_digest: String,
+    /// Versioned monotonic generation vector for the authority snapshot.
+    #[schema(pattern = "^maestro-authority:v1:[0-9]+:[0-9]+:[0-9]+$")]
+    pub authority_revision: String,
+    /// Legacy request-only digest retained for compatible replay detection.
     pub tuple_sha256: String,
     pub validated_at: DateTime<Utc>,
     pub replayed: bool,
