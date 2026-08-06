@@ -892,6 +892,36 @@ mod tests {
     }
 
     #[test]
+    fn cloudflare_command_capability_requires_durable_ledger_binding_marker() {
+        let base = |name: &str| match name {
+            "SANDBOXWICH_CLOUDFLARE_SANDBOX_URL" => Some("https://bridge.example".to_string()),
+            "SANDBOXWICH_CLOUDFLARE_SANDBOX_TOKEN" => Some("secret".to_string()),
+            _ => None,
+        };
+        let without_binding = CloudflareConfig::from_map(base).unwrap();
+        assert!(!without_binding.replay_ledger_configured);
+
+        let with_binding = CloudflareConfig::from_map(|name| match name {
+            "SANDBOXWICH_CLOUDFLARE_SANDBOX_URL" => Some("https://bridge.example".to_string()),
+            "SANDBOXWICH_CLOUDFLARE_SANDBOX_TOKEN" => Some("secret".to_string()),
+            "SANDBOXWICH_CLOUDFLARE_REPLAY_LEDGER_CONFIGURED" => Some("true".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert!(with_binding.replay_ledger_configured);
+
+        assert!(
+            CloudflareConfig::from_map(|name| match name {
+                "SANDBOXWICH_CLOUDFLARE_SANDBOX_URL" => Some("https://bridge.example".to_string()),
+                "SANDBOXWICH_CLOUDFLARE_SANDBOX_TOKEN" => Some("secret".to_string()),
+                "SANDBOXWICH_CLOUDFLARE_REPLAY_LEDGER_CONFIGURED" => Some("yes".to_string()),
+                _ => None,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
     fn cloudflare_provision_exec_stop_uses_external_identity_and_tenant_scope() {
         let provider = CloudflareSandboxProvider::for_test_with_replay_ledger();
         let mut spec = SandboxProvisionSpec {
