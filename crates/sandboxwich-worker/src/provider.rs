@@ -6113,8 +6113,14 @@ async fn run_kubectl_command_async(
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure_kubectl_process_group(&mut command);
     if stdin_payload.is_some() {
         command.stdin(Stdio::piped());
+    } else {
+        // Never inherit the worker's stdin. A wrapper or diagnostic command
+        // must see EOF when this invocation has no payload; otherwise it can
+        // wait on the worker's controlling pipe forever during rollback.
+        command.stdin(Stdio::null());
     }
     // ETXTBSY: exec can transiently fail while another thread's fork holds a
     // still-open write descriptor for the executable (rust-lang/cargo#7670).
@@ -6214,11 +6220,7 @@ async fn run_kubectl_command_async(
                     // `drive` (and the mutable borrow of `child` it held via
                     // `child.wait()`) was dropped when the timeout fired, so
                     // `child` is free to use again here.
-                    if let Err(kill_error) = child.start_kill() {
-                        eprintln!(
-                            "warning: failed to kill timed-out kubectl process ({context}): {kill_error}"
-                        );
-                    }
+                    kill_kubectl_process_group(&mut child, context);
                     // Reap the process so it doesn't linger as a zombie.
                     let _ = child.wait().await;
                     bail!(
@@ -6230,17 +6232,47 @@ async fn run_kubectl_command_async(
             }
         }
         () = wait_for_cancellation => {
-            if let Err(kill_error) = child.start_kill() {
-                eprintln!(
-                    "warning: failed to kill cancelled kubectl process ({context}): {kill_error}"
-                );
-            }
+            kill_kubectl_process_group(&mut child, context);
             let _ = child.wait().await;
             bail!(
                 "kubectl {context} was cancelled because lease renewal was lost; the job is \
                  being abandoned so it isn't run twice"
             );
         }
+    }
+}
+
+/// Put each kubectl invocation in its own process group so cancellation also
+/// terminates wrapper scripts and their descendants. A direct child kill is
+/// insufficient for a configured wrapper (or a test double): descendants can
+/// retain stdout/stderr pipes and make the worker wait until the command
+/// timeout even though the lease was already lost.
+fn configure_kubectl_process_group(command: &mut tokio::process::Command) {
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+}
+
+fn kill_kubectl_process_group(child: &mut tokio::process::Child, context: &str) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let process_group = format!("-{pid}");
+        match std::process::Command::new("/bin/kill")
+            .args(["-KILL", "--", &process_group])
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                eprintln!("warning: failed to kill kubectl process group for {context}: {status}")
+            }
+            Err(error) => {
+                eprintln!("warning: failed to invoke process-group kill for {context}: {error}")
+            }
+        }
+    }
+    if let Err(kill_error) = child.start_kill() {
+        eprintln!("warning: failed to kill kubectl process ({context}): {kill_error}");
     }
 }
 

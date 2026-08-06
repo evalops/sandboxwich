@@ -1,5 +1,6 @@
 use crate::db::Database;
 use crate::error::*;
+use crate::handlers::maestro_activations::record_observation;
 use crate::identity_mtls::IdentityServiceContext;
 use crate::rows::{parse_timestamp, parse_uuid};
 use crate::state::{AppState, TenantContext};
@@ -15,12 +16,14 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{AnyConnection, Row};
 use std::collections::BTreeMap;
+use std::time::Instant;
 use subtle::ConstantTimeEq;
 use url::Url;
 use uuid::Uuid;
 
 const ATTESTATION_VERSION: u32 = 2;
 const ATTESTATION_TTL_SECONDS: i64 = 300;
+pub(crate) const IDENTITY_METRICS_TENANT_ID: &str = "identity-service";
 
 struct PlacementFence {
     lease_attempt: u64,
@@ -1160,6 +1163,38 @@ pub(crate) async fn validate_maestro_workload_identity(
     Extension(_identity_service): Extension<IdentityServiceContext>,
     Json(request): Json<ValidateMaestroWorkloadIdentityRequest>,
 ) -> Result<Json<MaestroWorkloadIdentityResponse>, ApiError> {
+    let started = Instant::now();
+    let result = validate_maestro_workload_identity_inner(&state, request).await;
+    let (outcome, reason) = match &result {
+        Ok(_) => ("accepted", "validated"),
+        Err(error) if error.status.is_server_error() => ("error", "internal"),
+        Err(error) if error.status == StatusCode::NOT_FOUND => ("rejected", "not_found"),
+        Err(error) if error.status == StatusCode::CONFLICT => ("rejected", "not_live"),
+        Err(_) => ("rejected", "invalid_request"),
+    };
+    if let Err(error) = record_observation(
+        &state,
+        IDENTITY_METRICS_TENANT_ID,
+        outcome,
+        reason,
+        started.elapsed().as_millis(),
+    )
+    .await
+    {
+        tracing::warn!(
+            error = ?error,
+            outcome,
+            reason,
+            "maestro_identity_metric_write_failed"
+        );
+    }
+    result.map(Json)
+}
+
+async fn validate_maestro_workload_identity_inner(
+    state: &AppState,
+    request: ValidateMaestroWorkloadIdentityRequest,
+) -> Result<MaestroWorkloadIdentityResponse, ApiError> {
     if request.organization_id.trim().is_empty()
         || request.workspace_id.trim().is_empty()
         || request.runner_session_id.trim().is_empty()
@@ -1239,7 +1274,7 @@ pub(crate) async fn validate_maestro_workload_identity(
     }
     let labels = parse_labels(&row.try_get::<String, _>("labels")?)?;
     let sandbox_namespace = label(&labels, "sandbox_namespace")?.to_string();
-    Ok(Json(MaestroWorkloadIdentityResponse {
+    Ok(MaestroWorkloadIdentityResponse {
         active: true,
         organization_id: request.organization_id,
         workspace_id: request.workspace_id,
@@ -1258,7 +1293,7 @@ pub(crate) async fn validate_maestro_workload_identity(
         lease_attempt: fence.lease_attempt,
         lease_expires_at_epoch_seconds: fence.lease_expires_at.timestamp(),
         worker_id: fence.worker_id,
-    }))
+    })
 }
 
 #[cfg(test)]
