@@ -4303,33 +4303,63 @@ printf '%s\n' "$*" >> "{log}"
 case " $* " in
   *runtimeClassName*) printf '%s' '{observed_runtime_class}' ;;
   *" get "*)
-    kind=''
-    name=''
-    previous=''
-    for arg in "$@"; do
-      if [ "$previous" = get ]; then kind="$arg"; previous=kind; continue; fi
-      if [ "$previous" = kind ]; then name="$arg"; break; fi
-      previous="$arg"
-    done
-    kind=$(printf '%s' "$kind" | tr '[:upper:]' '[:lower:]')
-    marker="{dir}/$kind-$name"
-    [ -f "$marker" ] || exit 0
-    python3 - "$marker" <<'PY'
+    python3 - "{dir}" "$@" <<'PY'
 import json
+import os
 import sys
-with open(sys.argv[1], encoding="utf-8") as source:
-    value = json.load(source)
-metadata = value.setdefault("metadata", {{}})
-metadata["uid"] = "uid-" + metadata["name"]
-metadata["generation"] = 1
-print(json.dumps(value))
+directory = sys.argv[1]
+args = sys.argv[2:]
+get_index = args.index("get")
+resource_args = []
+for arg in args[get_index + 1:]:
+    if arg.startswith("-"):
+        break
+    resource_args.append(arg)
+requested_count = sum(1 for arg in resource_args if "/" in arg) or len(resource_args) // 2
+resources = []
+while resource_args:
+    resource = resource_args.pop(0)
+    if "/" in resource:
+        kind, name = resource.split("/", 1)
+    else:
+        kind = resource
+        name = resource_args.pop(0)
+    marker = os.path.join(directory, kind.lower() + "-" + name)
+    if not os.path.exists(marker):
+        continue
+    with open(marker, encoding="utf-8") as source:
+        value = json.load(source)
+    metadata = value.setdefault("metadata", {{}})
+    metadata["uid"] = "uid-" + metadata["name"]
+    metadata["generation"] = 1
+    resources.append(value)
+if requested_count == 1:
+    if resources:
+        print(json.dumps(resources[0]))
+else:
+    print(json.dumps({{"apiVersion": "v1", "kind": "List", "items": resources}}))
 PY
     ;;
   *" apply "*)
-    payload=$(cat)
-    kind=$(printf '%s' "$payload" | sed -n 's/.*"kind": "\([^"]*\)".*/\1/p' | head -1 | tr '[:upper:]' '[:lower:]')
-    name=$(printf '%s' "$payload" | sed -n 's/.*"name": "\([^"]*\)".*/\1/p' | head -1)
-    printf '%s' "$payload" > "{dir}/$kind-$name"
+    payload_file="{dir}/payload.$$"
+    cat > "$payload_file"
+    python3 - "{dir}" "{log}" "$payload_file" <<'PY'
+import json
+import os
+import sys
+directory, log, payload_file = sys.argv[1:]
+with open(payload_file, encoding="utf-8") as source:
+    documents = [json.loads(document) for document in source.read().split("\n---\n") if document.strip()]
+with open(log, "a", encoding="utf-8") as output:
+    output.write("DOCS " + " ".join(
+        value["kind"] + "/" + value["metadata"]["name"] for value in documents
+    ) + "\n")
+for value in documents:
+    marker = os.path.join(directory, value["kind"].lower() + "-" + value["metadata"]["name"])
+    with open(marker, "w", encoding="utf-8") as output:
+        json.dump(value, output)
+PY
+    rm -f "$payload_file"
     ;;
   *" wait "*) ;;
 esac
@@ -4348,6 +4378,77 @@ esac
         std::fs::set_permissions(&script_path, permissions).expect("chmod stateful fake kubectl");
     }
     (script_path, log_path)
+}
+
+#[test]
+fn provision_staged_batches_post_ready_services_in_one_apply() {
+    let (kubectl, log_path) = write_stateful_fake_kubectl();
+    let provider = apply_provider_with_fake_kubectl(&kubectl);
+    let sandbox_id = SandboxId::new();
+
+    provider
+        .provision_staged(
+            sandbox_id,
+            &SandboxProvisionSpec::default(),
+            &CancelSignal::never_cancelled(),
+            |_| Ok(()),
+        )
+        .expect("staged provision succeeds");
+
+    let log = std::fs::read_to_string(&log_path).expect("read staged kubectl log");
+    assert_eq!(
+        log.matches(" apply ").count(),
+        4,
+        "post-ready SSH and desktop Services should share one apply: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+#[test]
+fn batched_service_preflight_rejects_conflicting_identity_before_apply() {
+    let (kubectl, log_path) = write_stateful_fake_kubectl();
+    let provider = apply_provider_with_fake_kubectl(&kubectl);
+    let sandbox_id = SandboxId::new();
+    let ssh_service = provider.dry_run.ssh_service_manifest(sandbox_id);
+    let desktop_service = provider.dry_run.desktop_service_manifest(sandbox_id);
+    let mut conflicting = ssh_service.clone();
+    conflicting["metadata"]["labels"]["sandboxwich.dev/sandbox-id"] =
+        json!(SandboxId::new().to_string());
+    let marker = kubectl
+        .parent()
+        .expect("fake kubectl parent")
+        .join(format!("service-sandboxwich-ssh-{sandbox_id}"));
+    std::fs::write(
+        marker,
+        serde_json::to_string(&conflicting).expect("serialize conflicting Service"),
+    )
+    .expect("seed conflicting Service");
+
+    let mut resources_applied = false;
+    let error = provider
+        .apply_or_adopt_manifests_with_identity(
+            &[&ssh_service, &desktop_service],
+            "sandboxwich.dev/sandbox-id",
+            &sandbox_id.to_string(),
+            "sandbox",
+            &CancelSignal::never_cancelled(),
+            &mut resources_applied,
+        )
+        .expect_err("conflicting Service identity must fail closed");
+
+    assert!(
+        error.to_string().contains("conflicting sandbox identity"),
+        "unexpected conflict error: {error:#}"
+    );
+    assert!(!resources_applied);
+    let log = std::fs::read_to_string(&log_path).expect("read batched preflight log");
+    assert!(
+        !log.contains(" apply "),
+        "identity conflict must be detected before mutation: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
 }
 
 #[test]
@@ -4397,14 +4498,15 @@ fn provision_staged_applies_resources_in_durable_order_and_reports_uids() {
     );
 
     let log = std::fs::read_to_string(&log_path).expect("read staged kubectl log");
-    assert!(
-        log.matches(" get ").count() >= 10,
-        "expected pre/post reads: {log}"
+    assert_eq!(
+        log.matches(" get ").count(),
+        9,
+        "four stage-local pre/post reads plus runtime-class verification: {log}"
     );
     assert_eq!(
         log.matches(" apply ").count(),
-        5,
-        "one apply per manifest: {log}"
+        4,
+        "workspace, network, pod, and service waves: {log}"
     );
     assert!(log.contains(" wait --for=condition=Ready "));
 
@@ -4423,8 +4525,8 @@ fn provision_staged_applies_resources_in_durable_order_and_reports_uids() {
     let replay_log = std::fs::read_to_string(&log_path).expect("read replay kubectl log");
     assert_eq!(
         replay_log.matches(" apply ").count(),
-        5,
-        "replay must adopt the five existing resources: {replay_log}"
+        4,
+        "replay must adopt the four apply waves: {replay_log}"
     );
     assert_eq!(replay_reports.len(), 8);
 
@@ -4465,8 +4567,8 @@ fn managed_home_is_adopted_by_replacement_runtime_and_survives_runtime_stop() {
     let log = std::fs::read_to_string(&log_path).expect("read managed-home kubectl log");
     assert_eq!(
         log.matches(" apply ").count(),
-        9,
-        "the replacement must adopt the home PVC and apply only its four runtime resources: {log}"
+        7,
+        "the replacement must adopt the home PVC and apply only its three apply waves: {log}"
     );
     assert!(
         log.contains(&format!(
@@ -4558,8 +4660,8 @@ fn provision_staged_applies_the_guest_token_secret_before_the_pod() {
     let log = std::fs::read_to_string(&log_path).expect("read staged kubectl log");
     assert_eq!(
         log.matches(" apply ").count(),
-        6,
-        "workspace, secret, policy, pod, and two services: {log}"
+        5,
+        "workspace, secret, policy, pod, and service wave: {log}"
     );
 
     let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
