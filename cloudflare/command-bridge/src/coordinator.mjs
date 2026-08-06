@@ -55,6 +55,9 @@ export class CommandCoordinator {
   }
 
   async #dispatch(intent) {
+    if (intent.cwd && typeof this.sandbox.mkdir === "function") {
+      await this.sandbox.mkdir(intent.cwd, { recursive: true });
+    }
     const claimed = await this.ledger.claimDispatch(
       intent.commandId,
       intent.intentDigestSha256,

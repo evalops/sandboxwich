@@ -74,6 +74,10 @@ test("concurrent duplicate delivery starts one Cloudflare process", async () => 
     releaseStart = resolve;
   });
   const sandbox = {
+    async mkdir(path, options) {
+      assert.equal(path, intent.cwd);
+      assert.deepEqual(options, { recursive: true });
+    },
     async startProcess(command, options) {
       starts += 1;
       assert.equal(command, "'/bin/sh' '-c' 'printf once'");
