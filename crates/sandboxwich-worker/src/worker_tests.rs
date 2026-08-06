@@ -583,6 +583,7 @@ fn dispatches_command_job_to_provider_exec_handoff() {
         memory_limit: sandboxwich_core::MemoryLimit::FourG,
         network_egress: Default::default(),
         runtime_profile: Default::default(),
+        ..SandboxProvisionSpec::default()
     };
     let outcome = execute_job(
         &job(
@@ -819,6 +820,7 @@ fn run_command_job_completes_the_lease_even_when_the_command_exits_non_zero() {
         memory_limit: sandboxwich_core::MemoryLimit::FourG,
         network_egress: Default::default(),
         runtime_profile: Default::default(),
+        ..SandboxProvisionSpec::default()
     };
     let now = Utc::now();
     let provider = FixedExecResultProvider {

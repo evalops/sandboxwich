@@ -968,6 +968,40 @@ impl Default for ExecutionClass {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderPreference {
+    #[default]
+    Any,
+    Kubernetes,
+    Cloudflare,
+}
+
+impl DbVariant for ProviderPreference {
+    const VALUES: &'static [&'static str] = &["any", "kubernetes", "cloudflare"];
+
+    fn as_db_str(&self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::Kubernetes => "kubernetes",
+            Self::Cloudflare => "cloudflare",
+        }
+    }
+
+    fn parse_db_str(value: &str) -> Result<Self, DbVariantError> {
+        match value {
+            "any" => Ok(Self::Any),
+            "kubernetes" => Ok(Self::Kubernetes),
+            "cloudflare" => Ok(Self::Cloudflare),
+            _ => Err(DbVariantError {
+                enum_name: "ProviderPreference",
+                value: value.to_string(),
+                expected: Self::VALUES,
+            }),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default, utoipa::ToSchema)]
 pub struct SandboxProvisionSpec {
     #[serde(default)]
@@ -980,6 +1014,14 @@ pub struct SandboxProvisionSpec {
     pub runtime_profile: SandboxRuntimeProfile,
     #[serde(default)]
     pub execution_class: ExecutionClass,
+    #[serde(default)]
+    pub provider_preference: ProviderPreference,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub provider_external_id: Option<String>,
+    #[serde(default)]
+    pub provider_routing_scope: Option<String>,
     /// Resolved secret deliveries for this sandbox. Locators only; the worker
     /// turns each one into a read-only CSI volume mount.
     #[serde(default)]
@@ -1100,6 +1142,8 @@ pub struct CreateSandboxRequest {
     pub workspace_mode: Option<WorkspaceMode>,
     pub runtime_profile: Option<SandboxRuntimeProfile>,
     pub execution_class: Option<ExecutionClass>,
+    #[serde(default)]
+    pub provider_preference: Option<ProviderPreference>,
     pub ttl_seconds: Option<u64>,
     /// See `Sandbox::max_lifetime_seconds`. Server-side default/clamp config
     /// (`SANDBOXWICH_DEFAULT_MAX_LIFETIME_SECONDS` /
@@ -1169,6 +1213,12 @@ pub struct SandboxPlacementProof {
     pub provider: String,
     pub provider_mode: String,
     pub runtime_image: String,
+    #[serde(default)]
+    pub capabilities: Vec<WorkerCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_scope: Option<String>,
 }
 
 /// Provider-facing projection used by external control planes to reconcile a
@@ -3972,6 +4022,23 @@ impl SandboxSecretMount {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloudflare_provider_preference_is_typed_and_serialized_in_provision_spec() {
+        let spec = SandboxProvisionSpec {
+            provider_preference: ProviderPreference::Cloudflare,
+            ..SandboxProvisionSpec::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&spec).unwrap()["provider_preference"],
+            "cloudflare"
+        );
+        let decoded: SandboxProvisionSpec = serde_json::from_value(serde_json::json!({
+            "provider_preference": "cloudflare"
+        }))
+        .unwrap();
+        assert_eq!(decoded.provider_preference, ProviderPreference::Cloudflare);
+    }
 
     #[test]
     fn public_job_payload_redacts_durable_trace_context() {

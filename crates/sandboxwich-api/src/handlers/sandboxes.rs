@@ -31,6 +31,18 @@ pub(crate) fn provision_spec_from_request(
     request: &CreateSandboxRequest,
     parent: Option<&Sandbox>,
 ) -> Result<SandboxProvisionSpec, ApiError> {
+    provision_spec_from_request_with_provider(
+        request,
+        parent,
+        request.provider_preference.clone().unwrap_or_default(),
+    )
+}
+
+fn provision_spec_from_request_with_provider(
+    request: &CreateSandboxRequest,
+    parent: Option<&Sandbox>,
+    provider_preference: ProviderPreference,
+) -> Result<SandboxProvisionSpec, ApiError> {
     let memory_limit = request
         .memory_limit
         .clone()
@@ -76,6 +88,10 @@ pub(crate) fn provision_spec_from_request(
         network_egress,
         workspace_mode,
         runtime_profile,
+        provider_preference,
+        tenant_id: parent.map(|sandbox| sandbox.tenant_id.clone()),
+        provider_external_id: None,
+        provider_routing_scope: None,
     })
 }
 
@@ -221,7 +237,17 @@ pub(crate) async fn create_sandbox(
     Extension(trace): Extension<RequestTrace>,
     Json(request): Json<CreateSandboxRequest>,
 ) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
-    create_sandbox_with_home(state, ctx, request, None, Some(authorization), trace).await
+    let provider_preference = request.provider_preference.clone().unwrap_or_default();
+    create_sandbox_with_home_and_provider(
+        state,
+        ctx,
+        request,
+        None,
+        Some(authorization),
+        trace,
+        provider_preference,
+    )
+    .await
 }
 
 pub(crate) async fn create_sandbox_with_home(
@@ -232,9 +258,32 @@ pub(crate) async fn create_sandbox_with_home(
     authorization: Option<AuthorizationContext>,
     trace: RequestTrace,
 ) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
+    create_sandbox_with_home_and_provider(
+        state,
+        ctx,
+        request,
+        home_id,
+        authorization,
+        trace,
+        ProviderPreference::Any,
+    )
+    .await
+}
+
+async fn create_sandbox_with_home_and_provider(
+    state: AppState,
+    ctx: TenantContext,
+    request: CreateSandboxRequest,
+    home_id: Option<HomeId>,
+    authorization: Option<AuthorizationContext>,
+    trace: RequestTrace,
+    provider_preference: ProviderPreference,
+) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
     let now = Utc::now();
     let managed_home = home_id.is_some();
-    let mut provision_spec = provision_spec_from_request(&request, None)?;
+    let mut provision_spec =
+        provision_spec_from_request_with_provider(&request, None, provider_preference)?;
+    provision_spec.tenant_id = Some(ctx.tenant_id.clone());
     provision_spec.secret_mounts =
         resolve_secret_mounts(&state.db, &ctx.tenant_id, &request.secret_ref_ids).await?;
     if home_id.is_some() && provision_spec.workspace_mode != WorkspaceMode::Persistent {
@@ -463,7 +512,7 @@ async fn fetch_sandbox_with_placement_proof(
                 s.workspace_mode, s.runtime_profile, s.execution_class, s.created_at, s.updated_at,
                 s.ttl_seconds, s.max_lifetime_seconds, s.idle_ttl_seconds, s.last_activity_at,
                 s.parent_snapshot_id, p.worker_id as placement_worker_id, p.provider as placement_provider,
-                w.labels as placement_labels
+                w.labels as placement_labels, w.capabilities as placement_capabilities
            from sandboxes s
            left join sandbox_placements p on p.sandbox_id = s.id
            left join workers w on w.id = p.worker_id
@@ -480,6 +529,7 @@ async fn fetch_sandbox_with_placement_proof(
     let placement_worker_id: Option<String> = row.try_get("placement_worker_id")?;
     let placement_provider: Option<String> = row.try_get("placement_provider")?;
     let placement_labels: Option<String> = row.try_get("placement_labels")?;
+    let placement_capabilities: Option<String> = row.try_get("placement_capabilities")?;
 
     let mut sandbox = row_to_sandbox(row)?;
     hydrate_sandbox_network_egress(db, &mut sandbox).await?;
@@ -498,7 +548,25 @@ async fn fetch_sandbox_with_placement_proof(
         Some(worker_id) => {
             let provider = placement_provider.unwrap_or_default();
             let labels = placement_labels.unwrap_or_default();
-            Some(placement_proof_from_parts(worker_id, provider, labels)?)
+            let capabilities = placement_capabilities
+                .as_deref()
+                .and_then(|value| serde_json::from_str(value).ok())
+                .unwrap_or_default();
+            let mut proof =
+                placement_proof_from_parts(worker_id, provider.clone(), labels, capabilities)?;
+            let resource_sql = format!(
+                "select r.resource_name, r.namespace from runtime_resources r join sandbox_placements p on p.sandbox_id = r.sandbox_id and p.provider = r.provider where r.sandbox_id = {} and r.snapshot_id is null order by r.updated_at desc limit 1",
+                db.placeholder(1)
+            );
+            if let Some(resource) = sqlx::query(&resource_sql)
+                .bind(sandbox_id.to_string())
+                .fetch_optional(db.read_pool())
+                .await?
+            {
+                proof.external_id = resource.try_get("resource_name").ok();
+                proof.routing_scope = resource.try_get("namespace").ok();
+            }
+            Some(proof)
         }
     };
     Ok((sandbox, placement))
@@ -527,6 +595,7 @@ fn placement_proof_from_parts(
     worker_id: String,
     provider: String,
     labels: String,
+    capabilities: Vec<WorkerCapability>,
 ) -> Result<SandboxPlacementProof, ApiError> {
     if provider.is_empty() {
         return Err(ApiError::internal("worker placement provider is missing"));
@@ -549,6 +618,9 @@ fn placement_proof_from_parts(
         provider,
         provider_mode,
         runtime_image,
+        capabilities,
+        external_id: None,
+        routing_scope: None,
     })
 }
 
@@ -970,6 +1042,10 @@ pub(crate) async fn resume_sandbox(
         network_egress: sandbox.network_egress.clone(),
         workspace_mode: sandbox.workspace_mode.clone(),
         runtime_profile: sandbox.runtime_profile.clone(),
+        provider_preference: ProviderPreference::Any,
+        tenant_id: Some(sandbox.tenant_id.clone()),
+        provider_external_id: None,
+        provider_routing_scope: None,
     };
     let job = Job {
         id: JobId::new(),
@@ -1131,6 +1207,7 @@ pub(crate) async fn fork_sandbox(
             network_egress: parent.network_egress.clone(),
             workspace_mode: parent.workspace_mode.clone(),
             runtime_profile: parent.runtime_profile.clone(),
+            ..SandboxProvisionSpec::default()
         }),
         created_at: now,
         ready_at: None,
@@ -1189,6 +1266,7 @@ pub(crate) async fn fork_sandbox(
                 network_egress: parent.network_egress.clone(),
                 workspace_mode: parent.workspace_mode.clone(),
                 runtime_profile: parent.runtime_profile.clone(),
+                ..SandboxProvisionSpec::default()
             }
         }),
         required_capability: WorkerCapability::Snapshot,

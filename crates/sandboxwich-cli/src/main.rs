@@ -538,6 +538,7 @@ async fn main() -> anyhow::Result<()> {
                     ttl_seconds: args.ttl_seconds,
                     max_lifetime_seconds: args.max_lifetime_seconds,
                     idle_ttl_seconds: args.idle_ttl_seconds,
+                    provider_preference: None,
                 })
                 .send()
                 .await?;
@@ -613,6 +614,7 @@ async fn main() -> anyhow::Result<()> {
                     ttl_seconds: args.ttl_seconds,
                     max_lifetime_seconds: args.max_lifetime_seconds,
                     idle_ttl_seconds: args.idle_ttl_seconds,
+                    provider_preference: None,
                 })
                 .send()
                 .await?;

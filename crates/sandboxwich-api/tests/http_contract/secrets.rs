@@ -330,6 +330,7 @@ fn create_sandbox_request(secret_ref_ids: Vec<SecretRefId>) -> CreateSandboxRequ
         network_egress: None,
         workspace_mode: None,
         runtime_profile: None,
+        provider_preference: None,
         ttl_seconds: Some(120),
         max_lifetime_seconds: None,
         idle_ttl_seconds: None,

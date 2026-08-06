@@ -192,6 +192,7 @@ pub(crate) async fn fork_snapshot(
                 network_egress: child.network_egress.clone(),
                 workspace_mode: child.workspace_mode.clone(),
                 runtime_profile: child.runtime_profile.clone(),
+                ..SandboxProvisionSpec::default()
             }
         }),
         required_capability: fork_capability(&child.runtime_profile, &child.network_egress),
@@ -506,6 +507,7 @@ pub(crate) fn pending_snapshot_from_request(
             network_egress: sandbox.network_egress.clone(),
             workspace_mode: sandbox.workspace_mode.clone(),
             runtime_profile: sandbox.runtime_profile.clone(),
+            ..SandboxProvisionSpec::default()
         }),
         created_at: now,
         ready_at: None,
@@ -986,6 +988,7 @@ pub(crate) async fn queue_forks_waiting_on_snapshot_on_connection(
                         network_egress: child.network_egress.clone(),
                         workspace_mode: child.workspace_mode.clone(),
                         runtime_profile: child.runtime_profile.clone(),
+                        ..SandboxProvisionSpec::default()
                     }
                 }),
                 required_capability: fork_capability(&child.runtime_profile, &child.network_egress),

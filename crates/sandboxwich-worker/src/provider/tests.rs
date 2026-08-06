@@ -2124,6 +2124,7 @@ fn kubernetes_workspace_modes_render_distinct_bounded_storage_contracts() {
             memory_limit: MemoryLimit::OneG,
             network_egress: NetworkEgress::DenyAll,
             runtime_profile: Default::default(),
+            ..SandboxProvisionSpec::default()
         };
         let provisioned = provider
             .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
@@ -2215,6 +2216,7 @@ fn configured_workspace_storage_overrides_non_default_tier_disk_size() {
         memory_limit: MemoryLimit::FourG,
         network_egress: NetworkEgress::DenyAll,
         runtime_profile: Default::default(),
+        ..SandboxProvisionSpec::default()
     };
 
     let provisioned = provider
@@ -2244,6 +2246,7 @@ fn kubernetes_dry_run_renders_resource_network_and_runtime_class_controls() {
             }],
         },
         runtime_profile: Default::default(),
+        ..SandboxProvisionSpec::default()
     };
     let provisioned = provider
         .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
@@ -2361,6 +2364,7 @@ fn kubernetes_dry_run_rejects_host_allow_rules_for_standard_network_policy() {
             }],
         },
         runtime_profile: Default::default(),
+        ..SandboxProvisionSpec::default()
     };
 
     let error = provider
@@ -2386,6 +2390,7 @@ fn cilium_fqdn_backend_renders_host_allow_rules() {
             }],
         },
         runtime_profile: Default::default(),
+        ..SandboxProvisionSpec::default()
     };
 
     let provisioned = provider
@@ -2551,6 +2556,7 @@ fn host_rules_render_a_separate_gateway_and_no_direct_public_egress() {
             }],
         },
         runtime_profile: Default::default(),
+        ..SandboxProvisionSpec::default()
     };
 
     let provisioned = provider
@@ -2682,6 +2688,7 @@ fn host_rules_reject_an_unpinned_gateway_image() {
             }],
         },
         runtime_profile: Default::default(),
+        ..SandboxProvisionSpec::default()
     };
 
     let error = provider
@@ -3273,6 +3280,7 @@ fn allow_all_egress_carves_out_control_plane_and_dns_ranges() {
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::AllowAll,
         runtime_profile: Default::default(),
+        ..SandboxProvisionSpec::default()
     };
 
     let provisioned = provider
@@ -3343,6 +3351,7 @@ fn allowlist_egress_carves_out_control_plane_ranges_contained_within_allowed_cid
             }],
         },
         runtime_profile: Default::default(),
+        ..SandboxProvisionSpec::default()
     };
 
     let provisioned = provider
@@ -3390,6 +3399,7 @@ fn allowlist_egress_leaves_disjoint_narrow_cidrs_untouched() {
             }],
         },
         runtime_profile: Default::default(),
+        ..SandboxProvisionSpec::default()
     };
 
     let provisioned = provider
@@ -3425,6 +3435,7 @@ fn allowlist_egress_rejects_cidr_fully_covered_by_an_excluded_range() {
             }],
         },
         runtime_profile: Default::default(),
+        ..SandboxProvisionSpec::default()
     };
 
     let err = provider
@@ -3449,6 +3460,7 @@ fn allowlist_egress_rejects_cidr_exactly_equal_to_an_excluded_range() {
             }],
         },
         runtime_profile: Default::default(),
+        ..SandboxProvisionSpec::default()
     };
 
     provider
@@ -3472,6 +3484,7 @@ fn allowlist_egress_carves_out_control_plane_ranges_when_wide_open_cidr_is_allow
             }],
         },
         runtime_profile: Default::default(),
+        ..SandboxProvisionSpec::default()
     };
 
     let provisioned = provider
@@ -3506,6 +3519,7 @@ fn ipv6_allowlist_cidr_containing_an_ipv6_excluded_range_carves_it_out() {
             }],
         },
         runtime_profile: Default::default(),
+        ..SandboxProvisionSpec::default()
     };
 
     let provisioned = provider
@@ -3544,6 +3558,7 @@ fn ipv6_allow_rule_is_unaffected_by_default_ipv4_excluded_cidrs() {
             }],
         },
         runtime_profile: Default::default(),
+        ..SandboxProvisionSpec::default()
     };
 
     let provisioned = provider
@@ -3569,6 +3584,7 @@ fn operator_supplied_egress_excluded_cidrs_merge_with_defaults() {
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::AllowAll,
         runtime_profile: Default::default(),
+        ..SandboxProvisionSpec::default()
     };
 
     let provisioned = provider
@@ -3603,6 +3619,7 @@ fn with_egress_excluded_cidrs_replace_drops_the_defaults() {
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::AllowAll,
         runtime_profile: Default::default(),
+        ..SandboxProvisionSpec::default()
     };
 
     let provisioned = provider
@@ -3630,6 +3647,7 @@ fn deny_all_egress_keeps_only_dns_and_authenticated_api_control_plane_rules() {
         memory_limit: MemoryLimit::OneG,
         network_egress: NetworkEgress::DenyAll,
         runtime_profile: Default::default(),
+        ..SandboxProvisionSpec::default()
     };
 
     let provisioned = provider
@@ -3725,6 +3743,7 @@ fn pod_disables_service_account_token_automount_and_sets_ephemeral_storage_limit
         memory_limit: MemoryLimit::FourG,
         network_egress: NetworkEgress::DenyAll,
         runtime_profile: Default::default(),
+        ..SandboxProvisionSpec::default()
     };
     let provisioned = provider
         .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
@@ -4054,6 +4073,7 @@ fn teardown_args_honor_persisted_gke_fqdn_resource_on_an_unconfigured_worker() {
         SandboxId::new(),
         &SandboxTeardownSpec {
             delete_gke_fqdn_policy: true,
+            ..SandboxTeardownSpec::default()
         },
     );
 
@@ -4088,6 +4108,7 @@ fn stop_deletes_core_resources_when_optional_gke_crd_is_absent() {
             sandbox_id,
             &SandboxTeardownSpec {
                 delete_gke_fqdn_policy: true,
+                ..SandboxTeardownSpec::default()
             },
             &CancelSignal::never_cancelled(),
         )
@@ -6424,5 +6445,161 @@ fn kubernetes_provision_rejects_secret_mounts_with_non_derived_paths() {
     assert!(
         error.to_string().contains("not control-plane derived"),
         "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn cloudflare_bridge_contract_is_bounded_and_fail_closed() {
+    use crate::provider::cloudflare::{
+        CloudflareConfig, CloudflareSandboxProvider, MAX_COMMAND_OUTPUT_BYTES,
+        parse_sse_command_chunks, split_tenant_scope,
+    };
+
+    let config = CloudflareConfig {
+        base_url: "https://bridge.example".into(),
+        api_token: "bearer-secret".into(),
+        request_timeout: Duration::from_secs(1),
+        readiness_timeout: Duration::from_secs(1),
+        replay_ledger_configured: false,
+    };
+    assert!(!format!("{config:?}").contains("bearer-secret"));
+    assert_eq!(
+        crate::provider::cloudflare::safe_bridge_code("upstream\nsecret"),
+        "http_error"
+    );
+    assert_eq!(
+        split_tenant_scope("org:workspace").unwrap(),
+        ("org", "workspace")
+    );
+    assert!(split_tenant_scope("tenant:org:workspace").is_none());
+    assert!(split_tenant_scope("org:").is_none());
+    assert!(split_tenant_scope(":workspace").is_none());
+
+    let encoded =
+        base64::engine::general_purpose::STANDARD
+            .encode(vec![b'x'; MAX_COMMAND_OUTPUT_BYTES + 100]);
+    let output = format!(
+        "event: stdout\ndata: {}\n\nevent: exit\ndata: {{\"exit_code\":0}}\n\n",
+        encoded
+    );
+    let parsed = parse_sse_command_chunks(&[output.as_bytes()]).unwrap();
+    assert!(parsed.stdout.len() <= MAX_COMMAND_OUTPUT_BYTES);
+    assert_eq!(parsed.exit_code, Some(0));
+    assert!(parse_sse_command_chunks(&[b"event: stdout\ndata: eA==\n\n"]).is_err());
+    let chunks = output.as_bytes().chunks(7).collect::<Vec<_>>();
+    let incremental = parse_sse_command_chunks(&chunks).unwrap();
+    assert_eq!(incremental.exit_code, Some(0));
+
+    let provider = CloudflareSandboxProvider::for_test();
+    assert!(
+        !provider
+            .capability_report()
+            .capabilities
+            .contains(&WorkerCapability::RunCommand)
+    );
+}
+
+#[test]
+fn cloudflare_bridge_normalizes_api_and_health_endpoints() {
+    use crate::provider::cloudflare::{api_endpoint, health_endpoint};
+
+    assert_eq!(
+        api_endpoint("https://bridge.example", "/sandbox"),
+        "https://bridge.example/v1/sandbox"
+    );
+    assert_eq!(
+        api_endpoint("https://bridge.example/v1/", "/sandbox"),
+        "https://bridge.example/v1/sandbox"
+    );
+    assert_eq!(
+        health_endpoint("https://bridge.example/v1/"),
+        "https://bridge.example/health"
+    );
+}
+
+#[tokio::test]
+async fn cloudflare_http_body_cap_is_enforced_incrementally() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+        let chunk = vec![b'x'; 256 * 1024];
+        for _ in 0..9 {
+            let size = format!("{:x}\r\n", chunk.len());
+            if socket.write_all(size.as_bytes()).await.is_err() {
+                return;
+            }
+            if socket.write_all(&chunk).await.is_err() {
+                return;
+            }
+            if socket.write_all(b"\r\n").await.is_err() {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
+
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let mut response = client
+        .get(format!("http://{address}/oversized"))
+        .send()
+        .await
+        .unwrap();
+    let error = crate::provider::cloudflare::bounded_response_bytes(&mut response)
+        .await
+        .expect_err("an oversized connection-delimited response must fail while streaming");
+    assert!(
+        error.to_string().contains("bounded body limit"),
+        "unexpected bounded response error: {error}"
+    );
+    server.abort();
+    let _ = server.await;
+}
+
+#[test]
+fn cloudflare_command_execution_is_blocked_without_replay_ledger() {
+    use crate::provider::cloudflare::CloudflareSandboxProvider;
+    let provider = CloudflareSandboxProvider::for_test();
+    let spec = SandboxProvisionSpec {
+        provider_preference: sandboxwich_core::ProviderPreference::Cloudflare,
+        tenant_id: Some("org:workspace".into()),
+        provider_external_id: Some("external".into()),
+        provider_routing_scope: Some("org:workspace".into()),
+        ..SandboxProvisionSpec::default()
+    };
+    let request = AgentCommandRequest {
+        argv: vec!["true".into()],
+        cwd: None,
+        env: BTreeMap::new(),
+        stdin: None,
+        timeout_secs: None,
+    };
+    let error = provider
+        .exec_handoff(
+            SandboxId::new(),
+            &spec,
+            request,
+            &CancelSignal::never_cancelled(),
+        )
+        .expect_err("headers alone must not claim replay-safe command execution");
+    assert!(error.to_string().contains("durable replay ledger"));
+}
+
+#[test]
+fn cloudflare_create_key_is_stable_for_lost_create_retries() {
+    use crate::provider::cloudflare::create_idempotency_key;
+    let sandbox_id = SandboxId::new();
+    assert_eq!(
+        create_idempotency_key(sandbox_id),
+        create_idempotency_key(sandbox_id)
     );
 }

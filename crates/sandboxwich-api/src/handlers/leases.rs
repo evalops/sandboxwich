@@ -43,6 +43,13 @@ fn worker_supports_execution_class(worker: &Worker, execution_class: &ExecutionC
             .contains(&execution_capability(execution_class))
 }
 
+pub(crate) fn worker_matches_provider_preference(
+    worker_provider: &str,
+    preference: &ProviderPreference,
+) -> bool {
+    matches!(preference, ProviderPreference::Any) || preference.as_db_str() == worker_provider
+}
+
 fn guest_supports_uid_isolated_resident_process(checks: &serde_json::Value) -> bool {
     GuestAgentCapabilityReport::from_health_checks(checks)
         .is_some_and(|report| report.supports_uid_isolated_resident_process())
@@ -269,6 +276,16 @@ pub(crate) async fn claim_lease(
         {
             continue;
         }
+        let provider_preference = job
+            .payload
+            .get("provisionSpec")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<SandboxProvisionSpec>(value).ok())
+            .map(|spec| spec.provider_preference)
+            .unwrap_or_default();
+        if !worker_matches_provider_preference(&worker.provider, &provider_preference) {
+            continue;
+        }
         if !worker_supports_runtime_profile(&worker, &job) {
             continue;
         }
@@ -416,6 +433,28 @@ pub(crate) async fn claim_lease(
         if response.lease.is_some() {
             return Ok(Json(response));
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_preference_tests {
+    use super::worker_matches_provider_preference;
+    use sandboxwich_core::ProviderPreference;
+
+    #[test]
+    fn initial_cloudflare_work_cannot_match_a_kubernetes_worker() {
+        assert!(worker_matches_provider_preference(
+            "cloudflare",
+            &ProviderPreference::Cloudflare
+        ));
+        assert!(!worker_matches_provider_preference(
+            "kubernetes",
+            &ProviderPreference::Cloudflare
+        ));
+        assert!(worker_matches_provider_preference(
+            "kubernetes",
+            &ProviderPreference::Any
+        ));
     }
 }
 

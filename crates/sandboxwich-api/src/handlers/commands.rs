@@ -126,6 +126,7 @@ pub(crate) async fn queue_command(
                 network_egress: sandbox.network_egress.clone(),
                 workspace_mode: sandbox.workspace_mode.clone(),
                 runtime_profile: sandbox.runtime_profile.clone(),
+                ..SandboxProvisionSpec::default()
             }
         }),
         required_capability: WorkerCapability::RunCommand,

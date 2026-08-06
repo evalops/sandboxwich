@@ -20,6 +20,7 @@ use sandboxwich_core::*;
 use serde_json::json;
 use sha2::Digest;
 use sqlx::AnyConnection;
+use sqlx::Row;
 use uuid::Uuid;
 
 pub(crate) async fn create_job(
@@ -212,6 +213,8 @@ pub(crate) struct PlacementCacheEntry {
     pub sandbox: Sandbox,
     pub secret_mounts: Vec<SandboxSecretMount>,
     pub expected_provision_spec: serde_json::Value,
+    pub provider_external_id: Option<String>,
+    pub provider_routing_scope: Option<String>,
 }
 
 pub(crate) type PlacementEnrichmentCache =
@@ -264,7 +267,21 @@ fn apply_sandbox_placement(job: &mut Job, entry: &PlacementCacheEntry) -> Result
         return Ok(false);
     }
     job.required_execution_class = entry.sandbox.execution_class.clone();
-    add_provision_spec_to_payload(job, &entry.sandbox, &entry.secret_mounts)?;
+    let provider_preference = job
+        .payload
+        .get("provisionSpec")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<SandboxProvisionSpec>(value).ok())
+        .map(|spec| spec.provider_preference)
+        .unwrap_or_default();
+    add_provision_spec_to_payload_with_identity(
+        job,
+        &entry.sandbox,
+        &entry.secret_mounts,
+        provider_preference,
+        entry.provider_external_id.clone(),
+        entry.provider_routing_scope.clone(),
+    )?;
     Ok(true)
 }
 
@@ -285,7 +302,22 @@ pub(crate) fn placement_matches_sandbox(job: &Job, entry: &PlacementCacheEntry) 
     if image != entry.sandbox.template {
         return false;
     }
-    job.payload.get("provisionSpec") == Some(&entry.expected_provision_spec)
+    let Some(actual) = job.payload.get("provisionSpec").cloned() else {
+        return false;
+    };
+    let Ok(actual) = serde_json::from_value::<SandboxProvisionSpec>(actual) else {
+        return false;
+    };
+    let Ok(mut expected) =
+        serde_json::from_value::<SandboxProvisionSpec>(entry.expected_provision_spec.clone())
+    else {
+        return false;
+    };
+    expected.provider_preference = actual.provider_preference.clone();
+    let Ok(actual) = serde_json::to_value(actual) else {
+        return false;
+    };
+    serde_json::to_value(expected).ok() == Some(actual)
 }
 
 /// Test helper: build a cache entry and check placement without a DB.
@@ -304,10 +336,13 @@ pub(crate) fn placement_matches_sandbox_parts(
             sandbox: sandbox.clone(),
             secret_mounts: secret_mounts.to_vec(),
             expected_provision_spec: expected,
+            provider_external_id: None,
+            provider_routing_scope: None,
         },
     )
 }
 
+#[cfg(test)]
 fn expected_provision_spec_value(
     sandbox: &Sandbox,
     secret_mounts: &[SandboxSecretMount],
@@ -319,6 +354,8 @@ fn expected_provision_spec_value(
         network_egress: sandbox.network_egress.clone(),
         workspace_mode: sandbox.workspace_mode.clone(),
         runtime_profile: sandbox.runtime_profile.clone(),
+        tenant_id: Some(sandbox.tenant_id.clone()),
+        ..SandboxProvisionSpec::default()
     })?)
 }
 
@@ -332,11 +369,38 @@ async fn load_sandbox_placement_inputs(
     }
     let sandbox = fetch_sandbox(db, sandbox_id).await?;
     let secret_mounts = fetch_sandbox_secret_mounts(db, sandbox.id).await?;
-    let expected_provision_spec = expected_provision_spec_value(&sandbox, &secret_mounts)?;
+    let resource_sql = format!(
+        "select resource_name, namespace from runtime_resources where sandbox_id = {} and snapshot_id is null and provider = 'cloudflare' order by updated_at desc limit 1",
+        db.placeholder(1)
+    );
+    let identity = sqlx::query(&resource_sql)
+        .bind(sandbox_id.to_string())
+        .fetch_optional(db.read_pool())
+        .await?;
+    let provider_external_id = identity
+        .as_ref()
+        .and_then(|row| row.try_get("resource_name").ok());
+    let provider_routing_scope = identity
+        .as_ref()
+        .and_then(|row| row.try_get("namespace").ok());
+    let expected_provision_spec = serde_json::to_value(SandboxProvisionSpec {
+        secret_mounts: secret_mounts.clone(),
+        execution_class: sandbox.execution_class.clone(),
+        memory_limit: sandbox.memory_limit.clone(),
+        network_egress: sandbox.network_egress.clone(),
+        workspace_mode: sandbox.workspace_mode.clone(),
+        runtime_profile: sandbox.runtime_profile.clone(),
+        tenant_id: Some(sandbox.tenant_id.clone()),
+        provider_external_id: provider_external_id.clone(),
+        provider_routing_scope: provider_routing_scope.clone(),
+        ..SandboxProvisionSpec::default()
+    })?;
     let entry = PlacementCacheEntry {
         sandbox,
         secret_mounts,
         expected_provision_spec,
+        provider_external_id,
+        provider_routing_scope,
     };
     cache.insert(sandbox_id, entry.clone());
     Ok(entry)
@@ -346,6 +410,24 @@ pub(crate) fn add_provision_spec_to_payload(
     job: &mut Job,
     sandbox: &Sandbox,
     secret_mounts: &[SandboxSecretMount],
+) -> Result<(), ApiError> {
+    add_provision_spec_to_payload_with_identity(
+        job,
+        sandbox,
+        secret_mounts,
+        ProviderPreference::Any,
+        None,
+        None,
+    )
+}
+
+fn add_provision_spec_to_payload_with_identity(
+    job: &mut Job,
+    sandbox: &Sandbox,
+    secret_mounts: &[SandboxSecretMount],
+    provider_preference: ProviderPreference,
+    provider_external_id: Option<String>,
+    provider_routing_scope: Option<String>,
 ) -> Result<(), ApiError> {
     let Some(payload) = job.payload.as_object_mut() else {
         return Err(ApiError::bad_request("job payload must be an object"));
@@ -363,6 +445,10 @@ pub(crate) fn add_provision_spec_to_payload(
             network_egress: sandbox.network_egress.clone(),
             workspace_mode: sandbox.workspace_mode.clone(),
             runtime_profile: sandbox.runtime_profile.clone(),
+            provider_preference,
+            tenant_id: Some(sandbox.tenant_id.clone()),
+            provider_external_id,
+            provider_routing_scope,
         })?,
     );
     Ok(())
@@ -907,6 +993,19 @@ pub(crate) async fn try_claim_job(
     lease_seconds: Option<u64>,
     operation_id: Option<Uuid>,
 ) -> Result<Option<JobLease>, ApiError> {
+    let provider_preference = job
+        .payload
+        .get("provisionSpec")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<SandboxProvisionSpec>(value).ok())
+        .map(|spec| spec.provider_preference)
+        .unwrap_or_default();
+    if !crate::handlers::leases::worker_matches_provider_preference(
+        &worker.provider,
+        &provider_preference,
+    ) {
+        return Ok(None);
+    }
     let mut tx = db.pool.begin().await?;
     let claimed = async {
         lock_worker_for_claim_on_connection(db, &mut tx, worker.id).await?;
@@ -1232,7 +1331,9 @@ mod placement_match_tests {
                     workspace_mode: sandbox.workspace_mode.clone(),
                     runtime_profile: sandbox.runtime_profile.clone(),
                     execution_class: sandbox.execution_class.clone(),
+                    tenant_id: Some(sandbox.tenant_id.clone()),
                     secret_mounts: vec![],
+                    ..SandboxProvisionSpec::default()
                 },
             }),
             required_capability: WorkerCapability::RunCommand,
@@ -1252,6 +1353,8 @@ mod placement_match_tests {
             expected_provision_spec: expected_provision_spec_value(sandbox, &[]).unwrap(),
             sandbox: sandbox.clone(),
             secret_mounts: vec![],
+            provider_external_id: None,
+            provider_routing_scope: None,
         }
     }
 
@@ -1291,5 +1394,15 @@ mod placement_match_tests {
             Some(sandbox.template.as_str())
         );
         assert!(!apply_sandbox_placement(&mut job, &entry).unwrap());
+    }
+
+    #[test]
+    fn placement_matches_a_concrete_provider_preference() {
+        let sandbox = sample_sandbox();
+        let mut job = base_job(&sandbox);
+        job.payload["provisionSpec"]["provider_preference"] = json!("cloudflare");
+        let entry = entry_for(&sandbox);
+
+        assert!(placement_matches_sandbox(&job, &entry));
     }
 }

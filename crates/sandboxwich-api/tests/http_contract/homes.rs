@@ -12,6 +12,7 @@ fn persistent_sandbox(name: &str) -> CreateSandboxRequest {
         workspace_mode: Some(WorkspaceMode::Persistent),
         runtime_profile: None,
         execution_class: None,
+        provider_preference: None,
         ttl_seconds: Some(120),
         max_lifetime_seconds: None,
         idle_ttl_seconds: None,
