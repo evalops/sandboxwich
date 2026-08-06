@@ -1196,6 +1196,9 @@ pub struct CreateHomeRequest {
 pub struct HomeResponse {
     pub ok: bool,
     pub home: Home,
+    /// The tenant-scoped live sandbox currently attached to this home, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mounted_sandbox_id: Option<SandboxId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation: Option<Operation>,
 }

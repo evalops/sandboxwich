@@ -56,11 +56,13 @@ pub(crate) async fn create_home(
             fetch_home_by_logical_key(&state.db, logical_key, &home.tenant_id).await?,
         )
     };
+    let mounted_sandbox_id = fetch_mounted_sandbox_id(&state.db, home.id, &home.tenant_id).await?;
     Ok((
         status,
         Json(HomeResponse {
             ok: true,
             home,
+            mounted_sandbox_id,
             operation: None,
         }),
     ))
@@ -91,9 +93,11 @@ pub(crate) async fn get_home(
     Path(home_id): Path<Uuid>,
 ) -> Result<Json<HomeResponse>, ApiError> {
     let home = fetch_home(&state.db, HomeId(home_id), &ctx.tenant_id).await?;
+    let mounted_sandbox_id = fetch_mounted_sandbox_id(&state.db, home.id, &ctx.tenant_id).await?;
     Ok(Json(HomeResponse {
         ok: true,
         home,
+        mounted_sandbox_id,
         operation: None,
     }))
 }
@@ -203,6 +207,7 @@ pub(crate) async fn delete_home(
         Json(HomeResponse {
             ok: true,
             home,
+            mounted_sandbox_id: None,
             operation: Some(operation_from_job(&job)?),
         }),
     ))
@@ -279,6 +284,34 @@ async fn fetch_home_by_logical_key(
         .await?
         .ok_or_else(|| ApiError::internal("logical home conflict row was not found"))?;
     row_to_home(row)
+}
+
+async fn fetch_mounted_sandbox_id(
+    db: &Database,
+    home_id: HomeId,
+    tenant_id: &str,
+) -> Result<Option<SandboxId>, ApiError> {
+    let sql = format!(
+        "select mounts.sandbox_id from sandbox_home_mounts mounts
+         join sandboxes on sandboxes.id = mounts.sandbox_id
+         where mounts.home_id = {} and mounts.tenant_id = {}
+           and sandboxes.state not in ('archived', 'error')
+         limit 1",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    let row = sqlx::query(&sql)
+        .bind(home_id.to_string())
+        .bind(tenant_id)
+        .fetch_optional(&db.pool)
+        .await?;
+    row.map(|row| {
+        let value: String = row.try_get("sandbox_id")?;
+        let id = Uuid::parse_str(&value)
+            .map_err(|_| ApiError::internal("invalid mounted sandbox id"))?;
+        Ok(SandboxId(id))
+    })
+    .transpose()
 }
 
 fn row_to_home(row: sqlx::any::AnyRow) -> Result<Home, ApiError> {
