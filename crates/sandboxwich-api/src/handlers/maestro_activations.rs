@@ -16,6 +16,27 @@ const REPLAY_MISMATCH: &str = "maestro_activation_replay_mismatch";
 const STALE_GENERATION: &str = "maestro_activation_stale_generation";
 const EXPIRED_LEASE: &str = "maestro_activation_lease_expired";
 const NOT_LIVE: &str = "maestro_activation_not_live";
+const PROOF_DIGEST_PREFIX: &str = "sha256:v1:";
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivationProofTupleV1 {
+    resident_process_id: ResidentProcessId,
+    resident_process_generation: u64,
+    lease_id: Uuid,
+    lease_attempt: u64,
+    job_id: JobId,
+    worker_id: WorkerId,
+    placement_generation: u64,
+    provider_pod_uid: Uuid,
+    runtime_image: String,
+}
+
+#[derive(Clone, Copy)]
+struct ActivationAuthority {
+    resident_process_id: ResidentProcessId,
+    job_id: JobId,
+}
 
 fn tuple_sha256(
     request: &MaestroHostedRunnerActivationValidationRequest,
@@ -27,6 +48,60 @@ fn tuple_sha256(
     hasher.update(b"sandboxwich-maestro-activation-v1\0");
     hasher.update(encoded);
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn proof_tuple_digest(
+    live: &MaestroHostedRunnerConnectionBindingResponse,
+    authority: ActivationAuthority,
+) -> Result<String, ApiError> {
+    let tuple = ActivationProofTupleV1 {
+        resident_process_id: authority.resident_process_id,
+        resident_process_generation: live.resident_process_generation,
+        lease_id: live.lease_id,
+        lease_attempt: live.lease_attempt,
+        job_id: authority.job_id,
+        worker_id: live.worker_id,
+        placement_generation: live.placement_generation,
+        provider_pod_uid: live.pod_uid,
+        runtime_image: live.runtime_image.clone(),
+    };
+    digest_proof_tuple(&tuple)
+}
+
+fn digest_proof_tuple(tuple: &ActivationProofTupleV1) -> Result<String, ApiError> {
+    let encoded = serde_json::to_vec(tuple)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"sandboxwich-maestro-activation-proof-v1\0");
+    hasher.update(encoded);
+    Ok(format!("{PROOF_DIGEST_PREFIX}{:x}", hasher.finalize()))
+}
+
+fn authority_revision(live: &MaestroHostedRunnerConnectionBindingResponse) -> String {
+    format!(
+        "maestro-authority:v1:{}:{}:{}",
+        live.placement_generation, live.resident_process_generation, live.lease_attempt
+    )
+}
+
+fn validation_response(
+    request: &MaestroHostedRunnerActivationValidationRequest,
+    live: &MaestroHostedRunnerConnectionBindingResponse,
+    authority: ActivationAuthority,
+    tuple_sha256: String,
+    validated_at: chrono::DateTime<Utc>,
+    replayed: bool,
+) -> Result<MaestroHostedRunnerActivationValidationResponse, ApiError> {
+    Ok(MaestroHostedRunnerActivationValidationResponse {
+        ok: true,
+        activation_id: request.activation_id,
+        resident_process_id: authority.resident_process_id,
+        job_id: authority.job_id,
+        tuple_digest: proof_tuple_digest(live, authority)?,
+        authority_revision: authority_revision(live),
+        tuple_sha256,
+        validated_at,
+        replayed,
+    })
 }
 
 fn binding_matches(
@@ -246,16 +321,39 @@ async fn validate_maestro_activation_inner(
         ));
     }
 
+    let authority_sql = format!(
+        "select rp.id as resident_process_id, jl.job_id
+         from resident_processes rp
+         join job_leases jl on jl.id = rp.active_lease_id
+         where rp.tenant_id = {} and rp.sandbox_id = {} and rp.name = {}
+           and rp.active_lease_id = {}",
+        state.db.placeholder(1),
+        state.db.placeholder(2),
+        state.db.placeholder(3),
+        state.db.placeholder(4),
+    );
+    let authority_row = sqlx::query(&authority_sql)
+        .bind(tenant_id)
+        .bind(request.sandbox_id.to_string())
+        .bind(MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME)
+        .bind(request.lease_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await?;
+    let authority = ActivationAuthority {
+        resident_process_id: ResidentProcessId(
+            Uuid::parse_str(&authority_row.try_get::<String, _>("resident_process_id")?)
+                .map_err(|_| ApiError::internal("invalid authoritative resident process ID"))?,
+        ),
+        job_id: JobId(
+            Uuid::parse_str(&authority_row.try_get::<String, _>("job_id")?)
+                .map_err(|_| ApiError::internal("invalid authoritative job ID"))?,
+        ),
+    };
+
     if let Some(row) = existing {
         let validated_at = parse_timestamp(&row.try_get::<String, _>("validated_at")?)?;
         transaction.commit().await?;
-        return Ok(MaestroHostedRunnerActivationValidationResponse {
-            ok: true,
-            activation_id: request.activation_id,
-            tuple_sha256: digest,
-            validated_at,
-            replayed: true,
-        });
+        return validation_response(&request, &live, authority, digest, validated_at, true);
     }
 
     let validated_at = Utc::now();
@@ -275,13 +373,7 @@ async fn validate_maestro_activation_inner(
         .execute(&mut *transaction)
         .await?;
     transaction.commit().await?;
-    Ok(MaestroHostedRunnerActivationValidationResponse {
-        ok: true,
-        activation_id: request.activation_id,
-        tuple_sha256: digest,
-        validated_at,
-        replayed: false,
-    })
+    validation_response(&request, &live, authority, digest, validated_at, false)
 }
 
 fn metric_reason(code: &str) -> &'static str {
@@ -343,4 +435,40 @@ async fn record_observation(
         .execute(&state.db.pool)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn uuid(value: &str) -> Uuid {
+        Uuid::parse_str(value).unwrap()
+    }
+
+    #[test]
+    fn proof_digest_pins_the_canonical_v1_tuple() {
+        let tuple = ActivationProofTupleV1 {
+            resident_process_id: ResidentProcessId(uuid("00000000-0000-0000-0000-000000000001")),
+            resident_process_generation: 2,
+            lease_id: uuid("00000000-0000-0000-0000-000000000003"),
+            lease_attempt: 4,
+            job_id: JobId(uuid("00000000-0000-0000-0000-000000000005")),
+            worker_id: WorkerId(uuid("00000000-0000-0000-0000-000000000006")),
+            placement_generation: 7,
+            provider_pod_uid: uuid("00000000-0000-0000-0000-000000000008"),
+            runtime_image: format!("example@sha256:{}", "a".repeat(64)),
+        };
+
+        assert_eq!(
+            digest_proof_tuple(&tuple).unwrap(),
+            "sha256:v1:5be4e7df19ff91042cf78e8c5fee277b8dd702e149dd838b1ff9977d8327a603"
+        );
+
+        let mut different_job = tuple;
+        different_job.job_id = JobId(uuid("00000000-0000-0000-0000-000000000009"));
+        assert_ne!(
+            digest_proof_tuple(&different_job).unwrap(),
+            "sha256:v1:5be4e7df19ff91042cf78e8c5fee277b8dd702e149dd838b1ff9977d8327a603"
+        );
+    }
 }
