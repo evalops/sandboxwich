@@ -28,6 +28,8 @@ use std::convert::Infallible;
 use std::time::Duration;
 use uuid::Uuid;
 
+const MAESTRO_HOSTED_RUNNER_JOB_PRIORITY: i64 = 100;
+
 const MAESTRO_RESIDENT_CONTRACT_REVISION_V2: &str = "maestro-resident-model-ready-v2";
 const MAESTRO_RESIDENT_CONTRACT_REVISION_V3: &str = "maestro-resident-model-ready-v3";
 
@@ -783,6 +785,7 @@ pub(crate) async fn put_resident_process(
         .bootstrap
         .as_ref()
         .map(|bootstrap| format!("{:x}", Sha256::digest(&bootstrap.content)));
+    let is_maestro_hosted_runner = name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME;
 
     if let Ok(current) = fetch_named_resident_process(&state.db, sandbox_id, &name).await {
         if matches!(
@@ -880,7 +883,15 @@ pub(crate) async fn put_resident_process(
         }),
         required_capability: WorkerCapability::RunCommand,
         required_execution_class: sandbox.execution_class.clone(),
-        priority: 0,
+        // A hosted-runner resident is the connection's critical path. Keep it
+        // ahead of ordinary queued work while remaining below safety-critical
+        // cleanup jobs (priority 1000); the claim query already enforces this
+        // order within the tenant and still applies all capability/fence checks.
+        priority: if is_maestro_hosted_runner {
+            MAESTRO_HOSTED_RUNNER_JOB_PRIORITY
+        } else {
+            0
+        },
         attempts: 0,
         max_attempts: 3,
         scheduled_at: now,

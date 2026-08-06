@@ -389,7 +389,7 @@ fn metric_reason(code: &str) -> &'static str {
     }
 }
 
-async fn record_observation(
+pub(crate) async fn record_observation(
     state: &AppState,
     tenant_id: &str,
     outcome: &str,

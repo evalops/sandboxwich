@@ -242,6 +242,7 @@ pub(crate) fn identity_app(state: AppState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::resident_attestations::IDENTITY_METRICS_TENANT_ID;
     use crate::{
         config::{
             AuthConfig, IDENTITY_SERVICE_CLIENT_URI, IdentityMtlsConfig, SandboxLifetimeConfig,
@@ -394,12 +395,14 @@ mod tests {
         let tls = identity_tls_config(&pki.config).unwrap();
         let listener = TcpListener::bind(pki.config.bind).unwrap();
         let address = listener.local_addr().unwrap();
+        let state = test_state().await;
+        let metrics_db = state.db.clone();
         let handle = axum_server::Handle::new();
         let server_handle = handle.clone();
         let server = tokio::spawn(async move {
             axum_server::from_tcp_rustls(listener, tls)
                 .handle(server_handle)
-                .serve(identity_app(test_state().await).into_make_service())
+                .serve(identity_app(state).into_make_service())
                 .await
                 .unwrap();
         });
@@ -476,6 +479,17 @@ mod tests {
                 .contains("placement_attestation_not_found"),
             "the exact fence route must be present on the mTLS listener"
         );
+        let metric_count: i64 = sqlx::query_scalar(
+            "select sample_count from maestro_activation_validation_metrics
+             where tenant_id = ? and outcome = ? and reason = ?",
+        )
+        .bind(IDENTITY_METRICS_TENANT_ID)
+        .bind("rejected")
+        .bind("not_found")
+        .fetch_one(&metrics_db.pool)
+        .await
+        .unwrap();
+        assert_eq!(metric_count, 1);
 
         handle.graceful_shutdown(Some(Duration::from_secs(1)));
         server.await.unwrap();
