@@ -774,6 +774,9 @@ mod tests {
         .await
         .unwrap();
         let state = AppState {
+            maestro_observation_sink: crate::maestro_observation::ActivationObservationSink::new(
+                db.clone(),
+            ),
             db,
             auth: AuthConfig {
                 shared_token: Some(TEST_TENANT_TOKEN.into()),
