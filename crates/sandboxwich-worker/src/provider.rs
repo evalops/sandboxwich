@@ -3664,7 +3664,7 @@ impl KubernetesApplyProvider {
             report(stage_update(ProvisioningStage::WorkspaceReady, None))?;
         }
 
-        if let Some(gateway_policy) = self
+        let gateway_name = if let Some(gateway_policy) = self
             .dry_run
             .egress_gateway_network_policy_manifest(sandbox_id, &spec.network_egress)?
         {
@@ -3693,15 +3693,10 @@ impl KubernetesApplyProvider {
                 .egress_gateway_pod_manifest(sandbox_id, &spec.network_egress)?
                 .context("gateway pod missing for host policy")?;
             self.apply_or_adopt_manifest(&gateway_pod, sandbox_id, cancelled, resources_applied)?;
-            let gateway_name = format!("sandboxwich-egress-gateway-{sandbox_id}");
-            let wait = self.wait_for_named_pod_ready(&gateway_name, cancelled)?;
-            if !wait.success {
-                return Err(anyhow::Error::new(classified_kubectl_failure(
-                    "egress gateway pod did not become ready",
-                    &wait.stderr,
-                )));
-            }
-        }
+            Some(format!("sandboxwich-egress-gateway-{sandbox_id}"))
+        } else {
+            None
+        };
 
         let network_policy = self
             .dry_run
@@ -3741,6 +3736,21 @@ impl KubernetesApplyProvider {
         );
         let pod_identity =
             self.apply_or_adopt_manifest(&pod, sandbox_id, cancelled, resources_applied)?;
+
+        // The egress gateway and guest Pod are independent cold starts once
+        // their manifests are applied. Start both before waiting on either;
+        // waiting for the gateway first used to add its full scheduling and
+        // image-pull latency directly in front of the guest Pod startup.
+        if let Some(gateway_name) = gateway_name {
+            let wait = self.wait_for_named_pod_ready(&gateway_name, cancelled)?;
+            if !wait.success {
+                return Err(anyhow::Error::new(classified_kubectl_failure(
+                    "egress gateway pod did not become ready",
+                    &wait.stderr,
+                )));
+            }
+        }
+
         let wait = self.wait_for_pod_ready(sandbox_id, cancelled)?;
         if !wait.success {
             let context = "sandbox pod did not become ready";
