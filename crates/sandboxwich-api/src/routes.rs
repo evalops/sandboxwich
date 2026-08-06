@@ -84,6 +84,10 @@ pub(crate) fn app(state: AppState) -> Router {
             post(validate_maestro_activation),
         )
         .route(
+            "/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/activations/validate-identity",
+            post(validate_maestro_activation_identity),
+        )
+        .route(
             "/sandboxes/{sandbox_id}/resident-processes/{name}/stop",
             post(stop_resident_process),
         )
