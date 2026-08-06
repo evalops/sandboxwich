@@ -92,6 +92,10 @@ pub(crate) async fn log_mutation_rejections(request: Request, next: Next) -> Res
         .extensions()
         .get::<AuthorizationContext>()
         .map(|context| context.decision_id.clone());
+    let authorization_lineage_id = request
+        .extensions()
+        .get::<AuthorizationContext>()
+        .map(|context| context.authorization_lineage_id.clone());
     let authorization_fingerprint = request
         .extensions()
         .get::<AuthorizationContext>()
@@ -134,6 +138,7 @@ pub(crate) async fn log_mutation_rejections(request: Request, next: Next) -> Res
         detail = rejection.detail.as_deref().unwrap_or(""),
         tenant = tenant.as_deref().unwrap_or(UNKNOWN_TENANT),
         authorization_decision_id = authorization_decision_id.as_deref().unwrap_or("<none>"),
+        authorization_lineage_id = authorization_lineage_id.as_deref().unwrap_or("<none>"),
         authorization_fingerprint = authorization_fingerprint.as_deref().unwrap_or("<none>"),
         authorization_receipt_id = authorization_receipt_id.as_deref().unwrap_or("<none>"),
         authorization_policy_digest = authorization_policy_digest.as_deref().unwrap_or("<none>"),

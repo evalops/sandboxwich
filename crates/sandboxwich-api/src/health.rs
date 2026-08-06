@@ -207,6 +207,7 @@ pub(crate) async fn collect_prometheus_metrics(
         metrics.scalar("worker_heartbeat_oldest_seconds"),
     );
     append_slo_metrics(&mut body, db, tenant_id).await?;
+    crate::authz::append_authorization_metrics(&mut body);
     Ok(body)
 }
 
