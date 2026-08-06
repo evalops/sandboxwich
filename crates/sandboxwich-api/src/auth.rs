@@ -12,6 +12,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use sandboxwich_core::*;
 use sqlx::Row;
+use std::time::Instant;
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
@@ -124,13 +125,16 @@ pub(crate) async fn auth_and_tenant(
         Principal::Tenant if is_operator_request(&state, request.headers()) => Principal::Operator,
         principal => principal,
     };
+    let authorization_started = Instant::now();
     let authorization = AuthorizationContext::from_request(&request, &tenant_id, principal);
-    if !authorization.principal_allowed(principal) {
+    let authorization_allowed = authorization.principal_allowed(principal);
+    if !authorization_allowed {
         tracing::warn!(
             target: "sandboxwich.authorization",
             request_id = %authorization.request_id,
             decision_id = %authorization.decision_id,
             receipt_id = %authorization.receipt_id,
+            lineage_id = %authorization.authorization_lineage_id,
             authorization_fingerprint = %authorization.authorization_fingerprint,
             policy_digest = %authorization.policy_digest,
             resource_kind = authorization.resource_kind,
@@ -143,12 +147,16 @@ pub(crate) async fn auth_and_tenant(
         // Preserve Sandboxwich's established authentication contract for a
         // valid credential of the wrong class: route-specific middleware
         // returns 401 for these mismatches, and callers use that distinction
-        // to refresh or replace worker/guest credentials. A deliberately
-        // denied route is different: the caller is authenticated, but the
-        // route is not part of the exposed policy surface, so keep it 403.
+        // to refresh or replace worker/guest credentials. An unknown
+        // route is different: the caller is authenticated, but the route is
+        // not part of the exposed policy surface, so keep it 403. A route
+        // known only to another listener is NotExposed and remains 404.
         let error = match authorization.requirement {
             crate::authz::PrincipalRequirement::Deny => {
                 ApiError::forbidden("authenticated principal is not authorized for this route")
+            }
+            crate::authz::PrincipalRequirement::NotExposed => {
+                ApiError::not_found("resource not found")
             }
             _ => ApiError::unauthorized("valid credential for this route is required"),
         };
@@ -161,13 +169,27 @@ pub(crate) async fn auth_and_tenant(
             crate::authz::AUTHORIZATION_RECEIPT_ID_HEADER.clone(),
             authorization.receipt_header(),
         );
+        response.headers_mut().insert(
+            crate::authz::AUTHORIZATION_LINEAGE_ID_HEADER.clone(),
+            authorization.lineage_header(),
+        );
+        crate::authz::record_decision(
+            false,
+            authorization.requirement == crate::authz::PrincipalRequirement::Deny,
+            authorization_started.elapsed(),
+        );
         return response;
     }
 
+    crate::authz::record_decision(true, false, authorization_started.elapsed());
     let span = tracing::Span::current();
     span.record(
         "authorization_decision_id",
         authorization.decision_id.as_str(),
+    );
+    span.record(
+        "authorization_lineage_id",
+        authorization.authorization_lineage_id.as_str(),
     );
     span.record(
         "authorization_fingerprint",
@@ -201,6 +223,7 @@ pub(crate) async fn auth_and_tenant(
         target: "sandboxwich.authorization",
         request_id = %authorization.request_id,
         decision_id = %authorization.decision_id,
+        lineage_id = %authorization.authorization_lineage_id,
         authorization_fingerprint = %authorization.authorization_fingerprint,
         policy_id = authorization.policy_id,
         policy_version = authorization.policy_version,
@@ -222,6 +245,10 @@ pub(crate) async fn auth_and_tenant(
     response.headers_mut().insert(
         crate::authz::AUTHORIZATION_RECEIPT_ID_HEADER.clone(),
         authorization.receipt_header(),
+    );
+    response.headers_mut().insert(
+        crate::authz::AUTHORIZATION_LINEAGE_ID_HEADER.clone(),
+        authorization.lineage_header(),
     );
     response
 }

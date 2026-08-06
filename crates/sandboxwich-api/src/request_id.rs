@@ -126,6 +126,7 @@ pub(crate) async fn attach_request_id(mut request: Request, next: Next) -> Respo
         w3c.traceparent = %trace.traceparent,
         w3c.tracestate = %trace.tracestate,
         authorization_decision_id = tracing::field::Empty,
+        authorization_lineage_id = tracing::field::Empty,
         authorization_fingerprint = tracing::field::Empty,
         authorization_policy_id = tracing::field::Empty,
         authorization_policy_version = tracing::field::Empty,

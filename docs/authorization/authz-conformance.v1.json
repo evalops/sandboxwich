@@ -1,0 +1,113 @@
+{
+  "schema": "authz_conformance_v1",
+  "version": 1,
+  "hard_gates": {
+    "cross_boundary_allows": 0,
+    "unknown_route_allows": 0,
+    "unclassified_routes": 0,
+    "missing_evidence": 0,
+    "raw_identifier_leaks": 0,
+    "fail_open_decisions": 0
+  },
+  "evidence_fields": {
+    "platform": [
+      "requestId",
+      "decisionId",
+      "fingerprint",
+      "policyId",
+      "policyVersion",
+      "policyDigest",
+      "lineageId"
+    ],
+    "sandboxwich": [
+      "schema",
+      "requestId",
+      "decisionId",
+      "receiptId",
+      "fingerprint",
+      "policyId",
+      "policyVersion",
+      "policyDigest",
+      "resourceKind",
+      "action",
+      "principalClass",
+      "decision",
+      "reason",
+      "lineageId"
+    ]
+  },
+  "cases": [
+    {
+      "id": "platform_organization_boundary",
+      "engine": "platform",
+      "expected_effect": "deny",
+      "expected_reason": "organization_mismatch"
+    },
+    {
+      "id": "platform_delegation_narrowing",
+      "engine": "platform",
+      "expected_effect": "deny",
+      "expected_reason": "delegation_narrowed"
+    },
+    {
+      "id": "platform_approval_guard",
+      "engine": "platform",
+      "expected_effect": "require_approval",
+      "expected_reason": "approval_required"
+    },
+    {
+      "id": "sandbox_unknown_route",
+      "engine": "sandboxwich",
+      "method": "GET",
+      "path": "/v1/not-a-real-route",
+      "principal": "tenant",
+      "expected_effect": "deny",
+      "expected_reason": "unknown_route"
+    },
+    {
+      "id": "sandbox_identity_route_not_exposed",
+      "engine": "sandboxwich",
+      "method": "POST",
+      "path": "/v1/maestro-workload-identities/validate",
+      "principal": "tenant",
+      "expected_effect": "deny",
+      "expected_reason": "route_not_exposed"
+    },
+    {
+      "id": "sandbox_tenant_on_worker",
+      "engine": "sandboxwich",
+      "method": "POST",
+      "path": "/v1/workers/worker-1/heartbeat",
+      "principal": "tenant",
+      "expected_effect": "deny",
+      "expected_reason": "principal_class_not_allowed"
+    },
+    {
+      "id": "sandbox_worker_on_tenant",
+      "engine": "sandboxwich",
+      "method": "GET",
+      "path": "/v1/sandboxes",
+      "principal": "worker",
+      "expected_effect": "deny",
+      "expected_reason": "principal_class_not_allowed"
+    },
+    {
+      "id": "sandbox_operator_route_tenant",
+      "engine": "sandboxwich",
+      "method": "GET",
+      "path": "/v1/operator/tenant-policies/tenant-1",
+      "principal": "tenant",
+      "expected_effect": "deny",
+      "expected_reason": "principal_class_not_allowed"
+    },
+    {
+      "id": "sandbox_tenant_route_allow",
+      "engine": "sandboxwich",
+      "method": "GET",
+      "path": "/v1/sandboxes",
+      "principal": "tenant",
+      "expected_effect": "allow",
+      "expected_reason": "allowed"
+    }
+  ]
+}

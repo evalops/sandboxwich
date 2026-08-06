@@ -75,6 +75,7 @@ jobs:
       - run: python3 scripts/test-repository-rules.py
       - run: python3 scripts/test-deployment-images.py
       - run: python3 scripts/test-release-readiness.py
+      - run: python3 scripts/test-authz-proof.py
       - run: cargo test --workspace --locked
         env:
           SANDBOXWICH_TEST_POSTGRES_URL: >-

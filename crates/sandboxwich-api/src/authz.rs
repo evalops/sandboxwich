@@ -9,6 +9,11 @@
 use axum::extract::Request;
 use axum::http::{HeaderName, HeaderValue};
 use sha2::{Digest, Sha256};
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::request_id::{REQUEST_ID_HEADER, RequestTrace};
@@ -31,6 +36,7 @@ pub(crate) enum PrincipalRequirement {
     Worker,
     WorkerOrGuest,
     Deny,
+    NotExposed,
 }
 
 impl PrincipalRequirement {
@@ -72,13 +78,15 @@ const AUTHORIZATION_POLICY_RULES: &[&str] = &[
     "worker_or_guest|write|/sandboxes/*/guest-health",
     "worker_or_guest|refresh|/sandboxes/*/guest-token/refresh",
     "deny|unknown_worker|/workers/*",
-    "default|tenant_or_operator|*",
+    "deny|unclassified_route|*",
+    "not_exposed|identity_only|/maestro-workload-identities/validate",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AuthorizationContext {
     pub(crate) request_id: String,
     pub(crate) decision_id: String,
+    pub(crate) authorization_lineage_id: String,
     pub(crate) authorization_fingerprint: String,
     pub(crate) trace_id: Option<String>,
     pub(crate) policy_id: &'static str,
@@ -110,7 +118,16 @@ impl AuthorizationContext {
         let trace_id = request_trace
             .and_then(|trace| (!trace.trace_id.is_empty()).then(|| trace.trace_id.clone()));
 
-        Self::new(
+        let lineage_id = request
+            .headers()
+            .get(&AUTHORIZATION_LINEAGE_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| valid_request_id(value))
+            .unwrap_or(&request_id);
+
+        Self::new_with_lineage(
+            lineage_id,
             &request_id,
             trace_id.as_deref(),
             request.method().as_str(),
@@ -120,7 +137,22 @@ impl AuthorizationContext {
         )
     }
 
+    #[cfg(test)]
     fn new(
+        request_id: &str,
+        trace_id: Option<&str>,
+        method: &str,
+        path: &str,
+        tenant_id: &str,
+        principal: Principal,
+    ) -> Self {
+        Self::new_with_lineage(
+            request_id, request_id, trace_id, method, path, tenant_id, principal,
+        )
+    }
+
+    fn new_with_lineage(
+        lineage_id: &str,
         request_id: &str,
         trace_id: Option<&str>,
         method: &str,
@@ -130,7 +162,16 @@ impl AuthorizationContext {
     ) -> Self {
         let policy = route_policy(method, path);
         let policy_digest = authorization_policy_digest();
-        let decision_reason = if policy.requirement.allows(principal) {
+        let decision_reason = if matches!(
+            policy.requirement,
+            PrincipalRequirement::Deny | PrincipalRequirement::NotExposed
+        ) {
+            if policy.requirement == PrincipalRequirement::NotExposed {
+                "route_not_exposed"
+            } else {
+                "unknown_route"
+            }
+        } else if policy.requirement.allows(principal) {
             "allowed"
         } else {
             "principal_class_not_allowed"
@@ -149,6 +190,7 @@ impl AuthorizationContext {
         Self {
             request_id: request_id.to_owned(),
             decision_id: decision_id.clone(),
+            authorization_lineage_id: lineage_id.to_owned(),
             authorization_fingerprint,
             trace_id: trace_id.map(str::to_owned),
             policy_id: AUTHORIZATION_POLICY_ID,
@@ -166,6 +208,11 @@ impl AuthorizationContext {
     pub(crate) fn decision_header(&self) -> HeaderValue {
         HeaderValue::from_str(&self.decision_id)
             .expect("authorization decision id is a valid header value")
+    }
+
+    pub(crate) fn lineage_header(&self) -> HeaderValue {
+        HeaderValue::from_str(&self.authorization_lineage_id)
+            .expect("authorization lineage id is a valid header value")
     }
 
     pub(crate) fn receipt_header(&self) -> HeaderValue {
@@ -188,6 +235,7 @@ impl AuthorizationContext {
                 "requestId": self.request_id,
                 "decisionId": self.decision_id,
                 "receiptId": self.receipt_id,
+                "lineageId": self.authorization_lineage_id,
                 "fingerprint": self.authorization_fingerprint,
                 "policyId": self.policy_id,
                 "policyVersion": self.policy_version,
@@ -241,18 +289,44 @@ fn normalized_path(path: &str) -> &str {
     if path.is_empty() { "/" } else { path }
 }
 
+fn known_route(path: &str) -> bool {
+    AUTHORIZATION_ROUTE_MANIFEST
+        .iter()
+        .any(|template| path_matches_template(path, template))
+}
+fn known_non_tenant_route(path: &str) -> bool {
+    AUTHORIZATION_NON_TENANT_ROUTE_MANIFEST
+        .iter()
+        .any(|template| path_matches_template(path, template))
+}
+
+fn path_matches_template(path: &str, template: &str) -> bool {
+    let path_parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    let template_parts = template.trim_matches('/').split('/').collect::<Vec<_>>();
+    path_parts.len() == template_parts.len()
+        && path_parts
+            .iter()
+            .zip(template_parts)
+            .all(|(part, expected)| expected == "*" || part == &expected)
+}
+
 pub(crate) fn route_policy(method: &str, path: &str) -> RoutePolicy {
     let path = normalized_path(path);
-    let requirement = if path == "/workers/register" {
+    let requirement = if known_non_tenant_route(path) {
+        PrincipalRequirement::NotExposed
+    } else if path == "/workers/register" && known_route(path) {
         PrincipalRequirement::TenantOrOperator
-    } else if path == "/snapshots/cleanup" || path == "/operator" || path.starts_with("/operator/")
+    } else if (path == "/snapshots/cleanup"
+        || path == "/operator"
+        || path.starts_with("/operator/"))
+        && known_route(path)
     {
         PrincipalRequirement::Operator
-    } else if worker_route(path) {
+    } else if worker_route(path) && known_route(path) {
         PrincipalRequirement::Worker
-    } else if worker_or_guest_route(method, path) {
+    } else if worker_or_guest_route(method, path) && known_route(path) {
         PrincipalRequirement::WorkerOrGuest
-    } else if path.starts_with("/workers/") {
+    } else if path.starts_with("/workers/") || !known_route(path) {
         PrincipalRequirement::Deny
     } else {
         PrincipalRequirement::TenantOrOperator
@@ -370,6 +444,7 @@ fn requirement_code(requirement: PrincipalRequirement) -> &'static str {
         PrincipalRequirement::Worker => "worker",
         PrincipalRequirement::WorkerOrGuest => "worker_or_guest",
         PrincipalRequirement::Deny => "deny",
+        PrincipalRequirement::NotExposed => "not_exposed",
     }
 }
 
@@ -627,6 +702,8 @@ mod tests {
         let registration = route_policy("POST", "/v1/workers/register");
         let operator = route_policy("GET", "/v1/operator/tenant-policies/default");
         let unknown_worker = route_policy("POST", "/v1/workers/worker-1/unknown");
+        let unknown_route = route_policy("GET", "/v1/not-a-real-route");
+        let identity_only = route_policy("POST", "/v1/maestro-workload-identities/validate");
 
         assert_eq!(heartbeat.requirement, PrincipalRequirement::Worker);
         assert_eq!(claim.requirement, PrincipalRequirement::WorkerOrGuest);
@@ -636,6 +713,8 @@ mod tests {
         );
         assert_eq!(operator.requirement, PrincipalRequirement::Operator);
         assert_eq!(unknown_worker.requirement, PrincipalRequirement::Deny);
+        assert_eq!(unknown_route.requirement, PrincipalRequirement::Deny);
+        assert_eq!(identity_only.requirement, PrincipalRequirement::NotExposed);
     }
 
     #[test]
@@ -660,4 +739,281 @@ mod tests {
         assert!(!payload.to_string().contains("tenant-private"));
         assert!(!payload.to_string().contains("sandbox-private"));
     }
+}
+
+#[cfg(test)]
+mod conformance_tests {
+    use super::*;
+    use sandboxwich_core::WorkerId;
+    use serde::Deserialize;
+
+    #[test]
+    fn explicit_lineage_is_exposed_without_raw_identifiers() {
+        let context = AuthorizationContext::new_with_lineage(
+            "lineage-1",
+            "request-1",
+            None,
+            "GET",
+            "/v1/sandboxes/sandbox-1",
+            "tenant-private",
+            Principal::Tenant,
+        );
+        let mut payload = serde_json::json!({});
+
+        context.add_to_payload(&mut payload);
+
+        assert_eq!(context.authorization_lineage_id, "lineage-1");
+        assert_eq!(context.lineage_header().to_str().unwrap(), "lineage-1");
+        assert_eq!(payload["_authorization"]["lineageId"], "lineage-1");
+        assert!(!payload.to_string().contains("tenant-private"));
+        assert!(!payload.to_string().contains("sandbox-1"));
+    }
+
+    #[test]
+    fn shared_conformance_cases_fail_closed_for_sandboxwich() {
+        #[derive(Debug, Deserialize)]
+        struct Suite {
+            schema: String,
+            cases: Vec<Case>,
+        }
+        #[derive(Debug, Deserialize)]
+        struct Case {
+            id: String,
+            engine: String,
+            #[serde(default)]
+            method: Option<String>,
+            #[serde(default)]
+            path: Option<String>,
+            #[serde(default)]
+            principal: Option<String>,
+            expected_effect: String,
+            expected_reason: String,
+        }
+
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/authorization/authz-conformance.v1.json");
+        let suite: Suite = serde_json::from_str(
+            &std::fs::read_to_string(fixture_path).expect("conformance fixture is readable"),
+        )
+        .expect("conformance fixture is valid JSON");
+        assert_eq!(suite.schema, "authz_conformance_v1");
+
+        for case in suite
+            .cases
+            .iter()
+            .filter(|case| case.engine == "sandboxwich")
+        {
+            let principal = match case.principal.as_deref() {
+                Some("tenant") => Principal::Tenant,
+                Some("worker") => Principal::Worker(WorkerId(Uuid::from_u128(7))),
+                Some("operator") => Principal::Operator,
+                other => panic!("unsupported conformance principal {other:?}"),
+            };
+            let context = AuthorizationContext::new(
+                "conformance-request",
+                None,
+                case.method.as_deref().unwrap_or("GET"),
+                case.path.as_deref().expect("sandbox case path"),
+                "tenant-private",
+                principal,
+            );
+            let effect = if context.principal_allowed(principal) {
+                "allow"
+            } else {
+                "deny"
+            };
+            assert_eq!(effect, case.expected_effect, "case {}", case.id);
+            assert_eq!(
+                context.decision_reason, case.expected_reason,
+                "case {}",
+                case.id
+            );
+        }
+    }
+}
+pub(crate) static AUTHORIZATION_LINEAGE_ID_HEADER: HeaderName =
+    HeaderName::from_static("x-authorization-lineage-id");
+pub(crate) const AUTHORIZATION_ROUTE_MANIFEST: &[&str] = &[
+    "/healthz",
+    "/readyz",
+    "/openapi.json",
+    "/metrics",
+    "/homes",
+    "/homes/*",
+    "/homes/*/sandboxes",
+    "/sandboxes",
+    "/sandboxes/*",
+    "/sandboxes/*/observed-state",
+    "/sandboxes/*/files",
+    "/sandboxes/*/files/*",
+    "/sandboxes/*/runtime-resources",
+    "/sandboxes/*/stop",
+    "/sandboxes/*/resident-processes/*",
+    "/sandboxes/*/resident-processes/maestro-hosted-runner/connection-binding",
+    "/sandboxes/*/resident-processes/maestro-hosted-runner/activations/validate",
+    "/sandboxes/*/resident-processes/*/stop",
+    "/sandboxes/*/resident-processes/*/events",
+    "/sandboxes/*/resume",
+    "/sandboxes/*/fork",
+    "/sandboxes/*/snapshots",
+    "/sandboxes/*/desktop",
+    "/sandboxes/*/desktop-sessions",
+    "/sandboxes/*/commands",
+    "/sandboxes/*/prompt",
+    "/sandboxes/*/events",
+    "/desktop-sessions/*",
+    "/desktop-sessions/*/status",
+    "/desktop-sessions/*/access",
+    "/secret-refs",
+    "/secret-refs/*",
+    "/snapshots/cleanup",
+    "/snapshots/*",
+    "/snapshots/*/fork",
+    "/commands/*",
+    "/commands/*/output",
+    "/workers",
+    "/capacity",
+    "/jobs",
+    "/jobs/*",
+    "/divergence/reconcile",
+    "/sandboxes/*/tool-call-ledger",
+    "/sandboxes/*/divergence-findings",
+    "/operations/*",
+    "/operations/*/events",
+    "/operations/*/cancel",
+    "/sandboxes/*/guest-health",
+    "/sandboxes/*/ssh-keys",
+    "/sandboxes/*/ssh-access",
+    "/ssh-keys/*/status",
+    "/sandboxes/*/apex-task-instructions",
+    "/resident-placement-attestations/redeem",
+    "/resident-placement-attestations/validate",
+    "/workers/register",
+    "/workers/*/heartbeat",
+    "/workers/*/drain",
+    "/workers/*/runtime-resource-inventory",
+    "/workers/*/runtime-resources/reconcile",
+    "/workers/*/sandboxes/*/guest-token",
+    "/workers/*/apex-instruction-callbacks/*",
+    "/workers/*/leases/claim",
+    "/resident-processes/*/bootstrap",
+    "/resident-processes/*/observations",
+    "/leases/*/renew",
+    "/leases/*/materialization",
+    "/leases/*/provisioning",
+    "/leases/*/output",
+    "/leases/*/complete",
+    "/leases/*/fail",
+    "/sandboxes/*/guest-token/refresh",
+    "/operator/tenant-policies/*",
+];
+pub(crate) const AUTHORIZATION_NON_TENANT_ROUTE_MANIFEST: &[&str] =
+    &["/maestro-workload-identities/validate"];
+
+#[derive(Debug, Default)]
+struct AuthorizationMetrics {
+    decisions: AtomicU64,
+    allows: AtomicU64,
+    denials: AtomicU64,
+    unknown_route_denials: AtomicU64,
+    receipts: AtomicU64,
+    latency_ns_sum: AtomicU64,
+    latency_ns_max: AtomicU64,
+}
+
+static AUTHORIZATION_METRICS: OnceLock<AuthorizationMetrics> = OnceLock::new();
+
+fn authorization_metrics() -> &'static AuthorizationMetrics {
+    AUTHORIZATION_METRICS.get_or_init(AuthorizationMetrics::default)
+}
+
+pub(crate) fn record_decision(allowed: bool, unknown_route: bool, elapsed: Duration) {
+    let metrics = authorization_metrics();
+    metrics.decisions.fetch_add(1, Ordering::Relaxed);
+    metrics.receipts.fetch_add(1, Ordering::Relaxed);
+    if allowed {
+        metrics.allows.fetch_add(1, Ordering::Relaxed);
+    } else {
+        metrics.denials.fetch_add(1, Ordering::Relaxed);
+        if unknown_route {
+            metrics
+                .unknown_route_denials
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let elapsed_ns = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+    metrics
+        .latency_ns_sum
+        .fetch_add(elapsed_ns, Ordering::Relaxed);
+    let mut observed = metrics.latency_ns_max.load(Ordering::Relaxed);
+    while elapsed_ns > observed {
+        match metrics.latency_ns_max.compare_exchange_weak(
+            observed,
+            elapsed_ns,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(next) => observed = next,
+        }
+    }
+}
+
+pub(crate) fn append_authorization_metrics(body: &mut String) {
+    let metrics = authorization_metrics();
+    append_metric(
+        body,
+        "sandboxwich_authorization_decisions_total",
+        "Authorization decisions evaluated.",
+        "counter",
+        metrics.decisions.load(Ordering::Relaxed),
+    );
+    append_metric(
+        body,
+        "sandboxwich_authorization_allows_total",
+        "Authorization decisions that allowed the principal.",
+        "counter",
+        metrics.allows.load(Ordering::Relaxed),
+    );
+    append_metric(
+        body,
+        "sandboxwich_authorization_denials_total",
+        "Authorization decisions that denied the principal.",
+        "counter",
+        metrics.denials.load(Ordering::Relaxed),
+    );
+    append_metric(
+        body,
+        "sandboxwich_authorization_unknown_route_denials_total",
+        "Authorization denials caused by an unclassified route.",
+        "counter",
+        metrics.unknown_route_denials.load(Ordering::Relaxed),
+    );
+    append_metric(
+        body,
+        "sandboxwich_authorization_receipts_total",
+        "Authorization receipts emitted.",
+        "counter",
+        metrics.receipts.load(Ordering::Relaxed),
+    );
+    append_metric(
+        body,
+        "sandboxwich_authorization_decision_latency_ns_sum",
+        "Sum of authorization decision latency in nanoseconds.",
+        "counter",
+        metrics.latency_ns_sum.load(Ordering::Relaxed),
+    );
+    append_metric(
+        body,
+        "sandboxwich_authorization_decision_latency_ns_max",
+        "Maximum authorization decision latency in nanoseconds.",
+        "gauge",
+        metrics.latency_ns_max.load(Ordering::Relaxed),
+    );
+}
+
+fn append_metric(body: &mut String, name: &str, help: &str, kind: &str, value: u64) {
+    body.push_str(&format!(
+        "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n",
+    ));
 }
