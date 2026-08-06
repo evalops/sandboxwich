@@ -757,6 +757,100 @@
         "format": "uuid",
         "type": "string"
       },
+      "MaestroHostedRunnerActivationResolveRequest": {
+        "additionalProperties": false,
+        "description": "Signed claims parsed by Platform from the authenticated Maestro client\nidentity and its Open frame. Fields that only Sandboxwich can authoritatively\nresolve (service DNS coordinates, full image reference, server URI SAN, and\nlease expiry) are deliberately absent.",
+        "properties": {
+          "activationId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "leaseAttempt": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "leaseId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "organizationId": {
+            "type": "string"
+          },
+          "placementGeneration": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "podUid": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "residentProcessGeneration": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "runnerSessionId": {
+            "type": "string"
+          },
+          "runtimeImageDigest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "sandboxId": {
+            "$ref": "#/components/schemas/SandboxId"
+          },
+          "serviceName": {
+            "type": "string"
+          },
+          "servicePort": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "workerId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "workspaceId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "activationId",
+          "organizationId",
+          "workspaceId",
+          "sandboxId",
+          "podUid",
+          "placementGeneration",
+          "runnerSessionId",
+          "runtimeImageDigest",
+          "serviceName",
+          "servicePort",
+          "residentProcessGeneration",
+          "leaseId",
+          "leaseAttempt",
+          "workerId"
+        ],
+        "type": "object"
+      },
+      "MaestroHostedRunnerActivationResolveResponse": {
+        "description": "The exact locked binding Sandboxwich used to materialize a durable\nactivation proof. Returning both objects prevents a consumer from joining\na binding read from one authority generation to a proof from another.",
+        "properties": {
+          "binding": {
+            "$ref": "#/components/schemas/MaestroHostedRunnerConnectionBindingResponse"
+          },
+          "proof": {
+            "$ref": "#/components/schemas/MaestroHostedRunnerActivationValidationResponse"
+          }
+        },
+        "required": [
+          "binding",
+          "proof"
+        ],
+        "type": "object"
+      },
       "MaestroHostedRunnerActivationValidationRequest": {
         "additionalProperties": false,
         "description": "Authenticated Maestro rendezvous activation presented by Platform for\nvalidation against Sandboxwich's current resident, placement, and lease\nauthority. `activation_id` is the idempotency/replay fence; every remaining\nfield must exactly equal the live connection binding.",
@@ -3845,6 +3939,67 @@
         },
         "tags": [
           "crate::handlers::commands"
+        ]
+      }
+    },
+    "/v1/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/activations/resolve": {
+      "post": {
+        "operationId": "resolve_maestro_activation",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MaestroHostedRunnerActivationResolveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MaestroHostedRunnerActivationResolveResponse"
+                }
+              }
+            },
+            "description": "Exact locked Maestro binding and durable activation proof"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No tenant-scoped activation authority exists"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Signed claims are stale, expired, replayed with different material, or mismatched"
+          }
+        },
+        "tags": [
+          "crate::handlers::maestro_activations"
         ]
       }
     },

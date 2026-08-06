@@ -36,6 +36,7 @@ use sandboxwich_core::{
         crate::handlers::apex_instructions::read_apex_task_instructions,
         crate::handlers::resident_attestations::get_maestro_connection_binding,
         crate::handlers::maestro_activations::validate_maestro_activation,
+        crate::handlers::maestro_activations::resolve_maestro_activation,
         crate::handlers::resident_attestations::redeem_resident_placement_attestation,
         crate::handlers::resident_attestations::validate_resident_placement_attestation,
         crate::handlers::operations::get_operation,
@@ -85,6 +86,8 @@ use sandboxwich_core::{
         ,sandboxwich_core::MaestroHostedRunnerConnectionBindingResponse
         ,sandboxwich_core::MaestroHostedRunnerActivationValidationRequest
         ,sandboxwich_core::MaestroHostedRunnerActivationValidationResponse
+        ,sandboxwich_core::MaestroHostedRunnerActivationResolveRequest
+        ,sandboxwich_core::MaestroHostedRunnerActivationResolveResponse
         ,sandboxwich_core::SecretSource
         ,sandboxwich_core::SecretRef
         ,sandboxwich_core::CreateSecretRefRequest
@@ -125,6 +128,10 @@ const PUBLIC_V1_OPERATIONS: &[(&str, &str)] = &[
     (
         "post",
         "/v1/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/activations/validate",
+    ),
+    (
+        "post",
+        "/v1/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/activations/resolve",
     ),
     (
         "post",
@@ -372,6 +379,10 @@ mod tests {
             ),
             (
                 "/v1/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/activations/validate",
+                "post",
+            ),
+            (
+                "/v1/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/activations/resolve",
                 "post",
             ),
             ("/v1/operations/{operation_id}", "get"),

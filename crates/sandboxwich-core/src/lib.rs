@@ -2634,6 +2634,41 @@ pub struct MaestroHostedRunnerActivationValidationResponse {
     pub replayed: bool,
 }
 
+/// Signed claims parsed by Platform from the authenticated Maestro client
+/// identity and its Open frame. Fields that only Sandboxwich can authoritatively
+/// resolve (service DNS coordinates, full image reference, server URI SAN, and
+/// lease expiry) are deliberately absent.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MaestroHostedRunnerActivationResolveRequest {
+    pub activation_id: Uuid,
+    pub organization_id: String,
+    pub workspace_id: String,
+    pub sandbox_id: SandboxId,
+    pub pod_uid: Uuid,
+    pub placement_generation: u64,
+    pub runner_session_id: String,
+    #[schema(pattern = "^[0-9a-f]{64}$")]
+    pub runtime_image_digest: String,
+    pub service_name: String,
+    pub service_port: u16,
+    pub resident_process_generation: u64,
+    pub lease_id: Uuid,
+    pub lease_attempt: u64,
+    #[schema(value_type = Uuid)]
+    pub worker_id: WorkerId,
+}
+
+/// The exact locked binding Sandboxwich used to materialize a durable
+/// activation proof. Returning both objects prevents a consumer from joining
+/// a binding read from one authority generation to a proof from another.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MaestroHostedRunnerActivationResolveResponse {
+    pub binding: MaestroHostedRunnerConnectionBindingResponse,
+    pub proof: MaestroHostedRunnerActivationValidationResponse,
+}
+
 impl fmt::Debug for ResidentProcessRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

@@ -942,6 +942,39 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
         "the binding becomes available once the provider Pod identity is fenced"
     );
 
+    let resolve_url = format!(
+        "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}/activations/resolve",
+        server.base_url
+    );
+    let resolved_activation_id = Uuid::now_v7();
+    let distinct_workspace = client
+        .post(&resolve_url)
+        .json(&serde_json::json!({
+            "activationId": resolved_activation_id,
+            "organizationId": "org-cae96cb237bc161dd754903c",
+            "workspaceId": starting_connection.workspace_id,
+            "sandboxId": starting_connection.sandbox_id,
+            "podUid": starting_connection.pod_uid,
+            "placementGeneration": starting_connection.placement_generation,
+            "runnerSessionId": starting_connection.runner_session_id,
+            "runtimeImageDigest": "b".repeat(64),
+            "serviceName": starting_connection.service_name,
+            "servicePort": starting_connection.service_port,
+            "residentProcessGeneration": starting_connection.resident_process_generation,
+            "leaseId": starting_connection.lease_id,
+            "leaseAttempt": starting_connection.lease_attempt,
+            "workerId": starting_connection.worker_id,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(distinct_workspace.status(), reqwest::StatusCode::CONFLICT);
+    let distinct_workspace: ErrorEnvelope = distinct_workspace.json().await.unwrap();
+    assert_eq!(
+        distinct_workspace.code, "maestro_activation_binding_mismatch",
+        "a signed org/workspace whose combined tenant does not equal both auth and live binding must fail closed"
+    );
+
     let mut activation_url = format!(
         "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}/activations/validate",
         server.base_url
@@ -1322,6 +1355,233 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
         reqwest::StatusCode::CONFLICT,
         "an expired lease must not expose a connection binding"
     );
+}
+
+#[tokio::test]
+async fn maestro_activation_resolve_returns_the_locked_binding_and_legacy_compatible_proof() {
+    let organization_id = "org-proof";
+    let workspace_id = "workspace-proof";
+    let tenant_id = format!("{organization_id}:{workspace_id}");
+    let tenant_token = "sandboxwich-resolve-proof-token";
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::spawn(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("maestro-resolve.db").display()
+        ),
+        Some(data_dir),
+        true,
+        false,
+        |command| {
+            command
+                .env(
+                    "SANDBOXWICH_TENANT_TOKENS",
+                    format!("{tenant_id}={tenant_token}"),
+                )
+                .env("SANDBOXWICH_OPERATOR_TOKEN", TEST_OPERATOR_TOKEN);
+        },
+    )
+    .await
+    .with_auth_token(Some(tenant_token.into()));
+    let (sandbox_id, worker, _) =
+        provisioned_sandbox_with_guest(&server, "maestro-resolve", true).await;
+    let client = server.client();
+    let runner_session_id = "runner-proof";
+    let request = maestro_hosted_runner_request_for_organization(
+        &tenant_id,
+        sandbox_id,
+        workspace_id,
+        runner_session_id,
+    );
+    let created: ResidentProcessResponse = client
+        .put(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url
+        ))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let worker_http = worker_client(&worker);
+    let claimed: ClaimLeaseResponse = worker_http
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox_id),
+            kinds: Some(vec![JobKind::RunResidentProcess]),
+            wait_ms: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claimed.lease.expect("Maestro lease");
+    let pod_uid = Uuid::now_v7();
+    worker_http
+        .post(format!(
+            "{}/resident-processes/{}/observations",
+            server.base_url, created.resident_process.id
+        ))
+        .json(&ResidentProcessObservationRequest {
+            generation: created.resident_process.generation,
+            lease_id: lease.id.0,
+            observed_state: ResidentProcessObservedState::Starting,
+            pid: None,
+            exit_code: None,
+            error_code: None,
+            error_message: None,
+            provider_pod_name: Some("maestro-hosted-runner-pod".into()),
+            provider_pod_uid: Some(pod_uid.to_string()),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let binding: MaestroHostedRunnerConnectionBindingResponse = client
+        .get(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}/connection-binding",
+            server.base_url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let activation_id = Uuid::now_v7();
+    let resolve = MaestroHostedRunnerActivationResolveRequest {
+        activation_id,
+        organization_id: organization_id.into(),
+        workspace_id: workspace_id.into(),
+        sandbox_id,
+        pod_uid,
+        placement_generation: binding.placement_generation,
+        runner_session_id: runner_session_id.into(),
+        runtime_image_digest: "b".repeat(64),
+        service_name: binding.service_name.clone(),
+        service_port: binding.service_port,
+        resident_process_generation: binding.resident_process_generation,
+        lease_id: binding.lease_id,
+        lease_attempt: binding.lease_attempt,
+        worker_id: binding.worker_id,
+    };
+    let resolved: MaestroHostedRunnerActivationResolveResponse = client
+        .post(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}/activations/resolve",
+            server.base_url
+        ))
+        .json(&resolve)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resolved.binding, binding);
+    assert!(!resolved.proof.replayed);
+    let replayed_resolve: MaestroHostedRunnerActivationResolveResponse = client
+        .post(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}/activations/resolve",
+            server.base_url
+        ))
+        .json(&resolve)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replayed_resolve.binding, binding);
+    assert!(replayed_resolve.proof.replayed);
+    assert_eq!(
+        replayed_resolve.proof.tuple_digest,
+        resolved.proof.tuple_digest
+    );
+
+    let mut concurrent = resolve.clone();
+    concurrent.activation_id = Uuid::now_v7();
+    let concurrent_url = format!(
+        "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}/activations/resolve",
+        server.base_url
+    );
+    let left = client.post(&concurrent_url).json(&concurrent).send();
+    let right = client.post(&concurrent_url).json(&concurrent).send();
+    let (left, right) = tokio::join!(left, right);
+    let left: MaestroHostedRunnerActivationResolveResponse = left
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let right: MaestroHostedRunnerActivationResolveResponse = right
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(left.binding, right.binding);
+    assert_eq!(left.proof.tuple_digest, right.proof.tuple_digest);
+    assert_ne!(left.proof.replayed, right.proof.replayed);
+
+    let legacy = MaestroHostedRunnerActivationValidationRequest {
+        activation_id,
+        organization_id: binding.organization_id.clone(),
+        workspace_id: binding.workspace_id.clone(),
+        sandbox_id: binding.sandbox_id,
+        pod_uid: binding.pod_uid,
+        placement_generation: binding.placement_generation,
+        runner_session_id: binding.runner_session_id.clone(),
+        runtime_image: binding.runtime_image.clone(),
+        service_namespace: binding.service_namespace.clone(),
+        service_name: binding.service_name.clone(),
+        service_host: binding.service_host.clone(),
+        service_port: binding.service_port,
+        expected_server_uri_san: binding.expected_server_uri_san.clone(),
+        resident_process_generation: binding.resident_process_generation,
+        lease_id: binding.lease_id,
+        lease_attempt: binding.lease_attempt,
+        lease_expires_at_epoch_seconds: binding.lease_expires_at_epoch_seconds,
+        worker_id: binding.worker_id,
+    };
+    let replay: MaestroHostedRunnerActivationValidationResponse = client
+        .post(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}/activations/validate",
+            server.base_url
+        ))
+        .json(&legacy)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.tuple_sha256, resolved.proof.tuple_sha256);
+    assert_eq!(replay.tuple_digest, resolved.proof.tuple_digest);
+    assert_eq!(replay.authority_revision, resolved.proof.authority_revision);
 }
 
 #[tokio::test]

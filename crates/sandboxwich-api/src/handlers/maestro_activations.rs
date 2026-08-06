@@ -38,6 +38,76 @@ struct ActivationAuthority {
     job_id: JobId,
 }
 
+enum ActivationRequest {
+    Validate(MaestroHostedRunnerActivationValidationRequest),
+    Resolve(MaestroHostedRunnerActivationResolveRequest),
+}
+
+impl ActivationRequest {
+    fn sandbox_id(&self) -> SandboxId {
+        match self {
+            Self::Validate(request) => request.sandbox_id,
+            Self::Resolve(request) => request.sandbox_id,
+        }
+    }
+
+    fn activation_id(&self) -> Uuid {
+        match self {
+            Self::Validate(request) => request.activation_id,
+            Self::Resolve(request) => request.activation_id,
+        }
+    }
+
+    fn caller_tuple_digest(&self) -> Result<Option<String>, ApiError> {
+        match self {
+            Self::Validate(request) => tuple_sha256(request).map(Some),
+            Self::Resolve(_) => Ok(None),
+        }
+    }
+
+    fn materialize(
+        self,
+        live: &MaestroHostedRunnerConnectionBindingResponse,
+        tenant_id: &str,
+    ) -> Result<MaestroHostedRunnerActivationValidationRequest, ApiError> {
+        match self {
+            Self::Validate(request) => {
+                if !binding_matches(&request, live) {
+                    let code = if request.placement_generation != live.placement_generation
+                        || request.resident_process_generation != live.resident_process_generation
+                        || request.lease_attempt != live.lease_attempt
+                    {
+                        STALE_GENERATION
+                    } else {
+                        BINDING_MISMATCH
+                    };
+                    return Err(ApiError::conflict_code(
+                        code,
+                        "Maestro activation tuple does not exactly match live authority",
+                    ));
+                }
+                Ok(request)
+            }
+            Self::Resolve(request) => {
+                if !resolve_claims_match(&request, live, tenant_id) {
+                    let stale = request.placement_generation != live.placement_generation
+                        || request.resident_process_generation != live.resident_process_generation
+                        || request.lease_attempt != live.lease_attempt;
+                    return Err(ApiError::conflict_code(
+                        if stale {
+                            STALE_GENERATION
+                        } else {
+                            BINDING_MISMATCH
+                        },
+                        "Maestro activation claims do not exactly match live authority",
+                    ));
+                }
+                Ok(materialize_validation_request(&request, live))
+            }
+        }
+    }
+}
+
 fn tuple_sha256(
     request: &MaestroHostedRunnerActivationValidationRequest,
 ) -> Result<String, ApiError> {
@@ -193,13 +263,91 @@ async fn validate_maestro_activation_inner(
     path_sandbox_id: Uuid,
     request: MaestroHostedRunnerActivationValidationRequest,
 ) -> Result<MaestroHostedRunnerActivationValidationResponse, ApiError> {
-    if request.sandbox_id.0 != path_sandbox_id {
+    authoritative_activation_transaction(
+        state,
+        tenant_id,
+        path_sandbox_id,
+        ActivationRequest::Validate(request),
+    )
+    .await
+    .map(|(_, proof)| proof)
+}
+
+fn live_runtime_image_digest(live: &MaestroHostedRunnerConnectionBindingResponse) -> Option<&str> {
+    live.runtime_image
+        .rsplit_once("@sha256:")
+        .map(|(_, digest)| digest)
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn resolve_claims_match(
+    request: &MaestroHostedRunnerActivationResolveRequest,
+    live: &MaestroHostedRunnerConnectionBindingResponse,
+    tenant_id: &str,
+) -> bool {
+    let authority_tenant = format!("{}:{}", request.organization_id, request.workspace_id);
+    tenant_id == authority_tenant
+        && live.organization_id == authority_tenant
+        && live.workspace_id == request.workspace_id
+        && live.sandbox_id == request.sandbox_id
+        && live.pod_uid == request.pod_uid
+        && live.placement_generation == request.placement_generation
+        && live.runner_session_id == request.runner_session_id
+        && live_runtime_image_digest(live) == Some(request.runtime_image_digest.as_str())
+        && live.service_name == request.service_name
+        && live.service_port == request.service_port
+        && live.resident_process_generation == request.resident_process_generation
+        && live.lease_id == request.lease_id
+        && live.lease_attempt == request.lease_attempt
+        && live.worker_id == request.worker_id
+}
+
+fn materialize_validation_request(
+    request: &MaestroHostedRunnerActivationResolveRequest,
+    live: &MaestroHostedRunnerConnectionBindingResponse,
+) -> MaestroHostedRunnerActivationValidationRequest {
+    MaestroHostedRunnerActivationValidationRequest {
+        activation_id: request.activation_id,
+        organization_id: live.organization_id.clone(),
+        workspace_id: live.workspace_id.clone(),
+        sandbox_id: live.sandbox_id,
+        pod_uid: live.pod_uid,
+        placement_generation: live.placement_generation,
+        runner_session_id: live.runner_session_id.clone(),
+        runtime_image: live.runtime_image.clone(),
+        service_namespace: live.service_namespace.clone(),
+        service_name: live.service_name.clone(),
+        service_host: live.service_host.clone(),
+        service_port: live.service_port,
+        expected_server_uri_san: live.expected_server_uri_san.clone(),
+        resident_process_generation: live.resident_process_generation,
+        lease_id: live.lease_id,
+        lease_attempt: live.lease_attempt,
+        lease_expires_at_epoch_seconds: live.lease_expires_at_epoch_seconds,
+        worker_id: live.worker_id,
+    }
+}
+
+async fn authoritative_activation_transaction(
+    state: &AppState,
+    tenant_id: &str,
+    path_sandbox_id: Uuid,
+    request: ActivationRequest,
+) -> Result<
+    (
+        MaestroHostedRunnerConnectionBindingResponse,
+        MaestroHostedRunnerActivationValidationResponse,
+    ),
+    ApiError,
+> {
+    let sandbox_id = request.sandbox_id();
+    let activation_id = request.activation_id();
+    if sandbox_id.0 != path_sandbox_id {
         return Err(ApiError::conflict_code(
             BINDING_MISMATCH,
             "Maestro activation sandbox does not match the request path",
         ));
     }
-    let digest = tuple_sha256(&request)?;
     let mut transaction = state.db.pool.begin().await?;
 
     // No-op writes serialize every mutable source of the tuple on SQLite and
@@ -212,13 +360,15 @@ async fn validate_maestro_activation_inner(
         state.db.placeholder(2),
         state.db.placeholder(3),
     );
-    let locked = sqlx::query(&lock_sql)
+    if sqlx::query(&lock_sql)
         .bind(tenant_id)
-        .bind(request.sandbox_id.to_string())
+        .bind(sandbox_id.to_string())
         .bind(MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME)
         .execute(&mut *transaction)
-        .await?;
-    if locked.rows_affected() != 1 {
+        .await?
+        .rows_affected()
+        != 1
+    {
         return Err(ApiError {
             status: axum::http::StatusCode::NOT_FOUND,
             code: NOT_LIVE,
@@ -230,7 +380,7 @@ async fn validate_maestro_activation_inner(
         state.db.placeholder(1),
     );
     if sqlx::query(&placement_lock_sql)
-        .bind(request.sandbox_id.to_string())
+        .bind(sandbox_id.to_string())
         .execute(&mut *transaction)
         .await?
         .rows_affected()
@@ -253,7 +403,7 @@ async fn validate_maestro_activation_inner(
     );
     sqlx::query(&lease_lock_sql)
         .bind(tenant_id)
-        .bind(request.sandbox_id.to_string())
+        .bind(sandbox_id.to_string())
         .bind(MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME)
         .execute(&mut *transaction)
         .await?;
@@ -263,7 +413,7 @@ async fn validate_maestro_activation_inner(
         state.db.placeholder(1),
     );
     sqlx::query(&worker_lock_sql)
-        .bind(request.sandbox_id.to_string())
+        .bind(sandbox_id.to_string())
         .execute(&mut *transaction)
         .await?;
 
@@ -275,11 +425,16 @@ async fn validate_maestro_activation_inner(
     );
     let existing = sqlx::query(&existing_sql)
         .bind(tenant_id)
-        .bind(request.activation_id.to_string())
+        .bind(activation_id.to_string())
         .fetch_optional(&mut *transaction)
         .await?;
-    if let Some(row) = &existing
-        && row.try_get::<String, _>("tuple_sha256")? != digest
+    // Preserve the legacy validate endpoint's replay precedence: once an
+    // activation ID is durable, presenting different full tuple material is
+    // a replay mismatch even when that material also disagrees with today's
+    // live binding. Resolve cannot compute this digest until it has
+    // materialized the authoritative fields below.
+    if let (Some(row), Some(caller_digest)) = (&existing, request.caller_tuple_digest()?)
+        && row.try_get::<String, _>("tuple_sha256")? != caller_digest
     {
         return Err(ApiError::conflict_code(
             REPLAY_MISMATCH,
@@ -291,28 +446,24 @@ async fn validate_maestro_activation_inner(
         &state.db,
         &mut transaction,
         tenant_id,
-        request.sandbox_id,
+        sandbox_id,
     )
     .await
     .map_err(classify_live_error)?;
-    if !binding_matches(&request, &live) {
-        let code = if request.placement_generation != live.placement_generation
-            || request.resident_process_generation != live.resident_process_generation
-            || request.lease_attempt != live.lease_attempt
-        {
-            STALE_GENERATION
-        } else {
-            BINDING_MISMATCH
-        };
-        return Err(ApiError::conflict_code(
-            code,
-            "Maestro activation tuple does not exactly match live authority",
-        ));
-    }
+    let validation = request.materialize(&live, tenant_id)?;
     if Utc::now().timestamp() >= live.lease_expires_at_epoch_seconds {
         return Err(ApiError::conflict_code(
             EXPIRED_LEASE,
             "Maestro activation lease is expired",
+        ));
+    }
+    let digest = tuple_sha256(&validation)?;
+    if let Some(row) = &existing
+        && row.try_get::<String, _>("tuple_sha256")? != digest
+    {
+        return Err(ApiError::conflict_code(
+            REPLAY_MISMATCH,
+            "Maestro activation ID was already used for different tuple material",
         ));
     }
 
@@ -329,9 +480,9 @@ async fn validate_maestro_activation_inner(
     );
     let authority_row = sqlx::query(&authority_sql)
         .bind(tenant_id)
-        .bind(request.sandbox_id.to_string())
+        .bind(sandbox_id.to_string())
         .bind(MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME)
-        .bind(request.lease_id.to_string())
+        .bind(validation.lease_id.to_string())
         .fetch_one(&mut *transaction)
         .await?;
     let authority = ActivationAuthority {
@@ -345,30 +496,91 @@ async fn validate_maestro_activation_inner(
         ),
     };
 
-    if let Some(row) = existing {
-        let validated_at = parse_timestamp(&row.try_get::<String, _>("validated_at")?)?;
-        transaction.commit().await?;
-        return validation_response(&request, &live, authority, digest, validated_at, true);
-    }
-
-    let validated_at = Utc::now();
-    let insert_sql = format!(
-        "insert into maestro_activation_validations
-         (tenant_id, activation_id, sandbox_id, tuple_sha256, binding_json, validated_at)
-         values ({})",
-        state.db.placeholders(6)
-    );
-    sqlx::query(&insert_sql)
-        .bind(tenant_id)
-        .bind(request.activation_id.to_string())
-        .bind(request.sandbox_id.to_string())
-        .bind(&digest)
-        .bind(serde_json::to_string(&request)?)
-        .bind(validated_at.to_rfc3339())
-        .execute(&mut *transaction)
-        .await?;
+    let (validated_at, replayed) = if let Some(row) = existing {
+        (
+            parse_timestamp(&row.try_get::<String, _>("validated_at")?)?,
+            true,
+        )
+    } else {
+        let validated_at = Utc::now();
+        let insert_sql = format!(
+            "insert into maestro_activation_validations
+             (tenant_id, activation_id, sandbox_id, tuple_sha256, binding_json, validated_at)
+             values ({})",
+            state.db.placeholders(6),
+        );
+        sqlx::query(&insert_sql)
+            .bind(tenant_id)
+            .bind(activation_id.to_string())
+            .bind(sandbox_id.to_string())
+            .bind(&digest)
+            .bind(serde_json::to_string(&validation)?)
+            .bind(validated_at.to_rfc3339())
+            .execute(&mut *transaction)
+            .await?;
+        (validated_at, false)
+    };
+    let proof = validation_response(
+        &validation,
+        &live,
+        authority,
+        digest,
+        validated_at,
+        replayed,
+    )?;
     transaction.commit().await?;
-    validation_response(&request, &live, authority, digest, validated_at, false)
+    Ok((live, proof))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/activations/resolve",
+    params(("sandbox_id" = Uuid, Path)),
+    request_body = MaestroHostedRunnerActivationResolveRequest,
+    responses(
+        (status = 200, description = "Exact locked Maestro binding and durable activation proof", body = MaestroHostedRunnerActivationResolveResponse),
+        (status = 404, description = "No tenant-scoped activation authority exists", body = ErrorEnvelope),
+        (status = 409, description = "Signed claims are stale, expired, replayed with different material, or mismatched", body = ErrorEnvelope)
+    )
+)]
+pub(crate) async fn resolve_maestro_activation(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path(sandbox_id): Path<Uuid>,
+    Json(request): Json<MaestroHostedRunnerActivationResolveRequest>,
+) -> Result<Json<MaestroHostedRunnerActivationResolveResponse>, ApiError> {
+    let started = Instant::now();
+    let result =
+        resolve_maestro_activation_inner(&state, &ctx.tenant_id, sandbox_id, request).await;
+    let (outcome, reason) = match &result {
+        Ok(response) if response.proof.replayed => ("accepted", "replayed"),
+        Ok(_) => ("accepted", "validated"),
+        Err(error) if error.status.is_server_error() => ("error", "internal"),
+        Err(error) => ("rejected", metric_reason(error.code)),
+    };
+    state.maestro_observation_sink.try_enqueue(
+        &ctx.tenant_id,
+        outcome,
+        reason,
+        started.elapsed().as_millis(),
+    );
+    result.map(Json)
+}
+
+async fn resolve_maestro_activation_inner(
+    state: &AppState,
+    tenant_id: &str,
+    path_sandbox_id: Uuid,
+    request: MaestroHostedRunnerActivationResolveRequest,
+) -> Result<MaestroHostedRunnerActivationResolveResponse, ApiError> {
+    let (binding, proof) = authoritative_activation_transaction(
+        state,
+        tenant_id,
+        path_sandbox_id,
+        ActivationRequest::Resolve(request),
+    )
+    .await?;
+    Ok(MaestroHostedRunnerActivationResolveResponse { binding, proof })
 }
 
 fn metric_reason(code: &str) -> &'static str {
@@ -417,5 +629,127 @@ mod tests {
             digest_proof_tuple(&different_job).unwrap(),
             "sha256:v1:5be4e7df19ff91042cf78e8c5fee277b8dd702e149dd838b1ff9977d8327a603"
         );
+    }
+
+    #[test]
+    fn resolve_claims_fence_every_signed_identity_component() {
+        let sandbox_id = SandboxId(uuid("00000000-0000-0000-0000-000000000001"));
+        let pod_uid = uuid("00000000-0000-0000-0000-000000000002");
+        let lease_id = uuid("00000000-0000-0000-0000-000000000003");
+        let worker_id = WorkerId(uuid("00000000-0000-0000-0000-000000000004"));
+        let digest = "a".repeat(64);
+        let live = MaestroHostedRunnerConnectionBindingResponse {
+            ok: true,
+            organization_id: "org-1:workspace-1".into(),
+            workspace_id: "workspace-1".into(),
+            sandbox_id,
+            pod_uid,
+            placement_generation: 5,
+            runner_session_id: "session-1".into(),
+            runtime_image: format!("image@sha256:{digest}"),
+            service_namespace: "sandboxwich-sandboxes".into(),
+            service_name: "maestro-1".into(),
+            service_host: "maestro-1.sandboxwich-sandboxes.svc.cluster.local".into(),
+            service_port: 8443,
+            expected_server_uri_san: "spiffe://identity.evalops.dev/maestro/v1/exact".into(),
+            resident_process_generation: 6,
+            lease_id,
+            lease_attempt: 7,
+            lease_expires_at_epoch_seconds: 4_000_000_000,
+            worker_id,
+        };
+        let request = MaestroHostedRunnerActivationResolveRequest {
+            activation_id: uuid("00000000-0000-0000-0000-000000000005"),
+            organization_id: "org-1".into(),
+            workspace_id: "workspace-1".into(),
+            sandbox_id,
+            pod_uid,
+            placement_generation: 5,
+            runner_session_id: "session-1".into(),
+            runtime_image_digest: digest,
+            service_name: "maestro-1".into(),
+            service_port: 8443,
+            resident_process_generation: 6,
+            lease_id,
+            lease_attempt: 7,
+            worker_id,
+        };
+        assert!(resolve_claims_match(&request, &live, "org-1:workspace-1"));
+
+        macro_rules! reject {
+            ($change:expr) => {{
+                let mut changed = request.clone();
+                $change(&mut changed);
+                assert!(!resolve_claims_match(&changed, &live, "org-1:workspace-1"));
+            }};
+        }
+        reject!(
+            |value: &mut MaestroHostedRunnerActivationResolveRequest| value.organization_id =
+                "org-2".into()
+        );
+        reject!(
+            |value: &mut MaestroHostedRunnerActivationResolveRequest| value.workspace_id =
+                "workspace-2".into()
+        );
+        reject!(
+            |value: &mut MaestroHostedRunnerActivationResolveRequest| value.sandbox_id =
+                SandboxId(Uuid::new_v4())
+        );
+        reject!(
+            |value: &mut MaestroHostedRunnerActivationResolveRequest| value.pod_uid =
+                Uuid::new_v4()
+        );
+        reject!(
+            |value: &mut MaestroHostedRunnerActivationResolveRequest| value.placement_generation +=
+                1
+        );
+        reject!(
+            |value: &mut MaestroHostedRunnerActivationResolveRequest| value.runner_session_id =
+                "session-2".into()
+        );
+        reject!(
+            |value: &mut MaestroHostedRunnerActivationResolveRequest| value.runtime_image_digest =
+                "b".repeat(64)
+        );
+        reject!(
+            |value: &mut MaestroHostedRunnerActivationResolveRequest| value.service_name =
+                "maestro-2".into()
+        );
+        reject!(|value: &mut MaestroHostedRunnerActivationResolveRequest| value.service_port += 1);
+        reject!(
+            |value: &mut MaestroHostedRunnerActivationResolveRequest| value
+                .resident_process_generation +=
+                1
+        );
+        reject!(
+            |value: &mut MaestroHostedRunnerActivationResolveRequest| value.lease_id =
+                Uuid::new_v4()
+        );
+        reject!(|value: &mut MaestroHostedRunnerActivationResolveRequest| value.lease_attempt += 1);
+        reject!(
+            |value: &mut MaestroHostedRunnerActivationResolveRequest| value.worker_id =
+                WorkerId(Uuid::new_v4())
+        );
+        assert!(!resolve_claims_match(&request, &live, "other-tenant"));
+
+        for changed in [
+            MaestroHostedRunnerActivationResolveRequest {
+                placement_generation: request.placement_generation + 1,
+                ..request.clone()
+            },
+            MaestroHostedRunnerActivationResolveRequest {
+                resident_process_generation: request.resident_process_generation + 1,
+                ..request.clone()
+            },
+            MaestroHostedRunnerActivationResolveRequest {
+                lease_attempt: request.lease_attempt + 1,
+                ..request.clone()
+            },
+        ] {
+            let error = ActivationRequest::Resolve(changed)
+                .materialize(&live, "org-1:workspace-1")
+                .expect_err("generation mismatch must fail closed");
+            assert_eq!(error.code, STALE_GENERATION);
+        }
     }
 }

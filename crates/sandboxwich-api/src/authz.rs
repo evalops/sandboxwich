@@ -851,6 +851,7 @@ pub(crate) const AUTHORIZATION_ROUTE_MANIFEST: &[&str] = &[
     "/sandboxes/*/resident-processes/*",
     "/sandboxes/*/resident-processes/maestro-hosted-runner/connection-binding",
     "/sandboxes/*/resident-processes/maestro-hosted-runner/activations/validate",
+    "/sandboxes/*/resident-processes/maestro-hosted-runner/activations/resolve",
     "/sandboxes/*/resident-processes/*/stop",
     "/sandboxes/*/resident-processes/*/events",
     "/sandboxes/*/resume",
