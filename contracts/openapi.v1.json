@@ -848,13 +848,30 @@
             "format": "uuid",
             "type": "string"
           },
+          "authorityRevision": {
+            "description": "Versioned monotonic generation vector for the authority snapshot.",
+            "pattern": "^maestro-authority:v1:[0-9]+:[0-9]+:[0-9]+$",
+            "type": "string"
+          },
+          "jobId": {
+            "$ref": "#/components/schemas/JobId"
+          },
           "ok": {
             "type": "boolean"
           },
           "replayed": {
             "type": "boolean"
           },
+          "residentProcessId": {
+            "$ref": "#/components/schemas/ResidentProcessId"
+          },
+          "tupleDigest": {
+            "description": "Versioned digest of the exact authoritative tuple consumed by\nPlatform's activation CAS.",
+            "pattern": "^sha256:v1:[0-9a-f]{64}$",
+            "type": "string"
+          },
           "tupleSha256": {
+            "description": "Legacy request-only digest retained for compatible replay detection.",
             "type": "string"
           },
           "validatedAt": {
@@ -865,6 +882,10 @@
         "required": [
           "ok",
           "activationId",
+          "residentProcessId",
+          "jobId",
+          "tupleDigest",
+          "authorityRevision",
           "tupleSha256",
           "validatedAt",
           "replayed"
