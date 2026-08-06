@@ -20,6 +20,66 @@ fn persistent_sandbox(name: &str) -> CreateSandboxRequest {
 }
 
 #[tokio::test]
+async fn logical_home_creation_is_replayable_and_tenant_scoped() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("logical-home.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+    let request = CreateHomeRequest {
+        logical_key: Some("dex-computer-v2:abc123".to_string()),
+    };
+
+    let first_response = client
+        .post(format!("{}/homes", server.base_url))
+        .header("idempotency-key", "logical-home-first")
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first_response.status(), StatusCode::CREATED);
+    let first: HomeResponse = first_response.json().await.unwrap();
+
+    let duplicate_response = client
+        .post(format!("{}/homes", server.base_url))
+        .header("idempotency-key", "logical-home-lost-response-retry")
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(duplicate_response.status(), StatusCode::OK);
+    let duplicate: HomeResponse = duplicate_response.json().await.unwrap();
+    assert_eq!(duplicate.home.id, first.home.id);
+
+    let tenant_b = reqwest::Client::builder()
+        .default_headers(
+            [(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {TEST_TENANT_B_TOKEN}").parse().unwrap(),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .build()
+        .unwrap();
+    let tenant_b_home: HomeResponse = tenant_b
+        .post(format!("{}/homes", server.base_url))
+        .header("idempotency-key", "logical-home-tenant-b")
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_ne!(tenant_b_home.home.id, first.home.id);
+}
+
+#[tokio::test]
 async fn managed_home_is_tenant_scoped_and_single_mount() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!(
