@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.1.14 - 2026-08-06
+### Other
+
+- Add authoritative Maestro activation proof
+- Add authoritative Maestro activation validation
+- Define hosted runner activation lifecycle contract ([#312](https://github.com/evalops/sandboxwich/pull/312))
+
 ## 0.1.13 - 2026-08-05
 ### Fixed
 
