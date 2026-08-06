@@ -1,6 +1,5 @@
 use crate::db::Database;
 use crate::error::*;
-use crate::handlers::maestro_activations::record_observation;
 use crate::identity_mtls::IdentityServiceContext;
 use crate::rows::{parse_timestamp, parse_uuid};
 use crate::state::{AppState, TenantContext};
@@ -1172,22 +1171,12 @@ pub(crate) async fn validate_maestro_workload_identity(
         Err(error) if error.status == StatusCode::CONFLICT => ("rejected", "not_live"),
         Err(_) => ("rejected", "invalid_request"),
     };
-    if let Err(error) = record_observation(
-        &state,
+    state.maestro_observation_sink.try_enqueue(
         IDENTITY_METRICS_TENANT_ID,
         outcome,
         reason,
         started.elapsed().as_millis(),
-    )
-    .await
-    {
-        tracing::warn!(
-            error = ?error,
-            outcome,
-            reason,
-            "maestro_identity_metric_write_failed"
-        );
-    }
+    );
     result.map(Json)
 }
 

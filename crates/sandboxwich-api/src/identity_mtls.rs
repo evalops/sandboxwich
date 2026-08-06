@@ -362,6 +362,9 @@ mod tests {
             .unwrap();
         migrate_database(&db).await.unwrap();
         AppState {
+            maestro_observation_sink: crate::maestro_observation::ActivationObservationSink::new(
+                db.clone(),
+            ),
             db,
             auth: AuthConfig {
                 shared_token: None,
@@ -397,6 +400,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let state = test_state().await;
         let metrics_db = state.db.clone();
+        let observation_sink = state.maestro_observation_sink.clone();
         let handle = axum_server::Handle::new();
         let server_handle = handle.clone();
         let server = tokio::spawn(async move {
@@ -479,6 +483,7 @@ mod tests {
                 .contains("placement_attestation_not_found"),
             "the exact fence route must be present on the mTLS listener"
         );
+        observation_sink.flush().await;
         let metric_count: i64 = sqlx::query_scalar(
             "select sample_count from maestro_activation_validation_metrics
              where tenant_id = ? and outcome = ? and reason = ?",

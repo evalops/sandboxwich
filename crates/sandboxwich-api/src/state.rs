@@ -1,6 +1,7 @@
 use crate::bootstrap_handoff::{SharedBootstrapHandoff, delete_handoff};
 use crate::config::*;
 use crate::db::*;
+use crate::maestro_observation::ActivationObservationSink;
 use sandboxwich_core::*;
 use std::{
     collections::HashMap,
@@ -912,6 +913,7 @@ mod tests {
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) db: Database,
+    pub(crate) maestro_observation_sink: ActivationObservationSink,
     pub(crate) auth: AuthConfig,
     pub(crate) default_tenant_id: String,
     pub(crate) apex_callback_base_url: Option<String>,

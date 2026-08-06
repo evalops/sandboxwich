@@ -178,17 +178,12 @@ pub(crate) async fn validate_maestro_activation(
         Err(error) if error.status.is_server_error() => ("error", "internal"),
         Err(error) => ("rejected", metric_reason(error.code)),
     };
-    if let Err(error) = record_observation(
-        &state,
+    state.maestro_observation_sink.try_enqueue(
         &ctx.tenant_id,
         outcome,
         reason,
         started.elapsed().as_millis(),
-    )
-    .await
-    {
-        tracing::warn!(error = ?error, outcome, reason, "maestro_activation_metric_write_failed");
-    }
+    );
     result.map(Json)
 }
 
@@ -387,54 +382,6 @@ fn metric_reason(code: &str) -> &'static str {
         "bad_request" => "invalid_request",
         _ => "internal",
     }
-}
-
-pub(crate) async fn record_observation(
-    state: &AppState,
-    tenant_id: &str,
-    outcome: &str,
-    reason: &str,
-    elapsed_ms: u128,
-) -> Result<(), ApiError> {
-    const BUCKETS_MS: [u128; 8] = [
-        1_000, 5_000, 15_000, 30_000, 60_000, 120_000, 300_000, 900_000,
-    ];
-    let elapsed_ms = i64::try_from(elapsed_ms).unwrap_or(i64::MAX);
-    let buckets = BUCKETS_MS.map(|limit| i64::from((elapsed_ms as u128) <= limit));
-    let sql = format!(
-        "insert into maestro_activation_validation_metrics
-         (tenant_id, outcome, reason, sample_count, sum_ms, b0, b1, b2, b3, b4, b5, b6, b7)
-         values ({})
-         on conflict (tenant_id, outcome, reason) do update set
-           sample_count = maestro_activation_validation_metrics.sample_count + excluded.sample_count,
-           sum_ms = maestro_activation_validation_metrics.sum_ms + excluded.sum_ms,
-           b0 = maestro_activation_validation_metrics.b0 + excluded.b0,
-           b1 = maestro_activation_validation_metrics.b1 + excluded.b1,
-           b2 = maestro_activation_validation_metrics.b2 + excluded.b2,
-           b3 = maestro_activation_validation_metrics.b3 + excluded.b3,
-           b4 = maestro_activation_validation_metrics.b4 + excluded.b4,
-           b5 = maestro_activation_validation_metrics.b5 + excluded.b5,
-           b6 = maestro_activation_validation_metrics.b6 + excluded.b6,
-           b7 = maestro_activation_validation_metrics.b7 + excluded.b7",
-        state.db.placeholders(13)
-    );
-    sqlx::query(&sql)
-        .bind(tenant_id)
-        .bind(outcome)
-        .bind(reason)
-        .bind(1_i64)
-        .bind(elapsed_ms)
-        .bind(buckets[0])
-        .bind(buckets[1])
-        .bind(buckets[2])
-        .bind(buckets[3])
-        .bind(buckets[4])
-        .bind(buckets[5])
-        .bind(buckets[6])
-        .bind(buckets[7])
-        .execute(&state.db.pool)
-        .await?;
-    Ok(())
 }
 
 #[cfg(test)]

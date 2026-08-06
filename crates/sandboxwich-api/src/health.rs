@@ -1,6 +1,7 @@
 use crate::auth::*;
 use crate::db::*;
 use crate::error::*;
+use crate::maestro_observation::ActivationObservationSink;
 use crate::rows::parse_timestamp;
 use crate::slo_metrics::append_slo_metrics;
 use crate::state::*;
@@ -66,7 +67,8 @@ pub(crate) async fn metrics(
     } else {
         Some(ctx.tenant_id.as_str())
     };
-    let body = collect_prometheus_metrics(&state.db, tenant_scope).await?;
+    let body = collect_prometheus_metrics(&state.db, tenant_scope, &state.maestro_observation_sink)
+        .await?;
     Ok((
         [(
             header::CONTENT_TYPE,
@@ -91,6 +93,7 @@ pub(crate) async fn check_database_health(db: &Database) -> Result<HealthCompone
 pub(crate) async fn collect_prometheus_metrics(
     db: &Database,
     tenant_id: Option<&str>,
+    maestro_observation_sink: &ActivationObservationSink,
 ) -> Result<String, ApiError> {
     let metrics = fetch_prometheus_metrics(db, tenant_id).await?;
     let mut body = String::new();
@@ -207,6 +210,15 @@ pub(crate) async fn collect_prometheus_metrics(
         metrics.scalar("worker_heartbeat_oldest_seconds"),
     );
     append_slo_metrics(&mut body, db, tenant_id).await?;
+    if tenant_id.is_none() {
+        append_counter_family(
+            &mut body,
+            "sandboxwich_maestro_activation_observation_dropped_total",
+            "Process-local identity-validation observations not persisted by the bounded writer.",
+            "reason",
+            maestro_observation_sink.loss_counts(),
+        );
+    }
     crate::authz::append_authorization_metrics(&mut body);
     Ok(body)
 }

@@ -516,6 +516,9 @@ mod tests {
             .unwrap();
         migrate_database(&db).await.unwrap();
         AppState {
+            maestro_observation_sink: crate::maestro_observation::ActivationObservationSink::new(
+                db.clone(),
+            ),
             db,
             auth: AuthConfig {
                 shared_token: None,
