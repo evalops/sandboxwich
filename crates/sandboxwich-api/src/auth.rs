@@ -140,9 +140,19 @@ pub(crate) async fn auth_and_tenant(
             reason = authorization.decision_reason,
             "authorization policy denied principal for route"
         );
-        let mut response =
-            ApiError::forbidden("authenticated principal is not authorized for this route")
-                .into_response();
+        // Preserve Sandboxwich's established authentication contract for a
+        // valid credential of the wrong class: route-specific middleware
+        // returns 401 for these mismatches, and callers use that distinction
+        // to refresh or replace worker/guest credentials. A deliberately
+        // denied route is different: the caller is authenticated, but the
+        // route is not part of the exposed policy surface, so keep it 403.
+        let error = match authorization.requirement {
+            crate::authz::PrincipalRequirement::Deny => {
+                ApiError::forbidden("authenticated principal is not authorized for this route")
+            }
+            _ => ApiError::unauthorized("valid credential for this route is required"),
+        };
+        let mut response = error.into_response();
         response.headers_mut().insert(
             crate::authz::AUTHORIZATION_DECISION_ID_HEADER.clone(),
             authorization.decision_header(),
