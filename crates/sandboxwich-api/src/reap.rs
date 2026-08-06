@@ -220,6 +220,7 @@ pub(crate) async fn attempt_reap_candidate(
             "triggeredBy": "expiry_sweeper",
         }),
         None,
+        None,
     )
     .await;
     Ok(match stop {

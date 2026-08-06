@@ -1,4 +1,5 @@
 use crate::auth::*;
+use crate::authz::AuthorizationContext;
 use crate::db::*;
 use crate::error::*;
 use crate::handlers::commands::*;
@@ -216,10 +217,11 @@ pub(crate) fn looks_like_cidr(value: &str) -> bool {
 pub(crate) async fn create_sandbox(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
+    Extension(authorization): Extension<AuthorizationContext>,
     Extension(trace): Extension<RequestTrace>,
     Json(request): Json<CreateSandboxRequest>,
 ) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
-    create_sandbox_with_home(state, ctx, request, None, trace).await
+    create_sandbox_with_home(state, ctx, request, None, Some(authorization), trace).await
 }
 
 pub(crate) async fn create_sandbox_with_home(
@@ -227,6 +229,7 @@ pub(crate) async fn create_sandbox_with_home(
     ctx: TenantContext,
     request: CreateSandboxRequest,
     home_id: Option<HomeId>,
+    authorization: Option<AuthorizationContext>,
     trace: RequestTrace,
 ) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
     let now = Utc::now();
@@ -291,6 +294,9 @@ pub(crate) async fn create_sandbox_with_home(
         updated_at: now,
         last_error: None,
     };
+    if let Some(authorization) = authorization.as_ref() {
+        authorization.add_to_payload(&mut job.payload);
+    }
     trace.add_to_payload(&mut job.payload);
     // Payload already embeds provisionSpec + runtimeImage from the create
     // request path; re-running add_provision_spec would only re-serialize the
@@ -606,6 +612,7 @@ pub(crate) async fn stop_sandbox_via_job(
     resident_bootstraps: &ResidentBootstrapStore,
     sandbox: &Sandbox,
     lifecycle_event_data: serde_json::Value,
+    authorization: Option<AuthorizationContext>,
     trace: Option<RequestTrace>,
 ) -> Result<Option<Job>, ApiError> {
     let sandbox_id = sandbox.id;
@@ -638,6 +645,9 @@ pub(crate) async fn stop_sandbox_via_job(
     };
     if let Some(trace) = trace {
         trace.add_to_payload(&mut job.payload);
+    }
+    if let Some(authorization) = authorization.as_ref() {
+        authorization.add_to_payload(&mut job.payload);
     }
     add_provision_spec_to_payload(&mut job, sandbox, &secret_mounts)?;
     let mut tx = db.pool.begin().await?;
@@ -839,6 +849,7 @@ pub(crate) async fn stop_sandbox_via_job(
 pub(crate) async fn stop_sandbox(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
+    Extension(authorization): Extension<AuthorizationContext>,
     Extension(trace): Extension<RequestTrace>,
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
@@ -852,6 +863,7 @@ pub(crate) async fn stop_sandbox(
         &state.resident_bootstraps,
         &sandbox,
         json!({"state": SandboxState::Archiving, "reason": "stop_requested"}),
+        Some(authorization),
         Some(trace),
     )
     .await?

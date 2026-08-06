@@ -1,3 +1,4 @@
+use crate::authz::AuthorizationContext;
 use crate::db::Database;
 use crate::error::ApiError;
 use crate::handlers::jobs::insert_job_on_connection;
@@ -69,11 +70,20 @@ pub(crate) async fn get_home(
 pub(crate) async fn create_home_sandbox(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
+    Extension(authorization): Extension<AuthorizationContext>,
     Extension(trace): Extension<RequestTrace>,
     Path(home_id): Path<Uuid>,
     Json(request): Json<CreateSandboxRequest>,
 ) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
-    create_sandbox_with_home(state, ctx, request, Some(HomeId(home_id)), trace).await
+    create_sandbox_with_home(
+        state,
+        ctx,
+        request,
+        Some(HomeId(home_id)),
+        Some(authorization),
+        trace,
+    )
+    .await
 }
 
 #[utoipa::path(delete, path = "/v1/homes/{home_id}", params(("home_id" = Uuid, Path)), responses((status = 202, body = HomeResponse), (status = 404), (status = 409)))]

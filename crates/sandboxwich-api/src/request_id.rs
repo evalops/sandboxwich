@@ -52,19 +52,13 @@ impl RequestTrace {
     }
 
     pub(crate) fn add_to_payload(&self, payload: &mut serde_json::Value) {
-        if let serde_json::Value::Object(fields) = payload {
-            if !self.traceparent.is_empty() {
-                fields.insert(
-                    "_traceparent".to_string(),
-                    serde_json::Value::String(self.traceparent.clone()),
-                );
-            }
-            if !self.tracestate.is_empty() {
-                fields.insert(
-                    "_tracestate".to_string(),
-                    serde_json::Value::String(self.tracestate.clone()),
-                );
-            }
+        if let serde_json::Value::Object(fields) = payload
+            && !self.traceparent.is_empty()
+        {
+            fields.insert(
+                "_traceparent".to_string(),
+                serde_json::Value::String(self.traceparent.clone()),
+            );
         }
     }
 }
@@ -137,6 +131,11 @@ pub(crate) async fn attach_request_id(mut request: Request, next: Next) -> Respo
         authorization_policy_version = tracing::field::Empty,
         authorization_principal_class = tracing::field::Empty,
         authorization_trace_id = tracing::field::Empty,
+        authorization_receipt_id = tracing::field::Empty,
+        authorization_policy_digest = tracing::field::Empty,
+        authorization_resource_kind = tracing::field::Empty,
+        authorization_action = tracing::field::Empty,
+        authorization_decision_reason = tracing::field::Empty,
         http_status_code = tracing::field::Empty,
         duration_ms = tracing::field::Empty,
         outcome = tracing::field::Empty,
@@ -228,7 +227,7 @@ mod tests {
 
         assert_eq!(trace.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
         assert_eq!(payload["_traceparent"], trace.traceparent);
-        assert_eq!(payload["_tracestate"], "vendor=value");
+        assert!(payload.get("_tracestate").is_none());
     }
 
     #[test]
