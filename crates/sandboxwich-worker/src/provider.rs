@@ -3664,6 +3664,7 @@ impl KubernetesApplyProvider {
             report(stage_update(ProvisioningStage::WorkspaceReady, None))?;
         }
 
+        let mut network_wave = Vec::new();
         let gateway_name = if let Some(gateway_policy) = self
             .dry_run
             .egress_gateway_network_policy_manifest(sandbox_id, &spec.network_egress)?
@@ -3682,17 +3683,12 @@ impl KubernetesApplyProvider {
                 .dry_run
                 .egress_gateway_service_manifest(sandbox_id, &spec.network_egress)
                 .context("gateway service missing for host policy")?;
-            self.apply_or_adopt_manifest(
-                &gateway_service,
-                sandbox_id,
-                cancelled,
-                resources_applied,
-            )?;
+            network_wave.push(gateway_service);
             let gateway_pod = self
                 .dry_run
                 .egress_gateway_pod_manifest(sandbox_id, &spec.network_egress)?
                 .context("gateway pod missing for host policy")?;
-            self.apply_or_adopt_manifest(&gateway_pod, sandbox_id, cancelled, resources_applied)?;
+            network_wave.push(gateway_pod);
             Some(format!("sandboxwich-egress-gateway-{sandbox_id}"))
         } else {
             None
@@ -3701,12 +3697,12 @@ impl KubernetesApplyProvider {
         let network_policy = self
             .dry_run
             .network_policy_manifest(sandbox_id, &spec.network_egress)?;
-        let network_identity = self.apply_or_adopt_manifest(
-            &network_policy,
-            sandbox_id,
-            cancelled,
-            resources_applied,
-        )?;
+        network_wave.push(network_policy);
+        let mut network_identities =
+            self.apply_or_adopt_manifests(&network_wave, sandbox_id, cancelled, resources_applied)?;
+        let network_identity = network_identities
+            .pop()
+            .context("base network policy identity is required")?;
         report(stage_update(
             ProvisioningStage::NetworkPolicyReady,
             Some(network_identity),
@@ -4042,8 +4038,26 @@ impl KubernetesApplyProvider {
         cancelled: &CancelSignal,
         resources_applied: &mut bool,
     ) -> anyhow::Result<KubernetesResourceIdentity> {
-        self.apply_or_adopt_manifest_with_identity(
-            manifest,
+        self.apply_or_adopt_manifests(
+            std::slice::from_ref(manifest),
+            sandbox_id,
+            cancelled,
+            resources_applied,
+        )?
+        .into_iter()
+        .next()
+        .context("single staged sandbox resource identity is required")
+    }
+
+    fn apply_or_adopt_manifests(
+        &self,
+        manifests: &[Value],
+        sandbox_id: SandboxId,
+        cancelled: &CancelSignal,
+        resources_applied: &mut bool,
+    ) -> anyhow::Result<Vec<KubernetesResourceIdentity>> {
+        self.apply_or_adopt_manifests_with_identity(
+            manifests,
             "sandboxwich.dev/sandbox-id",
             &sandbox_id.to_string(),
             "sandbox",
@@ -4059,46 +4073,56 @@ impl KubernetesApplyProvider {
         cancelled: &CancelSignal,
         resources_applied: &mut bool,
     ) -> anyhow::Result<KubernetesResourceIdentity> {
-        self.apply_or_adopt_manifest_with_identity(
-            manifest,
+        self.apply_or_adopt_manifests_with_identity(
+            std::slice::from_ref(manifest),
             "sandboxwich.dev/home-id",
             &home_id.to_string(),
             "home",
             cancelled,
             resources_applied,
-        )
+        )?
+        .into_iter()
+        .next()
+        .context("single staged home resource identity is required")
     }
 
-    fn apply_or_adopt_manifest_with_identity(
+    fn apply_or_adopt_manifests_with_identity(
         &self,
-        manifest: &Value,
+        manifests: &[Value],
         identity_label: &str,
         identity_value: &str,
         identity_name: &str,
         cancelled: &CancelSignal,
         resources_applied: &mut bool,
-    ) -> anyhow::Result<KubernetesResourceIdentity> {
-        let kind = manifest["kind"]
-            .as_str()
-            .context("Kubernetes manifest kind is required")?;
-        let resource_kind = runtime_resource_kind_for_kubernetes_kind(kind)?;
-
-        if let Some(identity) = self.read_resource_identity(
-            manifest,
+    ) -> anyhow::Result<Vec<KubernetesResourceIdentity>> {
+        anyhow::ensure!(
+            !manifests.is_empty(),
+            "staged resource wave cannot be empty"
+        );
+        let observed = self.read_resource_identities(
+            manifests,
             identity_label,
             identity_value,
             identity_name,
-            resource_kind.clone(),
             cancelled,
-        )? {
-            return Ok(identity);
+        )?;
+        if observed.iter().all(Option::is_some) {
+            return observed
+                .into_iter()
+                .map(|identity| identity.context("observed staged resource identity is required"))
+                .collect();
         }
 
+        let missing = manifests
+            .iter()
+            .zip(&observed)
+            .filter_map(|(manifest, identity)| identity.is_none().then_some(manifest.clone()))
+            .collect::<Vec<_>>();
         *resources_applied = true;
         let apply = run_kubectl_documents(
             &self.kubectl,
             &self.kubectl_args("apply"),
-            std::slice::from_ref(manifest),
+            &missing,
             "apply staged sandbox resource",
             self.kubectl_command_timeout,
             Some(cancelled),
@@ -4110,46 +4134,50 @@ impl KubernetesApplyProvider {
                 &apply.stderr,
             )));
         }
-        self.read_resource_identity(
-            manifest,
+        let observed = self.read_resource_identities(
+            manifests,
             identity_label,
             identity_value,
             identity_name,
-            resource_kind,
             cancelled,
-        )?
-        .ok_or_else(|| {
-            anyhow::Error::new(ProviderError::classified(
-                ProvisioningErrorClass::RetryableProvider,
-                LifecycleReasonCode::ResourceObservationMissing,
-                anyhow::anyhow!("staged Kubernetes resource was not observable after apply"),
-            ))
-        })
+        )?;
+        observed
+            .into_iter()
+            .map(|identity| {
+                identity.ok_or_else(|| {
+                    anyhow::Error::new(ProviderError::classified(
+                        ProvisioningErrorClass::RetryableProvider,
+                        LifecycleReasonCode::ResourceObservationMissing,
+                        anyhow::anyhow!(
+                            "staged Kubernetes resource was not observable after apply"
+                        ),
+                    ))
+                })
+            })
+            .collect()
     }
 
-    fn read_resource_identity(
+    fn read_resource_identities(
         &self,
-        desired: &Value,
+        desired: &[Value],
         identity_label: &str,
         identity_value: &str,
         identity_name: &str,
-        resource_kind: RuntimeResourceKind,
         cancelled: &CancelSignal,
-    ) -> anyhow::Result<Option<KubernetesResourceIdentity>> {
-        let kind = desired["kind"]
-            .as_str()
-            .context("Kubernetes manifest kind is required")?;
-        let name = desired["metadata"]["name"]
-            .as_str()
-            .context("Kubernetes manifest metadata.name is required")?;
-        let namespace = desired["metadata"]["namespace"]
-            .as_str()
-            .context("Kubernetes manifest metadata.namespace is required")?;
+    ) -> anyhow::Result<Vec<Option<KubernetesResourceIdentity>>> {
+        anyhow::ensure!(!desired.is_empty(), "staged resource read cannot be empty");
         let mut args = self.kubectl_base_args();
+        args.push("get".to_string());
+        for resource in desired {
+            let kind = resource["kind"]
+                .as_str()
+                .context("Kubernetes manifest kind is required")?;
+            let name = resource["metadata"]["name"]
+                .as_str()
+                .context("Kubernetes manifest metadata.name is required")?;
+            args.push(format!("{kind}/{name}"));
+        }
         args.extend([
-            "get".to_string(),
-            kind.to_string(),
-            name.to_string(),
             "--ignore-not-found".to_string(),
             "-o".to_string(),
             "json".to_string(),
@@ -4169,39 +4197,68 @@ impl KubernetesApplyProvider {
             )));
         }
         if output.stdout.trim().is_empty() {
-            return Ok(None);
+            return Ok(vec![None; desired.len()]);
         }
-        let observed: Value = serde_json::from_str(&output.stdout).map_err(|error| {
+        let decoded: Value = serde_json::from_str(&output.stdout).map_err(|error| {
             anyhow::Error::new(ProviderError::classified(
                 ProvisioningErrorClass::RetryableProvider,
                 LifecycleReasonCode::ResourceObservationInvalid,
                 anyhow::Error::new(error).context("kubectl returned invalid resource JSON"),
             ))
         })?;
-        if observed["metadata"]["labels"][identity_label] != json!(identity_value) {
-            return Err(anyhow::Error::new(ProviderError::classified(
-                ProvisioningErrorClass::TerminalContract,
-                LifecycleReasonCode::ResourceIdentityConflict,
-                anyhow::anyhow!(
-                    "existing Kubernetes resource has a conflicting {identity_name} identity"
-                ),
-            )));
-        }
-        validate_adoption_contract(desired, &observed)?;
-        let uid = observed["metadata"]["uid"].as_str().ok_or_else(|| {
-            anyhow::Error::new(ProviderError::classified(
-                ProvisioningErrorClass::RetryableProvider,
-                LifecycleReasonCode::ResourceIdentityMissing,
-                anyhow::anyhow!("observed Kubernetes resource UID is required"),
-            ))
-        })?;
-        Ok(Some(KubernetesResourceIdentity {
-            resource_kind,
-            namespace: namespace.to_string(),
-            name: name.to_string(),
-            uid: uid.to_string(),
-            observed_generation: observed["metadata"]["generation"].as_i64(),
-        }))
+        let observed = if decoded["kind"] == "List" {
+            decoded["items"]
+                .as_array()
+                .context("kubectl resource List.items must be an array")?
+                .clone()
+        } else {
+            vec![decoded]
+        };
+        desired
+            .iter()
+            .map(|resource| {
+                let kind = resource["kind"]
+                    .as_str()
+                    .context("Kubernetes manifest kind is required")?;
+                let name = resource["metadata"]["name"]
+                    .as_str()
+                    .context("Kubernetes manifest metadata.name is required")?;
+                let namespace = resource["metadata"]["namespace"]
+                    .as_str()
+                    .context("Kubernetes manifest metadata.namespace is required")?;
+                let Some(observed) = observed.iter().find(|candidate| {
+                    candidate["kind"] == resource["kind"]
+                        && candidate["metadata"]["name"] == resource["metadata"]["name"]
+                        && candidate["metadata"]["namespace"] == resource["metadata"]["namespace"]
+                }) else {
+                    return Ok(None);
+                };
+                if observed["metadata"]["labels"][identity_label] != json!(identity_value) {
+                    return Err(anyhow::Error::new(ProviderError::classified(
+                        ProvisioningErrorClass::TerminalContract,
+                        LifecycleReasonCode::ResourceIdentityConflict,
+                        anyhow::anyhow!(
+                            "existing Kubernetes resource has a conflicting {identity_name} identity"
+                        ),
+                    )));
+                }
+                validate_adoption_contract(resource, observed)?;
+                let uid = observed["metadata"]["uid"].as_str().ok_or_else(|| {
+                    anyhow::Error::new(ProviderError::classified(
+                        ProvisioningErrorClass::RetryableProvider,
+                        LifecycleReasonCode::ResourceIdentityMissing,
+                        anyhow::anyhow!("observed Kubernetes resource UID is required"),
+                    ))
+                })?;
+                Ok(Some(KubernetesResourceIdentity {
+                    resource_kind: runtime_resource_kind_for_kubernetes_kind(kind)?,
+                    namespace: namespace.to_string(),
+                    name: name.to_string(),
+                    uid: uid.to_string(),
+                    observed_generation: observed["metadata"]["generation"].as_i64(),
+                }))
+            })
+            .collect()
     }
 
     /// Renders the smoke-test plan printed by `provider-apply-plan` and

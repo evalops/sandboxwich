@@ -4283,13 +4283,24 @@ fn apply_provider_with_fake_kubectl(kubectl: &std::path::Path) -> KubernetesAppl
 }
 
 fn write_stateful_fake_kubectl() -> (std::path::PathBuf, std::path::PathBuf) {
-    write_stateful_fake_kubectl_with_observed_runtime_class("")
+    write_stateful_fake_kubectl_with_options("", false)
 }
 
 /// Stateful fake kubectl whose live Pods report `observed_runtime_class` for
 /// the provider's `spec.runtimeClassName` boundary read.
 fn write_stateful_fake_kubectl_with_observed_runtime_class(
     observed_runtime_class: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    write_stateful_fake_kubectl_with_options(observed_runtime_class, false)
+}
+
+fn write_stateful_fake_kubectl_failing_partial_wave() -> (std::path::PathBuf, std::path::PathBuf) {
+    write_stateful_fake_kubectl_with_options("", true)
+}
+
+fn write_stateful_fake_kubectl_with_options(
+    observed_runtime_class: &str,
+    fail_partial_wave: bool,
 ) -> (std::path::PathBuf, std::path::PathBuf) {
     let dir =
         std::env::temp_dir().join(format!("sandboxwich-stateful-kubectl-{}", SandboxId::new()));
@@ -4303,33 +4314,65 @@ printf '%s\n' "$*" >> "{log}"
 case " $* " in
   *runtimeClassName*) printf '%s' '{observed_runtime_class}' ;;
   *" get "*)
-    kind=''
-    name=''
-    previous=''
-    for arg in "$@"; do
-      if [ "$previous" = get ]; then kind="$arg"; previous=kind; continue; fi
-      if [ "$previous" = kind ]; then name="$arg"; break; fi
-      previous="$arg"
-    done
-    kind=$(printf '%s' "$kind" | tr '[:upper:]' '[:lower:]')
-    marker="{dir}/$kind-$name"
-    [ -f "$marker" ] || exit 0
-    python3 - "$marker" <<'PY'
+    python3 - "{dir}" "$@" <<'PY'
 import json
+import pathlib
 import sys
-with open(sys.argv[1], encoding="utf-8") as source:
-    value = json.load(source)
-metadata = value.setdefault("metadata", {{}})
-metadata["uid"] = "uid-" + metadata["name"]
-metadata["generation"] = 1
-print(json.dumps(value))
+
+root = pathlib.Path(sys.argv[1])
+args = sys.argv[2:]
+start = args.index("get") + 1
+resources = []
+for arg in args[start:]:
+    if arg.startswith("-"):
+        break
+    if "/" in arg:
+        resources.append(tuple(arg.split("/", 1)))
+    elif not resources:
+        resources.append((arg, args[start + 1]))
+        break
+items = []
+for kind, name in resources:
+    marker = root / f"{{kind.lower()}}-{{name}}"
+    if not marker.exists():
+        continue
+    with marker.open(encoding="utf-8") as source:
+        value = json.load(source)
+    metadata = value.setdefault("metadata", {{}})
+    metadata["uid"] = "uid-" + metadata["name"]
+    metadata["generation"] = 1
+    items.append(value)
+if len(resources) == 1:
+    if items:
+        print(json.dumps(items[0]))
+else:
+    print(json.dumps({{"apiVersion": "v1", "kind": "List", "items": items}}))
 PY
     ;;
   *" apply "*)
-    payload=$(cat)
-    kind=$(printf '%s' "$payload" | sed -n 's/.*"kind": "\([^"]*\)".*/\1/p' | head -1 | tr '[:upper:]' '[:lower:]')
-    name=$(printf '%s' "$payload" | sed -n 's/.*"name": "\([^"]*\)".*/\1/p' | head -1)
-    printf '%s' "$payload" > "{dir}/$kind-$name"
+    payload="{dir}/apply-payload.$$"
+    cat > "$payload"
+    python3 - "$payload" "{dir}" <<'PY'
+import json
+import pathlib
+import sys
+
+payload = pathlib.Path(sys.argv[1])
+root = pathlib.Path(sys.argv[2])
+documents = [
+    document
+    for document in payload.read_text(encoding="utf-8").split("\n---\n")
+    if document.strip()
+]
+for index, document in enumerate(documents):
+    value = json.loads(document)
+    kind = value["kind"].lower()
+    name = value["metadata"]["name"]
+    (root / f"{{kind}}-{{name}}").write_text(json.dumps(value), encoding="utf-8")
+    if {fail_partial_wave} and len(documents) > 1 and index == 0:
+        sys.exit(42)
+payload.unlink()
+PY
     ;;
   *" wait "*) ;;
 esac
@@ -4337,6 +4380,7 @@ esac
         log = log_path.display(),
         dir = dir.display(),
         observed_runtime_class = observed_runtime_class,
+        fail_partial_wave = if fail_partial_wave { "True" } else { "False" },
     );
     std::fs::write(&script_path, script).expect("write stateful fake kubectl");
     {
@@ -4397,14 +4441,15 @@ fn provision_staged_applies_resources_in_durable_order_and_reports_uids() {
     );
 
     let log = std::fs::read_to_string(&log_path).expect("read staged kubectl log");
-    assert!(
-        log.matches(" get ").count() >= 10,
-        "expected pre/post reads: {log}"
+    assert_eq!(
+        log.matches(" get ").count(),
+        10,
+        "each durable stage wave must use one pre-apply and one post-apply read: {log}"
     );
     assert_eq!(
         log.matches(" apply ").count(),
         5,
-        "one apply per manifest: {log}"
+        "each authority-fenced stage must keep its own apply: {log}"
     );
     assert!(log.contains(" wait --for=condition=Ready "));
 
@@ -4429,6 +4474,51 @@ fn provision_staged_applies_resources_in_durable_order_and_reports_uids() {
     assert_eq!(replay_reports.len(), 8);
 
     let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+#[test]
+fn provision_staged_does_not_apply_desktop_service_after_ssh_report_rejection() {
+    let (kubectl, log_path) = write_stateful_fake_kubectl();
+    let provider = apply_provider_with_fake_kubectl(&kubectl);
+    let sandbox_id = SandboxId::new();
+
+    let error = provider
+        .provision_staged(
+            sandbox_id,
+            &SandboxProvisionSpec::default(),
+            &CancelSignal::never_cancelled(),
+            |report| {
+                if report.stage == sandboxwich_core::ProvisioningStage::ServiceReady {
+                    anyhow::bail!("lease authority moved before ServiceReady was accepted");
+                }
+                Ok(())
+            },
+        )
+        .expect_err("the first rejected ServiceReady report must stop provisioning");
+    assert!(
+        error.to_string().contains("lease authority moved"),
+        "the report rejection must remain the causal error: {error}"
+    );
+
+    let root = kubectl.parent().expect("fake kubectl parent");
+    assert!(
+        root.join(format!("service-sandboxwich-ssh-{sandbox_id}"))
+            .exists(),
+        "the SSH Service is applied before its readiness report"
+    );
+    assert!(
+        !root
+            .join(format!("service-sandboxwich-desktop-{sandbox_id}"))
+            .exists(),
+        "a rejected SSH readiness report must fence the later desktop Service mutation"
+    );
+    let log = std::fs::read_to_string(&log_path).expect("read staged kubectl log");
+    assert!(
+        !log.contains(" delete "),
+        "report rejection means lease authority may have moved, so this worker must not roll back: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4466,7 +4556,7 @@ fn managed_home_is_adopted_by_replacement_runtime_and_survives_runtime_stop() {
     assert_eq!(
         log.matches(" apply ").count(),
         9,
-        "the replacement must adopt the home PVC and apply only its four runtime resources: {log}"
+        "the replacement must adopt the home PVC and apply only its three runtime stage waves: {log}"
     );
     assert!(
         log.contains(&format!(
@@ -4559,7 +4649,7 @@ fn provision_staged_applies_the_guest_token_secret_before_the_pod() {
     assert_eq!(
         log.matches(" apply ").count(),
         6,
-        "workspace, secret, policy, pod, and two services: {log}"
+        "workspace, secret, policy, pod, and both authority-fenced Services: {log}"
     );
 
     let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
@@ -4596,11 +4686,21 @@ fn provision_staged_starts_runtime_before_waiting_for_gateway() {
         .find(&format!("pod/sandboxwich-egress-gateway-{sandbox_id}"))
         .expect("gateway readiness wait");
     let runtime_start = log
-        .find(&format!("get Pod sandboxwich-{sandbox_id}"))
+        .find(&format!("get Pod/sandboxwich-{sandbox_id}"))
         .expect("runtime start");
     assert!(
         runtime_start < gateway_wait,
         "runtime and gateway cold starts must overlap before readiness waits: {log}"
+    );
+    assert_eq!(
+        log.matches(" get ").count(),
+        12,
+        "host egress must use one pre/post read for each durable stage wave: {log}"
+    );
+    assert_eq!(
+        log.matches(" apply ").count(),
+        6,
+        "gateway service, pod, and base policy must share their same-stage apply: {log}"
     );
     assert!(handle.resources.iter().any(|resource| {
         resource.resource_kind == sandboxwich_core::RuntimeResourceKind::Pod
@@ -4627,6 +4727,211 @@ fn provision_staged_starts_runtime_before_waiting_for_gateway() {
     );
 
     let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+#[test]
+fn provision_staged_repairs_only_missing_network_wave_members_in_identity_order() {
+    let (kubectl, log_path) = write_stateful_fake_kubectl();
+    let dry_run =
+        KubernetesDryRunProvider::with_snapshot_class("gke-ci", "sandboxwich-ci", None, None)
+            .with_egress_gateway_image(Some(format!(
+                "ghcr.io/evalops/sandboxwich-worker@sha256:{}",
+                "a".repeat(64)
+            )));
+    let provider = KubernetesApplyProvider::new(dry_run, kubectl.to_string_lossy().into_owned())
+        .with_mutation_gate(true, true);
+    let sandbox_id = SandboxId::new();
+    let spec = SandboxProvisionSpec {
+        network_egress: NetworkEgress::Allowlist {
+            rules: vec![sandboxwich_core::NetworkAllowRule {
+                kind: NetworkAllowRuleKind::Host,
+                value: "api.example.com".to_string(),
+            }],
+        },
+        ..SandboxProvisionSpec::default()
+    };
+    provider
+        .provision_staged(sandbox_id, &spec, &CancelSignal::never_cancelled(), |_| {
+            Ok(())
+        })
+        .expect("initial gateway provision succeeds");
+
+    let root = kubectl.parent().expect("fake kubectl parent");
+    let base_policy = root.join(format!("networkpolicy-sandboxwich-egress-{sandbox_id}"));
+    std::fs::remove_file(&base_policy).expect("remove one network-wave member");
+    let gateway_service = root.join(format!("service-sandboxwich-egress-gateway-{sandbox_id}"));
+    let mut adopted: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&gateway_service).expect("read gateway Service marker"),
+    )
+    .expect("parse gateway Service marker");
+    adopted["metadata"]["annotations"]["test.sandboxwich.dev/adopted"] =
+        serde_json::Value::String("preserve".to_string());
+    std::fs::write(
+        &gateway_service,
+        serde_json::to_vec(&adopted).expect("encode adopted gateway Service"),
+    )
+    .expect("write adopted gateway Service marker");
+    let applies_before = std::fs::read_to_string(&log_path)
+        .expect("read initial kubectl log")
+        .matches(" apply ")
+        .count();
+    let mut reports = Vec::new();
+
+    provider
+        .provision_staged(
+            sandbox_id,
+            &spec,
+            &CancelSignal::never_cancelled(),
+            |report| {
+                reports.push(report);
+                Ok(())
+            },
+        )
+        .expect("a valid partial wave is repaired");
+    let replay_log = std::fs::read_to_string(&log_path).expect("read replay kubectl log");
+    assert_eq!(
+        replay_log.matches(" apply ").count(),
+        applies_before + 1,
+        "the wave must apply only its one missing member: {replay_log}"
+    );
+    let preserved: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&gateway_service).expect("read adopted gateway Service"),
+    )
+    .expect("parse adopted gateway Service");
+    assert_eq!(
+        preserved["metadata"]["annotations"]["test.sandboxwich.dev/adopted"], "preserve",
+        "an exact adopted member must not be included in the repair apply"
+    );
+    assert!(
+        base_policy.exists(),
+        "the missing base policy must be restored"
+    );
+    let network_report = reports
+        .iter()
+        .rev()
+        .find(|report| report.stage == sandboxwich_core::ProvisioningStage::NetworkPolicyReady)
+        .expect("base network policy readiness is reported after gateway policy readiness");
+    assert_eq!(
+        network_report.resource_name.as_deref(),
+        Some(format!("sandboxwich-egress-{sandbox_id}").as_str()),
+        "the batched identities must remain in desired order so the base policy is authoritative"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn provision_staged_rejects_a_conflicting_member_before_filling_a_partial_network_wave() {
+    let (kubectl, log_path) = write_stateful_fake_kubectl();
+    let dry_run =
+        KubernetesDryRunProvider::with_snapshot_class("gke-ci", "sandboxwich-ci", None, None)
+            .with_egress_gateway_image(Some(format!(
+                "ghcr.io/evalops/sandboxwich-worker@sha256:{}",
+                "a".repeat(64)
+            )));
+    let provider = KubernetesApplyProvider::new(dry_run, kubectl.to_string_lossy().into_owned())
+        .with_mutation_gate(true, true);
+    let sandbox_id = SandboxId::new();
+    let spec = SandboxProvisionSpec {
+        network_egress: NetworkEgress::Allowlist {
+            rules: vec![sandboxwich_core::NetworkAllowRule {
+                kind: NetworkAllowRuleKind::Host,
+                value: "api.example.com".to_string(),
+            }],
+        },
+        ..SandboxProvisionSpec::default()
+    };
+    provider
+        .provision_staged(sandbox_id, &spec, &CancelSignal::never_cancelled(), |_| {
+            Ok(())
+        })
+        .expect("initial gateway provision succeeds");
+
+    let root = kubectl.parent().expect("fake kubectl parent");
+    std::fs::remove_file(root.join(format!("networkpolicy-sandboxwich-egress-{sandbox_id}")))
+        .expect("remove one network-wave member");
+    let gateway_service = root.join(format!("service-sandboxwich-egress-gateway-{sandbox_id}"));
+    let mut conflicting: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&gateway_service).expect("read gateway Service marker"),
+    )
+    .expect("parse gateway Service marker");
+    conflicting["metadata"]["labels"]["sandboxwich.dev/sandbox-id"] =
+        serde_json::Value::String(SandboxId::new().to_string());
+    std::fs::write(
+        &gateway_service,
+        serde_json::to_vec(&conflicting).expect("encode conflicting gateway Service"),
+    )
+    .expect("write conflicting gateway Service marker");
+    let applies_before = std::fs::read_to_string(&log_path)
+        .expect("read initial kubectl log")
+        .matches(" apply ")
+        .count();
+
+    let error = provider
+        .provision_staged(sandbox_id, &spec, &CancelSignal::never_cancelled(), |_| {
+            Ok(())
+        })
+        .expect_err("a conflicting observed wave member must block partial repair");
+    assert!(
+        error.to_string().contains("resource_identity_conflict"),
+        "the exact identity-label mismatch must remain a typed conflict: {error:#}"
+    );
+    let replay_log = std::fs::read_to_string(&log_path).expect("read replay kubectl log");
+    assert_eq!(
+        replay_log.matches(" apply ").count(),
+        applies_before,
+        "no missing wave member may be applied after an observed member fails identity validation: {replay_log}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn provision_staged_rolls_back_after_a_partial_network_wave_apply_failure() {
+    let (kubectl, log_path) = write_stateful_fake_kubectl_failing_partial_wave();
+    let dry_run =
+        KubernetesDryRunProvider::with_snapshot_class("gke-ci", "sandboxwich-ci", None, None)
+            .with_egress_gateway_image(Some(format!(
+                "ghcr.io/evalops/sandboxwich-worker@sha256:{}",
+                "a".repeat(64)
+            )));
+    let provider = KubernetesApplyProvider::new(dry_run, kubectl.to_string_lossy().into_owned())
+        .with_mutation_gate(true, true);
+    let sandbox_id = SandboxId::new();
+    let spec = SandboxProvisionSpec {
+        network_egress: NetworkEgress::Allowlist {
+            rules: vec![sandboxwich_core::NetworkAllowRule {
+                kind: NetworkAllowRuleKind::Host,
+                value: "api.example.com".to_string(),
+            }],
+        },
+        ..SandboxProvisionSpec::default()
+    };
+
+    provider
+        .provision_staged(sandbox_id, &spec, &CancelSignal::never_cancelled(), |_| {
+            Ok(())
+        })
+        .expect_err("a partial multi-document apply must fail provisioning");
+    let root = kubectl.parent().expect("fake kubectl parent");
+    assert!(
+        root.join(format!("service-sandboxwich-egress-gateway-{sandbox_id}"))
+            .exists(),
+        "the fake must prove the first wave member was created before apply failed"
+    );
+    assert!(
+        !root
+            .join(format!("pod-sandboxwich-egress-gateway-{sandbox_id}"))
+            .exists(),
+        "the fake must stop before the second wave member"
+    );
+    let log = std::fs::read_to_string(&log_path).expect("read partial-apply kubectl log");
+    assert!(
+        log.contains(" delete "),
+        "resources_applied must be set before a batched apply so partial creation triggers rollback: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5488,37 +5793,67 @@ set -eu
 printf '%s\n' "$*" >> "{log}"
 case " $* " in
   *" get "*)
-    kind=''
-    name=''
-    previous=''
-    for arg in "$@"; do
-      if [ "$previous" = get ]; then kind="$arg"; previous=kind; continue; fi
-      if [ "$previous" = kind ]; then name="$arg"; break; fi
-      previous="$arg"
-    done
-    kind=$(printf '%s' "$kind" | tr '[:upper:]' '[:lower:]')
-    marker="{dir}/$kind-$name"
-    [ -f "$marker" ] || exit 0
-    python3 - "$marker" <<'PY'
+    python3 - "{dir}" "$@" <<'PY'
 import json
+import pathlib
 import sys
-with open(sys.argv[1], encoding="utf-8") as source:
-    value = json.load(source)
-metadata = value.setdefault("metadata", {{}})
-metadata["uid"] = "uid-" + metadata["name"]
-metadata["generation"] = 1
-print(json.dumps(value))
+
+root = pathlib.Path(sys.argv[1])
+args = sys.argv[2:]
+start = args.index("get") + 1
+resources = []
+for arg in args[start:]:
+    if arg.startswith("-"):
+        break
+    if "/" in arg:
+        resources.append(tuple(arg.split("/", 1)))
+    elif not resources:
+        resources.append((arg, args[start + 1]))
+        break
+items = []
+for kind, name in resources:
+    marker = root / f"{{kind.lower()}}-{{name}}"
+    if not marker.exists():
+        continue
+    with marker.open(encoding="utf-8") as source:
+        value = json.load(source)
+    metadata = value.setdefault("metadata", {{}})
+    metadata["uid"] = "uid-" + metadata["name"]
+    metadata["generation"] = 1
+    items.append(value)
+if len(resources) == 1:
+    if items:
+        print(json.dumps(items[0]))
+else:
+    print(json.dumps({{"apiVersion": "v1", "kind": "List", "items": items}}))
 PY
     ;;
   *" apply "*)
-    payload=$(cat)
-    kind=$(printf '%s' "$payload" | sed -n 's/.*"kind": "\([^"]*\)".*/\1/p' | head -1 | tr '[:upper:]' '[:lower:]')
-    name=$(printf '%s' "$payload" | sed -n 's/.*"name": "\([^"]*\)".*/\1/p' | head -1)
-    if [ "$kind" = "{rejected_kind}" ]; then
-      printf '%s\n' '{stderr}' >&2
-      exit 1
-    fi
-    printf '%s' "$payload" > "{dir}/$kind-$name"
+    payload="{dir}/apply-payload.$$"
+    cat > "$payload"
+    python3 - "$payload" "{dir}" "{rejected_kind}" <<'PY'
+import json
+import pathlib
+import sys
+
+payload = pathlib.Path(sys.argv[1])
+root = pathlib.Path(sys.argv[2])
+rejected_kind = sys.argv[3]
+stderr = {stderr:?}
+values = [
+    json.loads(document)
+    for document in payload.read_text(encoding="utf-8").split("\n---\n")
+    if document.strip()
+]
+payload.unlink()
+if any(value["kind"].lower() == rejected_kind for value in values):
+    print(stderr, file=sys.stderr)
+    raise SystemExit(1)
+for value in values:
+    kind = value["kind"].lower()
+    name = value["metadata"]["name"]
+    (root / f"{{kind}}-{{name}}").write_text(json.dumps(value), encoding="utf-8")
+PY
     ;;
   *" wait "*) ;;
   *" delete "*) ;;
