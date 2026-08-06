@@ -30,7 +30,7 @@ use sandboxwich_core::{
     PROVIDER_ISOLATED_RESIDENT_PROCESS_IMAGE_LABEL,
     PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL,
     PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE, PROVIDER_SECRET_DELIVERY_LABEL,
-    PROVIDER_SECRET_DELIVERY_LABEL_VALUE, ProvisioningOperationResponse,
+    PROVIDER_SECRET_DELIVERY_LABEL_VALUE, ProviderCapabilityReport, ProvisioningOperationResponse,
     ProvisioningStageUpdateRequest, RegisterWorkerRequest, RenewLeaseRequest,
     ResidentProcessBootstrapReadRequest, ResidentProcessBootstrapReadResponse, ResidentProcessId,
     ResidentProcessObservationRequest, ResidentProcessObservedState, ResidentProcessRestartPolicy,
@@ -1130,6 +1130,8 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&outcome)?);
         }
         Command::Register(args) => {
+            let provider_capability_report =
+                registration_provider_capability_report(&args.provider)?;
             let capabilities = capabilities_for_provider_mode(
                 capabilities_from_args(
                     args.capability,
@@ -1140,7 +1142,11 @@ async fn main() -> anyhow::Result<()> {
                 )?,
                 args.provider_mode,
             );
-            let capabilities = capabilities_for_worker_provider(&capabilities, &args.provider);
+            let capabilities = capabilities_for_worker_provider(
+                &capabilities,
+                &args.provider,
+                provider_capability_report.as_ref(),
+            );
             let mut labels: BTreeMap<_, _> = args.label.into_iter().collect();
             add_placement_proof_labels(&mut labels, args.provider_mode, None, false);
             let response = with_retries("register worker", API_RETRY_ATTEMPTS, || {
@@ -1228,6 +1234,8 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     args.worker_provider.clone()
                 };
+            let provider_capability_report =
+                registration_provider_capability_report(&worker_provider)?;
             let isolation_profile = args.provider.provider.isolation_profile;
             let runtime_class_name = args.provider.provider.runtime_class_name.as_deref();
             let fqdn_egress_backend = args.provider.provider.cilium_fqdn_egress
@@ -1258,7 +1266,11 @@ async fn main() -> anyhow::Result<()> {
                 )?,
                 args.provider.provider_mode,
             );
-            let capabilities = capabilities_for_worker_provider(&capabilities, &worker_provider);
+            let capabilities = capabilities_for_worker_provider(
+                &capabilities,
+                &worker_provider,
+                provider_capability_report.as_ref(),
+            );
             let mut labels: BTreeMap<_, _> = args.label.into_iter().collect();
             labels.insert(
                 "sandbox_namespace".into(),
@@ -4604,16 +4616,31 @@ fn capabilities_for_provider_mode(
 fn capabilities_for_worker_provider(
     capabilities: &[WorkerCapability],
     provider: &str,
+    provider_capability_report: Option<&ProviderCapabilityReport>,
 ) -> Vec<WorkerCapability> {
     if provider.eq_ignore_ascii_case("cloudflare") {
         capabilities
             .iter()
-            .filter(|capability| matches!(capability, WorkerCapability::ProvisionSandbox))
+            .filter(|capability| {
+                provider_capability_report
+                    .is_some_and(|report| report.capabilities.contains(capability))
+            })
             .cloned()
             .collect()
     } else {
         capabilities.to_vec()
     }
+}
+
+fn registration_provider_capability_report(
+    provider: &str,
+) -> anyhow::Result<Option<ProviderCapabilityReport>> {
+    if !provider.eq_ignore_ascii_case("cloudflare") {
+        return Ok(None);
+    }
+
+    let provider = CloudflareSandboxProvider::new(CloudflareConfig::from_env()?)?;
+    Ok(Some(provider.capability_report()))
 }
 
 fn add_provider_isolated_resident_process_label(

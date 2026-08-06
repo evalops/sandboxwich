@@ -258,6 +258,7 @@ pub(crate) async fn create_sandbox_with_home(
     authorization: Option<AuthorizationContext>,
     trace: RequestTrace,
 ) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
+    let provider_preference = request.provider_preference.clone().unwrap_or_default();
     create_sandbox_with_home_and_provider(
         state,
         ctx,
@@ -265,7 +266,7 @@ pub(crate) async fn create_sandbox_with_home(
         home_id,
         authorization,
         trace,
-        ProviderPreference::Any,
+        provider_preference,
     )
     .await
 }

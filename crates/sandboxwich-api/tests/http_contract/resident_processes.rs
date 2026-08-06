@@ -996,6 +996,79 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
     assert!(proof.tuple_digest.starts_with("sha256:v1:"));
     assert_eq!(proof.tuple_digest.len(), "sha256:v1:".len() + 64);
 
+    let identity_activation_id = Uuid::now_v7();
+    let identity = MaestroHostedRunnerActivationIdentityRequest {
+        activation_id: identity_activation_id,
+        organization_id: starting_connection.organization_id.clone(),
+        workspace_id: starting_connection.workspace_id.clone(),
+        sandbox_id: starting_connection.sandbox_id,
+        pod_uid: starting_connection.pod_uid,
+        placement_generation: starting_connection.placement_generation,
+        runner_session_id: starting_connection.runner_session_id.clone(),
+        runtime_image_digest: starting_connection
+            .runtime_image
+            .rsplit_once("@sha256:")
+            .unwrap()
+            .1
+            .into(),
+        service_name: starting_connection.service_name.clone(),
+        service_port: starting_connection.service_port,
+        resident_process_generation: starting_connection.resident_process_generation,
+        lease_id: starting_connection.lease_id,
+        lease_attempt: starting_connection.lease_attempt,
+        worker_id: starting_connection.worker_id,
+    };
+    let identity_url = format!(
+        "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}/activations/validate-identity",
+        server.base_url
+    );
+    let bundle: MaestroHostedRunnerActivationValidationBundleResponse = client
+        .post(&identity_url)
+        .json(&identity)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(bundle.binding, starting_connection);
+    assert_eq!(bundle.proof.activation_id, identity_activation_id);
+    assert!(!bundle.proof.replayed);
+    let identity_replay: MaestroHostedRunnerActivationValidationBundleResponse = client
+        .post(&identity_url)
+        .json(&identity)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(identity_replay.binding, starting_connection);
+    assert!(identity_replay.proof.replayed);
+    assert_eq!(
+        identity_replay.proof.tuple_digest,
+        bundle.proof.tuple_digest
+    );
+    let mut identity_mismatch = identity.clone();
+    identity_mismatch.activation_id = Uuid::now_v7();
+    identity_mismatch.service_port += 1;
+    let identity_mismatch = client
+        .post(&identity_url)
+        .json(&identity_mismatch)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(identity_mismatch.status(), reqwest::StatusCode::CONFLICT);
+    let identity_mismatch: ErrorEnvelope = identity_mismatch.json().await.unwrap();
+    assert_eq!(
+        identity_mismatch.code,
+        "maestro_activation_identity_mismatch"
+    );
+
     server.restart(false).await;
     connection_binding_url = format!(
         "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}/connection-binding",

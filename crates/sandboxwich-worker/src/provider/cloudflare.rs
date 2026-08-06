@@ -127,14 +127,27 @@ trait CloudflareBridge: Send + Sync {
 struct HttpCloudflareBridge {
     config: CloudflareConfig,
     client: reqwest::Client,
-    runtime: Arc<tokio::runtime::Runtime>,
+    /// Owned runtime is only created when constructed *outside* an existing
+    /// Tokio context (sync tests / non-async callers).
+    ///
+    /// When the worker runs under `#[tokio::main]`, we must not create a nested
+    /// `Runtime`: dropping it from the outer async stack panics with
+    /// "Cannot drop a runtime in a context where blocking is not allowed",
+    /// which is exactly how production `sandboxwich-cloudflare-worker` crash-
+    /// looped after capability registration started constructing a temporary
+    /// Cloudflare provider during `run`.
+    owned_runtime: Option<Arc<tokio::runtime::Runtime>>,
 }
 
 impl HttpCloudflareBridge {
     fn new(config: CloudflareConfig) -> anyhow::Result<Self> {
-        let runtime = Arc::new(
-            tokio::runtime::Runtime::new().context("failed to create Cloudflare Bridge runtime")?,
-        );
+        let owned_runtime = match tokio::runtime::Handle::try_current() {
+            Ok(_) => None,
+            Err(_) => Some(Arc::new(
+                tokio::runtime::Runtime::new()
+                    .context("failed to create Cloudflare Bridge runtime")?,
+            )),
+        };
         let client = reqwest::Client::builder()
             .timeout(config.request_timeout)
             .build()
@@ -142,7 +155,7 @@ impl HttpCloudflareBridge {
         Ok(Self {
             config,
             client,
-            runtime,
+            owned_runtime,
         })
     }
 
@@ -150,7 +163,13 @@ impl HttpCloudflareBridge {
         &self,
         future: impl std::future::Future<Output = anyhow::Result<T>>,
     ) -> anyhow::Result<T> {
-        self.runtime.block_on(future)
+        if let Some(runtime) = &self.owned_runtime {
+            return runtime.block_on(future);
+        }
+        // Already inside the worker's multi-thread runtime: drive the future on
+        // the current handle. `block_in_place` keeps the outer runtime responsive
+        // while the sync SandboxProvider trait blocks on bridge I/O.
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
     }
 
     fn request(
@@ -997,6 +1016,49 @@ mod tests {
             .expect("response body must remain readable after response headers arrive");
         assert_eq!(created.external_id, "stable-cloudflare-sandbox");
         server.join().unwrap();
+    }
+
+    /// Regression for production crash-loop: constructing (and dropping) a
+    /// Cloudflare provider from inside `#[tokio::main]` used to create a nested
+    /// Runtime and panic on drop during capability registration.
+    #[test]
+    fn cloudflare_provider_construct_and_drop_inside_async_runtime_does_not_panic() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            // Mirrors registration_provider_capability_report: temporary
+            // provider built on the async stack for a capability snapshot.
+            let report = {
+                let provider = CloudflareSandboxProvider::new(CloudflareConfig {
+                    base_url: "https://bridge.example".into(),
+                    api_token: "secret".into(),
+                    request_timeout: Duration::from_secs(1),
+                    readiness_timeout: Duration::from_secs(1),
+                    replay_ledger_configured: true,
+                })
+                .expect("construct inside async context");
+                let report = provider.capability_report();
+                drop(provider);
+                report
+            };
+            assert_eq!(report.provider, "cloudflare");
+            assert!(
+                report
+                    .capabilities
+                    .contains(&WorkerCapability::ProvisionSandbox),
+                "capability report should list provision without panicking on drop"
+            );
+            assert!(
+                report.capabilities.contains(&WorkerCapability::RunCommand),
+                "ledger-configured provider must advertise run_command"
+            );
+        });
+        // Dropping the outer test runtime after the nested work finishes must
+        // also succeed (owned_runtime was None inside the async block).
+        drop(runtime);
     }
 
     #[test]

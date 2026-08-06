@@ -47,7 +47,20 @@ pub(crate) fn worker_matches_provider_preference(
     worker_provider: &str,
     preference: &ProviderPreference,
 ) -> bool {
-    matches!(preference, ProviderPreference::Any) || preference.as_db_str() == worker_provider
+    // Specialized providers (currently Cloudflare) hard-require an explicit
+    // preference at provision time. Treating `Any` as "every registered
+    // worker" lets Cloudflare claim generic kubernetes-shaped jobs
+    // (`development_container` / `ubuntu-dev`) and then fail with
+    // "Cloudflare worker received a non-Cloudflare placement request".
+    //
+    // `Any` therefore means any general-purpose (kubernetes) worker; explicit
+    // preferences match only the named provider.
+    match preference {
+        ProviderPreference::Any => worker_provider.eq_ignore_ascii_case("kubernetes"),
+        ProviderPreference::Kubernetes | ProviderPreference::Cloudflare => {
+            preference.as_db_str().eq_ignore_ascii_case(worker_provider)
+        }
+    }
 }
 
 fn guest_supports_uid_isolated_resident_process(checks: &serde_json::Value) -> bool {
@@ -454,6 +467,28 @@ mod provider_preference_tests {
         assert!(worker_matches_provider_preference(
             "kubernetes",
             &ProviderPreference::Any
+        ));
+    }
+
+    #[test]
+    fn any_preference_does_not_match_specialized_cloudflare_workers() {
+        // Regression: CF workers advertising provision_sandbox used to claim
+        // provider_preference=any jobs, then fail the hard placement check.
+        assert!(!worker_matches_provider_preference(
+            "cloudflare",
+            &ProviderPreference::Any
+        ));
+        assert!(!worker_matches_provider_preference(
+            "cloudflare",
+            &ProviderPreference::Kubernetes
+        ));
+        assert!(worker_matches_provider_preference(
+            "kubernetes",
+            &ProviderPreference::Kubernetes
+        ));
+        assert!(worker_matches_provider_preference(
+            "Cloudflare", // case-insensitive wire values
+            &ProviderPreference::Cloudflare
         ));
     }
 }

@@ -2612,6 +2612,41 @@ pub struct MaestroHostedRunnerActivationValidationRequest {
     pub worker_id: WorkerId,
 }
 
+/// The exact identity tuple presented by an authenticated Maestro runner.
+/// Sandboxwich resolves the remaining binding fields from its authoritative
+/// resident, placement, and lease rows in the same transaction as validation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MaestroHostedRunnerActivationIdentityRequest {
+    pub activation_id: Uuid,
+    pub organization_id: String,
+    pub workspace_id: String,
+    pub sandbox_id: SandboxId,
+    pub pod_uid: Uuid,
+    pub placement_generation: u64,
+    pub runner_session_id: String,
+    #[schema(pattern = "^[0-9a-f]{64}$")]
+    pub runtime_image_digest: String,
+    pub service_name: String,
+    pub service_port: u16,
+    pub resident_process_generation: u64,
+    pub lease_id: Uuid,
+    pub lease_attempt: u64,
+    #[schema(value_type = Uuid)]
+    pub worker_id: WorkerId,
+}
+
+/// One authoritative binding and durable proof returned by the combined
+/// identity validation endpoint. The binding is resolved and the proof is
+/// committed under one database transaction, so callers do not need a
+/// preceding connection-binding read.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MaestroHostedRunnerActivationValidationBundleResponse {
+    pub binding: MaestroHostedRunnerConnectionBindingResponse,
+    pub proof: MaestroHostedRunnerActivationValidationResponse,
+}
+
 /// Durable point-in-time receipt that Sandboxwich accepted one exact Maestro
 /// activation tuple while its authoritative generation and lease were live.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
