@@ -127,14 +127,40 @@ trait CloudflareBridge: Send + Sync {
 struct HttpCloudflareBridge {
     config: CloudflareConfig,
     client: reqwest::Client,
-    runtime: Arc<tokio::runtime::Runtime>,
+    runtime: BridgeRuntime,
+}
+
+#[derive(Clone)]
+enum BridgeRuntime {
+    Current(tokio::runtime::Handle),
+    Owned(Arc<tokio::runtime::Runtime>),
+}
+
+impl BridgeRuntime {
+    fn new() -> anyhow::Result<Self> {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => Ok(Self::Current(handle)),
+            Err(_) => Ok(Self::Owned(Arc::new(
+                tokio::runtime::Runtime::new()
+                    .context("failed to create Cloudflare Bridge runtime")?,
+            ))),
+        }
+    }
+
+    fn block_on<T>(
+        &self,
+        future: impl std::future::Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        match self {
+            Self::Current(handle) => handle.block_on(future),
+            Self::Owned(runtime) => runtime.block_on(future),
+        }
+    }
 }
 
 impl HttpCloudflareBridge {
     fn new(config: CloudflareConfig) -> anyhow::Result<Self> {
-        let runtime = Arc::new(
-            tokio::runtime::Runtime::new().context("failed to create Cloudflare Bridge runtime")?,
-        );
+        let runtime = BridgeRuntime::new()?;
         let client = reqwest::Client::builder()
             .timeout(config.request_timeout)
             .build()
@@ -955,6 +981,20 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cloudflare_provider_drop_is_async_runtime_safe() {
+        let provider = CloudflareSandboxProvider::new(CloudflareConfig {
+            base_url: "https://bridge.example".to_string(),
+            api_token: "secret".to_string(),
+            request_timeout: Duration::from_secs(1),
+            readiness_timeout: Duration::from_secs(1),
+            replay_ledger_configured: true,
+        })
+        .expect("construct Cloudflare provider inside the worker runtime");
+
+        drop(provider);
     }
 
     #[test]
