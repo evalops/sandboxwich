@@ -20,6 +20,115 @@ fn persistent_sandbox(name: &str) -> CreateSandboxRequest {
 }
 
 #[tokio::test]
+async fn managed_home_preserves_explicit_cloudflare_provider_preference() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("managed-home-provider.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+    let home: HomeResponse = client
+        .post(format!("{}/homes", server.base_url))
+        .json(&CreateHomeRequest::default())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let register = |name: &str, provider: &str| RegisterWorkerRequest {
+        name: name.into(),
+        provider: provider.into(),
+        capabilities: vec![WorkerCapability::ProvisionSandbox],
+        max_concurrent_jobs: Some(1),
+        labels: Default::default(),
+    };
+    let kubernetes: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&register("managed-home-kubernetes", "kubernetes"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let cloudflare: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&register("managed-home-cloudflare", "cloudflare"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut request = persistent_sandbox("cloudflare-home");
+    request.provider_preference = Some(ProviderPreference::Cloudflare);
+    client
+        .post(format!(
+            "{}/homes/{}/sandboxes",
+            server.base_url, home.home.id
+        ))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let claim = ClaimLeaseRequest {
+        lease_seconds: Some(60),
+        sandbox_id: None,
+        kinds: Some(vec![JobKind::ProvisionSandbox]),
+        wait_ms: None,
+    };
+    let kubernetes_claim: ClaimLeaseResponse = worker_client(&kubernetes)
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, kubernetes.worker.id
+        ))
+        .json(&claim)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(kubernetes_claim.lease.is_none());
+
+    let cloudflare_claim: ClaimLeaseResponse = worker_client(&cloudflare)
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, cloudflare.worker.id
+        ))
+        .json(&claim)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let job = cloudflare_claim
+        .lease
+        .expect("Cloudflare worker must claim the managed-home provision")
+        .job;
+    assert_eq!(
+        job.payload["provisionSpec"]["provider_preference"],
+        "cloudflare"
+    );
+}
+
+#[tokio::test]
 async fn managed_home_is_tenant_scoped_and_single_mount() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!(
