@@ -572,10 +572,15 @@ pub(crate) async fn put_resident_process(
         // env values or bootstrap content. Revision bumps when the allowlist
         // or bootstrap path rule changes (see platform runner-host same event).
         let env_keys = request.env.keys().cloned().collect::<Vec<_>>().join(",");
+        let contract_revision = request
+            .env
+            .get("MAESTRO_RESIDENT_CONTRACT_REVISION")
+            .map(String::as_str)
+            .unwrap_or("unknown");
         tracing::info!(
             event = "maestro_resident_contract",
             stage = "resident.put.validate",
-            contract_revision = "maestro-resident-model-ready-v2",
+            contract_revision,
             sandbox_id = %sandbox_id,
             bootstrap_present = request.bootstrap.is_some(),
             bootstrap_target = request
@@ -651,7 +656,7 @@ pub(crate) async fn put_resident_process(
             "MAESTRO_EVALOPS_ENVIRONMENT",
             "MAESTRO_EVALOPS_CREDENTIAL_NAME",
             // Platform runner-host emits the canonical model selector and a
-            // low-cardinality contract fingerprint during the v2 rollout.
+            // low-cardinality contract fingerprint during the v3 rollout.
             "MAESTRO_MODEL",
             "MAESTRO_DEFAULT_MODEL",
             "MAESTRO_RESIDENT_CONTRACT_REVISION",
