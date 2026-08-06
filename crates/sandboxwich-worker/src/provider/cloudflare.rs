@@ -9,6 +9,8 @@ const MAX_BRIDGE_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SSE_LINE_BYTES: usize = 64 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_COMMAND_OUTPUT_BYTES: usize = 8 * 1024;
+pub(crate) const CLOUDFLARE_REPLAY_LEDGER_CONFIGURED_ENV: &str =
+    "SANDBOXWICH_CLOUDFLARE_REPLAY_LEDGER_CONFIGURED";
 
 pub(crate) fn create_idempotency_key(sandbox_id: SandboxId) -> String {
     format!("sandboxwich-create-{sandbox_id}")
@@ -38,9 +40,13 @@ impl std::fmt::Debug for CloudflareConfig {
 
 impl CloudflareConfig {
     pub fn from_env() -> anyhow::Result<Self> {
-        let base_url = std::env::var("SANDBOXWICH_CLOUDFLARE_SANDBOX_URL")
+        Self::from_map(|name| std::env::var(name).ok())
+    }
+
+    fn from_map(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        let base_url = get("SANDBOXWICH_CLOUDFLARE_SANDBOX_URL")
             .context("SANDBOXWICH_CLOUDFLARE_SANDBOX_URL is required")?;
-        let api_token = std::env::var("SANDBOXWICH_CLOUDFLARE_SANDBOX_TOKEN")
+        let api_token = get("SANDBOXWICH_CLOUDFLARE_SANDBOX_TOKEN")
             .context("SANDBOXWICH_CLOUDFLARE_SANDBOX_TOKEN is required")?;
         anyhow::ensure!(
             !base_url.trim().is_empty(),
@@ -50,12 +56,22 @@ impl CloudflareConfig {
             !api_token.trim().is_empty(),
             "Cloudflare Bridge token is empty"
         );
+        let replay_ledger_configured = match get(CLOUDFLARE_REPLAY_LEDGER_CONFIGURED_ENV)
+            .as_deref()
+            .map(str::trim)
+        {
+            None | Some("") | Some("false") => false,
+            Some("true") => true,
+            Some(_) => {
+                anyhow::bail!("{CLOUDFLARE_REPLAY_LEDGER_CONFIGURED_ENV} must be true or false")
+            }
+        };
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_token,
             request_timeout: Duration::from_secs(30),
             readiness_timeout: Duration::from_secs(60),
-            replay_ledger_configured: false,
+            replay_ledger_configured,
         })
     }
 }
@@ -91,6 +107,7 @@ trait CloudflareBridge: Send + Sync {
     fn create(
         &self,
         sandbox_id: SandboxId,
+        home_id: Option<HomeId>,
         spec: &SandboxProvisionSpec,
         create_key: &str,
     ) -> anyhow::Result<BridgeSandbox>;
@@ -110,24 +127,30 @@ trait CloudflareBridge: Send + Sync {
 struct HttpCloudflareBridge {
     config: CloudflareConfig,
     client: reqwest::Client,
+    runtime: Arc<tokio::runtime::Runtime>,
 }
 
 impl HttpCloudflareBridge {
     fn new(config: CloudflareConfig) -> anyhow::Result<Self> {
+        let runtime = Arc::new(
+            tokio::runtime::Runtime::new().context("failed to create Cloudflare Bridge runtime")?,
+        );
         let client = reqwest::Client::builder()
             .timeout(config.request_timeout)
             .build()
             .context("failed to build Cloudflare Bridge client")?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            runtime,
+        })
     }
 
     fn block_on<T>(
         &self,
         future: impl std::future::Future<Output = anyhow::Result<T>>,
     ) -> anyhow::Result<T> {
-        tokio::runtime::Runtime::new()
-            .context("failed to create Cloudflare Bridge runtime")?
-            .block_on(future)
+        self.runtime.block_on(future)
     }
 
     fn request(
@@ -207,6 +230,7 @@ impl CloudflareBridge for HttpCloudflareBridge {
     fn create(
         &self,
         sandbox_id: SandboxId,
+        home_id: Option<HomeId>,
         spec: &SandboxProvisionSpec,
         create_key: &str,
     ) -> anyhow::Result<BridgeSandbox> {
@@ -219,6 +243,7 @@ impl CloudflareBridge for HttpCloudflareBridge {
         );
         let body = json!({
             "sandboxId": sandbox_id,
+            "homeId": home_id,
             "tenantId": spec.tenant_id,
             "memoryLimit": spec.memory_limit,
             "networkEgress": spec.network_egress,
@@ -566,43 +591,11 @@ impl CloudflareSandboxProvider {
         }
         anyhow::Error::new(ProviderError::retryable(error))
     }
-}
 
-impl SandboxProvider for CloudflareSandboxProvider {
-    fn provider_name(&self) -> &'static str {
-        "cloudflare"
-    }
-
-    fn capability_report(&self) -> ProviderCapabilityReport {
-        let mut capabilities = vec![WorkerCapability::ProvisionSandbox];
-        if self.replay_ledger_configured {
-            capabilities.push(WorkerCapability::RunCommand);
-        }
-        ProviderCapabilityReport {
-            provider: "cloudflare".to_string(),
-            capabilities,
-            labels: BTreeMap::new(),
-        }
-    }
-
-    fn health_report(&self) -> ProviderHealthReport {
-        let result = self.bridge.health();
-        ProviderHealthReport {
-            provider: "cloudflare".to_string(),
-            status: if result.is_ok() {
-                ProviderHealthStatus::Healthy
-            } else {
-                ProviderHealthStatus::Degraded
-            },
-            checked_at: Utc::now(),
-            labels: BTreeMap::new(),
-            message: result.err().map(|error| error.to_string()),
-        }
-    }
-
-    fn provision(
+    fn provision_with_home(
         &self,
         sandbox_id: SandboxId,
+        home_id: Option<HomeId>,
         spec: &SandboxProvisionSpec,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<ProviderSandboxHandle> {
@@ -620,7 +613,7 @@ impl SandboxProvider for CloudflareSandboxProvider {
         let create_key = create_idempotency_key(sandbox_id);
         let sandbox = self
             .bridge
-            .create(sandbox_id, spec, &create_key)
+            .create(sandbox_id, home_id, spec, &create_key)
             .map_err(|error| {
                 if error
                     .downcast_ref::<CloudflareHttpError>()
@@ -662,11 +655,18 @@ impl SandboxProvider for CloudflareSandboxProvider {
                         ready_at: Some(Utc::now()),
                         error: None,
                     };
+                    let mut metadata = json!({
+                        "externalId": sandbox.external_id,
+                        "routingScope": sandbox.routing_scope,
+                    });
+                    if let Some(home_id) = home_id {
+                        metadata["homeId"] = json!(home_id);
+                    }
                     return Ok(ProviderSandboxHandle {
                         provider: "cloudflare".to_string(),
                         sandbox_id,
                         resources: vec![resource],
-                        metadata: json!({ "externalId": sandbox.external_id, "routingScope": sandbox.routing_scope }),
+                        metadata,
                     });
                 }
                 false => std::thread::sleep(Duration::from_millis(10)),
@@ -676,6 +676,65 @@ impl SandboxProvider for CloudflareSandboxProvider {
             ProviderError::retryable(anyhow::anyhow!("Cloudflare sandbox readiness timed out"))
                 .into(),
         )
+    }
+}
+
+impl SandboxProvider for CloudflareSandboxProvider {
+    fn provider_name(&self) -> &'static str {
+        "cloudflare"
+    }
+
+    fn capability_report(&self) -> ProviderCapabilityReport {
+        let mut capabilities = vec![WorkerCapability::ProvisionSandbox];
+        if self.replay_ledger_configured {
+            capabilities.push(WorkerCapability::RunCommand);
+        }
+        ProviderCapabilityReport {
+            provider: "cloudflare".to_string(),
+            capabilities,
+            labels: BTreeMap::new(),
+        }
+    }
+
+    fn health_report(&self) -> ProviderHealthReport {
+        let result = self.bridge.health();
+        ProviderHealthReport {
+            provider: "cloudflare".to_string(),
+            status: if result.is_ok() {
+                ProviderHealthStatus::Healthy
+            } else {
+                ProviderHealthStatus::Degraded
+            },
+            checked_at: Utc::now(),
+            labels: BTreeMap::new(),
+            message: result.err().map(|error| error.to_string()),
+        }
+    }
+
+    fn provision(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<ProviderSandboxHandle> {
+        self.provision_with_home(sandbox_id, None, spec, cancelled)
+    }
+
+    fn provision_home_staged(
+        &self,
+        sandbox_id: SandboxId,
+        home_id: HomeId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+        report: &mut dyn FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
+    ) -> anyhow::Result<ProviderSandboxHandle> {
+        anyhow::ensure!(
+            spec.workspace_mode == WorkspaceMode::Persistent,
+            "managed Cloudflare homes require persistent workspace mode"
+        );
+        let handle = self.provision_with_home(sandbox_id, Some(home_id), spec, cancelled)?;
+        report(stage_update(ProvisioningStage::SandboxReady, None))?;
+        Ok(handle)
     }
 
     fn exec_handoff(
@@ -773,6 +832,7 @@ impl CloudflareBridge for FakeBridge {
     fn create(
         &self,
         _sandbox_id: SandboxId,
+        _home_id: Option<HomeId>,
         spec: &SandboxProvisionSpec,
         _create_key: &str,
     ) -> anyhow::Result<BridgeSandbox> {
@@ -821,6 +881,123 @@ impl CloudflareBridge for FakeBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloudflare_managed_home_is_attached_to_replacement_runtime() {
+        let provider = CloudflareSandboxProvider::for_test_with_replay_ledger();
+        let sandbox_id = SandboxId::new();
+        let home_id = HomeId::new();
+        let spec = SandboxProvisionSpec {
+            provider_preference: ProviderPreference::Cloudflare,
+            tenant_id: Some("org:workspace".into()),
+            workspace_mode: WorkspaceMode::Persistent,
+            ..Default::default()
+        };
+        let mut stages = Vec::new();
+
+        let handle = provider
+            .provision_home_staged(
+                sandbox_id,
+                home_id,
+                &spec,
+                &CancelSignal::never_cancelled(),
+                &mut |update| {
+                    stages.push(update.stage);
+                    Ok(())
+                },
+            )
+            .expect("Cloudflare must attach a managed home to a replacement runtime");
+
+        assert_eq!(handle.sandbox_id, sandbox_id);
+        assert_eq!(handle.metadata["homeId"], home_id.to_string());
+        assert_eq!(stages.last(), Some(&ProvisioningStage::SandboxReady));
+    }
+
+    #[test]
+    fn cloudflare_command_capability_requires_durable_ledger_binding_marker() {
+        let base = |name: &str| match name {
+            "SANDBOXWICH_CLOUDFLARE_SANDBOX_URL" => Some("https://bridge.example".to_string()),
+            "SANDBOXWICH_CLOUDFLARE_SANDBOX_TOKEN" => Some("secret".to_string()),
+            _ => None,
+        };
+        let without_binding = CloudflareConfig::from_map(base).unwrap();
+        assert!(!without_binding.replay_ledger_configured);
+        assert!(
+            !CloudflareSandboxProvider::new(without_binding)
+                .unwrap()
+                .capability_report()
+                .capabilities
+                .contains(&WorkerCapability::RunCommand)
+        );
+
+        let with_binding = CloudflareConfig::from_map(|name| match name {
+            "SANDBOXWICH_CLOUDFLARE_SANDBOX_URL" => Some("https://bridge.example".to_string()),
+            "SANDBOXWICH_CLOUDFLARE_SANDBOX_TOKEN" => Some("secret".to_string()),
+            "SANDBOXWICH_CLOUDFLARE_REPLAY_LEDGER_CONFIGURED" => Some("true".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert!(with_binding.replay_ledger_configured);
+        assert!(
+            CloudflareSandboxProvider::new(with_binding)
+                .unwrap()
+                .capability_report()
+                .capabilities
+                .contains(&WorkerCapability::RunCommand)
+        );
+
+        assert!(
+            CloudflareConfig::from_map(|name| match name {
+                "SANDBOXWICH_CLOUDFLARE_SANDBOX_URL" => Some("https://bridge.example".to_string()),
+                "SANDBOXWICH_CLOUDFLARE_SANDBOX_TOKEN" => Some("secret".to_string()),
+                "SANDBOXWICH_CLOUDFLARE_REPLAY_LEDGER_CONFIGURED" => Some("yes".to_string()),
+                _ => None,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cloudflare_http_bridge_keeps_runtime_alive_while_reading_response_body() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            let body = br#"{"id":"stable-cloudflare-sandbox"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            stream.write_all(body).unwrap();
+        });
+        let bridge = HttpCloudflareBridge::new(CloudflareConfig {
+            base_url: format!("http://{address}"),
+            api_token: "secret".into(),
+            request_timeout: Duration::from_secs(2),
+            readiness_timeout: Duration::from_secs(2),
+            replay_ledger_configured: true,
+        })
+        .unwrap();
+        let spec = SandboxProvisionSpec {
+            provider_preference: ProviderPreference::Cloudflare,
+            tenant_id: Some("org:workspace".into()),
+            ..Default::default()
+        };
+
+        let created = bridge
+            .create(SandboxId::new(), None, &spec, "stable-create-key")
+            .expect("response body must remain readable after response headers arrive");
+        assert_eq!(created.external_id, "stable-cloudflare-sandbox");
+        server.join().unwrap();
+    }
 
     #[test]
     fn cloudflare_provision_exec_stop_uses_external_identity_and_tenant_scope() {
