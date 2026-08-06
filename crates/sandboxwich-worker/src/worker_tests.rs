@@ -19,6 +19,39 @@ fn provider() -> KubernetesDryRunProvider {
 }
 
 #[test]
+fn cloudflare_registration_omits_run_command_without_the_durable_ledger() {
+    let requested = vec![
+        WorkerCapability::ProvisionSandbox,
+        WorkerCapability::RunCommand,
+        WorkerCapability::Snapshot,
+    ];
+    let report = CloudflareSandboxProvider::for_test().capability_report();
+
+    assert_eq!(
+        capabilities_for_worker_provider(&requested, "cloudflare", Some(&report)),
+        vec![WorkerCapability::ProvisionSandbox]
+    );
+}
+
+#[test]
+fn cloudflare_registration_includes_run_command_with_the_durable_ledger() {
+    let requested = vec![
+        WorkerCapability::ProvisionSandbox,
+        WorkerCapability::RunCommand,
+        WorkerCapability::Snapshot,
+    ];
+    let report = CloudflareSandboxProvider::for_test_with_replay_ledger().capability_report();
+
+    assert_eq!(
+        capabilities_for_worker_provider(&requested, "cloudflare", Some(&report)),
+        vec![
+            WorkerCapability::ProvisionSandbox,
+            WorkerCapability::RunCommand,
+        ]
+    );
+}
+
+#[test]
 fn runtime_provider_forwards_managed_home_lifecycle() {
     let provider = RuntimeProvider::DryRun(provider());
     let sandbox_id = SandboxId::new();
