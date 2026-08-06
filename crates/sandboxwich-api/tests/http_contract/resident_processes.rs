@@ -887,6 +887,10 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
         MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
     );
     assert_eq!(
+        lease.job.priority, 100,
+        "the hosted-runner claim must use the connection-critical priority lane"
+    );
+    assert_eq!(
         lease.job.payload["workspaceClaimName"],
         format!("sandboxwich-pvc-{sandbox_id}")
     );
