@@ -682,6 +682,12 @@ pub(crate) async fn assert_metrics_are_exposed(client: &reqwest::Client, server:
     assert!(metrics.contains("# TYPE sandboxwich_cleanup_duration_seconds histogram"));
     assert!(metrics.contains("# TYPE sandboxwich_worker_claim_seconds histogram"));
     assert!(metrics.contains("# TYPE sandboxwich_provisioning_stage_seconds histogram"));
+    assert!(
+        metrics.contains(
+            "# TYPE sandboxwich_maestro_activation_validation_duration_seconds histogram"
+        )
+    );
+    assert!(metrics.contains("# TYPE sandboxwich_maestro_activation_total counter"));
 }
 
 pub(crate) async fn assert_slo_metrics_have_bounded_observations(

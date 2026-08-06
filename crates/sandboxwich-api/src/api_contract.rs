@@ -35,6 +35,7 @@ use sandboxwich_core::{
         crate::handlers::resident_processes::put_resident_process,
         crate::handlers::apex_instructions::read_apex_task_instructions,
         crate::handlers::resident_attestations::get_maestro_connection_binding,
+        crate::handlers::maestro_activations::validate_maestro_activation,
         crate::handlers::resident_attestations::redeem_resident_placement_attestation,
         crate::handlers::resident_attestations::validate_resident_placement_attestation,
         crate::handlers::operations::get_operation,
@@ -82,6 +83,8 @@ use sandboxwich_core::{
         ,sandboxwich_core::ValidateMaestroWorkloadIdentityRequest
         ,sandboxwich_core::MaestroWorkloadIdentityResponse
         ,sandboxwich_core::MaestroHostedRunnerConnectionBindingResponse
+        ,sandboxwich_core::MaestroHostedRunnerActivationValidationRequest
+        ,sandboxwich_core::MaestroHostedRunnerActivationValidationResponse
         ,sandboxwich_core::SecretSource
         ,sandboxwich_core::SecretRef
         ,sandboxwich_core::CreateSecretRefRequest
@@ -118,6 +121,10 @@ const PUBLIC_V1_OPERATIONS: &[(&str, &str)] = &[
     (
         "get",
         "/v1/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/connection-binding",
+    ),
+    (
+        "post",
+        "/v1/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/activations/validate",
     ),
     (
         "post",
@@ -363,6 +370,10 @@ mod tests {
                 "/v1/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/connection-binding",
                 "get",
             ),
+            (
+                "/v1/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/activations/validate",
+                "post",
+            ),
             ("/v1/operations/{operation_id}", "get"),
         ] {
             let operation = &document["paths"][path][method];
@@ -387,6 +398,53 @@ mod tests {
         assert!(
             resident_request["restartPolicy"].is_object(),
             "ResidentProcessRequest must expose restartPolicy in camelCase: {resident_request}"
+        );
+    }
+
+    #[test]
+    fn maestro_activation_fields_match_connection_binding_schema() {
+        use sandboxwich_core::lifecycle_contract::MAESTRO_HOSTED_RUNNER_ACTIVATION;
+        use std::collections::BTreeSet;
+
+        let document = serde_json::to_value(super::openapi_document()).unwrap();
+        let properties = document["components"]["schemas"]
+            ["MaestroHostedRunnerConnectionBindingResponse"]["properties"]
+            .as_object()
+            .expect("Maestro connection binding must be an object schema");
+        let documented = properties
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let required = MAESTRO_HOSTED_RUNNER_ACTIVATION
+            .required_binding_fields
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        assert!(
+            required.is_subset(&documented),
+            "activation requires fields missing from the connection binding schema: {:?}",
+            required.difference(&documented).collect::<Vec<_>>()
+        );
+
+        let activation = document["components"]["schemas"]
+            ["MaestroHostedRunnerActivationValidationRequest"]["properties"]
+            .as_object()
+            .expect("Maestro activation validation request must be an object schema")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert!(activation.contains("activationId"));
+        assert!(
+            required.is_subset(&activation),
+            "activation validation omits exact binding fields: {:?}",
+            required.difference(&activation).collect::<Vec<_>>()
+        );
+        let operation = &document["paths"]["/v1/sandboxes/{sandbox_id}/resident-processes/maestro-hosted-runner/activations/validate"]
+            ["post"];
+        assert!(
+            operation["requestBody"]["content"]["application/json"]["schema"].is_object(),
+            "activation validation must publish its exact request schema"
         );
     }
 
