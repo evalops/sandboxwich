@@ -91,6 +91,7 @@ trait CloudflareBridge: Send + Sync {
     fn create(
         &self,
         sandbox_id: SandboxId,
+        home_id: Option<HomeId>,
         spec: &SandboxProvisionSpec,
         create_key: &str,
     ) -> anyhow::Result<BridgeSandbox>;
@@ -207,6 +208,7 @@ impl CloudflareBridge for HttpCloudflareBridge {
     fn create(
         &self,
         sandbox_id: SandboxId,
+        home_id: Option<HomeId>,
         spec: &SandboxProvisionSpec,
         create_key: &str,
     ) -> anyhow::Result<BridgeSandbox> {
@@ -219,6 +221,7 @@ impl CloudflareBridge for HttpCloudflareBridge {
         );
         let body = json!({
             "sandboxId": sandbox_id,
+            "homeId": home_id,
             "tenantId": spec.tenant_id,
             "memoryLimit": spec.memory_limit,
             "networkEgress": spec.network_egress,
@@ -566,43 +569,11 @@ impl CloudflareSandboxProvider {
         }
         anyhow::Error::new(ProviderError::retryable(error))
     }
-}
 
-impl SandboxProvider for CloudflareSandboxProvider {
-    fn provider_name(&self) -> &'static str {
-        "cloudflare"
-    }
-
-    fn capability_report(&self) -> ProviderCapabilityReport {
-        let mut capabilities = vec![WorkerCapability::ProvisionSandbox];
-        if self.replay_ledger_configured {
-            capabilities.push(WorkerCapability::RunCommand);
-        }
-        ProviderCapabilityReport {
-            provider: "cloudflare".to_string(),
-            capabilities,
-            labels: BTreeMap::new(),
-        }
-    }
-
-    fn health_report(&self) -> ProviderHealthReport {
-        let result = self.bridge.health();
-        ProviderHealthReport {
-            provider: "cloudflare".to_string(),
-            status: if result.is_ok() {
-                ProviderHealthStatus::Healthy
-            } else {
-                ProviderHealthStatus::Degraded
-            },
-            checked_at: Utc::now(),
-            labels: BTreeMap::new(),
-            message: result.err().map(|error| error.to_string()),
-        }
-    }
-
-    fn provision(
+    fn provision_with_home(
         &self,
         sandbox_id: SandboxId,
+        home_id: Option<HomeId>,
         spec: &SandboxProvisionSpec,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<ProviderSandboxHandle> {
@@ -620,7 +591,7 @@ impl SandboxProvider for CloudflareSandboxProvider {
         let create_key = create_idempotency_key(sandbox_id);
         let sandbox = self
             .bridge
-            .create(sandbox_id, spec, &create_key)
+            .create(sandbox_id, home_id, spec, &create_key)
             .map_err(|error| {
                 if error
                     .downcast_ref::<CloudflareHttpError>()
@@ -662,11 +633,18 @@ impl SandboxProvider for CloudflareSandboxProvider {
                         ready_at: Some(Utc::now()),
                         error: None,
                     };
+                    let mut metadata = json!({
+                        "externalId": sandbox.external_id,
+                        "routingScope": sandbox.routing_scope,
+                    });
+                    if let Some(home_id) = home_id {
+                        metadata["homeId"] = json!(home_id);
+                    }
                     return Ok(ProviderSandboxHandle {
                         provider: "cloudflare".to_string(),
                         sandbox_id,
                         resources: vec![resource],
-                        metadata: json!({ "externalId": sandbox.external_id, "routingScope": sandbox.routing_scope }),
+                        metadata,
                     });
                 }
                 false => std::thread::sleep(Duration::from_millis(10)),
@@ -676,6 +654,65 @@ impl SandboxProvider for CloudflareSandboxProvider {
             ProviderError::retryable(anyhow::anyhow!("Cloudflare sandbox readiness timed out"))
                 .into(),
         )
+    }
+}
+
+impl SandboxProvider for CloudflareSandboxProvider {
+    fn provider_name(&self) -> &'static str {
+        "cloudflare"
+    }
+
+    fn capability_report(&self) -> ProviderCapabilityReport {
+        let mut capabilities = vec![WorkerCapability::ProvisionSandbox];
+        if self.replay_ledger_configured {
+            capabilities.push(WorkerCapability::RunCommand);
+        }
+        ProviderCapabilityReport {
+            provider: "cloudflare".to_string(),
+            capabilities,
+            labels: BTreeMap::new(),
+        }
+    }
+
+    fn health_report(&self) -> ProviderHealthReport {
+        let result = self.bridge.health();
+        ProviderHealthReport {
+            provider: "cloudflare".to_string(),
+            status: if result.is_ok() {
+                ProviderHealthStatus::Healthy
+            } else {
+                ProviderHealthStatus::Degraded
+            },
+            checked_at: Utc::now(),
+            labels: BTreeMap::new(),
+            message: result.err().map(|error| error.to_string()),
+        }
+    }
+
+    fn provision(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<ProviderSandboxHandle> {
+        self.provision_with_home(sandbox_id, None, spec, cancelled)
+    }
+
+    fn provision_home_staged(
+        &self,
+        sandbox_id: SandboxId,
+        home_id: HomeId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+        report: &mut dyn FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
+    ) -> anyhow::Result<ProviderSandboxHandle> {
+        anyhow::ensure!(
+            spec.workspace_mode == WorkspaceMode::Persistent,
+            "managed Cloudflare homes require persistent workspace mode"
+        );
+        let handle = self.provision_with_home(sandbox_id, Some(home_id), spec, cancelled)?;
+        report(stage_update(ProvisioningStage::SandboxReady, None))?;
+        Ok(handle)
     }
 
     fn exec_handoff(
@@ -773,6 +810,7 @@ impl CloudflareBridge for FakeBridge {
     fn create(
         &self,
         _sandbox_id: SandboxId,
+        _home_id: Option<HomeId>,
         spec: &SandboxProvisionSpec,
         _create_key: &str,
     ) -> anyhow::Result<BridgeSandbox> {
