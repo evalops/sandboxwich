@@ -60,6 +60,8 @@ pub(crate) struct PrepareArgs {
 #[derive(Debug, Args)]
 pub(crate) struct ClaimArgs {
     #[arg(long)]
+    claim_id: Uuid,
+    #[arg(long)]
     organization_id: String,
     #[arg(long)]
     workspace_id: String,
@@ -129,6 +131,7 @@ pub(crate) async fn claim(
     Ok(client
         .post(format!("{api}/sterile-cells/claim"))
         .json(&ClaimSterileCellRequestV1 {
+            claim_id: Some(args.claim_id),
             release: args.release.into_release(),
             organization_id: args.organization_id,
             workspace_id: args.workspace_id,

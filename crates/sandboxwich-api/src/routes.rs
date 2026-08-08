@@ -221,6 +221,14 @@ pub(crate) fn app(state: AppState) -> Router {
             post(prepare_sterile_cell),
         )
         .route(
+            "/workers/{worker_id}/sterile-cells/{cell_id}",
+            get(get_worker_sterile_cell),
+        )
+        .route(
+            "/workers/{worker_id}/sterile-cells/{cell_id}/retire",
+            post(retire_ready_sterile_cell),
+        )
+        .route(
             "/workers/{worker_id}/sterile-cells/{cell_id}/destroy",
             post(destroy_sterile_cell),
         )

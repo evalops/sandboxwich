@@ -11,7 +11,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, Mac};
 use sandboxwich_core::*;
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
 use sqlx::{Any, Row, Transaction};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -99,6 +99,25 @@ fn lease_token(key: &str, lease: &SterileCellLeaseV1) -> Result<String, ApiError
         "{LEASE_ATTESTATION_PREFIX}{}",
         URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
     ))
+}
+
+fn claim_request_digest(request: &ClaimSterileCellRequestV1) -> String {
+    let requested_lease_seconds = request
+        .lease_seconds
+        .map_or_else(|| "none".to_string(), |seconds| seconds.to_string());
+    let canonical = format!(
+        "sandboxwich-sterile-claim-v1\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+        request.release.release_set_id,
+        request.release.runtime_class.as_db_str(),
+        request.release.policy_digest,
+        request.release.signature,
+        request.organization_id,
+        request.workspace_id,
+        request.thread_id,
+        request.runner_session_id,
+        requested_lease_seconds,
+    );
+    URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()))
 }
 
 fn release_from_row(row: &sqlx::any::AnyRow) -> Result<SterileCellReleaseTrustClassV1, ApiError> {
@@ -219,10 +238,233 @@ async fn fetch_cell(db: &Database, cell_id: SterileCellId) -> Result<SterileCell
     cell_from_row(&row)
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/workers/{worker_id}/sterile-cells/{cell_id}",
+    params(("worker_id" = Uuid, Path), ("cell_id" = Uuid, Path)),
+    responses((status = 200, body = WorkerSterileCellLookupResponseV1), (status = 403, body = ErrorEnvelope), (status = 404, body = ErrorEnvelope))
+)]
+pub(crate) async fn get_worker_sterile_cell(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path((worker_id, cell_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<WorkerSterileCellLookupResponseV1>, ApiError> {
+    require_enabled(&state)?;
+    let worker_id = WorkerId(worker_id);
+    let cell_id = SterileCellId(cell_id);
+    ensure_worker_scope(&ctx, worker_id)?;
+    ensure_worker_tenant(&state.db, worker_id, &ctx).await?;
+    let sql = format!(
+        "select cells.*, claims.claim_id as claim_locator_id
+         from sterile_cells cells
+         left join sterile_cell_claims claims on claims.cell_id = cells.id
+         where cells.id = {} and cells.worker_id = {} and cells.tenant_id = {}",
+        state.db.placeholder(1),
+        state.db.placeholder(2),
+        state.db.placeholder(3),
+    );
+    let row = sqlx::query(&sql)
+        .bind(cell_id.to_string())
+        .bind(worker_id.to_string())
+        .bind(&ctx.tenant_id)
+        .fetch_optional(state.db.read_pool())
+        .await?
+        .ok_or_else(|| ApiError::not_found("resource not found"))?;
+    let claim_id = row.try_get::<Option<String>, _>("claim_locator_id")?;
+    let lease_id = row.try_get::<Option<String>, _>("lease_id")?;
+    let lease_expires_at = row.try_get::<Option<String>, _>("lease_expires_at")?;
+    let claim = if let Some(claim_id) = claim_id {
+        let (Some(lease_id), Some(expires_at)) = (lease_id, lease_expires_at) else {
+            return Err(ApiError::internal(
+                "sterile-cell claim locator is incomplete",
+            ));
+        };
+        Some(SterileCellClaimLocatorV1 {
+            claim_id: parse_uuid(&claim_id)?,
+            lease_id: parse_uuid(&lease_id)?,
+            generation: u64::try_from(row.try_get::<i64, _>("generation")?)
+                .map_err(|_| ApiError::internal("invalid sterile-cell generation"))?,
+            expires_at: parse_timestamp(&expires_at)?,
+        })
+    } else {
+        None
+    };
+    Ok(Json(WorkerSterileCellLookupResponseV1 {
+        ok: true,
+        cell: cell_from_row(&row)?,
+        claim,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/workers/{worker_id}/sterile-cells/{cell_id}/retire",
+    params(("worker_id" = Uuid, Path), ("cell_id" = Uuid, Path)),
+    request_body = RetireSterileCellRequestV1,
+    responses((status = 200, body = SterileCellResponseV1), (status = 403, body = ErrorEnvelope), (status = 404, body = ErrorEnvelope), (status = 409, body = ErrorEnvelope))
+)]
+pub(crate) async fn retire_ready_sterile_cell(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path((worker_id, cell_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<RetireSterileCellRequestV1>,
+) -> Result<Json<SterileCellResponseV1>, ApiError> {
+    require_enabled(&state)?;
+    let worker_id = WorkerId(worker_id);
+    let cell_id = SterileCellId(cell_id);
+    ensure_worker_scope(&ctx, worker_id)?;
+    ensure_worker_tenant(&state.db, worker_id, &ctx).await?;
+    let current = fetch_worker_cell(&state.db, worker_id, cell_id, &ctx.tenant_id).await?;
+    if current.state == SterileCellState::Quarantined
+        && current.generation == 1
+        && request.generation == 1
+        && current.disposition == Some(SterileCellDisposition::Quarantined)
+    {
+        return Ok(Json(SterileCellResponseV1 {
+            ok: true,
+            cell: current,
+        }));
+    }
+    if request.generation != 1
+        || current.generation != 1
+        || current.state != SterileCellState::Ready
+    {
+        return Err(ApiError::conflict(
+            "only a ready generation-1 sterile cell can be retired",
+        ));
+    }
+    let sql = format!(
+        "update sterile_cells set state = 'quarantined', disposition = 'quarantined',
+         destroyed_at = {}, updated_at = {}
+         where id = {} and worker_id = {} and tenant_id = {}
+         and state = 'ready' and generation = 1 and ever_tenant_exposed = 0",
+        state.db.placeholder(1),
+        state.db.placeholder(2),
+        state.db.placeholder(3),
+        state.db.placeholder(4),
+        state.db.placeholder(5),
+    );
+    let now = Utc::now().to_rfc3339();
+    let updated = sqlx::query(&sql)
+        .bind(&now)
+        .bind(&now)
+        .bind(cell_id.to_string())
+        .bind(worker_id.to_string())
+        .bind(&ctx.tenant_id)
+        .execute(&state.db.pool)
+        .await?;
+    if updated.rows_affected() != 1 {
+        return Err(ApiError::conflict(
+            "sterile-cell state changed before ready-cell retirement",
+        ));
+    }
+    Ok(Json(SterileCellResponseV1 {
+        ok: true,
+        cell: fetch_worker_cell(&state.db, worker_id, cell_id, &ctx.tenant_id).await?,
+    }))
+}
+
+async fn fetch_worker_cell(
+    db: &Database,
+    worker_id: WorkerId,
+    cell_id: SterileCellId,
+    tenant_id: &str,
+) -> Result<SterileCellV1, ApiError> {
+    let sql = format!(
+        "select * from sterile_cells where id = {} and worker_id = {} and tenant_id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+    );
+    let row = sqlx::query(&sql)
+        .bind(cell_id.to_string())
+        .bind(worker_id.to_string())
+        .bind(tenant_id)
+        .fetch_optional(db.read_pool())
+        .await?
+        .ok_or_else(|| ApiError::not_found("resource not found"))?;
+    cell_from_row(&row)
+}
+
 enum ClaimAttempt {
     Claimed(Box<SterileCellLeaseV1>, String),
     Contended,
     Empty,
+    NoLongerLive,
+}
+
+async fn recover_claim(
+    state: &AppState,
+    key: &str,
+    transaction: &mut Transaction<'_, Any>,
+    ctx: &TenantContext,
+    claim_id: Uuid,
+    request_digest: &str,
+) -> Result<Option<ClaimAttempt>, ApiError> {
+    let select = format!(
+        "select claims.request_sha256, claims.cell_id as claim_cell_id,
+         claims.lease_id as claim_lease_id, cells.*
+         from sterile_cell_claims claims
+         left join sterile_cells cells on cells.id = claims.cell_id
+         where claims.tenant_id = {} and claims.claim_id = {}",
+        state.db.placeholder(1),
+        state.db.placeholder(2),
+    );
+    let Some(row) = sqlx::query(&select)
+        .bind(&ctx.tenant_id)
+        .bind(claim_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let stored_digest: String = row.try_get("request_sha256")?;
+    if !constant_time_eq(stored_digest.as_bytes(), request_digest.as_bytes()) {
+        return Err(ApiError::conflict(
+            "claim_id was already used for a different sterile-cell claim",
+        ));
+    }
+    if row.try_get::<Option<String>, _>("claim_cell_id")?.is_none() {
+        return Ok(Some(ClaimAttempt::Empty));
+    }
+    let lease = lease_from_row(&row)?;
+    let claim_lease_id: &str = row.try_get("claim_lease_id")?;
+    if parse_uuid(claim_lease_id)? != lease.lease_id {
+        return Err(ApiError::internal(
+            "sterile-cell claim and lease locators do not match",
+        ));
+    }
+    let state_value: String = row.try_get("state")?;
+    if state_value != SterileCellState::Leased.as_db_str() || lease.expires_at <= Utc::now() {
+        if state_value == SterileCellState::Leased.as_db_str() {
+            let now = Utc::now().to_rfc3339();
+            let update = format!(
+                "update sterile_cells set state = 'quarantined', disposition = 'quarantined',
+                 destroyed_at = {}, updated_at = {} where id = {} and state = 'leased'",
+                state.db.placeholder(1),
+                state.db.placeholder(2),
+                state.db.placeholder(3),
+            );
+            sqlx::query(&update)
+                .bind(&now)
+                .bind(&now)
+                .bind(lease.cell_id.to_string())
+                .execute(&mut **transaction)
+                .await?;
+        }
+        return Ok(Some(ClaimAttempt::NoLongerLive));
+    }
+    let token = lease_token(key, &lease)?;
+    let stored_attestation_digest: &str = row.try_get("lease_attestation_sha256")?;
+    if !constant_time_eq(
+        stored_attestation_digest.as_bytes(),
+        hash_worker_token(&token).as_bytes(),
+    ) {
+        return Err(ApiError::conflict(
+            "live sterile-cell lease attestation cannot be regenerated",
+        ));
+    }
+    Ok(Some(ClaimAttempt::Claimed(Box::new(lease), token)))
 }
 
 async fn claim_once(
@@ -233,6 +475,39 @@ async fn claim_once(
     lease_expires_at: DateTime<Utc>,
 ) -> Result<ClaimAttempt, ApiError> {
     let mut transaction = state.db.pool.begin().await?;
+    let claim_fence = request
+        .claim_id
+        .map(|claim_id| (claim_id, claim_request_digest(request)));
+    if let Some((claim_id, request_digest)) = &claim_fence {
+        if let Some(recovered) =
+            recover_claim(state, key, &mut transaction, ctx, *claim_id, request_digest).await?
+        {
+            transaction.commit().await?;
+            if matches!(recovered, ClaimAttempt::NoLongerLive) {
+                return Err(ApiError::conflict(
+                    "claim_id refers to a sterile-cell lease that is no longer live",
+                ));
+            }
+            return Ok(recovered);
+        }
+        let insert_claim = format!(
+            "insert into sterile_cell_claims
+             (tenant_id, claim_id, request_sha256, created_at) values ({})
+             on conflict (tenant_id, claim_id) do nothing",
+            state.db.placeholders(4),
+        );
+        let inserted = sqlx::query(&insert_claim)
+            .bind(&ctx.tenant_id)
+            .bind(claim_id.to_string())
+            .bind(request_digest)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut *transaction)
+            .await?;
+        if inserted.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(ClaimAttempt::Contended);
+        }
+    }
     let select = format!(
         "select id, cell_expires_at, generation from sterile_cells
          where tenant_id = {} and state = 'ready' and release_set_id = {}
@@ -329,6 +604,30 @@ async fn claim_once(
         transaction.rollback().await?;
         return Ok(ClaimAttempt::Contended);
     }
+    if let Some((claim_id, request_digest)) = claim_fence {
+        let link_claim = format!(
+            "update sterile_cell_claims set cell_id = {}, lease_id = {}
+             where tenant_id = {} and claim_id = {} and request_sha256 = {}
+             and cell_id is null and lease_id is null",
+            state.db.placeholder(1),
+            state.db.placeholder(2),
+            state.db.placeholder(3),
+            state.db.placeholder(4),
+            state.db.placeholder(5),
+        );
+        let linked = sqlx::query(&link_claim)
+            .bind(cell_id.to_string())
+            .bind(lease.lease_id.to_string())
+            .bind(&ctx.tenant_id)
+            .bind(claim_id.to_string())
+            .bind(&request_digest)
+            .execute(&mut *transaction)
+            .await?;
+        if linked.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(ClaimAttempt::Contended);
+        }
+    }
     transaction.commit().await?;
     Ok(ClaimAttempt::Claimed(Box::new(lease), token))
 }
@@ -398,13 +697,21 @@ pub(crate) async fn claim_sterile_cell(
                 }));
             }
             ClaimAttempt::Contended => {}
+            ClaimAttempt::NoLongerLive => unreachable!("claim_once returns an error instead"),
         }
     }
-    Ok(secret_claim_response(ClaimSterileCellResponseV1 {
-        ok: true,
-        lease: None,
-        lease_attestation: None,
-    }))
+    if request.claim_id.is_some() {
+        Err(ApiError::conflict_code(
+            "sterile_cell_claim_contended",
+            "sterile-cell claim is contended; retry with the same claim_id",
+        ))
+    } else {
+        Ok(secret_claim_response(ClaimSterileCellResponseV1 {
+            ok: true,
+            lease: None,
+            lease_attestation: None,
+        }))
+    }
 }
 
 fn secret_claim_response(body: ClaimSterileCellResponseV1) -> Response {

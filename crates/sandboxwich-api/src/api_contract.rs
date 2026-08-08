@@ -40,6 +40,8 @@ use sandboxwich_core::{
         crate::handlers::resident_attestations::redeem_resident_placement_attestation,
         crate::handlers::resident_attestations::validate_resident_placement_attestation,
         crate::handlers::sterile_cells::prepare_sterile_cell,
+        crate::handlers::sterile_cells::get_worker_sterile_cell,
+        crate::handlers::sterile_cells::retire_ready_sterile_cell,
         crate::handlers::sterile_cells::claim_sterile_cell,
         crate::handlers::sterile_cells::validate_sterile_cell_lease,
         crate::handlers::sterile_cells::destroy_sterile_cell,
@@ -112,6 +114,9 @@ use sandboxwich_core::{
         ,sandboxwich_core::SterileCellResponseV1
         ,sandboxwich_core::ClaimSterileCellRequestV1
         ,sandboxwich_core::ClaimSterileCellResponseV1
+        ,sandboxwich_core::SterileCellClaimLocatorV1
+        ,sandboxwich_core::WorkerSterileCellLookupResponseV1
+        ,sandboxwich_core::RetireSterileCellRequestV1
         ,sandboxwich_core::ValidateSterileCellLeaseRequestV1
         ,sandboxwich_core::ValidateSterileCellLeaseResponseV1
         ,sandboxwich_core::DestroySterileCellRequestV1
@@ -206,6 +211,11 @@ const PUBLIC_V1_OPERATIONS: &[(&str, &str)] = &[
     ("post", "/v1/workers/{worker_id}/heartbeat"),
     ("post", "/v1/workers/{worker_id}/drain"),
     ("post", "/v1/workers/{worker_id}/sterile-cells/prepare"),
+    ("get", "/v1/workers/{worker_id}/sterile-cells/{cell_id}"),
+    (
+        "post",
+        "/v1/workers/{worker_id}/sterile-cells/{cell_id}/retire",
+    ),
     (
         "post",
         "/v1/workers/{worker_id}/sterile-cells/{cell_id}/destroy",
