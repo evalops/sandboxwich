@@ -1700,6 +1700,43 @@
         ],
         "type": "object"
       },
+      "ReleaseSterileCellLeaseRequestV1": {
+        "properties": {
+          "disposition": {
+            "$ref": "#/components/schemas/SterileCellDisposition"
+          },
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lease_attestation": {
+            "type": "string"
+          },
+          "organization_id": {
+            "type": "string"
+          },
+          "runner_session_id": {
+            "type": "string"
+          },
+          "thread_id": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "lease_attestation",
+          "generation",
+          "organization_id",
+          "workspace_id",
+          "thread_id",
+          "runner_session_id",
+          "disposition"
+        ],
+        "type": "object"
+      },
       "ResidentPlacementAttestationBootstrap": {
         "properties": {
           "token": {
@@ -1964,6 +2001,31 @@
               "null"
             ]
           },
+          "sterileCellId": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SterileCellId"
+              }
+            ]
+          },
+          "sterileLeaseGeneration": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sterileLeaseId": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "tenantId": {
             "type": "string"
           },
@@ -2057,6 +2119,16 @@
           },
           "sha256": {
             "type": "string"
+          },
+          "sterileActivation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SterileResidentActivationV1"
+              }
+            ]
           },
           "targetFile": {
             "type": "string"
@@ -2194,6 +2266,16 @@
           },
           "restartPolicy": {
             "$ref": "#/components/schemas/ResidentProcessRestartPolicy"
+          },
+          "sterileActivation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SterileResidentActivationV1"
+              }
+            ]
           }
         },
         "required": [
@@ -2464,6 +2546,17 @@
               "$ref": "#/components/schemas/SandboxSecretMount"
             },
             "type": "array"
+          },
+          "sterile_pool_candidate": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SterilePoolCandidateV1",
+                "description": "Control-plane-derived marker for a purpose-created sterile pool pod.\nOrdinary tenant provision requests cannot set this authoritatively;\nscheduler enrichment derives it from durable pool membership."
+              }
+            ]
           },
           "tenant_id": {
             "type": [
@@ -2895,6 +2988,67 @@
         "format": "uuid",
         "type": "string"
       },
+      "SterileCellLeaseStatusResponseV1": {
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "status": {
+            "$ref": "#/components/schemas/SterileCellLeaseStatusV1"
+          }
+        },
+        "required": [
+          "ok",
+          "status"
+        ],
+        "type": "object"
+      },
+      "SterileCellLeaseStatusV1": {
+        "properties": {
+          "cell_id": {
+            "$ref": "#/components/schemas/SterileCellId"
+          },
+          "cleanup_pending": {
+            "description": "True while the pool membership durably requires a provider cleanup retry.",
+            "type": "boolean"
+          },
+          "disposition": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SterileCellDisposition"
+              }
+            ]
+          },
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lease_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "provider_absent": {
+            "description": "True only after the pool membership records an exact provider-stop completion.",
+            "type": "boolean"
+          },
+          "state": {
+            "$ref": "#/components/schemas/SterileCellState"
+          }
+        },
+        "required": [
+          "lease_id",
+          "cell_id",
+          "generation",
+          "state",
+          "provider_absent",
+          "cleanup_pending"
+        ],
+        "type": "object"
+      },
       "SterileCellLeaseV1": {
         "properties": {
           "cell_id": {
@@ -3043,6 +3197,88 @@
           "generation",
           "release",
           "expires_at"
+        ],
+        "type": "object"
+      },
+      "SterilePoolCandidateV1": {
+        "properties": {
+          "agent_image": {
+            "description": "Digest-pinned image containing the exact sandboxwich-agent binary copied\ninto the candidate's shared executable volume.",
+            "type": "string"
+          },
+          "cell_id": {
+            "$ref": "#/components/schemas/SterileCellId"
+          },
+          "maestro_image": {
+            "description": "Digest-pinned Maestro image executed only after sterile activation.",
+            "type": "string"
+          },
+          "pod_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pod_uid": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "release": {
+            "$ref": "#/components/schemas/SterileCellReleaseTrustClassV1"
+          },
+          "service_name": {
+            "description": "Stable pre-created Service identity for the candidate Pod.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "cell_id",
+          "release",
+          "agent_image",
+          "maestro_image",
+          "service_name"
+        ],
+        "type": "object"
+      },
+      "SterileResidentActivationV1": {
+        "additionalProperties": false,
+        "description": "One-shot authority for activating a resident inside a purpose-created\nsterile cell. The attestation is a bearer secret and must only travel in\nthe bounded resident-bootstrap handoff.",
+        "properties": {
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "leaseAttestation": {
+            "type": "string"
+          },
+          "leaseId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "organizationId": {
+            "type": "string"
+          },
+          "runnerSessionId": {
+            "type": "string"
+          },
+          "threadId": {
+            "type": "string"
+          },
+          "workspaceId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "leaseId",
+          "generation",
+          "organizationId",
+          "workspaceId",
+          "threadId",
+          "runnerSessionId",
+          "leaseAttestation"
         ],
         "type": "object"
       },
@@ -5145,6 +5381,108 @@
         }
       }
     },
+    "/v1/sterile-cell-leases/{lease_id}": {
+      "get": {
+        "operationId": "get_sterile_cell_lease_status",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "lease_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SterileCellLeaseStatusResponseV1"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::sterile_cells"
+        ]
+      }
+    },
+    "/v1/sterile-cell-leases/{lease_id}/release": {
+      "post": {
+        "operationId": "release_sterile_cell_lease",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "lease_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReleaseSterileCellLeaseRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SterileCellLeaseStatusResponseV1"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::sterile_cells"
+        ]
+      }
+    },
     "/v1/sterile-cell-leases/{lease_id}/validate": {
       "post": {
         "operationId": "validate_sterile_cell_lease",
@@ -5482,6 +5820,76 @@
         },
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SterileCellResponseV1"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::sterile_cells"
+        ]
+      }
+    },
+    "/v1/workers/{worker_id}/sterile-cells/{cell_id}/release": {
+      "post": {
+        "operationId": "release_sterile_pool_cell",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "worker_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "cell_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DestroySterileCellRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
             "content": {
               "application/json": {
                 "schema": {

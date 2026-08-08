@@ -4,6 +4,11 @@ use sandboxwich_core::{
     ClaimSterileCellRequestV1, DestroySterileCellRequestV1, PrepareSterileCellRequestV1,
     SterileCellDisposition, SterileCellId, SterileCellReleaseTrustClassV1, SterileCellRuntimeClass,
 };
+use serde::Serialize;
+use std::io::Write as _;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -71,8 +76,35 @@ pub(crate) struct ClaimArgs {
     runner_session_id: String,
     #[arg(long, default_value_t = 120)]
     lease_seconds: u64,
+    /// New 0600 file that receives the raw one-time lease attestation. The
+    /// file must not already exist; stdout contains only the non-secret lease
+    /// locator and this path.
+    #[arg(long)]
+    attestation_output_file: PathBuf,
     #[command(flatten)]
     release: ReleaseArgs,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ClaimOutput {
+    ok: bool,
+    lease: Option<sandboxwich_core::SterileCellLeaseV1>,
+    attestation_file: Option<PathBuf>,
+}
+
+fn write_attestation(path: &Path, attestation: &str) -> anyhow::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("create sterile lease attestation file {}", path.display()))?;
+    file.write_all(attestation.as_bytes())
+        .with_context(|| format!("write sterile lease attestation file {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync sterile lease attestation file {}", path.display()))?;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -127,8 +159,8 @@ pub(crate) async fn claim(
     client: &reqwest::Client,
     api: &str,
     args: ClaimArgs,
-) -> anyhow::Result<reqwest::Response> {
-    Ok(client
+) -> anyhow::Result<ClaimOutput> {
+    let response = client
         .post(format!("{api}/sterile-cells/claim"))
         .json(&ClaimSterileCellRequestV1 {
             claim_id: Some(args.claim_id),
@@ -140,7 +172,26 @@ pub(crate) async fn claim(
             lease_seconds: Some(args.lease_seconds),
         })
         .send()
-        .await?)
+        .await?
+        .error_for_status()?
+        .json::<sandboxwich_core::ClaimSterileCellResponseV1>()
+        .await?;
+    match (response.lease, response.lease_attestation) {
+        (Some(lease), Some(attestation)) => {
+            write_attestation(&args.attestation_output_file, &attestation)?;
+            Ok(ClaimOutput {
+                ok: response.ok,
+                lease: Some(lease),
+                attestation_file: Some(args.attestation_output_file),
+            })
+        }
+        (None, None) => Ok(ClaimOutput {
+            ok: response.ok,
+            lease: None,
+            attestation_file: None,
+        }),
+        _ => anyhow::bail!("sterile claim response contains an incomplete lease attestation"),
+    }
 }
 
 pub(crate) async fn destroy(
@@ -188,6 +239,30 @@ mod tests {
         assert_eq!(
             SterileCellDisposition::from(DispositionArg::Quarantined),
             SterileCellDisposition::Quarantined
+        );
+    }
+
+    #[test]
+    fn attestation_output_is_create_new_and_owner_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lease.attestation");
+        write_attestation(&path, "raw-secret-attestation").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "raw-secret-attestation"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(write_attestation(&path, "replacement").is_err());
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "raw-secret-attestation"
         );
     }
 }

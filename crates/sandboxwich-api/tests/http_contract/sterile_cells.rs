@@ -5,7 +5,7 @@ use hmac::{Hmac, Mac};
 use reqwest::StatusCode;
 use sandboxwich_core::*;
 use sha2::Sha256;
-use sqlx::Row;
+use sqlx::{AnyPool, Row};
 use uuid::Uuid;
 
 fn signed_release(runtime_class: SterileCellRuntimeClass) -> SterileCellReleaseTrustClassV1 {
@@ -36,6 +36,7 @@ async fn register_worker(server: &TestServer, client: &reqwest::Client) -> Worke
             name: "sterile-cell-worker".into(),
             provider: "kubernetes".into(),
             capabilities: vec![
+                WorkerCapability::ProvisionSandbox,
                 WorkerCapability::VirtualMachine,
                 WorkerCapability::SandboxedContainer,
             ],
@@ -50,6 +51,352 @@ async fn register_worker(server: &TestServer, client: &reqwest::Client) -> Worke
         .json()
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn tenant_release_and_status_are_exactly_fenced_and_provider_terminal() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("pool-release.db").display()
+    );
+    let server = TestServer::start_with_sterile_cells(database_url, Some(data_dir), false).await;
+    let client = server.client();
+    let worker = register_worker(&server, &client).await;
+    let created: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
+            execution_class: Some(ExecutionClass::VirtualMachine),
+            workspace_mode: Some(WorkspaceMode::Ephemeral),
+            runtime_profile: Some(SandboxRuntimeProfile::Unprivileged),
+            name: Some("pool-contract".into()),
+            template: Some("ubuntu-dev".into()),
+            memory_limit: Some(MemoryLimit::OneG),
+            network_egress: Some(NetworkEgress::DenyAll),
+            provider_preference: Some(ProviderPreference::Kubernetes),
+            ttl_seconds: None,
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let cell_id = SterileCellId(created.sandbox.id.0);
+    let release = signed_release(SterileCellRuntimeClass::KataMicrovm);
+    prepare(&server, &worker, cell_id, release.clone()).await;
+    let claimed: ClaimSterileCellResponseV1 = client
+        .post(format!("{}/sterile-cells/claim", server.base_url))
+        .json(&claim_request(release.clone()))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claimed.lease.unwrap();
+    let attestation = claimed.lease_attestation.unwrap();
+
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&server.database_url)
+        .await
+        .unwrap();
+    let provision_job_id: String = sqlx::query_scalar(
+        "select id from jobs where sandbox_id = ? and kind = 'provision_sandbox' order by created_at asc limit 1",
+    )
+    .bind(created.sandbox.id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "insert into sandbox_placements
+         (sandbox_id, worker_id, provider, cluster, generation, created_at, updated_at)
+         values (?, ?, 'kubernetes', null, 1, ?, ?)",
+    )
+    .bind(created.sandbox.id.to_string())
+    .bind(worker.worker.id.to_string())
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into sterile_pool_memberships
+         (sandbox_id, tenant_id, state, worker_id, provision_job_id, release_set_id, runtime_class,
+          policy_digest, release_signature, ready_ttl_seconds, cell_expires_at, lease_id, generation,
+          candidate_agent_image, candidate_maestro_image, candidate_service_name,
+          candidate_pod_name, candidate_pod_uid, created_at, updated_at)
+         values (?, 'default', 'leased', ?, ?, ?, ?, ?, ?, 300, ?, ?, ?,
+                 'agent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                 'maestro@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                 ?, ?, 'pod-uid-test', ?, ?)",
+    )
+    .bind(created.sandbox.id.to_string())
+    .bind(worker.worker.id.to_string())
+    .bind(provision_job_id)
+    .bind(&release.release_set_id)
+    .bind(release.runtime_class.as_db_str())
+    .bind(&release.policy_digest)
+    .bind(&release.signature)
+    .bind(lease.expires_at.to_rfc3339())
+    .bind(lease.lease_id.to_string())
+    .bind(i64::try_from(lease.generation).unwrap())
+    .bind(format!("sandboxwich-mc-{}", created.sandbox.id))
+    .bind(format!("sandboxwich-{}", created.sandbox.id))
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let hidden_get = client
+        .get(format!(
+            "{}/sandboxes/{}",
+            server.base_url, created.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hidden_get.status(), StatusCode::NOT_FOUND);
+    let inventory: SandboxListResponse = client
+        .get(format!("{}/sandboxes", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        inventory
+            .sandboxes
+            .iter()
+            .all(|sandbox| sandbox.id != created.sandbox.id),
+        "leased pool identity appeared in ordinary tenant inventory"
+    );
+    let divergence = client
+        .post(format!("{}/divergence/reconcile", server.base_url))
+        .header(OPERATOR_TOKEN_HEADER, TEST_OPERATOR_TOKEN)
+        .json(&DivergenceReconcileRequest {
+            source: "limacharlie".into(),
+            observations: vec![SensorObservation {
+                external_id: "pool-identity-probe".into(),
+                sandbox_id: created.sandbox.id,
+                session_id: "pool-session".into(),
+                activity_class: ActivityClass::ProcessSpawn,
+                resource: "/usr/bin/true".into(),
+                observed_at: Utc::now(),
+            }],
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(divergence.status(), StatusCode::NOT_FOUND);
+    let observation_count: i64 =
+        sqlx::query_scalar("select count(*) from sensor_observations where sandbox_id = ?")
+            .bind(created.sandbox.id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(observation_count, 0);
+    let guest_token: GuestTokenResponse = worker_client(&worker)
+        .post(format!(
+            "{}/workers/{}/sandboxes/{}/guest-token",
+            server.base_url, worker.worker.id, created.sandbox.id
+        ))
+        .json(&MintGuestTokenRequest {
+            ttl_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(guest_token.sandbox_id, created.sandbox.id);
+
+    let status_response = client
+        .get(format!(
+            "{}/sterile-cell-leases/{}",
+            server.base_url, lease.lease_id
+        ))
+        .send()
+        .await
+        .unwrap();
+    let status_code = status_response.status();
+    let status_body = status_response.text().await.unwrap();
+    assert!(
+        status_code.is_success(),
+        "status lookup failed: {status_code} {status_body}"
+    );
+    let status: SterileCellLeaseStatusResponseV1 = serde_json::from_str(&status_body).unwrap();
+    assert_eq!(status.status.state, SterileCellState::Leased);
+    assert!(!status.status.provider_absent);
+    assert!(!status.status.cleanup_pending);
+    let cross_tenant = reqwest::Client::new()
+        .get(format!(
+            "{}/sterile-cell-leases/{}",
+            server.base_url, lease.lease_id
+        ))
+        .bearer_auth(TEST_TENANT_B_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_tenant.status(), StatusCode::NOT_FOUND);
+
+    let request = ReleaseSterileCellLeaseRequestV1 {
+        lease_attestation: attestation.clone(),
+        generation: lease.generation,
+        organization_id: lease.organization_id.clone(),
+        workspace_id: lease.workspace_id.clone(),
+        thread_id: lease.thread_id.clone(),
+        runner_session_id: lease.runner_session_id.clone(),
+        disposition: SterileCellDisposition::Destroyed,
+    };
+    let mut stale = request.clone();
+    stale.lease_attestation = "wrong".into();
+    let rejected = client
+        .post(format!(
+            "{}/sterile-cell-leases/{}/release",
+            server.base_url, lease.lease_id
+        ))
+        .json(&stale)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::CONFLICT);
+    let accepted = client
+        .post(format!(
+            "{}/sterile-cell-leases/{}/release",
+            server.base_url, lease.lease_id
+        ))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let accepted: SterileCellLeaseStatusResponseV1 = accepted.json().await.unwrap();
+    assert_eq!(accepted.status.state, SterileCellState::Leased);
+    assert!(!accepted.status.provider_absent);
+    assert!(!accepted.status.cleanup_pending);
+
+    let pool = AnyPool::connect(&server.database_url).await.unwrap();
+    sqlx::query(
+        "update sterile_pool_memberships set state = 'cleanup_pending' where sandbox_id = ?",
+    )
+    .bind(created.sandbox.id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let pending: SterileCellLeaseStatusResponseV1 = client
+        .get(format!(
+            "{}/sterile-cell-leases/{}",
+            server.base_url, lease.lease_id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pending.status.state, SterileCellState::Leased);
+    assert!(!pending.status.provider_absent);
+    assert!(pending.status.cleanup_pending);
+    sqlx::query("update sterile_pool_memberships set state = 'stopping' where sandbox_id = ?")
+        .bind(created.sandbox.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let claimed_stop: ClaimLeaseResponse = worker_client(&worker)
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(created.sandbox.id),
+            kinds: Some(vec![JobKind::StopSandbox]),
+            wait_ms: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let stop_lease = claimed_stop.lease.expect("placed pool stop is claimable");
+    worker_client(&worker)
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, stop_lease.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::StopSandbox {
+                provider: "kubernetes".into(),
+                sandbox_id: created.sandbox.id,
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let replayed_completion = worker_client(&worker)
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, stop_lease.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::StopSandbox {
+                provider: "kubernetes".into(),
+                sandbox_id: created.sandbox.id,
+            }),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        replayed_completion.status().is_success(),
+        "provider completion response loss must allow an exact replay"
+    );
+    let terminal: SterileCellLeaseStatusResponseV1 = client
+        .get(format!(
+            "{}/sterile-cell-leases/{}",
+            server.base_url, lease.lease_id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(terminal.status.state, SterileCellState::Destroyed);
+    assert_eq!(
+        terminal.status.disposition,
+        Some(SterileCellDisposition::Destroyed)
+    );
+    assert!(terminal.status.provider_absent);
+    assert!(!terminal.status.cleanup_pending);
 }
 
 async fn prepare(

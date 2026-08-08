@@ -195,6 +195,13 @@ pub(crate) async fn get_job(
 ) -> Result<Json<JobResponse>, ApiError> {
     let job = fetch_job(&state.db, JobId(job_id)).await?;
     ensure_job_tenant(&job, &ctx)?;
+    if job
+        .payload
+        .get(crate::sterile_pool::POOL_JOB_MARKER)
+        .is_some()
+    {
+        return Err(ApiError::not_found("resource not found"));
+    }
     Ok(Json(JobResponse {
         ok: true,
         job: job.into(),
@@ -215,6 +222,7 @@ pub(crate) struct PlacementCacheEntry {
     pub expected_provision_spec: serde_json::Value,
     pub provider_external_id: Option<String>,
     pub provider_routing_scope: Option<String>,
+    pub sterile_pool_candidate: Option<SterilePoolCandidateV1>,
 }
 
 pub(crate) type PlacementEnrichmentCache =
@@ -282,6 +290,21 @@ fn apply_sandbox_placement(job: &mut Job, entry: &PlacementCacheEntry) -> Result
         entry.provider_external_id.clone(),
         entry.provider_routing_scope.clone(),
     )?;
+    let payload = job
+        .payload
+        .as_object_mut()
+        .ok_or_else(|| ApiError::internal("job payload is not an object"))?;
+    let mut spec: SandboxProvisionSpec = serde_json::from_value(
+        payload
+            .get("provisionSpec")
+            .cloned()
+            .ok_or_else(|| ApiError::internal("job provisionSpec is missing"))?,
+    )?;
+    // Pool candidacy is control-plane state, never a tenant-provided hint.
+    // Assigning `None` is important: it strips forged or stale markers from
+    // ordinary provision jobs before they can reach a provider.
+    spec.sterile_pool_candidate = entry.sterile_pool_candidate.clone();
+    payload.insert("provisionSpec".into(), serde_json::to_value(spec)?);
     Ok(true)
 }
 
@@ -338,6 +361,7 @@ pub(crate) fn placement_matches_sandbox_parts(
             expected_provision_spec: expected,
             provider_external_id: None,
             provider_routing_scope: None,
+            sterile_pool_candidate: None,
         },
     )
 }
@@ -383,6 +407,36 @@ async fn load_sandbox_placement_inputs(
     let provider_routing_scope = identity
         .as_ref()
         .and_then(|row| row.try_get("namespace").ok());
+    let pool_sql = format!(
+        "select release_set_id, runtime_class, policy_digest, release_signature,
+                candidate_agent_image, candidate_maestro_image, candidate_service_name
+         from sterile_pool_memberships where sandbox_id = {}",
+        db.placeholder(1)
+    );
+    let sterile_pool_candidate = sqlx::query(&pool_sql)
+        .bind(sandbox_id.to_string())
+        .fetch_optional(db.read_pool())
+        .await?
+        .map(|row| {
+            Ok::<_, ApiError>(SterilePoolCandidateV1 {
+                cell_id: SterileCellId(sandbox_id.0),
+                release: SterileCellReleaseTrustClassV1 {
+                    release_set_id: row.try_get("release_set_id")?,
+                    runtime_class: SterileCellRuntimeClass::parse_db_str(
+                        row.try_get("runtime_class")?,
+                    )
+                    .map_err(|error| ApiError::internal(error.to_string()))?,
+                    policy_digest: row.try_get("policy_digest")?,
+                    signature: row.try_get("release_signature")?,
+                },
+                agent_image: row.try_get("candidate_agent_image")?,
+                maestro_image: row.try_get("candidate_maestro_image")?,
+                service_name: row.try_get("candidate_service_name")?,
+                pod_name: None,
+                pod_uid: None,
+            })
+        })
+        .transpose()?;
     let expected_provision_spec = serde_json::to_value(SandboxProvisionSpec {
         secret_mounts: secret_mounts.clone(),
         execution_class: sandbox.execution_class.clone(),
@@ -393,6 +447,7 @@ async fn load_sandbox_placement_inputs(
         tenant_id: Some(sandbox.tenant_id.clone()),
         provider_external_id: provider_external_id.clone(),
         provider_routing_scope: provider_routing_scope.clone(),
+        sterile_pool_candidate: sterile_pool_candidate.clone(),
         ..SandboxProvisionSpec::default()
     })?;
     let entry = PlacementCacheEntry {
@@ -401,6 +456,7 @@ async fn load_sandbox_placement_inputs(
         expected_provision_spec,
         provider_external_id,
         provider_routing_scope,
+        sterile_pool_candidate,
     };
     cache.insert(sandbox_id, entry.clone());
     Ok(entry)
@@ -449,6 +505,7 @@ fn add_provision_spec_to_payload_with_identity(
             tenant_id: Some(sandbox.tenant_id.clone()),
             provider_external_id,
             provider_routing_scope,
+            sterile_pool_candidate: None,
         })?,
     );
     Ok(())
@@ -686,7 +743,9 @@ pub(crate) async fn list_jobs(
         "select id, tenant_id, kind, status, payload, required_capability, required_execution_class, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
          from jobs
-         where tenant_id = {}",
+         where tenant_id = {}
+           and not exists (select 1 from sterile_pool_memberships p
+                           where p.sandbox_id = jobs.sandbox_id)",
         state.db.placeholder(1)
     );
     let (jobs, next_cursor) = fetch_keyset_page(
@@ -986,6 +1045,201 @@ pub(crate) fn effective_lease_seconds(requested: Option<u64>) -> u64 {
         .unwrap_or(DEFAULT_LEASE_SECONDS)
 }
 
+async fn recheck_sterile_resident_activation_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    job: &Job,
+) -> Result<(), ApiError> {
+    if job.kind != JobKind::RunResidentProcess {
+        return Ok(());
+    }
+    let process_id = resident_process_id_from_job(job)?;
+    let resident_generation = job
+        .payload
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| ApiError::internal("resident process job is missing generation"))?;
+    let activation = job.payload.get("sterileActivation");
+    let (cell_id, lease_id, lease_generation) = match activation {
+        None => {
+            let sql = format!(
+                "select 1 from resident_processes
+                 where id = {} and generation = {}
+                   and sterile_cell_id is null and sterile_lease_id is null
+                   and sterile_lease_generation is null",
+                db.placeholder(1),
+                db.placeholder(2),
+            );
+            if sqlx::query(&sql)
+                .bind(process_id.to_string())
+                .bind(i64::try_from(resident_generation).map_err(|_| {
+                    ApiError::internal("resident generation exceeds database range")
+                })?)
+                .fetch_optional(connection)
+                .await?
+                .is_none()
+            {
+                return Err(ApiError::conflict_code(
+                    "sterile_resident_activation_fence_mismatch",
+                    "ungated resident job does not match its durable activation fence",
+                ));
+            }
+            return Ok(());
+        }
+        Some(activation) => {
+            let cell_id = activation
+                .get("cellId")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| ApiError::internal("sterile resident job is missing cell id"))?;
+            let lease_id = activation
+                .get("leaseId")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| ApiError::internal("sterile resident job is missing lease id"))?;
+            let generation = activation
+                .get("generation")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| ApiError::internal("sterile resident job is missing generation"))?;
+            (cell_id, lease_id, generation)
+        }
+    };
+    let sandbox_id = sandbox_id_from_job(job)?;
+    if cell_id != sandbox_id.to_string() {
+        return Err(ApiError::conflict_code(
+            "sterile_resident_activation_fence_mismatch",
+            "sterile resident cell does not match the job sandbox",
+        ));
+    }
+    let sql = format!(
+        "select 1
+         from resident_processes rp
+         join sterile_cells sc on sc.id = rp.sterile_cell_id
+         where rp.id = {} and rp.tenant_id = {} and rp.generation = {}
+           and rp.sterile_cell_id = {} and rp.sterile_lease_id = {}
+           and rp.sterile_lease_generation = {}
+           and sc.tenant_id = rp.tenant_id and sc.state = 'leased'
+           and sc.activated_resident_process_id = rp.id
+           and sc.activated_resident_generation = rp.generation
+           and sc.lease_id = rp.sterile_lease_id
+           and sc.generation = rp.sterile_lease_generation
+           and sc.lease_expires_at > {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4),
+        db.placeholder(5),
+        db.placeholder(6),
+        db.placeholder(7),
+    );
+    let matched = sqlx::query(&sql)
+        .bind(process_id.to_string())
+        .bind(&job.tenant_id)
+        .bind(
+            i64::try_from(resident_generation)
+                .map_err(|_| ApiError::internal("resident generation exceeds database range"))?,
+        )
+        .bind(cell_id)
+        .bind(lease_id)
+        .bind(
+            i64::try_from(lease_generation).map_err(|_| {
+                ApiError::internal("sterile lease generation exceeds database range")
+            })?,
+        )
+        .bind(Utc::now().to_rfc3339())
+        .fetch_optional(connection)
+        .await?;
+    if matched.is_none() {
+        return Err(ApiError::conflict_code(
+            "sterile_resident_activation_fence_mismatch",
+            "sterile resident activation is no longer live at job claim",
+        ));
+    }
+    Ok(())
+}
+
+async fn quarantine_invalid_sterile_resident_job(db: &Database, job: &Job) -> Result<(), ApiError> {
+    let Some(activation) = job.payload.get("sterileActivation") else {
+        return Ok(());
+    };
+    let Some(cell_id) = activation.get("cellId").and_then(serde_json::Value::as_str) else {
+        return Ok(());
+    };
+    let process_id = resident_process_id_from_job(job)?;
+    let now = Utc::now().to_rfc3339();
+    let mut tx = db.pool.begin().await?;
+    let job_sql = format!(
+        "update jobs set status = 'dead', last_error = {}, updated_at = {}
+         where id = {} and status = 'queued'",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+    );
+    let terminalized = sqlx::query(&job_sql)
+        .bind("sterile resident activation expired or changed before claim")
+        .bind(&now)
+        .bind(job.id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    if terminalized.rows_affected() == 1 {
+        let process_sql = format!(
+            "update resident_processes
+             set desired_state = 'stopped', observed_state = 'failed',
+                 last_error = {}, updated_at = {}
+             where id = {} and sterile_cell_id = {}",
+            db.placeholder(1),
+            db.placeholder(2),
+            db.placeholder(3),
+            db.placeholder(4),
+        );
+        sqlx::query(&process_sql)
+            .bind("sterile resident activation expired or changed before claim")
+            .bind(&now)
+            .bind(process_id.to_string())
+            .bind(cell_id)
+            .execute(&mut *tx)
+            .await?;
+        let cell_sql = format!(
+            "update sterile_cells
+             set state = 'quarantined', disposition = 'quarantined',
+                 destroyed_at = {}, updated_at = {}
+             where id = {} and state = 'leased'",
+            db.placeholder(1),
+            db.placeholder(2),
+            db.placeholder(3),
+        );
+        sqlx::query(&cell_sql)
+            .bind(&now)
+            .bind(&now)
+            .bind(cell_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Scheduler-side stale activation cleanup. This runs before ordinary worker,
+/// provider, health, and capacity eligibility filters so an expired gated job
+/// cannot remain queued forever merely because no executor is eligible to
+/// reach `try_claim_job`'s transactional fence check.
+pub(crate) async fn terminalize_invalid_sterile_resident_job_before_filtering(
+    db: &Database,
+    job: &Job,
+) -> Result<bool, ApiError> {
+    if job.kind != JobKind::RunResidentProcess || job.payload.get("sterileActivation").is_none() {
+        return Ok(false);
+    }
+    let mut connection = db.pool.acquire().await?;
+    match recheck_sterile_resident_activation_on_connection(db, &mut connection, job).await {
+        Ok(()) => Ok(false),
+        Err(error) if error.code == "sterile_resident_activation_fence_mismatch" => {
+            drop(connection);
+            quarantine_invalid_sterile_resident_job(db, job).await?;
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) async fn try_claim_job(
     db: &Database,
     worker: &Worker,
@@ -1017,6 +1271,7 @@ pub(crate) async fn try_claim_job(
         if active_leases >= worker.max_concurrent_jobs {
             return Ok(None);
         }
+        recheck_sterile_resident_activation_on_connection(db, &mut tx, job).await?;
 
         let now = Utc::now();
         let attempt = job.attempts + 1;
@@ -1124,6 +1379,10 @@ pub(crate) async fn try_claim_job(
         Err(error) => {
             if let Err(rollback_error) = tx.rollback().await {
                 tracing::warn!(%rollback_error, "failed to roll back lease claim");
+            }
+            if error.code == "sterile_resident_activation_fence_mismatch" {
+                quarantine_invalid_sterile_resident_job(db, job).await?;
+                return Ok(None);
             }
             Err(error)
         }
@@ -1355,6 +1614,7 @@ mod placement_match_tests {
             secret_mounts: vec![],
             provider_external_id: None,
             provider_routing_scope: None,
+            sterile_pool_candidate: None,
         }
     }
 
@@ -1394,6 +1654,26 @@ mod placement_match_tests {
             Some(sandbox.template.as_str())
         );
         assert!(!apply_sandbox_placement(&mut job, &entry).unwrap());
+    }
+
+    #[test]
+    fn apply_sandbox_placement_strips_forged_pool_candidate() {
+        let sandbox = sample_sandbox();
+        let entry = entry_for(&sandbox);
+        let mut job = base_job(&sandbox);
+        job.payload["provisionSpec"]["sterile_pool_candidate"] = json!({
+            "cell_id": sandbox.id,
+            "release": {
+                "release_set_id": "forged",
+                "runtime_class": "kata_microvm",
+                "policy_digest": "sha256:forged",
+                "signature": "forged"
+            }
+        });
+
+        assert!(apply_sandbox_placement(&mut job, &entry).unwrap());
+        assert!(job.payload["provisionSpec"]["sterile_pool_candidate"].is_null());
+        assert!(placement_matches_sandbox(&job, &entry));
     }
 
     #[test]

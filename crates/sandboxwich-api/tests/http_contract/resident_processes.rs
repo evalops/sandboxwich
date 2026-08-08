@@ -1,9 +1,141 @@
 use crate::common::*;
-use base64::Engine as _;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, Mac};
 use sandboxwich_core::*;
+use sha2::Sha256;
 use sqlx::AnyPool;
 use std::collections::BTreeMap;
 use uuid::Uuid;
+
+fn signed_sterile_release() -> SterileCellReleaseTrustClassV1 {
+    let release_set_id = "resident-activation-release".to_string();
+    let runtime_class = SterileCellRuntimeClass::KataMicrovm;
+    let policy_digest = "c".repeat(64);
+    let canonical = format!(
+        "sandboxwich-sterile-release-v1\0{release_set_id}\0{}\0{policy_digest}",
+        runtime_class.as_db_str()
+    );
+    let mut mac = Hmac::<Sha256>::new_from_slice(TEST_STERILE_CELL_SIGNING_KEY.as_bytes()).unwrap();
+    mac.update(canonical.as_bytes());
+    SterileCellReleaseTrustClassV1 {
+        release_set_id,
+        runtime_class,
+        policy_digest,
+        signature: format!(
+            "swrs1_{}",
+            URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+        ),
+    }
+}
+
+async fn claim_sterile_sandbox(
+    server: &TestServer,
+    worker: &WorkerResponse,
+    sandbox_id: SandboxId,
+) -> ClaimSterileCellResponseV1 {
+    claim_sterile_sandbox_with_pool_membership(server, worker, sandbox_id, true).await
+}
+
+async fn claim_sterile_sandbox_with_pool_membership(
+    server: &TestServer,
+    worker: &WorkerResponse,
+    sandbox_id: SandboxId,
+    pool_member: bool,
+) -> ClaimSterileCellResponseV1 {
+    let release = signed_sterile_release();
+    worker_client(worker)
+        .post(format!(
+            "{}/workers/{}/sterile-cells/prepare",
+            server.base_url, worker.worker.id
+        ))
+        .json(&PrepareSterileCellRequestV1 {
+            cell_id: SterileCellId(sandbox_id.0),
+            release: release.clone(),
+            provider_cell_id: sandbox_id.to_string(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    if pool_member {
+        let pool = AnyPool::connect(&server.database_url).await.unwrap();
+        let provision_job_id: String = sqlx::query_scalar(
+            "select id from jobs where sandbox_id = ? and kind = 'provision_sandbox' limit 1",
+        )
+        .bind(sandbox_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "insert into sterile_pool_memberships
+             (sandbox_id, tenant_id, state, worker_id, provision_job_id,
+              release_set_id, runtime_class, policy_digest, release_signature,
+              candidate_agent_image, candidate_maestro_image, candidate_service_name,
+              candidate_pod_name, candidate_pod_uid,
+              ready_ttl_seconds, cell_expires_at, generation, created_at, updated_at)
+             values (?, 'default', 'ready', ?, ?, ?, ?, ?, ?,
+                     'agent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                     'maestro@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                     ?, ?, 'pod-uid-test', 300, ?, 1, ?, ?)",
+        )
+        .bind(sandbox_id.to_string())
+        .bind(worker.worker.id.to_string())
+        .bind(provision_job_id)
+        .bind(&release.release_set_id)
+        .bind(release.runtime_class.as_db_str())
+        .bind(&release.policy_digest)
+        .bind(&release.signature)
+        .bind(format!("sandboxwich-mc-{sandbox_id}"))
+        .bind(format!("sandboxwich-{sandbox_id}"))
+        .bind((now + chrono::Duration::minutes(5)).to_rfc3339())
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    server
+        .client()
+        .post(format!("{}/sterile-cells/claim", server.base_url))
+        .json(&ClaimSterileCellRequestV1 {
+            claim_id: Some(Uuid::now_v7()),
+            release,
+            organization_id: "default".into(),
+            workspace_id: "workspace-sterile".into(),
+            thread_id: "thread-sterile".into(),
+            runner_session_id: "session-sterile".into(),
+            lease_seconds: Some(120),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+fn sterile_activation_from_claim(
+    claimed: &ClaimSterileCellResponseV1,
+) -> SterileResidentActivationV1 {
+    let lease = claimed.lease.as_ref().expect("sterile lease");
+    SterileResidentActivationV1 {
+        lease_id: lease.lease_id,
+        generation: lease.generation,
+        organization_id: lease.organization_id.clone(),
+        workspace_id: lease.workspace_id.clone(),
+        thread_id: lease.thread_id.clone(),
+        runner_session_id: lease.runner_session_id.clone(),
+        lease_attestation: claimed
+            .lease_attestation
+            .clone()
+            .expect("one-time attestation"),
+    }
+}
 
 /// Provisions a sandbox and worker, completes the `ProvisionSandbox` job, and
 /// mints a guest token bound to that sandbox -- the shared setup every
@@ -24,7 +156,7 @@ async fn provisioned_sandbox_with_guest(
             template: Some("ubuntu-dev".into()),
             memory_limit: None,
             network_egress: Some(NetworkEgress::DenyAll),
-            workspace_mode: None,
+            workspace_mode: provider_isolated_sidecar.then_some(WorkspaceMode::Persistent),
             runtime_profile: None,
             execution_class: None,
             provider_preference: None,
@@ -51,6 +183,7 @@ async fn provisioned_sandbox_with_guest(
                 WorkerCapability::ProvisionSandbox,
                 WorkerCapability::RunCommand,
                 WorkerCapability::UidIsolatedResidentProcess,
+                WorkerCapability::VirtualMachine,
             ],
             // Resident leases run inside the sandbox and therefore must not
             // consume the worker's ordinary job-execution slots. Keeping this
@@ -223,6 +356,7 @@ fn resident_process_request(
             target_file: target_file.into(),
             mode: 0o600,
         }),
+        sterile_activation: None,
     }
 }
 
@@ -310,7 +444,484 @@ fn maestro_hosted_runner_request_for_organization(
             target_file: MAESTRO_HOSTED_RUNNER_GATEWAY_TOKEN_FILE.into(),
             mode: 0o400,
         }),
+        sterile_activation: None,
     }
+}
+
+#[tokio::test]
+async fn sterile_activation_is_fenced_once_and_secret_only_uses_bootstrap_handoff() {
+    sqlx::any::install_default_drivers();
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with_sterile_cells(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("sterile-resident.db").display()
+        ),
+        Some(data_dir),
+        false,
+    )
+    .await;
+    let (sandbox_id, worker, guest_client) =
+        provisioned_sandbox_with_guest(&server, "sterile-resident", true).await;
+    let claimed = claim_sterile_sandbox(&server, &worker, sandbox_id).await;
+    let sterile_lease = claimed.lease.clone().expect("sterile lease");
+    let attestation = claimed
+        .lease_attestation
+        .clone()
+        .expect("one-time attestation");
+    let mut request = maestro_hosted_runner_request(
+        sandbox_id,
+        &sterile_lease.workspace_id,
+        &sterile_lease.runner_session_id,
+    );
+    request.sterile_activation = Some(SterileResidentActivationV1 {
+        lease_id: sterile_lease.lease_id,
+        generation: sterile_lease.generation,
+        organization_id: sterile_lease.organization_id.clone(),
+        workspace_id: sterile_lease.workspace_id.clone(),
+        thread_id: sterile_lease.thread_id.clone(),
+        runner_session_id: sterile_lease.runner_session_id.clone(),
+        lease_attestation: attestation.clone(),
+    });
+    let created: ResidentProcessResponse = server
+        .client()
+        .put(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url
+        ))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let mut mismatched_replay = request.clone();
+    mismatched_replay
+        .sterile_activation
+        .as_mut()
+        .unwrap()
+        .lease_attestation = "different-raw-attestation".into();
+    let replay = server
+        .client()
+        .put(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url
+        ))
+        .json(&mismatched_replay)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), reqwest::StatusCode::CONFLICT);
+
+    let pool = AnyPool::connect(&server.database_url).await.unwrap();
+    let job_payload: String = sqlx::query_scalar(
+        "select payload from jobs where kind = 'run_resident_process' and tenant_id = 'default'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!job_payload.contains(&attestation));
+    assert!(job_payload.contains(&sterile_lease.lease_id.to_string()));
+    let durable: (String, i64, String, i64) = sqlx::query_as(
+        "select rp.sterile_lease_id, rp.sterile_lease_generation,
+                sc.activated_resident_process_id, sc.activated_resident_generation
+         from resident_processes rp join sterile_cells sc on sc.id = rp.sterile_cell_id
+         where rp.id = ?",
+    )
+    .bind(created.resident_process.id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(durable.0, sterile_lease.lease_id.to_string());
+    assert_eq!(durable.1, sterile_lease.generation as i64);
+    assert_eq!(durable.2, created.resident_process.id.to_string());
+    assert_eq!(durable.3, created.resident_process.generation as i64);
+
+    let resident_lease =
+        claim_resident_process_lease(&server, &worker, &guest_client, sandbox_id).await;
+    assert_eq!(created.resident_process.generation, 1);
+    assert_eq!(sterile_lease.generation, 2);
+    assert_eq!(
+        resident_lease.job.payload["sterileActivation"]["generation"],
+        sterile_lease.generation
+    );
+    let bootstrap: ResidentProcessBootstrapReadResponse = guest_client
+        .post(format!(
+            "{}/resident-processes/{}/bootstrap",
+            server.base_url, created.resident_process.id
+        ))
+        .json(&ResidentProcessBootstrapReadRequest {
+            generation: created.resident_process.generation,
+            lease_id: resident_lease.id.0,
+            expected_sha256: created.resident_process.bootstrap_sha256.unwrap(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        bootstrap
+            .sterile_activation
+            .expect("activation is delivered with the bootstrap handoff")
+            .lease_attestation,
+        attestation
+    );
+}
+
+#[tokio::test]
+async fn sterile_resident_activation_requires_exact_leased_pool_membership() {
+    sqlx::any::install_default_drivers();
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with_sterile_cells(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("sterile-pool-membership.db").display()
+        ),
+        Some(data_dir),
+        false,
+    )
+    .await;
+    let (sandbox_id, worker, _) =
+        provisioned_sandbox_with_guest(&server, "sterile-pool-membership", true).await;
+    let claimed =
+        claim_sterile_sandbox_with_pool_membership(&server, &worker, sandbox_id, false).await;
+    let lease = claimed.lease.as_ref().expect("sterile lease");
+    let mut request =
+        maestro_hosted_runner_request(sandbox_id, &lease.workspace_id, &lease.runner_session_id);
+    request.sterile_activation = Some(sterile_activation_from_claim(&claimed));
+
+    let response = server
+        .client()
+        .put(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url
+        ))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn sterile_resident_activation_rejects_pool_release_tuple_drift() {
+    sqlx::any::install_default_drivers();
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with_sterile_cells(
+        format!(
+            "sqlite://{}",
+            data_dir
+                .path()
+                .join("sterile-pool-release-drift.db")
+                .display()
+        ),
+        Some(data_dir),
+        false,
+    )
+    .await;
+    let (sandbox_id, worker, _) =
+        provisioned_sandbox_with_guest(&server, "sterile-pool-release-drift", true).await;
+    let claimed = claim_sterile_sandbox(&server, &worker, sandbox_id).await;
+    sqlx::query("update sterile_pool_memberships set release_signature = 'swrs1_forged' where sandbox_id = ?")
+        .bind(sandbox_id.to_string())
+        .execute(&AnyPool::connect(&server.database_url).await.unwrap())
+        .await
+        .unwrap();
+    let lease = claimed.lease.as_ref().expect("sterile lease");
+    let mut request =
+        maestro_hosted_runner_request(sandbox_id, &lease.workspace_id, &lease.runner_session_id);
+    request.sterile_activation = Some(sterile_activation_from_claim(&claimed));
+
+    let response = server
+        .client()
+        .put(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url
+        ))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn sterile_activation_without_file_bootstrap_uses_an_internal_one_read_handoff() {
+    sqlx::any::install_default_drivers();
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with_sterile_cells(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("sterile-activation-only.db").display()
+        ),
+        Some(data_dir),
+        false,
+    )
+    .await;
+    let (sandbox_id, worker, guest_client) =
+        provisioned_sandbox_with_guest(&server, "sterile-activation-only", true).await;
+    let claimed = claim_sterile_sandbox(&server, &worker, sandbox_id).await;
+    let lease = claimed.lease.expect("sterile lease");
+    let attestation = claimed
+        .lease_attestation
+        .expect("one-time lease attestation");
+    let mut request =
+        maestro_hosted_runner_request(sandbox_id, &lease.workspace_id, &lease.runner_session_id);
+    request.bootstrap = None;
+    request.sterile_activation = Some(SterileResidentActivationV1 {
+        lease_id: lease.lease_id,
+        generation: lease.generation,
+        organization_id: lease.organization_id,
+        workspace_id: lease.workspace_id,
+        thread_id: lease.thread_id,
+        runner_session_id: lease.runner_session_id,
+        lease_attestation: attestation.clone(),
+    });
+    let created: ResidentProcessResponse = server
+        .client()
+        .put(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url
+        ))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(created.resident_process.bootstrap_byte_count, None);
+    assert_eq!(created.resident_process.bootstrap_target_file, None);
+    assert_eq!(created.resident_process.bootstrap_mode, None);
+
+    let pool = AnyPool::connect(&server.database_url).await.unwrap();
+    let persisted: (String, String, Option<String>, Option<i64>) = sqlx::query_as(
+        "select j.payload, rp.env, rp.bootstrap_target_file, rp.bootstrap_mode
+         from jobs j join resident_processes rp
+           on json_extract(j.payload, '$.residentProcessId') = rp.id
+         where rp.id = ?",
+    )
+    .bind(created.resident_process.id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!persisted.0.contains(&attestation));
+    assert!(!persisted.1.contains(&attestation));
+    assert_eq!(persisted.2, None);
+    assert_eq!(persisted.3, None);
+
+    let resident_lease =
+        claim_resident_process_lease(&server, &worker, &guest_client, sandbox_id).await;
+    let read_request = ResidentProcessBootstrapReadRequest {
+        generation: created.resident_process.generation,
+        lease_id: resident_lease.id.0,
+        expected_sha256: created
+            .resident_process
+            .bootstrap_sha256
+            .expect("activation-only handoff digest"),
+    };
+    let first: ResidentProcessBootstrapReadResponse = guest_client
+        .post(format!(
+            "{}/resident-processes/{}/bootstrap",
+            server.base_url, created.resident_process.id
+        ))
+        .json(&read_request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(first.content.is_empty());
+    assert!(first.target_file.is_empty());
+    assert_eq!(first.mode, 0);
+    assert_eq!(
+        first
+            .sterile_activation
+            .expect("activation-only handoff is delivered")
+            .lease_attestation,
+        attestation
+    );
+    guest_client
+        .post(format!(
+            "{}/resident-processes/{}/observations",
+            server.base_url, created.resident_process.id
+        ))
+        .json(&ResidentProcessObservationRequest {
+            generation: read_request.generation,
+            lease_id: read_request.lease_id,
+            observed_state: ResidentProcessObservedState::Running,
+            pid: Some(901),
+            exit_code: None,
+            error_code: None,
+            error_message: None,
+            provider_pod_name: Some(format!("sandboxwich-{sandbox_id}")),
+            provider_pod_uid: Some("pod-uid-test".into()),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let second = guest_client
+        .post(format!(
+            "{}/resident-processes/{}/bootstrap",
+            server.base_url, created.resident_process.id
+        ))
+        .json(&read_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), reqwest::StatusCode::GONE);
+}
+
+#[tokio::test]
+async fn sterile_lease_can_activate_only_one_resident_identity() {
+    sqlx::any::install_default_drivers();
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with_sterile_cells(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("sterile-once.db").display()
+        ),
+        Some(data_dir),
+        false,
+    )
+    .await;
+    let (sandbox_id, worker, _) =
+        provisioned_sandbox_with_guest(&server, "sterile-once", true).await;
+    let claimed = claim_sterile_sandbox(&server, &worker, sandbox_id).await;
+    let lease = claimed.lease.unwrap();
+    let mut request =
+        maestro_hosted_runner_request(sandbox_id, &lease.workspace_id, &lease.runner_session_id);
+    request.sterile_activation = Some(SterileResidentActivationV1 {
+        lease_id: lease.lease_id,
+        generation: lease.generation,
+        organization_id: lease.organization_id,
+        workspace_id: lease.workspace_id,
+        thread_id: lease.thread_id,
+        runner_session_id: lease.runner_session_id,
+        lease_attestation: claimed.lease_attestation.unwrap(),
+    });
+    let url = format!(
+        "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+        server.base_url
+    );
+    let first: ResidentProcessResponse = server
+        .client()
+        .put(&url)
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    sqlx::query("update resident_processes set name = 'retired-test-resident' where id = ?")
+        .bind(first.resident_process.id.to_string())
+        .execute(&AnyPool::connect(&server.database_url).await.unwrap())
+        .await
+        .unwrap();
+    let second = server
+        .client()
+        .put(&url)
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), reqwest::StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn sterile_activation_expiring_before_claim_is_terminalized_and_quarantined() {
+    sqlx::any::install_default_drivers();
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with_sterile_cells(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("sterile-expiry.db").display()
+        ),
+        Some(data_dir),
+        false,
+    )
+    .await;
+    let (sandbox_id, worker, guest_client) =
+        provisioned_sandbox_with_guest(&server, "sterile-expiry", true).await;
+    let claimed = claim_sterile_sandbox(&server, &worker, sandbox_id).await;
+    let lease = claimed.lease.unwrap();
+    let mut request =
+        maestro_hosted_runner_request(sandbox_id, &lease.workspace_id, &lease.runner_session_id);
+    request.sterile_activation = Some(SterileResidentActivationV1 {
+        lease_id: lease.lease_id,
+        generation: lease.generation,
+        organization_id: lease.organization_id,
+        workspace_id: lease.workspace_id,
+        thread_id: lease.thread_id,
+        runner_session_id: lease.runner_session_id,
+        lease_attestation: claimed.lease_attestation.unwrap(),
+    });
+    server
+        .client()
+        .put(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url
+        ))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    sqlx::query("update sterile_cells set lease_expires_at = ? where id = ?")
+        .bind((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339())
+        .bind(sandbox_id.to_string())
+        .execute(&AnyPool::connect(&server.database_url).await.unwrap())
+        .await
+        .unwrap();
+    // Make the placed worker ineligible at the ordinary Maestro image-label
+    // filter. Stale activation cleanup must run before that filter, otherwise
+    // the queued job and leased cell are stranded indefinitely.
+    sqlx::query("update workers set labels = '{}' where id = ?")
+        .bind(worker.worker.id.to_string())
+        .execute(&AnyPool::connect(&server.database_url).await.unwrap())
+        .await
+        .unwrap();
+    let claimed: ClaimLeaseResponse = guest_client
+        .post(format!(
+            "{}/workers/{}/leases/claim",
+            server.base_url, worker.worker.id
+        ))
+        .json(&ClaimLeaseRequest {
+            lease_seconds: Some(60),
+            sandbox_id: Some(sandbox_id),
+            kinds: Some(vec![JobKind::RunResidentProcess]),
+            wait_ms: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(claimed.lease.is_none());
+    let state: (String, String) = sqlx::query_as("select j.status, sc.state from jobs j join resident_processes rp on json_extract(j.payload, '$.residentProcessId') = rp.id join sterile_cells sc on sc.id = rp.sterile_cell_id where j.kind = 'run_resident_process'").fetch_one(&AnyPool::connect(&server.database_url).await.unwrap()).await.unwrap();
+    assert_eq!(state, ("dead".into(), "quarantined".into()));
 }
 
 #[tokio::test]
@@ -1704,6 +2315,7 @@ pub(crate) async fn resident_process_create_is_idempotent_tenant_scoped_and_reda
             target_file: "/run/sandboxwich/bootstrap/orb-token".into(),
             mode: 0o600,
         }),
+        sterile_activation: None,
     };
     let url = format!(
         "{}/sandboxes/{}/resident-processes/orb-executor",
@@ -4296,6 +4908,154 @@ async fn read_resident_bootstrap(
         .send()
         .await
         .unwrap()
+}
+
+async fn create_sterile_activation_bootstrap(
+    server: &TestServer,
+    label: &str,
+) -> (
+    ResidentProcessResponse,
+    reqwest::Client,
+    ResidentProcessBootstrapReadRequest,
+    String,
+) {
+    sqlx::any::install_default_drivers();
+    let (sandbox_id, worker, guest_client) =
+        provisioned_sandbox_with_guest(server, label, true).await;
+    let claimed = claim_sterile_sandbox(server, &worker, sandbox_id).await;
+    let lease = claimed.lease.expect("sterile lease");
+    let attestation = claimed.lease_attestation.expect("sterile attestation");
+    let mut create =
+        maestro_hosted_runner_request(sandbox_id, &lease.workspace_id, &lease.runner_session_id);
+    create.sterile_activation = Some(SterileResidentActivationV1 {
+        lease_id: lease.lease_id,
+        generation: lease.generation,
+        organization_id: lease.organization_id,
+        workspace_id: lease.workspace_id,
+        thread_id: lease.thread_id,
+        runner_session_id: lease.runner_session_id,
+        lease_attestation: attestation.clone(),
+    });
+    let created: ResidentProcessResponse = server
+        .client()
+        .put(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url
+        ))
+        .json(&create)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let resident_lease =
+        claim_resident_process_lease(server, &worker, &guest_client, sandbox_id).await;
+    let read = ResidentProcessBootstrapReadRequest {
+        generation: created.resident_process.generation,
+        lease_id: resident_lease.id.0,
+        expected_sha256: created.resident_process.bootstrap_sha256.clone().unwrap(),
+    };
+    (created, guest_client, read, attestation)
+}
+
+#[tokio::test]
+async fn sterile_activation_handoff_survives_restart_and_exact_response_loss_replay() {
+    sqlx::any::install_default_drivers();
+    let data_dir = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_with_sterile_cells(
+        format!(
+            "sqlite://{}",
+            data_dir
+                .path()
+                .join("sterile-activation-restart.db")
+                .display()
+        ),
+        Some(data_dir),
+        false,
+    )
+    .await;
+    let (created, guest_client, read, attestation) =
+        create_sterile_activation_bootstrap(&server, "sterile-activation-restart").await;
+    server.restart_with_sterile_cells().await;
+    let first: ResidentProcessBootstrapReadResponse = read_resident_bootstrap(
+        &server.base_url,
+        &guest_client,
+        created.resident_process.id,
+        &read,
+    )
+    .await
+    .error_for_status()
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(
+        first.sterile_activation.as_ref().unwrap().lease_attestation,
+        attestation
+    );
+    server.restart_with_sterile_cells().await;
+    let replay: ResidentProcessBootstrapReadResponse = read_resident_bootstrap(
+        &server.base_url,
+        &guest_client,
+        created.resident_process.id,
+        &read,
+    )
+    .await
+    .error_for_status()
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(replay, first);
+}
+
+#[tokio::test]
+async fn sterile_activation_handoff_replays_across_replicas_after_response_loss() {
+    sqlx::any::install_default_drivers();
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with_sterile_cells(
+        format!(
+            "sqlite://{}",
+            data_dir
+                .path()
+                .join("sterile-activation-replica.db")
+                .display()
+        ),
+        Some(data_dir),
+        false,
+    )
+    .await;
+    let (created, guest_client, read, _) =
+        create_sterile_activation_bootstrap(&server, "sterile-activation-replica").await;
+    let replica = server.spawn_sterile_replica().await;
+    let first: ResidentProcessBootstrapReadResponse = read_resident_bootstrap(
+        &replica.base_url,
+        &guest_client,
+        created.resident_process.id,
+        &read,
+    )
+    .await
+    .error_for_status()
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let replay: ResidentProcessBootstrapReadResponse = read_resident_bootstrap(
+        &server.base_url,
+        &guest_client,
+        created.resident_process.id,
+        &read,
+    )
+    .await
+    .error_for_status()
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(replay, first);
 }
 
 #[tokio::test]

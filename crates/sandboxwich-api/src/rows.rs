@@ -171,6 +171,9 @@ pub(crate) fn row_to_resident_process(row: AnyRow) -> Result<ResidentProcess, Ap
     let pid: Option<i64> = row.try_get("pid")?;
     let bootstrap_byte_count: Option<i64> = row.try_get("bootstrap_byte_count")?;
     let bootstrap_mode: Option<i64> = row.try_get("bootstrap_mode")?;
+    let sterile_cell_id: Option<&str> = row.try_get("sterile_cell_id")?;
+    let sterile_lease_id: Option<&str> = row.try_get("sterile_lease_id")?;
+    let sterile_lease_generation: Option<i64> = row.try_get("sterile_lease_generation")?;
     let started_at: Option<&str> = row.try_get("started_at")?;
     let ready_at: Option<&str> = row.try_get("ready_at")?;
     let exited_at: Option<&str> = row.try_get("exited_at")?;
@@ -199,6 +202,17 @@ pub(crate) fn row_to_resident_process(row: AnyRow) -> Result<ResidentProcess, Ap
             .map(u32::try_from)
             .transpose()
             .map_err(|_| ApiError::internal("database contains invalid bootstrap mode"))?,
+        sterile_cell_id: sterile_cell_id
+            .map(parse_uuid)
+            .transpose()?
+            .map(SterileCellId),
+        sterile_lease_id: sterile_lease_id.map(parse_uuid).transpose()?,
+        sterile_lease_generation: sterile_lease_generation
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| {
+                ApiError::internal("database contains invalid sterile lease generation")
+            })?,
         restart_policy: ResidentProcessRestartPolicy::parse_db_str(restart_policy)
             .map_err(|_| ApiError::internal("database contains invalid restart policy"))?,
         desired_state: ResidentProcessDesiredState::parse_db_str(desired_state)

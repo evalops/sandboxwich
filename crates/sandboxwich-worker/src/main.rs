@@ -1233,8 +1233,8 @@ async fn main() -> anyhow::Result<()> {
             print_json::<sandboxwich_core::SterileCellResponseV1>(response).await?;
         }
         Command::SterileClaim(args) => {
-            let response = sterile_cells::claim(&client, &api, args).await?;
-            print_json::<sandboxwich_core::ClaimSterileCellResponseV1>(response).await?;
+            let output = sterile_cells::claim(&client, &api, args).await?;
+            println!("{}", serde_json::to_string_pretty(&output)?);
         }
         Command::SterileDestroy(args) => {
             let response = sterile_cells::destroy(&client, &api, args).await?;

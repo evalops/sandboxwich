@@ -148,6 +148,14 @@ pub(crate) fn app(state: AppState) -> Router {
         .route("/jobs", get(list_jobs).post(create_job))
         .route("/jobs/{job_id}", get(get_job))
         .route("/sterile-cells/claim", post(claim_sterile_cell))
+        .route(
+            "/sterile-cell-leases/{lease_id}",
+            get(get_sterile_cell_lease_status),
+        )
+        .route(
+            "/sterile-cell-leases/{lease_id}/release",
+            post(release_sterile_cell_lease),
+        )
         .route("/divergence/reconcile", post(reconcile_divergence))
         .route(
             "/sandboxes/{sandbox_id}/tool-call-ledger",
@@ -231,6 +239,10 @@ pub(crate) fn app(state: AppState) -> Router {
         .route(
             "/workers/{worker_id}/sterile-cells/{cell_id}/destroy",
             post(destroy_sterile_cell),
+        )
+        .route(
+            "/workers/{worker_id}/sterile-cells/{cell_id}/release",
+            post(release_sterile_pool_cell),
         )
         .route(
             "/workers/{worker_id}/runtime-resource-inventory",

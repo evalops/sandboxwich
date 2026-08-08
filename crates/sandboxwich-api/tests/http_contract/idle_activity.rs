@@ -395,6 +395,7 @@ async fn resident_process_observation_resets_the_idle_clock() {
             restart_policy: ResidentProcessRestartPolicy::OnFailure,
             expected_generation: 0,
             bootstrap: None,
+            sterile_activation: None,
         })
         .send()
         .await

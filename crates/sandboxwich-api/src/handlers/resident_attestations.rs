@@ -18,6 +18,42 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 use subtle::ConstantTimeEq;
 use url::Url;
+
+async fn resident_service_name(
+    db: &Database,
+    connection: &mut AnyConnection,
+    process_id: ResidentProcessId,
+    generation: u64,
+    lease_id: Uuid,
+) -> Result<String, ApiError> {
+    // The activated resident fence lives on sterile_cells, while the stable
+    // Service lives on pool membership. Join both to prevent an unrelated
+    // resident from borrowing a candidate's pre-created endpoint.
+    let exact_sql = format!(
+        "select p.candidate_service_name
+         from resident_processes rp
+         join sterile_cells c on c.id = rp.sterile_cell_id
+         join sterile_pool_memberships p on p.sandbox_id = c.id
+         where rp.id = {} and rp.generation = {} and rp.active_lease_id = {}
+           and p.state = 'leased' and c.activated_resident_process_id = rp.id
+           and c.activated_resident_generation = rp.generation",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3)
+    );
+    if let Some(service_name) = sqlx::query_scalar::<_, String>(&exact_sql)
+        .bind(process_id.to_string())
+        .bind(i64::try_from(generation).unwrap_or(i64::MAX))
+        .bind(lease_id.to_string())
+        .fetch_optional(&mut *connection)
+        .await?
+    {
+        return Ok(service_name);
+    }
+    Ok(maestro_hosted_runner_service_name(
+        process_id, generation, lease_id,
+    ))
+}
 use uuid::Uuid;
 
 const ATTESTATION_VERSION: u32 = 2;
@@ -570,7 +606,8 @@ pub(crate) async fn authoritative_maestro_connection_binding(
     }
     let labels = parse_labels(&row.try_get::<String, _>("labels")?)?;
     let service_namespace = label(&labels, "sandbox_namespace")?.to_string();
-    let service_name = maestro_hosted_runner_service_name(process_id, process_generation, lease_id);
+    let service_name =
+        resident_service_name(db, connection, process_id, process_generation, lease_id).await?;
     let service_host = format!("{service_name}.{service_namespace}.svc.cluster.local");
     let expected_server_uri_san = maestro_expected_server_uri_san(&MaestroUriComponents {
         organization_id,
@@ -1263,6 +1300,15 @@ async fn validate_maestro_workload_identity_inner(
     }
     let labels = parse_labels(&row.try_get::<String, _>("labels")?)?;
     let sandbox_namespace = label(&labels, "sandbox_namespace")?.to_string();
+    let mut connection = state.db.pool.acquire().await?;
+    let service_name = resident_service_name(
+        &state.db,
+        &mut connection,
+        process_id,
+        process_generation,
+        lease_id,
+    )
+    .await?;
     Ok(MaestroWorkloadIdentityResponse {
         active: true,
         organization_id: request.organization_id,
@@ -1275,7 +1321,7 @@ async fn validate_maestro_workload_identity_inner(
         runtime_image: fence.runtime_image,
         service_account_namespace: sandbox_namespace,
         service_account_name: MAESTRO_HOSTED_RUNNER_SERVICE_ACCOUNT.into(),
-        service_name: maestro_hosted_runner_service_name(process_id, process_generation, lease_id),
+        service_name,
         service_port: MAESTRO_HOSTED_RUNNER_CONTAINER_PORT,
         resident_process_generation: process_generation,
         lease_id,

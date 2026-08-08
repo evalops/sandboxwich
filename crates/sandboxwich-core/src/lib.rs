@@ -974,6 +974,52 @@ pub struct DestroySterileCellRequestV1 {
     pub disposition: SterileCellDisposition,
 }
 
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ReleaseSterileCellLeaseRequestV1 {
+    #[schema(value_type = String)]
+    pub lease_attestation: String,
+    pub generation: u64,
+    pub organization_id: String,
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub runner_session_id: String,
+    pub disposition: SterileCellDisposition,
+}
+
+impl fmt::Debug for ReleaseSterileCellLeaseRequestV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReleaseSterileCellLeaseRequestV1")
+            .field("lease_attestation", &"[REDACTED]")
+            .field("generation", &self.generation)
+            .field("organization_id", &self.organization_id)
+            .field("workspace_id", &self.workspace_id)
+            .field("thread_id", &self.thread_id)
+            .field("runner_session_id", &self.runner_session_id)
+            .field("disposition", &self.disposition)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SterileCellLeaseStatusV1 {
+    pub lease_id: Uuid,
+    pub cell_id: SterileCellId,
+    pub generation: u64,
+    pub state: SterileCellState,
+    pub disposition: Option<SterileCellDisposition>,
+    /// True only after the pool membership records an exact provider-stop completion.
+    pub provider_absent: bool,
+    /// True while the pool membership durably requires a provider cleanup retry.
+    pub cleanup_pending: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SterileCellLeaseStatusResponseV1 {
+    pub ok: bool,
+    pub status: SterileCellLeaseStatusV1,
+}
+
 db_variant_enum! {
 pub enum CleanupRunStatus {
     Running => "running",
@@ -1218,6 +1264,32 @@ pub struct SandboxProvisionSpec {
     /// turns each one into a read-only CSI volume mount.
     #[serde(default)]
     pub secret_mounts: Vec<SandboxSecretMount>,
+    /// Control-plane-derived marker for a purpose-created sterile pool pod.
+    /// Ordinary tenant provision requests cannot set this authoritatively;
+    /// scheduler enrichment derives it from durable pool membership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sterile_pool_candidate: Option<SterilePoolCandidateV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SterilePoolCandidateV1 {
+    pub cell_id: SterileCellId,
+    pub release: SterileCellReleaseTrustClassV1,
+    /// Digest-pinned image containing the exact sandboxwich-agent binary copied
+    /// into the candidate's shared executable volume.
+    pub agent_image: String,
+    /// Digest-pinned Maestro image executed only after sterile activation.
+    pub maestro_image: String,
+    /// Stable pre-created Service identity for the candidate Pod.
+    pub service_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_uid: Option<String>,
+}
+
+pub fn sterile_maestro_candidate_service_name(cell_id: SterileCellId) -> String {
+    format!("sandboxwich-mc-{cell_id}")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2517,6 +2589,47 @@ pub struct ResidentProcessBootstrap {
     pub mode: u32,
 }
 
+/// One-shot authority for activating a resident inside a purpose-created
+/// sterile cell. The attestation is a bearer secret and must only travel in
+/// the bounded resident-bootstrap handoff.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SterileResidentActivationV1 {
+    pub lease_id: Uuid,
+    pub generation: u64,
+    pub organization_id: String,
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub runner_session_id: String,
+    #[schema(value_type = String)]
+    pub lease_attestation: String,
+}
+
+/// Non-secret durable projection of a sterile resident activation. This is
+/// the only sterile activation state permitted in resident rows and jobs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SterileResidentActivationFenceV1 {
+    pub cell_id: SterileCellId,
+    pub lease_id: Uuid,
+    pub generation: u64,
+}
+
+impl fmt::Debug for SterileResidentActivationV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SterileResidentActivationV1")
+            .field("lease_id", &self.lease_id)
+            .field("generation", &self.generation)
+            .field("organization_id", &self.organization_id)
+            .field("workspace_id", &self.workspace_id)
+            .field("thread_id", &self.thread_id)
+            .field("runner_session_id", &self.runner_session_id)
+            .field("lease_attestation", &"[REDACTED]")
+            .finish()
+    }
+}
+
 impl fmt::Debug for ResidentProcessBootstrap {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -2541,6 +2654,8 @@ pub struct ResidentProcessRequest {
     pub restart_policy: ResidentProcessRestartPolicy,
     pub expected_generation: u64,
     pub bootstrap: Option<ResidentProcessBootstrap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sterile_activation: Option<SterileResidentActivationV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -2557,6 +2672,12 @@ pub struct ResidentProcess {
     pub bootstrap_byte_count: Option<u64>,
     pub bootstrap_target_file: Option<String>,
     pub bootstrap_mode: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sterile_cell_id: Option<SterileCellId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sterile_lease_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sterile_lease_generation: Option<u64>,
     pub restart_policy: ResidentProcessRestartPolicy,
     pub desired_state: ResidentProcessDesiredState,
     pub observed_state: ResidentProcessObservedState,
@@ -2636,6 +2757,8 @@ pub struct ResidentProcessBootstrapReadResponse {
     pub mode: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_attestation: Option<ResidentPlacementAttestationBootstrap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sterile_activation: Option<SterileResidentActivationV1>,
 }
 
 impl fmt::Debug for ResidentProcessBootstrapReadResponse {
@@ -2651,6 +2774,7 @@ impl fmt::Debug for ResidentProcessBootstrapReadResponse {
             .field("target_file", &self.target_file)
             .field("mode", &format_args!("{:#o}", self.mode))
             .field("placement_attestation", &self.placement_attestation)
+            .field("sterile_activation", &self.sterile_activation)
             .finish()
     }
 }
@@ -2871,6 +2995,7 @@ impl fmt::Debug for ResidentProcessRequest {
             .field("restart_policy", &self.restart_policy)
             .field("expected_generation", &self.expected_generation)
             .field("bootstrap", &self.bootstrap)
+            .field("sterile_activation", &self.sterile_activation)
             .finish()
     }
 }
@@ -2891,6 +3016,8 @@ pub enum ResidentProcessRequestError {
     BootstrapPathOutsideAllowedRoot,
     #[error("resident process bootstrap mode must be between 0400 and 0700")]
     InvalidBootstrapMode,
+    #[error("sterile resident activation attestation is empty or exceeds 1024 bytes")]
+    InvalidSterileActivationAttestation,
 }
 
 pub fn validate_resident_process_request(
@@ -2933,6 +3060,13 @@ pub fn validate_resident_process_request(
         if !(0o400..=0o700).contains(&bootstrap.mode) {
             return Err(ResidentProcessRequestError::InvalidBootstrapMode);
         }
+    }
+    if let Some(activation) = &request.sterile_activation
+        && (activation.lease_attestation.is_empty()
+            || activation.lease_attestation.len() > 1024
+            || activation.generation == 0)
+    {
+        return Err(ResidentProcessRequestError::InvalidSterileActivationAttestation);
     }
     Ok(())
 }
@@ -4320,6 +4454,15 @@ mod tests {
             placement_attestation: Some(ResidentPlacementAttestationBootstrap {
                 token: "placement-secret-canary".into(),
             }),
+            sterile_activation: Some(SterileResidentActivationV1 {
+                lease_id: Uuid::now_v7(),
+                generation: 2,
+                organization_id: "org-1".into(),
+                workspace_id: "workspace-1".into(),
+                thread_id: "thread-1".into(),
+                runner_session_id: "session-1".into(),
+                lease_attestation: "raw-sterile-attestation-secret".into(),
+            }),
         };
         let encoded = serde_json::to_value(&response).unwrap();
         assert_eq!(
@@ -4327,6 +4470,7 @@ mod tests {
             "placement-secret-canary"
         );
         assert!(!format!("{response:?}").contains("placement-secret-canary"));
+        assert!(!format!("{response:?}").contains("raw-sterile-attestation-secret"));
 
         let legacy: ResidentProcessBootstrapReadResponse =
             serde_json::from_value(serde_json::json!({
@@ -4565,11 +4709,22 @@ mod tests {
                 target_file: "/run/sandboxwich/bootstrap/orb-token".into(),
                 mode: 0o600,
             }),
+            sterile_activation: Some(SterileResidentActivationV1 {
+                lease_id: Uuid::now_v7(),
+                generation: 2,
+                organization_id: "org-1".into(),
+                workspace_id: "workspace-1".into(),
+                thread_id: "thread-1".into(),
+                runner_session_id: "session-1".into(),
+                lease_attestation: "raw-sterile-attestation-secret".into(),
+            }),
         };
 
         validate_resident_process_request(&request).expect("valid resident process request");
         let debug = format!("{request:?}");
         assert!(!debug.contains("canary-resident-secret"));
+        assert!(!debug.contains("raw-sterile-attestation-secret"));
+        assert!(debug.contains("[REDACTED]"));
         assert!(debug.contains("<redacted:22 bytes>"));
     }
 
@@ -4628,6 +4783,7 @@ mod tests {
             restart_policy: ResidentProcessRestartPolicy::Never,
             expected_generation: 0,
             bootstrap: None,
+            sterile_activation: None,
         };
 
         let mut empty_argv = valid.clone();

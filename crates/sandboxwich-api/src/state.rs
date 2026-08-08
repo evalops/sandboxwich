@@ -152,6 +152,7 @@ pub(crate) struct LiveResidentBootstrap {
     pub(crate) target_file: String,
     pub(crate) mode: u32,
     pub(crate) generation: u64,
+    pub(crate) sterile_activation: Option<SterileResidentActivationV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -627,6 +628,7 @@ mod tests {
             target_file: "/run/secret".into(),
             mode: 0o600,
             generation,
+            sterile_activation: None,
         }
     }
 
@@ -922,6 +924,7 @@ pub(crate) struct AppState {
     pub(crate) resident_bootstraps: ResidentBootstrapStore,
     pub(crate) sandbox_lifetime: SandboxLifetimeConfig,
     pub(crate) sterile_cell_signing_key: Option<Arc<str>>,
+    pub(crate) sterile_resident_activation_enabled: bool,
     #[cfg(test)]
     pub(crate) apex_callback_test_hook: Option<ApexCallbackTestHook>,
 }

@@ -1347,6 +1347,11 @@ impl TestServer {
                     )
                     .env("SANDBOXWICH_OPERATOR_TOKEN", TEST_OPERATOR_TOKEN)
                     .env("SANDBOXWICH_STERILE_CELLS_ENABLED", "true")
+                    .env("SANDBOXWICH_STERILE_RESIDENT_ACTIVATION_ENABLED", "true")
+                    .env(
+                        "SANDBOXWICH_BOOTSTRAP_HANDOFF_KEY",
+                        TEST_BOOTSTRAP_HANDOFF_KEY,
+                    )
                     .env(
                         "SANDBOXWICH_STERILE_CELL_SIGNING_KEY_FILE",
                         &signing_key_path,
@@ -1367,7 +1372,7 @@ impl TestServer {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let key = shared_bootstrap_handoff.then_some(TEST_BOOTSTRAP_HANDOFF_KEY);
-        let (base_url, child) = spawn_process_against(&self.database_url, key).await;
+        let (base_url, child) = spawn_process_against(&self.database_url, key, false).await;
         self.base_url = base_url;
         self.child = child;
     }
@@ -1376,13 +1381,28 @@ impl TestServer {
     /// database: the replica a request fails over to.
     pub(crate) async fn spawn_replica(&self, shared_bootstrap_handoff: bool) -> TestReplica {
         let key = shared_bootstrap_handoff.then_some(TEST_BOOTSTRAP_HANDOFF_KEY);
-        let (base_url, child) = spawn_process_against(&self.database_url, key).await;
+        let (base_url, child) = spawn_process_against(&self.database_url, key, false).await;
         TestReplica { base_url, child }
     }
 
     /// A replica holding a specific sealing key, for rotation coverage.
     pub(crate) async fn spawn_replica_with_key(&self, key: &str) -> TestReplica {
-        let (base_url, child) = spawn_process_against(&self.database_url, Some(key)).await;
+        let (base_url, child) = spawn_process_against(&self.database_url, Some(key), false).await;
+        TestReplica { base_url, child }
+    }
+
+    pub(crate) async fn restart_with_sterile_cells(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let (base_url, child) =
+            spawn_process_against(&self.database_url, Some(TEST_BOOTSTRAP_HANDOFF_KEY), true).await;
+        self.base_url = base_url;
+        self.child = child;
+    }
+
+    pub(crate) async fn spawn_sterile_replica(&self) -> TestReplica {
+        let (base_url, child) =
+            spawn_process_against(&self.database_url, Some(TEST_BOOTSTRAP_HANDOFF_KEY), true).await;
         TestReplica { base_url, child }
     }
 
@@ -1477,7 +1497,13 @@ impl Drop for TestReplica {
 async fn spawn_process_against(
     database_url: &str,
     bootstrap_handoff_key: Option<&str>,
+    sterile_cells: bool,
 ) -> (String, Child) {
+    let mut signing_key_file = tempfile::NamedTempFile::new().unwrap();
+    signing_key_file
+        .write_all(TEST_STERILE_CELL_SIGNING_KEY.as_bytes())
+        .unwrap();
+    let signing_key_path = signing_key_file.path().to_path_buf();
     const MAX_SPAWN_ATTEMPTS: u32 = 5;
     let mut last_bind_race: Option<String> = None;
     for _ in 0..MAX_SPAWN_ATTEMPTS {
@@ -1490,6 +1516,15 @@ async fn spawn_process_against(
                 .env("SANDBOXWICH_OPERATOR_TOKEN", TEST_OPERATOR_TOKEN);
             if let Some(key) = bootstrap_handoff_key {
                 command.env("SANDBOXWICH_BOOTSTRAP_HANDOFF_KEY", key);
+            }
+            if sterile_cells {
+                command
+                    .env("SANDBOXWICH_STERILE_CELLS_ENABLED", "true")
+                    .env("SANDBOXWICH_STERILE_RESIDENT_ACTIVATION_ENABLED", "true")
+                    .env(
+                        "SANDBOXWICH_STERILE_CELL_SIGNING_KEY_FILE",
+                        &signing_key_path,
+                    );
             }
         })
         .await;

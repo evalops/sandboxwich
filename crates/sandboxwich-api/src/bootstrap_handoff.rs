@@ -40,12 +40,19 @@ use chacha20poly1305::aead::{Aead, KeyInit, OsRng, Payload, rand_core::RngCore};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use chrono::{DateTime, Utc};
 use sandboxwich_core::{ResidentProcessId, SandboxId};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{AnyConnection, Row};
 use std::time::Duration;
 
 pub(crate) const BOOTSTRAP_HANDOFF_KEY_BYTES: usize = 32;
 pub(crate) const DEFAULT_BOOTSTRAP_HANDOFF_TTL: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Serialize, Deserialize)]
+struct SealedBootstrapPayload {
+    content: Vec<u8>,
+    sterile_activation: Option<sandboxwich_core::SterileResidentActivationV1>,
+}
 
 /// An operator-held sealing key plus the retention window for sealed rows.
 pub(crate) struct SharedBootstrapHandoff {
@@ -67,6 +74,42 @@ impl SharedBootstrapHandoff {
         &self.key_id
     }
 
+    fn open_payload(
+        &self,
+        nonce: &XNonce,
+        ciphertext: &[u8],
+        id: ResidentProcessId,
+        sandbox_id: SandboxId,
+        bootstrap: &LiveResidentBootstrap,
+    ) -> Option<SealedBootstrapPayload> {
+        if let Ok(plaintext) = self.cipher.decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad: associated_data(id, sandbox_id, bootstrap).as_bytes(),
+            },
+        ) {
+            return serde_json::from_slice(&plaintext).ok();
+        }
+        // Rolling-deploy compatibility: releases before sterile activation
+        // sealed the raw bootstrap content under the v1 AAD. New writers use
+        // the v2 envelope, but readers must drain existing v1 handoffs without
+        // changing the feature-off resident path.
+        self.cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: legacy_associated_data(id, sandbox_id, bootstrap).as_bytes(),
+                },
+            )
+            .ok()
+            .map(|content| SealedBootstrapPayload {
+                content,
+                sterile_activation: None,
+            })
+    }
+
     /// Seals `bootstrap` and writes it on the caller's connection, so the
     /// handoff row commits atomically with the `resident_processes` row it
     /// belongs to.
@@ -82,12 +125,17 @@ impl SharedBootstrapHandoff {
         let mut nonce_bytes = [0u8; 24];
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = XNonce::from_slice(&nonce_bytes);
+        let plaintext = serde_json::to_vec(&SealedBootstrapPayload {
+            content: bootstrap.content.clone(),
+            sterile_activation: bootstrap.sterile_activation.clone(),
+        })
+        .map_err(|_| HandoffError::Seal)?;
         let ciphertext = self
             .cipher
             .encrypt(
                 nonce,
                 Payload {
-                    msg: &bootstrap.content,
+                    msg: &plaintext,
                     aad: associated_data(id, sandbox_id, bootstrap).as_bytes(),
                 },
             )
@@ -167,6 +215,7 @@ impl SharedBootstrapHandoff {
             target_file: row.try_get("target_file")?,
             mode,
             generation,
+            sterile_activation: None,
         };
         let Ok(nonce_bytes) = BASE64.decode(row.try_get::<String, _>("nonce")?) else {
             return Ok(unreadable("nonce is not base64"));
@@ -177,21 +226,34 @@ impl SharedBootstrapHandoff {
         let Ok(ciphertext) = BASE64.decode(row.try_get::<String, _>("ciphertext")?) else {
             return Ok(unreadable("ciphertext is not base64"));
         };
-        let Ok(content) = self.cipher.decrypt(
+        let Some(payload) = self.open_payload(
             XNonce::from_slice(&nonce_bytes),
-            Payload {
-                msg: &ciphertext,
-                aad: associated_data(id, sandbox_id, &bootstrap_shell).as_bytes(),
-            },
+            &ciphertext,
+            id,
+            sandbox_id,
+            &bootstrap_shell,
         ) else {
             return Ok(None);
         };
+        let content = payload.content;
         if content.len() as i64 != byte_count || content_digest(&content) != bootstrap_shell.sha256
+        {
+            return Ok(None);
+        }
+        if !activation_matches_durable_fence(
+            db,
+            id,
+            sandbox_id,
+            payload.sterile_activation.as_ref(),
+            Utc::now(),
+        )
+        .await?
         {
             return Ok(None);
         }
         Ok(Some(LiveResidentBootstrap {
             content,
+            sterile_activation: payload.sterile_activation,
             ..bootstrap_shell
         }))
     }
@@ -249,9 +311,79 @@ fn associated_data(
     bootstrap: &LiveResidentBootstrap,
 ) -> String {
     format!(
+        "sandboxwich-resident-bootstrap-handoff/v2|{id}|{sandbox_id}|{}|{}|{}",
+        bootstrap.tenant_id, bootstrap.generation, bootstrap.sha256
+    )
+}
+
+fn legacy_associated_data(
+    id: ResidentProcessId,
+    sandbox_id: SandboxId,
+    bootstrap: &LiveResidentBootstrap,
+) -> String {
+    format!(
         "sandboxwich-resident-bootstrap-handoff/v1|{id}|{sandbox_id}|{}|{}|{}",
         bootstrap.tenant_id, bootstrap.generation, bootstrap.sha256
     )
+}
+
+async fn activation_matches_durable_fence(
+    db: &Database,
+    id: ResidentProcessId,
+    sandbox_id: SandboxId,
+    activation: Option<&sandboxwich_core::SterileResidentActivationV1>,
+    now: DateTime<Utc>,
+) -> Result<bool, HandoffError> {
+    let Some(activation) = activation else {
+        let sql = format!(
+            "select 1 from resident_processes where id = {} and sterile_lease_id is null",
+            db.placeholder(1)
+        );
+        return Ok(sqlx::query(&sql)
+            .bind(id.to_string())
+            .fetch_optional(&db.pool)
+            .await?
+            .is_some());
+    };
+    let attestation_sha256 = content_digest(activation.lease_attestation.as_bytes());
+    let sql = format!(
+        "select 1
+         from resident_processes rp
+         join sterile_cells sc on sc.id = rp.sterile_cell_id
+         where rp.id = {} and rp.sandbox_id = {} and rp.sterile_cell_id = {}
+           and rp.sterile_lease_id = {} and rp.sterile_lease_generation = {}
+           and sc.state = 'leased' and sc.lease_id = rp.sterile_lease_id
+           and sc.generation = rp.sterile_lease_generation
+           and sc.organization_id = {} and sc.workspace_id = {}
+           and sc.thread_id = {} and sc.runner_session_id = {}
+           and sc.lease_attestation_sha256 = {} and sc.lease_expires_at > {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4),
+        db.placeholder(5),
+        db.placeholder(6),
+        db.placeholder(7),
+        db.placeholder(8),
+        db.placeholder(9),
+        db.placeholder(10),
+        db.placeholder(11),
+    );
+    Ok(sqlx::query(&sql)
+        .bind(id.to_string())
+        .bind(sandbox_id.to_string())
+        .bind(sandbox_id.to_string())
+        .bind(activation.lease_id.to_string())
+        .bind(activation.generation as i64)
+        .bind(&activation.organization_id)
+        .bind(&activation.workspace_id)
+        .bind(&activation.thread_id)
+        .bind(&activation.runner_session_id)
+        .bind(attestation_sha256)
+        .bind(now.to_rfc3339())
+        .fetch_optional(&db.pool)
+        .await?
+        .is_some())
 }
 
 fn content_digest(content: &[u8]) -> String {
@@ -320,6 +452,7 @@ mod tests {
             target_file: "/run/orb/bootstrap".into(),
             mode: 0o600,
             generation: 3,
+            sterile_activation: None,
         }
     }
 
@@ -406,5 +539,30 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn v2_reader_opens_a_legacy_v1_raw_handoff() {
+        let handoff = SharedBootstrapHandoff::new([4u8; 32], DEFAULT_BOOTSTRAP_HANDOFF_TTL);
+        let id = ResidentProcessId::new();
+        let sandbox_id = SandboxId::new();
+        let bootstrap = bootstrap(b"legacy-resident-credential");
+        let nonce = XNonce::from_slice(&[7u8; 24]);
+        let ciphertext = handoff
+            .cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: &bootstrap.content,
+                    aad: legacy_associated_data(id, sandbox_id, &bootstrap).as_bytes(),
+                },
+            )
+            .unwrap();
+
+        let opened = handoff
+            .open_payload(nonce, &ciphertext, id, sandbox_id, &bootstrap)
+            .expect("legacy v1 handoff remains readable during rollout");
+        assert_eq!(opened.content, bootstrap.content);
+        assert!(opened.sterile_activation.is_none());
     }
 }

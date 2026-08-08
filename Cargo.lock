@@ -2039,12 +2039,16 @@ version = "0.1.14"
 dependencies = [
  "anyhow",
  "axum",
+ "axum-server",
  "cap-std",
  "chrono",
  "clap",
  "flate2",
+ "rcgen",
  "reqwest",
  "rustix",
+ "rustls",
+ "rustls-pemfile",
  "sandboxwich-core",
  "serde",
  "serde_json",
@@ -2053,6 +2057,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]
@@ -2144,15 +2149,19 @@ dependencies = [
  "chrono",
  "clap",
  "ipnet",
+ "rcgen",
  "reqwest",
+ "rustls-pemfile",
  "sandboxwich-core",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]
