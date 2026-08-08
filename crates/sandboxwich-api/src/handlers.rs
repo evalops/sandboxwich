@@ -14,4 +14,5 @@ pub(crate) mod sandboxes;
 pub(crate) mod secrets;
 pub(crate) mod snapshots;
 pub(crate) mod ssh;
+pub(crate) mod sterile_cells;
 pub(crate) mod workers;

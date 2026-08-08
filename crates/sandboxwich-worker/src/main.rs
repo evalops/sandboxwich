@@ -1,5 +1,6 @@
 mod egress_gateway;
 mod provider;
+mod sterile_cells;
 
 use std::{
     collections::BTreeMap,
@@ -40,6 +41,8 @@ use sandboxwich_core::{
 };
 use serde_json::json;
 use sha2::Digest;
+use sterile_cells::PrepareArgs as SterilePrepareArgs;
+use sterile_cells::{ClaimArgs as SterileClaimArgs, DestroyArgs as SterileDestroyArgs};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -87,6 +90,9 @@ enum Command {
     Renew(RenewArgs),
     Complete(CompleteArgs),
     Fail(FailArgs),
+    SterilePrepare(SterilePrepareArgs),
+    SterileClaim(SterileClaimArgs),
+    SterileDestroy(SterileDestroyArgs),
     Run(RunArgs),
     Reconcile(ReconcileArgs),
     WorkOnce(WorkOnceArgs),
@@ -1221,6 +1227,18 @@ async fn main() -> anyhow::Result<()> {
                 .send()
                 .await?;
             print_json::<LeaseResponse>(response).await?;
+        }
+        Command::SterilePrepare(args) => {
+            let response = sterile_cells::prepare(&client, &api, args).await?;
+            print_json::<sandboxwich_core::SterileCellResponseV1>(response).await?;
+        }
+        Command::SterileClaim(args) => {
+            let response = sterile_cells::claim(&client, &api, args).await?;
+            print_json::<sandboxwich_core::ClaimSterileCellResponseV1>(response).await?;
+        }
+        Command::SterileDestroy(args) => {
+            let response = sterile_cells::destroy(&client, &api, args).await?;
+            print_json::<sandboxwich_core::SterileCellResponseV1>(response).await?;
         }
         Command::Run(args) => {
             anyhow::ensure!(

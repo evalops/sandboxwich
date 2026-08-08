@@ -42,6 +42,8 @@ mod sandboxes;
 mod secrets;
 #[path = "http_contract/snapshots.rs"]
 mod snapshots;
+#[path = "http_contract/sterile_cells.rs"]
+mod sterile_cells;
 #[path = "http_contract/types.rs"]
 mod types;
 #[path = "http_contract/workers.rs"]

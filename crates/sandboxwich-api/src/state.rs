@@ -921,6 +921,7 @@ pub(crate) struct AppState {
     pub(crate) apex_waiters: ApexInstructionWaiters,
     pub(crate) resident_bootstraps: ResidentBootstrapStore,
     pub(crate) sandbox_lifetime: SandboxLifetimeConfig,
+    pub(crate) sterile_cell_signing_key: Option<Arc<str>>,
     #[cfg(test)]
     pub(crate) apex_callback_test_hook: Option<ApexCallbackTestHook>,
 }

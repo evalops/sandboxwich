@@ -39,6 +39,10 @@ use sandboxwich_core::{
         crate::handlers::maestro_activations::validate_maestro_activation_identity,
         crate::handlers::resident_attestations::redeem_resident_placement_attestation,
         crate::handlers::resident_attestations::validate_resident_placement_attestation,
+        crate::handlers::sterile_cells::prepare_sterile_cell,
+        crate::handlers::sterile_cells::claim_sterile_cell,
+        crate::handlers::sterile_cells::validate_sterile_cell_lease,
+        crate::handlers::sterile_cells::destroy_sterile_cell,
         crate::handlers::operations::get_operation,
         crate::handlers::operations::cancel_operation,
         crate::handlers::divergence::append_tool_call_ledger,
@@ -97,6 +101,20 @@ use sandboxwich_core::{
         ,sandboxwich_core::CreateSandboxRequest
         ,sandboxwich_core::ApexTaskInstructionsReadRequest
         ,sandboxwich_core::ApexTaskInstructionsReadResponse
+        ,sandboxwich_core::SterileCellId
+        ,sandboxwich_core::SterileCellRuntimeClass
+        ,sandboxwich_core::SterileCellState
+        ,sandboxwich_core::SterileCellDisposition
+        ,sandboxwich_core::SterileCellReleaseTrustClassV1
+        ,sandboxwich_core::SterileCellV1
+        ,sandboxwich_core::SterileCellLeaseV1
+        ,sandboxwich_core::PrepareSterileCellRequestV1
+        ,sandboxwich_core::SterileCellResponseV1
+        ,sandboxwich_core::ClaimSterileCellRequestV1
+        ,sandboxwich_core::ClaimSterileCellResponseV1
+        ,sandboxwich_core::ValidateSterileCellLeaseRequestV1
+        ,sandboxwich_core::ValidateSterileCellLeaseResponseV1
+        ,sandboxwich_core::DestroySterileCellRequestV1
     )),
     tags((name = "operations", description = "Asynchronous operation lifecycle"))
 )]
@@ -170,6 +188,8 @@ const PUBLIC_V1_OPERATIONS: &[(&str, &str)] = &[
     ("get", "/v1/jobs"),
     ("post", "/v1/jobs"),
     ("get", "/v1/jobs/{job_id}"),
+    ("post", "/v1/sterile-cells/claim"),
+    ("post", "/v1/sterile-cell-leases/{lease_id}/validate"),
     ("post", "/v1/sandboxes/{sandbox_id}/apex-task-instructions"),
     ("post", "/v1/divergence/reconcile"),
     ("post", "/v1/sandboxes/{sandbox_id}/tool-call-ledger"),
@@ -185,6 +205,11 @@ const PUBLIC_V1_OPERATIONS: &[(&str, &str)] = &[
     ("post", "/v1/ssh-keys/{ssh_key_id}/status"),
     ("post", "/v1/workers/{worker_id}/heartbeat"),
     ("post", "/v1/workers/{worker_id}/drain"),
+    ("post", "/v1/workers/{worker_id}/sterile-cells/prepare"),
+    (
+        "post",
+        "/v1/workers/{worker_id}/sterile-cells/{cell_id}/destroy",
+    ),
     (
         "post",
         "/v1/workers/{worker_id}/sandboxes/{sandbox_id}/guest-token",

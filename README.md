@@ -73,6 +73,9 @@ hostile workloads. Provider-isolated `orb-sidecar` placement additionally
 requires a digest-pinned `SANDBOXWICH_ISOLATED_RESIDENT_PROCESS_IMAGE`; see the
 guide for the boundary and bootstrap-delivery limitations.
 
+The feature-flagged one-shot ready-cell API and Platform handoff are specified
+in [the sterile-cell contract](docs/sterile-cells.md).
+
 By default the CLI talks to `http://127.0.0.1:3217`. Override it with `SANDBOXWICH_API`.
 
 By default the API writes to `sqlite://sandboxwich.db`. Override it with `SANDBOXWICH_DATABASE_URL`, for example `postgres://sandboxwich:secret@localhost:5432/sandboxwich`.

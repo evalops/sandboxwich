@@ -91,6 +91,68 @@
         ],
         "type": "object"
       },
+      "ClaimSterileCellRequestV1": {
+        "properties": {
+          "lease_seconds": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "organization_id": {
+            "type": "string"
+          },
+          "release": {
+            "$ref": "#/components/schemas/SterileCellReleaseTrustClassV1"
+          },
+          "runner_session_id": {
+            "type": "string"
+          },
+          "thread_id": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "release",
+          "organization_id",
+          "workspace_id",
+          "thread_id",
+          "runner_session_id"
+        ],
+        "type": "object"
+      },
+      "ClaimSterileCellResponseV1": {
+        "properties": {
+          "lease": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SterileCellLeaseV1"
+              }
+            ]
+          },
+          "lease_attestation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "type": "object"
+      },
       "CommandId": {
         "format": "uuid",
         "type": "string"
@@ -497,6 +559,28 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "DestroySterileCellRequestV1": {
+        "properties": {
+          "disposition": {
+            "$ref": "#/components/schemas/SterileCellDisposition"
+          },
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lease_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "lease_id",
+          "generation",
+          "disposition"
+        ],
         "type": "object"
       },
       "DivergenceFinding": {
@@ -1351,6 +1435,30 @@
           "cancelled"
         ],
         "type": "string"
+      },
+      "PrepareSterileCellRequestV1": {
+        "properties": {
+          "cell_id": {
+            "$ref": "#/components/schemas/SterileCellId"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "provider_cell_id": {
+            "type": "string"
+          },
+          "release": {
+            "$ref": "#/components/schemas/SterileCellReleaseTrustClassV1"
+          }
+        },
+        "required": [
+          "cell_id",
+          "release",
+          "provider_cell_id",
+          "expires_at"
+        ],
+        "type": "object"
       },
       "ProviderPreference": {
         "enum": [
@@ -2726,6 +2834,168 @@
         ],
         "type": "string"
       },
+      "SterileCellDisposition": {
+        "enum": [
+          "destroyed",
+          "quarantined"
+        ],
+        "type": "string"
+      },
+      "SterileCellId": {
+        "format": "uuid",
+        "type": "string"
+      },
+      "SterileCellLeaseV1": {
+        "properties": {
+          "cell_id": {
+            "$ref": "#/components/schemas/SterileCellId"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lease_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "organization_id": {
+            "type": "string"
+          },
+          "release": {
+            "$ref": "#/components/schemas/SterileCellReleaseTrustClassV1"
+          },
+          "runner_session_id": {
+            "type": "string"
+          },
+          "thread_id": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "lease_id",
+          "cell_id",
+          "generation",
+          "release",
+          "organization_id",
+          "workspace_id",
+          "thread_id",
+          "runner_session_id",
+          "expires_at"
+        ],
+        "type": "object"
+      },
+      "SterileCellReleaseTrustClassV1": {
+        "properties": {
+          "policy_digest": {
+            "type": "string"
+          },
+          "release_set_id": {
+            "type": "string"
+          },
+          "runtime_class": {
+            "$ref": "#/components/schemas/SterileCellRuntimeClass"
+          },
+          "signature": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "release_set_id",
+          "runtime_class",
+          "policy_digest",
+          "signature"
+        ],
+        "type": "object"
+      },
+      "SterileCellResponseV1": {
+        "properties": {
+          "cell": {
+            "$ref": "#/components/schemas/SterileCellV1"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "cell"
+        ],
+        "type": "object"
+      },
+      "SterileCellRuntimeClass": {
+        "description": "Closed isolation classes admitted to the one-shot sterile-cell pool.\n`KataMicrovm` preserves the VM boundary. `GvisorLowerRisk` is a distinct,\nexplicitly signed class and cannot satisfy a Kata claim.",
+        "enum": [
+          "kata_microvm",
+          "gvisor_lower_risk"
+        ],
+        "type": "string"
+      },
+      "SterileCellState": {
+        "enum": [
+          "ready",
+          "leased",
+          "destroyed",
+          "quarantined"
+        ],
+        "type": "string"
+      },
+      "SterileCellV1": {
+        "properties": {
+          "cell_id": {
+            "$ref": "#/components/schemas/SterileCellId"
+          },
+          "disposition": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SterileCellDisposition"
+              }
+            ]
+          },
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "provider_cell_id": {
+            "type": "string"
+          },
+          "release": {
+            "$ref": "#/components/schemas/SterileCellReleaseTrustClassV1"
+          },
+          "state": {
+            "$ref": "#/components/schemas/SterileCellState"
+          },
+          "worker_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "cell_id",
+          "worker_id",
+          "provider_cell_id",
+          "state",
+          "generation",
+          "release",
+          "expires_at"
+        ],
+        "type": "object"
+      },
       "TenantLimitPolicy": {
         "properties": {
           "mutationLimit": {
@@ -2837,6 +3107,54 @@
         },
         "required": [
           "attestationId"
+        ],
+        "type": "object"
+      },
+      "ValidateSterileCellLeaseRequestV1": {
+        "properties": {
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lease_attestation": {
+            "type": "string"
+          },
+          "organization_id": {
+            "type": "string"
+          },
+          "runner_session_id": {
+            "type": "string"
+          },
+          "thread_id": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "lease_attestation",
+          "generation",
+          "organization_id",
+          "workspace_id",
+          "thread_id",
+          "runner_session_id"
+        ],
+        "type": "object"
+      },
+      "ValidateSterileCellLeaseResponseV1": {
+        "properties": {
+          "lease": {
+            "$ref": "#/components/schemas/SterileCellLeaseV1"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "lease"
         ],
         "type": "object"
       },
@@ -4752,6 +5070,117 @@
         }
       }
     },
+    "/v1/sterile-cell-leases/{lease_id}/validate": {
+      "post": {
+        "operationId": "validate_sterile_cell_lease",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "lease_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ValidateSterileCellLeaseRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidateSterileCellLeaseResponseV1"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::sterile_cells"
+        ]
+      }
+    },
+    "/v1/sterile-cells/claim": {
+      "post": {
+        "operationId": "claim_sterile_cell",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClaimSterileCellRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClaimSterileCellResponseV1"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::sterile_cells"
+        ]
+      }
+    },
     "/v1/workers": {
       "get": {
         "operationId": "get_workers",
@@ -4820,6 +5249,137 @@
             "description": "Successful response"
           }
         }
+      }
+    },
+    "/v1/workers/{worker_id}/sterile-cells/prepare": {
+      "post": {
+        "operationId": "prepare_sterile_cell",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "worker_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrepareSterileCellRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SterileCellResponseV1"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::sterile_cells"
+        ]
+      }
+    },
+    "/v1/workers/{worker_id}/sterile-cells/{cell_id}/destroy": {
+      "post": {
+        "operationId": "destroy_sterile_cell",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "worker_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "cell_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DestroySterileCellRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SterileCellResponseV1"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::sterile_cells"
+        ]
       }
     }
   },

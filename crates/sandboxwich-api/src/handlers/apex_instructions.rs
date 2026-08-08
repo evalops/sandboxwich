@@ -792,6 +792,7 @@ mod tests {
             apex_waiters: ApexInstructionWaiters::default(),
             resident_bootstraps: Default::default(),
             sandbox_lifetime: Default::default(),
+            sterile_cell_signing_key: None,
             apex_callback_test_hook: None,
         };
         let ctx = TenantContext {

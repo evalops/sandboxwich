@@ -2,7 +2,12 @@ use crate::bootstrap_handoff::{
     BOOTSTRAP_HANDOFF_KEY_BYTES, DEFAULT_BOOTSTRAP_HANDOFF_TTL, parse_bootstrap_handoff_key,
 };
 use anyhow::Context;
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    io::Read as _,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 pub(crate) const IDENTITY_SERVICE_CLIENT_URI: &str =
     "spiffe://identity.evalops.dev/service/identity/sandboxwich-fence";
@@ -66,6 +71,7 @@ pub(crate) struct ApiConfig {
     pub(crate) bootstrap_handoff_ttl: Duration,
     pub(crate) identity_mtls: Option<IdentityMtlsConfig>,
     pub(crate) sandbox_lifetime: SandboxLifetimeConfig,
+    pub(crate) sterile_cell_signing_key: Option<String>,
 }
 
 /// Server-side default/ceiling for the two active-lifetime reaping knobs
@@ -177,6 +183,13 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
         default_idle_ttl_seconds: parse_env_optional_u64("SANDBOXWICH_DEFAULT_IDLE_TTL_SECONDS")?,
         max_idle_ttl_seconds: parse_env_optional_u64("SANDBOXWICH_MAX_IDLE_TTL_SECONDS")?,
     };
+    let sterile_cells_enabled = parse_env_bool("SANDBOXWICH_STERILE_CELLS_ENABLED", false)?;
+    let sterile_cell_signing_key = load_sterile_cell_signing_key(
+        sterile_cells_enabled,
+        std::env::var_os("SANDBOXWICH_STERILE_CELL_SIGNING_KEY_FILE")
+            .map(PathBuf::from)
+            .as_deref(),
+    )?;
 
     Ok(ApiConfig {
         command,
@@ -197,7 +210,45 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
         bootstrap_handoff_ttl,
         identity_mtls,
         sandbox_lifetime,
+        sterile_cell_signing_key,
     })
+}
+
+fn load_sterile_cell_signing_key(
+    enabled: bool,
+    path: Option<&Path>,
+) -> anyhow::Result<Option<String>> {
+    if !enabled {
+        return Ok(None);
+    }
+    let path = path.context(
+        "SANDBOXWICH_STERILE_CELL_SIGNING_KEY_FILE is required when SANDBOXWICH_STERILE_CELLS_ENABLED is true",
+    )?;
+    let file = std::fs::File::open(path).with_context(|| {
+        format!(
+            "open SANDBOXWICH_STERILE_CELL_SIGNING_KEY_FILE {}",
+            path.display()
+        )
+    })?;
+    let mut bytes = Vec::with_capacity(4097);
+    file.take(4097).read_to_end(&mut bytes).with_context(|| {
+        format!(
+            "read SANDBOXWICH_STERILE_CELL_SIGNING_KEY_FILE {}",
+            path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        bytes.len() <= 4096,
+        "SANDBOXWICH_STERILE_CELL_SIGNING_KEY_FILE exceeds 4096 bytes"
+    );
+    let key = String::from_utf8(bytes)
+        .context("SANDBOXWICH_STERILE_CELL_SIGNING_KEY_FILE is not UTF-8")?;
+    let key = key.trim().to_string();
+    anyhow::ensure!(
+        key.len() >= 32,
+        "SANDBOXWICH_STERILE_CELL_SIGNING_KEY_FILE must contain at least 32 bytes"
+    );
+    Ok(Some(key))
 }
 
 pub(crate) fn parse_identity_mtls_config(
@@ -439,5 +490,27 @@ mod tests {
             Some(3600)
         );
         assert!(parse_optional_u64_value("TEST", Some("not-a-number")).is_err());
+    }
+
+    #[test]
+    fn sterile_cell_signing_key_is_loaded_only_from_a_bounded_secret_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let key_path = directory.path().join("sterile-signing-key");
+        std::fs::write(&key_path, "k".repeat(32)).unwrap();
+        assert_eq!(
+            load_sterile_cell_signing_key(true, Some(&key_path))
+                .unwrap()
+                .as_deref(),
+            Some("kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk")
+        );
+        assert_eq!(
+            load_sterile_cell_signing_key(false, Some(&key_path)).unwrap(),
+            None
+        );
+        assert!(load_sterile_cell_signing_key(true, None).is_err());
+        std::fs::write(&key_path, "short").unwrap();
+        assert!(load_sterile_cell_signing_key(true, Some(&key_path)).is_err());
+        std::fs::write(&key_path, "x".repeat(4097)).unwrap();
+        assert!(load_sterile_cell_signing_key(true, Some(&key_path)).is_err());
     }
 }
