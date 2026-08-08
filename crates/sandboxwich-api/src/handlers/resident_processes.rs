@@ -1,5 +1,7 @@
 use crate::activity::bump_sandbox_activity_best_effort;
-use crate::auth::{ensure_lease_worker_scope, ensure_resident_lease_scope, ensure_sandbox_tenant};
+use crate::auth::{
+    ensure_lease_worker_scope, ensure_resident_lease_scope, ensure_sandbox_tenant, ensure_tenant,
+};
 use crate::db::Database;
 use crate::error::*;
 use crate::handlers::commands::{insert_event, insert_event_on_connection};
@@ -7,6 +9,7 @@ use crate::handlers::jobs::{add_provision_spec_to_payload, insert_job_on_connect
 use crate::handlers::resident_attestations::{
     issue_resident_placement_attestation, record_provider_pod_identity,
 };
+use crate::handlers::sandboxes::fetch_sandbox;
 use crate::handlers::secrets::fetch_sandbox_secret_mounts;
 use crate::rows::{parse_timestamp, row_to_job, row_to_resident_process};
 use crate::state::{
@@ -23,7 +26,7 @@ use chrono::Utc;
 use sandboxwich_core::*;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sqlx::Row;
+use sqlx::{AnyConnection, Row};
 use std::convert::Infallible;
 use std::time::Duration;
 use uuid::Uuid;
@@ -531,6 +534,149 @@ fn same_spec(
                 .as_ref()
                 .map(|value| value.target_file.clone())
         && current.bootstrap_mode == request.bootstrap.as_ref().map(|value| value.mode)
+        && current.sterile_lease_id
+            == request
+                .sterile_activation
+                .as_ref()
+                .map(|activation| activation.lease_id)
+        && current.sterile_lease_generation
+            == request
+                .sterile_activation
+                .as_ref()
+                .map(|activation| activation.generation)
+        && current.sterile_cell_id
+            == request
+                .sterile_activation
+                .as_ref()
+                .map(|_| SterileCellId(current.sandbox_id.0))
+}
+
+async fn fence_sterile_resident_activation_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    tenant_id: &str,
+    sandbox_id: SandboxId,
+    resident_process_id: ResidentProcessId,
+    resident_generation: u64,
+    activation: &SterileResidentActivationV1,
+) -> Result<(), ApiError> {
+    let attestation_sha256 = format!(
+        "{:x}",
+        Sha256::digest(activation.lease_attestation.as_bytes())
+    );
+    let now = Utc::now().to_rfc3339();
+    let sql = format!(
+        "update sterile_cells
+         set activated_resident_process_id = {}, activated_resident_generation = {}
+         where id = {} and tenant_id = {} and state = 'leased'
+           and lease_id = {} and generation = {}
+           and organization_id = {} and workspace_id = {}
+           and thread_id = {} and runner_session_id = {}
+           and lease_attestation_sha256 = {} and lease_expires_at > {}
+           and activated_resident_process_id is null
+           and activated_resident_generation is null",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4),
+        db.placeholder(5),
+        db.placeholder(6),
+        db.placeholder(7),
+        db.placeholder(8),
+        db.placeholder(9),
+        db.placeholder(10),
+        db.placeholder(11),
+        db.placeholder(12),
+    );
+    let matched = sqlx::query(&sql)
+        .bind(resident_process_id.to_string())
+        .bind(
+            i64::try_from(resident_generation)
+                .map_err(|_| ApiError::internal("resident generation exceeds database range"))?,
+        )
+        .bind(sandbox_id.to_string())
+        .bind(tenant_id)
+        .bind(activation.lease_id.to_string())
+        .bind(i64::try_from(activation.generation).map_err(|_| {
+            ApiError::bad_request("sterile activation generation exceeds database range")
+        })?)
+        .bind(&activation.organization_id)
+        .bind(&activation.workspace_id)
+        .bind(&activation.thread_id)
+        .bind(&activation.runner_session_id)
+        .bind(attestation_sha256)
+        .bind(now)
+        .execute(connection)
+        .await?;
+    if matched.rows_affected() != 1 {
+        return Err(ApiError::conflict_code(
+            "sterile_resident_activation_invalid",
+            "sterile resident activation does not match one exact live leased cell",
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_sterile_resident_activation_replay(
+    db: &Database,
+    tenant_id: &str,
+    sandbox_id: SandboxId,
+    resident_process_id: ResidentProcessId,
+    resident_generation: u64,
+    activation: &SterileResidentActivationV1,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "select 1 from sterile_cells
+         where id = {} and tenant_id = {} and state = 'leased'
+           and lease_id = {} and generation = {}
+           and organization_id = {} and workspace_id = {}
+           and thread_id = {} and runner_session_id = {}
+           and lease_attestation_sha256 = {} and lease_expires_at > {}
+           and activated_resident_process_id = {}
+           and activated_resident_generation = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4),
+        db.placeholder(5),
+        db.placeholder(6),
+        db.placeholder(7),
+        db.placeholder(8),
+        db.placeholder(9),
+        db.placeholder(10),
+        db.placeholder(11),
+        db.placeholder(12),
+    );
+    let matched = sqlx::query(&sql)
+        .bind(sandbox_id.to_string())
+        .bind(tenant_id)
+        .bind(activation.lease_id.to_string())
+        .bind(i64::try_from(activation.generation).map_err(|_| {
+            ApiError::bad_request("sterile activation generation exceeds database range")
+        })?)
+        .bind(&activation.organization_id)
+        .bind(&activation.workspace_id)
+        .bind(&activation.thread_id)
+        .bind(&activation.runner_session_id)
+        .bind(format!(
+            "{:x}",
+            Sha256::digest(activation.lease_attestation.as_bytes())
+        ))
+        .bind(Utc::now().to_rfc3339())
+        .bind(resident_process_id.to_string())
+        .bind(
+            i64::try_from(resident_generation)
+                .map_err(|_| ApiError::internal("resident generation exceeds database range"))?,
+        )
+        .fetch_optional(&db.pool)
+        .await?;
+    if matched.is_none() {
+        return Err(ApiError::conflict_code(
+            "sterile_resident_activation_invalid",
+            "sterile resident activation does not match the bound live leased cell",
+        ));
+    }
+    Ok(())
 }
 
 #[utoipa::path(
@@ -554,6 +700,11 @@ pub(crate) async fn put_resident_process(
 ) -> Result<(StatusCode, Json<ResidentProcessResponse>), ApiError> {
     validate_resident_process_request(&request)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if request.sterile_activation.is_some() && !state.sterile_resident_activation_enabled {
+        return Err(ApiError::not_found(
+            "sterile resident activation is not enabled",
+        ));
+    }
     if !is_supported_resident_process_name(&name) {
         return Err(ApiError::bad_request(
             "the resident-process contract supports only orb-executor, orb-sidecar, and maestro-hosted-runner",
@@ -725,7 +876,19 @@ pub(crate) async fn put_resident_process(
         }
     }
     let sandbox_id = SandboxId(sandbox_id);
-    let sandbox = ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?;
+    // The pool lifecycle intentionally hides leased sterile sandboxes from
+    // ordinary tenant operations. Activation is the one narrow admission
+    // path: fetch the purpose-created sandbox directly, establish tenant
+    // ownership, then prove its exact live sterile lease inside the insert
+    // transaction below. The activation-absent path retains the ordinary
+    // sandbox policy unchanged.
+    let sandbox = if request.sterile_activation.is_some() {
+        let sandbox = fetch_sandbox(&state.db, sandbox_id).await?;
+        ensure_tenant(&sandbox.tenant_id, &ctx)?;
+        sandbox
+    } else {
+        ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?
+    };
     let workspace_claim_name = if name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME {
         if sandbox.workspace_mode != WorkspaceMode::Persistent {
             return Err(ApiError::bad_request_code(
@@ -784,7 +947,13 @@ pub(crate) async fn put_resident_process(
     let bootstrap_digest = request
         .bootstrap
         .as_ref()
-        .map(|bootstrap| format!("{:x}", Sha256::digest(&bootstrap.content)));
+        .map(|bootstrap| format!("{:x}", Sha256::digest(&bootstrap.content)))
+        .or_else(|| {
+            request
+                .sterile_activation
+                .as_ref()
+                .map(|_| format!("{:x}", Sha256::digest([])))
+        });
     let is_maestro_hosted_runner = name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME;
 
     if let Ok(current) = fetch_named_resident_process(&state.db, sandbox_id, &name).await {
@@ -806,6 +975,17 @@ pub(crate) async fn put_resident_process(
             ));
         }
         if same_spec(&current, &request, bootstrap_digest.as_deref()) {
+            if let Some(activation) = request.sterile_activation.as_ref() {
+                validate_sterile_resident_activation_replay(
+                    &state.db,
+                    &current.tenant_id,
+                    current.sandbox_id,
+                    current.id,
+                    current.generation,
+                    activation,
+                )
+                .await?;
+            }
             return Ok((
                 StatusCode::OK,
                 Json(ResidentProcessResponse {
@@ -845,6 +1025,18 @@ pub(crate) async fn put_resident_process(
             .as_ref()
             .map(|value| value.target_file.clone()),
         bootstrap_mode: request.bootstrap.as_ref().map(|value| value.mode),
+        sterile_cell_id: request
+            .sterile_activation
+            .as_ref()
+            .map(|_| SterileCellId(sandbox_id.0)),
+        sterile_lease_id: request
+            .sterile_activation
+            .as_ref()
+            .map(|activation| activation.lease_id),
+        sterile_lease_generation: request
+            .sterile_activation
+            .as_ref()
+            .map(|activation| activation.generation),
         restart_policy: request.restart_policy,
         desired_state: ResidentProcessDesiredState::Running,
         observed_state: ResidentProcessObservedState::Pending,
@@ -899,6 +1091,23 @@ pub(crate) async fn put_resident_process(
         updated_at: now,
         last_error: None,
     };
+    if let (Some(cell_id), Some(lease_id), Some(generation)) = (
+        process.sterile_cell_id,
+        process.sterile_lease_id,
+        process.sterile_lease_generation,
+    ) {
+        job.payload
+            .as_object_mut()
+            .expect("resident-process payload is an object")
+            .insert(
+                "sterileActivation".into(),
+                json!({
+                    "cellId": cell_id,
+                    "leaseId": lease_id,
+                    "generation": generation,
+                }),
+            );
+    }
     let secret_mounts = fetch_sandbox_secret_mounts(&state.db, sandbox.id).await?;
     add_provision_spec_to_payload(&mut job, &sandbox, &secret_mounts)?;
     if let Some(workspace_claim_name) = workspace_claim_name {
@@ -911,24 +1120,35 @@ pub(crate) async fn put_resident_process(
             );
     }
 
-    let bootstrap_reservation = request
-        .bootstrap
-        .map(|bootstrap| {
+    let sterile_activation = request.sterile_activation.take();
+    let bootstrap_reservation = match request.bootstrap.take() {
+        Some(bootstrap) => Some(state.resident_bootstraps.reserve(LiveResidentBootstrap {
+            tenant_id: process.tenant_id.clone(),
+            content: bootstrap.content,
+            sha256: bootstrap_digest.clone().unwrap_or_default(),
+            target_file: bootstrap.target_file,
+            mode: bootstrap.mode,
+            generation: process.generation,
+            sterile_activation: sterile_activation.clone(),
+        })),
+        None => sterile_activation.clone().map(|activation| {
             state.resident_bootstraps.reserve(LiveResidentBootstrap {
                 tenant_id: process.tenant_id.clone(),
-                content: bootstrap.content,
+                content: Vec::new(),
                 sha256: bootstrap_digest.clone().unwrap_or_default(),
-                target_file: bootstrap.target_file,
-                mode: bootstrap.mode,
+                target_file: String::new(),
+                mode: 0,
                 generation: process.generation,
+                sterile_activation: Some(activation),
             })
-        })
-        .transpose()
-        .map_err(|_| ApiError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "resident_bootstrap_capacity",
-            message: "resident bootstrap capacity is exhausted".into(),
-        })?;
+        }),
+    }
+    .transpose()
+    .map_err(|_| ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "resident_bootstrap_capacity",
+        message: "resident bootstrap capacity is exhausted".into(),
+    })?;
 
     let handoff_bootstrap = bootstrap_reservation
         .as_ref()
@@ -940,12 +1160,25 @@ pub(crate) async fn put_resident_process(
             id, sandbox_id, tenant_id, name, argv, cwd, env,
             bootstrap_sha256, bootstrap_byte_count, bootstrap_target_file, bootstrap_mode,
             restart_policy, desired_state, observed_state, generation,
-            provider_isolation_version,
+            provider_isolation_version, sterile_cell_id, sterile_lease_id,
+            sterile_lease_generation,
             created_at, updated_at
          ) values ({})",
-        state.db.placeholders(18)
+        state.db.placeholders(21)
     );
     let mut tx = state.db.pool.begin().await?;
+    if let Some(activation) = sterile_activation.as_ref() {
+        fence_sterile_resident_activation_on_connection(
+            &state.db,
+            &mut tx,
+            &process.tenant_id,
+            process.sandbox_id,
+            process.id,
+            process.generation,
+            activation,
+        )
+        .await?;
+    }
     sqlx::query(&insert_sql)
         .bind(process.id.to_string())
         .bind(process.sandbox_id.to_string())
@@ -972,6 +1205,9 @@ pub(crate) async fn put_resident_process(
                 0
             },
         )
+        .bind(process.sterile_cell_id.map(|value| value.to_string()))
+        .bind(process.sterile_lease_id.map(|value| value.to_string()))
+        .bind(process.sterile_lease_generation.map(|value| value as i64))
         .bind(process.created_at.to_rfc3339())
         .bind(process.updated_at.to_rfc3339())
         .execute(&mut *tx)
@@ -1348,6 +1584,7 @@ pub(crate) async fn read_resident_process_bootstrap(
         target_file: bootstrap.target_file,
         mode: bootstrap.mode,
         placement_attestation,
+        sterile_activation: bootstrap.sterile_activation,
     }))
 }
 

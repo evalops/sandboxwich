@@ -153,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
         resident_bootstraps,
         sandbox_lifetime: config.sandbox_lifetime,
         sterile_cell_signing_key: config.sterile_cell_signing_key.map(Arc::<str>::from),
+        sterile_resident_activation_enabled: config.sterile_resident_activation_enabled,
         #[cfg(test)]
         apex_callback_test_hook: None,
     };

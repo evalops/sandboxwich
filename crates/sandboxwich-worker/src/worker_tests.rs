@@ -336,6 +336,7 @@ fn resident_bootstrap() -> ResidentProcessBootstrapReadResponse {
         target_file: "/run/sandboxwich/bootstrap/token".to_string(),
         mode: 0o400,
         placement_attestation: None,
+        sterile_activation: None,
     }
 }
 

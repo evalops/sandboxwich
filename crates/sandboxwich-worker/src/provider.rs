@@ -1424,6 +1424,12 @@ impl KubernetesDryRunProvider {
                 "value": "2222"
             }),
         ];
+        if let Some(candidate) = spec.sterile_pool_candidate.as_ref() {
+            env.push(json!({
+                "name": "SANDBOXWICH_STERILE_POOL_CANDIDATE_V1",
+                "value": json!(candidate).to_string()
+            }));
+        }
         if self
             .guest_credentials
             .as_ref()

@@ -1347,6 +1347,7 @@ impl TestServer {
                     )
                     .env("SANDBOXWICH_OPERATOR_TOKEN", TEST_OPERATOR_TOKEN)
                     .env("SANDBOXWICH_STERILE_CELLS_ENABLED", "true")
+                    .env("SANDBOXWICH_STERILE_RESIDENT_ACTIVATION_ENABLED", "true")
                     .env(
                         "SANDBOXWICH_STERILE_CELL_SIGNING_KEY_FILE",
                         &signing_key_path,

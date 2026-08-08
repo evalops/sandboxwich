@@ -109,10 +109,13 @@ The worker binary exposes `sterile-prepare`, `sterile-claim`, and
 `sterile-destroy` actions for the three lifecycle calls. The worker-scoped
 token is required for prepare, lookup, ready-cell retirement, and destroy.
 Platform uses its tenant-scoped token for claim. `sterile-claim` requires an
-explicit `--claim-id` so retries can reuse the same fence.
+explicit `--claim-id` so retries can reuse the same fence. It also requires
+`--attestation-output-file`. The command creates that file with mode `0600`
+and fails if the path already exists. Standard output contains the lease
+locator and redacted metadata; it never contains the raw attestation.
 
-The sterile child receives the claim fields and raw attestation through a
-read-only file. Configure the agent daemon with:
+The legacy direct-start path supplies the claim fields and raw attestation
+through a read-only file. Configure the agent daemon with:
 
 ```text
 SANDBOXWICH_STERILE_LEASE_ID
@@ -128,6 +131,44 @@ If one value is present, all seven are required. The daemon validates the
 lease through Sandboxwich before its first ready heartbeat or lease claim.
 Attestation bytes do not go on argv or into provider metadata.
 
+## Resident activation
+
+Resident activation has a separate feature flag and is disabled by default:
+
+```text
+SANDBOXWICH_STERILE_RESIDENT_ACTIVATION_ENABLED=true
+```
+
+A resident request may include `sterileActivation` with the lease ID,
+generation, exact organization/workspace/thread/runner-session tuple, and raw
+attestation. The sandbox ID must equal the purpose-created cell ID. Admission
+checks the live leased cell, tenant, tuple, attestation hash, and expiry in the
+resident insert transaction. That transaction binds one resident process ID
+and generation to the cell. A different resident identity receives `409`.
+
+The resident row and queued job contain only the cell ID, lease ID, and lease
+generation. The API keeps the raw attestation in the bounded in-memory
+bootstrap store or in its encrypted shared handoff. An activation without a
+file bootstrap uses a zero-byte internal handoff; its resident row has no
+bootstrap target or mode. The agent reads the handoff under the active job
+lease, validates the raw attestation immediately before bootstrap preparation
+and each process spawn, and rejects an expired or mismatched lease. A stale
+queued activation is marked dead and its cell is quarantined during claim so
+it cannot block later jobs.
+
+Purpose-created prewarmed agents receive the immutable non-secret
+`SANDBOXWICH_STERILE_POOL_CANDIDATE_V1` marker. Its JSON contains the cell ID
+and signed release tuple. The release signature carries no secret key material.
+Candidate agents accept only gated resident jobs for that cell and release.
+Agents without the marker reject gated jobs, and candidate agents reject
+ungated jobs. The raw lease attestation is never placed in this marker, an
+environment variable, argv, a job, provider metadata, or a log entry.
+
+The seven startup settings remain available for the legacy direct-start mode.
+Prewarmed pool agents start before a lease exists and therefore use the
+immutable candidate marker plus the resident activation handoff. They receive
+no post-start environment injection.
+
 ## Platform request sequence
 
 1. Select the release set, runtime class, and policy digest required by the
@@ -136,8 +177,8 @@ Attestation bytes do not go on argv or into provider metadata.
    `claim_id` and the tenant-authenticated tuple. Reuse that ID and the exact
    body after an ambiguous response.
 3. When `lease` is null, use the existing cold sandbox path.
-4. Deliver the returned attestation to the leased child through a read-only
-   file and pass the six non-secret fence values as environment variables.
+4. Put the resident process with `sterileActivation`. The API transfers the
+   raw attestation through the resident bootstrap handoff.
 5. Permit tenant bootstrap only after the agent's validation call succeeds.
 6. After execution, delete every provider object for the child and call the
    destroy endpoint with the lease ID and generation.

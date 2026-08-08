@@ -72,6 +72,7 @@ pub(crate) struct ApiConfig {
     pub(crate) identity_mtls: Option<IdentityMtlsConfig>,
     pub(crate) sandbox_lifetime: SandboxLifetimeConfig,
     pub(crate) sterile_cell_signing_key: Option<String>,
+    pub(crate) sterile_resident_activation_enabled: bool,
 }
 
 /// Server-side default/ceiling for the two active-lifetime reaping knobs
@@ -190,6 +191,8 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
             .map(PathBuf::from)
             .as_deref(),
     )?;
+    let sterile_resident_activation_enabled =
+        parse_env_bool("SANDBOXWICH_STERILE_RESIDENT_ACTIVATION_ENABLED", false)?;
 
     Ok(ApiConfig {
         command,
@@ -211,6 +214,7 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
         identity_mtls,
         sandbox_lifetime,
         sterile_cell_signing_key,
+        sterile_resident_activation_enabled,
     })
 }
 

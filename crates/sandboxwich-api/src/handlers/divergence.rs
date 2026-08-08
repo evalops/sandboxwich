@@ -533,6 +533,7 @@ mod tests {
             resident_bootstraps: Default::default(),
             sandbox_lifetime: Default::default(),
             sterile_cell_signing_key: None,
+            sterile_resident_activation_enabled: false,
             apex_callback_test_hook: None,
         }
     }

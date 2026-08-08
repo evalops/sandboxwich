@@ -449,6 +449,7 @@ fn add_provision_spec_to_payload_with_identity(
             tenant_id: Some(sandbox.tenant_id.clone()),
             provider_external_id,
             provider_routing_scope,
+            sterile_pool_candidate: None,
         })?,
     );
     Ok(())
@@ -986,6 +987,178 @@ pub(crate) fn effective_lease_seconds(requested: Option<u64>) -> u64 {
         .unwrap_or(DEFAULT_LEASE_SECONDS)
 }
 
+async fn recheck_sterile_resident_activation_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    job: &Job,
+) -> Result<(), ApiError> {
+    if job.kind != JobKind::RunResidentProcess {
+        return Ok(());
+    }
+    let process_id = resident_process_id_from_job(job)?;
+    let resident_generation = job
+        .payload
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| ApiError::internal("resident process job is missing generation"))?;
+    let activation = job.payload.get("sterileActivation");
+    let (cell_id, lease_id, lease_generation) = match activation {
+        None => {
+            let sql = format!(
+                "select 1 from resident_processes
+                 where id = {} and generation = {}
+                   and sterile_cell_id is null and sterile_lease_id is null
+                   and sterile_lease_generation is null",
+                db.placeholder(1),
+                db.placeholder(2),
+            );
+            if sqlx::query(&sql)
+                .bind(process_id.to_string())
+                .bind(i64::try_from(resident_generation).map_err(|_| {
+                    ApiError::internal("resident generation exceeds database range")
+                })?)
+                .fetch_optional(connection)
+                .await?
+                .is_none()
+            {
+                return Err(ApiError::conflict_code(
+                    "sterile_resident_activation_fence_mismatch",
+                    "ungated resident job does not match its durable activation fence",
+                ));
+            }
+            return Ok(());
+        }
+        Some(activation) => {
+            let cell_id = activation
+                .get("cellId")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| ApiError::internal("sterile resident job is missing cell id"))?;
+            let lease_id = activation
+                .get("leaseId")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| ApiError::internal("sterile resident job is missing lease id"))?;
+            let generation = activation
+                .get("generation")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| ApiError::internal("sterile resident job is missing generation"))?;
+            (cell_id, lease_id, generation)
+        }
+    };
+    let sandbox_id = sandbox_id_from_job(job)?;
+    if cell_id != sandbox_id.to_string() {
+        return Err(ApiError::conflict_code(
+            "sterile_resident_activation_fence_mismatch",
+            "sterile resident cell does not match the job sandbox",
+        ));
+    }
+    let sql = format!(
+        "select 1
+         from resident_processes rp
+         join sterile_cells sc on sc.id = rp.sterile_cell_id
+         where rp.id = {} and rp.tenant_id = {} and rp.generation = {}
+           and rp.sterile_cell_id = {} and rp.sterile_lease_id = {}
+           and rp.sterile_lease_generation = {}
+           and sc.tenant_id = rp.tenant_id and sc.state = 'leased'
+           and sc.activated_resident_process_id = rp.id
+           and sc.activated_resident_generation = rp.generation
+           and sc.lease_id = rp.sterile_lease_id
+           and sc.generation = rp.sterile_lease_generation
+           and sc.lease_expires_at > {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4),
+        db.placeholder(5),
+        db.placeholder(6),
+        db.placeholder(7),
+    );
+    let matched = sqlx::query(&sql)
+        .bind(process_id.to_string())
+        .bind(&job.tenant_id)
+        .bind(
+            i64::try_from(resident_generation)
+                .map_err(|_| ApiError::internal("resident generation exceeds database range"))?,
+        )
+        .bind(cell_id)
+        .bind(lease_id)
+        .bind(
+            i64::try_from(lease_generation).map_err(|_| {
+                ApiError::internal("sterile lease generation exceeds database range")
+            })?,
+        )
+        .bind(Utc::now().to_rfc3339())
+        .fetch_optional(connection)
+        .await?;
+    if matched.is_none() {
+        return Err(ApiError::conflict_code(
+            "sterile_resident_activation_fence_mismatch",
+            "sterile resident activation is no longer live at job claim",
+        ));
+    }
+    Ok(())
+}
+
+async fn quarantine_invalid_sterile_resident_job(db: &Database, job: &Job) -> Result<(), ApiError> {
+    let Some(activation) = job.payload.get("sterileActivation") else {
+        return Ok(());
+    };
+    let Some(cell_id) = activation.get("cellId").and_then(serde_json::Value::as_str) else {
+        return Ok(());
+    };
+    let process_id = resident_process_id_from_job(job)?;
+    let now = Utc::now().to_rfc3339();
+    let mut tx = db.pool.begin().await?;
+    let job_sql = format!(
+        "update jobs set status = 'dead', last_error = {}, updated_at = {}
+         where id = {} and status = 'queued'",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+    );
+    let terminalized = sqlx::query(&job_sql)
+        .bind("sterile resident activation expired or changed before claim")
+        .bind(&now)
+        .bind(job.id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    if terminalized.rows_affected() == 1 {
+        let process_sql = format!(
+            "update resident_processes
+             set desired_state = 'stopped', observed_state = 'failed',
+                 last_error = {}, updated_at = {}
+             where id = {} and sterile_cell_id = {}",
+            db.placeholder(1),
+            db.placeholder(2),
+            db.placeholder(3),
+            db.placeholder(4),
+        );
+        sqlx::query(&process_sql)
+            .bind("sterile resident activation expired or changed before claim")
+            .bind(&now)
+            .bind(process_id.to_string())
+            .bind(cell_id)
+            .execute(&mut *tx)
+            .await?;
+        let cell_sql = format!(
+            "update sterile_cells
+             set state = 'quarantined', disposition = 'quarantined',
+                 destroyed_at = {}, updated_at = {}
+             where id = {} and state = 'leased'",
+            db.placeholder(1),
+            db.placeholder(2),
+            db.placeholder(3),
+        );
+        sqlx::query(&cell_sql)
+            .bind(&now)
+            .bind(&now)
+            .bind(cell_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 pub(crate) async fn try_claim_job(
     db: &Database,
     worker: &Worker,
@@ -1017,6 +1190,7 @@ pub(crate) async fn try_claim_job(
         if active_leases >= worker.max_concurrent_jobs {
             return Ok(None);
         }
+        recheck_sterile_resident_activation_on_connection(db, &mut tx, job).await?;
 
         let now = Utc::now();
         let attempt = job.attempts + 1;
@@ -1124,6 +1298,10 @@ pub(crate) async fn try_claim_job(
         Err(error) => {
             if let Err(rollback_error) = tx.rollback().await {
                 tracing::warn!(%rollback_error, "failed to roll back lease claim");
+            }
+            if error.code == "sterile_resident_activation_fence_mismatch" {
+                quarantine_invalid_sterile_resident_job(db, job).await?;
+                return Ok(None);
             }
             Err(error)
         }

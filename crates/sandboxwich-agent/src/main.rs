@@ -272,6 +272,12 @@ struct DaemonArgs {
     #[command(flatten)]
     sterile_lease_gate: SterileLeaseGateArgs,
 
+    /// Immutable scheduler-derived identity of a purpose-created sterile pool
+    /// pod. The Kubernetes provider renders the exact JSON marker; ordinary
+    /// pods have no value and therefore reject gated resident jobs.
+    #[arg(long, env = "SANDBOXWICH_STERILE_POOL_CANDIDATE_V1")]
+    sterile_pool_candidate: Option<String>,
+
     /// Pre-provisioned sandbox-scoped guest credential (`sbw_gtok_...`, see
     /// GH-64's guest-token endpoint) to use for guest-facing calls
     /// (claim/renew/complete/fail/output, guest-health) instead of the
@@ -499,6 +505,18 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
     let api_token = resolve_api_token(args.api_token_file, args.api_token)?;
     let client = build_api_client(api_token.as_deref(), args.tenant.as_deref())?;
     let sandbox_id = SandboxId(args.sandbox_id);
+    let sterile_pool_candidate = args
+        .sterile_pool_candidate
+        .as_deref()
+        .map(serde_json::from_str::<sandboxwich_core::SterilePoolCandidateV1>)
+        .transpose()
+        .context("SANDBOXWICH_STERILE_POOL_CANDIDATE_V1 is not a valid candidate marker")?;
+    if let Some(candidate) = sterile_pool_candidate.as_ref() {
+        anyhow::ensure!(
+            candidate.cell_id.0 == sandbox_id.0,
+            "sterile pool candidate cell does not match SANDBOXWICH_SANDBOX_ID"
+        );
+    }
 
     // A daemon with a worker id is an executor. It must not claim work until
     // it has a credential bound to this exact sandbox: falling back to the
@@ -661,6 +679,8 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
                         }
                         let client = guest_session.client.clone();
                         let api = api.clone();
+                        let sterile_cell_lease = sterile_lease.clone();
+                        let sterile_pool_candidate = sterile_pool_candidate.clone();
                         resident_processes.spawn(metadata, async move {
                             handle_lease(
                                 &client,
@@ -668,6 +688,8 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
                                 sandbox_id,
                                 lease,
                                 args.max_captured_output_bytes,
+                                sterile_cell_lease,
+                                sterile_pool_candidate,
                             )
                             .await
                         })?;
@@ -677,6 +699,8 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
                         sandbox_id,
                         lease,
                         args.max_captured_output_bytes,
+                        sterile_lease.clone(),
+                        sterile_pool_candidate.clone(),
                     )
                     .await
                     {
@@ -1801,6 +1825,8 @@ async fn handle_lease(
     sandbox_id: SandboxId,
     lease: sandboxwich_core::JobLease,
     max_captured_output_bytes: u64,
+    sterile_cell_lease: Option<sandboxwich_core::SterileCellLeaseV1>,
+    sterile_pool_candidate: Option<sandboxwich_core::SterilePoolCandidateV1>,
 ) -> anyhow::Result<LeaseResponse> {
     if let Some(violation) = lease_scope_violation(&lease.job, sandbox_id) {
         eprintln!(
@@ -1814,7 +1840,15 @@ async fn handle_lease(
     }
 
     if lease.job.kind == JobKind::RunResidentProcess {
-        return handle_resident_process(client, api, lease).await;
+        return handle_resident_process(
+            client,
+            api,
+            sandbox_id,
+            lease,
+            sterile_cell_lease,
+            sterile_pool_candidate,
+        )
+        .await;
     }
 
     let request = agent_request_from_payload(&lease.job.payload)?;
@@ -2179,21 +2213,142 @@ async fn reconcile_resident_cancellation(
 async fn handle_resident_process(
     client: &reqwest::Client,
     api: &str,
+    sandbox_id: SandboxId,
     lease: sandboxwich_core::JobLease,
+    sterile_cell_lease: Option<sandboxwich_core::SterileCellLeaseV1>,
+    sterile_pool_candidate: Option<sandboxwich_core::SterilePoolCandidateV1>,
 ) -> anyhow::Result<LeaseResponse> {
     handle_resident_process_with_bootstrap_root(
         client,
         api,
+        sandbox_id,
         lease,
+        sterile_cell_lease,
+        sterile_pool_candidate,
         Path::new("/run/sandboxwich/bootstrap"),
     )
     .await
 }
 
+async fn validate_resident_sterile_activation(
+    client: &reqwest::Client,
+    api: &str,
+    sandbox_id: SandboxId,
+    fence: Option<&sandboxwich_core::SterileResidentActivationFenceV1>,
+    daemon_lease: Option<&sandboxwich_core::SterileCellLeaseV1>,
+    pool_candidate: Option<&sandboxwich_core::SterilePoolCandidateV1>,
+    activation: Option<&sandboxwich_core::SterileResidentActivationV1>,
+) -> anyhow::Result<()> {
+    match (fence, activation) {
+        (None, None) if daemon_lease.is_none() && pool_candidate.is_none() => return Ok(()),
+        (Some(fence), Some(activation)) => {
+            anyhow::ensure!(
+                daemon_lease.is_some() || pool_candidate.is_some(),
+                "ordinary agent rejected a gated sterile resident job"
+            );
+            anyhow::ensure!(
+                fence.cell_id.0 == sandbox_id.0
+                    && activation.lease_id == fence.lease_id
+                    && activation.generation == fence.generation,
+                "resident sterile activation does not match the job fence"
+            );
+        }
+        _ => anyhow::bail!("resident sterile activation gated/ungated mismatch"),
+    }
+    let fence = fence.expect("matched above");
+    let activation = activation.expect("matched above");
+    let response = client
+        .post(format!(
+            "{api}/sterile-cell-leases/{}/validate",
+            fence.lease_id
+        ))
+        .json(&ValidateSterileCellLeaseRequestV1 {
+            lease_attestation: activation.lease_attestation.clone(),
+            generation: activation.generation,
+            organization_id: activation.organization_id.clone(),
+            workspace_id: activation.workspace_id.clone(),
+            thread_id: activation.thread_id.clone(),
+            runner_session_id: activation.runner_session_id.clone(),
+        })
+        .send()
+        .await
+        .context("revalidate sterile resident activation")?;
+    let validated: ValidateSterileCellLeaseResponseV1 = decode_json(response)
+        .await
+        .map_err(|error| anyhow::anyhow!("sterile resident activation rejected: {error}"))?;
+    anyhow::ensure!(
+        validated.lease.cell_id == fence.cell_id
+            && validated.lease.lease_id == fence.lease_id
+            && validated.lease.generation == fence.generation
+            && validated.lease.organization_id == activation.organization_id
+            && validated.lease.workspace_id == activation.workspace_id
+            && validated.lease.thread_id == activation.thread_id
+            && validated.lease.runner_session_id == activation.runner_session_id
+            && validated.lease.expires_at > Utc::now(),
+        "sterile resident activation validation returned a mismatched or expired lease"
+    );
+    if let Some(daemon_lease) = daemon_lease {
+        anyhow::ensure!(
+            &validated.lease == daemon_lease,
+            "resident sterile activation does not match the legacy startup lease"
+        );
+    }
+    if let Some(candidate) = pool_candidate {
+        anyhow::ensure!(
+            candidate.cell_id == validated.lease.cell_id
+                && candidate.release == validated.lease.release,
+            "sterile resident activation does not match the immutable pool candidate"
+        );
+    }
+    Ok(())
+}
+
+fn prepare_resident_bootstrap_file(
+    bootstrap: &ResidentProcessBootstrapReadResponse,
+    bootstrap_root: &Path,
+    run_as_uid: Option<u32>,
+) -> anyhow::Result<()> {
+    if bootstrap.target_file.is_empty() {
+        anyhow::ensure!(
+            bootstrap.content.is_empty() && bootstrap.mode == 0,
+            "activation-only resident handoff contains bootstrap file data"
+        );
+        return Ok(());
+    }
+    let target = Path::new(&bootstrap.target_file);
+    anyhow::ensure!(
+        target.starts_with(bootstrap_root),
+        "resident bootstrap path is outside the allowed root"
+    );
+    let parent = target
+        .parent()
+        .context("resident bootstrap has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(bootstrap.mode);
+    let mut file = options
+        .open(target)
+        .with_context(|| format!("failed to create {}", target.display()))?;
+    file.write_all(&bootstrap.content)?;
+    file.sync_all()?;
+    transfer_resident_bootstrap_ownership(&file, run_as_uid).with_context(|| {
+        format!(
+            "failed to transfer {} to the resident-process identity",
+            target.display()
+        )
+    })?;
+    Ok(())
+}
+
 async fn handle_resident_process_with_bootstrap_root(
     client: &reqwest::Client,
     api: &str,
+    sandbox_id: SandboxId,
     lease: sandboxwich_core::JobLease,
+    sterile_cell_lease: Option<sandboxwich_core::SterileCellLeaseV1>,
+    sterile_pool_candidate: Option<sandboxwich_core::SterilePoolCandidateV1>,
     bootstrap_root: &Path,
 ) -> anyhow::Result<LeaseResponse> {
     let metadata = ResidentProcessTaskMetadata::from_lease(&lease)?;
@@ -2250,6 +2405,22 @@ async fn handle_resident_process_with_bootstrap_root(
         .get("bootstrapSha256")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    let sterile_activation_fence = lease
+        .job
+        .payload
+        .get("sterileActivation")
+        .cloned()
+        .map(serde_json::from_value::<sandboxwich_core::SterileResidentActivationFenceV1>)
+        .transpose()
+        .context("resident sterile activation fence is invalid")?;
+    if let Some(fence) = sterile_activation_fence {
+        anyhow::ensure!(
+            fence.cell_id.0 == sandbox_id.0,
+            "resident sterile activation cell does not match this sandbox"
+        );
+    }
+
+    let mut delivered_sterile_activation = None;
 
     if let Some(expected_sha256) = expected_sha256 {
         let bootstrap: ResidentProcessBootstrapReadResponse = decode_json(
@@ -2264,33 +2435,18 @@ async fn handle_resident_process_with_bootstrap_root(
                 .await?,
         )
         .await?;
-        let prepare = (|| -> anyhow::Result<()> {
-            let target = Path::new(&bootstrap.target_file);
-            anyhow::ensure!(
-                target.starts_with(bootstrap_root),
-                "resident bootstrap path is outside the allowed root"
-            );
-            let parent = target
-                .parent()
-                .context("resident bootstrap has no parent")?;
-            std::fs::create_dir_all(parent)?;
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            options.mode(bootstrap.mode);
-            let mut file = options
-                .open(target)
-                .with_context(|| format!("failed to create {}", target.display()))?;
-            file.write_all(&bootstrap.content)?;
-            file.sync_all()?;
-            transfer_resident_bootstrap_ownership(&file, run_as_uid).with_context(|| {
-                format!(
-                    "failed to transfer {} to the resident-process identity",
-                    target.display()
-                )
-            })?;
-            Ok(())
-        })();
+        validate_resident_sterile_activation(
+            client,
+            api,
+            sandbox_id,
+            sterile_activation_fence.as_ref(),
+            sterile_cell_lease.as_ref(),
+            sterile_pool_candidate.as_ref(),
+            bootstrap.sterile_activation.as_ref(),
+        )
+        .await?;
+        delivered_sterile_activation = bootstrap.sterile_activation.clone();
+        let prepare = prepare_resident_bootstrap_file(&bootstrap, bootstrap_root, run_as_uid);
         if let Err(error) = prepare {
             return fail_lease_terminal(
                 client,
@@ -2321,6 +2477,16 @@ async fn handle_resident_process_with_bootstrap_root(
         };
         let mut last_exit_code = None;
         for attempt in 1..=max_attempts {
+            validate_resident_sterile_activation(
+                client,
+                api,
+                sandbox_id,
+                sterile_activation_fence.as_ref(),
+                sterile_cell_lease.as_ref(),
+                sterile_pool_candidate.as_ref(),
+                delivered_sterile_activation.as_ref(),
+            )
+            .await?;
             let mut command = ProcessCommand::new(program);
             command.args(args).envs(&env);
             if let Some(cwd) = &cwd {
@@ -2912,6 +3078,10 @@ fn parse_env(value: &str) -> Result<(String, String), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sandboxwich_core::{
+        SterileCellId, SterileCellReleaseTrustClassV1, SterileCellRuntimeClass,
+    };
+    use sha2::{Digest as _, Sha256};
     use std::sync::atomic::AtomicBool;
 
     use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
@@ -3022,6 +3192,159 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("oversized"));
+    }
+
+    #[tokio::test]
+    async fn prewarmed_daemon_rejects_activation_that_expires_before_resident_spawn() {
+        async fn validate(
+            State(lease): State<sandboxwich_core::SterileCellLeaseV1>,
+        ) -> Json<ValidateSterileCellLeaseResponseV1> {
+            Json(ValidateSterileCellLeaseResponseV1 { ok: true, lease })
+        }
+        let sandbox_id = SandboxId::new();
+        let lease_id = Uuid::now_v7();
+        let generation = 2;
+        let lease = sandboxwich_core::SterileCellLeaseV1 {
+            lease_id,
+            cell_id: SterileCellId(sandbox_id.0),
+            generation,
+            release: SterileCellReleaseTrustClassV1 {
+                release_set_id: "release-set-test".into(),
+                runtime_class: SterileCellRuntimeClass::KataMicrovm,
+                policy_digest: "a".repeat(64),
+                signature: "swrs1_test".into(),
+            },
+            organization_id: "org-1".into(),
+            workspace_id: "workspace-1".into(),
+            thread_id: "thread-1".into(),
+            runner_session_id: "session-1".into(),
+            expires_at: Utc::now() - chrono::Duration::seconds(1),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/sterile-cell-leases/{lease_id}/validate", post(validate))
+            .with_state(lease);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let error = validate_resident_sterile_activation(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            sandbox_id,
+            Some(&sandboxwich_core::SterileResidentActivationFenceV1 {
+                cell_id: SterileCellId(sandbox_id.0),
+                lease_id,
+                generation,
+            }),
+            None,
+            Some(&sandboxwich_core::SterilePoolCandidateV1 {
+                cell_id: SterileCellId(sandbox_id.0),
+                release: SterileCellReleaseTrustClassV1 {
+                    release_set_id: "release-set-test".into(),
+                    runtime_class: SterileCellRuntimeClass::KataMicrovm,
+                    policy_digest: "a".repeat(64),
+                    signature: "swrs1_test".into(),
+                },
+            }),
+            Some(&sandboxwich_core::SterileResidentActivationV1 {
+                lease_id,
+                generation,
+                organization_id: "org-1".into(),
+                workspace_id: "workspace-1".into(),
+                thread_id: "thread-1".into(),
+                runner_session_id: "session-1".into(),
+                lease_attestation: "raw-secret-attestation".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        server.abort();
+        assert!(error.to_string().contains("expired"));
+    }
+
+    #[tokio::test]
+    async fn sterile_candidate_and_ordinary_agents_reject_opposite_gate_modes() {
+        let sandbox_id = SandboxId::new();
+        let candidate = sandboxwich_core::SterilePoolCandidateV1 {
+            cell_id: SterileCellId(sandbox_id.0),
+            release: SterileCellReleaseTrustClassV1 {
+                release_set_id: "release-set-test".into(),
+                runtime_class: SterileCellRuntimeClass::KataMicrovm,
+                policy_digest: "a".repeat(64),
+                signature: "swrs1_test".into(),
+            },
+        };
+        let candidate_error = validate_resident_sterile_activation(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1",
+            sandbox_id,
+            None,
+            None,
+            Some(&candidate),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            candidate_error
+                .to_string()
+                .contains("gated/ungated mismatch")
+        );
+
+        let fence = sandboxwich_core::SterileResidentActivationFenceV1 {
+            cell_id: candidate.cell_id,
+            lease_id: Uuid::now_v7(),
+            generation: 2,
+        };
+        let activation = sandboxwich_core::SterileResidentActivationV1 {
+            lease_id: fence.lease_id,
+            generation: fence.generation,
+            organization_id: "org-1".into(),
+            workspace_id: "workspace-1".into(),
+            thread_id: "thread-1".into(),
+            runner_session_id: "session-1".into(),
+            lease_attestation: "raw-secret".into(),
+        };
+        let ordinary_error = validate_resident_sterile_activation(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1",
+            sandbox_id,
+            Some(&fence),
+            None,
+            None,
+            Some(&activation),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            ordinary_error
+                .to_string()
+                .contains("ordinary agent rejected")
+        );
+    }
+
+    #[test]
+    fn activation_only_handoff_does_not_create_a_bootstrap_file() {
+        let root = tempfile::tempdir().unwrap();
+        let bootstrap = ResidentProcessBootstrapReadResponse {
+            ok: true,
+            content: Vec::new(),
+            sha256: format!("{:x}", Sha256::digest([])),
+            target_file: String::new(),
+            mode: 0,
+            placement_attestation: None,
+            sterile_activation: Some(sandboxwich_core::SterileResidentActivationV1 {
+                lease_id: Uuid::now_v7(),
+                generation: 2,
+                organization_id: "org-1".into(),
+                workspace_id: "workspace-1".into(),
+                thread_id: "thread-1".into(),
+                runner_session_id: "session-1".into(),
+                lease_attestation: "raw-secret-attestation".into(),
+            }),
+        };
+
+        prepare_resident_bootstrap_file(&bootstrap, root.path(), None).unwrap();
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]
@@ -3239,6 +3562,7 @@ mod tests {
                 target_file: target.to_string_lossy().into_owned(),
                 mode: 0o600,
                 placement_attestation: None,
+                sterile_activation: None,
             },
             lease: lease.clone(),
             bootstrap_read: Arc::new(AtomicBool::new(false)),
@@ -3267,7 +3591,10 @@ mod tests {
         let response = handle_resident_process_with_bootstrap_root(
             &client,
             &format!("http://{address}"),
+            SandboxId::new(),
             lease,
+            None,
+            None,
             bootstrap_root.path(),
         )
         .await
@@ -3329,6 +3656,7 @@ mod tests {
                 target_file: target.to_string_lossy().into_owned(),
                 mode: 0o600,
                 placement_attestation: None,
+                sterile_activation: None,
             },
             lease: lease.clone(),
             bootstrap_read: Arc::new(AtomicBool::new(false)),
@@ -3352,7 +3680,10 @@ mod tests {
         let response = handle_resident_process_with_bootstrap_root(
             &reqwest::Client::new(),
             &format!("http://{address}"),
+            SandboxId::new(),
             lease,
+            None,
+            None,
             bootstrap_root.path(),
         )
         .await

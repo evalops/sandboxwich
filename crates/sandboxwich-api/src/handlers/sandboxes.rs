@@ -92,6 +92,7 @@ fn provision_spec_from_request_with_provider(
         tenant_id: parent.map(|sandbox| sandbox.tenant_id.clone()),
         provider_external_id: None,
         provider_routing_scope: None,
+        sterile_pool_candidate: None,
     })
 }
 
@@ -1047,6 +1048,7 @@ pub(crate) async fn resume_sandbox(
         tenant_id: Some(sandbox.tenant_id.clone()),
         provider_external_id: None,
         provider_routing_scope: None,
+        sterile_pool_candidate: None,
     };
     let job = Job {
         id: JobId::new(),

@@ -1964,6 +1964,31 @@
               "null"
             ]
           },
+          "sterileCellId": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SterileCellId"
+              }
+            ]
+          },
+          "sterileLeaseGeneration": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sterileLeaseId": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "tenantId": {
             "type": "string"
           },
@@ -2057,6 +2082,16 @@
           },
           "sha256": {
             "type": "string"
+          },
+          "sterileActivation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SterileResidentActivationV1"
+              }
+            ]
           },
           "targetFile": {
             "type": "string"
@@ -2194,6 +2229,16 @@
           },
           "restartPolicy": {
             "$ref": "#/components/schemas/ResidentProcessRestartPolicy"
+          },
+          "sterileActivation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SterileResidentActivationV1"
+              }
+            ]
           }
         },
         "required": [
@@ -2464,6 +2509,17 @@
               "$ref": "#/components/schemas/SandboxSecretMount"
             },
             "type": "array"
+          },
+          "sterile_pool_candidate": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SterilePoolCandidateV1",
+                "description": "Control-plane-derived marker for a purpose-created sterile pool pod.\nOrdinary tenant provision requests cannot set this authoritatively;\nscheduler enrichment derives it from durable pool membership."
+              }
+            ]
           },
           "tenant_id": {
             "type": [
@@ -3043,6 +3099,61 @@
           "generation",
           "release",
           "expires_at"
+        ],
+        "type": "object"
+      },
+      "SterilePoolCandidateV1": {
+        "properties": {
+          "cell_id": {
+            "$ref": "#/components/schemas/SterileCellId"
+          },
+          "release": {
+            "$ref": "#/components/schemas/SterileCellReleaseTrustClassV1"
+          }
+        },
+        "required": [
+          "cell_id",
+          "release"
+        ],
+        "type": "object"
+      },
+      "SterileResidentActivationV1": {
+        "additionalProperties": false,
+        "description": "One-shot authority for activating a resident inside a purpose-created\nsterile cell. The attestation is a bearer secret and must only travel in\nthe bounded resident-bootstrap handoff.",
+        "properties": {
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "leaseAttestation": {
+            "type": "string"
+          },
+          "leaseId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "organizationId": {
+            "type": "string"
+          },
+          "runnerSessionId": {
+            "type": "string"
+          },
+          "threadId": {
+            "type": "string"
+          },
+          "workspaceId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "leaseId",
+          "generation",
+          "organizationId",
+          "workspaceId",
+          "threadId",
+          "runnerSessionId",
+          "leaseAttestation"
         ],
         "type": "object"
       },
