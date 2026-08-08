@@ -6,6 +6,7 @@ use crate::rows::{parse_timestamp, parse_uuid};
 use crate::state::{AppState, TenantContext};
 use axum::Json;
 use axum::extract::{Extension, Path, State};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration, Utc};
@@ -36,7 +37,10 @@ fn valid_identifier(value: &str) -> bool {
         })
 }
 
-fn validate_release(key: &str, release: &SterileCellReleaseTrustClassV1) -> Result<(), ApiError> {
+pub(crate) fn validate_release(
+    key: &str,
+    release: &SterileCellReleaseTrustClassV1,
+) -> Result<(), ApiError> {
     if !valid_identifier(&release.release_set_id)
         || release.policy_digest.len() != 64
         || !release
@@ -604,6 +608,14 @@ async fn claim_once(
         transaction.rollback().await?;
         return Ok(ClaimAttempt::Contended);
     }
+    crate::sterile_pool::record_pool_claim_on_connection(
+        &state.db,
+        &mut transaction,
+        cell_id,
+        lease.lease_id,
+        generation,
+    )
+    .await?;
     if let Some((claim_id, request_digest)) = claim_fence {
         let link_claim = format!(
             "update sterile_cell_claims set cell_id = {}, lease_id = {}
@@ -736,31 +748,66 @@ pub(crate) async fn validate_sterile_cell_lease(
     Json(request): Json<ValidateSterileCellLeaseRequestV1>,
 ) -> Result<Json<ValidateSterileCellLeaseResponseV1>, ApiError> {
     require_enabled(&state)?;
+    let validated = validate_live_lease_fence(
+        &state.db,
+        &ctx,
+        lease_id,
+        request.generation,
+        &request.organization_id,
+        &request.workspace_id,
+        &request.thread_id,
+        &request.runner_session_id,
+        &request.lease_attestation,
+    )
+    .await?;
+    Ok(Json(ValidateSterileCellLeaseResponseV1 {
+        ok: true,
+        lease: validated.lease,
+    }))
+}
+
+struct ValidatedLiveLease {
+    lease: SterileCellLeaseV1,
+    worker_id: WorkerId,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn validate_live_lease_fence(
+    db: &Database,
+    ctx: &TenantContext,
+    lease_id: Uuid,
+    generation: u64,
+    organization_id: &str,
+    workspace_id: &str,
+    thread_id: &str,
+    runner_session_id: &str,
+    lease_attestation: &str,
+) -> Result<ValidatedLiveLease, ApiError> {
     let sql = format!(
-        "select id, state, generation, release_set_id, runtime_class, policy_digest,
+        "select id, worker_id, state, generation, release_set_id, runtime_class, policy_digest,
          release_signature, lease_id, organization_id, workspace_id, thread_id,
          runner_session_id, lease_expires_at, lease_attestation_sha256
          from sterile_cells where lease_id = {} and tenant_id = {}",
-        state.db.placeholder(1),
-        state.db.placeholder(2),
+        db.placeholder(1),
+        db.placeholder(2),
     );
     let row = sqlx::query(&sql)
         .bind(lease_id.to_string())
         .bind(&ctx.tenant_id)
-        .fetch_optional(state.db.read_pool())
+        .fetch_optional(db.read_pool())
         .await?
         .ok_or_else(|| ApiError::not_found("resource not found"))?;
     let lease = lease_from_row(&row)?;
     let digest: String = row.try_get("lease_attestation_sha256")?;
     let valid = lease.lease_id == lease_id
-        && lease.generation == request.generation
-        && lease.organization_id == request.organization_id
-        && lease.workspace_id == request.workspace_id
-        && lease.thread_id == request.thread_id
-        && lease.runner_session_id == request.runner_session_id
+        && lease.generation == generation
+        && lease.organization_id == organization_id
+        && lease.workspace_id == workspace_id
+        && lease.thread_id == thread_id
+        && lease.runner_session_id == runner_session_id
         && constant_time_eq(
             digest.as_bytes(),
-            hash_worker_token(&request.lease_attestation).as_bytes(),
+            hash_worker_token(lease_attestation).as_bytes(),
         );
     if !valid {
         return Err(ApiError::conflict(
@@ -769,10 +816,132 @@ pub(crate) async fn validate_sterile_cell_lease(
     }
     let state_value: String = row.try_get("state")?;
     if state_value != SterileCellState::Leased.as_db_str() || lease.expires_at <= Utc::now() {
-        quarantine_lease(&state.db, lease.cell_id).await?;
+        quarantine_lease(db, lease.cell_id).await?;
         return Err(ApiError::conflict("sterile-cell lease is no longer live"));
     }
-    Ok(Json(ValidateSterileCellLeaseResponseV1 { ok: true, lease }))
+    let worker_id: &str = row.try_get("worker_id")?;
+    Ok(ValidatedLiveLease {
+        lease,
+        worker_id: WorkerId(parse_uuid(worker_id)?),
+    })
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/sterile-cell-leases/{lease_id}/release",
+    params(("lease_id" = Uuid, Path)),
+    request_body = ReleaseSterileCellLeaseRequestV1,
+    responses((status = 202, body = SterileCellLeaseStatusResponseV1), (status = 404, body = ErrorEnvelope), (status = 409, body = ErrorEnvelope))
+)]
+pub(crate) async fn release_sterile_cell_lease(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path(lease_id): Path<Uuid>,
+    Json(request): Json<ReleaseSterileCellLeaseRequestV1>,
+) -> Result<(StatusCode, Json<SterileCellLeaseStatusResponseV1>), ApiError> {
+    require_enabled(&state)?;
+    let validated = validate_live_lease_fence(
+        &state.db,
+        &ctx,
+        lease_id,
+        request.generation,
+        &request.organization_id,
+        &request.workspace_id,
+        &request.thread_id,
+        &request.runner_session_id,
+        &request.lease_attestation,
+    )
+    .await?;
+    let cell_id = validated.lease.cell_id;
+    let mut tx = state.db.pool.begin().await?;
+    match crate::sterile_pool::enqueue_pool_stop_on_connection(
+        &state.db,
+        &mut tx,
+        validated.worker_id,
+        cell_id,
+        lease_id,
+        request.generation,
+        request.disposition,
+    )
+    .await
+    {
+        Ok(true) => tx.commit().await?,
+        Ok(false) => {
+            tx.rollback().await?;
+            return Err(ApiError::not_found("resource not found"));
+        }
+        Err(error) => {
+            if error.status == StatusCode::CONFLICT {
+                tx.commit().await?;
+            } else {
+                tx.rollback().await?;
+            }
+            return Err(error);
+        }
+    }
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SterileCellLeaseStatusResponseV1 {
+            ok: true,
+            status: SterileCellLeaseStatusV1 {
+                lease_id,
+                cell_id,
+                generation: request.generation,
+                state: SterileCellState::Leased,
+                disposition: None,
+                provider_absent: false,
+                cleanup_pending: false,
+            },
+        }),
+    ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/sterile-cell-leases/{lease_id}",
+    params(("lease_id" = Uuid, Path)),
+    responses((status = 200, body = SterileCellLeaseStatusResponseV1), (status = 404, body = ErrorEnvelope))
+)]
+pub(crate) async fn get_sterile_cell_lease_status(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path(lease_id): Path<Uuid>,
+) -> Result<Json<SterileCellLeaseStatusResponseV1>, ApiError> {
+    require_enabled(&state)?;
+    let sql = format!(
+        "select c.id, c.generation, c.state, c.disposition,
+                p.provider_absent, p.state as pool_state
+         from sterile_cells c
+         join sterile_pool_memberships p on p.sandbox_id = c.id and p.lease_id = c.lease_id
+         where c.lease_id = {} and c.tenant_id = {}",
+        state.db.placeholder(1),
+        state.db.placeholder(2)
+    );
+    let row = sqlx::query(&sql)
+        .bind(lease_id.to_string())
+        .bind(&ctx.tenant_id)
+        .fetch_optional(state.db.read_pool())
+        .await?
+        .ok_or_else(|| ApiError::not_found("resource not found"))?;
+    let state_value: &str = row.try_get("state")?;
+    let disposition: Option<String> = row.try_get("disposition")?;
+    Ok(Json(SterileCellLeaseStatusResponseV1 {
+        ok: true,
+        status: SterileCellLeaseStatusV1 {
+            lease_id,
+            cell_id: SterileCellId(parse_uuid(row.try_get("id")?)?),
+            generation: u64::try_from(row.try_get::<i64, _>("generation")?)
+                .map_err(|_| ApiError::internal("invalid sterile-cell generation"))?,
+            state: SterileCellState::parse_db_str(state_value)
+                .map_err(|error| ApiError::internal(error.to_string()))?,
+            disposition: disposition
+                .map(|value| SterileCellDisposition::parse_db_str(&value))
+                .transpose()
+                .map_err(|error| ApiError::internal(error.to_string()))?,
+            provider_absent: row.try_get::<i64, _>("provider_absent")? == 1,
+            cleanup_pending: row.try_get::<String, _>("pool_state")? == "cleanup_pending",
+        },
+    }))
 }
 
 async fn quarantine_lease(db: &Database, cell_id: SterileCellId) -> Result<(), ApiError> {
@@ -826,6 +995,11 @@ pub(crate) async fn destroy_sterile_cell(
     let current_lease_id = row
         .try_get::<Option<String>, _>("lease_id")?
         .and_then(|value| Uuid::parse_str(&value).ok());
+    if crate::sterile_pool::sandbox_has_pool_membership(&state.db, SandboxId(cell_id.0)).await? {
+        return Err(ApiError::conflict(
+            "pool-created cells must be released before provider-confirmed destruction",
+        ));
+    }
     if matches!(
         current.state,
         SterileCellState::Destroyed | SterileCellState::Quarantined
@@ -895,6 +1069,67 @@ pub(crate) async fn destroy_sterile_cell(
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/workers/{worker_id}/sterile-cells/{cell_id}/release",
+    params(("worker_id" = Uuid, Path), ("cell_id" = Uuid, Path)),
+    request_body = DestroySterileCellRequestV1,
+    responses((status = 202, body = SterileCellResponseV1), (status = 404, body = ErrorEnvelope), (status = 409, body = ErrorEnvelope))
+)]
+pub(crate) async fn release_sterile_pool_cell(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Path((worker_id, cell_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<DestroySterileCellRequestV1>,
+) -> Result<(StatusCode, Json<SterileCellResponseV1>), ApiError> {
+    require_enabled(&state)?;
+    let worker_id = WorkerId(worker_id);
+    let cell_id = SterileCellId(cell_id);
+    ensure_worker_scope(&ctx, worker_id)?;
+    ensure_worker_tenant(&state.db, worker_id, &ctx).await?;
+    let current = fetch_worker_cell(&state.db, worker_id, cell_id, &ctx.tenant_id).await?;
+    if current.state != SterileCellState::Leased {
+        return Err(ApiError::conflict(
+            "only a live leased pool cell can be released",
+        ));
+    }
+    let mut tx = state.db.pool.begin().await?;
+    match crate::sterile_pool::enqueue_pool_stop_on_connection(
+        &state.db,
+        &mut tx,
+        worker_id,
+        cell_id,
+        request.lease_id,
+        request.generation,
+        request.disposition,
+    )
+    .await
+    {
+        Ok(true) => {
+            tx.commit().await?;
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(SterileCellResponseV1 {
+                    ok: true,
+                    cell: current,
+                }),
+            ))
+        }
+        Ok(false) => {
+            tx.rollback().await?;
+            Err(ApiError::not_found("resource not found"))
+        }
+        Err(error) => {
+            if error.status == StatusCode::CONFLICT {
+                tx.commit().await?;
+            } else {
+                tx.rollback().await?;
+            }
+            Err(error)
+        }
+    }
+}
+
 pub(crate) async fn quarantine_expired_sterile_cells(db: &Database) -> Result<u64, ApiError> {
     let now = Utc::now().to_rfc3339();
     let ready = quarantine_expired_state(db, "ready", "cell_expires_at", &now).await?;
@@ -917,7 +1152,10 @@ async fn quarantine_expired_state(
     let sql = format!(
         "update sterile_cells set state = 'quarantined', disposition = 'quarantined',
          destroyed_at = {}, updated_at = {}
-         where state = '{state}' and {expiry_column} is not null and {expiry_column} <= {}",
+         where state = '{state}' and {expiry_column} is not null and {expiry_column} <= {}
+           and not exists (
+             select 1 from sterile_pool_memberships p where p.sandbox_id = sterile_cells.id
+           )",
         db.placeholder(1),
         db.placeholder(2),
         db.placeholder(3),

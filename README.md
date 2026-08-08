@@ -110,6 +110,11 @@ which is the same fail-closed outcome as no shared tier at all.
 Leaving the variable unset keeps the previous behavior, where a control-plane
 restart strands a pending bootstrap.
 
+`SANDBOXWICH_BOOTSTRAP_HANDOFF_KEY` is required when
+`SANDBOXWICH_STERILE_RESIDENT_ACTIVATION_ENABLED=true`; the API refuses to
+start rather than allowing a sterile activation secret to depend on one
+process's memory.
+
 ### Sandbox lifetime: three separate knobs
 
 Sandboxes carry three independent, easy-to-conflate timing fields. Do not assume they're the same thing:

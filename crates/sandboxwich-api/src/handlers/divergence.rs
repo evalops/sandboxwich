@@ -3,7 +3,7 @@ use crate::error::*;
 use crate::handlers::commands::insert_event_on_connection;
 use crate::handlers::jobs::{add_provision_spec_to_payload, insert_job_on_connection};
 use crate::handlers::sandboxes::{
-    fetch_sandbox, fetch_sandbox_on_connection, hydrate_sandbox_network_egress_on_connection,
+    fetch_sandbox_on_connection, hydrate_sandbox_network_egress_on_connection,
     set_sandbox_state_on_connection,
 };
 use crate::handlers::secrets::fetch_sandbox_secret_mounts_on_connection;
@@ -182,8 +182,7 @@ pub(crate) async fn reconcile_with_adapter(
     let mut matched = 0;
     let mut findings = Vec::new();
     for observation in &observations {
-        let sandbox = fetch_sandbox(&state.db, observation.sandbox_id).await?;
-        ensure_tenant(&sandbox.tenant_id, ctx)?;
+        ensure_sandbox_tenant(&state.db, observation.sandbox_id, ctx).await?;
         validate_observation(observation)?;
         persist_observation(state, ctx, observation).await?;
         match correlate(state, ctx, observation).await? {
@@ -296,8 +295,7 @@ async fn correlate(
         (id, tenant_id, sandbox_id, observation_external_id, session_id, receipt_id, kind, activity_class, resource, status, detected_at)
         values ({}) on conflict (tenant_id, observation_external_id) do nothing",
         (1..=11).map(|i| state.db.placeholder(i)).collect::<Vec<_>>().join(", "));
-    let sandbox = fetch_sandbox(&state.db, finding.sandbox_id).await?;
-    ensure_tenant(&sandbox.tenant_id, ctx)?;
+    let sandbox = ensure_sandbox_tenant(&state.db, finding.sandbox_id, ctx).await?;
     let mut tx = state.db.pool.begin().await?;
     let inserted = sqlx::query(&sql)
         .bind(finding.id.to_string())

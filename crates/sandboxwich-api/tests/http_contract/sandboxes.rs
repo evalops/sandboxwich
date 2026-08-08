@@ -540,7 +540,7 @@ pub(crate) async fn list_sandboxes_hydrates_each_allowlist_sandboxes_own_rules()
 }
 
 #[tokio::test]
-async fn stop_before_first_provision_is_claimable_and_cannot_be_undone() {
+async fn stop_before_first_provision_waits_for_placement_and_cannot_be_undone() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!(
         "sqlite://{}",
@@ -637,19 +637,23 @@ async fn stop_before_first_provision_is_claimable_and_cannot_be_undone() {
         .json()
         .await
         .unwrap();
-    let stop_lease = stop_claim
+    let provision_lease = stop_claim
         .lease
-        .expect("unplaced stop job must be claimable");
-    assert_eq!(stop_lease.job.kind, JobKind::StopSandbox);
+        .expect("unplaced provision job remains drainable");
+    assert_eq!(provision_lease.job.kind, JobKind::ProvisionSandbox);
     worker_client
         .post(format!(
             "{}/leases/{}/complete",
-            server.base_url, stop_lease.id
+            server.base_url, provision_lease.id
         ))
         .json(&CompleteLeaseRequest {
-            result: Some(WorkerJobResult::StopSandbox {
-                provider: "kubernetes".to_string(),
-                sandbox_id: created.sandbox.id,
+            result: Some(WorkerJobResult::ProvisionSandbox {
+                handle: ProviderSandboxHandle {
+                    provider: "kubernetes".to_string(),
+                    sandbox_id: created.sandbox.id,
+                    resources: provision_resources(created.sandbox.id),
+                    metadata: serde_json::json!({}),
+                },
             }),
         })
         .send()
@@ -677,23 +681,19 @@ async fn stop_before_first_provision_is_claimable_and_cannot_be_undone() {
         .json()
         .await
         .unwrap();
-    let provision_lease = provision_claim
+    let stop_lease = provision_claim
         .lease
-        .expect("original provision job remains drainable");
-    assert_eq!(provision_lease.job.kind, JobKind::ProvisionSandbox);
+        .expect("stop job becomes claimable only by its placed provider worker");
+    assert_eq!(stop_lease.job.kind, JobKind::StopSandbox);
     worker_client
         .post(format!(
             "{}/leases/{}/complete",
-            server.base_url, provision_lease.id
+            server.base_url, stop_lease.id
         ))
         .json(&CompleteLeaseRequest {
-            result: Some(WorkerJobResult::ProvisionSandbox {
-                handle: ProviderSandboxHandle {
-                    provider: "kubernetes".to_string(),
-                    sandbox_id: created.sandbox.id,
-                    resources: provision_resources(created.sandbox.id),
-                    metadata: serde_json::json!({}),
-                },
+            result: Some(WorkerJobResult::StopSandbox {
+                provider: "kubernetes".to_string(),
+                sandbox_id: created.sandbox.id,
             }),
         })
         .send()

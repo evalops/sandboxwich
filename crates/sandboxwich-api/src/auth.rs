@@ -407,6 +407,9 @@ pub(crate) async fn ensure_sandbox_tenant(
 ) -> Result<Sandbox, ApiError> {
     let sandbox = fetch_sandbox(db, sandbox_id).await?;
     ensure_tenant(&sandbox.tenant_id, ctx)?;
+    if crate::sterile_pool::sandbox_has_pool_membership(db, sandbox_id).await? {
+        return Err(ApiError::not_found("resource not found"));
+    }
     Ok(sandbox)
 }
 
@@ -475,7 +478,7 @@ pub(crate) async fn ensure_lease_worker_scope(
             return Err(ApiError::not_found("resource not found"));
         };
         let sql = format!(
-            "select tenant_id, sandbox_id, name from resident_processes where id = {}",
+            "select tenant_id, sandbox_id, name, sterile_cell_id from resident_processes where id = {}",
             db.placeholder(1)
         );
         let Some(process) = sqlx::query(&sql)
@@ -488,13 +491,17 @@ pub(crate) async fn ensure_lease_worker_scope(
         let process_tenant_id: String = process.try_get("tenant_id")?;
         let process_sandbox_id: String = process.try_get("sandbox_id")?;
         let process_name: String = process.try_get("name")?;
+        let sterile_cell_id: Option<String> = process.try_get("sterile_cell_id")?;
         let process_sandbox_id = SandboxId(parse_uuid(&process_sandbox_id)?);
         if process_tenant_id != lease.job.tenant_id
             || !job_matches_sandbox(&lease.job, process_sandbox_id)
         {
             return Err(ApiError::not_found("resource not found"));
         }
-        let owns_role = matches!(
+        let guest_sterile_maestro = process_name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
+            && matches!(ctx.principal, Principal::Guest { .. })
+            && sterile_cell_id.as_deref() == Some(process_sandbox_id.to_string().as_str());
+        let owns_role = (matches!(
             (process_name.as_str(), ctx.principal),
             (ORB_SIDECAR_RESIDENT_PROCESS_NAME, Principal::Worker(_))
                 | (
@@ -502,9 +509,10 @@ pub(crate) async fn ensure_lease_worker_scope(
                     Principal::Worker(_)
                 )
                 | (ORB_EXECUTOR_RESIDENT_PROCESS_NAME, Principal::Guest { .. })
-        ) && ctx
-            .guest_sandbox_id()
-            .is_none_or(|sandbox_id| sandbox_id == process_sandbox_id);
+        ) || guest_sterile_maestro)
+            && ctx
+                .guest_sandbox_id()
+                .is_none_or(|sandbox_id| sandbox_id == process_sandbox_id);
         if !owns_role {
             return Err(ApiError::not_found("resource not found"));
         }
@@ -549,9 +557,10 @@ pub(crate) async fn ensure_resident_lease_scope(
     Ok(lease)
 }
 
-/// Like [`ensure_sandbox_tenant`], but additionally requires (see GH-64) that
-/// the request authenticated as the worker currently placed for
-/// `sandbox_id`.
+/// Requires (see GH-64) that the request authenticated as the worker currently
+/// placed for `sandbox_id`. This deliberately bypasses the ordinary tenant
+/// pool guard: purpose-created candidates still need their worker/guest token
+/// and health lifecycle before tenant activation.
 /// Used on the guest-facing guest-health route so a worker-scoped token can
 /// only report health for sandboxes it actually owns, and a tenant-wide
 /// token is rejected outright.
@@ -560,7 +569,8 @@ pub(crate) async fn ensure_sandbox_worker_scope(
     sandbox_id: SandboxId,
     ctx: &TenantContext,
 ) -> Result<Sandbox, ApiError> {
-    let sandbox = ensure_sandbox_tenant(db, sandbox_id, ctx).await?;
+    let sandbox = fetch_sandbox(db, sandbox_id).await?;
+    ensure_tenant(&sandbox.tenant_id, ctx)?;
     if let Some(bound_sandbox_id) = ctx.guest_sandbox_id() {
         return if bound_sandbox_id == sandbox_id {
             Ok(sandbox)

@@ -1,7 +1,5 @@
 use crate::activity::bump_sandbox_activity_best_effort;
-use crate::auth::{
-    ensure_lease_worker_scope, ensure_resident_lease_scope, ensure_sandbox_tenant, ensure_tenant,
-};
+use crate::auth::{ensure_lease_worker_scope, ensure_resident_lease_scope, ensure_sandbox_tenant};
 use crate::db::Database;
 use crate::error::*;
 use crate::handlers::commands::{insert_event, insert_event_on_connection};
@@ -9,7 +7,6 @@ use crate::handlers::jobs::{add_provision_spec_to_payload, insert_job_on_connect
 use crate::handlers::resident_attestations::{
     issue_resident_placement_attestation, record_provider_pod_identity,
 };
-use crate::handlers::sandboxes::fetch_sandbox;
 use crate::handlers::secrets::fetch_sandbox_secret_mounts;
 use crate::rows::{parse_timestamp, row_to_job, row_to_resident_process};
 use crate::state::{
@@ -343,6 +340,13 @@ fn ensure_resident_owner_role(
         {
             true
         }
+        (name, Principal::Guest { sandbox_id, .. })
+            if name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
+                && sandbox_id == process.sandbox_id
+                && process.sterile_cell_id == Some(SterileCellId(sandbox_id.0)) =>
+        {
+            true
+        }
         _ => false,
     };
     if !owns_role {
@@ -574,7 +578,19 @@ async fn fence_sterile_resident_activation_on_connection(
            and thread_id = {} and runner_session_id = {}
            and lease_attestation_sha256 = {} and lease_expires_at > {}
            and activated_resident_process_id is null
-           and activated_resident_generation is null",
+           and activated_resident_generation is null
+           and exists (
+             select 1 from sterile_pool_memberships p
+             where p.sandbox_id = sterile_cells.id
+               and p.tenant_id = sterile_cells.tenant_id
+               and p.state = 'leased'
+               and p.lease_id = sterile_cells.lease_id
+               and p.generation = sterile_cells.generation
+               and p.release_set_id = sterile_cells.release_set_id
+               and p.runtime_class = sterile_cells.runtime_class
+               and p.policy_digest = sterile_cells.policy_digest
+               and p.release_signature = sterile_cells.release_signature
+           )",
         db.placeholder(1),
         db.placeholder(2),
         db.placeholder(3),
@@ -633,7 +649,19 @@ async fn validate_sterile_resident_activation_replay(
            and thread_id = {} and runner_session_id = {}
            and lease_attestation_sha256 = {} and lease_expires_at > {}
            and activated_resident_process_id = {}
-           and activated_resident_generation = {}",
+           and activated_resident_generation = {}
+           and exists (
+             select 1 from sterile_pool_memberships p
+             where p.sandbox_id = sterile_cells.id
+               and p.tenant_id = sterile_cells.tenant_id
+               and p.state = 'leased'
+               and p.lease_id = sterile_cells.lease_id
+               and p.generation = sterile_cells.generation
+               and p.release_set_id = sterile_cells.release_set_id
+               and p.runtime_class = sterile_cells.runtime_class
+               and p.policy_digest = sterile_cells.policy_digest
+               and p.release_signature = sterile_cells.release_signature
+           )",
         db.placeholder(1),
         db.placeholder(2),
         db.placeholder(3),
@@ -705,6 +733,12 @@ pub(crate) async fn put_resident_process(
             "sterile resident activation is not enabled",
         ));
     }
+    if request.sterile_activation.is_some() && name != MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME {
+        return Err(ApiError::bad_request_code(
+            "sterile_activation_resident_invalid",
+            "sterile activation is restricted to the purpose-created Maestro resident",
+        ));
+    }
     if !is_supported_resident_process_name(&name) {
         return Err(ApiError::bad_request(
             "the resident-process contract supports only orb-executor, orb-sidecar, and maestro-hosted-runner",
@@ -747,19 +781,20 @@ pub(crate) async fn put_resident_process(
             argv = ?request.argv,
             "Maestro resident contract admission check"
         );
-        let Some(bootstrap) = request.bootstrap.as_ref() else {
+        if let Some(bootstrap) = request.bootstrap.as_ref() {
+            if bootstrap.content.is_empty()
+                || bootstrap.target_file != MAESTRO_HOSTED_RUNNER_GATEWAY_TOKEN_FILE
+                || bootstrap.mode != 0o400
+            {
+                return Err(ApiError::bad_request_code(
+                    "maestro_bootstrap_path_invalid",
+                    "maestro-hosted-runner requires the fixed managed gateway bootstrap path",
+                ));
+            }
+        } else if request.sterile_activation.is_none() {
             return Err(ApiError::bad_request_code(
                 "maestro_bootstrap_required",
                 "maestro-hosted-runner requires the managed gateway bootstrap",
-            ));
-        };
-        if bootstrap.content.is_empty()
-            || bootstrap.target_file != MAESTRO_HOSTED_RUNNER_GATEWAY_TOKEN_FILE
-            || bootstrap.mode != 0o400
-        {
-            return Err(ApiError::bad_request_code(
-                "maestro_bootstrap_path_invalid",
-                "maestro-hosted-runner requires the fixed managed gateway bootstrap path",
             ));
         }
         if request.argv
@@ -882,10 +917,15 @@ pub(crate) async fn put_resident_process(
     // ownership, then prove its exact live sterile lease inside the insert
     // transaction below. The activation-absent path retains the ordinary
     // sandbox policy unchanged.
-    let sandbox = if request.sterile_activation.is_some() {
-        let sandbox = fetch_sandbox(&state.db, sandbox_id).await?;
-        ensure_tenant(&sandbox.tenant_id, &ctx)?;
-        sandbox
+    let sandbox = if let Some(activation) = request.sterile_activation.as_ref() {
+        crate::sterile_pool::fetch_exact_leased_pool_sandbox(
+            &state.db,
+            &ctx.tenant_id,
+            sandbox_id,
+            activation.lease_id,
+            activation.generation,
+        )
+        .await?
     } else {
         ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?
     };
@@ -1731,6 +1771,37 @@ pub(crate) async fn observe_resident_process(
         let pod_uid = request.provider_pod_uid.as_deref().ok_or_else(|| {
             ApiError::bad_request("provider-isolated sidecar observation requires providerPodUid")
         })?;
+        if let Some(cell_id) = process.sterile_cell_id {
+            let candidate_identity_sql = format!(
+                "select 1 from sterile_pool_memberships p
+                 join sterile_cells c on c.id = p.sandbox_id
+                 where p.sandbox_id = {} and p.tenant_id = {} and p.state = 'leased'
+                   and c.activated_resident_process_id = {} and c.activated_resident_generation = {}
+                   and p.candidate_pod_name = {} and p.candidate_pod_uid = {}",
+                state.db.placeholder(1),
+                state.db.placeholder(2),
+                state.db.placeholder(3),
+                state.db.placeholder(4),
+                state.db.placeholder(5),
+                state.db.placeholder(6)
+            );
+            if sqlx::query(&candidate_identity_sql)
+                .bind(cell_id.to_string())
+                .bind(&ctx.tenant_id)
+                .bind(process.id.to_string())
+                .bind(i64::try_from(request.generation).unwrap_or(i64::MAX))
+                .bind(pod_name)
+                .bind(pod_uid)
+                .fetch_optional(state.db.read_pool())
+                .await?
+                .is_none()
+            {
+                return Err(ApiError::conflict_code(
+                    "sterile_candidate_pod_identity_mismatch",
+                    "resident observation does not match the bound sterile candidate Pod",
+                ));
+            }
+        }
         record_provider_pod_identity(
             &state.db,
             &ctx.tenant_id,

@@ -2,7 +2,8 @@
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
     collections::BTreeMap,
-    io::{Read as _, Write as _},
+    io::{Cursor, Read as _, Write as _},
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -13,12 +14,30 @@ use std::{
 };
 
 use anyhow::{Context, bail};
+use axum::{
+    Json, Router,
+    extract::{DefaultBodyLimit, State},
+    http::StatusCode,
+    routing::{get, put},
+};
+use axum_server::tls_rustls::RustlsConfig;
 use cap_std::{
     ambient_authority,
     fs::{Dir, OpenOptions},
 };
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
+use rustls::{
+    CertificateError, DigitallySignedStruct, DistinguishedName, RootCertStore, ServerConfig,
+    SignatureScheme,
+    client::danger::HandshakeSignatureValid,
+    pki_types::{CertificateDer, UnixTime},
+    server::{
+        WebPkiClientVerifier,
+        danger::{ClientCertVerified, ClientCertVerifier},
+    },
+};
+use rustls_pemfile::Item;
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, AgentFileReadResponse, AgentFileWriteRequest,
     AgentHealthResponse, AppendCommandOutputRequest, ClaimLeaseRequest, ClaimLeaseResponse,
@@ -32,11 +51,15 @@ use sandboxwich_core::{
     ValidateSterileCellLeaseResponseV1, WorkerJobResult, build_api_client,
     resident_process_run_as_uid, validate_agent_command_request,
 };
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command as ProcessCommand,
+    sync::Mutex,
 };
 use uuid::Uuid;
+use x509_parser::{extensions::GeneralName, parse_x509_certificate};
 
 mod compiler_cache_archive;
 mod resident_process_supervisor;
@@ -99,6 +122,8 @@ struct Cli {
 enum Command {
     Heartbeat(HeartbeatArgs),
     Daemon(Box<DaemonArgs>),
+    /// Consume one validated sterile activation bundle and supervise Maestro.
+    SterileLauncher(SterileLauncherArgs),
     Exec(ExecArgs),
     WriteFile(FileWriteArgs),
     ReadFile(FileReadArgs),
@@ -113,6 +138,140 @@ enum Command {
     /// Stage a bounded archive at the helper's fixed private path.
     CompilerCacheStageArchive(CompilerCacheStageArchiveArgs),
 }
+
+#[derive(Debug, Args)]
+struct SterileLauncherArgs {
+    #[arg(long, env = "SANDBOXWICH_STERILE_ACTIVATION_BIND")]
+    activation_bind: SocketAddr,
+    #[arg(long, env = "SANDBOXWICH_STERILE_ACTIVATION_SERVER_CERT_FILE")]
+    server_cert_file: PathBuf,
+    #[arg(long, env = "SANDBOXWICH_STERILE_ACTIVATION_SERVER_KEY_FILE")]
+    server_key_file: PathBuf,
+    #[arg(long, env = "SANDBOXWICH_STERILE_ACTIVATION_CLIENT_CA_FILE")]
+    client_ca_file: PathBuf,
+    #[arg(long, env = "SANDBOXWICH_STERILE_ACTIVATION_CLIENT_URI")]
+    client_uri: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SterileActivationRequestV1 {
+    version: u8,
+    candidate: sandboxwich_core::SterilePoolCandidateV1,
+    fence: sandboxwich_core::SterileResidentActivationFenceV1,
+    validated_expires_at: DateTime<Utc>,
+    argv: Vec<String>,
+    cwd: Option<String>,
+    env: BTreeMap<String, String>,
+    bootstrap: ResidentProcessBootstrapReadResponse,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SterileLauncherStatusV1 {
+    phase: SterileLauncherPhaseV1,
+    pid: Option<u32>,
+    exit_code: Option<i32>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SterileLauncherPhaseV1 {
+    Accepted,
+    Running,
+    Terminal,
+}
+
+#[derive(Clone)]
+struct SterileLauncherServerState {
+    activation: Arc<Mutex<SterileLauncherActivationState>>,
+}
+
+enum SterileLauncherActivationState {
+    Waiting,
+    Accepted {
+        request_digest: [u8; 32],
+        status: SterileLauncherStatusV1,
+    },
+}
+
+#[derive(Debug)]
+struct ExactSterileClientCertVerifier {
+    inner: Arc<dyn ClientCertVerifier>,
+    required_uri: Arc<str>,
+}
+
+impl ClientCertVerifier for ExactSterileClientCertVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        let verified = self
+            .inner
+            .verify_client_cert(end_entity, intermediates, now)?;
+        let (remainder, certificate) = parse_x509_certificate(end_entity.as_ref())
+            .map_err(|_| rustls::Error::InvalidCertificate(CertificateError::BadEncoding))?;
+        let matches = remainder.is_empty()
+            && certificate
+                .subject_alternative_name()
+                .map_err(|_| rustls::Error::InvalidCertificate(CertificateError::BadEncoding))?
+                .is_some_and(|extension| {
+                    extension.value.general_names.iter().any(
+                        |name| matches!(name, GeneralName::URI(uri) if *uri == &*self.required_uri),
+                    )
+                });
+        if !matches {
+            return Err(rustls::Error::InvalidCertificate(
+                CertificateError::ApplicationVerificationFailure,
+            ));
+        }
+        Ok(verified)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        false
+    }
+}
+
+const MAX_STERILE_BUNDLE_BYTES: usize = 1024 * 1024;
+const MAX_STERILE_TLS_FILE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Args)]
 struct CompilerCacheCaptureArgs {
@@ -278,6 +437,12 @@ struct DaemonArgs {
     #[arg(long, env = "SANDBOXWICH_STERILE_POOL_CANDIDATE_V1")]
     sterile_pool_candidate: Option<String>,
 
+    #[arg(long, env = "SANDBOXWICH_PROVIDER_POD_NAME")]
+    provider_pod_name: Option<String>,
+
+    #[arg(long, env = "SANDBOXWICH_PROVIDER_POD_UID")]
+    provider_pod_uid: Option<String>,
+
     /// Pre-provisioned sandbox-scoped guest credential (`sbw_gtok_...`, see
     /// GH-64's guest-token endpoint) to use for guest-facing calls
     /// (claim/renew/complete/fail/output, guest-health) instead of the
@@ -441,6 +606,7 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Heartbeat(args) => heartbeat(args).await,
         Command::Daemon(args) => daemon(*args).await,
+        Command::SterileLauncher(args) => sterile_launcher(args).await,
         Command::Exec(args) => exec(args).await,
         Command::WriteFile(args) => write_file(args).await,
         Command::ReadFile(args) => read_file(args).await,
@@ -505,7 +671,7 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
     let api_token = resolve_api_token(args.api_token_file, args.api_token)?;
     let client = build_api_client(api_token.as_deref(), args.tenant.as_deref())?;
     let sandbox_id = SandboxId(args.sandbox_id);
-    let sterile_pool_candidate = args
+    let mut sterile_pool_candidate = args
         .sterile_pool_candidate
         .as_deref()
         .map(serde_json::from_str::<sandboxwich_core::SterilePoolCandidateV1>)
@@ -516,6 +682,20 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
             candidate.cell_id.0 == sandbox_id.0,
             "sterile pool candidate cell does not match SANDBOXWICH_SANDBOX_ID"
         );
+    }
+    if let Some(candidate) = sterile_pool_candidate.as_mut() {
+        let pod_name = args
+            .provider_pod_name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .context("sterile pool candidate requires SANDBOXWICH_PROVIDER_POD_NAME")?;
+        let pod_uid = args
+            .provider_pod_uid
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .context("sterile pool candidate requires SANDBOXWICH_PROVIDER_POD_UID")?;
+        candidate.pod_name = Some(pod_name.to_string());
+        candidate.pod_uid = Some(pod_uid.to_string());
     }
 
     // A daemon with a worker id is an executor. It must not claim work until
@@ -635,6 +815,7 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
                             sandbox_id,
                             args.lease_seconds,
                             !resident_processes.is_full(),
+                            sterile_pool_candidate.is_some(),
                         )
                     })
                     .await?;
@@ -1573,6 +1754,7 @@ async fn claim_lease(
     sandbox_id: SandboxId,
     lease_seconds: Option<u64>,
     include_resident_processes: bool,
+    sterile_pool_candidate: bool,
 ) -> Result<ClaimLeaseResponse, AgentRequestError> {
     // Scope the claim to this daemon's own sandbox and to the only job kind it
     // knows how to execute. `client` here should be the sandbox-scoped guest
@@ -1590,7 +1772,10 @@ async fn claim_lease(
         .json(&ClaimLeaseRequest {
             lease_seconds,
             sandbox_id: Some(sandbox_id),
-            kinds: Some(guest_claim_kinds(include_resident_processes)),
+            kinds: Some(guest_claim_kinds(
+                include_resident_processes,
+                sterile_pool_candidate,
+            )),
             wait_ms: None,
         })
         .send()
@@ -1598,7 +1783,15 @@ async fn claim_lease(
     decode_json(response).await
 }
 
-fn guest_claim_kinds(include_resident_processes: bool) -> Vec<JobKind> {
+fn guest_claim_kinds(
+    include_resident_processes: bool,
+    sterile_pool_candidate: bool,
+) -> Vec<JobKind> {
+    if sterile_pool_candidate {
+        return include_resident_processes
+            .then_some(vec![JobKind::RunResidentProcess])
+            .unwrap_or_default();
+    }
     let mut kinds = vec![JobKind::RunCommand];
     if include_resident_processes {
         kinds.push(JobKind::RunResidentProcess);
@@ -2238,9 +2431,9 @@ async fn validate_resident_sterile_activation(
     daemon_lease: Option<&sandboxwich_core::SterileCellLeaseV1>,
     pool_candidate: Option<&sandboxwich_core::SterilePoolCandidateV1>,
     activation: Option<&sandboxwich_core::SterileResidentActivationV1>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<sandboxwich_core::SterileCellLeaseV1>> {
     match (fence, activation) {
-        (None, None) if daemon_lease.is_none() && pool_candidate.is_none() => return Ok(()),
+        (None, None) if daemon_lease.is_none() && pool_candidate.is_none() => return Ok(None),
         (Some(fence), Some(activation)) => {
             anyhow::ensure!(
                 daemon_lease.is_some() || pool_candidate.is_some(),
@@ -2300,7 +2493,7 @@ async fn validate_resident_sterile_activation(
             "sterile resident activation does not match the immutable pool candidate"
         );
     }
-    Ok(())
+    Ok(Some(validated.lease))
 }
 
 fn prepare_resident_bootstrap_file(
@@ -2340,6 +2533,542 @@ fn prepare_resident_bootstrap_file(
         )
     })?;
     Ok(())
+}
+
+async fn sterile_launcher(args: SterileLauncherArgs) -> anyhow::Result<()> {
+    let tls = sterile_launcher_tls_config(
+        &args.server_cert_file,
+        &args.server_key_file,
+        &args.client_ca_file,
+        &args.client_uri,
+    )?;
+    let state = SterileLauncherServerState {
+        activation: Arc::new(Mutex::new(SterileLauncherActivationState::Waiting)),
+    };
+    let app = Router::new()
+        .route("/v1/activation", put(accept_sterile_activation))
+        .route("/v1/status", get(get_sterile_launcher_status))
+        .layer(DefaultBodyLimit::max(MAX_STERILE_BUNDLE_BYTES))
+        .with_state(state);
+    axum_server::bind_rustls(args.activation_bind, tls)
+        .serve(app.into_make_service())
+        .await
+        .context("serve sterile launcher activation channel")
+}
+
+fn validate_sterile_activation_request(bundle: &SterileActivationRequestV1) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        bundle.version == 1,
+        "unsupported sterile activation request version"
+    );
+    anyhow::ensure!(
+        bundle.validated_expires_at > Utc::now(),
+        "sterile activation expired before launcher consumption"
+    );
+    anyhow::ensure!(
+        bundle.fence.cell_id == bundle.candidate.cell_id,
+        "sterile launcher cell fence mismatch"
+    );
+    anyhow::ensure!(
+        bundle.bootstrap.sterile_activation.is_none(),
+        "raw sterile attestation reached the workload handoff"
+    );
+    let marker: sandboxwich_core::SterilePoolCandidateV1 = serde_json::from_str(
+        &std::env::var("SANDBOXWICH_STERILE_POOL_CANDIDATE_V1")
+            .context("launcher is missing immutable candidate marker")?,
+    )?;
+    anyhow::ensure!(
+        marker.cell_id == bundle.candidate.cell_id
+            && marker.release == bundle.candidate.release
+            && marker.agent_image == bundle.candidate.agent_image
+            && marker.maestro_image == bundle.candidate.maestro_image
+            && marker.service_name == bundle.candidate.service_name,
+        "sterile launcher candidate marker mismatch"
+    );
+    anyhow::ensure!(
+        std::env::var("SANDBOXWICH_PROVIDER_POD_NAME")
+            .ok()
+            .as_deref()
+            == bundle.candidate.pod_name.as_deref()
+            && std::env::var("SANDBOXWICH_PROVIDER_POD_UID")
+                .ok()
+                .as_deref()
+                == bundle.candidate.pod_uid.as_deref(),
+        "sterile launcher Pod identity mismatch"
+    );
+    continue_candidate_bootstrap_validation(&bundle.bootstrap)
+}
+
+async fn accept_sterile_activation(
+    State(state): State<SterileLauncherServerState>,
+    Json(bundle): Json<SterileActivationRequestV1>,
+) -> Result<(StatusCode, Json<SterileLauncherStatusV1>), (StatusCode, &'static str)> {
+    validate_sterile_activation_request(&bundle)
+        .map_err(|_| (StatusCode::UNPROCESSABLE_ENTITY, "invalid activation"))?;
+    let encoded = serde_json::to_vec(&bundle)
+        .map_err(|_| (StatusCode::UNPROCESSABLE_ENTITY, "invalid activation"))?;
+    if encoded.len() > MAX_STERILE_BUNDLE_BYTES {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "activation too large"));
+    }
+    let digest: [u8; 32] = Sha256::digest(&encoded).into();
+    let accepted = SterileLauncherStatusV1 {
+        phase: SterileLauncherPhaseV1::Accepted,
+        pid: None,
+        exit_code: None,
+        error: None,
+    };
+    let (is_new, status) = register_sterile_activation(&state, digest, accepted).await?;
+    if !is_new {
+        return Ok((StatusCode::OK, Json(status)));
+    }
+    tokio::spawn(run_sterile_activation(state, bundle));
+    Ok((StatusCode::ACCEPTED, Json(status)))
+}
+
+async fn register_sterile_activation(
+    state: &SterileLauncherServerState,
+    request_digest: [u8; 32],
+    accepted: SterileLauncherStatusV1,
+) -> Result<(bool, SterileLauncherStatusV1), (StatusCode, &'static str)> {
+    let mut activation = state.activation.lock().await;
+    match &*activation {
+        SterileLauncherActivationState::Waiting => {
+            *activation = SterileLauncherActivationState::Accepted {
+                request_digest,
+                status: accepted.clone(),
+            };
+            Ok((true, accepted))
+        }
+        SterileLauncherActivationState::Accepted {
+            request_digest: existing,
+            status,
+        } if existing == &request_digest => Ok((false, status.clone())),
+        SterileLauncherActivationState::Accepted { .. } => {
+            Err((StatusCode::CONFLICT, "conflicting activation"))
+        }
+    }
+}
+
+async fn run_sterile_activation(
+    state: SterileLauncherServerState,
+    bundle: SterileActivationRequestV1,
+) {
+    let terminal = match spawn_and_wait_sterile_maestro(&state, bundle).await {
+        Ok(exit_code) => SterileLauncherStatusV1 {
+            phase: SterileLauncherPhaseV1::Terminal,
+            pid: None,
+            exit_code,
+            error: None,
+        },
+        Err(_) => SterileLauncherStatusV1 {
+            phase: SterileLauncherPhaseV1::Terminal,
+            pid: None,
+            exit_code: None,
+            error: Some("sterile launcher failed".into()),
+        },
+    };
+    set_sterile_launcher_status(&state, terminal).await;
+}
+
+async fn spawn_and_wait_sterile_maestro(
+    state: &SterileLauncherServerState,
+    bundle: SterileActivationRequestV1,
+) -> anyhow::Result<Option<i32>> {
+    prepare_resident_bootstrap_file(
+        &bundle.bootstrap,
+        Path::new("/run/sandboxwich/bootstrap"),
+        None,
+    )?;
+    let (program, argv) = bundle
+        .argv
+        .split_first()
+        .context("sterile launcher argv is empty")?;
+    let mut command = ProcessCommand::new(program);
+    command
+        .args(argv)
+        .envs(bundle.env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    if let Some(cwd) = bundle.cwd {
+        command.current_dir(cwd);
+    }
+    let mut child = command
+        .spawn()
+        .context("spawn Maestro from sterile launcher")?;
+    set_sterile_launcher_status(
+        state,
+        SterileLauncherStatusV1 {
+            phase: SterileLauncherPhaseV1::Running,
+            pid: child.id(),
+            exit_code: None,
+            error: None,
+        },
+    )
+    .await;
+    let status = child
+        .wait()
+        .await
+        .context("wait for sterile Maestro process")?;
+    Ok(status.code())
+}
+
+async fn set_sterile_launcher_status(
+    state: &SterileLauncherServerState,
+    status: SterileLauncherStatusV1,
+) {
+    let mut activation = state.activation.lock().await;
+    if let SterileLauncherActivationState::Accepted {
+        status: current, ..
+    } = &mut *activation
+    {
+        *current = status;
+    }
+}
+
+async fn get_sterile_launcher_status(
+    State(state): State<SterileLauncherServerState>,
+) -> Result<Json<SterileLauncherStatusV1>, StatusCode> {
+    let activation = state.activation.lock().await;
+    match &*activation {
+        SterileLauncherActivationState::Waiting => Err(StatusCode::NOT_FOUND),
+        SterileLauncherActivationState::Accepted { status, .. } => Ok(Json(status.clone())),
+    }
+}
+
+fn continue_candidate_bootstrap_validation(
+    bootstrap: &ResidentProcessBootstrapReadResponse,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        bootstrap.content.len() <= MAX_STERILE_BUNDLE_BYTES,
+        "candidate bootstrap exceeds the launcher handoff bound"
+    );
+    if bootstrap.target_file.is_empty() {
+        anyhow::ensure!(
+            bootstrap.content.is_empty() && bootstrap.mode == 0,
+            "activation-only bootstrap is malformed"
+        );
+    } else {
+        anyhow::ensure!(
+            Path::new(&bootstrap.target_file).starts_with("/run/sandboxwich/bootstrap"),
+            "candidate bootstrap target is outside the launcher bootstrap root"
+        );
+    }
+    Ok(())
+}
+
+async fn wait_launcher_status(
+    client: &reqwest::Client,
+    activation_url: &str,
+    phase: SterileLauncherPhaseV1,
+    expires_at: DateTime<Utc>,
+) -> anyhow::Result<SterileLauncherStatusV1> {
+    loop {
+        anyhow::ensure!(
+            expires_at > Utc::now(),
+            "sterile activation expired while waiting for launcher"
+        );
+        if let Ok(response) = client
+            .get(format!("{activation_url}/v1/status"))
+            .send()
+            .await
+            && response.status().is_success()
+        {
+            let status: SterileLauncherStatusV1 = response.json().await?;
+            if status.phase == phase
+                || (phase == SterileLauncherPhaseV1::Running
+                    && status.phase == SterileLauncherPhaseV1::Terminal)
+            {
+                return Ok(status);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn read_bounded_sterile_tls_file(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("inspect sterile activation TLS file {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() > 0 && metadata.len() <= MAX_STERILE_TLS_FILE_BYTES,
+        "sterile activation TLS file must be a bounded regular file"
+    );
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("read sterile activation TLS file {}", path.display()))?;
+    anyhow::ensure!(
+        !bytes.is_empty() && bytes.len() as u64 <= MAX_STERILE_TLS_FILE_BYTES,
+        "sterile activation TLS file must be bounded"
+    );
+    Ok(bytes)
+}
+
+fn sterile_launcher_tls_config(
+    cert_file: &Path,
+    key_file: &Path,
+    client_ca_file: &Path,
+    client_uri: &str,
+) -> anyhow::Result<RustlsConfig> {
+    anyhow::ensure!(
+        client_uri.starts_with("spiffe://sandboxwich.dev/sterile-cell/")
+            && !client_uri.contains(char::is_whitespace),
+        "launcher client URI is invalid"
+    );
+    let certificates =
+        rustls_pemfile::certs(&mut Cursor::new(read_bounded_sterile_tls_file(cert_file)?))
+            .collect::<Result<Vec<_>, _>>()?;
+    anyhow::ensure!(!certificates.is_empty(), "launcher certificate is empty");
+    let mut key = None;
+    for item in rustls_pemfile::read_all(&mut Cursor::new(read_bounded_sterile_tls_file(key_file)?))
+    {
+        let parsed = match item? {
+            Item::Pkcs1Key(value) => rustls::pki_types::PrivateKeyDer::Pkcs1(value),
+            Item::Pkcs8Key(value) => rustls::pki_types::PrivateKeyDer::Pkcs8(value),
+            Item::Sec1Key(value) => rustls::pki_types::PrivateKeyDer::Sec1(value),
+            _ => bail!("launcher key file contains non-key PEM"),
+        };
+        anyhow::ensure!(
+            key.replace(parsed).is_none(),
+            "launcher key file contains multiple keys"
+        );
+    }
+    let mut roots = RootCertStore::empty();
+    for certificate in rustls_pemfile::certs(&mut Cursor::new(read_bounded_sterile_tls_file(
+        client_ca_file,
+    )?)) {
+        roots.add(certificate?)?;
+    }
+    anyhow::ensure!(!roots.is_empty(), "launcher client CA is empty");
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier =
+        WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone()).build()?;
+    let verifier = Arc::new(ExactSterileClientCertVerifier {
+        inner: verifier,
+        required_uri: Arc::from(client_uri),
+    });
+    let mut config = ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certificates, key.context("launcher key is empty")?)?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(RustlsConfig::from_config(Arc::new(config)))
+}
+
+fn sterile_activation_http_client() -> anyhow::Result<(reqwest::Client, String)> {
+    let activation_url = std::env::var("SANDBOXWICH_STERILE_ACTIVATION_URL")
+        .context("candidate control is missing SANDBOXWICH_STERILE_ACTIVATION_URL")?;
+    anyhow::ensure!(
+        activation_url.starts_with("https://") && !activation_url.ends_with('/'),
+        "sterile activation URL must be an HTTPS origin without a trailing slash"
+    );
+    let cert = PathBuf::from(
+        std::env::var("SANDBOXWICH_STERILE_ACTIVATION_CLIENT_CERT_FILE")
+            .context("candidate control is missing sterile activation client certificate")?,
+    );
+    let key = PathBuf::from(
+        std::env::var("SANDBOXWICH_STERILE_ACTIVATION_CLIENT_KEY_FILE")
+            .context("candidate control is missing sterile activation client key")?,
+    );
+    let ca = PathBuf::from(
+        std::env::var("SANDBOXWICH_STERILE_ACTIVATION_SERVER_CA_FILE")
+            .context("candidate control is missing sterile activation server CA")?,
+    );
+    let mut identity = read_bounded_sterile_tls_file(&cert)?;
+    identity.extend_from_slice(&read_bounded_sterile_tls_file(&key)?);
+    anyhow::ensure!(
+        identity.len() as u64 <= 2 * MAX_STERILE_TLS_FILE_BYTES,
+        "sterile activation client identity exceeds bound"
+    );
+    let client = reqwest::Client::builder()
+        .https_only(true)
+        .identity(reqwest::Identity::from_pem(&identity)?)
+        .add_root_certificate(reqwest::Certificate::from_pem(
+            &read_bounded_sterile_tls_file(&ca)?,
+        )?)
+        .build()?;
+    Ok((client, activation_url))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn activate_sterile_launcher_after_revalidation(
+    client: &reqwest::Client,
+    api: &str,
+    sandbox_id: SandboxId,
+    fence: &sandboxwich_core::SterileResidentActivationFenceV1,
+    daemon_lease: Option<&sandboxwich_core::SterileCellLeaseV1>,
+    candidate: &sandboxwich_core::SterilePoolCandidateV1,
+    activation: &sandboxwich_core::SterileResidentActivationV1,
+    activation_client: &reqwest::Client,
+    activation_url: &str,
+    argv: Vec<String>,
+    cwd: Option<String>,
+    env: BTreeMap<String, String>,
+    bootstrap: ResidentProcessBootstrapReadResponse,
+) -> anyhow::Result<DateTime<Utc>> {
+    let live = validate_resident_sterile_activation(
+        client,
+        api,
+        sandbox_id,
+        Some(fence),
+        daemon_lease,
+        Some(candidate),
+        Some(activation),
+    )
+    .await?
+    .context("candidate activation expired before launcher activation")?;
+    anyhow::ensure!(
+        bootstrap.sterile_activation.is_none(),
+        "raw sterile attestation cannot cross the launcher activation channel"
+    );
+    let request = SterileActivationRequestV1 {
+        version: 1,
+        candidate: candidate.clone(),
+        fence: *fence,
+        validated_expires_at: live.expires_at,
+        argv,
+        cwd,
+        env,
+        bootstrap,
+    };
+    let endpoint = format!("{activation_url}/v1/activation");
+    loop {
+        anyhow::ensure!(
+            live.expires_at > Utc::now(),
+            "sterile activation expired before launcher acknowledged activation"
+        );
+        match activation_client.put(&endpoint).json(&request).send().await {
+            Ok(response) if response.status().is_success() => break,
+            Ok(response) if response.status() == reqwest::StatusCode::CONFLICT => {
+                bail!("sterile launcher rejected conflicting activation")
+            }
+            Ok(response) if response.status().is_client_error() => {
+                bail!(
+                    "sterile launcher rejected activation: {}",
+                    response.status()
+                )
+            }
+            Ok(_) | Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    Ok(live.expires_at)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn supervise_sterile_launcher(
+    client: &reqwest::Client,
+    api: &str,
+    lease: sandboxwich_core::JobLease,
+    process_id: ResidentProcessId,
+    generation: u64,
+    candidate: sandboxwich_core::SterilePoolCandidateV1,
+    activation_client: reqwest::Client,
+    activation_url: String,
+    expires_at: DateTime<Utc>,
+) -> anyhow::Result<LeaseResponse> {
+    let cancellation = LeaseCancellation::new();
+    let renewal = LeaseRenewalTask::new(spawn_lease_renewal_task(
+        client.clone(),
+        api.to_string(),
+        &lease,
+        cancellation.clone(),
+    ));
+    let outcome = async {
+        let started = wait_launcher_status(
+            &activation_client,
+            &activation_url,
+            SterileLauncherPhaseV1::Running,
+            expires_at,
+        )
+        .await?;
+        let observation = |observed_state, pid, exit_code, error_code, error_message| {
+            ResidentProcessObservationRequest {
+                generation,
+                lease_id: lease.id.0,
+                observed_state,
+                pid,
+                exit_code,
+                error_code,
+                error_message,
+                provider_pod_name: candidate.pod_name.clone(),
+                provider_pod_uid: candidate.pod_uid.clone(),
+            }
+        };
+        post_resident_observation(
+            client,
+            api,
+            process_id,
+            observation(
+                ResidentProcessObservedState::Starting,
+                started.pid,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await?;
+        post_resident_observation(
+            client,
+            api,
+            process_id,
+            observation(
+                ResidentProcessObservedState::Running,
+                started.pid,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await?;
+        let terminal = wait_launcher_status(
+            &activation_client,
+            &activation_url,
+            SterileLauncherPhaseV1::Terminal,
+            expires_at,
+        )
+        .await?;
+        let success = terminal.exit_code == Some(0) && terminal.error.is_none();
+        post_resident_observation(
+            client,
+            api,
+            process_id,
+            observation(
+                if success {
+                    ResidentProcessObservedState::Stopped
+                } else {
+                    ResidentProcessObservedState::Failed
+                },
+                None,
+                terminal.exit_code,
+                (!success).then(|| "sterile_launcher_terminal".into()),
+                terminal.error,
+            ),
+        )
+        .await?;
+        if success {
+            complete_resident_lease_until_resolved(
+                client,
+                api,
+                ResidentLeaseFence {
+                    lease_id: lease.id,
+                    process_id,
+                    generation,
+                },
+                terminal.exit_code,
+                &cancellation,
+            )
+            .await
+            .map_err(|reason| {
+                anyhow::anyhow!("sterile launcher lease completion cancelled: {reason:?}")
+            })
+        } else {
+            fail_lease_terminal(client, api, lease.id, "sterile launcher failed".into())
+                .await
+                .map_err(anyhow::Error::from)
+        }
+    }
+    .await;
+    renewal.abort_and_wait().await;
+    outcome
 }
 
 async fn handle_resident_process_with_bootstrap_root(
@@ -2421,6 +3150,8 @@ async fn handle_resident_process_with_bootstrap_root(
     }
 
     let mut delivered_sterile_activation = None;
+    let mut delivered_bootstrap = None;
+    let mut validated_activation_lease = None;
 
     if let Some(expected_sha256) = expected_sha256 {
         let bootstrap: ResidentProcessBootstrapReadResponse = decode_json(
@@ -2435,7 +3166,7 @@ async fn handle_resident_process_with_bootstrap_root(
                 .await?,
         )
         .await?;
-        validate_resident_sterile_activation(
+        validated_activation_lease = validate_resident_sterile_activation(
             client,
             api,
             sandbox_id,
@@ -2446,17 +3177,73 @@ async fn handle_resident_process_with_bootstrap_root(
         )
         .await?;
         delivered_sterile_activation = bootstrap.sterile_activation.clone();
-        let prepare = prepare_resident_bootstrap_file(&bootstrap, bootstrap_root, run_as_uid);
-        if let Err(error) = prepare {
-            return fail_lease_terminal(
-                client,
-                api,
-                lease.id,
-                format!("resident bootstrap preparation failed after delivery: {error:#}"),
-            )
-            .await
-            .map_err(Into::into);
+        let mut launcher_bootstrap = bootstrap.clone();
+        launcher_bootstrap.sterile_activation = None;
+        delivered_bootstrap = Some(launcher_bootstrap);
+        if sterile_pool_candidate.is_some() {
+            // The trusted control sidecar must never materialize the tenant
+            // bootstrap in its own filesystem; only the credential-free
+            // launcher consumes it from the one-shot tmpfs handoff.
+            continue_candidate_bootstrap_validation(&bootstrap)?;
+        } else {
+            let prepare = prepare_resident_bootstrap_file(&bootstrap, bootstrap_root, run_as_uid);
+            if let Err(error) = prepare {
+                return fail_lease_terminal(
+                    client,
+                    api,
+                    lease.id,
+                    format!("resident bootstrap preparation failed after delivery: {error:#}"),
+                )
+                .await
+                .map_err(Into::into);
+            }
         }
+    }
+
+    if let Some(candidate) = sterile_pool_candidate.as_ref() {
+        validated_activation_lease
+            .as_ref()
+            .context("candidate activation did not yield a validated live lease")?;
+        let bootstrap = delivered_bootstrap
+            .context("candidate activation did not deliver its one-shot bootstrap")?;
+        // The bootstrap read may race lease revocation/expiry. Revalidate the
+        // bearer authority at the final control-side boundary and send only
+        // the non-attestation activation over the dedicated mTLS channel.
+        let (activation_client, activation_url) = sterile_activation_http_client()?;
+        let fence = sterile_activation_fence
+            .as_ref()
+            .context("candidate job lost activation fence")?;
+        let activation = delivered_sterile_activation
+            .as_ref()
+            .context("candidate bootstrap lost sterile activation")?;
+        let expires_at = activate_sterile_launcher_after_revalidation(
+            client,
+            api,
+            sandbox_id,
+            fence,
+            sterile_cell_lease.as_ref(),
+            candidate,
+            activation,
+            &activation_client,
+            &activation_url,
+            argv,
+            cwd,
+            env,
+            bootstrap,
+        )
+        .await?;
+        return supervise_sterile_launcher(
+            client,
+            api,
+            lease,
+            process_id,
+            generation,
+            candidate.clone(),
+            activation_client,
+            activation_url,
+            expires_at,
+        )
+        .await;
     }
 
     let cancellation = LeaseCancellation::new();
@@ -2523,8 +3310,12 @@ async fn handle_resident_process_with_bootstrap_root(
                             exit_code: None,
                             error_code: Some("resident_process_spawn_failed".into()),
                             error_message: Some(error_message.clone()),
-                            provider_pod_name: None,
-                            provider_pod_uid: None,
+                            provider_pod_name: sterile_pool_candidate
+                                .as_ref()
+                                .and_then(|candidate| candidate.pod_name.clone()),
+                            provider_pod_uid: sterile_pool_candidate
+                                .as_ref()
+                                .and_then(|candidate| candidate.pod_uid.clone()),
                         },
                         &cancellation,
                     )
@@ -2553,8 +3344,12 @@ async fn handle_resident_process_with_bootstrap_root(
                     exit_code: None,
                     error_code: None,
                     error_message: None,
-                    provider_pod_name: None,
-                    provider_pod_uid: None,
+                    provider_pod_name: sterile_pool_candidate
+                        .as_ref()
+                        .and_then(|candidate| candidate.pod_name.clone()),
+                    provider_pod_uid: sterile_pool_candidate
+                        .as_ref()
+                        .and_then(|candidate| candidate.pod_uid.clone()),
                 },
                 &cancellation,
             )
@@ -2577,8 +3372,12 @@ async fn handle_resident_process_with_bootstrap_root(
                     exit_code: None,
                     error_code: None,
                     error_message: None,
-                    provider_pod_name: None,
-                    provider_pod_uid: None,
+                    provider_pod_name: sterile_pool_candidate
+                        .as_ref()
+                        .and_then(|candidate| candidate.pod_name.clone()),
+                    provider_pod_uid: sterile_pool_candidate
+                        .as_ref()
+                        .and_then(|candidate| candidate.pod_uid.clone()),
                 },
                 &cancellation,
             )
@@ -2626,8 +3425,12 @@ async fn handle_resident_process_with_bootstrap_root(
                 exit_code: last_exit_code,
                 error_code: (last_exit_code != Some(0)).then(|| "resident_process_exit".into()),
                 error_message: None,
-                provider_pod_name: None,
-                provider_pod_uid: None,
+                provider_pod_name: sterile_pool_candidate
+                    .as_ref()
+                    .and_then(|candidate| candidate.pod_name.clone()),
+                provider_pod_uid: sterile_pool_candidate
+                    .as_ref()
+                    .and_then(|candidate| candidate.pod_uid.clone()),
             },
             &cancellation,
         )
@@ -3078,10 +3881,13 @@ fn parse_env(value: &str) -> Result<(String, String), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rcgen::{
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+        KeyUsagePurpose, SanType, string::Ia5String,
+    };
     use sandboxwich_core::{
         SterileCellId, SterileCellReleaseTrustClassV1, SterileCellRuntimeClass,
     };
-    use sha2::{Digest as _, Sha256};
     use std::sync::atomic::AtomicBool;
 
     use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
@@ -3195,7 +4001,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prewarmed_daemon_rejects_activation_that_expires_before_resident_spawn() {
+    async fn prewarmed_daemon_rejects_activation_expired_at_final_pre_bundle_validation() {
         async fn validate(
             State(lease): State<sandboxwich_core::SterileCellLeaseV1>,
         ) -> Json<ValidateSterileCellLeaseResponseV1> {
@@ -3244,6 +4050,11 @@ mod tests {
                     policy_digest: "a".repeat(64),
                     signature: "swrs1_test".into(),
                 },
+                agent_image: format!("agent@sha256:{}", "b".repeat(64)),
+                maestro_image: format!("maestro@sha256:{}", "c".repeat(64)),
+                service_name: format!("sandboxwich-mc-{sandbox_id}"),
+                pod_name: Some(format!("sandboxwich-{sandbox_id}")),
+                pod_uid: Some("pod-uid-test".into()),
             }),
             Some(&sandboxwich_core::SterileResidentActivationV1 {
                 lease_id,
@@ -3262,6 +4073,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revocation_between_bootstrap_read_and_final_validation_sends_no_activation() {
+        async fn validate(
+            State((lease, calls)): State<(
+                sandboxwich_core::SterileCellLeaseV1,
+                Arc<std::sync::atomic::AtomicUsize>,
+            )>,
+        ) -> Json<ValidateSterileCellLeaseResponseV1> {
+            let mut lease = lease;
+            if calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                lease.expires_at = Utc::now() - chrono::Duration::seconds(1);
+            }
+            Json(ValidateSterileCellLeaseResponseV1 { ok: true, lease })
+        }
+        let sandbox_id = SandboxId::new();
+        let lease_id = Uuid::now_v7();
+        let release = SterileCellReleaseTrustClassV1 {
+            release_set_id: "release-set-test".into(),
+            runtime_class: SterileCellRuntimeClass::KataMicrovm,
+            policy_digest: "a".repeat(64),
+            signature: "swrs1_test".into(),
+        };
+        let lease = sandboxwich_core::SterileCellLeaseV1 {
+            lease_id,
+            cell_id: SterileCellId(sandbox_id.0),
+            generation: 2,
+            release: release.clone(),
+            organization_id: "org-1".into(),
+            workspace_id: "workspace-1".into(),
+            thread_id: "thread-1".into(),
+            runner_session_id: "session-1".into(),
+            expires_at: Utc::now() + chrono::Duration::minutes(1),
+        };
+        let fence = sandboxwich_core::SterileResidentActivationFenceV1 {
+            cell_id: lease.cell_id,
+            lease_id,
+            generation: lease.generation,
+        };
+        let candidate = sandboxwich_core::SterilePoolCandidateV1 {
+            cell_id: lease.cell_id,
+            release,
+            agent_image: format!("agent@sha256:{}", "b".repeat(64)),
+            maestro_image: format!("maestro@sha256:{}", "c".repeat(64)),
+            service_name: format!("sandboxwich-mc-{sandbox_id}"),
+            pod_name: Some(format!("sandboxwich-{sandbox_id}")),
+            pod_uid: Some("pod-uid-test".into()),
+        };
+        let activation = sandboxwich_core::SterileResidentActivationV1 {
+            lease_id,
+            generation: 2,
+            organization_id: "org-1".into(),
+            workspace_id: "workspace-1".into(),
+            thread_id: "thread-1".into(),
+            runner_session_id: "session-1".into(),
+            lease_attestation: "raw-secret-attestation".into(),
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/sterile-cell-leases/{lease_id}/validate", post(validate))
+            .with_state((lease, calls.clone()));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let api = format!("http://{address}");
+        validate_resident_sterile_activation(
+            &client,
+            &api,
+            sandbox_id,
+            Some(&fence),
+            None,
+            Some(&candidate),
+            Some(&activation),
+        )
+        .await
+        .expect("initial admission validation succeeds");
+        let error = activate_sterile_launcher_after_revalidation(
+            &client,
+            &api,
+            sandbox_id,
+            &fence,
+            None,
+            &candidate,
+            &activation,
+            &reqwest::Client::new(),
+            "https://127.0.0.1:1",
+            vec!["/usr/local/bin/maestro".into()],
+            None,
+            BTreeMap::new(),
+            ResidentProcessBootstrapReadResponse {
+                ok: true,
+                content: b"gateway-token-secret-canary".to_vec(),
+                sha256: "hash".into(),
+                target_file: "/run/sandboxwich/bootstrap/gateway-token".into(),
+                mode: 0o400,
+                placement_attestation: None,
+                sterile_activation: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        server.abort();
+        assert!(error.to_string().contains("expired"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn sterile_candidate_and_ordinary_agents_reject_opposite_gate_modes() {
         let sandbox_id = SandboxId::new();
         let candidate = sandboxwich_core::SterilePoolCandidateV1 {
@@ -3272,6 +4189,11 @@ mod tests {
                 policy_digest: "a".repeat(64),
                 signature: "swrs1_test".into(),
             },
+            agent_image: format!("agent@sha256:{}", "b".repeat(64)),
+            maestro_image: format!("maestro@sha256:{}", "c".repeat(64)),
+            service_name: format!("sandboxwich-mc-{sandbox_id}"),
+            pod_name: Some(format!("sandboxwich-{sandbox_id}")),
+            pod_uid: Some("pod-uid-test".into()),
         };
         let candidate_error = validate_resident_sterile_activation(
             &reqwest::Client::new(),
@@ -3345,6 +4267,141 @@ mod tests {
 
         prepare_resident_bootstrap_file(&bootstrap, root.path(), None).unwrap();
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn sterile_launcher_response_loss_replay_is_exactly_idempotent() {
+        let state = SterileLauncherServerState {
+            activation: Arc::new(Mutex::new(SterileLauncherActivationState::Waiting)),
+        };
+        let accepted = SterileLauncherStatusV1 {
+            phase: SterileLauncherPhaseV1::Accepted,
+            pid: None,
+            exit_code: None,
+            error: None,
+        };
+        assert!(
+            register_sterile_activation(&state, [7; 32], accepted.clone())
+                .await
+                .unwrap()
+                .0
+        );
+        assert!(
+            !register_sterile_activation(&state, [7; 32], accepted.clone())
+                .await
+                .unwrap()
+                .0
+        );
+        let conflict = register_sterile_activation(&state, [8; 32], accepted)
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn sterile_launcher_channel_requires_a_client_certificate() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyCertSign,
+        ];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+        let mut server_params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let server_key = KeyPair::generate().unwrap();
+        let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
+        let mut client_params = CertificateParams::new(Vec::new()).unwrap();
+        let client_uri = "spiffe://sandboxwich.dev/sterile-cell/test/supervisor/test";
+        client_params.subject_alt_names =
+            vec![SanType::URI(Ia5String::try_from(client_uri).unwrap())];
+        client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let client_key = KeyPair::generate().unwrap();
+        let client_cert = client_params.signed_by(&client_key, &issuer).unwrap();
+        let mut wrong_client_params = CertificateParams::new(Vec::new()).unwrap();
+        wrong_client_params.subject_alt_names = vec![SanType::URI(
+            Ia5String::try_from("spiffe://sandboxwich.dev/sterile-cell/other/supervisor/other")
+                .unwrap(),
+        )];
+        wrong_client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let wrong_client_key = KeyPair::generate().unwrap();
+        let wrong_client_cert = wrong_client_params
+            .signed_by(&wrong_client_key, &issuer)
+            .unwrap();
+
+        let server_cert_file = directory.path().join("server.crt");
+        let server_key_file = directory.path().join("server.key");
+        let ca_file = directory.path().join("ca.crt");
+        std::fs::write(&server_cert_file, server_cert.pem()).unwrap();
+        std::fs::write(&server_key_file, server_key.serialize_pem()).unwrap();
+        std::fs::write(&ca_file, ca.pem()).unwrap();
+        let tls =
+            sterile_launcher_tls_config(&server_cert_file, &server_key_file, &ca_file, client_uri)
+                .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let state = SterileLauncherServerState {
+            activation: Arc::new(Mutex::new(SterileLauncherActivationState::Waiting)),
+        };
+        let app = Router::new()
+            .route("/v1/status", get(get_sterile_launcher_status))
+            .with_state(state);
+        let handle = axum_server::Handle::new();
+        let server_handle = handle.clone();
+        let server = tokio::spawn(async move {
+            axum_server::from_tcp_rustls(listener, tls)
+                .handle(server_handle)
+                .serve(app.into_make_service())
+                .await
+                .unwrap();
+        });
+        let ca = reqwest::Certificate::from_pem(ca.pem().as_bytes()).unwrap();
+        let without_identity = reqwest::Client::builder()
+            .add_root_certificate(ca.clone())
+            .build()
+            .unwrap();
+        assert!(
+            without_identity
+                .get(format!("https://localhost:{}/v1/status", address.port()))
+                .send()
+                .await
+                .is_err()
+        );
+        let wrong_identity = format!(
+            "{}{}",
+            wrong_client_cert.pem(),
+            wrong_client_key.serialize_pem()
+        );
+        let wrong_client = reqwest::Client::builder()
+            .identity(reqwest::Identity::from_pem(wrong_identity.as_bytes()).unwrap())
+            .add_root_certificate(ca.clone())
+            .build()
+            .unwrap();
+        assert!(
+            wrong_client
+                .get(format!("https://localhost:{}/v1/status", address.port()))
+                .send()
+                .await
+                .is_err()
+        );
+        let identity = format!("{}{}", client_cert.pem(), client_key.serialize_pem());
+        let authenticated = reqwest::Client::builder()
+            .identity(reqwest::Identity::from_pem(identity.as_bytes()).unwrap())
+            .add_root_certificate(ca)
+            .build()
+            .unwrap();
+        let response = authenticated
+            .get(format!("https://localhost:{}/v1/status", address.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        handle.shutdown();
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -4198,10 +5255,15 @@ mod tests {
 
     #[test]
     fn full_resident_supervisor_leaves_resident_work_queued() {
-        assert_eq!(guest_claim_kinds(false), vec![JobKind::RunCommand]);
+        assert_eq!(guest_claim_kinds(false, false), vec![JobKind::RunCommand]);
         assert_eq!(
-            guest_claim_kinds(true),
+            guest_claim_kinds(true, false),
             vec![JobKind::RunCommand, JobKind::RunResidentProcess]
+        );
+        assert!(guest_claim_kinds(false, true).is_empty());
+        assert_eq!(
+            guest_claim_kinds(true, true),
+            vec![JobKind::RunResidentProcess]
         );
     }
 

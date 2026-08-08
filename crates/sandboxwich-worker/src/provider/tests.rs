@@ -1,6 +1,29 @@
 use super::*;
-use sandboxwich_core::{MAX_COMMAND_STDIN_BYTES, NetworkAllowRule, RuntimeResourceInventoryItem};
+use sandboxwich_core::{
+    MAX_COMMAND_STDIN_BYTES, NetworkAllowRule, RuntimeResourceInventoryItem, SterileCellId,
+    SterileCellReleaseTrustClassV1, SterileCellRuntimeClass, SterilePoolCandidateV1,
+};
 use sandboxwich_core::{SandboxSecretMount, SecretRef, SecretRefId, SecretRefState, SecretSource};
+
+fn sterile_maestro_candidate(sandbox_id: SandboxId) -> SterilePoolCandidateV1 {
+    SterilePoolCandidateV1 {
+        cell_id: SterileCellId(sandbox_id.0),
+        release: SterileCellReleaseTrustClassV1 {
+            release_set_id: "release-test".into(),
+            runtime_class: SterileCellRuntimeClass::KataMicrovm,
+            policy_digest: "a".repeat(64),
+            signature: "swrs1_test".into(),
+        },
+        agent_image: format!(
+            "ghcr.io/evalops/sandboxwich-agent@sha256:{}",
+            "b".repeat(64)
+        ),
+        maestro_image: format!("ghcr.io/evalops/maestro@sha256:{}", "c".repeat(64)),
+        service_name: format!("sandboxwich-mc-{sandbox_id}"),
+        pod_name: None,
+        pod_uid: None,
+    }
+}
 
 #[test]
 fn compiler_cache_materialization_stages_then_restores_before_success() {
@@ -165,6 +188,300 @@ fn compiler_cache_containers_are_non_root_with_a_guest_invisible_staging_volume(
     assert!(helper.get("env").is_none());
     assert!(helper.get("ports").is_none());
     assert_eq!(pod["spec"]["automountServiceAccountToken"], false);
+}
+
+#[test]
+fn kubernetes_pod_marks_only_authoritative_sterile_pool_candidates() {
+    let sandbox_id = SandboxId::new();
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+    let ordinary = provider.pod_manifest(sandbox_id, &SandboxProvisionSpec::default());
+    let ordinary_env = ordinary["spec"]["containers"][0]["env"].as_array().unwrap();
+    assert!(
+        ordinary_env
+            .iter()
+            .all(|entry| { entry["name"] != "SANDBOXWICH_STERILE_POOL_CANDIDATE_V1" })
+    );
+
+    let candidate = sterile_maestro_candidate(sandbox_id);
+    let spec = SandboxProvisionSpec {
+        sterile_pool_candidate: Some(candidate.clone()),
+        workspace_mode: WorkspaceMode::Persistent,
+        tenant_id: Some("tenant-canary-must-not-render".to_string()),
+        network_egress: NetworkEgress::AllowAll,
+        ..SandboxProvisionSpec::default()
+    };
+    let apply = KubernetesApplyProvider::new(
+        provider
+            .clone()
+            .with_runtime_class_name(Some("kata".to_string()))
+            .with_guest_credentials(
+                sandbox_id,
+                Uuid::now_v7(),
+                "http://sandboxwich-api.sandboxwich-ci.svc.cluster.local:3217",
+                "sbw_gtok_candidate",
+            ),
+        "kubectl",
+    );
+    let manifests = apply
+        .provision_manifests(sandbox_id, &spec)
+        .expect("candidate manifests");
+    let pool_pod = manifests
+        .iter()
+        .find(|manifest| {
+            manifest["kind"] == "Pod"
+                && manifest["metadata"]["name"] == format!("sandboxwich-{sandbox_id}")
+        })
+        .expect("tenant candidate Pod");
+    let supervisor_pod = manifests
+        .iter()
+        .find(|manifest| {
+            manifest["kind"] == "Pod"
+                && manifest["metadata"]["name"] == format!("sandboxwich-supervisor-{sandbox_id}")
+        })
+        .expect("candidate supervisor Pod");
+    let marker = pool_pod["spec"]["containers"][0]["env"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "SANDBOXWICH_STERILE_POOL_CANDIDATE_V1")
+        .expect("pool candidate marker missing from sandbox container");
+    let decoded: SterilePoolCandidateV1 =
+        serde_json::from_str(marker["value"].as_str().unwrap()).unwrap();
+    assert_eq!(decoded, candidate);
+
+    assert_eq!(
+        manifests
+            .iter()
+            .map(|manifest| manifest["kind"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            "PersistentVolumeClaim",
+            "Secret",
+            "Secret",
+            "Secret",
+            "NetworkPolicy",
+            "NetworkPolicy",
+            "Service",
+            "Pod",
+            "Pod"
+        ],
+        "candidate provisioning separates tenant and supervisor security boundaries"
+    );
+    assert_eq!(
+        pool_pod["spec"]["initContainers"][0]["image"],
+        candidate.agent_image
+    );
+    assert_eq!(
+        pool_pod["spec"]["containers"][0]["image"],
+        candidate.maestro_image
+    );
+    assert_eq!(
+        supervisor_pod["spec"]["containers"][0]["command"],
+        json!(["/opt/sandboxwich/bin/sandboxwich-agent", "daemon"])
+    );
+    assert_eq!(
+        pool_pod["spec"]["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|volume| volume["name"] == "bootstrap")
+            .unwrap()["emptyDir"]["medium"],
+        "Memory"
+    );
+    let rendered = serde_json::to_string(&manifests).unwrap();
+    assert!(!rendered.contains("placement-attestation"));
+    assert!(!rendered.contains("managed-gateway-token"));
+    assert!(!rendered.contains("tenant-canary-must-not-render"));
+    assert!(!rendered.contains("0.0.0.0/0"));
+    assert!(!rendered.contains("sandboxwich-ssh"));
+    assert!(!rendered.contains("sandboxwich-desktop"));
+    assert!(pool_pod["spec"]["runtimeClassName"].is_string());
+    assert!(supervisor_pod["spec"].get("runtimeClassName").is_none());
+    assert_eq!(pool_pod["spec"]["containers"].as_array().unwrap().len(), 1);
+    let maestro = &pool_pod["spec"]["containers"][0];
+    let maestro_rendered = serde_json::to_string(maestro).unwrap();
+    assert!(!maestro_rendered.contains("sandboxwich-guest-token"));
+    assert!(!maestro_rendered.contains("SANDBOXWICH_API"));
+    assert!(!maestro_rendered.contains("SANDBOXWICH_GUEST_TOKEN"));
+    assert!(maestro_rendered.contains("SANDBOXWICH_STERILE_POOL_CANDIDATE_V1"));
+    assert!(maestro_rendered.contains("SANDBOXWICH_PROVIDER_POD_NAME"));
+    assert!(maestro_rendered.contains("SANDBOXWICH_PROVIDER_POD_UID"));
+    assert!(maestro_rendered.contains("--activation-bind"));
+    assert!(maestro_rendered.contains("0.0.0.0:9443"));
+    assert!(maestro_rendered.contains("activation-tls"));
+    let supervisor_rendered = serde_json::to_string(supervisor_pod).unwrap();
+    assert!(supervisor_rendered.contains("SANDBOXWICH_GUEST_TOKEN_FILE"));
+    assert!(supervisor_rendered.contains("SANDBOXWICH_STERILE_ACTIVATION_URL"));
+    assert!(supervisor_rendered.contains(":9443"));
+    assert!(!maestro_rendered.contains("SANDBOXWICH_GUEST_TOKEN"));
+    assert!(!maestro_rendered.contains("SANDBOXWICH_API"));
+    assert!(!supervisor_rendered.contains(MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT));
+    assert!(!rendered.contains("\"name\":\"activation\",\"emptyDir\""));
+    let policies = manifests
+        .iter()
+        .filter(|manifest| manifest["kind"] == "NetworkPolicy")
+        .collect::<Vec<_>>();
+    assert_eq!(policies.len(), 2);
+    let policies_rendered = serde_json::to_string(&policies).unwrap();
+    for required in [
+        "sandboxwich-api",
+        "identity",
+        "llm-gateway",
+        "runner-host",
+        "9443",
+    ] {
+        assert!(
+            policies_rendered.contains(required),
+            "missing {required} policy boundary"
+        );
+    }
+    let service = manifests
+        .iter()
+        .find(|manifest| manifest["kind"] == "Service")
+        .unwrap();
+    assert_eq!(service["metadata"]["name"], candidate.service_name);
+    assert_eq!(service["spec"]["ports"][0]["port"], 8443);
+    assert_eq!(service["spec"]["ports"][1]["port"], 9443);
+
+    let tls_secrets = manifests
+        .iter()
+        .filter(|manifest| {
+            manifest["kind"] == "Secret"
+                && manifest["metadata"]["name"]
+                    .as_str()
+                    .is_some_and(|name| name.contains("activation"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tls_secrets.len(), 2);
+    assert!(manifests.iter().all(|manifest| {
+        manifest["metadata"]["labels"]["sandboxwich.dev/sandbox-id"]
+            == json!(sandbox_id.to_string())
+    }));
+    let teardown = apply.teardown_args(sandbox_id);
+    assert!(teardown.contains(&SANDBOX_TEARDOWN_RESOURCE_KINDS.to_string()));
+    assert!(SANDBOX_TEARDOWN_RESOURCE_KINDS.contains("pod"));
+    assert!(SANDBOX_TEARDOWN_RESOURCE_KINDS.contains("persistentvolumeclaim"));
+    assert!(SANDBOX_TEARDOWN_RESOURCE_KINDS.contains("service"));
+    assert!(SANDBOX_TEARDOWN_RESOURCE_KINDS.contains("networkpolicy"));
+    assert!(SANDBOX_TEARDOWN_RESOURCE_KINDS.contains("secret"));
+    let metadata = apply
+        .dry_run
+        .metadata(sandbox_id, "provision", &spec)
+        .expect("candidate metadata");
+    let metadata_json = serde_json::to_string(&metadata).unwrap();
+    for secret in tls_secrets {
+        for value in secret["stringData"].as_object().unwrap().values() {
+            let secret_value = value.as_str().unwrap();
+            assert!(!metadata_json.contains(secret_value));
+        }
+    }
+}
+
+#[test]
+fn sterile_maestro_candidate_rejects_unpinned_or_noncanonical_runtime_identity() {
+    let sandbox_id = SandboxId::new();
+    let provider = KubernetesApplyProvider::new(
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_runtime_class_name(Some("kata".to_string()))
+            .with_guest_credentials(
+                sandbox_id,
+                Uuid::now_v7(),
+                "http://sandboxwich-api.sandboxwich-ci.svc.cluster.local:3217",
+                "sbw_gtok_candidate",
+            ),
+        "kubectl",
+    );
+    let mut candidate = sterile_maestro_candidate(sandbox_id);
+    candidate.maestro_image = "ghcr.io/evalops/maestro:latest".to_string();
+    let mut spec = SandboxProvisionSpec {
+        workspace_mode: WorkspaceMode::Persistent,
+        sterile_pool_candidate: Some(candidate),
+        ..SandboxProvisionSpec::default()
+    };
+    assert!(
+        provider
+            .provision_manifests(sandbox_id, &spec)
+            .expect_err("a mutable Maestro image must fail closed")
+            .to_string()
+            .contains("digest-pinned")
+    );
+
+    let mut candidate = sterile_maestro_candidate(sandbox_id);
+    candidate.service_name = "attacker-selected-service".to_string();
+    spec.sterile_pool_candidate = Some(candidate);
+    assert!(
+        provider
+            .provision_manifests(sandbox_id, &spec)
+            .expect_err("a noncanonical Service identity must fail closed")
+            .to_string()
+            .contains("service name is not canonical")
+    );
+}
+
+#[test]
+fn sterile_activation_tls_rejects_forged_identity_and_key_mismatch_without_leaking_keys() {
+    let sandbox_id = SandboxId::new();
+    let candidate = sterile_maestro_candidate(sandbox_id);
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+    let tls = provider
+        .sterile_activation_tls(sandbox_id, &candidate)
+        .expect("generate activation PKI");
+
+    let mut forged = tls.server_secret.clone();
+    forged["metadata"]["annotations"]["sandboxwich.dev/activation-server-dns"] =
+        json!("attacker.invalid");
+    let error = validate_activation_tls_secret(&forged)
+        .expect_err("a forged semantic annotation must not authorize the certificate");
+    assert!(error.to_string().contains("wrong identity"));
+
+    let mut mismatched = tls.server_secret.clone();
+    let private_key = tls.client_secret["stringData"]["client.key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    mismatched["stringData"]["tls.key"] = json!(private_key.clone());
+    let error = validate_activation_tls_secret(&mismatched)
+        .expect_err("a mismatched leaf private key must fail closed");
+    let rendered_error = format!("{error:#}");
+    assert!(rendered_error.contains("does not match"));
+    assert!(!rendered_error.contains(&private_key));
+}
+
+#[test]
+fn sterile_activation_tls_adopts_existing_ca_and_recovers_missing_server_secret() {
+    let sandbox_id = SandboxId::new();
+    let candidate = sterile_maestro_candidate(sandbox_id);
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+    let first = provider
+        .sterile_activation_tls(sandbox_id, &candidate)
+        .expect("initial activation PKI");
+    let recovered = provider
+        .sterile_activation_tls_from_existing_client(
+            sandbox_id,
+            &candidate,
+            first.client_secret.clone(),
+        )
+        .expect("recover server identity from the fixed client PKI Secret");
+    assert_eq!(
+        recovered.client_secret["metadata"]["annotations"]["sandboxwich.dev/activation-ca-sha256"],
+        recovered.server_secret["metadata"]["annotations"]["sandboxwich.dev/activation-ca-sha256"]
+    );
+    validate_activation_tls_secret(&recovered.client_secret).unwrap();
+    validate_activation_tls_secret(&recovered.server_secret).unwrap();
+    validate_adoption_contract(&recovered.client_secret, &first.client_secret)
+        .expect("the fixed client Secret is adopted without random-secret drift");
+    validate_adoption_contract(&recovered.server_secret, &first.server_secret)
+        .expect("a regenerated server leaf under the adopted CA matches semantically");
+
+    let unrelated = provider
+        .sterile_activation_tls(sandbox_id, &candidate)
+        .expect("unrelated activation PKI");
+    let error = validate_adoption_contract(&recovered.server_secret, &unrelated.server_secret)
+        .expect_err("a server Secret from another CA must fail closed");
+    assert!(error.to_string().contains("does not match"));
 }
 
 #[test]
@@ -575,6 +892,12 @@ fn maestro_hosted_runner_uses_only_projected_identity_in_an_isolated_pod() {
     let rendered_guest = serde_json::to_string(&guest).expect("render guest Pod");
     assert!(!rendered_guest.contains("workload-identity"));
     assert!(!rendered_guest.contains(MAESTRO_HOSTED_RUNNER_TOKEN_DIRECTORY));
+
+    let cleanup = provider.isolated_resident_process_cleanup_manifests(&spec);
+    assert!(
+        cleanup.iter().any(|manifest| manifest["kind"] == "Secret"),
+        "resident teardown must remove the managed-gateway bootstrap Secret"
+    );
 }
 
 #[test]
@@ -4710,6 +5033,160 @@ fn provision_staged_applies_the_guest_token_secret_before_the_pod() {
     );
 
     let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+#[test]
+fn provision_staged_reports_the_actual_sterile_maestro_pod_identity() {
+    let (kubectl, _) = write_stateful_fake_kubectl();
+    let sandbox_id = SandboxId::new();
+    let candidate = sterile_maestro_candidate(sandbox_id);
+    let dry_run =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_runtime_class_name(Some("kata".to_string()))
+            .with_guest_credentials(
+                sandbox_id,
+                Uuid::now_v7(),
+                "http://sandboxwich-api.evalops.svc.cluster.local:3217",
+                "sbw_gtok_sterile_candidate",
+            );
+    let provider = KubernetesApplyProvider::new(dry_run, kubectl.to_string_lossy().into_owned())
+        .with_kubectl_context(Some("in-cluster".to_string()))
+        .with_mutation_gate(true, true);
+    let spec = SandboxProvisionSpec {
+        workspace_mode: WorkspaceMode::Persistent,
+        sterile_pool_candidate: Some(candidate.clone()),
+        ..SandboxProvisionSpec::default()
+    };
+    let mut reports = Vec::new();
+
+    let handle = provider
+        .provision_staged(
+            sandbox_id,
+            &spec,
+            &CancelSignal::never_cancelled(),
+            |report| {
+                reports.push(report);
+                Ok(())
+            },
+        )
+        .expect("staged sterile candidate provision succeeds");
+
+    let pod = reports
+        .iter()
+        .find(|report| report.stage == ProvisioningStage::PodReady)
+        .expect("PodReady report");
+    assert_eq!(
+        pod.resource_name.as_deref(),
+        Some(format!("sandboxwich-{sandbox_id}").as_str())
+    );
+    assert!(
+        pod.resource_uid
+            .as_deref()
+            .is_some_and(|uid| uid.starts_with("uid-"))
+    );
+    assert!(pod.observed_generation.is_some());
+    assert!(handle.resources.iter().any(|resource| {
+        resource.resource_kind == RuntimeResourceKind::Service
+            && resource.resource_name == candidate.service_name
+            && resource.service_port == Some(MAESTRO_HOSTED_RUNNER_CONTAINER_PORT)
+    }));
+    assert!(handle.resources.iter().all(|resource| {
+        !matches!(
+            resource.purpose,
+            RuntimeResourcePurpose::Ssh | RuntimeResourcePurpose::Desktop
+        )
+    }));
+
+    let supervisor_marker = kubectl
+        .parent()
+        .unwrap()
+        .join(format!("pod-sandboxwich-supervisor-{sandbox_id}"));
+    let supervisor: Value = serde_json::from_str(
+        &std::fs::read_to_string(supervisor_marker).expect("supervisor Pod was applied"),
+    )
+    .unwrap();
+    let env = supervisor["spec"]["containers"][0]["env"]
+        .as_array()
+        .unwrap();
+    let env_value = |name: &str| {
+        env.iter()
+            .find(|entry| entry["name"] == name)
+            .and_then(|entry| entry["value"].as_str())
+            .unwrap()
+    };
+    assert_eq!(
+        env_value("SANDBOXWICH_PROVIDER_POD_NAME"),
+        format!("sandboxwich-{sandbox_id}")
+    );
+    assert_eq!(
+        env_value("SANDBOXWICH_PROVIDER_POD_UID"),
+        format!("uid-sandboxwich-{sandbox_id}")
+    );
+
+    let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+#[test]
+fn provision_staged_adopts_candidate_pki_after_lost_response_without_secret_drift() {
+    let (kubectl, _) = write_stateful_fake_kubectl();
+    let sandbox_id = SandboxId::new();
+    let candidate = sterile_maestro_candidate(sandbox_id);
+    let spec = SandboxProvisionSpec {
+        workspace_mode: WorkspaceMode::Persistent,
+        sterile_pool_candidate: Some(candidate),
+        ..SandboxProvisionSpec::default()
+    };
+    let make_provider = |worker_id| {
+        KubernetesApplyProvider::new(
+            KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+                .with_runtime_class_name(Some("kata".to_string()))
+                .with_guest_credentials(
+                    sandbox_id,
+                    worker_id,
+                    "http://sandboxwich-api.evalops.svc.cluster.local:3217",
+                    format!("sbw_gtok_{worker_id}"),
+                ),
+            kubectl.to_string_lossy().into_owned(),
+        )
+        .with_kubectl_context(Some("in-cluster".to_string()))
+        .with_mutation_gate(true, true)
+    };
+    make_provider(Uuid::now_v7())
+        .provision_staged(sandbox_id, &spec, &CancelSignal::never_cancelled(), |_| {
+            Ok(())
+        })
+        .expect("initial candidate provision");
+    let client_marker = kubectl
+        .parent()
+        .unwrap()
+        .join(format!("secret-sandboxwich-activation-client-{sandbox_id}"));
+    let server_marker = kubectl
+        .parent()
+        .unwrap()
+        .join(format!("secret-sandboxwich-activation-server-{sandbox_id}"));
+    let client_before = std::fs::read(&client_marker).unwrap();
+    let server_before = std::fs::read(&server_marker).unwrap();
+    std::fs::remove_file(&server_marker)
+        .expect("simulate response loss after client/CA creation but before server observation");
+
+    make_provider(Uuid::now_v7())
+        .provision_staged(sandbox_id, &spec, &CancelSignal::never_cancelled(), |_| {
+            Ok(())
+        })
+        .expect("lost-response retry adopts the existing candidate boundary");
+    assert_eq!(std::fs::read(client_marker).unwrap(), client_before);
+    let server_after = std::fs::read(server_marker).unwrap();
+    assert_ne!(server_after, server_before);
+    let client: Value = serde_json::from_slice(&client_before).unwrap();
+    let server: Value = serde_json::from_slice(&server_after).unwrap();
+    assert_eq!(
+        client["stringData"]["ca.crt"],
+        server["stringData"]["ca.crt"]
+    );
+    validate_activation_tls_secret(&client).unwrap();
+    validate_activation_tls_secret(&server).unwrap();
+
+    let _ = std::fs::remove_dir_all(kubectl.parent().unwrap());
 }
 
 #[test]

@@ -68,6 +68,70 @@ fn guest_supports_uid_isolated_resident_process(checks: &serde_json::Value) -> b
         .is_some_and(|report| report.supports_uid_isolated_resident_process())
 }
 
+async fn exact_sterile_candidate_resident_job(
+    db: &Database,
+    job: &Job,
+    sandbox_id: SandboxId,
+) -> Result<(bool, bool), ApiError> {
+    let membership_sql = format!(
+        "select 1 from sterile_pool_memberships where sandbox_id = {}",
+        db.placeholder(1)
+    );
+    let has_membership = sqlx::query(&membership_sql)
+        .bind(sandbox_id.to_string())
+        .fetch_optional(db.read_pool())
+        .await?
+        .is_some();
+    let Some(activation) = job.payload.get("sterileActivation") else {
+        return Ok((has_membership, false));
+    };
+    let Ok(fence) = serde_json::from_value::<SterileResidentActivationFenceV1>(activation.clone())
+    else {
+        return Ok((has_membership, false));
+    };
+    let Some(process_id) = job
+        .payload
+        .get("residentProcessId")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok((has_membership, false));
+    };
+    let Some(process_generation) = job
+        .payload
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return Ok((has_membership, false));
+    };
+    let exact_sql = format!(
+        "select 1 from sterile_pool_memberships p
+         join sterile_cells c on c.id = p.sandbox_id
+         where p.sandbox_id = {} and p.tenant_id = {} and p.state = 'leased'
+           and p.lease_id = {} and p.generation = {}
+           and p.candidate_pod_name is not null and p.candidate_pod_uid is not null
+           and c.state = 'leased' and c.lease_id = p.lease_id and c.generation = p.generation
+           and c.activated_resident_process_id = {} and c.activated_resident_generation = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4),
+        db.placeholder(5),
+        db.placeholder(6)
+    );
+    let exact = fence.cell_id.0 == sandbox_id.0
+        && sqlx::query(&exact_sql)
+            .bind(sandbox_id.to_string())
+            .bind(&job.tenant_id)
+            .bind(fence.lease_id.to_string())
+            .bind(i64::try_from(fence.generation).unwrap_or(i64::MAX))
+            .bind(process_id)
+            .bind(i64::try_from(process_generation).unwrap_or(i64::MAX))
+            .fetch_optional(db.read_pool())
+            .await?
+            .is_some();
+    Ok((has_membership, exact))
+}
+
 pub(crate) async fn claim_lease(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
@@ -200,7 +264,7 @@ pub(crate) async fn claim_lease(
         .push(
             ")
            and (
-             kind in ('provision_sandbox', 'run_prompt', 'stop_sandbox', 'delete_home')
+             kind in ('provision_sandbox', 'run_prompt', 'delete_home')
              or exists (
                select 1 from sandbox_placements p
                where p.sandbox_id = coalesce(jobs.sandbox_id, jobs.parent_sandbox_id)
@@ -278,6 +342,9 @@ pub(crate) async fn claim_lease(
     let mut placement_cache = crate::handlers::jobs::PlacementEnrichmentCache::new();
     for row in rows {
         let mut job = row_to_job(row)?;
+        if terminalize_invalid_sterile_resident_job_before_filtering(&state.db, &job).await? {
+            continue;
+        }
         // Defense in depth: SQL is the efficient scheduling filter, but keep the typed
         // capability check at the claim boundary so a future query refactor cannot lease
         // work to an incompatible worker.
@@ -333,12 +400,22 @@ pub(crate) async fn claim_lease(
                 continue;
             };
             let process_name = job.payload.get("name").and_then(serde_json::Value::as_str);
-            let is_provider_isolated = matches!(
-                process_name,
-                Some(
-                    ORB_SIDECAR_RESIDENT_PROCESS_NAME | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
-                )
-            );
+            let is_maestro = process_name == Some(MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME);
+            let (is_pool_candidate, exact_sterile_candidate) =
+                exact_sterile_candidate_resident_job(&state.db, &job, sandbox_id).await?;
+            if is_pool_candidate && is_maestro && !exact_sterile_candidate {
+                // The membership read above can observe a fence transition
+                // after the early scheduler cleanup. Re-run the authoritative
+                // live check and terminalize when it is stale; never silently
+                // strand the queued gated job behind this routing filter.
+                terminalize_invalid_sterile_resident_job_before_filtering(&state.db, &job).await?;
+                continue;
+            }
+            if is_pool_candidate && !is_maestro {
+                continue;
+            }
+            let is_provider_isolated = process_name == Some(ORB_SIDECAR_RESIDENT_PROCESS_NAME)
+                || (is_maestro && !exact_sterile_candidate);
             if is_provider_isolated == ctx.guest_sandbox_id().is_some()
                 || !worker_owns_sandbox(&state.db, worker.id, sandbox_id).await?
             {
@@ -365,6 +442,7 @@ pub(crate) async fn claim_lease(
                 continue;
             }
             if !is_provider_isolated
+                && !exact_sterile_candidate
                 && !executor_sidecar_is_ready_for_claim(&state.db, sandbox_id, &job.tenant_id)
                     .await?
             {
@@ -2618,6 +2696,10 @@ pub(crate) async fn apply_completed_job_on_connection(
                     Err(error) => return Err(error),
                 }
             }
+            if transitioned {
+                crate::sterile_pool::admit_provisioned_cell_on_connection(db, connection, job)
+                    .await?;
+            }
         }
         (JobKind::StopSandbox, WorkerJobResult::StopSandbox { sandbox_id, .. }) => {
             if sandbox_id != sandbox_id_from_job(job)? {
@@ -2662,6 +2744,7 @@ pub(crate) async fn apply_completed_job_on_connection(
                 )
                 .await?;
             }
+            crate::sterile_pool::complete_pool_stop_on_connection(db, connection, job).await?;
             let release_sql = format!(
                 "delete from sandbox_home_mounts where sandbox_id = {}",
                 db.placeholder(1)
@@ -3132,7 +3215,12 @@ pub(crate) async fn apply_failed_job_on_connection(
             )
             .await?;
         }
-        JobKind::ProvisionSandbox | JobKind::StopSandbox => {}
+        JobKind::ProvisionSandbox | JobKind::StopSandbox => {
+            crate::sterile_pool::quarantine_failed_pool_job_on_connection(
+                db, connection, job, error,
+            )
+            .await?;
+        }
         JobKind::DeleteHome => {
             mark_home_delete_failed_on_connection(db, connection, home_id_from_job(job)?, error)
                 .await?;

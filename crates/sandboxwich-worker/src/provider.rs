@@ -15,6 +15,10 @@ use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use clap::ValueEnum;
 use ipnet::IpNet;
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose, PublicKeyData, SanType, string::Ia5String,
+};
 use sandboxwich_core::lifecycle_contract::LifecycleReasonCode;
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, DbVariant, ExecutionClass, HomeId,
@@ -34,14 +38,15 @@ use sandboxwich_core::{
     RESIDENT_PROCESS_BOOTSTRAP_PREFIX, ResidentProcessId, RuntimeResourceInventoryResponse,
     RuntimeResourceKind, RuntimeResourcePurpose, RuntimeResourceStatus, SANDBOX_WORKSPACE_GID,
     SandboxId, SandboxProvisionSpec, SandboxRuntimeProfile, SecretBackend, SecretDelivery,
-    SnapshotId, WorkerCapability, WorkspaceMode, secret_mount_dir, validate_agent_command_request,
-    validate_secret_ref_name,
+    SnapshotId, SterilePoolCandidateV1, WorkerCapability, WorkspaceMode, secret_mount_dir,
+    validate_agent_command_request, validate_secret_ref_name,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
+use x509_parser::{extensions::GeneralName, parse_x509_certificate};
 
 use crate::egress_gateway::EgressGatewayPolicy;
 
@@ -50,6 +55,11 @@ pub use cloudflare::{CloudflareConfig, CloudflareSandboxProvider};
 
 fn sha256_hex(content: &[u8]) -> String {
     format!("{:x}", Sha256::digest(content))
+}
+
+struct SterileActivationTls {
+    server_secret: Value,
+    client_secret: Value,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -245,6 +255,11 @@ pub const SANDBOX_TEARDOWN_RESOURCE_KINDS: &str =
 pub const SANDBOX_RECONCILIATION_RESOURCE_KINDS: &str =
     "pod,persistentvolumeclaim,service,secret,networkpolicy";
 pub const GUEST_TOKEN_REDACTED: &str = "[redacted]";
+const STERILE_ACTIVATION_PORT: u16 = 9443;
+const STERILE_ACTIVATION_TLS_DIRECTORY: &str = "/run/sandboxwich/activation-tls";
+const STERILE_ACTIVATION_SERVER_SECRET_PREFIX: &str = "sandboxwich-activation-server-";
+const STERILE_ACTIVATION_CLIENT_SECRET_PREFIX: &str = "sandboxwich-activation-client-";
+const STERILE_SUPERVISOR_POD_PREFIX: &str = "sandboxwich-supervisor-";
 
 /// Name prefix of the per-sandbox workspace PersistentVolumeClaim
 /// (`sandboxwich-pvc-<sandbox id>`). Managed home claims are named
@@ -1180,6 +1195,57 @@ impl KubernetesDryRunProvider {
         spec: &SandboxProvisionSpec,
     ) -> anyhow::Result<serde_json::Value> {
         self.validate_runtime_profile(spec)?;
+        if let Some(candidate) = spec.sterile_pool_candidate.as_ref() {
+            self.validate_sterile_pool_candidate(sandbox_id, spec, candidate)?;
+            let activation_tls = self.sterile_activation_tls(sandbox_id, candidate)?;
+            let tenant_pod_name = format!("sandboxwich-{sandbox_id}");
+            return Ok(json!({
+                "provider": "kubernetes",
+                "mode": "dry_run",
+                "operation": operation,
+                "cluster": self.cluster,
+                "namespace": self.effective_sandbox_namespace(),
+                "controlPlaneNamespace": self.namespace,
+                "sandboxId": sandbox_id,
+                "podName": format!("sandboxwich-{sandbox_id}"),
+                "storageClass": self.storage_class,
+                "snapshotClass": self.snapshot_class,
+                "workspaceStorage": self.effective_workspace_storage_for_spec(spec),
+                "workspaceMode": spec.workspace_mode,
+                "runtime": {
+                    "agentImage": candidate.agent_image,
+                    "maestroImage": candidate.maestro_image,
+                    "workspaceMount": MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT,
+                    "serviceName": candidate.service_name,
+                    "servicePort": MAESTRO_HOSTED_RUNNER_CONTAINER_PORT,
+                },
+                "resources": self.resource_metadata(&spec.memory_limit),
+                "networkEgress": "provider-isolated-maestro",
+                "isolation": self.isolation_metadata(),
+                "manifests": {
+                    "pod": self.sterile_pool_candidate_pod_manifest(sandbox_id, spec, candidate)?,
+                    "supervisorPod": self.sterile_pool_candidate_supervisor_pod_manifest(
+                        sandbox_id,
+                        candidate,
+                        &tenant_pod_name,
+                        "[provider-observed-uid]",
+                    )?,
+                    "pvc": self.pvc_manifest(
+                        format!("sandboxwich-pvc-{sandbox_id}"),
+                        Some(sandbox_id),
+                        &spec.memory_limit,
+                    ),
+                    "service": self.sterile_pool_candidate_service_manifest(sandbox_id, candidate),
+                    "networkPolicies": self.sterile_pool_candidate_network_policy_manifests(
+                        sandbox_id,
+                        candidate,
+                    )?,
+                    "guestTokenSecret": self.guest_token_secret_manifest_redacted(sandbox_id),
+                    "activationServerSecret": Self::redact_secret(activation_tls.server_secret),
+                    "activationClientSecret": Self::redact_secret(activation_tls.client_secret),
+                }
+            }));
+        }
         let network_policy = self.network_policy_manifest(sandbox_id, &spec.network_egress)?;
         let egress_gateway_pod =
             self.egress_gateway_pod_manifest(sandbox_id, &spec.network_egress)?;
@@ -1365,6 +1431,648 @@ impl KubernetesDryRunProvider {
         })
     }
 
+    fn validate_sterile_pool_candidate(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxProvisionSpec,
+        candidate: &SterilePoolCandidateV1,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            candidate.cell_id.0 == sandbox_id.0,
+            "sterile pool candidate cell does not match sandbox id"
+        );
+        anyhow::ensure!(
+            candidate.pod_name.is_none() && candidate.pod_uid.is_none(),
+            "sterile pool candidate provider Pod identity must be downward-API derived"
+        );
+        anyhow::ensure!(
+            spec.workspace_mode == WorkspaceMode::Persistent,
+            "sterile Maestro candidates require a persistent workspace"
+        );
+        anyhow::ensure!(
+            image_is_digest_pinned(&candidate.agent_image),
+            "sterile pool candidate agent image must be digest-pinned"
+        );
+        anyhow::ensure!(
+            image_is_digest_pinned(&candidate.maestro_image),
+            "sterile pool candidate Maestro image must be digest-pinned"
+        );
+        anyhow::ensure!(
+            candidate.service_name
+                == sandboxwich_core::sterile_maestro_candidate_service_name(candidate.cell_id),
+            "sterile pool candidate service name is not canonical"
+        );
+        anyhow::ensure!(
+            self.runtime_class_name
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty()),
+            "sterile Maestro candidates require a RuntimeClass"
+        );
+        anyhow::ensure!(
+            self.guest_credentials
+                .as_ref()
+                .is_some_and(|credentials| credentials.sandbox_id == sandbox_id),
+            "sterile Maestro candidates require a sandbox-scoped guest token"
+        );
+        Ok(())
+    }
+
+    fn sterile_pool_candidate_labels(
+        &self,
+        sandbox_id: SandboxId,
+        candidate: &SterilePoolCandidateV1,
+    ) -> Value {
+        json!({
+            "app.kubernetes.io/name": "maestro-hosted-runner",
+            "app.kubernetes.io/managed-by": "sandboxwich",
+            "app.kubernetes.io/component": "sterile-pool-candidate",
+            "sandboxwich.dev/component": "runtime",
+            "sandboxwich.dev/sandbox-id": sandbox_id.to_string(),
+            "sandboxwich.dev/sterile-cell-id": candidate.cell_id.to_string(),
+            "sandboxwich.dev/security-boundary": "tenant",
+        })
+    }
+
+    fn sterile_pool_supervisor_labels(
+        &self,
+        sandbox_id: SandboxId,
+        candidate: &SterilePoolCandidateV1,
+    ) -> Value {
+        json!({
+            "app.kubernetes.io/name": "sandboxwich-agent",
+            "app.kubernetes.io/managed-by": "sandboxwich",
+            "app.kubernetes.io/component": "sterile-pool-supervisor",
+            "sandboxwich.dev/component": "supervisor",
+            "sandboxwich.dev/sandbox-id": sandbox_id.to_string(),
+            "sandboxwich.dev/sterile-cell-id": candidate.cell_id.to_string(),
+            "sandboxwich.dev/security-boundary": "supervisor",
+        })
+    }
+
+    fn sterile_activation_server_secret_name(&self, sandbox_id: SandboxId) -> String {
+        format!("{STERILE_ACTIVATION_SERVER_SECRET_PREFIX}{sandbox_id}")
+    }
+
+    fn sterile_activation_client_secret_name(&self, sandbox_id: SandboxId) -> String {
+        format!("{STERILE_ACTIVATION_CLIENT_SECRET_PREFIX}{sandbox_id}")
+    }
+
+    fn sterile_pool_supervisor_pod_name(&self, sandbox_id: SandboxId) -> String {
+        format!("{STERILE_SUPERVISOR_POD_PREFIX}{sandbox_id}")
+    }
+
+    fn sterile_activation_server_dns(&self, candidate: &SterilePoolCandidateV1) -> String {
+        format!(
+            "{}.{}.svc.cluster.local",
+            candidate.service_name,
+            self.effective_sandbox_namespace()
+        )
+    }
+
+    fn sterile_activation_client_identity(&self, sandbox_id: SandboxId) -> String {
+        format!(
+            "spiffe://sandboxwich.dev/sterile-cell/{sandbox_id}/supervisor/{}",
+            self.sterile_pool_supervisor_pod_name(sandbox_id)
+        )
+    }
+
+    fn sterile_activation_tls(
+        &self,
+        sandbox_id: SandboxId,
+        candidate: &SterilePoolCandidateV1,
+    ) -> anyhow::Result<SterileActivationTls> {
+        let server_dns = self.sterile_activation_server_dns(candidate);
+        let client_identity = self.sterile_activation_client_identity(sandbox_id);
+
+        let mut ca_params = CertificateParams::new(Vec::new())?;
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+        ];
+        ca_params.distinguished_name = DistinguishedName::new();
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, format!("sandboxwich-cell-{sandbox_id}"));
+        let ca_key = KeyPair::generate()?;
+        let ca_certificate = ca_params.self_signed(&ca_key)?;
+        let ca_pem = ca_certificate.pem();
+        let ca_sha256 = sha256_hex(ca_pem.as_bytes());
+        let ca_key_pem = ca_key.serialize_pem();
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let mut server_params = CertificateParams::new(vec![server_dns.clone()])?;
+        server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        server_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let server_key = KeyPair::generate()?;
+        let server_certificate = server_params.signed_by(&server_key, &issuer)?;
+
+        let mut client_params = CertificateParams::new(Vec::new())?;
+        client_params.subject_alt_names =
+            vec![SanType::URI(Ia5String::try_from(client_identity.as_str())?)];
+        client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        client_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let client_key = KeyPair::generate()?;
+        let client_certificate = client_params.signed_by(&client_key, &issuer)?;
+
+        let mut server_metadata = self.object_metadata(
+            self.sterile_activation_server_secret_name(sandbox_id),
+            Some(sandbox_id),
+        );
+        server_metadata["annotations"] = json!({
+            "sandboxwich.dev/activation-server-dns": server_dns,
+            "sandboxwich.dev/activation-ca-sha256": ca_sha256,
+            "sandboxwich.dev/activation-tls-version": "1",
+        });
+        let mut client_metadata = self.object_metadata(
+            self.sterile_activation_client_secret_name(sandbox_id),
+            Some(sandbox_id),
+        );
+        client_metadata["annotations"] = json!({
+            "sandboxwich.dev/activation-client-identity": client_identity,
+            "sandboxwich.dev/activation-ca-sha256": ca_sha256,
+            "sandboxwich.dev/activation-tls-version": "1",
+        });
+        Ok(SterileActivationTls {
+            // The CA signing key remains supervisor-only and is deliberately
+            // omitted from the mounted Secret items. Keeping it in this
+            // fixed-name object lets a retry recover from a response lost
+            // after the client Secret was created but before the server
+            // Secret was durably observed.
+            client_secret: json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "type": "Opaque",
+                "immutable": true,
+                "metadata": client_metadata,
+                "stringData": {
+                    "ca.crt": ca_pem,
+                    "ca.key": ca_key_pem,
+                    "client.crt": client_certificate.pem(),
+                    "client.key": client_key.serialize_pem(),
+                }
+            }),
+            server_secret: json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "type": "kubernetes.io/tls",
+                "immutable": true,
+                "metadata": server_metadata,
+                "stringData": {
+                    "ca.crt": ca_certificate.pem(),
+                    "tls.crt": server_certificate.pem(),
+                    "tls.key": server_key.serialize_pem(),
+                }
+            }),
+        })
+    }
+
+    fn sterile_activation_tls_from_existing_client(
+        &self,
+        sandbox_id: SandboxId,
+        candidate: &SterilePoolCandidateV1,
+        client_secret: Value,
+    ) -> anyhow::Result<SterileActivationTls> {
+        validate_activation_tls_secret(&client_secret)?;
+        let ca_pem = kubernetes_secret_value(&client_secret, "ca.crt")?;
+        let ca_key_pem = kubernetes_secret_value(&client_secret, "ca.key")?;
+        let ca_pem_text = std::str::from_utf8(&ca_pem)
+            .context("activation TLS CA certificate is not PEM text")?;
+        let ca_key = KeyPair::from_pem(
+            std::str::from_utf8(&ca_key_pem).context("activation TLS CA key is not PEM text")?,
+        )?;
+        let issuer = Issuer::from_ca_cert_pem(ca_pem_text, ca_key)?;
+        let server_dns = self.sterile_activation_server_dns(candidate);
+        let mut server_params = CertificateParams::new(vec![server_dns.clone()])?;
+        server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        server_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let server_key = KeyPair::generate()?;
+        let server_certificate = server_params.signed_by(&server_key, &issuer)?;
+        let mut metadata = self.object_metadata(
+            self.sterile_activation_server_secret_name(sandbox_id),
+            Some(sandbox_id),
+        );
+        metadata["annotations"] = json!({
+            "sandboxwich.dev/activation-server-dns": server_dns,
+            "sandboxwich.dev/activation-ca-sha256": sha256_hex(&ca_pem),
+            "sandboxwich.dev/activation-tls-version": "1",
+        });
+        Ok(SterileActivationTls {
+            client_secret,
+            server_secret: json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "type": "kubernetes.io/tls",
+                "immutable": true,
+                "metadata": metadata,
+                "stringData": {
+                    "ca.crt": ca_pem_text,
+                    "tls.crt": server_certificate.pem(),
+                    "tls.key": server_key.serialize_pem(),
+                }
+            }),
+        })
+    }
+
+    fn redact_secret(mut secret: Value) -> Value {
+        if let Some(values) = secret["stringData"].as_object_mut() {
+            for value in values.values_mut() {
+                *value = json!(GUEST_TOKEN_REDACTED);
+            }
+        }
+        secret
+    }
+
+    fn sterile_pool_candidate_network_policy_manifests(
+        &self,
+        sandbox_id: SandboxId,
+        candidate: &SterilePoolCandidateV1,
+    ) -> anyhow::Result<Vec<Value>> {
+        let tenant_labels = self.sterile_pool_candidate_labels(sandbox_id, candidate);
+        let supervisor_labels = self.sterile_pool_supervisor_labels(sandbox_id, candidate);
+        let mut tenant_egress = self.dns_egress_rules();
+        tenant_egress.push(json!({
+            "to": [{
+                "namespaceSelector": { "matchLabels": {
+                    "kubernetes.io/metadata.name": self.effective_ingress_namespace()
+                }},
+                "podSelector": { "matchLabels": { "app": "identity" }}
+            }],
+            "ports": [{ "protocol": "TCP", "port": 8080 }]
+        }));
+        tenant_egress.push(json!({
+            "to": [{
+                "namespaceSelector": { "matchLabels": {
+                    "kubernetes.io/metadata.name": self.effective_ingress_namespace()
+                }},
+                "podSelector": { "matchLabels": { "app": "llm-gateway" }}
+            }, {
+                "namespaceSelector": { "matchLabels": {
+                    "kubernetes.io/metadata.name": self.effective_ingress_namespace()
+                }},
+                "podSelector": { "matchLabels": { "app": "llm-gateway-canary" }}
+            }],
+            "ports": [{ "protocol": "TCP", "port": 8080 }]
+        }));
+        let mut supervisor_egress = self.dns_egress_rules();
+        supervisor_egress.push(self.api_egress_rule());
+        supervisor_egress.push(json!({
+            "to": [{ "podSelector": { "matchLabels": tenant_labels } }],
+            "ports": [{ "protocol": "TCP", "port": STERILE_ACTIVATION_PORT }]
+        }));
+        Ok(vec![
+            json!({
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "NetworkPolicy",
+                "metadata": {
+                    "name": format!("sandboxwich-maestro-tenant-{sandbox_id}"),
+                    "namespace": self.effective_sandbox_namespace(),
+                    "labels": tenant_labels,
+                },
+                "spec": {
+                    "podSelector": { "matchLabels": tenant_labels },
+                    "policyTypes": ["Ingress", "Egress"],
+                    "ingress": [{
+                        "from": [{
+                            "namespaceSelector": { "matchLabels": {
+                                "kubernetes.io/metadata.name": self.effective_ingress_namespace()
+                            }},
+                            "podSelector": { "matchLabels": { "app": "runner-host" }}
+                        }],
+                        "ports": [{
+                            "protocol": "TCP",
+                            "port": MAESTRO_HOSTED_RUNNER_CONTAINER_PORT
+                        }]
+                    }, {
+                        "from": [{ "podSelector": { "matchLabels": supervisor_labels } }],
+                        "ports": [{ "protocol": "TCP", "port": STERILE_ACTIVATION_PORT }]
+                    }],
+                    "egress": tenant_egress,
+                }
+            }),
+            json!({
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "NetworkPolicy",
+                "metadata": {
+                    "name": format!("sandboxwich-maestro-supervisor-{sandbox_id}"),
+                    "namespace": self.effective_sandbox_namespace(),
+                    "labels": supervisor_labels,
+                },
+                "spec": {
+                    "podSelector": { "matchLabels": supervisor_labels },
+                    "policyTypes": ["Ingress", "Egress"],
+                    "ingress": [],
+                    "egress": supervisor_egress,
+                }
+            }),
+        ])
+    }
+
+    fn sterile_pool_candidate_service_manifest(
+        &self,
+        sandbox_id: SandboxId,
+        candidate: &SterilePoolCandidateV1,
+    ) -> Value {
+        let labels = self.sterile_pool_candidate_labels(sandbox_id, candidate);
+        json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {
+                "name": candidate.service_name,
+                "namespace": self.effective_sandbox_namespace(),
+                "labels": labels,
+            },
+            "spec": {
+                "type": "ClusterIP",
+                "selector": labels,
+                "ports": [{
+                    "name": "maestro-mtls",
+                    "port": MAESTRO_HOSTED_RUNNER_CONTAINER_PORT,
+                    "targetPort": "maestro-mtls"
+                }, {
+                    "name": "activation-mtls",
+                    "port": STERILE_ACTIVATION_PORT,
+                    "targetPort": "activation-mtls"
+                }]
+            }
+        })
+    }
+
+    fn sterile_pool_candidate_pod_manifest(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxProvisionSpec,
+        candidate: &SterilePoolCandidateV1,
+    ) -> anyhow::Result<Value> {
+        self.validate_sterile_pool_candidate(sandbox_id, spec, candidate)?;
+        let labels = self.sterile_pool_candidate_labels(sandbox_id, candidate);
+        let marker = serde_json::to_string(candidate)?;
+        let restricted = json!({
+            "allowPrivilegeEscalation": false,
+            "readOnlyRootFilesystem": true,
+            "runAsNonRoot": true,
+            "runAsUser": MAESTRO_HOSTED_RUNNER_UID,
+            "runAsGroup": MAESTRO_HOSTED_RUNNER_UID,
+            "capabilities": { "drop": ["ALL"] },
+            "seccompProfile": { "type": "RuntimeDefault" }
+        });
+        Ok(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": format!("sandboxwich-{sandbox_id}"),
+                "namespace": self.effective_sandbox_namespace(),
+                "labels": labels,
+            },
+            "spec": {
+                "runtimeClassName": self.runtime_class_name,
+                "serviceAccountName": MAESTRO_HOSTED_RUNNER_SERVICE_ACCOUNT,
+                "automountServiceAccountToken": false,
+                "enableServiceLinks": false,
+                "hostNetwork": false,
+                "hostPID": false,
+                "hostIPC": false,
+                "restartPolicy": "Never",
+                "terminationGracePeriodSeconds": 30,
+                "securityContext": {
+                    "runAsNonRoot": true,
+                    "runAsUser": MAESTRO_HOSTED_RUNNER_UID,
+                    "runAsGroup": MAESTRO_HOSTED_RUNNER_UID,
+                    "fsGroup": MAESTRO_HOSTED_RUNNER_UID,
+                    "fsGroupChangePolicy": "OnRootMismatch",
+                    "seccompProfile": { "type": "RuntimeDefault" }
+                },
+                "initContainers": [{
+                    "name": "sandboxwich-agent-install",
+                    "image": candidate.agent_image,
+                    "imagePullPolicy": "IfNotPresent",
+                    "command": ["/bin/sh", "-c", "set -eu; cp /usr/local/bin/sandboxwich-agent /opt/sandboxwich/bin/sandboxwich-agent; chmod 0555 /opt/sandboxwich/bin/sandboxwich-agent"],
+                    "securityContext": restricted,
+                    "resources": {
+                        "requests": { "cpu": "5m", "memory": "16Mi" },
+                        "limits": { "cpu": "50m", "memory": "32Mi" }
+                    },
+                    "volumeMounts": [{
+                        "name": "sandboxwich-agent-bin",
+                        "mountPath": "/opt/sandboxwich/bin"
+                    }]
+                }],
+                "containers": [{
+                    "name": "maestro-hosted-runner",
+                    "image": candidate.maestro_image,
+                    "imagePullPolicy": "IfNotPresent",
+                    "command": [
+                        "/opt/sandboxwich/bin/sandboxwich-agent",
+                        "sterile-launcher",
+                        "--activation-bind", "0.0.0.0:9443",
+                        "--server-cert-file", "/run/sandboxwich/activation-tls/tls.crt",
+                        "--server-key-file", "/run/sandboxwich/activation-tls/tls.key",
+                        "--client-ca-file", "/run/sandboxwich/activation-tls/ca.crt",
+                        "--client-uri", self.sterile_activation_client_identity(sandbox_id)
+                    ],
+                    "workingDir": MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT,
+                    "env": [{
+                        "name": "SANDBOXWICH_STERILE_POOL_CANDIDATE_V1",
+                        "value": marker
+                    }, {
+                        "name": "SANDBOXWICH_PROVIDER_POD_NAME",
+                        "valueFrom": { "fieldRef": { "fieldPath": "metadata.name" } }
+                    }, {
+                        "name": "SANDBOXWICH_PROVIDER_POD_UID",
+                        "valueFrom": { "fieldRef": { "fieldPath": "metadata.uid" } }
+                    }, {
+                        "name": "MAESTRO_KUBERNETES_POD_NAME",
+                        "valueFrom": { "fieldRef": { "fieldPath": "metadata.name" } }
+                    }, {
+                        "name": "MAESTRO_KUBERNETES_POD_UID",
+                        "valueFrom": { "fieldRef": { "fieldPath": "metadata.uid" } }
+                    }],
+                    "ports": [{
+                        "name": "maestro-mtls",
+                        "containerPort": MAESTRO_HOSTED_RUNNER_CONTAINER_PORT
+                    }, {
+                        "name": "activation-mtls",
+                        "containerPort": STERILE_ACTIVATION_PORT
+                    }],
+                    "securityContext": restricted,
+                    "resources": {
+                        "requests": { "cpu": "50m", "memory": "64Mi" },
+                        "limits": { "cpu": "500m", "memory": "256Mi" }
+                    },
+                    "volumeMounts": [{
+                        "name": "sandboxwich-agent-bin",
+                        "mountPath": "/opt/sandboxwich/bin",
+                        "readOnly": true
+                    }, {
+                        "name": "activation-tls",
+                        "mountPath": STERILE_ACTIVATION_TLS_DIRECTORY,
+                        "readOnly": true
+                    }, {
+                        "name": "workspace",
+                        "mountPath": MAESTRO_HOSTED_RUNNER_WORKSPACE_ROOT
+                    }, {
+                        "name": "workload-identity",
+                        "mountPath": MAESTRO_HOSTED_RUNNER_TOKEN_DIRECTORY,
+                        "readOnly": true
+                    }, {
+                        "name": "bootstrap",
+                        "mountPath": RESIDENT_PROCESS_BOOTSTRAP_PREFIX
+                    }, {
+                        "name": "maestro-tmp",
+                        "mountPath": "/tmp"
+                    }]
+                }],
+                "volumes": [{
+                    "name": "sandboxwich-agent-bin",
+                    "emptyDir": { "sizeLimit": "32Mi" }
+                }, {
+                    "name": "activation-tls",
+                    "secret": {
+                        "secretName": self.sterile_activation_server_secret_name(sandbox_id),
+                        "defaultMode": 0o400,
+                        "items": [
+                            { "key": "ca.crt", "path": "ca.crt", "mode": 0o400 },
+                            { "key": "tls.crt", "path": "tls.crt", "mode": 0o400 },
+                            { "key": "tls.key", "path": "tls.key", "mode": 0o400 }
+                        ]
+                    }
+                }, {
+                    "name": "workspace",
+                    "persistentVolumeClaim": { "claimName": format!("sandboxwich-pvc-{sandbox_id}") }
+                }, {
+                    "name": "workload-identity",
+                    "projected": {
+                        "defaultMode": 0o400,
+                        "sources": [{ "serviceAccountToken": {
+                            "audience": MAESTRO_HOSTED_RUNNER_TOKEN_AUDIENCE,
+                            "expirationSeconds": 600,
+                            "path": "token"
+                        }}, { "secret": {
+                            "name": MAESTRO_HOSTED_RUNNER_IDENTITY_CA_SECRET,
+                            "items": [{ "key": "ca.crt", "path": "ca.crt", "mode": 0o400 }]
+                        }}]
+                    }
+                }, {
+                    "name": "bootstrap",
+                    "emptyDir": { "medium": "Memory", "sizeLimit": "1Mi" }
+                }, {
+                    "name": "maestro-tmp",
+                    "emptyDir": { "sizeLimit": "64Mi" }
+                }]
+            }
+        }))
+    }
+
+    fn sterile_pool_candidate_supervisor_pod_manifest(
+        &self,
+        sandbox_id: SandboxId,
+        candidate: &SterilePoolCandidateV1,
+        tenant_pod_name: &str,
+        tenant_pod_uid: &str,
+    ) -> anyhow::Result<Value> {
+        let credentials = self
+            .guest_credentials
+            .as_ref()
+            .filter(|credentials| credentials.sandbox_id == sandbox_id)
+            .context("candidate supervisor requires sandbox-scoped guest credentials")?;
+        let labels = self.sterile_pool_supervisor_labels(sandbox_id, candidate);
+        let marker = serde_json::to_string(candidate)?;
+        let restricted = json!({
+            "allowPrivilegeEscalation": false,
+            "readOnlyRootFilesystem": true,
+            "runAsNonRoot": true,
+            "runAsUser": MAESTRO_HOSTED_RUNNER_UID,
+            "runAsGroup": MAESTRO_HOSTED_RUNNER_UID,
+            "capabilities": { "drop": ["ALL"] },
+            "seccompProfile": { "type": "RuntimeDefault" }
+        });
+        Ok(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": self.sterile_pool_supervisor_pod_name(sandbox_id),
+                "namespace": self.effective_sandbox_namespace(),
+                "labels": labels,
+            },
+            "spec": {
+                "automountServiceAccountToken": false,
+                "enableServiceLinks": false,
+                "hostNetwork": false,
+                "hostPID": false,
+                "hostIPC": false,
+                "restartPolicy": "Never",
+                "terminationGracePeriodSeconds": 30,
+                "securityContext": {
+                    "runAsNonRoot": true,
+                    "runAsUser": MAESTRO_HOSTED_RUNNER_UID,
+                    "runAsGroup": MAESTRO_HOSTED_RUNNER_UID,
+                    "fsGroup": MAESTRO_HOSTED_RUNNER_UID,
+                    "fsGroupChangePolicy": "OnRootMismatch",
+                    "seccompProfile": { "type": "RuntimeDefault" }
+                },
+                "initContainers": [{
+                    "name": "sandboxwich-agent-install",
+                    "image": candidate.agent_image,
+                    "imagePullPolicy": "IfNotPresent",
+                    "command": ["/bin/sh", "-c", "set -eu; cp /usr/local/bin/sandboxwich-agent /opt/sandboxwich/bin/sandboxwich-agent; chmod 0555 /opt/sandboxwich/bin/sandboxwich-agent"],
+                    "securityContext": restricted,
+                    "volumeMounts": [{ "name": "sandboxwich-agent-bin", "mountPath": "/opt/sandboxwich/bin" }]
+                }],
+                "containers": [{
+                    "name": "sandboxwich-supervisor",
+                    "image": candidate.agent_image,
+                    "imagePullPolicy": "IfNotPresent",
+                    "command": ["/opt/sandboxwich/bin/sandboxwich-agent", "daemon"],
+                    "env": [{
+                        "name": "SANDBOXWICH_API",
+                        "valueFrom": { "secretKeyRef": { "name": self.guest_token_secret_name(sandbox_id), "key": "api-url" } }
+                    },
+                        { "name": "SANDBOXWICH_GUEST_TOKEN_FILE", "value": "/run/sandboxwich/guest/api-token" },
+                        { "name": "SANDBOXWICH_SANDBOX_ID", "value": sandbox_id.to_string() },
+                        { "name": "SANDBOXWICH_WORKER_ID", "value": credentials.worker_id.to_string() },
+                        { "name": "SANDBOXWICH_STERILE_POOL_CANDIDATE_V1", "value": marker },
+                        { "name": "SANDBOXWICH_PROVIDER_POD_NAME", "value": tenant_pod_name },
+                        { "name": "SANDBOXWICH_PROVIDER_POD_UID", "value": tenant_pod_uid },
+                        { "name": "SANDBOXWICH_STERILE_ACTIVATION_URL", "value": format!("https://{}:{}", self.sterile_activation_server_dns(candidate), STERILE_ACTIVATION_PORT) },
+                        { "name": "SANDBOXWICH_STERILE_ACTIVATION_CLIENT_CERT_FILE", "value": "/run/sandboxwich/activation-tls/client.crt" },
+                        { "name": "SANDBOXWICH_STERILE_ACTIVATION_CLIENT_KEY_FILE", "value": "/run/sandboxwich/activation-tls/client.key" },
+                        { "name": "SANDBOXWICH_STERILE_ACTIVATION_SERVER_CA_FILE", "value": "/run/sandboxwich/activation-tls/ca.crt" }
+                    ],
+                    "securityContext": restricted,
+                    "volumeMounts": [{
+                        "name": "sandboxwich-agent-bin", "mountPath": "/opt/sandboxwich/bin", "readOnly": true
+                    }, {
+                        "name": "sandboxwich-guest-token", "mountPath": "/run/sandboxwich/guest", "readOnly": true
+                    }, {
+                        "name": "activation-tls", "mountPath": STERILE_ACTIVATION_TLS_DIRECTORY, "readOnly": true
+                    }, {
+                        "name": "supervisor-tmp", "mountPath": "/tmp"
+                    }]
+                }],
+                "volumes": [{
+                    "name": "sandboxwich-agent-bin", "emptyDir": { "sizeLimit": "32Mi" }
+                }, {
+                    "name": "sandboxwich-guest-token",
+                    "secret": { "secretName": self.guest_token_secret_name(sandbox_id), "items": [{ "key": "api-token", "path": "api-token" }] }
+                }, {
+                    "name": "activation-tls",
+                    "secret": {
+                        "secretName": self.sterile_activation_client_secret_name(sandbox_id),
+                        "defaultMode": 0o400,
+                        "items": [
+                            { "key": "ca.crt", "path": "ca.crt", "mode": 0o400 },
+                            { "key": "client.crt", "path": "client.crt", "mode": 0o400 },
+                            { "key": "client.key", "path": "client.key", "mode": 0o400 }
+                        ]
+                    }
+                }, {
+                    "name": "supervisor-tmp", "emptyDir": { "sizeLimit": "16Mi" }
+                }]
+            }
+        }))
+    }
+
     /// Ephemeral (root filesystem) storage limit for the sandbox container.
     /// This is separate from the PVC-backed `/workspace` mount and bounds
     /// how much a sandbox can write to `/tmp`, `/home`, and other
@@ -1424,12 +2132,6 @@ impl KubernetesDryRunProvider {
                 "value": "2222"
             }),
         ];
-        if let Some(candidate) = spec.sterile_pool_candidate.as_ref() {
-            env.push(json!({
-                "name": "SANDBOXWICH_STERILE_POOL_CANDIDATE_V1",
-                "value": json!(candidate).to_string()
-            }));
-        }
         if self
             .guest_credentials
             .as_ref()
@@ -2393,6 +3095,64 @@ impl KubernetesDryRunProvider {
         spec: &SandboxProvisionSpec,
         status: RuntimeResourceStatus,
     ) -> Vec<ProviderRuntimeResource> {
+        if let Some(candidate) = spec.sterile_pool_candidate.as_ref() {
+            let mut pod = self.runtime_pod_resource(sandbox_id, status.clone());
+            pod.runtime_image = Some(candidate.maestro_image.clone());
+            let mut service = self.base_resource(
+                sandbox_id,
+                None,
+                RuntimeResourceKind::Service,
+                RuntimeResourcePurpose::Runtime,
+                candidate.service_name.clone(),
+                status.clone(),
+            );
+            service.service_port = Some(MAESTRO_HOSTED_RUNNER_CONTAINER_PORT);
+            service.target_port = Some("maestro-mtls".to_string());
+            let mut resources = vec![
+                self.workspace_pvc_resource(sandbox_id, &spec.memory_limit, status.clone(), None),
+                pod,
+                self.base_resource(
+                    sandbox_id,
+                    None,
+                    RuntimeResourceKind::Pod,
+                    RuntimeResourcePurpose::Runtime,
+                    self.sterile_pool_supervisor_pod_name(sandbox_id),
+                    status.clone(),
+                ),
+                service,
+                self.base_resource(
+                    sandbox_id,
+                    None,
+                    RuntimeResourceKind::NetworkPolicy,
+                    RuntimeResourcePurpose::Network,
+                    format!("sandboxwich-maestro-tenant-{sandbox_id}"),
+                    status.clone(),
+                ),
+                self.base_resource(
+                    sandbox_id,
+                    None,
+                    RuntimeResourceKind::NetworkPolicy,
+                    RuntimeResourcePurpose::Network,
+                    format!("sandboxwich-maestro-supervisor-{sandbox_id}"),
+                    status.clone(),
+                ),
+            ];
+            for name in [
+                self.guest_token_secret_name(sandbox_id),
+                self.sterile_activation_client_secret_name(sandbox_id),
+                self.sterile_activation_server_secret_name(sandbox_id),
+            ] {
+                resources.push(self.base_resource(
+                    sandbox_id,
+                    None,
+                    RuntimeResourceKind::Secret,
+                    RuntimeResourcePurpose::Runtime,
+                    name,
+                    status.clone(),
+                ));
+            }
+            return resources;
+        }
         let mut resources = Vec::new();
         if spec.workspace_mode == WorkspaceMode::Persistent {
             resources.push(self.workspace_pvc_resource(
@@ -3073,6 +3833,166 @@ fn runtime_resource_kind_for_kubernetes_kind(kind: &str) -> anyhow::Result<Runti
     }
 }
 
+fn kubernetes_secret_value(secret: &Value, key: &str) -> anyhow::Result<Vec<u8>> {
+    if let Some(value) = secret["stringData"][key].as_str() {
+        return Ok(value.as_bytes().to_vec());
+    }
+    let value = secret["data"][key]
+        .as_str()
+        .context("activation TLS Secret is missing a required key")?;
+    general_purpose::STANDARD
+        .decode(value)
+        .context("activation TLS Secret contains invalid base64")
+}
+
+fn single_pem_certificate(pem: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let certificates =
+        rustls_pemfile::certs(&mut std::io::Cursor::new(pem)).collect::<Result<Vec<_>, _>>()?;
+    anyhow::ensure!(
+        certificates.len() == 1,
+        "activation TLS Secret must contain exactly one certificate"
+    );
+    Ok(certificates[0].as_ref().to_vec())
+}
+
+fn validate_activation_leaf(
+    ca_pem: &[u8],
+    certificate_pem: &[u8],
+    private_key_pem: &[u8],
+    expected_san: &str,
+    server: bool,
+) -> anyhow::Result<()> {
+    let ca_der = single_pem_certificate(ca_pem)?;
+    let certificate_der = single_pem_certificate(certificate_pem)?;
+    let (_, ca) = parse_x509_certificate(&ca_der)
+        .map_err(|_| anyhow::anyhow!("activation TLS CA certificate is invalid"))?;
+    let (_, certificate) = parse_x509_certificate(&certificate_der)
+        .map_err(|_| anyhow::anyhow!("activation TLS leaf certificate is invalid"))?;
+    anyhow::ensure!(
+        ca.basic_constraints()
+            .map_err(|_| anyhow::anyhow!("activation TLS CA constraints are invalid"))?
+            .is_some_and(|constraints| constraints.value.ca),
+        "activation TLS issuer is not a certificate authority"
+    );
+    anyhow::ensure!(
+        ca.validity().is_valid() && certificate.validity().is_valid(),
+        "activation TLS certificate is expired or not yet valid"
+    );
+    ca.verify_signature(None)
+        .map_err(|_| anyhow::anyhow!("activation TLS CA signature is invalid"))?;
+    certificate
+        .verify_signature(Some(ca.public_key()))
+        .map_err(|_| anyhow::anyhow!("activation TLS leaf is not signed by its CA"))?;
+    let names = certificate
+        .subject_alternative_name()
+        .map_err(|_| anyhow::anyhow!("activation TLS SAN is invalid"))?
+        .context("activation TLS leaf is missing its SAN")?
+        .value
+        .general_names
+        .as_slice();
+    let exact_san = if server {
+        names == [GeneralName::DNSName(expected_san)]
+    } else {
+        names == [GeneralName::URI(expected_san)]
+    };
+    anyhow::ensure!(exact_san, "activation TLS leaf has the wrong identity");
+    let usage = certificate
+        .extended_key_usage()
+        .map_err(|_| anyhow::anyhow!("activation TLS extended key usage is invalid"))?
+        .context("activation TLS leaf is missing extended key usage")?
+        .value;
+    anyhow::ensure!(
+        if server {
+            usage.server_auth && !usage.client_auth
+        } else {
+            usage.client_auth && !usage.server_auth
+        },
+        "activation TLS leaf has the wrong extended key usage"
+    );
+    let private_key = std::str::from_utf8(private_key_pem)
+        .context("activation TLS private key is not PEM text")?;
+    let private_key = KeyPair::from_pem(private_key)
+        .map_err(|_| anyhow::anyhow!("activation TLS private key is invalid"))?;
+    anyhow::ensure!(
+        private_key.subject_public_key_info().as_slice() == certificate.public_key().raw,
+        "activation TLS private key does not match its certificate"
+    );
+    Ok(())
+}
+
+fn validate_activation_tls_secret(secret: &Value) -> anyhow::Result<()> {
+    let name = secret["metadata"]["name"].as_str().unwrap_or_default();
+    if !name.starts_with(STERILE_ACTIVATION_SERVER_SECRET_PREFIX)
+        && !name.starts_with(STERILE_ACTIVATION_CLIENT_SECRET_PREFIX)
+    {
+        return Ok(());
+    }
+    let ca_pem = kubernetes_secret_value(secret, "ca.crt")?;
+    let mut keys = BTreeMap::new();
+    for field in ["data", "stringData"] {
+        if let Some(values) = secret[field].as_object() {
+            for key in values.keys() {
+                keys.insert(key.as_str(), ());
+            }
+        }
+    }
+    let expected_ca_sha256 =
+        secret["metadata"]["annotations"]["sandboxwich.dev/activation-ca-sha256"]
+            .as_str()
+            .context("activation TLS Secret is missing its CA fingerprint")?;
+    anyhow::ensure!(
+        sha256_hex(&ca_pem) == expected_ca_sha256,
+        "activation TLS Secret CA fingerprint does not match its certificate"
+    );
+    if name.starts_with(STERILE_ACTIVATION_SERVER_SECRET_PREFIX) {
+        anyhow::ensure!(
+            keys.keys().copied().collect::<Vec<_>>() == ["ca.crt", "tls.crt", "tls.key"],
+            "activation server Secret has an unexpected key set"
+        );
+        let expected = secret["metadata"]["annotations"]["sandboxwich.dev/activation-server-dns"]
+            .as_str()
+            .context("activation server Secret is missing its identity annotation")?;
+        return validate_activation_leaf(
+            &ca_pem,
+            &kubernetes_secret_value(secret, "tls.crt")?,
+            &kubernetes_secret_value(secret, "tls.key")?,
+            expected,
+            true,
+        );
+    }
+    if name.starts_with(STERILE_ACTIVATION_CLIENT_SECRET_PREFIX) {
+        anyhow::ensure!(
+            keys.keys().copied().collect::<Vec<_>>()
+                == ["ca.crt", "ca.key", "client.crt", "client.key"],
+            "activation client Secret has an unexpected key set"
+        );
+        let expected =
+            secret["metadata"]["annotations"]["sandboxwich.dev/activation-client-identity"]
+                .as_str()
+                .context("activation client Secret is missing its identity annotation")?;
+        let ca_key_pem = kubernetes_secret_value(secret, "ca.key")?;
+        validate_activation_leaf(
+            &ca_pem,
+            &kubernetes_secret_value(secret, "client.crt")?,
+            &kubernetes_secret_value(secret, "client.key")?,
+            expected,
+            false,
+        )?;
+        let ca_der = single_pem_certificate(&ca_pem)?;
+        let (_, ca) = parse_x509_certificate(&ca_der)
+            .map_err(|_| anyhow::anyhow!("activation TLS CA certificate is invalid"))?;
+        let ca_key = KeyPair::from_pem(
+            std::str::from_utf8(&ca_key_pem).context("activation TLS CA key is not PEM text")?,
+        )
+        .map_err(|_| anyhow::anyhow!("activation TLS CA key is invalid"))?;
+        anyhow::ensure!(
+            ca_key.subject_public_key_info().as_slice() == ca.public_key().raw,
+            "activation TLS CA key does not match its certificate"
+        );
+    }
+    Ok(())
+}
+
 fn adoption_contract(resource: &Value) -> anyhow::Result<Value> {
     let kind = resource["kind"]
         .as_str()
@@ -3142,6 +4062,7 @@ fn adoption_contract(resource: &Value) -> anyhow::Result<Value> {
             "ports": resource["spec"]["ports"],
         }),
         "Secret" => {
+            validate_activation_tls_secret(resource)?;
             let mut data = resource["data"].as_object().cloned().unwrap_or_default();
             if let Some(string_data) = resource["stringData"].as_object() {
                 for (key, value) in string_data {
@@ -3170,9 +4091,19 @@ fn adoption_contract(resource: &Value) -> anyhow::Result<Value> {
             {
                 *token = json!("<present>");
             }
+            let activation_secret = resource["metadata"]["name"].as_str().is_some_and(|name| {
+                name.starts_with(STERILE_ACTIVATION_SERVER_SECRET_PREFIX)
+                    || name.starts_with(STERILE_ACTIVATION_CLIENT_SECRET_PREFIX)
+            });
+            if activation_secret {
+                for value in data.values_mut() {
+                    *value = json!("<present>");
+                }
+            }
             json!({
                 "type": resource["type"],
                 "immutable": resource["immutable"],
+                "annotations": resource["metadata"]["annotations"],
                 "data": data,
             })
         }
@@ -3207,10 +4138,24 @@ fn validate_adoption_contract(desired: &Value, observed: &Value) -> anyhow::Resu
     let kind = desired["kind"]
         .as_str()
         .context("desired Kubernetes resource kind is required")?;
+    let desired_contract = adoption_contract(desired).map_err(|error| {
+        anyhow::Error::new(ProviderError::classified(
+            ProvisioningErrorClass::TerminalSecurity,
+            LifecycleReasonCode::ResourceContractConflict,
+            error.context("desired Kubernetes security contract is invalid"),
+        ))
+    })?;
+    let observed_contract = adoption_contract(observed).map_err(|error| {
+        anyhow::Error::new(ProviderError::classified(
+            ProvisioningErrorClass::TerminalSecurity,
+            LifecycleReasonCode::ResourceContractConflict,
+            error.context("existing Kubernetes security contract is invalid"),
+        ))
+    })?;
     if observed["kind"] != desired["kind"]
         || observed["metadata"]["name"] != desired["metadata"]["name"]
         || observed["metadata"]["namespace"] != desired["metadata"]["namespace"]
-        || !semantic_contract_matches(&adoption_contract(desired)?, &adoption_contract(observed)?)
+        || !semantic_contract_matches(&desired_contract, &observed_contract)
     {
         let error_class = match kind {
             "Pod" | "NetworkPolicy" | "Secret" => ProvisioningErrorClass::TerminalSecurity,
@@ -3634,6 +4579,10 @@ impl KubernetesApplyProvider {
         self.dry_run.validate_runtime_profile(spec)?;
         self.dry_run
             .validate_network_policy_egress(&spec.network_egress)?;
+        if let Some(candidate) = spec.sterile_pool_candidate.as_ref() {
+            self.dry_run
+                .validate_sterile_pool_candidate(sandbox_id, spec, candidate)?;
+        }
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
         report(stage_update(ProvisioningStage::WorkspacePlanned, None))?;
 
@@ -3671,7 +4620,9 @@ impl KubernetesApplyProvider {
         }
 
         let mut network_wave = Vec::new();
-        let gateway_name = if let Some(gateway_policy) = self
+        let gateway_name = if spec.sterile_pool_candidate.is_some() {
+            None
+        } else if let Some(gateway_policy) = self
             .dry_run
             .egress_gateway_network_policy_manifest(sandbox_id, &spec.network_egress)?
         {
@@ -3700,10 +4651,16 @@ impl KubernetesApplyProvider {
             None
         };
 
-        let network_policy = self
-            .dry_run
-            .network_policy_manifest(sandbox_id, &spec.network_egress)?;
-        network_wave.push(network_policy);
+        match spec.sterile_pool_candidate.as_ref() {
+            Some(candidate) => network_wave.extend(
+                self.dry_run
+                    .sterile_pool_candidate_network_policy_manifests(sandbox_id, candidate)?,
+            ),
+            None => network_wave.push(
+                self.dry_run
+                    .network_policy_manifest(sandbox_id, &spec.network_egress)?,
+            ),
+        }
         // These resources are one report-free network wave. Keep resources
         // separated whenever a durable report can revoke this worker's
         // authority before the next mutation.
@@ -3739,13 +4696,43 @@ impl KubernetesApplyProvider {
             report(stage_update(ProvisioningStage::CredentialsReady, None))?;
         }
 
-        let pod = home_id.map_or_else(
-            || self.dry_run.pod_manifest(sandbox_id, spec),
-            |home_id| {
+        if let Some(candidate) = spec.sterile_pool_candidate.as_ref() {
+            let activation_tls =
+                self.sterile_activation_tls_for_staged(sandbox_id, candidate, cancelled)?;
+            // Create/adopt the supervisor-only client/CA object first. It owns
+            // the CA signing key needed to recover a response lost before the
+            // server leaf Secret was durably observed.
+            self.apply_or_adopt_manifest(
+                &activation_tls.client_secret,
+                sandbox_id,
+                cancelled,
+                resources_applied,
+            )?;
+            self.apply_or_adopt_manifest(
+                &activation_tls.server_secret,
+                sandbox_id,
+                cancelled,
+                resources_applied,
+            )?;
+        }
+
+        let pod = match spec.sterile_pool_candidate.as_ref() {
+            Some(candidate) => {
+                anyhow::ensure!(
+                    home_id.is_none(),
+                    "sterile Maestro candidates cannot use a managed home"
+                );
                 self.dry_run
-                    .pod_manifest_with_home(sandbox_id, home_id, spec)
-            },
-        );
+                    .sterile_pool_candidate_pod_manifest(sandbox_id, spec, candidate)?
+            }
+            None => home_id.map_or_else(
+                || self.dry_run.pod_manifest(sandbox_id, spec),
+                |home_id| {
+                    self.dry_run
+                        .pod_manifest_with_home(sandbox_id, home_id, spec)
+                },
+            ),
+        };
         let pod_identity =
             self.apply_or_adopt_manifest(&pod, sandbox_id, cancelled, resources_applied)?;
 
@@ -3777,29 +4764,64 @@ impl KubernetesApplyProvider {
             )));
         }
         self.verify_pod_runtime_class(sandbox_id, spec, cancelled)?;
+        let tenant_pod_name = pod_identity.name.clone();
+        let tenant_pod_uid = pod_identity.uid.clone();
         report(stage_update(
             ProvisioningStage::PodReady,
             Some(pod_identity),
         ))?;
 
-        let ssh_service = self.dry_run.ssh_service_manifest(sandbox_id);
-        let ssh_service_identity =
-            self.apply_or_adopt_manifest(&ssh_service, sandbox_id, cancelled, resources_applied)?;
-        report(stage_update(
-            ProvisioningStage::ServiceReady,
-            Some(ssh_service_identity),
-        ))?;
-        let desktop_service = self.dry_run.desktop_service_manifest(sandbox_id);
-        let desktop_service_identity = self.apply_or_adopt_manifest(
-            &desktop_service,
-            sandbox_id,
-            cancelled,
-            resources_applied,
-        )?;
-        report(stage_update(
-            ProvisioningStage::ServiceReady,
-            Some(desktop_service_identity),
-        ))?;
+        if let Some(candidate) = spec.sterile_pool_candidate.as_ref() {
+            let service = self
+                .dry_run
+                .sterile_pool_candidate_service_manifest(sandbox_id, candidate);
+            let service_identity =
+                self.apply_or_adopt_manifest(&service, sandbox_id, cancelled, resources_applied)?;
+            report(stage_update(
+                ProvisioningStage::ServiceReady,
+                Some(service_identity),
+            ))?;
+            let supervisor = self
+                .dry_run
+                .sterile_pool_candidate_supervisor_pod_manifest(
+                    sandbox_id,
+                    candidate,
+                    &tenant_pod_name,
+                    &tenant_pod_uid,
+                )?;
+            self.apply_or_adopt_manifest(&supervisor, sandbox_id, cancelled, resources_applied)?;
+            let supervisor_name = self.dry_run.sterile_pool_supervisor_pod_name(sandbox_id);
+            let wait = self.wait_for_named_pod_ready(&supervisor_name, cancelled)?;
+            if !wait.success {
+                return Err(anyhow::Error::new(classified_kubectl_failure(
+                    "sterile candidate supervisor pod did not become ready",
+                    &wait.stderr,
+                )));
+            }
+        } else {
+            let ssh_service = self.dry_run.ssh_service_manifest(sandbox_id);
+            let ssh_service_identity = self.apply_or_adopt_manifest(
+                &ssh_service,
+                sandbox_id,
+                cancelled,
+                resources_applied,
+            )?;
+            report(stage_update(
+                ProvisioningStage::ServiceReady,
+                Some(ssh_service_identity),
+            ))?;
+            let desktop_service = self.dry_run.desktop_service_manifest(sandbox_id);
+            let desktop_service_identity = self.apply_or_adopt_manifest(
+                &desktop_service,
+                sandbox_id,
+                cancelled,
+                resources_applied,
+            )?;
+            report(stage_update(
+                ProvisioningStage::ServiceReady,
+                Some(desktop_service_identity),
+            ))?;
+        }
         report(stage_update(ProvisioningStage::SandboxReady, None))?;
 
         let mut handle = match home_id {
@@ -4045,6 +5067,67 @@ impl KubernetesApplyProvider {
             deleted,
             apply,
         })
+    }
+
+    fn read_optional_resource(
+        &self,
+        kind: &str,
+        name: &str,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<Option<Value>> {
+        let mut args = self.kubectl_base_args();
+        args.extend([
+            "get".to_string(),
+            kind.to_string(),
+            name.to_string(),
+            "--ignore-not-found".to_string(),
+            "-o".to_string(),
+            "json".to_string(),
+        ]);
+        let output = run_kubectl_command(
+            &self.kubectl,
+            &args,
+            "read optional staged sandbox resource",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        if !output.success {
+            return Err(anyhow::Error::new(classified_kubectl_failure(
+                "kubectl get optional staged sandbox resource failed",
+                &output.stderr,
+            )));
+        }
+        if output.stdout.trim().is_empty() {
+            return Ok(None);
+        }
+        serde_json::from_str(&output.stdout)
+            .context("kubectl returned invalid optional resource JSON")
+            .map(Some)
+    }
+
+    fn sterile_activation_tls_for_staged(
+        &self,
+        sandbox_id: SandboxId,
+        candidate: &SterilePoolCandidateV1,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<SterileActivationTls> {
+        let name = self
+            .dry_run
+            .sterile_activation_client_secret_name(sandbox_id);
+        match self.read_optional_resource("Secret", &name, cancelled)? {
+            Some(existing) => self
+                .dry_run
+                .sterile_activation_tls_from_existing_client(sandbox_id, candidate, existing)
+                .map_err(|error| {
+                    anyhow::Error::new(ProviderError::classified(
+                        ProvisioningErrorClass::TerminalSecurity,
+                        LifecycleReasonCode::ResourceContractConflict,
+                        error.context("existing activation PKI failed validation"),
+                    ))
+                }),
+            None => self.dry_run.sterile_activation_tls(sandbox_id, candidate),
+        }
     }
 
     fn apply_or_adopt_manifest(
@@ -4677,6 +5760,41 @@ impl KubernetesApplyProvider {
         spec: &SandboxProvisionSpec,
     ) -> anyhow::Result<Vec<Value>> {
         self.dry_run.validate_runtime_profile(spec)?;
+        if let Some(candidate) = spec.sterile_pool_candidate.as_ref() {
+            self.dry_run
+                .validate_sterile_pool_candidate(sandbox_id, spec, candidate)?;
+            let activation_tls = self.dry_run.sterile_activation_tls(sandbox_id, candidate)?;
+            let mut manifests = vec![self.dry_run.pvc_manifest(
+                format!("sandboxwich-pvc-{sandbox_id}"),
+                Some(sandbox_id),
+                &spec.memory_limit,
+            )];
+            manifests.extend(self.dry_run.guest_token_secret_manifest(sandbox_id));
+            manifests.push(activation_tls.client_secret);
+            manifests.push(activation_tls.server_secret);
+            manifests.extend(
+                self.dry_run
+                    .sterile_pool_candidate_network_policy_manifests(sandbox_id, candidate)?,
+            );
+            manifests.push(
+                self.dry_run
+                    .sterile_pool_candidate_service_manifest(sandbox_id, candidate),
+            );
+            manifests.push(
+                self.dry_run
+                    .sterile_pool_candidate_pod_manifest(sandbox_id, spec, candidate)?,
+            );
+            manifests.push(
+                self.dry_run
+                    .sterile_pool_candidate_supervisor_pod_manifest(
+                        sandbox_id,
+                        candidate,
+                        &format!("sandboxwich-{sandbox_id}"),
+                        "[provider-observed-uid]",
+                    )?,
+            );
+            return Ok(manifests);
+        }
         let mut manifests = Vec::new();
         if spec.workspace_mode == WorkspaceMode::Persistent {
             manifests.push(self.dry_run.pvc_manifest(
@@ -5954,16 +7072,18 @@ impl KubernetesApplyProvider {
                     "namespace": self.dry_run.effective_sandbox_namespace(),
                 },
             }));
-        } else {
-            manifests.push(json!({
-                "apiVersion": "v1",
-                "kind": "Secret",
-                "metadata": {
-                    "name": self.isolated_resident_process_secret_name(spec),
-                    "namespace": self.dry_run.effective_sandbox_namespace(),
-                },
-            }));
         }
+        // Both isolated process kinds stage bootstrap bytes in a per-attempt
+        // Secret. Maestro used to omit this object from its cleanup set,
+        // leaking the managed-gateway credential after the resident stopped.
+        manifests.push(json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": self.isolated_resident_process_secret_name(spec),
+                "namespace": self.dry_run.effective_sandbox_namespace(),
+            },
+        }));
         manifests
     }
 
@@ -6946,6 +8066,10 @@ impl SandboxProvider for KubernetesApplyProvider {
         self.dry_run
             .validate_network_policy_egress(&spec.network_egress)?;
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
+        anyhow::ensure!(
+            spec.sterile_pool_candidate.is_none(),
+            "sterile pool candidates require staged provisioning so the supervisor can bind the observed tenant Pod UID"
+        );
         let manifests = self.provision_manifests(sandbox_id, spec)?;
         let apply = run_kubectl_documents(
             &self.kubectl,

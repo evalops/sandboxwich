@@ -24,6 +24,7 @@ mod rows;
 mod scheduler;
 mod slo_metrics;
 mod state;
+mod sterile_pool;
 #[cfg(test)]
 mod tests;
 mod util;
@@ -45,6 +46,7 @@ use crate::maestro_observation::ActivationObservationSink;
 use crate::routes::app;
 use crate::scheduler::spawn_expiry_sweeper;
 use crate::state::{AppState, ResidentBootstrapStore};
+use crate::sterile_pool::spawn_sterile_pool_reconciler;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -129,6 +131,11 @@ async fn main() -> anyhow::Result<()> {
             config.sterile_cell_signing_key.is_some(),
         );
     }
+    spawn_sterile_pool_reconciler(
+        db.clone(),
+        config.sterile_pool.clone(),
+        Duration::from_millis(config.sweep_interval_ms),
+    );
 
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await

@@ -974,6 +974,52 @@ pub struct DestroySterileCellRequestV1 {
     pub disposition: SterileCellDisposition,
 }
 
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ReleaseSterileCellLeaseRequestV1 {
+    #[schema(value_type = String)]
+    pub lease_attestation: String,
+    pub generation: u64,
+    pub organization_id: String,
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub runner_session_id: String,
+    pub disposition: SterileCellDisposition,
+}
+
+impl fmt::Debug for ReleaseSterileCellLeaseRequestV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReleaseSterileCellLeaseRequestV1")
+            .field("lease_attestation", &"[REDACTED]")
+            .field("generation", &self.generation)
+            .field("organization_id", &self.organization_id)
+            .field("workspace_id", &self.workspace_id)
+            .field("thread_id", &self.thread_id)
+            .field("runner_session_id", &self.runner_session_id)
+            .field("disposition", &self.disposition)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SterileCellLeaseStatusV1 {
+    pub lease_id: Uuid,
+    pub cell_id: SterileCellId,
+    pub generation: u64,
+    pub state: SterileCellState,
+    pub disposition: Option<SterileCellDisposition>,
+    /// True only after the pool membership records an exact provider-stop completion.
+    pub provider_absent: bool,
+    /// True while the pool membership durably requires a provider cleanup retry.
+    pub cleanup_pending: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SterileCellLeaseStatusResponseV1 {
+    pub ok: bool,
+    pub status: SterileCellLeaseStatusV1,
+}
+
 db_variant_enum! {
 pub enum CleanupRunStatus {
     Running => "running",
@@ -1229,6 +1275,21 @@ pub struct SandboxProvisionSpec {
 pub struct SterilePoolCandidateV1 {
     pub cell_id: SterileCellId,
     pub release: SterileCellReleaseTrustClassV1,
+    /// Digest-pinned image containing the exact sandboxwich-agent binary copied
+    /// into the candidate's shared executable volume.
+    pub agent_image: String,
+    /// Digest-pinned Maestro image executed only after sterile activation.
+    pub maestro_image: String,
+    /// Stable pre-created Service identity for the candidate Pod.
+    pub service_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_uid: Option<String>,
+}
+
+pub fn sterile_maestro_candidate_service_name(cell_id: SterileCellId) -> String {
+    format!("sandboxwich-mc-{cell_id}")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
