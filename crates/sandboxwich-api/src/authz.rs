@@ -31,6 +31,7 @@ pub(crate) static AUTHORIZATION_RECEIPT_ID_HEADER: HeaderName =
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PrincipalRequirement {
+    Authenticated,
     TenantOrOperator,
     Operator,
     Worker,
@@ -43,10 +44,12 @@ impl PrincipalRequirement {
     fn allows(self, principal: Principal) -> bool {
         matches!(
             (self, principal),
-            (
-                Self::TenantOrOperator,
-                Principal::Tenant | Principal::Operator
-            ) | (Self::Operator, Principal::Operator)
+            (Self::Authenticated, _)
+                | (
+                    Self::TenantOrOperator,
+                    Principal::Tenant | Principal::Operator
+                )
+                | (Self::Operator, Principal::Operator)
                 | (Self::Worker, Principal::Worker(_))
                 | (
                     Self::WorkerOrGuest,
@@ -68,6 +71,8 @@ const AUTHORIZATION_POLICY_RULES: &[&str] = &[
     "operator|cleanup|/snapshots/cleanup",
     "worker|heartbeat|/workers/*/heartbeat",
     "worker|drain|/workers/*/drain",
+    "worker|prepare|/workers/*/sterile-cells/prepare",
+    "worker|destroy|/workers/*/sterile-cells/*/destroy",
     "worker|read|/workers/*/runtime-resource-inventory",
     "worker|reconcile|/workers/*/runtime-resources/reconcile",
     "worker|create|/workers/*/sandboxes/*/guest-token",
@@ -316,6 +321,8 @@ pub(crate) fn route_policy(method: &str, path: &str) -> RoutePolicy {
         PrincipalRequirement::NotExposed
     } else if path == "/workers/register" && known_route(path) {
         PrincipalRequirement::TenantOrOperator
+    } else if path.starts_with("/sterile-cell-leases/") && known_route(path) {
+        PrincipalRequirement::Authenticated
     } else if (path == "/snapshots/cleanup"
         || path == "/operator"
         || path.starts_with("/operator/"))
@@ -346,6 +353,8 @@ fn worker_route(path: &str) -> bool {
             || path.ends_with("/runtime-resource-inventory")
             || path.ends_with("/runtime-resources/reconcile")
             || path.ends_with("/guest-token")
+            || path.ends_with("/sterile-cells/prepare")
+            || (path.contains("/sterile-cells/") && path.ends_with("/destroy"))
             || path.contains("/apex-instruction-callbacks/"))
 }
 
@@ -368,6 +377,8 @@ fn resource_kind(path: &str) -> &'static str {
         "resident_process"
     } else if path.starts_with("/leases") {
         "lease"
+    } else if path.starts_with("/sterile-cell") {
+        "sterile_cell"
     } else if path.starts_with("/snapshots") {
         "snapshot"
     } else if path.starts_with("/homes") {
@@ -439,6 +450,7 @@ fn action(method: &str, path: &str) -> &'static str {
 
 fn requirement_code(requirement: PrincipalRequirement) -> &'static str {
     match requirement {
+        PrincipalRequirement::Authenticated => "authenticated",
         PrincipalRequirement::TenantOrOperator => "tenant_or_operator",
         PrincipalRequirement::Operator => "operator",
         PrincipalRequirement::Worker => "worker",
@@ -876,6 +888,8 @@ pub(crate) const AUTHORIZATION_ROUTE_MANIFEST: &[&str] = &[
     "/capacity",
     "/jobs",
     "/jobs/*",
+    "/sterile-cells/claim",
+    "/sterile-cell-leases/*/validate",
     "/divergence/reconcile",
     "/sandboxes/*/tool-call-ledger",
     "/sandboxes/*/divergence-findings",
@@ -892,6 +906,8 @@ pub(crate) const AUTHORIZATION_ROUTE_MANIFEST: &[&str] = &[
     "/workers/register",
     "/workers/*/heartbeat",
     "/workers/*/drain",
+    "/workers/*/sterile-cells/prepare",
+    "/workers/*/sterile-cells/*/destroy",
     "/workers/*/runtime-resource-inventory",
     "/workers/*/runtime-resources/reconcile",
     "/workers/*/sandboxes/*/guest-token",

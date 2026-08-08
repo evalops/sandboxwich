@@ -126,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
             db.clone(),
             resident_bootstraps.clone(),
             Duration::from_millis(config.sweep_interval_ms),
+            config.sterile_cell_signing_key.is_some(),
         );
     }
 
@@ -151,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
         maestro_observation_sink,
         resident_bootstraps,
         sandbox_lifetime: config.sandbox_lifetime,
+        sterile_cell_signing_key: config.sterile_cell_signing_key.map(Arc::<str>::from),
         #[cfg(test)]
         apex_callback_test_hook: None,
     };

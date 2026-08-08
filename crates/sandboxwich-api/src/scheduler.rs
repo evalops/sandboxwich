@@ -4,6 +4,7 @@ use crate::db::*;
 use crate::handlers::desktop::*;
 use crate::handlers::leases::*;
 use crate::handlers::snapshots::*;
+use crate::handlers::sterile_cells::quarantine_expired_sterile_cells;
 use crate::handlers::workers::*;
 use crate::idempotency::expire_idempotency_records;
 use crate::limits::expire_tenant_limit_counters;
@@ -40,6 +41,7 @@ pub(crate) fn spawn_expiry_sweeper(
     db: Database,
     resident_bootstraps: ResidentBootstrapStore,
     interval: Duration,
+    sterile_cells_enabled: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -61,6 +63,10 @@ pub(crate) fn spawn_expiry_sweeper(
             }
             if let Err(error) = expire_due_desktop_sessions(&db).await {
                 tracing::warn!(?error, "desktop session expiry sweep failed");
+            }
+            if sterile_cells_enabled && let Err(error) = quarantine_expired_sterile_cells(&db).await
+            {
+                tracing::warn!(?error, "sterile-cell expiry quarantine sweep failed");
             }
             if let Err(error) = reconcile_worker_liveness(&db).await {
                 tracing::warn!(?error, "worker liveness reconciliation failed");

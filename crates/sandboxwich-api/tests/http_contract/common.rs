@@ -9,7 +9,7 @@ use crate::workers::*;
 use reqwest::StatusCode;
 use sandboxwich_core::*;
 use sqlx::any::AnyPoolOptions;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -39,6 +39,8 @@ pub(crate) const TEST_BOOTSTRAP_HANDOFF_KEY: &str = "c2FuZGJveHdpY2gtdGVzdC1ib29
 /// able to open rows sealed under `TEST_BOOTSTRAP_HANDOFF_KEY`.
 pub(crate) const ROTATED_TEST_BOOTSTRAP_HANDOFF_KEY: &str =
     "c2FuZGJveHdpY2gtdGVzdC1yb3RhdGVkLWtleSEhISE=";
+pub(crate) const TEST_STERILE_CELL_SIGNING_KEY: &str =
+    "sandboxwich-test-sterile-cell-signing-key-32-bytes-minimum";
 
 pub(crate) struct TestServer {
     pub(crate) base_url: String,
@@ -1318,6 +1320,43 @@ impl TestServer {
         })
         .await
         .with_auth_token(Some(TEST_DEFAULT_TENANT_TOKEN.to_string()))
+    }
+
+    pub(crate) async fn start_with_sterile_cells(
+        database_url: String,
+        data_dir: Option<TempDir>,
+        enable_sweeper: bool,
+    ) -> Self {
+        let mut signing_key_file = tempfile::NamedTempFile::new().unwrap();
+        signing_key_file
+            .write_all(TEST_STERILE_CELL_SIGNING_KEY.as_bytes())
+            .unwrap();
+        let signing_key_path = signing_key_file.path().to_path_buf();
+        let server = Self::spawn(
+            database_url,
+            data_dir,
+            true,
+            enable_sweeper,
+            move |command| {
+                command
+                    .env(
+                        "SANDBOXWICH_TENANT_TOKENS",
+                        format!(
+                            "default={TEST_DEFAULT_TENANT_TOKEN},tenant-b={TEST_TENANT_B_TOKEN}"
+                        ),
+                    )
+                    .env("SANDBOXWICH_OPERATOR_TOKEN", TEST_OPERATOR_TOKEN)
+                    .env("SANDBOXWICH_STERILE_CELLS_ENABLED", "true")
+                    .env(
+                        "SANDBOXWICH_STERILE_CELL_SIGNING_KEY_FILE",
+                        &signing_key_path,
+                    );
+            },
+        )
+        .await
+        .with_auth_token(Some(TEST_DEFAULT_TENANT_TOKEN.to_string()));
+        drop(signing_key_file);
+        server
     }
 
     /// Kills this server and starts a new process against the same database,

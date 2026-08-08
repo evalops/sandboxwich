@@ -137,6 +137,19 @@ async fn openapi_covers_every_public_v1_operation() {
         ("POST", "/v1/leases/{lease_id}/output"),
         ("POST", "/v1/leases/{lease_id}/complete"),
         ("POST", "/v1/leases/{lease_id}/fail"),
+        ("POST", "/v1/sterile-cells/claim"),
+        (
+            "POST",
+            "/v1/sterile-cell-leases/{lease_id}/validate",
+        ),
+        (
+            "POST",
+            "/v1/workers/{worker_id}/sterile-cells/prepare",
+        ),
+        (
+            "POST",
+            "/v1/workers/{worker_id}/sterile-cells/{cell_id}/destroy",
+        ),
         ("GET", "/v1/operator/tenant-policies/{tenant_id}"),
         ("PUT", "/v1/operator/tenant-policies/{tenant_id}"),
     ]

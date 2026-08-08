@@ -16,6 +16,7 @@ use crate::handlers::sandboxes::*;
 use crate::handlers::secrets::*;
 use crate::handlers::snapshots::*;
 use crate::handlers::ssh::*;
+use crate::handlers::sterile_cells::*;
 use crate::handlers::workers::*;
 use crate::health::*;
 use crate::idempotency::enforce_idempotency;
@@ -146,6 +147,7 @@ pub(crate) fn app(state: AppState) -> Router {
         .route("/capacity", get(get_capacity))
         .route("/jobs", get(list_jobs).post(create_job))
         .route("/jobs/{job_id}", get(get_job))
+        .route("/sterile-cells/claim", post(claim_sterile_cell))
         .route("/divergence/reconcile", post(reconcile_divergence))
         .route(
             "/sandboxes/{sandbox_id}/tool-call-ledger",
@@ -197,6 +199,14 @@ pub(crate) fn app(state: AppState) -> Router {
         )
         .route_layer(middleware::from_fn(require_tenant_principal));
 
+    // The raw lease attestation is delivered into the isolated child. Its
+    // validation call may authenticate as the tenant, worker, or sandbox guest,
+    // but the handler still requires the exact tenant-bound token and tuple.
+    let sterile_attestation_routes = Router::new().route(
+        "/sterile-cell-leases/{lease_id}/validate",
+        post(validate_sterile_cell_lease),
+    );
+
     // Registration returns a one-time raw worker credential. It deliberately does not use the
     // generic response-replay middleware because raw worker tokens must never be persisted.
     let registration_routes = Router::new()
@@ -206,6 +216,14 @@ pub(crate) fn app(state: AppState) -> Router {
     let worker_routes = Router::new()
         .route("/workers/{worker_id}/heartbeat", post(heartbeat_worker))
         .route("/workers/{worker_id}/drain", post(drain_worker))
+        .route(
+            "/workers/{worker_id}/sterile-cells/prepare",
+            post(prepare_sterile_cell),
+        )
+        .route(
+            "/workers/{worker_id}/sterile-cells/{cell_id}/destroy",
+            post(destroy_sterile_cell),
+        )
         .route(
             "/workers/{worker_id}/runtime-resource-inventory",
             get(runtime_resource_inventory),
@@ -291,6 +309,9 @@ pub(crate) fn app(state: AppState) -> Router {
     let resident_attestation_routes = resident_attestation_routes.layer(
         middleware::from_fn_with_state(state.clone(), enforce_tenant_limits),
     );
+    let sterile_attestation_routes = sterile_attestation_routes.layer(
+        middleware::from_fn_with_state(state.clone(), enforce_tenant_limits),
+    );
 
     let versioned_routes = Router::new()
         .merge(tenant_routes.clone())
@@ -298,7 +319,8 @@ pub(crate) fn app(state: AppState) -> Router {
         .merge(worker_routes.clone())
         .merge(guest_routes.clone())
         .merge(registration_routes.clone())
-        .merge(resident_attestation_routes.clone());
+        .merge(resident_attestation_routes.clone())
+        .merge(sterile_attestation_routes.clone());
 
     let operator_routes = Router::new()
         .route(
@@ -321,6 +343,7 @@ pub(crate) fn app(state: AppState) -> Router {
         .merge(guest_routes)
         .merge(registration_routes)
         .merge(resident_attestation_routes)
+        .merge(sterile_attestation_routes)
         .layer(DefaultBodyLimit::max(DEFAULT_BODY_LIMIT_BYTES))
         .with_state(state.clone())
         // Deliberately inside `auth_and_tenant` (so the log line can name the

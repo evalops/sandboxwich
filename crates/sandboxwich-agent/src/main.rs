@@ -28,8 +28,9 @@ use sandboxwich_core::{
     RefreshGuestTokenRequest, RenewLeaseRequest, ResidentProcessBootstrapReadRequest,
     ResidentProcessBootstrapReadResponse, ResidentProcessId, ResidentProcessObservationRequest,
     ResidentProcessObservedState, ResidentProcessRestartPolicy, SandboxId,
-    UpdateGuestHealthRequest, WorkerJobResult, build_api_client, resident_process_run_as_uid,
-    validate_agent_command_request,
+    UpdateGuestHealthRequest, ValidateSterileCellLeaseRequestV1,
+    ValidateSterileCellLeaseResponseV1, WorkerJobResult, build_api_client,
+    resident_process_run_as_uid, validate_agent_command_request,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -97,7 +98,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Heartbeat(HeartbeatArgs),
-    Daemon(DaemonArgs),
+    Daemon(Box<DaemonArgs>),
     Exec(ExecArgs),
     WriteFile(FileWriteArgs),
     ReadFile(FileReadArgs),
@@ -170,6 +171,77 @@ struct HeartbeatArgs {
     sandbox_id: Option<Uuid>,
 }
 
+#[derive(Debug, Args, Default)]
+struct SterileLeaseGateArgs {
+    #[arg(long, env = "SANDBOXWICH_STERILE_LEASE_ID")]
+    lease_id: Option<Uuid>,
+
+    #[arg(long, env = "SANDBOXWICH_STERILE_LEASE_GENERATION")]
+    generation: Option<u64>,
+
+    #[arg(long, env = "SANDBOXWICH_STERILE_LEASE_ATTESTATION_FILE")]
+    attestation_file: Option<PathBuf>,
+
+    #[arg(long, env = "SANDBOXWICH_STERILE_ORGANIZATION_ID")]
+    organization_id: Option<String>,
+
+    #[arg(long, env = "SANDBOXWICH_STERILE_WORKSPACE_ID")]
+    workspace_id: Option<String>,
+
+    #[arg(long, env = "SANDBOXWICH_STERILE_THREAD_ID")]
+    thread_id: Option<String>,
+
+    #[arg(long, env = "SANDBOXWICH_STERILE_RUNNER_SESSION_ID")]
+    runner_session_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct SterileLeaseBootstrap {
+    lease_id: Uuid,
+    generation: u64,
+    attestation_file: PathBuf,
+    organization_id: String,
+    workspace_id: String,
+    thread_id: String,
+    runner_session_id: String,
+}
+
+impl SterileLeaseGateArgs {
+    fn into_bootstrap(self) -> anyhow::Result<Option<SterileLeaseBootstrap>> {
+        match (
+            self.lease_id,
+            self.generation,
+            self.attestation_file,
+            self.organization_id,
+            self.workspace_id,
+            self.thread_id,
+            self.runner_session_id,
+        ) {
+            (None, None, None, None, None, None, None) => Ok(None),
+            (
+                Some(lease_id),
+                Some(generation),
+                Some(attestation_file),
+                Some(organization_id),
+                Some(workspace_id),
+                Some(thread_id),
+                Some(runner_session_id),
+            ) => Ok(Some(SterileLeaseBootstrap {
+                lease_id,
+                generation,
+                attestation_file,
+                organization_id,
+                workspace_id,
+                thread_id,
+                runner_session_id,
+            })),
+            _ => bail!(
+                "sterile-cell startup requires lease id, generation, attestation file, organization, workspace, thread, and runner session together"
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 struct DaemonArgs {
     #[arg(long, env = "SANDBOXWICH_API", default_value = "http://127.0.0.1:3217")]
@@ -193,6 +265,12 @@ struct DaemonArgs {
 
     #[arg(long, env = "SANDBOXWICH_WORKER_ID")]
     worker_id: Option<Uuid>,
+
+    /// Sterile-cell lease fence. When any field in this group is configured,
+    /// all fields are required and the daemon validates the short-lived
+    /// attestation before reporting readiness or claiming tenant work.
+    #[command(flatten)]
+    sterile_lease_gate: SterileLeaseGateArgs,
 
     /// Pre-provisioned sandbox-scoped guest credential (`sbw_gtok_...`, see
     /// GH-64's guest-token endpoint) to use for guest-facing calls
@@ -356,7 +434,7 @@ struct FileReadArgs {
 async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Heartbeat(args) => heartbeat(args).await,
-        Command::Daemon(args) => daemon(args).await,
+        Command::Daemon(args) => daemon(*args).await,
         Command::Exec(args) => exec(args).await,
         Command::WriteFile(args) => write_file(args).await,
         Command::ReadFile(args) => read_file(args).await,
@@ -417,6 +495,7 @@ async fn heartbeat(args: HeartbeatArgs) -> anyhow::Result<()> {
 
 async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
     let api = args.api.trim_end_matches('/').to_string();
+    let sterile_lease_bootstrap = args.sterile_lease_gate.into_bootstrap()?;
     let api_token = resolve_api_token(args.api_token_file, args.api_token)?;
     let client = build_api_client(api_token.as_deref(), args.tenant.as_deref())?;
     let sandbox_id = SandboxId(args.sandbox_id);
@@ -455,6 +534,9 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
             Some(Utc::now() + chrono::Duration::seconds(guest_session.ttl_seconds as i64));
     }
 
+    let sterile_lease =
+        validate_sterile_lease_gate(&guest_session.client, &api, sterile_lease_bootstrap).await?;
+
     let mut iterations = 0_u64;
     let heartbeat_interval = Duration::from_millis(args.heartbeat_interval_ms.max(1));
     post_guest_health(
@@ -478,7 +560,7 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
     // reachability of the control plane and use the same bounded backoff.
     let mut resident_processes = ResidentProcessSupervisor::new(args.max_resident_processes);
 
-    let mut daemon_result = async {
+    let daemon_loop = async {
         loop {
             while let Some(completion) = resident_processes.try_reap() {
                 reconcile_resident_completion(
@@ -627,8 +709,9 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
         }
 
         Ok(())
-    }
-    .await;
+    };
+    let mut daemon_result =
+        run_until_sterile_lease_expiry(daemon_loop, sterile_lease.as_ref()).await;
 
     for completion in resident_processes.shutdown().await {
         if let Err(shutdown_error) = reconcile_resident_completion(
@@ -660,6 +743,87 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
     }
 
     daemon_result
+}
+
+async fn run_until_sterile_lease_expiry<F>(
+    daemon: F,
+    sterile_lease: Option<&sandboxwich_core::SterileCellLeaseV1>,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = anyhow::Result<()>>,
+{
+    let Some(lease) = sterile_lease else {
+        return daemon.await;
+    };
+    let time_to_expiry = (lease.expires_at - Utc::now())
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    tokio::pin!(daemon);
+    tokio::select! {
+        result = &mut daemon => result,
+        () = tokio::time::sleep(time_to_expiry) => {
+            Err(anyhow::anyhow!("sterile-cell lease expired; stopping tenant execution"))
+        }
+    }
+}
+
+async fn validate_sterile_lease_gate(
+    client: &reqwest::Client,
+    api: &str,
+    bootstrap: Option<SterileLeaseBootstrap>,
+) -> anyhow::Result<Option<sandboxwich_core::SterileCellLeaseV1>> {
+    let Some(bootstrap) = bootstrap else {
+        return Ok(None);
+    };
+    let file = tokio::fs::File::open(&bootstrap.attestation_file)
+        .await
+        .with_context(|| {
+            format!(
+                "read sterile-cell lease attestation from {}",
+                bootstrap.attestation_file.display()
+            )
+        })?;
+    let mut lease_attestation = Vec::with_capacity(1025);
+    file.take(1025)
+        .read_to_end(&mut lease_attestation)
+        .await
+        .with_context(|| {
+            format!(
+                "read sterile-cell lease attestation from {}",
+                bootstrap.attestation_file.display()
+            )
+        })?;
+    anyhow::ensure!(
+        lease_attestation.len() <= 1024,
+        "sterile-cell lease attestation file is empty or oversized"
+    );
+    let lease_attestation = String::from_utf8(lease_attestation)
+        .context("sterile-cell lease attestation is not UTF-8")?;
+    let lease_attestation = lease_attestation.trim();
+    anyhow::ensure!(
+        !lease_attestation.is_empty(),
+        "sterile-cell lease attestation file is empty or oversized"
+    );
+    let response = client
+        .post(format!(
+            "{api}/sterile-cell-leases/{}/validate",
+            bootstrap.lease_id
+        ))
+        .json(&ValidateSterileCellLeaseRequestV1 {
+            lease_attestation: lease_attestation.to_string(),
+            generation: bootstrap.generation,
+            organization_id: bootstrap.organization_id,
+            workspace_id: bootstrap.workspace_id,
+            thread_id: bootstrap.thread_id,
+            runner_session_id: bootstrap.runner_session_id,
+        })
+        .send()
+        .await
+        .context("validate sterile-cell lease attestation")?;
+    let validated: ValidateSterileCellLeaseResponseV1 = decode_json(response)
+        .await
+        .map_err(|error| anyhow::anyhow!("sterile-cell lease attestation rejected: {error}"))?;
+    Ok(Some(validated.lease))
 }
 
 async fn fail_lease_retryable(
@@ -2761,6 +2925,130 @@ mod tests {
         let path = std::env::temp_dir().join(format!("sandboxwich-agent-test-{}", Uuid::new_v4()));
         std::fs::write(&path, contents).expect("write temp file");
         path
+    }
+
+    #[tokio::test]
+    async fn sterile_lease_gate_preserves_the_cold_path_when_unconfigured() {
+        validate_sterile_lease_gate(&reqwest::Client::new(), "http://127.0.0.1:1", None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sterile_lease_gate_rejects_partial_bootstrap_before_network_access() {
+        let error = SterileLeaseGateArgs {
+            lease_id: Some(Uuid::now_v7()),
+            ..Default::default()
+        }
+        .into_bootstrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("requires lease id"));
+    }
+
+    #[tokio::test]
+    async fn sterile_lease_gate_validates_a_complete_live_bootstrap() {
+        async fn validate(
+            State(lease): State<sandboxwich_core::SterileCellLeaseV1>,
+            Json(request): Json<ValidateSterileCellLeaseRequestV1>,
+        ) -> Json<ValidateSterileCellLeaseResponseV1> {
+            assert_eq!(request.generation, lease.generation);
+            assert_eq!(request.organization_id, lease.organization_id);
+            assert_eq!(request.workspace_id, lease.workspace_id);
+            assert_eq!(request.thread_id, lease.thread_id);
+            assert_eq!(request.runner_session_id, lease.runner_session_id);
+            assert_eq!(request.lease_attestation, "swla1_test");
+            Json(ValidateSterileCellLeaseResponseV1 { ok: true, lease })
+        }
+
+        let lease_id = Uuid::now_v7();
+        let generation = 2;
+        let lease = sandboxwich_core::SterileCellLeaseV1 {
+            lease_id,
+            cell_id: sandboxwich_core::SterileCellId::new(),
+            generation,
+            release: sandboxwich_core::SterileCellReleaseTrustClassV1 {
+                release_set_id: "release-set-test".into(),
+                runtime_class: sandboxwich_core::SterileCellRuntimeClass::KataMicrovm,
+                policy_digest: "a".repeat(64),
+                signature: "swrs1_test".into(),
+            },
+            organization_id: "org-1".into(),
+            workspace_id: "workspace-1".into(),
+            thread_id: "thread-1".into(),
+            runner_session_id: "session-1".into(),
+            expires_at: Utc::now() + chrono::Duration::minutes(1),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/sterile-cell-leases/{lease_id}/validate", post(validate))
+            .with_state(lease);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let attestation_file = write_temp_file("swla1_test\n");
+        validate_sterile_lease_gate(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            Some(SterileLeaseBootstrap {
+                lease_id,
+                generation,
+                attestation_file,
+                organization_id: "org-1".into(),
+                workspace_id: "workspace-1".into(),
+                thread_id: "thread-1".into(),
+                runner_session_id: "session-1".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sterile_lease_gate_rejects_oversized_attestation_before_network_access() {
+        let attestation_file = write_temp_file(&"x".repeat(1025));
+        let error = validate_sterile_lease_gate(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1",
+            Some(SterileLeaseBootstrap {
+                lease_id: Uuid::now_v7(),
+                generation: 2,
+                attestation_file,
+                organization_id: "org-1".into(),
+                workspace_id: "workspace-1".into(),
+                thread_id: "thread-1".into(),
+                runner_session_id: "session-1".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("oversized"));
+    }
+
+    #[tokio::test]
+    async fn sterile_lease_expiry_stops_a_running_daemon() {
+        let lease = sandboxwich_core::SterileCellLeaseV1 {
+            lease_id: Uuid::now_v7(),
+            cell_id: sandboxwich_core::SterileCellId::new(),
+            generation: 2,
+            release: sandboxwich_core::SterileCellReleaseTrustClassV1 {
+                release_set_id: "release-set-test".into(),
+                runtime_class: sandboxwich_core::SterileCellRuntimeClass::KataMicrovm,
+                policy_digest: "a".repeat(64),
+                signature: "swrs1_test".into(),
+            },
+            organization_id: "org-1".into(),
+            workspace_id: "workspace-1".into(),
+            thread_id: "thread-1".into(),
+            runner_session_id: "session-1".into(),
+            expires_at: Utc::now() + chrono::Duration::milliseconds(10),
+        };
+        let error = run_until_sterile_lease_expiry(
+            std::future::pending::<anyhow::Result<()>>(),
+            Some(&lease),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("lease expired"));
     }
 
     #[test]

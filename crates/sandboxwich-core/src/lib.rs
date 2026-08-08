@@ -398,6 +398,28 @@ impl fmt::Display for LeaseId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(transparent)]
+pub struct SterileCellId(pub Uuid);
+
+impl SterileCellId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for SterileCellId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for SterileCellId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SshKeyId(pub Uuid);
@@ -780,6 +802,150 @@ pub enum RuntimeResourceStatus {
     Deleted => "deleted",
     Destroyed => "destroyed",
 }
+}
+
+db_variant_enum! {
+/// Closed isolation classes admitted to the one-shot sterile-cell pool.
+/// `KataMicrovm` preserves the VM boundary. `GvisorLowerRisk` is a distinct,
+/// explicitly signed class and cannot satisfy a Kata claim.
+pub enum SterileCellRuntimeClass {
+    KataMicrovm => "kata_microvm",
+    GvisorLowerRisk => "gvisor_lower_risk",
+}
+}
+
+db_variant_enum! {
+pub enum SterileCellState {
+    Ready => "ready",
+    Leased => "leased",
+    Destroyed => "destroyed",
+    Quarantined => "quarantined",
+}
+}
+
+db_variant_enum! {
+pub enum SterileCellDisposition {
+    Destroyed => "destroyed",
+    Quarantined => "quarantined",
+}
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SterileCellReleaseTrustClassV1 {
+    pub release_set_id: String,
+    pub runtime_class: SterileCellRuntimeClass,
+    pub policy_digest: String,
+    pub signature: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SterileCellV1 {
+    pub cell_id: SterileCellId,
+    #[schema(value_type = Uuid)]
+    pub worker_id: WorkerId,
+    pub provider_cell_id: String,
+    pub state: SterileCellState,
+    pub generation: u64,
+    pub release: SterileCellReleaseTrustClassV1,
+    pub expires_at: DateTime<Utc>,
+    pub disposition: Option<SterileCellDisposition>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SterileCellLeaseV1 {
+    pub lease_id: Uuid,
+    pub cell_id: SterileCellId,
+    pub generation: u64,
+    pub release: SterileCellReleaseTrustClassV1,
+    pub organization_id: String,
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub runner_session_id: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PrepareSterileCellRequestV1 {
+    pub cell_id: SterileCellId,
+    pub release: SterileCellReleaseTrustClassV1,
+    pub provider_cell_id: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SterileCellResponseV1 {
+    pub ok: bool,
+    pub cell: SterileCellV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ClaimSterileCellRequestV1 {
+    pub release: SterileCellReleaseTrustClassV1,
+    pub organization_id: String,
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub runner_session_id: String,
+    pub lease_seconds: Option<u64>,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ClaimSterileCellResponseV1 {
+    pub ok: bool,
+    pub lease: Option<SterileCellLeaseV1>,
+    #[schema(value_type = Option<String>)]
+    pub lease_attestation: Option<String>,
+}
+
+impl fmt::Debug for ClaimSterileCellResponseV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClaimSterileCellResponseV1")
+            .field("ok", &self.ok)
+            .field("lease", &self.lease)
+            .field(
+                "lease_attestation",
+                &self.lease_attestation.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ValidateSterileCellLeaseRequestV1 {
+    #[schema(value_type = String)]
+    pub lease_attestation: String,
+    pub generation: u64,
+    pub organization_id: String,
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub runner_session_id: String,
+}
+
+impl fmt::Debug for ValidateSterileCellLeaseRequestV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ValidateSterileCellLeaseRequestV1")
+            .field("lease_attestation", &"[REDACTED]")
+            .field("generation", &self.generation)
+            .field("organization_id", &self.organization_id)
+            .field("workspace_id", &self.workspace_id)
+            .field("thread_id", &self.thread_id)
+            .field("runner_session_id", &self.runner_session_id)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ValidateSterileCellLeaseResponseV1 {
+    pub ok: bool,
+    pub lease: SterileCellLeaseV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct DestroySterileCellRequestV1 {
+    pub lease_id: Uuid,
+    pub generation: u64,
+    pub disposition: SterileCellDisposition,
 }
 
 db_variant_enum! {
