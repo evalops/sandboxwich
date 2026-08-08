@@ -1700,6 +1700,43 @@
         ],
         "type": "object"
       },
+      "ReleaseSterileCellLeaseRequestV1": {
+        "properties": {
+          "disposition": {
+            "$ref": "#/components/schemas/SterileCellDisposition"
+          },
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lease_attestation": {
+            "type": "string"
+          },
+          "organization_id": {
+            "type": "string"
+          },
+          "runner_session_id": {
+            "type": "string"
+          },
+          "thread_id": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "lease_attestation",
+          "generation",
+          "organization_id",
+          "workspace_id",
+          "thread_id",
+          "runner_session_id",
+          "disposition"
+        ],
+        "type": "object"
+      },
       "ResidentPlacementAttestationBootstrap": {
         "properties": {
           "token": {
@@ -2465,6 +2502,17 @@
             },
             "type": "array"
           },
+          "sterile_pool_candidate": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SterilePoolCandidateV1",
+                "description": "Control-plane-derived marker for a purpose-created sterile pool pod.\nOrdinary tenant provision requests cannot set this authoritatively;\nscheduler enrichment derives it from durable pool membership."
+              }
+            ]
+          },
           "tenant_id": {
             "type": [
               "string",
@@ -2895,6 +2943,57 @@
         "format": "uuid",
         "type": "string"
       },
+      "SterileCellLeaseStatusResponseV1": {
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "status": {
+            "$ref": "#/components/schemas/SterileCellLeaseStatusV1"
+          }
+        },
+        "required": [
+          "ok",
+          "status"
+        ],
+        "type": "object"
+      },
+      "SterileCellLeaseStatusV1": {
+        "properties": {
+          "cell_id": {
+            "$ref": "#/components/schemas/SterileCellId"
+          },
+          "disposition": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SterileCellDisposition"
+              }
+            ]
+          },
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lease_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/SterileCellState"
+          }
+        },
+        "required": [
+          "lease_id",
+          "cell_id",
+          "generation",
+          "state"
+        ],
+        "type": "object"
+      },
       "SterileCellLeaseV1": {
         "properties": {
           "cell_id": {
@@ -3043,6 +3142,21 @@
           "generation",
           "release",
           "expires_at"
+        ],
+        "type": "object"
+      },
+      "SterilePoolCandidateV1": {
+        "properties": {
+          "cell_id": {
+            "$ref": "#/components/schemas/SterileCellId"
+          },
+          "release": {
+            "$ref": "#/components/schemas/SterileCellReleaseTrustClassV1"
+          }
+        },
+        "required": [
+          "cell_id",
+          "release"
         ],
         "type": "object"
       },
@@ -5145,6 +5259,108 @@
         }
       }
     },
+    "/v1/sterile-cell-leases/{lease_id}": {
+      "get": {
+        "operationId": "get_sterile_cell_lease_status",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "lease_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SterileCellLeaseStatusResponseV1"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::sterile_cells"
+        ]
+      }
+    },
+    "/v1/sterile-cell-leases/{lease_id}/release": {
+      "post": {
+        "operationId": "release_sterile_cell_lease",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "lease_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReleaseSterileCellLeaseRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SterileCellLeaseStatusResponseV1"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::sterile_cells"
+        ]
+      }
+    },
     "/v1/sterile-cell-leases/{lease_id}/validate": {
       "post": {
         "operationId": "validate_sterile_cell_lease",
@@ -5482,6 +5698,76 @@
         },
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SterileCellResponseV1"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::sterile_cells"
+        ]
+      }
+    },
+    "/v1/workers/{worker_id}/sterile-cells/{cell_id}/release": {
+      "post": {
+        "operationId": "release_sterile_pool_cell",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "worker_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "cell_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DestroySterileCellRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
             "content": {
               "application/json": {
                 "schema": {

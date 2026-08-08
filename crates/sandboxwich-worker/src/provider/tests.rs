@@ -1,5 +1,8 @@
 use super::*;
-use sandboxwich_core::{MAX_COMMAND_STDIN_BYTES, NetworkAllowRule, RuntimeResourceInventoryItem};
+use sandboxwich_core::{
+    MAX_COMMAND_STDIN_BYTES, NetworkAllowRule, RuntimeResourceInventoryItem, SterileCellId,
+    SterileCellReleaseTrustClassV1, SterileCellRuntimeClass, SterilePoolCandidateV1,
+};
 use sandboxwich_core::{SandboxSecretMount, SecretRef, SecretRefId, SecretRefState, SecretSource};
 
 #[test]
@@ -165,6 +168,44 @@ fn compiler_cache_containers_are_non_root_with_a_guest_invisible_staging_volume(
     assert!(helper.get("env").is_none());
     assert!(helper.get("ports").is_none());
     assert_eq!(pod["spec"]["automountServiceAccountToken"], false);
+}
+
+#[test]
+fn kubernetes_pod_marks_only_authoritative_sterile_pool_candidates() {
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+    let sandbox_id = SandboxId::new();
+    let ordinary = provider.pod_manifest(sandbox_id, &SandboxProvisionSpec::default());
+    let ordinary_env = ordinary["spec"]["containers"][0]["env"].as_array().unwrap();
+    assert!(
+        ordinary_env
+            .iter()
+            .all(|entry| { entry["name"] != "SANDBOXWICH_STERILE_POOL_CANDIDATE_V1" })
+    );
+
+    let candidate = SterilePoolCandidateV1 {
+        cell_id: SterileCellId(sandbox_id.0),
+        release: SterileCellReleaseTrustClassV1 {
+            release_set_id: "release-test".into(),
+            runtime_class: SterileCellRuntimeClass::KataMicrovm,
+            policy_digest: "a".repeat(64),
+            signature: "swrs1_test".into(),
+        },
+    };
+    let spec = SandboxProvisionSpec {
+        sterile_pool_candidate: Some(candidate.clone()),
+        ..SandboxProvisionSpec::default()
+    };
+    let pool_pod = provider.pod_manifest(sandbox_id, &spec);
+    let marker = pool_pod["spec"]["containers"][0]["env"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "SANDBOXWICH_STERILE_POOL_CANDIDATE_V1")
+        .expect("pool candidate marker missing from sandbox container");
+    let decoded: SterilePoolCandidateV1 =
+        serde_json::from_str(marker["value"].as_str().unwrap()).unwrap();
+    assert_eq!(decoded, candidate);
 }
 
 #[test]

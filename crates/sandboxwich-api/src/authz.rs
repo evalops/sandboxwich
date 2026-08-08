@@ -75,6 +75,7 @@ const AUTHORIZATION_POLICY_RULES: &[&str] = &[
     "worker|read|/workers/*/sterile-cells/*",
     "worker|retire|/workers/*/sterile-cells/*/retire",
     "worker|destroy|/workers/*/sterile-cells/*/destroy",
+    "worker|release|/workers/*/sterile-cells/*/release",
     "worker|read|/workers/*/runtime-resource-inventory",
     "worker|reconcile|/workers/*/runtime-resources/reconcile",
     "worker|create|/workers/*/sandboxes/*/guest-token",
@@ -323,7 +324,7 @@ pub(crate) fn route_policy(method: &str, path: &str) -> RoutePolicy {
         PrincipalRequirement::NotExposed
     } else if path == "/workers/register" && known_route(path) {
         PrincipalRequirement::TenantOrOperator
-    } else if path.starts_with("/sterile-cell-leases/") && known_route(path) {
+    } else if path_matches_template(path, "/sterile-cell-leases/*/validate") && known_route(path) {
         PrincipalRequirement::Authenticated
     } else if (path == "/snapshots/cleanup"
         || path == "/operator"
@@ -359,6 +360,7 @@ fn worker_route(path: &str) -> bool {
             || path_matches_template(path, "/workers/*/sterile-cells/*")
             || (path.contains("/sterile-cells/") && path.ends_with("/retire"))
             || (path.contains("/sterile-cells/") && path.ends_with("/destroy"))
+            || (path.contains("/sterile-cells/") && path.ends_with("/release"))
             || path.contains("/apex-instruction-callbacks/"))
 }
 
@@ -895,6 +897,8 @@ pub(crate) const AUTHORIZATION_ROUTE_MANIFEST: &[&str] = &[
     "/jobs",
     "/jobs/*",
     "/sterile-cells/claim",
+    "/sterile-cell-leases/*",
+    "/sterile-cell-leases/*/release",
     "/sterile-cell-leases/*/validate",
     "/divergence/reconcile",
     "/sandboxes/*/tool-call-ledger",
@@ -916,6 +920,7 @@ pub(crate) const AUTHORIZATION_ROUTE_MANIFEST: &[&str] = &[
     "/workers/*/sterile-cells/*",
     "/workers/*/sterile-cells/*/retire",
     "/workers/*/sterile-cells/*/destroy",
+    "/workers/*/sterile-cells/*/release",
     "/workers/*/runtime-resource-inventory",
     "/workers/*/runtime-resources/reconcile",
     "/workers/*/sandboxes/*/guest-token",

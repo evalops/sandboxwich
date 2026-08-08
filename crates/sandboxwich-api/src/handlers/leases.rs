@@ -200,7 +200,7 @@ pub(crate) async fn claim_lease(
         .push(
             ")
            and (
-             kind in ('provision_sandbox', 'run_prompt', 'stop_sandbox', 'delete_home')
+             kind in ('provision_sandbox', 'run_prompt', 'delete_home')
              or exists (
                select 1 from sandbox_placements p
                where p.sandbox_id = coalesce(jobs.sandbox_id, jobs.parent_sandbox_id)
@@ -2618,6 +2618,10 @@ pub(crate) async fn apply_completed_job_on_connection(
                     Err(error) => return Err(error),
                 }
             }
+            if transitioned {
+                crate::sterile_pool::admit_provisioned_cell_on_connection(db, connection, job)
+                    .await?;
+            }
         }
         (JobKind::StopSandbox, WorkerJobResult::StopSandbox { sandbox_id, .. }) => {
             if sandbox_id != sandbox_id_from_job(job)? {
@@ -2662,6 +2666,7 @@ pub(crate) async fn apply_completed_job_on_connection(
                 )
                 .await?;
             }
+            crate::sterile_pool::complete_pool_stop_on_connection(db, connection, job).await?;
             let release_sql = format!(
                 "delete from sandbox_home_mounts where sandbox_id = {}",
                 db.placeholder(1)
@@ -3132,7 +3137,12 @@ pub(crate) async fn apply_failed_job_on_connection(
             )
             .await?;
         }
-        JobKind::ProvisionSandbox | JobKind::StopSandbox => {}
+        JobKind::ProvisionSandbox | JobKind::StopSandbox => {
+            crate::sterile_pool::quarantine_failed_pool_job_on_connection(
+                db, connection, job, error,
+            )
+            .await?;
+        }
         JobKind::DeleteHome => {
             mark_home_delete_failed_on_connection(db, connection, home_id_from_job(job)?, error)
                 .await?;

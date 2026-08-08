@@ -974,6 +974,48 @@ pub struct DestroySterileCellRequestV1 {
     pub disposition: SterileCellDisposition,
 }
 
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ReleaseSterileCellLeaseRequestV1 {
+    #[schema(value_type = String)]
+    pub lease_attestation: String,
+    pub generation: u64,
+    pub organization_id: String,
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub runner_session_id: String,
+    pub disposition: SterileCellDisposition,
+}
+
+impl fmt::Debug for ReleaseSterileCellLeaseRequestV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReleaseSterileCellLeaseRequestV1")
+            .field("lease_attestation", &"[REDACTED]")
+            .field("generation", &self.generation)
+            .field("organization_id", &self.organization_id)
+            .field("workspace_id", &self.workspace_id)
+            .field("thread_id", &self.thread_id)
+            .field("runner_session_id", &self.runner_session_id)
+            .field("disposition", &self.disposition)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SterileCellLeaseStatusV1 {
+    pub lease_id: Uuid,
+    pub cell_id: SterileCellId,
+    pub generation: u64,
+    pub state: SterileCellState,
+    pub disposition: Option<SterileCellDisposition>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SterileCellLeaseStatusResponseV1 {
+    pub ok: bool,
+    pub status: SterileCellLeaseStatusV1,
+}
+
 db_variant_enum! {
 pub enum CleanupRunStatus {
     Running => "running",
@@ -1218,6 +1260,17 @@ pub struct SandboxProvisionSpec {
     /// turns each one into a read-only CSI volume mount.
     #[serde(default)]
     pub secret_mounts: Vec<SandboxSecretMount>,
+    /// Control-plane-derived marker for a purpose-created sterile pool pod.
+    /// Ordinary tenant provision requests cannot set this authoritatively;
+    /// scheduler enrichment derives it from durable pool membership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sterile_pool_candidate: Option<SterilePoolCandidateV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SterilePoolCandidateV1 {
+    pub cell_id: SterileCellId,
+    pub release: SterileCellReleaseTrustClassV1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

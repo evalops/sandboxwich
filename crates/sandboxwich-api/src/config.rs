@@ -2,6 +2,9 @@ use crate::bootstrap_handoff::{
     BOOTSTRAP_HANDOFF_KEY_BYTES, DEFAULT_BOOTSTRAP_HANDOFF_TTL, parse_bootstrap_handoff_key,
 };
 use anyhow::Context;
+use sandboxwich_core::{
+    DbVariant, SandboxRuntimeProfile, SterileCellReleaseTrustClassV1, SterileCellRuntimeClass,
+};
 use std::{
     io::Read as _,
     net::SocketAddr,
@@ -72,6 +75,17 @@ pub(crate) struct ApiConfig {
     pub(crate) identity_mtls: Option<IdentityMtlsConfig>,
     pub(crate) sandbox_lifetime: SandboxLifetimeConfig,
     pub(crate) sterile_cell_signing_key: Option<String>,
+    pub(crate) sterile_pool: Option<SterilePoolConfig>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SterilePoolConfig {
+    pub(crate) target: u32,
+    pub(crate) tenant_id: String,
+    pub(crate) release: SterileCellReleaseTrustClassV1,
+    pub(crate) sandbox_profile: SandboxRuntimeProfile,
+    pub(crate) template: String,
+    pub(crate) ready_ttl: Duration,
 }
 
 /// Server-side default/ceiling for the two active-lifetime reaping knobs
@@ -190,6 +204,18 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
             .map(PathBuf::from)
             .as_deref(),
     )?;
+    let sterile_pool = parse_sterile_pool_config(
+        parse_env_u32("SANDBOXWICH_STERILE_POOL_TARGET", 0)?,
+        std::env::var("SANDBOXWICH_STERILE_POOL_TENANT_ID").ok(),
+        std::env::var("SANDBOXWICH_STERILE_POOL_RELEASE_SET_ID").ok(),
+        std::env::var("SANDBOXWICH_STERILE_POOL_RUNTIME_CLASS").ok(),
+        std::env::var("SANDBOXWICH_STERILE_POOL_POLICY_DIGEST").ok(),
+        std::env::var("SANDBOXWICH_STERILE_POOL_RELEASE_SIGNATURE").ok(),
+        std::env::var("SANDBOXWICH_STERILE_POOL_SANDBOX_PROFILE").ok(),
+        std::env::var("SANDBOXWICH_STERILE_POOL_TEMPLATE").ok(),
+        parse_env_u32("SANDBOXWICH_STERILE_POOL_READY_TTL_SECONDS", 300)?,
+        sterile_cell_signing_key.as_deref(),
+    )?;
 
     Ok(ApiConfig {
         command,
@@ -211,7 +237,71 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
         identity_mtls,
         sandbox_lifetime,
         sterile_cell_signing_key,
+        sterile_pool,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_sterile_pool_config(
+    target: u32,
+    tenant_id: Option<String>,
+    release_set_id: Option<String>,
+    runtime_class: Option<String>,
+    policy_digest: Option<String>,
+    release_signature: Option<String>,
+    sandbox_profile: Option<String>,
+    template: Option<String>,
+    ready_ttl_seconds: u32,
+    signing_key: Option<&str>,
+) -> anyhow::Result<Option<SterilePoolConfig>> {
+    if target == 0 {
+        return Ok(None);
+    }
+    let required = |name: &'static str, value: Option<String>| -> anyhow::Result<String> {
+        value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .with_context(|| {
+                format!("{name} is required when SANDBOXWICH_STERILE_POOL_TARGET is non-zero")
+            })
+    };
+    let runtime_class = SterileCellRuntimeClass::parse_db_str(&required(
+        "SANDBOXWICH_STERILE_POOL_RUNTIME_CLASS",
+        runtime_class,
+    )?)
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let sandbox_profile = SandboxRuntimeProfile::parse_db_str(&required(
+        "SANDBOXWICH_STERILE_POOL_SANDBOX_PROFILE",
+        sandbox_profile,
+    )?)
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let release = SterileCellReleaseTrustClassV1 {
+        release_set_id: required("SANDBOXWICH_STERILE_POOL_RELEASE_SET_ID", release_set_id)?,
+        runtime_class,
+        policy_digest: required("SANDBOXWICH_STERILE_POOL_POLICY_DIGEST", policy_digest)?
+            .to_ascii_lowercase(),
+        signature: required(
+            "SANDBOXWICH_STERILE_POOL_RELEASE_SIGNATURE",
+            release_signature,
+        )?,
+    };
+    let signing_key = signing_key.context(
+        "sterile-cell signing must be enabled before SANDBOXWICH_STERILE_POOL_TARGET can be non-zero",
+    )?;
+    crate::handlers::sterile_cells::validate_release(signing_key, &release)
+        .map_err(|error| anyhow::anyhow!(error.message))?;
+    anyhow::ensure!(
+        ready_ttl_seconds > 0,
+        "SANDBOXWICH_STERILE_POOL_READY_TTL_SECONDS must be non-zero"
+    );
+    Ok(Some(SterilePoolConfig {
+        target,
+        tenant_id: required("SANDBOXWICH_STERILE_POOL_TENANT_ID", tenant_id)?,
+        release,
+        sandbox_profile,
+        template: required("SANDBOXWICH_STERILE_POOL_TEMPLATE", template)?,
+        ready_ttl: Duration::from_secs(u64::from(ready_ttl_seconds)),
+    }))
 }
 
 fn load_sterile_cell_signing_key(
@@ -398,6 +488,24 @@ pub(crate) fn parse_tenant_tokens(value: Option<&str>) -> anyhow::Result<Vec<Ten
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    fn signed_pool_release(key: &str) -> (String, String) {
+        let digest = "a".repeat(64);
+        let canonical =
+            format!("sandboxwich-sterile-release-v1\0release-test\0kata_microvm\0{digest}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes()).unwrap();
+        mac.update(canonical.as_bytes());
+        (
+            digest,
+            format!(
+                "swrs1_{}",
+                URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+            ),
+        )
+    }
 
     #[test]
     fn apex_callback_base_is_an_instance_origin_or_startup_fails() {
@@ -512,5 +620,62 @@ mod tests {
         assert!(load_sterile_cell_signing_key(true, Some(&key_path)).is_err());
         std::fs::write(&key_path, "x".repeat(4097)).unwrap();
         assert!(load_sterile_cell_signing_key(true, Some(&key_path)).is_err());
+    }
+
+    #[test]
+    fn sterile_pool_target_is_zero_until_every_authority_field_is_configured() {
+        assert!(
+            parse_sterile_pool_config(
+                0,
+                Some("ignored".into()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                300,
+                None,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            parse_sterile_pool_config(
+                1,
+                Some("default".into()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                300,
+                Some("sandboxwich-test-signing-key-32-bytes"),
+            )
+            .is_err()
+        );
+
+        let key = "sandboxwich-test-signing-key-32-bytes";
+        let (digest, signature) = signed_pool_release(key);
+        let config = parse_sterile_pool_config(
+            2,
+            Some("default".into()),
+            Some("release-test".into()),
+            Some("kata_microvm".into()),
+            Some(digest),
+            Some(signature),
+            Some("unprivileged".into()),
+            Some("ubuntu-dev@sha256:test".into()),
+            300,
+            Some(key),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(config.target, 2);
+        assert_eq!(
+            config.release.runtime_class,
+            SterileCellRuntimeClass::KataMicrovm
+        );
     }
 }

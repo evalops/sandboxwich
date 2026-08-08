@@ -10,6 +10,40 @@ SANDBOXWICH_STERILE_CELL_SIGNING_KEY_FILE=/run/secrets/sterile-cell-signing-key
 When disabled, the existing sandbox creation and resident-process paths keep
 their previous behavior. Sterile-cell routes return `404`.
 
+## Purpose-created pool
+
+The API creates no pool members unless `SANDBOXWICH_STERILE_POOL_TARGET` is
+greater than zero and these values are set:
+
+```text
+SANDBOXWICH_STERILE_POOL_TENANT_ID
+SANDBOXWICH_STERILE_POOL_RELEASE_SET_ID
+SANDBOXWICH_STERILE_POOL_RUNTIME_CLASS
+SANDBOXWICH_STERILE_POOL_POLICY_DIGEST
+SANDBOXWICH_STERILE_POOL_RELEASE_SIGNATURE
+SANDBOXWICH_STERILE_POOL_SANDBOX_PROFILE
+SANDBOXWICH_STERILE_POOL_TEMPLATE
+```
+
+`SANDBOXWICH_STERILE_POOL_READY_TTL_SECONDS` defaults to `300`. Its clock
+starts when provider provisioning completes. The configured release signature
+must validate under `SANDBOXWICH_STERILE_CELL_SIGNING_KEY_FILE`, and the pool
+provider preference is fixed to Kubernetes. This repository contains no
+production pool values.
+
+Pool membership is stored by `sandbox_id`. The sandbox ID, sterile cell ID,
+and provider cell ID are identical. Provision completion inserts the ready
+cell and records its worker placement in one database transaction. A claim
+removes that member from the reserve count, so the next reconcile creates one
+replacement.
+
+Pool sandboxes and their jobs are absent from ordinary tenant list, read, and
+mutation routes for the lifetime of their durable membership. Sterile
+activation uses the exact lease ID and generation lookup instead. The
+Kubernetes pod receives `SANDBOXWICH_STERILE_POOL_CANDIDATE_V1`, whose JSON
+value contains the cell ID and signed release tuple. Scheduler enrichment
+derives this value from pool membership.
+
 ## Signed trust class
 
 A ready cell is admitted under this exact tuple:
@@ -57,11 +91,14 @@ ready(generation=1, never exposed)
   -> destroyed
 ```
 
-`quarantined` is terminal. Expired ready cells, expired leases, stale cleanup
-generations, and cleanup requests whose lease fence does not match enter that
-state. No route transitions `leased`, `destroyed`, or `quarantined` back to
-`ready`. The database primary key also prevents a destroyed cell ID from being
-prepared again.
+`quarantined` is terminal for cell authority. Pool membership remains
+`cleanup_pending` after a failed, expired, or ambiguous stop until the
+controller queues another placed provider stop under the recorded fence. This
+cleanup reconciler runs after API restart even when the configured pool target
+is zero. Only provider-confirmed completion terminalizes pool membership. No
+route transitions `leased`, `destroyed`, or `quarantined` back to `ready`. The
+database primary key also prevents a destroyed cell ID from being prepared
+again.
 
 Workers must delete the child container or microVM, its overlay, and its
 runtime namespace before reporting `destroyed`. If deletion cannot be proven,
@@ -80,7 +117,10 @@ the Sandboxwich API.
 | Worker token | `POST /workers/{worker_id}/sterile-cells/{cell_id}/retire` | Quarantines an unexposed `ready(generation=1)` cell under an exact generation fence. |
 | Tenant token | `POST /sterile-cells/claim` | Atomically leases one exact matching cell. Fenced claims durably record `lease: null`; legacy unfenced claims retain the original one-shot behavior. |
 | Tenant, worker, or guest token plus lease attestation | `POST /sterile-cell-leases/{lease_id}/validate` | Returns the live tuple only when token, tenant, generation, tuple, state, and expiry match. |
+| Tenant token | `POST /sterile-cell-leases/{lease_id}/release` | Accepts provider teardown under the exact attestation, generation, and organization/workspace/thread/session tuple; returns `202` while teardown runs. |
+| Tenant token | `GET /sterile-cell-leases/{lease_id}` | Returns the tenant-scoped cell ID, lease ID, generation, state, and disposition without provider locators or attestation data. |
 | Worker token | `POST /workers/{worker_id}/sterile-cells/{cell_id}/destroy` | Records proven destruction or quarantine under the exact lease generation. |
+| Worker token | `POST /workers/{worker_id}/sterile-cells/{cell_id}/release` | Controller-only release trigger for a pool-created cell. |
 
 New controllers supply the optional UUID `claim_id`. While its lease remains
 live, an exact fenced retry returns the same lease and deterministically
@@ -139,10 +179,13 @@ Attestation bytes do not go on argv or into provider metadata.
 4. Deliver the returned attestation to the leased child through a read-only
    file and pass the six non-secret fence values as environment variables.
 5. Permit tenant bootstrap only after the agent's validation call succeeds.
-6. After execution, delete every provider object for the child and call the
-   destroy endpoint with the lease ID and generation.
-7. Submit `quarantined` when cleanup evidence is incomplete. Do not return the
-   cell to inventory.
+6. After execution, call `POST /v1/sterile-cell-leases/{lease_id}/release`
+   with the exact attestation, generation, tuple, and requested disposition.
+7. Poll `GET /v1/sterile-cell-leases/{lease_id}` until it reports `destroyed`
+   or `quarantined`. Only a completed `StopSandbox` provider job records
+   `destroyed`; a failed job revokes cell authority and remains cleanup-pending
+   until an exact provider retry succeeds. Exact completion replays are
+   idempotent.
 8. If prepare is ambiguous, use the worker lookup before retrying registration.
    If an unclaimed ready cell must be removed, delete its provider resources
    and call `retire` with generation `1`; retirement only records

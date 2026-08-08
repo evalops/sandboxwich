@@ -92,6 +92,7 @@ fn provision_spec_from_request_with_provider(
         tenant_id: parent.map(|sandbox| sandbox.tenant_id.clone()),
         provider_external_id: None,
         provider_routing_scope: None,
+        sterile_pool_candidate: None,
     })
 }
 
@@ -438,7 +439,9 @@ pub(crate) async fn list_sandboxes(
                 created_at, updated_at, ttl_seconds, max_lifetime_seconds, idle_ttl_seconds, last_activity_at, parent_snapshot_id,
                 network_egress_rules_json
          from sandboxes
-         where tenant_id = {}",
+         where tenant_id = {}
+           and not exists (select 1 from sterile_pool_memberships p
+                           where p.sandbox_id = sandboxes.id)",
         state.db.placeholder(1)
     );
     let (sandboxes, next_cursor) = fetch_keyset_page(
@@ -487,6 +490,9 @@ pub(crate) async fn get_sandbox(
     Extension(ctx): Extension<TenantContext>,
     Path(sandbox_id): Path<Uuid>,
 ) -> Result<Json<SandboxResponse>, ApiError> {
+    if crate::sterile_pool::sandbox_has_pool_membership(&state.db, SandboxId(sandbox_id)).await? {
+        return Err(ApiError::not_found("resource not found"));
+    }
     let (sandbox, placement) =
         fetch_sandbox_with_placement_proof(&state.db, SandboxId(sandbox_id)).await?;
     ensure_tenant(&sandbox.tenant_id, &ctx)?;
@@ -1047,6 +1053,7 @@ pub(crate) async fn resume_sandbox(
         tenant_id: Some(sandbox.tenant_id.clone()),
         provider_external_id: None,
         provider_routing_scope: None,
+        sterile_pool_candidate: None,
     };
     let job = Job {
         id: JobId::new(),

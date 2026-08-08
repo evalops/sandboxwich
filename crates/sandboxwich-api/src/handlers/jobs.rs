@@ -195,6 +195,13 @@ pub(crate) async fn get_job(
 ) -> Result<Json<JobResponse>, ApiError> {
     let job = fetch_job(&state.db, JobId(job_id)).await?;
     ensure_job_tenant(&job, &ctx)?;
+    if job
+        .payload
+        .get(crate::sterile_pool::POOL_JOB_MARKER)
+        .is_some()
+    {
+        return Err(ApiError::not_found("resource not found"));
+    }
     Ok(Json(JobResponse {
         ok: true,
         job: job.into(),
@@ -215,6 +222,7 @@ pub(crate) struct PlacementCacheEntry {
     pub expected_provision_spec: serde_json::Value,
     pub provider_external_id: Option<String>,
     pub provider_routing_scope: Option<String>,
+    pub sterile_pool_candidate: Option<SterilePoolCandidateV1>,
 }
 
 pub(crate) type PlacementEnrichmentCache =
@@ -282,6 +290,21 @@ fn apply_sandbox_placement(job: &mut Job, entry: &PlacementCacheEntry) -> Result
         entry.provider_external_id.clone(),
         entry.provider_routing_scope.clone(),
     )?;
+    let payload = job
+        .payload
+        .as_object_mut()
+        .ok_or_else(|| ApiError::internal("job payload is not an object"))?;
+    let mut spec: SandboxProvisionSpec = serde_json::from_value(
+        payload
+            .get("provisionSpec")
+            .cloned()
+            .ok_or_else(|| ApiError::internal("job provisionSpec is missing"))?,
+    )?;
+    // Pool candidacy is control-plane state, never a tenant-provided hint.
+    // Assigning `None` is important: it strips forged or stale markers from
+    // ordinary provision jobs before they can reach a provider.
+    spec.sterile_pool_candidate = entry.sterile_pool_candidate.clone();
+    payload.insert("provisionSpec".into(), serde_json::to_value(spec)?);
     Ok(true)
 }
 
@@ -338,6 +361,7 @@ pub(crate) fn placement_matches_sandbox_parts(
             expected_provision_spec: expected,
             provider_external_id: None,
             provider_routing_scope: None,
+            sterile_pool_candidate: None,
         },
     )
 }
@@ -383,6 +407,30 @@ async fn load_sandbox_placement_inputs(
     let provider_routing_scope = identity
         .as_ref()
         .and_then(|row| row.try_get("namespace").ok());
+    let pool_sql = format!(
+        "select release_set_id, runtime_class, policy_digest, release_signature
+         from sterile_pool_memberships where sandbox_id = {}",
+        db.placeholder(1)
+    );
+    let sterile_pool_candidate = sqlx::query(&pool_sql)
+        .bind(sandbox_id.to_string())
+        .fetch_optional(db.read_pool())
+        .await?
+        .map(|row| {
+            Ok::<_, ApiError>(SterilePoolCandidateV1 {
+                cell_id: SterileCellId(sandbox_id.0),
+                release: SterileCellReleaseTrustClassV1 {
+                    release_set_id: row.try_get("release_set_id")?,
+                    runtime_class: SterileCellRuntimeClass::parse_db_str(
+                        row.try_get("runtime_class")?,
+                    )
+                    .map_err(|error| ApiError::internal(error.to_string()))?,
+                    policy_digest: row.try_get("policy_digest")?,
+                    signature: row.try_get("release_signature")?,
+                },
+            })
+        })
+        .transpose()?;
     let expected_provision_spec = serde_json::to_value(SandboxProvisionSpec {
         secret_mounts: secret_mounts.clone(),
         execution_class: sandbox.execution_class.clone(),
@@ -393,6 +441,7 @@ async fn load_sandbox_placement_inputs(
         tenant_id: Some(sandbox.tenant_id.clone()),
         provider_external_id: provider_external_id.clone(),
         provider_routing_scope: provider_routing_scope.clone(),
+        sterile_pool_candidate: sterile_pool_candidate.clone(),
         ..SandboxProvisionSpec::default()
     })?;
     let entry = PlacementCacheEntry {
@@ -401,6 +450,7 @@ async fn load_sandbox_placement_inputs(
         expected_provision_spec,
         provider_external_id,
         provider_routing_scope,
+        sterile_pool_candidate,
     };
     cache.insert(sandbox_id, entry.clone());
     Ok(entry)
@@ -449,6 +499,7 @@ fn add_provision_spec_to_payload_with_identity(
             tenant_id: Some(sandbox.tenant_id.clone()),
             provider_external_id,
             provider_routing_scope,
+            sterile_pool_candidate: None,
         })?,
     );
     Ok(())
@@ -686,7 +737,9 @@ pub(crate) async fn list_jobs(
         "select id, tenant_id, kind, status, payload, required_capability, required_execution_class, priority, attempts, max_attempts,
                 scheduled_at, created_at, updated_at, last_error
          from jobs
-         where tenant_id = {}",
+         where tenant_id = {}
+           and not exists (select 1 from sterile_pool_memberships p
+                           where p.sandbox_id = jobs.sandbox_id)",
         state.db.placeholder(1)
     );
     let (jobs, next_cursor) = fetch_keyset_page(
@@ -1355,6 +1408,7 @@ mod placement_match_tests {
             secret_mounts: vec![],
             provider_external_id: None,
             provider_routing_scope: None,
+            sterile_pool_candidate: None,
         }
     }
 
@@ -1394,6 +1448,26 @@ mod placement_match_tests {
             Some(sandbox.template.as_str())
         );
         assert!(!apply_sandbox_placement(&mut job, &entry).unwrap());
+    }
+
+    #[test]
+    fn apply_sandbox_placement_strips_forged_pool_candidate() {
+        let sandbox = sample_sandbox();
+        let entry = entry_for(&sandbox);
+        let mut job = base_job(&sandbox);
+        job.payload["provisionSpec"]["sterile_pool_candidate"] = json!({
+            "cell_id": sandbox.id,
+            "release": {
+                "release_set_id": "forged",
+                "runtime_class": "kata_microvm",
+                "policy_digest": "sha256:forged",
+                "signature": "forged"
+            }
+        });
+
+        assert!(apply_sandbox_placement(&mut job, &entry).unwrap());
+        assert!(job.payload["provisionSpec"]["sterile_pool_candidate"].is_null());
+        assert!(placement_matches_sandbox(&job, &entry));
     }
 
     #[test]

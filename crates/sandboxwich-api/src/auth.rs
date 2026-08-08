@@ -407,6 +407,9 @@ pub(crate) async fn ensure_sandbox_tenant(
 ) -> Result<Sandbox, ApiError> {
     let sandbox = fetch_sandbox(db, sandbox_id).await?;
     ensure_tenant(&sandbox.tenant_id, ctx)?;
+    if crate::sterile_pool::sandbox_has_pool_membership(db, sandbox_id).await? {
+        return Err(ApiError::not_found("resource not found"));
+    }
     Ok(sandbox)
 }
 
@@ -549,9 +552,10 @@ pub(crate) async fn ensure_resident_lease_scope(
     Ok(lease)
 }
 
-/// Like [`ensure_sandbox_tenant`], but additionally requires (see GH-64) that
-/// the request authenticated as the worker currently placed for
-/// `sandbox_id`.
+/// Requires (see GH-64) that the request authenticated as the worker currently
+/// placed for `sandbox_id`. This deliberately bypasses the ordinary tenant
+/// pool guard: purpose-created candidates still need their worker/guest token
+/// and health lifecycle before tenant activation.
 /// Used on the guest-facing guest-health route so a worker-scoped token can
 /// only report health for sandboxes it actually owns, and a tenant-wide
 /// token is rejected outright.
@@ -560,7 +564,8 @@ pub(crate) async fn ensure_sandbox_worker_scope(
     sandbox_id: SandboxId,
     ctx: &TenantContext,
 ) -> Result<Sandbox, ApiError> {
-    let sandbox = ensure_sandbox_tenant(db, sandbox_id, ctx).await?;
+    let sandbox = fetch_sandbox(db, sandbox_id).await?;
+    ensure_tenant(&sandbox.tenant_id, ctx)?;
     if let Some(bound_sandbox_id) = ctx.guest_sandbox_id() {
         return if bound_sandbox_id == sandbox_id {
             Ok(sandbox)

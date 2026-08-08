@@ -142,6 +142,8 @@ async fn openapi_covers_every_public_v1_operation() {
             "POST",
             "/v1/sterile-cell-leases/{lease_id}/validate",
         ),
+        ("GET", "/v1/sterile-cell-leases/{lease_id}"),
+        ("POST", "/v1/sterile-cell-leases/{lease_id}/release"),
         (
             "POST",
             "/v1/workers/{worker_id}/sterile-cells/prepare",
@@ -157,6 +159,10 @@ async fn openapi_covers_every_public_v1_operation() {
         (
             "POST",
             "/v1/workers/{worker_id}/sterile-cells/{cell_id}/destroy",
+        ),
+        (
+            "POST",
+            "/v1/workers/{worker_id}/sterile-cells/{cell_id}/release",
         ),
         ("GET", "/v1/operator/tenant-policies/{tenant_id}"),
         ("PUT", "/v1/operator/tenant-policies/{tenant_id}"),
