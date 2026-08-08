@@ -880,12 +880,38 @@ pub struct SterileCellResponseV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ClaimSterileCellRequestV1 {
+    /// Client-generated idempotency fence. New controllers should always set
+    /// this; omission preserves the original V1 one-shot claim behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_id: Option<Uuid>,
     pub release: SterileCellReleaseTrustClassV1,
     pub organization_id: String,
     pub workspace_id: String,
     pub thread_id: String,
     pub runner_session_id: String,
     pub lease_seconds: Option<u64>,
+}
+
+/// Non-secret locator returned only to the worker that owns a sterile cell.
+/// The raw lease attestation and its stored digest are deliberately absent.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SterileCellClaimLocatorV1 {
+    pub claim_id: Uuid,
+    pub lease_id: Uuid,
+    pub generation: u64,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct WorkerSterileCellLookupResponseV1 {
+    pub ok: bool,
+    pub cell: SterileCellV1,
+    pub claim: Option<SterileCellClaimLocatorV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RetireSterileCellRequestV1 {
+    pub generation: u64,
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]

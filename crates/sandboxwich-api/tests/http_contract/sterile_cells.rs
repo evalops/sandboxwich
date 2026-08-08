@@ -81,6 +81,7 @@ async fn prepare(
 
 fn claim_request(release: SterileCellReleaseTrustClassV1) -> ClaimSterileCellRequestV1 {
     ClaimSterileCellRequestV1 {
+        claim_id: Some(Uuid::now_v7()),
         release,
         organization_id: "org-1".into(),
         workspace_id: "workspace-1".into(),
@@ -160,9 +161,11 @@ async fn atomic_claim_binds_identity_and_a_cell_is_never_reused() {
 
     let url = format!("{}/sterile-cells/claim", server.base_url);
     let request = claim_request(release.clone());
+    let mut competing_request = request.clone();
+    competing_request.claim_id = Some(Uuid::now_v7());
     let (left, right) = tokio::join!(
         client.post(&url).json(&request).send(),
-        client.post(&url).json(&request).send()
+        client.post(&url).json(&competing_request).send()
     );
     let responses = [left.unwrap(), right.unwrap()];
     assert_eq!(
@@ -284,10 +287,11 @@ async fn claim_attestation_is_never_persisted_for_idempotent_replay() {
     let release = signed_release(SterileCellRuntimeClass::KataMicrovm);
     prepare(&server, &worker, SterileCellId::new(), release.clone()).await;
     let idempotency_key = Uuid::now_v7().to_string();
+    let request = claim_request(release.clone());
     let claimed: ClaimSterileCellResponseV1 = client
         .post(format!("{}/sterile-cells/claim", server.base_url))
         .header("idempotency-key", &idempotency_key)
-        .json(&claim_request(release.clone()))
+        .json(&request)
         .send()
         .await
         .unwrap()
@@ -319,6 +323,149 @@ async fn claim_attestation_is_never_persisted_for_idempotent_replay() {
     let replayed: ClaimSterileCellResponseV1 = client
         .post(format!("{}/sterile-cells/claim", server.base_url))
         .header("idempotency-key", &idempotency_key)
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replayed.lease, claimed.lease);
+    assert_eq!(
+        replayed.lease_attestation.as_deref(),
+        Some(attestation.as_str())
+    );
+}
+
+#[tokio::test]
+async fn claim_id_replays_one_live_lease_and_conflicting_reuse_fails_closed() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("claim-fence.db").display()
+    );
+    let server = TestServer::start_with_sterile_cells(database_url, Some(data_dir), false).await;
+    let client = server.client();
+    let worker = register_worker(&server, &client).await;
+    let release = signed_release(SterileCellRuntimeClass::KataMicrovm);
+    let first_cell = SterileCellId::new();
+    let second_cell = SterileCellId::new();
+    prepare(&server, &worker, first_cell, release.clone()).await;
+    prepare(&server, &worker, second_cell, release.clone()).await;
+    let request = claim_request(release.clone());
+    let url = format!("{}/sterile-cells/claim", server.base_url);
+
+    let (first, replay) = tokio::join!(
+        client.post(&url).json(&request).send(),
+        client.post(&url).json(&request).send()
+    );
+    let first = first
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<ClaimSterileCellResponseV1>()
+        .await
+        .unwrap();
+    let replay = replay
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<ClaimSterileCellResponseV1>()
+        .await
+        .unwrap();
+    assert_eq!(replay, first);
+
+    let mut conflict = request.clone();
+    conflict.runner_session_id = "session-conflict".into();
+    let response = client.post(&url).json(&conflict).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let mut ttl_conflict = request.clone();
+    ttl_conflict.lease_seconds = Some(121);
+    let response = client.post(&url).json(&ttl_conflict).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&server.database_url)
+        .await
+        .unwrap();
+    let leased: i64 =
+        sqlx::query("select count(*) as count from sterile_cells where state = 'leased'")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get("count")
+            .unwrap();
+    assert_eq!(
+        leased, 1,
+        "an exact retry must not consume another ready cell"
+    );
+
+    let lease = first.lease.unwrap();
+    worker_client(&worker)
+        .post(format!(
+            "{}/workers/{}/sterile-cells/{}/destroy",
+            server.base_url, worker.worker.id, lease.cell_id
+        ))
+        .json(&DestroySterileCellRequestV1 {
+            lease_id: lease.lease_id,
+            generation: lease.generation,
+            disposition: SterileCellDisposition::Destroyed,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let terminal_retry = client.post(&url).json(&request).send().await.unwrap();
+    assert_eq!(terminal_retry.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn an_empty_claim_id_replays_empty_instead_of_consuming_later_inventory() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("empty-fence.db").display()
+    );
+    let server = TestServer::start_with_sterile_cells(database_url, Some(data_dir), false).await;
+    let client = server.client();
+    let worker = register_worker(&server, &client).await;
+    let release = signed_release(SterileCellRuntimeClass::KataMicrovm);
+    let request = claim_request(release.clone());
+    let url = format!("{}/sterile-cells/claim", server.base_url);
+
+    let empty: ClaimSterileCellResponseV1 = client
+        .post(&url)
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(empty.lease.is_none());
+    prepare(&server, &worker, SterileCellId::new(), release.clone()).await;
+    let replay: ClaimSterileCellResponseV1 = client
+        .post(&url)
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replay, empty);
+
+    let fresh: ClaimSterileCellResponseV1 = client
+        .post(&url)
         .json(&claim_request(release))
         .send()
         .await
@@ -328,11 +475,184 @@ async fn claim_attestation_is_never_persisted_for_idempotent_replay() {
         .json()
         .await
         .unwrap();
-    assert!(replayed.lease_attestation.is_none());
-    assert_ne!(
-        replayed.lease_attestation.as_deref(),
-        Some(attestation.as_str())
+    assert!(fresh.lease.is_some());
+}
+
+#[tokio::test]
+async fn missing_claim_id_preserves_legacy_unfenced_one_shot_semantics() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("legacy-claim.db").display()
     );
+    let server = TestServer::start_with_sterile_cells(database_url, Some(data_dir), false).await;
+    let client = server.client();
+    let worker = register_worker(&server, &client).await;
+    let release = signed_release(SterileCellRuntimeClass::KataMicrovm);
+    prepare(&server, &worker, SterileCellId::new(), release.clone()).await;
+    prepare(&server, &worker, SterileCellId::new(), release.clone()).await;
+    let mut legacy_request = serde_json::to_value(claim_request(release)).unwrap();
+    legacy_request.as_object_mut().unwrap().remove("claim_id");
+    let url = format!("{}/sterile-cells/claim", server.base_url);
+
+    let first: ClaimSterileCellResponseV1 = client
+        .post(&url)
+        .json(&legacy_request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let second: ClaimSterileCellResponseV1 = client
+        .post(&url)
+        .json(&legacy_request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let first_lease = first.lease.unwrap();
+    let second_lease = second.lease.unwrap();
+    assert_ne!(first_lease.cell_id, second_lease.cell_id);
+
+    let legacy_lookup: WorkerSterileCellLookupResponseV1 = worker_client(&worker)
+        .get(format!(
+            "{}/workers/{}/sterile-cells/{}",
+            server.base_url, worker.worker.id, first_lease.cell_id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(legacy_lookup.cell.state, SterileCellState::Leased);
+    assert!(legacy_lookup.claim.is_none());
+}
+
+#[tokio::test]
+async fn worker_lookup_recovers_non_secret_claim_locator_and_ready_retire_is_fenced() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("worker-recovery.db").display()
+    );
+    let server = TestServer::start_with_sterile_cells(database_url, Some(data_dir), false).await;
+    let client = server.client();
+    let worker = register_worker(&server, &client).await;
+    let release = signed_release(SterileCellRuntimeClass::KataMicrovm);
+    let ready_id = SterileCellId::new();
+    prepare(&server, &worker, ready_id, release.clone()).await;
+    let lookup_url = format!(
+        "{}/workers/{}/sterile-cells/{ready_id}",
+        server.base_url, worker.worker.id
+    );
+
+    let ready: WorkerSterileCellLookupResponseV1 = worker_client(&worker)
+        .get(&lookup_url)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ready.cell.state, SterileCellState::Ready);
+    assert!(ready.claim.is_none());
+
+    let retired: SterileCellResponseV1 = worker_client(&worker)
+        .post(format!("{lookup_url}/retire"))
+        .json(&RetireSterileCellRequestV1 { generation: 1 })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(retired.cell.state, SterileCellState::Quarantined);
+    assert_eq!(
+        retired.cell.disposition,
+        Some(SterileCellDisposition::Quarantined)
+    );
+    worker_client(&worker)
+        .post(format!("{lookup_url}/retire"))
+        .json(&RetireSterileCellRequestV1 { generation: 1 })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let claimed_id = SterileCellId::new();
+    prepare(&server, &worker, claimed_id, release.clone()).await;
+    let claim = claim_request(release);
+    let claimed: ClaimSterileCellResponseV1 = client
+        .post(format!("{}/sterile-cells/claim", server.base_url))
+        .json(&claim)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lease = claimed.lease.unwrap();
+    let response = worker_client(&worker)
+        .get(format!(
+            "{}/workers/{}/sterile-cells/{claimed_id}",
+            server.base_url, worker.worker.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let raw = response.text().await.unwrap();
+    assert!(!raw.contains("attestation"));
+    assert!(!raw.contains("sha256"));
+    let lookup: WorkerSterileCellLookupResponseV1 = serde_json::from_str(&raw).unwrap();
+    let locator = lookup.claim.unwrap();
+    assert_eq!(Some(locator.claim_id), claim.claim_id);
+    assert_eq!(locator.lease_id, lease.lease_id);
+    assert_eq!(locator.generation, lease.generation);
+    assert_eq!(locator.expires_at, lease.expires_at);
+
+    let stale_retire = worker_client(&worker)
+        .post(format!(
+            "{}/workers/{}/sterile-cells/{claimed_id}/retire",
+            server.base_url, worker.worker.id
+        ))
+        .json(&RetireSterileCellRequestV1 { generation: 1 })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale_retire.status(), StatusCode::CONFLICT);
+    let after: WorkerSterileCellLookupResponseV1 = worker_client(&worker)
+        .get(format!(
+            "{}/workers/{}/sterile-cells/{claimed_id}",
+            server.base_url, worker.worker.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after.cell.state, SterileCellState::Leased);
 }
 
 #[tokio::test]
@@ -524,7 +844,7 @@ async fn atomic_claim_works_over_postgres_when_configured() {
     let release = signed_release(SterileCellRuntimeClass::KataMicrovm);
     prepare(&server, &worker, SterileCellId::new(), release.clone()).await;
     let url = format!("{}/sterile-cells/claim", server.base_url);
-    let request = claim_request(release);
+    let request = claim_request(release.clone());
     let (left, right) = tokio::join!(
         client.post(&url).json(&request).send(),
         client.post(&url).json(&request).send()
@@ -543,8 +863,33 @@ async fn atomic_claim_works_over_postgres_when_configured() {
         .json::<ClaimSterileCellResponseV1>()
         .await
         .unwrap();
+    assert!(left.lease.is_some());
+    assert_eq!(left, right);
+
+    prepare(&server, &worker, SterileCellId::new(), release.clone()).await;
+    let first_request = claim_request(release.clone());
+    let second_request = claim_request(release);
+    let (left, right) = tokio::join!(
+        client.post(&url).json(&first_request).send(),
+        client.post(&url).json(&second_request).send()
+    );
+    let left = left
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<ClaimSterileCellResponseV1>()
+        .await
+        .unwrap();
+    let right = right
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<ClaimSterileCellResponseV1>()
+        .await
+        .unwrap();
     assert_eq!(
         usize::from(left.lease.is_some()) + usize::from(right.lease.is_some()),
-        1
+        1,
+        "distinct claim IDs still compete for one cell"
     );
 }

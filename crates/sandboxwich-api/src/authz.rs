@@ -72,6 +72,8 @@ const AUTHORIZATION_POLICY_RULES: &[&str] = &[
     "worker|heartbeat|/workers/*/heartbeat",
     "worker|drain|/workers/*/drain",
     "worker|prepare|/workers/*/sterile-cells/prepare",
+    "worker|read|/workers/*/sterile-cells/*",
+    "worker|retire|/workers/*/sterile-cells/*/retire",
     "worker|destroy|/workers/*/sterile-cells/*/destroy",
     "worker|read|/workers/*/runtime-resource-inventory",
     "worker|reconcile|/workers/*/runtime-resources/reconcile",
@@ -354,6 +356,8 @@ fn worker_route(path: &str) -> bool {
             || path.ends_with("/runtime-resources/reconcile")
             || path.ends_with("/guest-token")
             || path.ends_with("/sterile-cells/prepare")
+            || path_matches_template(path, "/workers/*/sterile-cells/*")
+            || (path.contains("/sterile-cells/") && path.ends_with("/retire"))
             || (path.contains("/sterile-cells/") && path.ends_with("/destroy"))
             || path.contains("/apex-instruction-callbacks/"))
 }
@@ -409,6 +413,8 @@ fn action(method: &str, path: &str) -> &'static str {
         "heartbeat"
     } else if path.ends_with("/drain") {
         "drain"
+    } else if path.ends_with("/retire") {
+        "retire"
     } else if path.ends_with("/claim") {
         "claim"
     } else if path.ends_with("/refresh") {
@@ -907,6 +913,8 @@ pub(crate) const AUTHORIZATION_ROUTE_MANIFEST: &[&str] = &[
     "/workers/*/heartbeat",
     "/workers/*/drain",
     "/workers/*/sterile-cells/prepare",
+    "/workers/*/sterile-cells/*",
+    "/workers/*/sterile-cells/*/retire",
     "/workers/*/sterile-cells/*/destroy",
     "/workers/*/runtime-resource-inventory",
     "/workers/*/runtime-resources/reconcile",

@@ -147,6 +147,14 @@ async fn openapi_covers_every_public_v1_operation() {
             "/v1/workers/{worker_id}/sterile-cells/prepare",
         ),
         (
+            "GET",
+            "/v1/workers/{worker_id}/sterile-cells/{cell_id}",
+        ),
+        (
+            "POST",
+            "/v1/workers/{worker_id}/sterile-cells/{cell_id}/retire",
+        ),
+        (
             "POST",
             "/v1/workers/{worker_id}/sterile-cells/{cell_id}/destroy",
         ),

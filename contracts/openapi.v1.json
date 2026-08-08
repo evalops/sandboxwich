@@ -93,6 +93,14 @@
       },
       "ClaimSterileCellRequestV1": {
         "properties": {
+          "claim_id": {
+            "description": "Client-generated idempotency fence. New controllers should always set\nthis; omission preserves the original V1 one-shot claim behavior.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "lease_seconds": {
             "format": "int64",
             "minimum": 0,
@@ -2227,6 +2235,19 @@
         ],
         "type": "string"
       },
+      "RetireSterileCellRequestV1": {
+        "properties": {
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "generation"
+        ],
+        "type": "object"
+      },
       "RuntimeResourceKind": {
         "enum": [
           "pod",
@@ -2834,6 +2855,35 @@
         ],
         "type": "string"
       },
+      "SterileCellClaimLocatorV1": {
+        "description": "Non-secret locator returned only to the worker that owns a sterile cell.\nThe raw lease attestation and its stored digest are deliberately absent.",
+        "properties": {
+          "claim_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lease_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "claim_id",
+          "lease_id",
+          "generation",
+          "expires_at"
+        ],
+        "type": "object"
+      },
       "SterileCellDisposition": {
         "enum": [
           "destroyed",
@@ -3176,6 +3226,31 @@
           "apex_trusted_supervisor_v1"
         ],
         "type": "string"
+      },
+      "WorkerSterileCellLookupResponseV1": {
+        "properties": {
+          "cell": {
+            "$ref": "#/components/schemas/SterileCellV1"
+          },
+          "claim": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SterileCellClaimLocatorV1"
+              }
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "cell"
+        ],
+        "type": "object"
       },
       "WorkspaceMode": {
         "enum": [
@@ -5312,6 +5387,66 @@
         ]
       }
     },
+    "/v1/workers/{worker_id}/sterile-cells/{cell_id}": {
+      "get": {
+        "operationId": "get_worker_sterile_cell",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "worker_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "cell_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerSterileCellLookupResponseV1"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::sterile_cells"
+        ]
+      }
+    },
     "/v1/workers/{worker_id}/sterile-cells/{cell_id}/destroy": {
       "post": {
         "operationId": "destroy_sterile_cell",
@@ -5351,6 +5486,86 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/SterileCellResponseV1"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "crate::handlers::sterile_cells"
+        ]
+      }
+    },
+    "/v1/workers/{worker_id}/sterile-cells/{cell_id}/retire": {
+      "post": {
+        "operationId": "retire_ready_sterile_cell",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "worker_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "cell_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetireSterileCellRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SterileCellResponseV1"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
             },
