@@ -16,6 +16,8 @@ mod commands;
 mod common;
 #[path = "http_contract/desktop.rs"]
 mod desktop;
+#[path = "http_contract/drain_receipts.rs"]
+mod drain_receipts;
 #[path = "http_contract/divergence.rs"]
 mod divergence;
 #[path = "http_contract/homes.rs"]
