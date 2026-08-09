@@ -144,6 +144,33 @@ async fn connect_database(database_url: &str) -> sqlx::AnyPool {
 }
 
 #[tokio::test]
+async fn legacy_bodyless_drain_remains_rollout_compatible() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("legacy-drain.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let worker = register_worker(&server, "legacy-drain-worker").await;
+
+    let response: WorkerResponse = worker_client(&worker)
+        .post(format!(
+            "{}/workers/{}/drain",
+            server.base_url, worker.worker.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(response.worker.status, WorkerStatus::Draining);
+}
+
+#[tokio::test]
 async fn drain_receipt_is_idempotent_and_captures_exact_active_leases() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!("sqlite://{}", data_dir.path().join("receipt.db").display());
