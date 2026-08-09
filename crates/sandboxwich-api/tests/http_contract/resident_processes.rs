@@ -2445,6 +2445,33 @@ async fn run_terminal_resident_replacement_contract(server: TestServer) {
         vec!["/usr/local/bin/orb-executor-v2"]
     );
     assert!(!body.contains("generation-two-secret"));
+
+    mark_resident_terminal_failed(&server, replaced.resident_process.id).await;
+    let mut bootstrapless = resident_process_request(
+        "/usr/local/bin/orb-executor-v3",
+        b"unused",
+        "/run/sandboxwich/bootstrap/orb-token",
+    );
+    bootstrapless.expected_generation = replaced.resident_process.generation;
+    bootstrapless.replace_terminal = true;
+    bootstrapless.bootstrap = None;
+    let bootstrapless: ResidentProcessResponse = client
+        .put(&url)
+        .header(
+            "Idempotency-Key",
+            "terminal-resident-generation-3-no-bootstrap",
+        )
+        .json(&bootstrapless)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(bootstrapless.resident_process.generation, 3);
+    assert!(bootstrapless.resident_process.bootstrap_sha256.is_none());
 }
 
 #[tokio::test]

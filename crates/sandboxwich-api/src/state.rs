@@ -289,17 +289,53 @@ impl ResidentBootstrapStore {
         &self,
         bootstrap: LiveResidentBootstrap,
     ) -> Result<ResidentBootstrapReservation, ()> {
+        self.reserve_inner(bootstrap, None)
+    }
+
+    pub(crate) fn reserve_replacement(
+        &self,
+        bootstrap: LiveResidentBootstrap,
+        id: ResidentProcessId,
+        expected_generation: u64,
+    ) -> Result<ResidentBootstrapReservation, ()> {
+        self.reserve_inner(bootstrap, Some((id, expected_generation)))
+    }
+
+    fn reserve_inner(
+        &self,
+        bootstrap: LiveResidentBootstrap,
+        replacement: Option<(ResidentProcessId, u64)>,
+    ) -> Result<ResidentBootstrapReservation, ()> {
         let mut inner = self
             .inner
             .lock()
             .expect("resident bootstrap mutex poisoned");
-        if inner.values.len() + inner.reserved >= inner.capacity {
+        let replaces_local_entry = match replacement {
+            Some((id, expected_generation)) => match inner.values.get(&id) {
+                Some(entry)
+                    if entry.generation() == expected_generation
+                        && entry.tenant_id() == bootstrap.tenant_id =>
+                {
+                    true
+                }
+                Some(_) => return Err(()),
+                None => false,
+            },
+            None => false,
+        };
+        if inner.values.len() + inner.reserved - usize::from(replaces_local_entry) >= inner.capacity
+        {
             return Err(());
         }
         let tenant_entries = inner
             .values
-            .values()
-            .filter(|entry| entry.tenant_id() == bootstrap.tenant_id)
+            .iter()
+            .filter(|(id, entry)| {
+                entry.tenant_id() == bootstrap.tenant_id
+                    && !replacement.is_some_and(|(replacement_id, _)| {
+                        replaces_local_entry && **id == replacement_id
+                    })
+            })
             .count();
         let tenant_reservations = inner
             .reserved_by_tenant
@@ -460,6 +496,23 @@ impl ResidentBootstrapStore {
                 true
             }
             _ => false,
+        }
+    }
+
+    pub(crate) fn discard_generation(&self, id: &ResidentProcessId, generation: u64) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("resident bootstrap mutex poisoned");
+        if inner
+            .values
+            .get(id)
+            .is_some_and(|entry| entry.generation() == generation)
+        {
+            inner.values.remove(id);
+            true
+        } else {
+            false
         }
     }
 }
@@ -734,6 +787,36 @@ mod tests {
             store
                 .begin_delivery(&id, resident_bootstrap_fence(Uuid::now_v7()))
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn resident_bootstrap_replacement_reuses_the_predecessor_capacity_slot() {
+        let store = ResidentBootstrapStore::with_capacity(1);
+        let id = ResidentProcessId::new();
+        store
+            .reserve(resident_bootstrap("tenant-a", 1))
+            .unwrap()
+            .publish(id);
+
+        let replacement = store
+            .reserve_replacement(resident_bootstrap("tenant-a", 2), id, 1)
+            .expect("the exact successor must reuse its predecessor's bounded slot");
+        replacement.publish_replacement(id, 1);
+        assert_eq!(
+            store
+                .begin_delivery(
+                    &id,
+                    ResidentBootstrapFence {
+                        generation: 2,
+                        lease_id: Uuid::now_v7(),
+                        sha256: "digest".into(),
+                    },
+                )
+                .unwrap()
+                .bootstrap()
+                .generation,
+            2
         );
     }
 

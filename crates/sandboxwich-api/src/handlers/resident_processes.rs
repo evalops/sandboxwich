@@ -1206,8 +1206,8 @@ pub(crate) async fn put_resident_process(
     }
 
     let sterile_activation = request.sterile_activation.take();
-    let bootstrap_reservation = match request.bootstrap.take() {
-        Some(bootstrap) => Some(state.resident_bootstraps.reserve(LiveResidentBootstrap {
+    let reserve_bootstrap = |bootstrap: ResidentProcessBootstrap| {
+        let bootstrap = LiveResidentBootstrap {
             tenant_id: process.tenant_id.clone(),
             content: bootstrap.content,
             sha256: bootstrap_digest.clone().unwrap_or_default(),
@@ -1215,7 +1215,18 @@ pub(crate) async fn put_resident_process(
             mode: bootstrap.mode,
             generation: process.generation,
             sterile_activation: sterile_activation.clone(),
-        })),
+        };
+        match replacement.as_ref() {
+            Some(current) => state.resident_bootstraps.reserve_replacement(
+                bootstrap,
+                process.id,
+                current.generation,
+            ),
+            None => state.resident_bootstraps.reserve(bootstrap),
+        }
+    };
+    let bootstrap_reservation = match request.bootstrap.take() {
+        Some(bootstrap) => Some(reserve_bootstrap(bootstrap)),
         None => sterile_activation.clone().map(|activation| {
             state.resident_bootstraps.reserve(LiveResidentBootstrap {
                 tenant_id: process.tenant_id.clone(),
@@ -1384,12 +1395,19 @@ pub(crate) async fn put_resident_process(
     }
     drop(handoff_bootstrap);
     tx.commit().await?;
-    if let Some(reservation) = bootstrap_reservation {
-        if let Some(current) = replacement.as_ref() {
+    match (bootstrap_reservation, replacement.as_ref()) {
+        (Some(reservation), Some(current)) => {
             reservation.publish_replacement(process.id, current.generation);
-        } else {
+        }
+        (Some(reservation), None) => {
             reservation.publish(process.id);
         }
+        (None, Some(current)) => {
+            state
+                .resident_bootstraps
+                .discard_generation(&process.id, current.generation);
+        }
+        (None, None) => {}
     }
 
     let process_id = process.id.0;
