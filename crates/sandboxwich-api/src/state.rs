@@ -539,18 +539,27 @@ impl ResidentBootstrapReservation {
     }
 
     pub(crate) fn publish(mut self, id: ResidentProcessId) {
-        self.publish_inner(id, None);
+        let published = self.publish_inner(id, None);
+        debug_assert!(published.is_ok(), "resident bootstrap published twice");
     }
 
     /// Publishes a bootstrap for the successor generation of an existing
     /// terminal resident. The durable generation CAS has already committed,
     /// so only the exact predecessor may be displaced from process-local
     /// delivery state.
-    pub(crate) fn publish_replacement(mut self, id: ResidentProcessId, expected_generation: u64) {
-        self.publish_inner(id, Some(expected_generation));
+    pub(crate) fn publish_replacement(
+        mut self,
+        id: ResidentProcessId,
+        expected_generation: u64,
+    ) -> Result<(), ()> {
+        self.publish_inner(id, Some(expected_generation))
     }
 
-    fn publish_inner(&mut self, id: ResidentProcessId, replaced_generation: Option<u64>) {
+    fn publish_inner(
+        &mut self,
+        id: ResidentProcessId,
+        replaced_generation: Option<u64>,
+    ) -> Result<(), ()> {
         let bootstrap = self
             .bootstrap
             .take()
@@ -569,18 +578,17 @@ impl ResidentBootstrapReservation {
         if *reservations == 0 {
             inner.reserved_by_tenant.remove(&bootstrap.tenant_id);
         }
-        let previous = inner
+        match (inner.values.get(&id), replaced_generation) {
+            (Some(previous), Some(expected)) if previous.generation() != expected => {
+                return Err(());
+            }
+            (Some(_), None) => return Err(()),
+            _ => {}
+        }
+        inner
             .values
             .insert(id, ResidentBootstrapEntry::Ready(bootstrap));
-        match (previous.as_ref(), replaced_generation) {
-            (None, _) => {}
-            (Some(previous), Some(expected)) => debug_assert_eq!(
-                previous.generation(),
-                expected,
-                "resident bootstrap replacement displaced the wrong generation"
-            ),
-            (Some(_), None) => debug_assert!(false, "resident bootstrap published twice"),
-        }
+        Ok(())
     }
 }
 
@@ -634,6 +642,13 @@ impl ResidentBootstrapDelivery {
             .inner
             .lock()
             .expect("resident bootstrap mutex poisoned");
+        let exact_delivery = matches!(
+            inner.values.get(&self.id),
+            Some(ResidentBootstrapEntry::InFlight { fence, .. }) if *fence == self.fence
+        );
+        if !exact_delivery {
+            return Err(ResidentBootstrapDeliveryError::Unavailable);
+        }
         let previous = inner.values.remove(&self.id);
         let acknowledged = matches!(
             &previous,
@@ -642,10 +657,6 @@ impl ResidentBootstrapDelivery {
                 ..
             })
         );
-        debug_assert!(matches!(
-            &previous,
-            Some(ResidentBootstrapEntry::InFlight { .. })
-        ));
         if !acknowledged {
             inner.values.insert(
                 self.id,
@@ -668,6 +679,13 @@ impl Drop for ResidentBootstrapDelivery {
                 .inner
                 .lock()
                 .expect("resident bootstrap mutex poisoned");
+            let exact_delivery = matches!(
+                inner.values.get(&self.id),
+                Some(ResidentBootstrapEntry::InFlight { fence, .. }) if *fence == self.fence
+            );
+            if !exact_delivery {
+                return;
+            }
             let previous = inner.values.remove(&self.id);
             let acknowledged = matches!(
                 &previous,
@@ -676,10 +694,6 @@ impl Drop for ResidentBootstrapDelivery {
                     ..
                 })
             );
-            debug_assert!(matches!(
-                &previous,
-                Some(ResidentBootstrapEntry::InFlight { .. })
-            ));
             if acknowledged {
                 return;
             }
@@ -802,7 +816,7 @@ mod tests {
         let replacement = store
             .reserve_replacement(resident_bootstrap("tenant-a", 2), id, 1)
             .expect("the exact successor must reuse its predecessor's bounded slot");
-        replacement.publish_replacement(id, 1);
+        replacement.publish_replacement(id, 1).unwrap();
         assert_eq!(
             store
                 .begin_delivery(
@@ -818,6 +832,117 @@ mod tests {
                 .generation,
             2
         );
+    }
+
+    #[test]
+    fn stale_delivery_drop_cannot_restore_a_replaced_bootstrap_generation() {
+        let store = ResidentBootstrapStore::with_capacity(2);
+        let id = ResidentProcessId::new();
+        store
+            .reserve(resident_bootstrap("tenant-a", 1))
+            .unwrap()
+            .publish(id);
+        let stale_delivery = store
+            .begin_delivery(
+                &id,
+                ResidentBootstrapFence {
+                    generation: 1,
+                    lease_id: Uuid::now_v7(),
+                    sha256: "digest".into(),
+                },
+            )
+            .unwrap();
+        store
+            .reserve_replacement(resident_bootstrap("tenant-a", 2), id, 1)
+            .unwrap()
+            .publish_replacement(id, 1)
+            .unwrap();
+
+        drop(stale_delivery);
+
+        let successor = store
+            .begin_delivery(
+                &id,
+                ResidentBootstrapFence {
+                    generation: 2,
+                    lease_id: Uuid::now_v7(),
+                    sha256: "digest".into(),
+                },
+            )
+            .expect("stale delivery drop must not erase the successor");
+        assert_eq!(successor.bootstrap().generation, 2);
+    }
+
+    #[test]
+    fn stale_delivery_completion_cannot_erase_a_replaced_bootstrap_generation() {
+        let store = ResidentBootstrapStore::with_capacity(2);
+        let id = ResidentProcessId::new();
+        store
+            .reserve(resident_bootstrap("tenant-a", 1))
+            .unwrap()
+            .publish(id);
+        let stale_delivery = store
+            .begin_delivery(
+                &id,
+                ResidentBootstrapFence {
+                    generation: 1,
+                    lease_id: Uuid::now_v7(),
+                    sha256: "digest".into(),
+                },
+            )
+            .unwrap();
+        store
+            .reserve_replacement(resident_bootstrap("tenant-a", 2), id, 1)
+            .unwrap()
+            .publish_replacement(id, 1)
+            .unwrap();
+
+        assert!(matches!(
+            stale_delivery.mark_delivered(),
+            Err(ResidentBootstrapDeliveryError::Unavailable)
+        ));
+        let successor = store
+            .begin_delivery(
+                &id,
+                ResidentBootstrapFence {
+                    generation: 2,
+                    lease_id: Uuid::now_v7(),
+                    sha256: "digest".into(),
+                },
+            )
+            .expect("stale delivery completion must not erase the successor");
+        assert_eq!(successor.bootstrap().generation, 2);
+    }
+
+    #[test]
+    fn stale_replacement_publish_cannot_displace_a_newer_local_generation() {
+        let store = ResidentBootstrapStore::with_capacity(6);
+        let id = ResidentProcessId::new();
+        store
+            .reserve(resident_bootstrap("tenant-a", 1))
+            .unwrap()
+            .publish(id);
+        let stale_replacement = store
+            .reserve_replacement(resident_bootstrap("tenant-a", 2), id, 1)
+            .unwrap();
+        assert!(store.discard_generation(&id, 1));
+        store
+            .reserve(resident_bootstrap("tenant-a", 3))
+            .unwrap()
+            .publish(id);
+
+        assert!(stale_replacement.publish_replacement(id, 1).is_err());
+        let current = store
+            .begin_delivery(
+                &id,
+                ResidentBootstrapFence {
+                    generation: 3,
+                    lease_id: Uuid::now_v7(),
+                    sha256: "digest".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(current.bootstrap().generation, 3);
     }
 
     #[test]

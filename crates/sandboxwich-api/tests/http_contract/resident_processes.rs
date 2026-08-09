@@ -2446,6 +2446,24 @@ async fn run_terminal_resident_replacement_contract(server: TestServer) {
     );
     assert!(!body.contains("generation-two-secret"));
 
+    let replay_after_response_loss: ResidentProcessResponse = client
+        .put(&url)
+        .header(
+            "Idempotency-Key",
+            "terminal-resident-generation-2-response-loss-replay",
+        )
+        .json(&replacement)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .expect("the exact predecessor-fenced replacement must replay after its CAS committed")
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replay_after_response_loss.resident_process.generation, 2);
+    assert!(replay_after_response_loss.operation.is_none());
+
     mark_resident_terminal_failed(&server, replaced.resident_process.id).await;
     let mut bootstrapless = resident_process_request(
         "/usr/local/bin/orb-executor-v3",

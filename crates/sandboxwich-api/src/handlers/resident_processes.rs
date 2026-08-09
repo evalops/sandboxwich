@@ -1010,13 +1010,14 @@ pub(crate) async fn put_resident_process(
                 "the existing orb-sidecar predates supported provider isolation and cannot be reused",
             ));
         }
-        if request.expected_generation != current.generation {
-            return Err(ApiError::conflict_code(
-                "resident_process_generation_conflict",
-                "resident process generation changed",
-            ));
-        }
-        if same_spec(&current, &request, bootstrap_digest.as_deref()) {
+        let same_spec = same_spec(&current, &request, bootstrap_digest.as_deref());
+        let exact_replay = request.expected_generation == current.generation
+            || (request.replace_terminal
+                && request
+                    .expected_generation
+                    .checked_add(1)
+                    .is_some_and(|generation| generation == current.generation));
+        if same_spec && exact_replay {
             if let Some(activation) = request.sterile_activation.as_ref() {
                 validate_sterile_resident_activation_replay(
                     &state.db,
@@ -1035,6 +1036,12 @@ pub(crate) async fn put_resident_process(
                     resident_process: current,
                     operation: None,
                 }),
+            ));
+        }
+        if request.expected_generation != current.generation {
+            return Err(ApiError::conflict_code(
+                "resident_process_generation_conflict",
+                "resident process generation changed",
             ));
         }
         if !request.replace_terminal {
@@ -1397,7 +1404,16 @@ pub(crate) async fn put_resident_process(
     tx.commit().await?;
     match (bootstrap_reservation, replacement.as_ref()) {
         (Some(reservation), Some(current)) => {
-            reservation.publish_replacement(process.id, current.generation);
+            if reservation
+                .publish_replacement(process.id, current.generation)
+                .is_err()
+            {
+                tracing::error!(
+                    resident_process_id = %process.id,
+                    generation = process.generation,
+                    "durable resident replacement could not publish its process-local bootstrap"
+                );
+            }
         }
         (Some(reservation), None) => {
             reservation.publish(process.id);
