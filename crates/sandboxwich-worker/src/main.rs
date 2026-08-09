@@ -1887,6 +1887,134 @@ async fn drain_worker(
     Ok(())
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerDrainRequest {
+    shutdown_id: Uuid,
+    hard_deadline: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerDrainLeaseFence {
+    lease_id: sandboxwich_core::LeaseId,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerDrainReceipt {
+    shutdown_id: Uuid,
+    worker_id: sandboxwich_core::WorkerId,
+    hard_deadline: chrono::DateTime<chrono::Utc>,
+    leases: Vec<WorkerDrainLeaseFence>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerDrainResponse {
+    drain_receipt: WorkerDrainReceipt,
+}
+
+#[derive(Clone)]
+struct ShutdownPlan {
+    request: WorkerDrainRequest,
+    deadline: Instant,
+}
+
+#[derive(Clone)]
+struct ShutdownState {
+    plan: Arc<std::sync::OnceLock<ShutdownPlan>>,
+    plan_ready: Arc<tokio::sync::Notify>,
+    drain_timeout: Duration,
+}
+
+impl ShutdownState {
+    fn new(drain_timeout: Duration) -> Self {
+        Self {
+            plan: Arc::new(std::sync::OnceLock::new()),
+            plan_ready: Arc::new(tokio::sync::Notify::new()),
+            drain_timeout,
+        }
+    }
+
+    fn request_now(&self) -> ShutdownPlan {
+        let plan = self
+            .plan
+            .get_or_init(|| ShutdownPlan {
+                request: WorkerDrainRequest {
+                    shutdown_id: Uuid::now_v7(),
+                    hard_deadline: chrono::Utc::now()
+                        + chrono::Duration::from_std(self.drain_timeout)
+                            .expect("bounded worker drain timeout converts to chrono"),
+                },
+                deadline: Instant::now() + self.drain_timeout,
+            })
+            .clone();
+        self.plan_ready.notify_waiters();
+        plan
+    }
+
+    fn is_requested(&self) -> bool {
+        self.plan.get().is_some()
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.plan.get().map(|plan| plan.deadline)
+    }
+
+    async fn wait_for_plan(&self) -> ShutdownPlan {
+        loop {
+            let notified = self.plan_ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(plan) = self.plan.get() {
+                return plan.clone();
+            }
+            notified.await;
+        }
+    }
+}
+
+async fn publish_worker_drain_receipt(
+    client: &reqwest::Client,
+    api: &str,
+    worker_id: Uuid,
+    request: &WorkerDrainRequest,
+) -> Result<WorkerDrainReceipt, WorkerRequestError> {
+    let response = client
+        .post(format!("{api}/workers/{worker_id}/drain"))
+        .json(request)
+        .send()
+        .await?;
+    Ok(decode_json::<WorkerDrainResponse>(response)
+        .await?
+        .drain_receipt)
+}
+
+fn validate_worker_drain_receipt(
+    plan: &ShutdownPlan,
+    worker_id: Uuid,
+    receipt: WorkerDrainReceipt,
+) -> anyhow::Result<std::collections::HashSet<sandboxwich_core::LeaseId>> {
+    anyhow::ensure!(
+        receipt.shutdown_id == plan.request.shutdown_id,
+        "drain receipt shutdown id does not match the signal-owned request"
+    );
+    anyhow::ensure!(
+        receipt.worker_id.0 == worker_id,
+        "drain receipt worker id does not match this worker"
+    );
+    anyhow::ensure!(
+        receipt.hard_deadline == plan.request.hard_deadline,
+        "drain receipt deadline does not match the signal-owned deadline"
+    );
+    Ok(receipt
+        .leases
+        .into_iter()
+        .map(|fence| fence.lease_id)
+        .collect())
+}
+
 /// Maximum number of attempts (including the first) for a single bounded retry
 /// around a control-plane API call.
 const API_RETRY_ATTEMPTS: u32 = 5;
@@ -1900,6 +2028,8 @@ const MIN_RENEW_INTERVAL: Duration = Duration::from_secs(5);
 /// after a shutdown signal before giving up and exiting anyway (see
 /// `wait_for_shutdown_signal` and the `--drain-timeout-secs` flag).
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 300;
+const MIN_DURABLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_DURABLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// Keep a bounded tail of the existing drain timeout for cancelling a resident
 /// process and acknowledging its retryable lease release. The deployment grace
 /// period must not be the mechanism that releases fenced authority.
@@ -1922,6 +2052,27 @@ const MAX_RESIDENT_PROVIDER_ATTEMPTS: u32 = 30;
 // Starting/Running. Poll observations aggressively so the first validate
 // succeeds as soon as the Pod identity is known.
 const RESIDENT_OBSERVATION_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+fn durable_drain_timeout(configured_secs: u64) -> Duration {
+    Duration::from_secs(configured_secs).clamp(MIN_DURABLE_DRAIN_TIMEOUT, MAX_DURABLE_DRAIN_TIMEOUT)
+}
+
+fn resident_shutdown_release_budget(drain_timeout: Duration) -> Duration {
+    (drain_timeout / 10).min(MAX_RESIDENT_SHUTDOWN_RELEASE_BUDGET)
+}
+
+fn resident_shutdown_graceful_deadline(deadline: Instant, release_budget: Duration) -> Instant {
+    deadline.checked_sub(release_budget).unwrap_or(deadline)
+}
+
+async fn complete_before_shutdown_deadline<F: Future>(
+    deadline: Instant,
+    future: F,
+) -> Option<F::Output> {
+    tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), future)
+        .await
+        .ok()
+}
 
 async fn release_claimed_lease_for_shutdown(
     client: &reqwest::Client,
@@ -1958,52 +2109,6 @@ async fn release_claimed_lease_for_shutdown(
     .await
     .context("shutdown-raced lease release exceeded the shutdown deadline")?
     .with_context(|| format!("failed to release shutdown-raced lease {lease_id}"))
-}
-
-#[derive(Clone)]
-struct ShutdownState {
-    requested: Arc<std::sync::atomic::AtomicBool>,
-    deadline: Arc<std::sync::OnceLock<Instant>>,
-    deadline_ready: Arc<tokio::sync::Notify>,
-    drain_timeout: Duration,
-}
-
-impl ShutdownState {
-    fn new(drain_timeout: Duration) -> Self {
-        Self {
-            requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            deadline: Arc::new(std::sync::OnceLock::new()),
-            deadline_ready: Arc::new(tokio::sync::Notify::new()),
-            drain_timeout,
-        }
-    }
-
-    fn request_now(&self) {
-        let _ = self.deadline.set(Instant::now() + self.drain_timeout);
-        self.requested
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.deadline_ready.notify_waiters();
-    }
-
-    fn is_requested(&self) -> bool {
-        self.requested.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    fn deadline(&self) -> Option<Instant> {
-        self.deadline.get().copied()
-    }
-
-    async fn wait_for_deadline(&self) -> Instant {
-        loop {
-            let notified = self.deadline_ready.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if let Some(deadline) = self.deadline() {
-                return deadline;
-            }
-            notified.await;
-        }
-    }
 }
 
 async fn admit_or_release_claimed_work<T, Release, ReleaseFuture>(
@@ -2133,35 +2238,6 @@ async fn drain_resident_tasks_to_channel_until_deadline<T: 'static>(
         forced_release,
         timed_out: !tasks.is_empty(),
     }
-}
-
-fn resident_shutdown_release_budget(drain_timeout: Duration) -> Duration {
-    (drain_timeout / 10).min(MAX_RESIDENT_SHUTDOWN_RELEASE_BUDGET)
-}
-
-fn resident_shutdown_graceful_deadline(deadline: Instant, release_budget: Duration) -> Instant {
-    deadline.checked_sub(release_budget).unwrap_or(deadline)
-}
-
-async fn complete_before_shutdown_deadline<F: Future>(
-    deadline: Instant,
-    future: F,
-) -> Option<F::Output> {
-    tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), future)
-        .await
-        .ok()
-}
-
-async fn run_when_shutdown_requested<Operation, OperationFuture>(
-    shutdown: ShutdownState,
-    operation: Operation,
-) -> Option<OperationFuture::Output>
-where
-    Operation: FnOnce() -> OperationFuture,
-    OperationFuture: Future,
-{
-    let deadline = shutdown.wait_for_deadline().await;
-    complete_before_shutdown_deadline(deadline, operation()).await
 }
 
 impl LeaseCancellation {
@@ -2431,9 +2507,8 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
-/// Spawns a background task that records one absolute shutdown deadline when a
-/// signal arrives. Every in-flight and post-loop drain phase consumes that same
-/// budget instead of restarting the timeout after finishing other work.
+/// Spawns a background task that records one durable drain tuple and absolute
+/// deadline at the shutdown signal.
 fn spawn_shutdown_listener(drain_timeout: Duration) -> ShutdownState {
     let shutdown = ShutdownState::new(drain_timeout);
     let signal_state = shutdown.clone();
@@ -2461,12 +2536,11 @@ async fn sleep_or_shutdown(duration: Duration, shutdown: &ShutdownState) {
     }
 }
 
-/// Resolves at the graceful cutoff before the absolute shutdown deadline.
-/// Raced against an in-flight lease so resident cancellation and fenced release
-/// retain their reserved tail of the original drain budget.
+/// Resolves at the graceful cutoff, preserving the tail of the signal-owned
+/// deadline for fenced resident cancellation and reconciliation.
 async fn drain_watchdog(shutdown: ShutdownState, release_budget: Duration) {
-    let deadline = shutdown.wait_for_deadline().await;
-    let graceful_deadline = resident_shutdown_graceful_deadline(deadline, release_budget);
+    let plan = shutdown.wait_for_plan().await;
+    let graceful_deadline = resident_shutdown_graceful_deadline(plan.deadline, release_budget);
     tokio::time::sleep(graceful_deadline.saturating_duration_since(Instant::now())).await;
 }
 
@@ -2602,7 +2676,7 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
     let ordinary_slots = max_concurrent_jobs.saturating_sub(1).max(1);
     let provider = Arc::new(runtime_provider_from_args(args.provider)?);
     let labels: BTreeMap<_, _> = args.label.into_iter().collect();
-    let drain_timeout = Duration::from_secs(args.drain_timeout_secs);
+    let drain_timeout = durable_drain_timeout(args.drain_timeout_secs);
     let resident_release_budget = resident_shutdown_release_budget(drain_timeout);
     let shutdown = spawn_shutdown_listener(drain_timeout);
     let mut iterations = 0_u64;
@@ -2615,18 +2689,25 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
         anyhow::Result<LeaseResponse>,
     )> = tokio::task::JoinSet::new();
     let worker_id = args.worker_id;
-    let drain_fence_client = client.clone();
-    let drain_fence_api = api.to_string();
-    let drain_fence_shutdown = shutdown.clone();
-    let drain_fence_task = tokio::spawn(run_when_shutdown_requested(
-        drain_fence_shutdown,
-        move || async move {
-            with_retries("mark worker draining", API_RETRY_ATTEMPTS, || {
-                drain_worker(&drain_fence_client, &drain_fence_api, worker_id)
-            })
-            .await
-        },
-    ));
+    let drain_receipt_client = client.clone();
+    let drain_receipt_api = api.to_string();
+    let drain_receipt_shutdown = shutdown.clone();
+    let drain_receipt_task = tokio::spawn(async move {
+        let plan = drain_receipt_shutdown.wait_for_plan().await;
+        let request = plan.request.clone();
+        complete_before_shutdown_deadline(
+            plan.deadline,
+            with_retries("publish worker drain receipt", API_RETRY_ATTEMPTS, || {
+                publish_worker_drain_receipt(
+                    &drain_receipt_client,
+                    &drain_receipt_api,
+                    worker_id,
+                    &request,
+                )
+            }),
+        )
+        .await
+    });
 
     // Independent heartbeat so a long provision cannot starve liveness and a
     // heartbeat failure cannot skip claim for an entire iteration.
@@ -2970,8 +3051,9 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
         };
         let Some(outcome) = outcome else {
             eprintln!(
-                "warning: lease {lease_id} did not finish before the resident release phase; \
-                 exiting the work loop (the lease will expire and be reclaimed by another worker)"
+                "warning: lease {lease_id} did not finish within the {drain_timeout:?} drain \
+                 timeout after shutdown was requested; exiting anyway (the lease will expire and \
+                 be reclaimed by another worker)"
             );
             break;
         };
@@ -2996,29 +3078,45 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
     }
 
     heartbeat_task.abort();
-    if !shutdown.is_requested() {
-        shutdown.request_now();
-    }
-    let shutdown_deadline = shutdown
-        .deadline()
-        .expect("shutdown request records its deadline");
-
-    // The admission fence started at the signal. Await it concurrently with
-    // local drain work so a slow API retry cannot consume the resident release
-    // budget by itself.
-    let finish_drain_fence = async {
-        match drain_fence_task.await {
-            Ok(Some(Ok(()))) => {}
+    let shutdown_plan = shutdown.request_now();
+    let resident_authority = resident_tasks_by_id
+        .values()
+        .map(|metadata| (metadata.lease_id, metadata.cancellation.clone()))
+        .collect::<Vec<_>>();
+    let finish_drain_receipt = async {
+        let captured_lease_ids = match drain_receipt_task.await {
+            Ok(Some(Ok(receipt))) => {
+                match validate_worker_drain_receipt(&shutdown_plan, worker_id, receipt) {
+                    Ok(captured) => Some(captured),
+                    Err(error) => {
+                        eprintln!("warning: rejected mismatched worker drain receipt: {error:#}");
+                        None
+                    }
+                }
+            }
             Ok(Some(Err(error))) => {
-                eprintln!("warning: failed to mark worker draining before drain: {error:#}")
+                eprintln!("warning: failed to publish worker drain receipt: {error:#}");
+                None
             }
             Ok(None) => {
-                eprintln!("warning: marking worker draining exceeded the shutdown deadline")
+                eprintln!(
+                    "warning: worker drain receipt publication exceeded the shutdown deadline"
+                );
+                None
             }
-            Err(error) => eprintln!("warning: worker drain fence task failed: {error}"),
+            Err(error) => {
+                eprintln!("warning: worker drain receipt task failed: {error}");
+                None
+            }
+        };
+        if let Some(captured_lease_ids) = captured_lease_ids.as_ref() {
+            for (lease_id, cancellation) in resident_authority {
+                if !captured_lease_ids.contains(&lease_id) {
+                    cancellation.cancel(LeaseCancellationReason::LeaseLost);
+                }
+            }
         }
     };
-
     let resident_cancellations = resident_tasks_by_id
         .iter()
         .map(|(task_id, metadata)| (*task_id, metadata.cancellation.clone()))
@@ -3027,14 +3125,14 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
     let drain_residents = drain_resident_tasks_to_channel_until_deadline(
         &mut resident_tasks,
         &resident_cancellations,
-        shutdown_deadline,
+        shutdown_plan.deadline,
         resident_release_budget,
         resident_result_tx,
     );
     let reconcile_residents = async {
         while let Some(result) = resident_result_rx.recv().await {
             if complete_before_shutdown_deadline(
-                shutdown_deadline,
+                shutdown_plan.deadline,
                 reconcile_resident_task_result(
                     client,
                     api,
@@ -3052,9 +3150,9 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
         false
     };
     let ((), resident_drain, resident_reconciliation_timed_out) =
-        tokio::join!(finish_drain_fence, drain_residents, reconcile_residents);
+        tokio::join!(finish_drain_receipt, drain_residents, reconcile_residents);
     if resident_drain.forced_release {
-        eprintln!("worker: provider-isolated resident leases reached the fenced release phase");
+        eprintln!("worker: provider-isolated resident leases reached fenced release");
     }
     if resident_drain.timed_out || resident_reconciliation_timed_out {
         eprintln!("warning: provider-isolated resident leases exceeded the drain deadline");
@@ -3067,7 +3165,9 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
         }
     };
     if tokio::time::timeout(
-        shutdown_deadline.saturating_duration_since(Instant::now()),
+        shutdown_plan
+            .deadline
+            .saturating_duration_since(Instant::now()),
         drain_ordinary,
     )
     .await
