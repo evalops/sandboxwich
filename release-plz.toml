@@ -5,7 +5,10 @@
 # and cargo publish is always skipped.
 [workspace]
 repo_url = "https://github.com/evalops/sandboxwich"
-git_only = true
+# Only sandboxwich-core owns the shared git tag. Keeping git-only enabled for
+# every workspace member makes release-plz package the full workspace once per
+# crate when it reconstructs the tagged baseline.
+git_only = false
 publish = false
 # release.yml builds the CLI binaries, OpenAPI contract, and image digest
 # inventory and creates the GitHub release when the tag lands, so release-plz
@@ -31,6 +34,7 @@ dependencies_update = true
 # that creates the shared vX.Y.Z git tag.
 [[package]]
 name = "sandboxwich-core"
+git_only = true
 changelog_path = "CHANGELOG.md"
 changelog_include = [
     "sandboxwich-agent",
