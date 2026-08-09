@@ -1785,6 +1785,21 @@ async fn shutdown_deadline_is_not_restarted_after_in_flight_work_finishes() {
 }
 
 #[tokio::test]
+async fn shutdown_watchdog_preserves_the_resident_release_budget() {
+    let shutdown = ShutdownState::new(Duration::from_millis(100));
+    shutdown.request_now();
+    let started = Instant::now();
+
+    drain_watchdog(shutdown, Duration::from_millis(40)).await;
+
+    assert!(started.elapsed() >= Duration::from_millis(45));
+    assert!(
+        started.elapsed() < Duration::from_millis(90),
+        "in-flight work must stop before the resident release budget begins"
+    );
+}
+
+#[tokio::test]
 async fn worker_drain_fence_starts_when_shutdown_is_requested() {
     let shutdown = ShutdownState::new(Duration::from_millis(100));
     let request_shutdown = shutdown.clone();
