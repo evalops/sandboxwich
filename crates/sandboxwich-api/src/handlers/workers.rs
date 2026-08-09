@@ -532,7 +532,12 @@ pub(crate) async fn register_worker(
     let token_hash = hash_worker_token(&worker_token);
     if existing.is_some() {
         let sql = format!(
-            "update workers set status = {}, capabilities = {}, max_concurrent_jobs = {},
+            "update workers set status = case
+                 when exists (
+                   select 1 from worker_drain_lease_fences
+                   where worker_id = workers.id and resolved_at is null
+                 ) then 'draining' else {} end,
+             capabilities = {}, max_concurrent_jobs = {},
              labels = {}, registered_at = {}, last_heartbeat_at = null, token_hash = {}
              where id = {}",
             state.db.placeholder(1),
@@ -576,6 +581,8 @@ pub(crate) async fn register_worker(
             .execute(&state.db.pool)
             .await?;
     }
+
+    let worker = fetch_worker(&state.db, worker.id).await?;
 
     Ok(Json(WorkerResponse {
         ok: true,
@@ -867,7 +874,12 @@ pub(crate) async fn heartbeat_worker(
         (Some(max_concurrent_jobs), Some(envelope)) => {
             let sql = format!(
                 "update workers
-                 set status = case when status = 'draining' then status else {} end,
+                 set status = case
+                       when exists (
+                         select 1 from worker_drain_lease_fences
+                         where worker_id = workers.id and resolved_at is null
+                       ) then 'draining'
+                       when status = 'draining' then status else {} end,
                      last_heartbeat_at = {}, labels = {},
                      max_concurrent_jobs = {}, resource_envelope = {}
                  where id = {}",
@@ -891,7 +903,12 @@ pub(crate) async fn heartbeat_worker(
         (Some(max_concurrent_jobs), None) => {
             let sql = format!(
                 "update workers
-                 set status = case when status = 'draining' then status else {} end,
+                 set status = case
+                       when exists (
+                         select 1 from worker_drain_lease_fences
+                         where worker_id = workers.id and resolved_at is null
+                       ) then 'draining'
+                       when status = 'draining' then status else {} end,
                      last_heartbeat_at = {}, labels = {}, max_concurrent_jobs = {}
                  where id = {}",
                 state.db.placeholder(1),
@@ -912,7 +929,12 @@ pub(crate) async fn heartbeat_worker(
         (None, Some(envelope)) => {
             let sql = format!(
                 "update workers
-                 set status = case when status = 'draining' then status else {} end,
+                 set status = case
+                       when exists (
+                         select 1 from worker_drain_lease_fences
+                         where worker_id = workers.id and resolved_at is null
+                       ) then 'draining'
+                       when status = 'draining' then status else {} end,
                      last_heartbeat_at = {}, labels = {}, resource_envelope = {}
                  where id = {}",
                 state.db.placeholder(1),
@@ -933,7 +955,12 @@ pub(crate) async fn heartbeat_worker(
         (None, None) => {
             let sql = format!(
                 "update workers
-                 set status = case when status = 'draining' then status else {} end,
+                 set status = case
+                       when exists (
+                         select 1 from worker_drain_lease_fences
+                         where worker_id = workers.id and resolved_at is null
+                       ) then 'draining'
+                       when status = 'draining' then status else {} end,
                      last_heartbeat_at = {}, labels = {}
                  where id = {}",
                 state.db.placeholder(1),

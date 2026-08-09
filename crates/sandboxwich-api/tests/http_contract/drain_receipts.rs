@@ -347,6 +347,184 @@ async fn draining_worker_renewal_is_capped_at_the_receipt_deadline() {
 }
 
 #[tokio::test]
+async fn reregister_during_drain_keeps_admission_closed_and_exact_renewal_capped() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("reregister-fence.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let worker = register_worker(&server, "reregister-worker").await;
+    let sandbox = create_provision_job(&server, "reregister-sandbox").await;
+    let lease = claim_provision_job(&server, &worker, sandbox.sandbox.id)
+        .await
+        .unwrap();
+    let request = DrainWorkerRequest {
+        shutdown_id: Uuid::new_v4(),
+        hard_deadline: Utc::now() + ChronoDuration::seconds(30),
+    };
+    drain(&server, &worker, &request).await;
+
+    let restarted = register_worker(&server, "reregister-worker").await;
+    assert_eq!(restarted.worker.id, worker.worker.id);
+    assert_eq!(restarted.worker.status, WorkerStatus::Draining);
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new()
+        .connect(&server.database_url)
+        .await
+        .unwrap();
+    sqlx::query("update workers set status = 'offline' where id = ?")
+        .bind(restarted.worker.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let renewed: LeaseResponse = worker_client(&restarted)
+        .post(format!("{}/leases/{}/renew", server.base_url, lease.id))
+        .json(&RenewLeaseRequest {
+            lease_seconds: Some(3_600),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(renewed.lease.expires_at <= request.hard_deadline);
+
+    let heartbeat: WorkerResponse = worker_client(&restarted)
+        .post(format!(
+            "{}/workers/{}/heartbeat",
+            server.base_url, restarted.worker.id
+        ))
+        .json(&WorkerHeartbeatRequest::default())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(heartbeat.worker.status, WorkerStatus::Draining);
+
+    let another = create_provision_job(&server, "reregister-claim-sandbox").await;
+    assert!(
+        claim_provision_job(&server, &restarted, another.sandbox.id)
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn postgres_terminalization_waits_for_drain_fence_publication() {
+    let Ok(database_url) = std::env::var("SANDBOXWICH_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let server = TestServer::start(database_url, None).await;
+    let worker = register_worker(&server, "terminal-drain-race-worker").await;
+    let sandbox = create_provision_job(&server, "terminal-drain-race-sandbox").await;
+    let lease = claim_provision_job(&server, &worker, sandbox.sandbox.id)
+        .await
+        .unwrap();
+    let shutdown_id = Uuid::new_v4();
+    let hard_deadline = Utc::now() + ChronoDuration::seconds(30);
+    let pool = AnyPoolOptions::new()
+        .connect(&server.database_url)
+        .await
+        .unwrap();
+    let mut drain_tx = pool.begin().await.unwrap();
+    sqlx::query("update workers set status = 'draining' where id = $1")
+        .bind(worker.worker.id.to_string())
+        .execute(&mut *drain_tx)
+        .await
+        .unwrap();
+
+    let terminal_client = worker_client(&worker);
+    let terminal_url = format!("{}/leases/{}/complete", server.base_url, lease.id);
+    let sandbox_id = sandbox.sandbox.id;
+    let terminal = tokio::spawn(async move {
+        terminal_client
+            .post(terminal_url)
+            .json(&CompleteLeaseRequest {
+                result: Some(WorkerJobResult::ProvisionSandbox {
+                    handle: ProviderSandboxHandle {
+                        provider: "kubernetes".to_string(),
+                        sandbox_id,
+                        resources: provision_resources(sandbox_id),
+                        metadata: serde_json::json!({}),
+                    },
+                }),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        !terminal.is_finished(),
+        "terminal transition escaped the worker-row drain serialization lock"
+    );
+
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "insert into worker_drain_receipts
+         (shutdown_id, worker_id, tenant_id, hard_deadline, created_at)
+         values ($1, $2, 'default', $3, $4)",
+    )
+    .bind(shutdown_id.to_string())
+    .bind(worker.worker.id.to_string())
+    .bind(hard_deadline.to_rfc3339())
+    .bind(&now)
+    .execute(&mut *drain_tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into worker_drain_lease_fences
+         (shutdown_id, lease_id, worker_id, job_id, attempt, hard_deadline)
+         values ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(shutdown_id.to_string())
+    .bind(lease.id.to_string())
+    .bind(worker.worker.id.to_string())
+    .bind(lease.job_id.to_string())
+    .bind(lease.attempt)
+    .bind(hard_deadline.to_rfc3339())
+    .execute(&mut *drain_tx)
+    .await
+    .unwrap();
+    drain_tx.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), terminal)
+        .await
+        .expect("terminal transition remained blocked after drain commit")
+        .unwrap();
+
+    let row = sqlx::query(
+        "select outcome, resolved_at from worker_drain_lease_fences
+         where shutdown_id = $1 and lease_id = $2",
+    )
+    .bind(shutdown_id.to_string())
+    .bind(lease.id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        row.try_get::<Option<String>, _>("outcome")
+            .unwrap()
+            .as_deref(),
+        Some("completed")
+    );
+    assert!(
+        row.try_get::<Option<String>, _>("resolved_at")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn captured_leases_resolve_receipt_progress_when_they_finish_before_deadline() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!(
