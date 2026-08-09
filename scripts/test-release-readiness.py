@@ -75,6 +75,10 @@ class ReleaseReadinessTest(unittest.TestCase):
         self.assertEqual(
             workflow.count("GITHUB_TOKEN: ${{ steps.bot-token.outputs.token }}"), 2
         )
+        self.assertIn(
+            "CARGO_TARGET_DIR: ${{ runner.temp }}/release-plz-target",
+            workflow.split("name: release-pr", 1)[1],
+        )
         self.assertNotIn("GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}", workflow)
 
         with (ROOT / "release-plz.toml").open("rb") as fh:
