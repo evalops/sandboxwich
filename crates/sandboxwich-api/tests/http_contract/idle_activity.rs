@@ -394,6 +394,7 @@ async fn resident_process_observation_resets_the_idle_clock() {
             env: BTreeMap::new(),
             restart_policy: ResidentProcessRestartPolicy::OnFailure,
             expected_generation: 0,
+            replace_terminal: false,
             bootstrap: None,
             sterile_activation: None,
         })

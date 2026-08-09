@@ -351,6 +351,7 @@ fn resident_process_request(
         env: BTreeMap::new(),
         restart_policy: ResidentProcessRestartPolicy::OnFailure,
         expected_generation: 0,
+        replace_terminal: false,
         bootstrap: Some(ResidentProcessBootstrap {
             content: secret.to_vec(),
             target_file: target_file.into(),
@@ -439,6 +440,7 @@ fn maestro_hosted_runner_request_for_organization(
         ]),
         restart_policy: ResidentProcessRestartPolicy::OnFailure,
         expected_generation: 0,
+        replace_terminal: false,
         bootstrap: Some(ResidentProcessBootstrap {
             content: b"managed-gateway-token".to_vec(),
             target_file: MAESTRO_HOSTED_RUNNER_GATEWAY_TOKEN_FILE.into(),
@@ -2265,6 +2267,305 @@ async fn set_lease_expiry(
     .unwrap();
 }
 
+async fn mark_resident_terminal_failed(server: &TestServer, process_id: ResidentProcessId) {
+    sqlx::any::install_default_drivers();
+    let pool = AnyPool::connect(&server.database_url).await.unwrap();
+    let placeholder = if server.database_url.starts_with("postgres:")
+        || server.database_url.starts_with("postgresql:")
+    {
+        "$1"
+    } else {
+        "?"
+    };
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query(&format!(
+        "update jobs set status = 'failed'
+         where tenant_id = {placeholder} and kind = 'run_resident_process'"
+    ))
+    .bind("default")
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "update resident_processes
+         set observed_state = 'failed', active_lease_id = null,
+             pid = null, exit_code = null, last_error = 'injected terminal failure'
+         where id = {placeholder}"
+    ))
+    .bind(process_id.to_string())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+async fn mark_resident_failed_preserving_lease(server: &TestServer, process_id: ResidentProcessId) {
+    sqlx::any::install_default_drivers();
+    let pool = AnyPool::connect(&server.database_url).await.unwrap();
+    let placeholder = if server.database_url.starts_with("postgres:")
+        || server.database_url.starts_with("postgresql:")
+    {
+        "$1"
+    } else {
+        "?"
+    };
+    sqlx::query(&format!(
+        "update resident_processes
+         set observed_state = 'failed', pid = null,
+             exit_code = null, last_error = 'injected leased terminal failure'
+         where id = {placeholder}"
+    ))
+    .bind(process_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+}
+
+async fn run_terminal_resident_replacement_contract(server: TestServer) {
+    let client = server.client();
+    let (sandbox_id, worker, guest_client) =
+        provisioned_sandbox_with_guest(&server, "terminal-resident-replacement", true).await;
+    let url = format!(
+        "{}/sandboxes/{sandbox_id}/resident-processes/orb-executor",
+        server.base_url
+    );
+    let first: ResidentProcessResponse = client
+        .put(&url)
+        .header("Idempotency-Key", "terminal-resident-generation-1")
+        .json(&resident_process_request(
+            "/usr/local/bin/orb-executor",
+            b"generation-one-secret",
+            "/run/sandboxwich/bootstrap/orb-token",
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first.resident_process.generation, 1);
+
+    let mut replacement = resident_process_request(
+        "/usr/local/bin/orb-executor-v2",
+        b"generation-two-secret",
+        "/run/sandboxwich/bootstrap/orb-token",
+    );
+    replacement.expected_generation = first.resident_process.generation;
+    replacement.replace_terminal = true;
+
+    let mut exact_replay = resident_process_request(
+        "/usr/local/bin/orb-executor",
+        b"generation-one-secret",
+        "/run/sandboxwich/bootstrap/orb-token",
+    );
+    exact_replay.expected_generation = first.resident_process.generation;
+    exact_replay.replace_terminal = true;
+    let replay: ResidentProcessResponse = client
+        .put(&url)
+        .header("Idempotency-Key", "terminal-resident-exact-replay")
+        .json(&exact_replay)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replay.resident_process.generation, 1);
+    assert!(
+        replay.operation.is_none(),
+        "exact replay must remain idempotent"
+    );
+
+    let live = client
+        .put(&url)
+        .header("Idempotency-Key", "terminal-resident-live-replacement")
+        .json(&replacement)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(live.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        live.json::<serde_json::Value>().await.unwrap()["code"],
+        "resident_process_replacement_not_terminal"
+    );
+
+    let _lease = claim_resident_process_lease(&server, &worker, &guest_client, sandbox_id).await;
+    mark_resident_failed_preserving_lease(&server, first.resident_process.id).await;
+    let leased = client
+        .put(&url)
+        .header("Idempotency-Key", "terminal-resident-leased-replacement")
+        .json(&replacement)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(leased.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        leased.json::<serde_json::Value>().await.unwrap()["code"],
+        "resident_process_replacement_not_terminal"
+    );
+
+    let mut stale = replacement.clone();
+    stale.expected_generation = 0;
+    let stale_response = client
+        .put(&url)
+        .header("Idempotency-Key", "terminal-resident-stale-replacement")
+        .json(&stale)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale_response.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        stale_response.json::<serde_json::Value>().await.unwrap()["code"],
+        "resident_process_generation_conflict"
+    );
+
+    mark_resident_terminal_failed(&server, first.resident_process.id).await;
+    let response = client
+        .put(&url)
+        .header("Idempotency-Key", "terminal-resident-generation-2")
+        .json(&replacement)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert!(
+        status.is_success(),
+        "an explicitly fenced terminal replacement must succeed, got {status}: {body}"
+    );
+    let replaced: ResidentProcessResponse = serde_json::from_str(&body).unwrap();
+    assert_eq!(replaced.resident_process.id, first.resident_process.id);
+    assert_eq!(replaced.resident_process.generation, 2);
+    assert_eq!(
+        replaced.resident_process.argv,
+        vec!["/usr/local/bin/orb-executor-v2"]
+    );
+    assert!(!body.contains("generation-two-secret"));
+}
+
+#[tokio::test]
+async fn terminal_resident_replacement_is_generation_fenced_over_sqlite() {
+    let data_dir = tempfile::tempdir().unwrap();
+    run_terminal_resident_replacement_contract(
+        TestServer::start(
+            format!(
+                "sqlite://{}",
+                data_dir
+                    .path()
+                    .join("terminal-resident-replacement.db")
+                    .display()
+            ),
+            Some(data_dir),
+        )
+        .await,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn terminal_resident_replacement_is_generation_fenced_over_postgres_when_configured() {
+    let Ok(database_url) = std::env::var("SANDBOXWICH_TEST_POSTGRES_URL") else {
+        return;
+    };
+    run_terminal_resident_replacement_contract(TestServer::start(database_url, None).await).await;
+}
+
+#[tokio::test]
+async fn concurrent_terminal_resident_successors_have_one_generation_winner_over_postgres_when_configured()
+ {
+    let Ok(database_url) = std::env::var("SANDBOXWICH_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let server = TestServer::start(database_url, None).await;
+    let client = server.client();
+    let (sandbox_id, _worker, _guest_client) =
+        provisioned_sandbox_with_guest(&server, "concurrent-terminal-replacement", true).await;
+    let url = format!(
+        "{}/sandboxes/{sandbox_id}/resident-processes/orb-executor",
+        server.base_url
+    );
+    let first: ResidentProcessResponse = client
+        .put(&url)
+        .header("Idempotency-Key", "concurrent-terminal-generation-1")
+        .json(&resident_process_request(
+            "/usr/local/bin/orb-executor",
+            b"generation-one-secret",
+            "/run/sandboxwich/bootstrap/orb-token",
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    mark_resident_terminal_failed(&server, first.resident_process.id).await;
+
+    let mut successor_a = resident_process_request(
+        "/usr/local/bin/orb-executor-successor-a",
+        b"successor-a-secret",
+        "/run/sandboxwich/bootstrap/orb-token",
+    );
+    successor_a.expected_generation = first.resident_process.generation;
+    successor_a.replace_terminal = true;
+    let mut successor_b = successor_a.clone();
+    successor_b.argv = vec!["/usr/local/bin/orb-executor-successor-b".into()];
+    successor_b.bootstrap.as_mut().unwrap().content = b"successor-b-secret".to_vec();
+
+    let request_a = client
+        .put(&url)
+        .header("Idempotency-Key", "concurrent-terminal-successor-a")
+        .json(&successor_a)
+        .send();
+    let request_b = client
+        .put(&url)
+        .header("Idempotency-Key", "concurrent-terminal-successor-b")
+        .json(&successor_b)
+        .send();
+    let (response_a, response_b) = tokio::join!(request_a, request_b);
+    let response_a = response_a.unwrap();
+    let response_b = response_b.unwrap();
+    let statuses = [response_a.status(), response_b.status()];
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == reqwest::StatusCode::ACCEPTED)
+            .count(),
+        1,
+        "exactly one successor must win the generation CAS: {statuses:?}"
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == reqwest::StatusCode::CONFLICT)
+            .count(),
+        1,
+        "the concurrent stale successor must fail closed: {statuses:?}"
+    );
+
+    let current: ResidentProcessResponse = client
+        .get(&url)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(current.resident_process.id, first.resident_process.id);
+    assert_eq!(current.resident_process.generation, 2);
+    assert!(
+        current.resident_process.argv == successor_a.argv
+            || current.resident_process.argv == successor_b.argv
+    );
+}
+
 #[tokio::test]
 pub(crate) async fn resident_process_create_is_idempotent_tenant_scoped_and_redacted() {
     let data_dir = tempfile::tempdir().unwrap();
@@ -2310,6 +2611,7 @@ pub(crate) async fn resident_process_create_is_idempotent_tenant_scoped_and_reda
         )]),
         restart_policy: ResidentProcessRestartPolicy::OnFailure,
         expected_generation: 0,
+        replace_terminal: false,
         bootstrap: Some(ResidentProcessBootstrap {
             content: b"resident-canary-secret".to_vec(),
             target_file: "/run/sandboxwich/bootstrap/orb-token".into(),

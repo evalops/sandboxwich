@@ -2653,6 +2653,10 @@ pub struct ResidentProcessRequest {
     pub env: BTreeMap<String, String>,
     pub restart_policy: ResidentProcessRestartPolicy,
     pub expected_generation: u64,
+    /// Explicitly replace an authoritative terminal resident at
+    /// `expected_generation`. Live or leased residents always reject this.
+    #[serde(default)]
+    pub replace_terminal: bool,
     pub bootstrap: Option<ResidentProcessBootstrap>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sterile_activation: Option<SterileResidentActivationV1>,
@@ -2994,6 +2998,7 @@ impl fmt::Debug for ResidentProcessRequest {
             .field("env", &self.env)
             .field("restart_policy", &self.restart_policy)
             .field("expected_generation", &self.expected_generation)
+            .field("replace_terminal", &self.replace_terminal)
             .field("bootstrap", &self.bootstrap)
             .field("sterile_activation", &self.sterile_activation)
             .finish()
@@ -4704,6 +4709,7 @@ mod tests {
             )]),
             restart_policy: ResidentProcessRestartPolicy::OnFailure,
             expected_generation: 0,
+            replace_terminal: false,
             bootstrap: Some(ResidentProcessBootstrap {
                 content: b"canary-resident-secret".to_vec(),
                 target_file: "/run/sandboxwich/bootstrap/orb-token".into(),
@@ -4782,6 +4788,7 @@ mod tests {
             env: BTreeMap::new(),
             restart_policy: ResidentProcessRestartPolicy::Never,
             expected_generation: 0,
+            replace_terminal: false,
             bootstrap: None,
             sterile_activation: None,
         };

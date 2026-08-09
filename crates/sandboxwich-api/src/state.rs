@@ -182,6 +182,13 @@ impl ResidentBootstrapEntry {
             Self::InFlight { tenant_id, .. } => tenant_id,
         }
     }
+
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Ready(bootstrap) | Self::Delivered { bootstrap, .. } => bootstrap.generation,
+            Self::InFlight { fence, .. } => fence.generation,
+        }
+    }
 }
 
 struct ResidentBootstrapStoreInner {
@@ -479,6 +486,18 @@ impl ResidentBootstrapReservation {
     }
 
     pub(crate) fn publish(mut self, id: ResidentProcessId) {
+        self.publish_inner(id, None);
+    }
+
+    /// Publishes a bootstrap for the successor generation of an existing
+    /// terminal resident. The durable generation CAS has already committed,
+    /// so only the exact predecessor may be displaced from process-local
+    /// delivery state.
+    pub(crate) fn publish_replacement(mut self, id: ResidentProcessId, expected_generation: u64) {
+        self.publish_inner(id, Some(expected_generation));
+    }
+
+    fn publish_inner(&mut self, id: ResidentProcessId, replaced_generation: Option<u64>) {
         let bootstrap = self
             .bootstrap
             .take()
@@ -500,7 +519,15 @@ impl ResidentBootstrapReservation {
         let previous = inner
             .values
             .insert(id, ResidentBootstrapEntry::Ready(bootstrap));
-        debug_assert!(previous.is_none(), "resident bootstrap published twice");
+        match (previous.as_ref(), replaced_generation) {
+            (None, _) => {}
+            (Some(previous), Some(expected)) => debug_assert_eq!(
+                previous.generation(),
+                expected,
+                "resident bootstrap replacement displaced the wrong generation"
+            ),
+            (Some(_), None) => debug_assert!(false, "resident bootstrap published twice"),
+        }
     }
 }
 
