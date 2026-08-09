@@ -1866,6 +1866,21 @@ pub(crate) async fn reconcile_due_worker_drain_fences(db: &Database) -> Result<(
             resolve_worker_drain_fence(db, &shutdown_id, lease_id, &status, now).await?;
         }
     }
+    let retire_sql = format!(
+        "update worker_drain_receipts set retired_at = {}
+         where retired_at is null and hard_deadline <= {}
+           and not exists (
+             select 1 from worker_drain_lease_fences
+             where shutdown_id = worker_drain_receipts.shutdown_id and resolved_at is null
+           )",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    sqlx::query(&retire_sql)
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&db.pool)
+        .await?;
     Ok(())
 }
 

@@ -3,11 +3,15 @@ create table if not exists worker_drain_receipts (
     worker_id text not null references workers(id) on delete cascade,
     tenant_id text not null,
     hard_deadline text not null,
-    created_at text not null
+    created_at text not null,
+    retired_at text
 );
 
 create index if not exists idx_worker_drain_receipts_worker_created
     on worker_drain_receipts(worker_id, created_at desc);
+
+create index if not exists idx_worker_drain_receipts_due
+    on worker_drain_receipts(retired_at, hard_deadline, worker_id);
 
 create table if not exists worker_drain_lease_fences (
     shutdown_id text not null references worker_drain_receipts(shutdown_id) on delete cascade,

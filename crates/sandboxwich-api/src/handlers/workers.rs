@@ -534,8 +534,8 @@ pub(crate) async fn register_worker(
         let sql = format!(
             "update workers set status = case
                  when exists (
-                   select 1 from worker_drain_lease_fences
-                   where worker_id = workers.id and resolved_at is null
+                   select 1 from worker_drain_receipts
+                   where worker_id = workers.id and retired_at is null
                  ) then 'draining' else {} end,
              capabilities = {}, max_concurrent_jobs = {},
              labels = {}, registered_at = {}, last_heartbeat_at = null, token_hash = {}
@@ -876,8 +876,8 @@ pub(crate) async fn heartbeat_worker(
                 "update workers
                  set status = case
                        when exists (
-                         select 1 from worker_drain_lease_fences
-                         where worker_id = workers.id and resolved_at is null
+                         select 1 from worker_drain_receipts
+                         where worker_id = workers.id and retired_at is null
                        ) then 'draining'
                        when status = 'draining' then status else {} end,
                      last_heartbeat_at = {}, labels = {},
@@ -905,8 +905,8 @@ pub(crate) async fn heartbeat_worker(
                 "update workers
                  set status = case
                        when exists (
-                         select 1 from worker_drain_lease_fences
-                         where worker_id = workers.id and resolved_at is null
+                         select 1 from worker_drain_receipts
+                         where worker_id = workers.id and retired_at is null
                        ) then 'draining'
                        when status = 'draining' then status else {} end,
                      last_heartbeat_at = {}, labels = {}, max_concurrent_jobs = {}
@@ -931,8 +931,8 @@ pub(crate) async fn heartbeat_worker(
                 "update workers
                  set status = case
                        when exists (
-                         select 1 from worker_drain_lease_fences
-                         where worker_id = workers.id and resolved_at is null
+                         select 1 from worker_drain_receipts
+                         where worker_id = workers.id and retired_at is null
                        ) then 'draining'
                        when status = 'draining' then status else {} end,
                      last_heartbeat_at = {}, labels = {}, resource_envelope = {}
@@ -957,8 +957,8 @@ pub(crate) async fn heartbeat_worker(
                 "update workers
                  set status = case
                        when exists (
-                         select 1 from worker_drain_lease_fences
-                         where worker_id = workers.id and resolved_at is null
+                         select 1 from worker_drain_receipts
+                         where worker_id = workers.id and retired_at is null
                        ) then 'draining'
                        when status = 'draining' then status else {} end,
                      last_heartbeat_at = {}, labels = {}

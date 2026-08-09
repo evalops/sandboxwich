@@ -418,6 +418,100 @@ async fn reregister_during_drain_keeps_admission_closed_and_exact_renewal_capped
 }
 
 #[tokio::test]
+async fn empty_drain_receipt_keeps_restart_admission_closed_until_retired() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("empty-receipt-restart.db").display()
+    );
+    let server = TestServer::start_with_expiry_sweeper(database_url.clone(), Some(data_dir)).await;
+    let worker = register_worker(&server, "empty-receipt-worker").await;
+    let request = DrainWorkerRequest {
+        shutdown_id: Uuid::new_v4(),
+        hard_deadline: Utc::now() + ChronoDuration::seconds(1),
+    };
+    let receipt = drain(&server, &worker, &request).await;
+    assert!(receipt.drain_receipt.leases.is_empty());
+
+    let restarted = register_worker(&server, "empty-receipt-worker").await;
+    assert_eq!(restarted.worker.status, WorkerStatus::Draining);
+    let sandbox = create_provision_job(&server, "empty-receipt-claim").await;
+    assert!(
+        claim_provision_job(&server, &restarted, sandbox.sandbox.id)
+            .await
+            .is_none()
+    );
+
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    let pool = connect_database(&database_url).await;
+    let retired_at: Option<String> =
+        sqlx::query_scalar("select retired_at from worker_drain_receipts where shutdown_id = ?")
+            .bind(request.shutdown_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(retired_at.is_some());
+    let reopened = register_worker(&server, "empty-receipt-worker").await;
+    assert_eq!(reopened.worker.status, WorkerStatus::Registered);
+    assert!(
+        claim_provision_job(&server, &reopened, sandbox.sandbox.id)
+            .await
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn resolved_drain_receipt_keeps_restart_admission_closed_until_retired() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("resolved-receipt-restart.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let worker = register_worker(&server, "resolved-receipt-worker").await;
+    let sandbox = create_provision_job(&server, "resolved-receipt-sandbox").await;
+    let lease = claim_provision_job(&server, &worker, sandbox.sandbox.id)
+        .await
+        .unwrap();
+    let request = DrainWorkerRequest {
+        shutdown_id: Uuid::new_v4(),
+        hard_deadline: Utc::now() + ChronoDuration::seconds(30),
+    };
+    drain(&server, &worker, &request).await;
+    worker_client(&worker)
+        .post(format!("{}/leases/{}/fail", server.base_url, lease.id))
+        .json(&FailLeaseRequest {
+            error: "shutdown cleanup".to_string(),
+            retry: true,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let resolved = drain(&server, &worker, &request).await;
+    assert!(
+        resolved
+            .drain_receipt
+            .leases
+            .iter()
+            .all(|fence| fence.resolved_at.is_some())
+    );
+
+    let restarted = register_worker(&server, "resolved-receipt-worker").await;
+    assert_eq!(restarted.worker.status, WorkerStatus::Draining);
+    let another = create_provision_job(&server, "resolved-receipt-claim").await;
+    assert!(
+        claim_provision_job(&server, &restarted, another.sandbox.id)
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn postgres_terminalization_waits_for_drain_fence_publication() {
     let Ok(database_url) = std::env::var("SANDBOXWICH_TEST_POSTGRES_URL") else {
         return;
