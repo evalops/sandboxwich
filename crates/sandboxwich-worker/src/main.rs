@@ -1900,6 +1900,10 @@ const MIN_RENEW_INTERVAL: Duration = Duration::from_secs(5);
 /// after a shutdown signal before giving up and exiting anyway (see
 /// `wait_for_shutdown_signal` and the `--drain-timeout-secs` flag).
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 300;
+/// Keep a bounded tail of the existing drain timeout for cancelling a resident
+/// process and acknowledging its retryable lease release. The deployment grace
+/// period must not be the mechanism that releases fenced authority.
+const MAX_RESIDENT_SHUTDOWN_RELEASE_BUDGET: Duration = Duration::from_secs(30);
 /// How often the drain watchdog polls the shutdown flag while a lease is being
 /// handled. Small relative to any realistic drain timeout, so it doesn't add
 /// meaningful latency to the shutdown-requested -> timeout-elapsed window.
@@ -1967,6 +1971,62 @@ struct ResidentTaskMetadata {
     process_id: Uuid,
     generation: u64,
     cancellation: LeaseCancellation,
+}
+
+struct ResidentShutdownDrain<T> {
+    results: Vec<Result<(tokio::task::Id, T), tokio::task::JoinError>>,
+    forced_release: bool,
+    timed_out: bool,
+}
+
+async fn drain_resident_tasks_until_deadline<T: 'static>(
+    tasks: &mut tokio::task::JoinSet<T>,
+    metadata_by_task: &std::collections::HashMap<tokio::task::Id, ResidentTaskMetadata>,
+    deadline: Instant,
+    release_budget: Duration,
+) -> ResidentShutdownDrain<T> {
+    let graceful_deadline = deadline.checked_sub(release_budget).unwrap_or(deadline);
+    let mut results = Vec::new();
+    while !tasks.is_empty() {
+        let remaining = graceful_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, tasks.join_next_with_id()).await {
+            Ok(Some(result)) => results.push(result),
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    let forced_release = !tasks.is_empty();
+    if forced_release {
+        for metadata in metadata_by_task.values() {
+            metadata
+                .cancellation
+                .cancel(LeaseCancellationReason::Shutdown);
+        }
+        while !tasks.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, tasks.join_next_with_id()).await {
+                Ok(Some(result)) => results.push(result),
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+    }
+    let timed_out = !tasks.is_empty();
+    ResidentShutdownDrain {
+        results,
+        forced_release,
+        timed_out,
+    }
+}
+
+fn resident_shutdown_release_budget(drain_timeout: Duration) -> Duration {
+    (drain_timeout / 10).min(MAX_RESIDENT_SHUTDOWN_RELEASE_BUDGET)
 }
 
 impl LeaseCancellation {
@@ -2757,23 +2817,34 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
     }
 
     heartbeat_task.abort();
+    let shutdown_deadline = Instant::now() + drain_timeout;
 
-    for metadata in resident_tasks_by_id.values() {
-        metadata
-            .cancellation
-            .cancel(LeaseCancellationReason::Shutdown);
-    }
-    let drain_residents = async {
-        while let Some(result) = resident_tasks.join_next_with_id().await {
-            reconcile_resident_task_result(client, api, result, &mut resident_tasks_by_id, true)
-                .await;
-        }
-    };
-    if tokio::time::timeout(drain_timeout, drain_residents)
-        .await
-        .is_err()
+    // Publish the admission fence before waiting on work already owned by this
+    // worker. Existing resident tasks keep renewing their exact leases below;
+    // the draining worker cannot claim replacements.
+    if let Err(error) = with_retries("mark worker draining", API_RETRY_ATTEMPTS, || {
+        drain_worker(client, api, args.worker_id)
+    })
+    .await
     {
-        eprintln!("warning: provider-isolated resident leases exceeded the drain timeout");
+        eprintln!("warning: failed to mark worker draining before drain: {error:#}");
+    }
+
+    let resident_drain = drain_resident_tasks_until_deadline(
+        &mut resident_tasks,
+        &resident_tasks_by_id,
+        shutdown_deadline,
+        resident_shutdown_release_budget(drain_timeout),
+    )
+    .await;
+    for result in resident_drain.results {
+        reconcile_resident_task_result(client, api, result, &mut resident_tasks_by_id, true).await;
+    }
+    if resident_drain.forced_release {
+        eprintln!("worker: provider-isolated resident leases reached the fenced release phase");
+    }
+    if resident_drain.timed_out {
+        eprintln!("warning: provider-isolated resident leases exceeded the drain deadline");
     }
     let drain_ordinary = async {
         while let Some(joined) = ordinary_tasks.join_next().await {
@@ -2782,19 +2853,14 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
             }
         }
     };
-    if tokio::time::timeout(drain_timeout, drain_ordinary)
-        .await
-        .is_err()
-    {
-        eprintln!("warning: ordinary concurrent leases exceeded the drain timeout");
-    }
-
-    if let Err(error) = with_retries("mark worker draining", API_RETRY_ATTEMPTS, || {
-        drain_worker(client, api, args.worker_id)
-    })
+    if tokio::time::timeout(
+        shutdown_deadline.saturating_duration_since(Instant::now()),
+        drain_ordinary,
+    )
     .await
+    .is_err()
     {
-        eprintln!("warning: failed to mark worker draining before exit: {error:#}");
+        eprintln!("warning: ordinary concurrent leases exceeded the drain deadline");
     }
     Ok(())
 }

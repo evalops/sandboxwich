@@ -1591,6 +1591,102 @@ async fn failed_resident_task_retains_exact_metadata_for_reconciliation() {
 }
 
 #[tokio::test]
+async fn resident_shutdown_drain_preserves_the_lease_until_clean_completion() {
+    let cancellation = LeaseCancellation::new();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut tasks = tokio::task::JoinSet::new();
+    let task = tasks.spawn({
+        let cancellation = cancellation.clone();
+        let release = release.clone();
+        async move {
+            release.notified().await;
+            cancellation.reason()
+        }
+    });
+    let metadata = std::collections::HashMap::from([(
+        task.id(),
+        ResidentTaskMetadata {
+            lease_id: sandboxwich_core::LeaseId::new(),
+            process_id: Uuid::new_v4(),
+            generation: 17,
+            cancellation: cancellation.clone(),
+        },
+    )]);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        release.notify_one();
+    });
+
+    let drain = drain_resident_tasks_until_deadline(
+        &mut tasks,
+        &metadata,
+        Instant::now() + Duration::from_secs(1),
+        Duration::from_millis(100),
+    )
+    .await;
+
+    assert!(!drain.forced_release);
+    assert!(!drain.timed_out);
+    let (_, reason) = drain
+        .results
+        .into_iter()
+        .next()
+        .expect("the clean resident completion is reaped")
+        .expect("the resident task does not panic");
+    assert_eq!(reason, LeaseCancellationReason::None);
+    assert!(!cancellation.signal.is_cancelled());
+}
+
+#[tokio::test]
+async fn resident_shutdown_drain_releases_the_exact_lease_before_the_deadline() {
+    let cancellation = LeaseCancellation::new();
+    let mut tasks = tokio::task::JoinSet::new();
+    let task = tasks.spawn({
+        let cancellation = cancellation.clone();
+        async move {
+            while !cancellation.signal.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+            cancellation.reason()
+        }
+    });
+    let task_id = task.id();
+    let lease_id = sandboxwich_core::LeaseId::new();
+    let metadata = std::collections::HashMap::from([(
+        task_id,
+        ResidentTaskMetadata {
+            lease_id,
+            process_id: Uuid::new_v4(),
+            generation: 19,
+            cancellation: cancellation.clone(),
+        },
+    )]);
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(150);
+
+    let drain = drain_resident_tasks_until_deadline(
+        &mut tasks,
+        &metadata,
+        deadline,
+        Duration::from_millis(100),
+    )
+    .await;
+
+    assert!(drain.forced_release);
+    assert!(!drain.timed_out);
+    assert!(Instant::now() < deadline);
+    let (reaped_task_id, reason) = drain
+        .results
+        .into_iter()
+        .next()
+        .expect("the fenced resident release is reaped")
+        .expect("the resident task does not panic");
+    assert_eq!(reaped_task_id, task_id);
+    assert_eq!(metadata[&reaped_task_id].lease_id, lease_id);
+    assert_eq!(reason, LeaseCancellationReason::Shutdown);
+}
+
+#[tokio::test]
 async fn production_resident_task_result_dispatches_failure_and_panic_reconciliation() {
     use axum::{
         Router,
