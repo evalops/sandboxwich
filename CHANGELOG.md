@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 0.1.15 - 2026-08-09
+### Added
+
+- *(api)* Replace fenced terminal residents ([#340](https://github.com/evalops/sandboxwich/pull/340))
+- *(runtime)* Add one-shot sterile cell pool
+- *(api)* Make sterile cell claims recoverable
+- *(api)* Add one-shot sterile cell leases ([#336](https://github.com/evalops/sandboxwich/pull/336))
+- *(api)* Deterministic home identity via external_key + mount visibility
+- Add native Cloudflare sandbox provider
+
+### Fixed
+
+- Stabilize Cloudflare body bounds and defaults
+
+### Other
+
+- Merge sterile cell pool with resident activation
+- *(activation)* Combine identity validation and proof
+
 ## 0.1.14 - 2026-08-06
 ### Other
 
