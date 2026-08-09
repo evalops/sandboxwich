@@ -2974,39 +2974,44 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
 
     heartbeat_task.abort();
     let shutdown_plan = shutdown.request_now();
-    let captured_lease_ids = match drain_receipt_task.await {
-        Ok(Some(Ok(receipt))) => {
-            match validate_worker_drain_receipt(&shutdown_plan, worker_id, receipt) {
-                Ok(captured) => Some(captured),
-                Err(error) => {
-                    eprintln!("warning: rejected mismatched worker drain receipt: {error:#}");
-                    None
+    let resident_authority = resident_tasks_by_id
+        .values()
+        .map(|metadata| (metadata.lease_id, metadata.cancellation.clone()))
+        .collect::<Vec<_>>();
+    let finish_drain_receipt = async {
+        let captured_lease_ids = match drain_receipt_task.await {
+            Ok(Some(Ok(receipt))) => {
+                match validate_worker_drain_receipt(&shutdown_plan, worker_id, receipt) {
+                    Ok(captured) => Some(captured),
+                    Err(error) => {
+                        eprintln!("warning: rejected mismatched worker drain receipt: {error:#}");
+                        None
+                    }
+                }
+            }
+            Ok(Some(Err(error))) => {
+                eprintln!("warning: failed to publish worker drain receipt: {error:#}");
+                None
+            }
+            Ok(None) => {
+                eprintln!(
+                    "warning: worker drain receipt publication exceeded the shutdown deadline"
+                );
+                None
+            }
+            Err(error) => {
+                eprintln!("warning: worker drain receipt task failed: {error}");
+                None
+            }
+        };
+        if let Some(captured_lease_ids) = captured_lease_ids.as_ref() {
+            for (lease_id, cancellation) in resident_authority {
+                if !captured_lease_ids.contains(&lease_id) {
+                    cancellation.cancel(LeaseCancellationReason::LeaseLost);
                 }
             }
         }
-        Ok(Some(Err(error))) => {
-            eprintln!("warning: failed to publish worker drain receipt: {error:#}");
-            None
-        }
-        Ok(None) => {
-            eprintln!("warning: worker drain receipt publication exceeded the shutdown deadline");
-            None
-        }
-        Err(error) => {
-            eprintln!("warning: worker drain receipt task failed: {error}");
-            None
-        }
     };
-
-    if let Some(captured_lease_ids) = captured_lease_ids.as_ref() {
-        for metadata in resident_tasks_by_id.values() {
-            if !captured_lease_ids.contains(&metadata.lease_id) {
-                metadata
-                    .cancellation
-                    .cancel(LeaseCancellationReason::LeaseLost);
-            }
-        }
-    }
     let resident_cancellations = resident_tasks_by_id
         .iter()
         .map(|(task_id, metadata)| (*task_id, metadata.cancellation.clone()))
@@ -3039,8 +3044,8 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
         }
         false
     };
-    let (resident_drain, resident_reconciliation_timed_out) =
-        tokio::join!(drain_residents, reconcile_residents);
+    let ((), resident_drain, resident_reconciliation_timed_out) =
+        tokio::join!(finish_drain_receipt, drain_residents, reconcile_residents);
     if resident_drain.forced_release {
         eprintln!("worker: provider-isolated resident leases reached fenced release");
     }
