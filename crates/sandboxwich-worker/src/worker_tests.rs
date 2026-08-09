@@ -1777,6 +1777,13 @@ async fn shutdown_plan_owns_one_absolute_deadline_from_the_request() {
     );
 }
 
+#[test]
+fn durable_drain_timeout_stays_inside_the_api_deadline_window() {
+    assert_eq!(durable_drain_timeout(0), Duration::from_secs(1));
+    assert_eq!(durable_drain_timeout(300), Duration::from_secs(300));
+    assert_eq!(durable_drain_timeout(7_200), Duration::from_secs(3_600));
+}
+
 #[tokio::test]
 async fn production_resident_task_result_dispatches_failure_and_panic_reconciliation() {
     use axum::{

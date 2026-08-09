@@ -2024,6 +2024,7 @@ const MIN_RENEW_INTERVAL: Duration = Duration::from_secs(5);
 /// after a shutdown signal before giving up and exiting anyway (see
 /// `wait_for_shutdown_signal` and the `--drain-timeout-secs` flag).
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 300;
+const MIN_DURABLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_DURABLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const MAX_RESIDENT_SHUTDOWN_RELEASE_BUDGET: Duration = Duration::from_secs(30);
 /// How often the drain watchdog polls the shutdown flag while a lease is being
@@ -2044,6 +2045,10 @@ const MAX_RESIDENT_PROVIDER_ATTEMPTS: u32 = 30;
 // Starting/Running. Poll observations aggressively so the first validate
 // succeeds as soon as the Pod identity is known.
 const RESIDENT_OBSERVATION_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+fn durable_drain_timeout(configured_secs: u64) -> Duration {
+    Duration::from_secs(configured_secs).clamp(MIN_DURABLE_DRAIN_TIMEOUT, MAX_DURABLE_DRAIN_TIMEOUT)
+}
 
 fn resident_shutdown_release_budget(drain_timeout: Duration) -> Duration {
     (drain_timeout / 10).min(MAX_RESIDENT_SHUTDOWN_RELEASE_BUDGET)
@@ -2609,7 +2614,7 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
     let ordinary_slots = max_concurrent_jobs.saturating_sub(1).max(1);
     let provider = Arc::new(runtime_provider_from_args(args.provider)?);
     let labels: BTreeMap<_, _> = args.label.into_iter().collect();
-    let drain_timeout = Duration::from_secs(args.drain_timeout_secs).min(MAX_DURABLE_DRAIN_TIMEOUT);
+    let drain_timeout = durable_drain_timeout(args.drain_timeout_secs);
     let resident_release_budget = resident_shutdown_release_budget(drain_timeout);
     let shutdown = spawn_shutdown_listener(drain_timeout);
     let mut iterations = 0_u64;
