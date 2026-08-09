@@ -1900,6 +1900,10 @@ const MIN_RENEW_INTERVAL: Duration = Duration::from_secs(5);
 /// after a shutdown signal before giving up and exiting anyway (see
 /// `wait_for_shutdown_signal` and the `--drain-timeout-secs` flag).
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 300;
+/// Keep a bounded tail of the existing drain timeout for cancelling a resident
+/// process and acknowledging its retryable lease release. The deployment grace
+/// period must not be the mechanism that releases fenced authority.
+const MAX_RESIDENT_SHUTDOWN_RELEASE_BUDGET: Duration = Duration::from_secs(30);
 /// How often the drain watchdog polls the shutdown flag while a lease is being
 /// handled. Small relative to any realistic drain timeout, so it doesn't add
 /// meaningful latency to the shutdown-requested -> timeout-elapsed window.
@@ -1918,6 +1922,107 @@ const MAX_RESIDENT_PROVIDER_ATTEMPTS: u32 = 30;
 // Starting/Running. Poll observations aggressively so the first validate
 // succeeds as soon as the Pod identity is known.
 const RESIDENT_OBSERVATION_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+async fn release_claimed_lease_for_shutdown(
+    client: &reqwest::Client,
+    api: &str,
+    lease_id: sandboxwich_core::LeaseId,
+    shutdown: &ShutdownState,
+) -> anyhow::Result<LeaseResponse> {
+    let payload = FailLeaseRequest {
+        error: "lease claimed while worker shutdown was requested".to_string(),
+        retry: true,
+    };
+    let deadline = shutdown
+        .deadline()
+        .context("shutdown-raced lease has no shutdown deadline")?;
+    let release_deadline = resident_shutdown_graceful_deadline(
+        deadline,
+        resident_shutdown_release_budget(shutdown.drain_timeout),
+    );
+    complete_before_shutdown_deadline(
+        release_deadline,
+        with_retries(
+            "release shutdown-raced lease",
+            API_RETRY_ATTEMPTS,
+            || async {
+                let response = client
+                    .post(format!("{api}/leases/{lease_id}/fail"))
+                    .json(&payload)
+                    .send()
+                    .await?;
+                decode_json::<LeaseResponse>(response).await
+            },
+        ),
+    )
+    .await
+    .context("shutdown-raced lease release exceeded the shutdown deadline")?
+    .with_context(|| format!("failed to release shutdown-raced lease {lease_id}"))
+}
+
+#[derive(Clone)]
+struct ShutdownState {
+    requested: Arc<std::sync::atomic::AtomicBool>,
+    deadline: Arc<std::sync::OnceLock<Instant>>,
+    deadline_ready: Arc<tokio::sync::Notify>,
+    drain_timeout: Duration,
+}
+
+impl ShutdownState {
+    fn new(drain_timeout: Duration) -> Self {
+        Self {
+            requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deadline: Arc::new(std::sync::OnceLock::new()),
+            deadline_ready: Arc::new(tokio::sync::Notify::new()),
+            drain_timeout,
+        }
+    }
+
+    fn request_now(&self) {
+        let _ = self.deadline.set(Instant::now() + self.drain_timeout);
+        self.requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.deadline_ready.notify_waiters();
+    }
+
+    fn is_requested(&self) -> bool {
+        self.requested.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.deadline.get().copied()
+    }
+
+    async fn wait_for_deadline(&self) -> Instant {
+        loop {
+            let notified = self.deadline_ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(deadline) = self.deadline() {
+                return deadline;
+            }
+            notified.await;
+        }
+    }
+}
+
+async fn admit_or_release_claimed_work<T, Release, ReleaseFuture>(
+    claimed: Option<T>,
+    shutdown: &ShutdownState,
+    release: Release,
+) -> anyhow::Result<Option<T>>
+where
+    Release: FnOnce(T) -> ReleaseFuture,
+    ReleaseFuture: Future<Output = anyhow::Result<()>>,
+{
+    match claimed {
+        Some(claimed) if shutdown.is_requested() => {
+            release(claimed).await?;
+            Ok(None)
+        }
+        claimed => Ok(claimed),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -1967,6 +2072,96 @@ struct ResidentTaskMetadata {
     process_id: Uuid,
     generation: u64,
     cancellation: LeaseCancellation,
+}
+
+struct ResidentShutdownDrainStatus {
+    forced_release: bool,
+    timed_out: bool,
+}
+
+async fn drain_resident_tasks_to_channel_until_deadline<T: 'static>(
+    tasks: &mut tokio::task::JoinSet<T>,
+    cancellations_by_task: &std::collections::HashMap<tokio::task::Id, LeaseCancellation>,
+    deadline: Instant,
+    release_budget: Duration,
+    result_tx: tokio::sync::mpsc::UnboundedSender<
+        Result<(tokio::task::Id, T), tokio::task::JoinError>,
+    >,
+) -> ResidentShutdownDrainStatus {
+    let graceful_deadline = resident_shutdown_graceful_deadline(deadline, release_budget);
+    let mut completed_task_ids = std::collections::HashSet::new();
+    let deliver =
+        |result: Result<(tokio::task::Id, T), tokio::task::JoinError>,
+         completed_task_ids: &mut std::collections::HashSet<tokio::task::Id>| {
+            completed_task_ids.insert(match &result {
+                Ok((task_id, _)) => *task_id,
+                Err(error) => error.id(),
+            });
+            let _ = result_tx.send(result);
+        };
+    while !tasks.is_empty() {
+        let remaining = graceful_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, tasks.join_next_with_id()).await {
+            Ok(Some(result)) => deliver(result, &mut completed_task_ids),
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    let forced_release = !tasks.is_empty();
+    if forced_release {
+        for (task_id, cancellation) in cancellations_by_task {
+            if !completed_task_ids.contains(task_id) {
+                cancellation.cancel(LeaseCancellationReason::Shutdown);
+            }
+        }
+        while !tasks.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, tasks.join_next_with_id()).await {
+                Ok(Some(result)) => deliver(result, &mut completed_task_ids),
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+    }
+    ResidentShutdownDrainStatus {
+        forced_release,
+        timed_out: !tasks.is_empty(),
+    }
+}
+
+fn resident_shutdown_release_budget(drain_timeout: Duration) -> Duration {
+    (drain_timeout / 10).min(MAX_RESIDENT_SHUTDOWN_RELEASE_BUDGET)
+}
+
+fn resident_shutdown_graceful_deadline(deadline: Instant, release_budget: Duration) -> Instant {
+    deadline.checked_sub(release_budget).unwrap_or(deadline)
+}
+
+async fn complete_before_shutdown_deadline<F: Future>(
+    deadline: Instant,
+    future: F,
+) -> Option<F::Output> {
+    tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), future)
+        .await
+        .ok()
+}
+
+async fn run_when_shutdown_requested<Operation, OperationFuture>(
+    shutdown: ShutdownState,
+    operation: Operation,
+) -> Option<OperationFuture::Output>
+where
+    Operation: FnOnce() -> OperationFuture,
+    OperationFuture: Future,
+{
+    let deadline = shutdown.wait_for_deadline().await;
+    complete_before_shutdown_deadline(deadline, operation()).await
 }
 
 impl LeaseCancellation {
@@ -2236,19 +2431,19 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
-/// Spawns a background task that sets `shutdown` once a shutdown signal
-/// arrives, so the main work loop (which is not itself listening for
-/// signals mid-iteration) can observe it via a plain flag check.
-fn spawn_shutdown_listener() -> Arc<std::sync::atomic::AtomicBool> {
-    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let flag = shutdown.clone();
+/// Spawns a background task that records one absolute shutdown deadline when a
+/// signal arrives. Every in-flight and post-loop drain phase consumes that same
+/// budget instead of restarting the timeout after finishing other work.
+fn spawn_shutdown_listener(drain_timeout: Duration) -> ShutdownState {
+    let shutdown = ShutdownState::new(drain_timeout);
+    let signal_state = shutdown.clone();
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;
         eprintln!(
             "worker: received shutdown signal; will stop claiming new leases and let any \
              in-flight lease finish (bounded by --drain-timeout-secs)"
         );
-        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        signal_state.request_now();
     });
     shutdown
 }
@@ -2256,29 +2451,23 @@ fn spawn_shutdown_listener() -> Arc<std::sync::atomic::AtomicBool> {
 /// Sleeps for `duration`, but wakes early (and returns) as soon as `shutdown`
 /// is observed, so an idle worker doesn't sit through a full idle-sleep
 /// interval after a shutdown signal before exiting.
-async fn sleep_or_shutdown(duration: Duration, shutdown: &std::sync::atomic::AtomicBool) {
+async fn sleep_or_shutdown(duration: Duration, shutdown: &ShutdownState) {
     let deadline = tokio::time::Instant::now() + duration;
     while tokio::time::Instant::now() < deadline {
-        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+        if shutdown.is_requested() {
             return;
         }
         tokio::time::sleep(SHUTDOWN_POLL_INTERVAL.min(duration)).await;
     }
 }
 
-/// Resolves once `shutdown` has been observed *and* an additional
-/// `drain_timeout` has elapsed since. Raced against an in-flight lease's
-/// future so a job that never finishes can't hang the worker forever once a
-/// shutdown has been requested; the lease itself is left to expire and be
-/// reclaimed by another worker if this fires.
-async fn drain_watchdog(shutdown: Arc<std::sync::atomic::AtomicBool>, drain_timeout: Duration) {
-    loop {
-        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
-        }
-        tokio::time::sleep(SHUTDOWN_POLL_INTERVAL).await;
-    }
-    tokio::time::sleep(drain_timeout).await;
+/// Resolves at the graceful cutoff before the absolute shutdown deadline.
+/// Raced against an in-flight lease so resident cancellation and fenced release
+/// retain their reserved tail of the original drain budget.
+async fn drain_watchdog(shutdown: ShutdownState, release_budget: Duration) {
+    let deadline = shutdown.wait_for_deadline().await;
+    let graceful_deadline = resident_shutdown_graceful_deadline(deadline, release_budget);
+    tokio::time::sleep(graceful_deadline.saturating_duration_since(Instant::now())).await;
 }
 
 async fn fetch_runtime_resource_inventory(
@@ -2414,7 +2603,8 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
     let provider = Arc::new(runtime_provider_from_args(args.provider)?);
     let labels: BTreeMap<_, _> = args.label.into_iter().collect();
     let drain_timeout = Duration::from_secs(args.drain_timeout_secs);
-    let shutdown = spawn_shutdown_listener();
+    let resident_release_budget = resident_shutdown_release_budget(drain_timeout);
+    let shutdown = spawn_shutdown_listener(drain_timeout);
     let mut iterations = 0_u64;
     let mut last_idle_heartbeat = None;
     let mut resident_tasks: tokio::task::JoinSet<anyhow::Result<LeaseResponse>> =
@@ -2425,6 +2615,18 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
         anyhow::Result<LeaseResponse>,
     )> = tokio::task::JoinSet::new();
     let worker_id = args.worker_id;
+    let drain_fence_client = client.clone();
+    let drain_fence_api = api.to_string();
+    let drain_fence_shutdown = shutdown.clone();
+    let drain_fence_task = tokio::spawn(run_when_shutdown_requested(
+        drain_fence_shutdown,
+        move || async move {
+            with_retries("mark worker draining", API_RETRY_ATTEMPTS, || {
+                drain_worker(&drain_fence_client, &drain_fence_api, worker_id)
+            })
+            .await
+        },
+    ));
 
     // Independent heartbeat so a long provision cannot starve liveness and a
     // heartbeat failure cannot skip claim for an entire iteration.
@@ -2435,7 +2637,7 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
     let heartbeat_task = tokio::spawn(async move {
         let interval = Duration::from_secs(15);
         loop {
-            if heartbeat_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            if heartbeat_shutdown.is_requested() {
                 break;
             }
             if let Err(error) = with_retries("worker heartbeat", API_RETRY_ATTEMPTS, || {
@@ -2453,7 +2655,7 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
                 );
             }
             sleep_or_shutdown(interval, &heartbeat_shutdown).await;
-            if heartbeat_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            if heartbeat_shutdown.is_requested() {
                 break;
             }
         }
@@ -2484,7 +2686,7 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
                 }
             }
         }
-        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+        if shutdown.is_requested() {
             eprintln!(
                 "worker: shutdown requested, exiting work loop before claiming further leases"
             );
@@ -2503,7 +2705,7 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
         // own task above so claim is never gated on heartbeat success.
         // Re-check right before claiming: a signal received during concurrent
         // work reaping above must still stop us from picking up new work.
-        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+        if shutdown.is_requested() {
             eprintln!(
                 "worker: shutdown requested, exiting work loop before claiming further leases"
             );
@@ -2537,7 +2739,22 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
             }
         };
 
-        let Some(lease) = response.lease else {
+        let release_shutdown = shutdown.clone();
+        let response_lease =
+            match admit_or_release_claimed_work(response.lease, &shutdown, |lease| async move {
+                release_claimed_lease_for_shutdown(client, api, lease.id, &release_shutdown)
+                    .await
+                    .map(|_| ())
+            })
+            .await
+            {
+                Ok(lease) => lease,
+                Err(error) => {
+                    eprintln!("error: failed to release shutdown-raced lease: {error:#}");
+                    break;
+                }
+            };
+        let Some(lease) = response_lease else {
             let now = Instant::now();
             if idle_heartbeat_due(last_idle_heartbeat, now) {
                 tracing::info!(
@@ -2646,7 +2863,7 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
             provider.clone(),
             None,
         ));
-        let mut drain_future = Box::pin(drain_watchdog(shutdown.clone(), drain_timeout));
+        let mut drain_future = Box::pin(drain_watchdog(shutdown.clone(), resident_release_budget));
         let outcome = loop {
             while let Some(result) = resident_tasks.try_join_next_with_id() {
                 reconcile_resident_task_result(
@@ -2660,7 +2877,7 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
             }
             let resident_fast_lane_has_capacity = resident_fast_lane_enabled
                 && resident_tasks.len() < max_resident_processes
-                && !shutdown.load(std::sync::atomic::Ordering::SeqCst);
+                && !shutdown.is_requested();
             let resident_claim_args = ClaimArgs {
                 worker_id,
                 lease_seconds: args.lease_seconds,
@@ -2676,8 +2893,31 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
                 }), if resident_fast_lane_has_capacity => {
                     match response {
                         Ok(response) => {
-                            let Some(resident_lease) = response.lease else {
-                                continue;
+                            let release_shutdown = shutdown.clone();
+                            let resident_lease = match admit_or_release_claimed_work(
+                                response.lease,
+                                &shutdown,
+                                |lease| async move {
+                                    release_claimed_lease_for_shutdown(
+                                        client,
+                                        api,
+                                        lease.id,
+                                        &release_shutdown,
+                                    )
+                                    .await
+                                    .map(|_| ())
+                                },
+                            )
+                            .await
+                            {
+                                Ok(Some(lease)) => lease,
+                                Ok(None) => continue,
+                                Err(error) => {
+                                    eprintln!(
+                                        "error: failed to release shutdown-raced resident lease: {error:#}"
+                                    );
+                                    continue;
+                                }
                             };
                             let resident_lease_id = resident_lease.id;
                             let fallback_reason = match spawn_provider_isolated_resident_lease(
@@ -2730,9 +2970,8 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
         };
         let Some(outcome) = outcome else {
             eprintln!(
-                "warning: lease {lease_id} did not finish within the {drain_timeout:?} drain \
-                 timeout after shutdown was requested; exiting anyway (the lease will expire and \
-                 be reclaimed by another worker)"
+                "warning: lease {lease_id} did not finish before the resident release phase; \
+                 exiting the work loop (the lease will expire and be reclaimed by another worker)"
             );
             break;
         };
@@ -2757,23 +2996,68 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
     }
 
     heartbeat_task.abort();
-
-    for metadata in resident_tasks_by_id.values() {
-        metadata
-            .cancellation
-            .cancel(LeaseCancellationReason::Shutdown);
+    if !shutdown.is_requested() {
+        shutdown.request_now();
     }
-    let drain_residents = async {
-        while let Some(result) = resident_tasks.join_next_with_id().await {
-            reconcile_resident_task_result(client, api, result, &mut resident_tasks_by_id, true)
-                .await;
+    let shutdown_deadline = shutdown
+        .deadline()
+        .expect("shutdown request records its deadline");
+
+    // The admission fence started at the signal. Await it concurrently with
+    // local drain work so a slow API retry cannot consume the resident release
+    // budget by itself.
+    let finish_drain_fence = async {
+        match drain_fence_task.await {
+            Ok(Some(Ok(()))) => {}
+            Ok(Some(Err(error))) => {
+                eprintln!("warning: failed to mark worker draining before drain: {error:#}")
+            }
+            Ok(None) => {
+                eprintln!("warning: marking worker draining exceeded the shutdown deadline")
+            }
+            Err(error) => eprintln!("warning: worker drain fence task failed: {error}"),
         }
     };
-    if tokio::time::timeout(drain_timeout, drain_residents)
-        .await
-        .is_err()
-    {
-        eprintln!("warning: provider-isolated resident leases exceeded the drain timeout");
+
+    let resident_cancellations = resident_tasks_by_id
+        .iter()
+        .map(|(task_id, metadata)| (*task_id, metadata.cancellation.clone()))
+        .collect();
+    let (resident_result_tx, mut resident_result_rx) = tokio::sync::mpsc::unbounded_channel();
+    let drain_residents = drain_resident_tasks_to_channel_until_deadline(
+        &mut resident_tasks,
+        &resident_cancellations,
+        shutdown_deadline,
+        resident_release_budget,
+        resident_result_tx,
+    );
+    let reconcile_residents = async {
+        while let Some(result) = resident_result_rx.recv().await {
+            if complete_before_shutdown_deadline(
+                shutdown_deadline,
+                reconcile_resident_task_result(
+                    client,
+                    api,
+                    result,
+                    &mut resident_tasks_by_id,
+                    true,
+                ),
+            )
+            .await
+            .is_none()
+            {
+                return true;
+            }
+        }
+        false
+    };
+    let ((), resident_drain, resident_reconciliation_timed_out) =
+        tokio::join!(finish_drain_fence, drain_residents, reconcile_residents);
+    if resident_drain.forced_release {
+        eprintln!("worker: provider-isolated resident leases reached the fenced release phase");
+    }
+    if resident_drain.timed_out || resident_reconciliation_timed_out {
+        eprintln!("warning: provider-isolated resident leases exceeded the drain deadline");
     }
     let drain_ordinary = async {
         while let Some(joined) = ordinary_tasks.join_next().await {
@@ -2782,19 +3066,14 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
             }
         }
     };
-    if tokio::time::timeout(drain_timeout, drain_ordinary)
-        .await
-        .is_err()
-    {
-        eprintln!("warning: ordinary concurrent leases exceeded the drain timeout");
-    }
-
-    if let Err(error) = with_retries("mark worker draining", API_RETRY_ATTEMPTS, || {
-        drain_worker(client, api, args.worker_id)
-    })
+    if tokio::time::timeout(
+        shutdown_deadline.saturating_duration_since(Instant::now()),
+        drain_ordinary,
+    )
     .await
+    .is_err()
     {
-        eprintln!("warning: failed to mark worker draining before exit: {error:#}");
+        eprintln!("warning: ordinary concurrent leases exceeded the drain deadline");
     }
     Ok(())
 }

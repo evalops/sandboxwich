@@ -1591,6 +1591,342 @@ async fn failed_resident_task_retains_exact_metadata_for_reconciliation() {
 }
 
 #[tokio::test]
+async fn resident_shutdown_drain_preserves_the_lease_until_clean_completion() {
+    let cancellation = LeaseCancellation::new();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut tasks = tokio::task::JoinSet::new();
+    let task = tasks.spawn({
+        let cancellation = cancellation.clone();
+        let release = release.clone();
+        async move {
+            release.notified().await;
+            cancellation.reason()
+        }
+    });
+    let metadata = std::collections::HashMap::from([(
+        task.id(),
+        ResidentTaskMetadata {
+            lease_id: sandboxwich_core::LeaseId::new(),
+            process_id: Uuid::new_v4(),
+            generation: 17,
+            cancellation: cancellation.clone(),
+        },
+    )]);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        release.notify_one();
+    });
+    let cancellations = metadata
+        .iter()
+        .map(|(task_id, metadata)| (*task_id, metadata.cancellation.clone()))
+        .collect();
+    let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let drain = drain_resident_tasks_to_channel_until_deadline(
+        &mut tasks,
+        &cancellations,
+        Instant::now() + Duration::from_secs(1),
+        Duration::from_millis(100),
+        result_tx,
+    )
+    .await;
+
+    assert!(!drain.forced_release);
+    assert!(!drain.timed_out);
+    let (_, reason) = result_rx
+        .recv()
+        .await
+        .expect("the clean resident completion is reaped")
+        .expect("the resident task does not panic");
+    assert_eq!(reason, LeaseCancellationReason::None);
+    assert!(!cancellation.signal.is_cancelled());
+}
+
+#[tokio::test]
+async fn resident_shutdown_drain_releases_the_exact_lease_before_the_deadline() {
+    let cancellation = LeaseCancellation::new();
+    let mut tasks = tokio::task::JoinSet::new();
+    let task = tasks.spawn({
+        let cancellation = cancellation.clone();
+        async move {
+            while !cancellation.signal.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+            cancellation.reason()
+        }
+    });
+    let task_id = task.id();
+    let lease_id = sandboxwich_core::LeaseId::new();
+    let metadata = std::collections::HashMap::from([(
+        task_id,
+        ResidentTaskMetadata {
+            lease_id,
+            process_id: Uuid::new_v4(),
+            generation: 19,
+            cancellation: cancellation.clone(),
+        },
+    )]);
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(150);
+    let cancellations = metadata
+        .iter()
+        .map(|(task_id, metadata)| (*task_id, metadata.cancellation.clone()))
+        .collect();
+    let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let drain = drain_resident_tasks_to_channel_until_deadline(
+        &mut tasks,
+        &cancellations,
+        deadline,
+        Duration::from_millis(100),
+        result_tx,
+    )
+    .await;
+
+    assert!(drain.forced_release);
+    assert!(!drain.timed_out);
+    assert!(Instant::now() < deadline);
+    let (reaped_task_id, reason) = result_rx
+        .recv()
+        .await
+        .expect("the fenced resident release is reaped")
+        .expect("the resident task does not panic");
+    assert_eq!(reaped_task_id, task_id);
+    assert_eq!(metadata[&reaped_task_id].lease_id, lease_id);
+    assert_eq!(reason, LeaseCancellationReason::Shutdown);
+}
+
+#[tokio::test]
+async fn resident_shutdown_drain_does_not_cancel_a_cleanly_reaped_peer() {
+    let clean_cancellation = LeaseCancellation::new();
+    let pending_cancellation = LeaseCancellation::new();
+    let clean_release = Arc::new(tokio::sync::Notify::new());
+    let mut tasks = tokio::task::JoinSet::new();
+    let clean_task = tasks.spawn({
+        let cancellation = clean_cancellation.clone();
+        let release = clean_release.clone();
+        async move {
+            release.notified().await;
+            cancellation.reason()
+        }
+    });
+    let pending_task = tasks.spawn({
+        let cancellation = pending_cancellation.clone();
+        async move {
+            while !cancellation.signal.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+            cancellation.reason()
+        }
+    });
+    let metadata = std::collections::HashMap::from([
+        (
+            clean_task.id(),
+            ResidentTaskMetadata {
+                lease_id: sandboxwich_core::LeaseId::new(),
+                process_id: Uuid::new_v4(),
+                generation: 23,
+                cancellation: clean_cancellation.clone(),
+            },
+        ),
+        (
+            pending_task.id(),
+            ResidentTaskMetadata {
+                lease_id: sandboxwich_core::LeaseId::new(),
+                process_id: Uuid::new_v4(),
+                generation: 29,
+                cancellation: pending_cancellation.clone(),
+            },
+        ),
+    ]);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        clean_release.notify_one();
+    });
+    let cancellations = metadata
+        .iter()
+        .map(|(task_id, metadata)| (*task_id, metadata.cancellation.clone()))
+        .collect();
+    let (result_tx, _result_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let drain = drain_resident_tasks_to_channel_until_deadline(
+        &mut tasks,
+        &cancellations,
+        Instant::now() + Duration::from_millis(150),
+        Duration::from_millis(100),
+        result_tx,
+    )
+    .await;
+
+    assert!(drain.forced_release);
+    assert!(!drain.timed_out);
+    assert_eq!(clean_cancellation.reason(), LeaseCancellationReason::None);
+    assert_eq!(
+        pending_cancellation.reason(),
+        LeaseCancellationReason::Shutdown
+    );
+}
+
+#[tokio::test]
+async fn shutdown_deadline_is_not_restarted_after_in_flight_work_finishes() {
+    let shutdown = ShutdownState::new(Duration::from_millis(100));
+    shutdown.request_now();
+    let signal_deadline = shutdown
+        .deadline()
+        .expect("a shutdown request records its absolute deadline");
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    assert_eq!(shutdown.deadline(), Some(signal_deadline));
+    assert!(
+        signal_deadline.saturating_duration_since(Instant::now()) < Duration::from_millis(90),
+        "time spent finishing in-flight work consumes the original shutdown budget"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_watchdog_preserves_the_resident_release_budget() {
+    let shutdown = ShutdownState::new(Duration::from_millis(100));
+    shutdown.request_now();
+    let started = Instant::now();
+
+    drain_watchdog(shutdown, Duration::from_millis(40)).await;
+
+    assert!(started.elapsed() >= Duration::from_millis(45));
+    assert!(
+        started.elapsed() < Duration::from_millis(90),
+        "in-flight work must stop before the resident release budget begins"
+    );
+}
+
+#[tokio::test]
+async fn worker_drain_fence_starts_when_shutdown_is_requested() {
+    let shutdown = ShutdownState::new(Duration::from_millis(100));
+    let request_shutdown = shutdown.clone();
+    let started = Instant::now();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        request_shutdown.request_now();
+    });
+
+    let fence_started_at = run_when_shutdown_requested(shutdown, || async { started.elapsed() })
+        .await
+        .expect("the drain fence starts within the shutdown deadline");
+
+    assert!(
+        fence_started_at < Duration::from_millis(40),
+        "publishing the worker drain fence must not wait for in-flight work"
+    );
+}
+
+#[tokio::test]
+async fn ordinary_and_fast_lane_claim_responses_after_shutdown_are_fenced_releases() {
+    let shutdown = ShutdownState::new(Duration::from_secs(1));
+    shutdown.request_now();
+    let ordinary_lease_id = sandboxwich_core::LeaseId::new();
+    let fast_lane_lease_id = sandboxwich_core::LeaseId::new();
+    let released = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    for claimed_lease_id in [ordinary_lease_id, fast_lane_lease_id] {
+        let admitted = admit_or_release_claimed_work(Some(claimed_lease_id), &shutdown, {
+            let released = released.clone();
+            move |lease_id| async move {
+                released.lock().unwrap().push(lease_id);
+                Ok(())
+            }
+        })
+        .await
+        .expect("shutdown-raced claim is released");
+        assert_eq!(admitted, None);
+    }
+    assert_eq!(
+        *released.lock().unwrap(),
+        vec![ordinary_lease_id, fast_lane_lease_id]
+    );
+
+    let running = ShutdownState::new(Duration::from_secs(1));
+    assert_eq!(
+        admit_or_release_claimed_work(Some(ordinary_lease_id), &running, |_| async {
+            panic!("a claim before shutdown must remain admitted")
+        })
+        .await
+        .unwrap(),
+        Some(ordinary_lease_id)
+    );
+}
+
+#[tokio::test]
+async fn resident_reconciliation_is_bounded_by_the_shutdown_deadline() {
+    let started = Instant::now();
+    let result = complete_before_shutdown_deadline(
+        started + Duration::from_millis(30),
+        std::future::pending::<()>(),
+    )
+    .await;
+
+    assert!(result.is_none());
+    assert!(started.elapsed() < Duration::from_millis(100));
+}
+
+#[tokio::test]
+async fn resident_completion_is_delivered_for_reconciliation_while_a_peer_is_running() {
+    let clean_cancellation = LeaseCancellation::new();
+    let pending_cancellation = LeaseCancellation::new();
+    let clean_release = Arc::new(tokio::sync::Notify::new());
+    let mut tasks = tokio::task::JoinSet::new();
+    let clean_task = tasks.spawn({
+        let release = clean_release.clone();
+        async move {
+            release.notified().await;
+        }
+    });
+    let pending_task = tasks.spawn({
+        let cancellation = pending_cancellation.clone();
+        async move {
+            while !cancellation.signal.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+    let cancellations = std::collections::HashMap::from([
+        (clean_task.id(), clean_cancellation),
+        (pending_task.id(), pending_cancellation),
+    ]);
+    let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
+    let started = Instant::now();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        clean_release.notify_one();
+    });
+
+    let drain_future = drain_resident_tasks_to_channel_until_deadline(
+        &mut tasks,
+        &cancellations,
+        started + Duration::from_millis(150),
+        Duration::from_millis(100),
+        result_tx,
+    );
+    let receive_future = async {
+        let first = result_rx
+            .recv()
+            .await
+            .expect("the clean completion is delivered immediately");
+        first.expect("the clean resident task does not panic");
+        let first_result_at = started.elapsed();
+        while result_rx.recv().await.is_some() {}
+        first_result_at
+    };
+    let (drain, first_result_at) = tokio::join!(drain_future, receive_future);
+
+    assert!(drain.forced_release);
+    assert!(!drain.timed_out);
+    assert!(
+        first_result_at < Duration::from_millis(40),
+        "reconciliation delivery must not wait for the peer's grace deadline"
+    );
+}
+
+#[tokio::test]
 async fn production_resident_task_result_dispatches_failure_and_panic_reconciliation() {
     use axum::{
         Router,
