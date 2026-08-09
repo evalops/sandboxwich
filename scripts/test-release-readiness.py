@@ -80,14 +80,9 @@ class ReleaseReadinessTest(unittest.TestCase):
         with (ROOT / "release-plz.toml").open("rb") as fh:
             config = tomllib.load(fh)
         workspace = config["workspace"]
-        # Only the tag-owning crate needs the expensive git-only baseline.
-        # Disabled workspace peers must not each package the full workspace.
-        self.assertFalse(workspace["git_only"])
+        # Unpublished crates: git tags are the release source of truth.
+        self.assertTrue(workspace["git_only"])
         self.assertFalse(workspace["publish"])
-        packages = {
-            package["name"]: package for package in config.get("package", [])
-        }
-        self.assertTrue(packages["sandboxwich-core"]["git_only"])
         # release.yml owns the GitHub release; release-plz only tags.
         self.assertFalse(workspace["git_release_enable"])
         self.assertEqual(workspace["git_tag_name"], "v{{ version }}")
