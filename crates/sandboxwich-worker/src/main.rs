@@ -1958,6 +1958,10 @@ impl ShutdownState {
         self.plan.get().is_some()
     }
 
+    fn deadline(&self) -> Option<Instant> {
+        self.plan.get().map(|plan| plan.deadline)
+    }
+
     async fn wait_for_plan(&self) -> ShutdownPlan {
         loop {
             let notified = self.plan_ready.notified();
@@ -2026,6 +2030,9 @@ const MIN_RENEW_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 300;
 const MIN_DURABLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_DURABLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+/// Keep a bounded tail of the existing drain timeout for cancelling a resident
+/// process and acknowledging its retryable lease release. The deployment grace
+/// period must not be the mechanism that releases fenced authority.
 const MAX_RESIDENT_SHUTDOWN_RELEASE_BUDGET: Duration = Duration::from_secs(30);
 /// How often the drain watchdog polls the shutdown flag while a lease is being
 /// handled. Small relative to any realistic drain timeout, so it doesn't add
@@ -2065,6 +2072,61 @@ async fn complete_before_shutdown_deadline<F: Future>(
     tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), future)
         .await
         .ok()
+}
+
+async fn release_claimed_lease_for_shutdown(
+    client: &reqwest::Client,
+    api: &str,
+    lease_id: sandboxwich_core::LeaseId,
+    shutdown: &ShutdownState,
+) -> anyhow::Result<LeaseResponse> {
+    let payload = FailLeaseRequest {
+        error: "lease claimed while worker shutdown was requested".to_string(),
+        retry: true,
+    };
+    let deadline = shutdown
+        .deadline()
+        .context("shutdown-raced lease has no shutdown deadline")?;
+    let release_deadline = resident_shutdown_graceful_deadline(
+        deadline,
+        resident_shutdown_release_budget(shutdown.drain_timeout),
+    );
+    complete_before_shutdown_deadline(
+        release_deadline,
+        with_retries(
+            "release shutdown-raced lease",
+            API_RETRY_ATTEMPTS,
+            || async {
+                let response = client
+                    .post(format!("{api}/leases/{lease_id}/fail"))
+                    .json(&payload)
+                    .send()
+                    .await?;
+                decode_json::<LeaseResponse>(response).await
+            },
+        ),
+    )
+    .await
+    .context("shutdown-raced lease release exceeded the shutdown deadline")?
+    .with_context(|| format!("failed to release shutdown-raced lease {lease_id}"))
+}
+
+async fn admit_or_release_claimed_work<T, Release, ReleaseFuture>(
+    claimed: Option<T>,
+    shutdown: &ShutdownState,
+    release: Release,
+) -> anyhow::Result<Option<T>>
+where
+    Release: FnOnce(T) -> ReleaseFuture,
+    ReleaseFuture: Future<Output = anyhow::Result<()>>,
+{
+    match claimed {
+        Some(claimed) if shutdown.is_requested() => {
+            release(claimed).await?;
+            Ok(None)
+        }
+        claimed => Ok(claimed),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2758,7 +2820,22 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
             }
         };
 
-        let Some(lease) = response.lease else {
+        let release_shutdown = shutdown.clone();
+        let response_lease =
+            match admit_or_release_claimed_work(response.lease, &shutdown, |lease| async move {
+                release_claimed_lease_for_shutdown(client, api, lease.id, &release_shutdown)
+                    .await
+                    .map(|_| ())
+            })
+            .await
+            {
+                Ok(lease) => lease,
+                Err(error) => {
+                    eprintln!("error: failed to release shutdown-raced lease: {error:#}");
+                    break;
+                }
+            };
+        let Some(lease) = response_lease else {
             let now = Instant::now();
             if idle_heartbeat_due(last_idle_heartbeat, now) {
                 tracing::info!(
@@ -2897,8 +2974,31 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
                 }), if resident_fast_lane_has_capacity => {
                     match response {
                         Ok(response) => {
-                            let Some(resident_lease) = response.lease else {
-                                continue;
+                            let release_shutdown = shutdown.clone();
+                            let resident_lease = match admit_or_release_claimed_work(
+                                response.lease,
+                                &shutdown,
+                                |lease| async move {
+                                    release_claimed_lease_for_shutdown(
+                                        client,
+                                        api,
+                                        lease.id,
+                                        &release_shutdown,
+                                    )
+                                    .await
+                                    .map(|_| ())
+                                },
+                            )
+                            .await
+                            {
+                                Ok(Some(lease)) => lease,
+                                Ok(None) => continue,
+                                Err(error) => {
+                                    eprintln!(
+                                        "error: failed to release shutdown-raced resident lease: {error:#}"
+                                    );
+                                    continue;
+                                }
                             };
                             let resident_lease_id = resident_lease.id;
                             let fallback_reason = match spawn_provider_isolated_resident_lease(

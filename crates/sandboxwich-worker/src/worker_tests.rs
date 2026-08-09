@@ -1785,6 +1785,70 @@ fn durable_drain_timeout_stays_inside_the_api_deadline_window() {
 }
 
 #[tokio::test]
+async fn ordinary_and_fast_lane_claim_responses_after_shutdown_are_fenced_releases() {
+    let shutdown = ShutdownState::new(Duration::from_secs(1));
+    shutdown.request_now();
+    let ordinary_lease_id = sandboxwich_core::LeaseId::new();
+    let fast_lane_lease_id = sandboxwich_core::LeaseId::new();
+    let released = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    for claimed_lease_id in [ordinary_lease_id, fast_lane_lease_id] {
+        let admitted = admit_or_release_claimed_work(Some(claimed_lease_id), &shutdown, {
+            let released = released.clone();
+            move |lease_id| async move {
+                released.lock().unwrap().push(lease_id);
+                Ok(())
+            }
+        })
+        .await
+        .expect("shutdown-raced claim is released");
+        assert_eq!(admitted, None);
+    }
+    assert_eq!(
+        *released.lock().unwrap(),
+        vec![ordinary_lease_id, fast_lane_lease_id]
+    );
+
+    let running = ShutdownState::new(Duration::from_secs(1));
+    assert_eq!(
+        admit_or_release_claimed_work(Some(ordinary_lease_id), &running, |_| async {
+            panic!("a claim before shutdown must remain admitted")
+        })
+        .await
+        .unwrap(),
+        Some(ordinary_lease_id)
+    );
+}
+
+#[tokio::test]
+async fn shutdown_watchdog_preserves_the_resident_release_budget() {
+    let shutdown = ShutdownState::new(Duration::from_millis(100));
+    shutdown.request_now();
+    let started = Instant::now();
+
+    drain_watchdog(shutdown, Duration::from_millis(40)).await;
+
+    assert!(started.elapsed() >= Duration::from_millis(45));
+    assert!(
+        started.elapsed() < Duration::from_millis(90),
+        "in-flight work must stop before the resident release budget begins"
+    );
+}
+
+#[tokio::test]
+async fn resident_reconciliation_is_bounded_by_the_shutdown_deadline() {
+    let started = Instant::now();
+    let result = complete_before_shutdown_deadline(
+        started + Duration::from_millis(30),
+        std::future::pending::<()>(),
+    )
+    .await;
+
+    assert!(result.is_none());
+    assert!(started.elapsed() < Duration::from_millis(100));
+}
+
+#[tokio::test]
 async fn production_resident_task_result_dispatches_failure_and_panic_reconciliation() {
     use axum::{
         Router,
