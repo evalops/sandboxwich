@@ -729,6 +729,74 @@
         ],
         "type": "object"
       },
+      "DrainLeaseFence": {
+        "properties": {
+          "attempt": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "jobId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "leaseId": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "leaseId",
+          "jobId",
+          "attempt"
+        ],
+        "type": "object"
+      },
+      "DrainReceipt": {
+        "properties": {
+          "hardDeadline": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "leases": {
+            "items": {
+              "$ref": "#/components/schemas/DrainLeaseFence"
+            },
+            "type": "array"
+          },
+          "shutdownId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "workerId": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "shutdownId",
+          "workerId",
+          "hardDeadline",
+          "leases"
+        ],
+        "type": "object"
+      },
+      "DrainWorkerRequest": {
+        "properties": {
+          "hardDeadline": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "shutdownId": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "shutdownId",
+          "hardDeadline"
+        ],
+        "type": "object"
+      },
       "ErrorEnvelope": {
         "properties": {
           "code": {
@@ -5620,12 +5688,42 @@
     },
     "/v1/workers/{worker_id}/drain": {
       "post": {
-        "operationId": "post_workers__worker_id__drain",
+        "operationId": "drain_worker",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "worker_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/DrainWorkerRequest"
+                  }
+                ]
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
-            "description": "Successful response"
+            "description": "Worker admission closed; typed requests return a durable drain receipt"
           }
-        }
+        },
+        "tags": [
+          "crate::handlers::workers"
+        ]
       }
     },
     "/v1/workers/{worker_id}/heartbeat": {

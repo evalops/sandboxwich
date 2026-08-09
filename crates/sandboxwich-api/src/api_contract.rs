@@ -48,6 +48,7 @@ use sandboxwich_core::{
         crate::handlers::sterile_cells::release_sterile_cell_lease,
         crate::handlers::sterile_cells::destroy_sterile_cell,
         crate::handlers::sterile_cells::release_sterile_pool_cell,
+        crate::handlers::workers::drain_worker,
         crate::handlers::operations::get_operation,
         crate::handlers::operations::cancel_operation,
         crate::handlers::divergence::append_tool_call_ledger,
@@ -126,6 +127,9 @@ use sandboxwich_core::{
         ,sandboxwich_core::ReleaseSterileCellLeaseRequestV1
         ,sandboxwich_core::SterileCellLeaseStatusV1
         ,sandboxwich_core::SterileCellLeaseStatusResponseV1
+        ,crate::handlers::workers::DrainWorkerRequest
+        ,crate::handlers::workers::DrainLeaseFence
+        ,crate::handlers::workers::DrainReceipt
     )),
     tags((name = "operations", description = "Asynchronous operation lifecycle"))
 )]

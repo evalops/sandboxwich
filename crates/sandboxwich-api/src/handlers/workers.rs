@@ -17,25 +17,28 @@ use sqlx::Row;
 use std::time::Instant;
 use uuid::Uuid;
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DrainWorkerRequest {
     pub(crate) shutdown_id: Uuid,
     pub(crate) hard_deadline: DateTime<Utc>,
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DrainLeaseFence {
+    #[schema(value_type = Uuid)]
     pub(crate) lease_id: LeaseId,
+    #[schema(value_type = Uuid)]
     pub(crate) job_id: JobId,
     pub(crate) attempt: i64,
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DrainReceipt {
     pub(crate) shutdown_id: Uuid,
+    #[schema(value_type = Uuid)]
     pub(crate) worker_id: WorkerId,
     pub(crate) hard_deadline: DateTime<Utc>,
     pub(crate) leases: Vec<DrainLeaseFence>,
@@ -599,6 +602,13 @@ async fn fetch_worker_by_logical_identity(
         .transpose()
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/workers/{worker_id}/drain",
+    params(("worker_id" = Uuid, Path)),
+    request_body = Option<DrainWorkerRequest>,
+    responses((status = 200, description = "Worker admission closed; typed requests return a durable drain receipt"))
+)]
 pub(crate) async fn drain_worker(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
