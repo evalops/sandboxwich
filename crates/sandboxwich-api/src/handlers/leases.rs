@@ -841,13 +841,25 @@ pub(crate) async fn renew_lease(
     // GH-64: guest-facing route -- only the worker holding this lease may
     // renew it; tenant-wide tokens are rejected.
     let lease = ensure_lease_worker_scope(&state.db, lease_id, &ctx).await?;
+    let mut tx = state.db.pool.begin().await?;
+    // Serialize renewal with drain publication through the same worker row.
+    // If renewal wins, drain subsequently caps it; if drain wins, this request
+    // observes and applies the durable deadline below.
+    let worker_lock_sql = format!(
+        "update workers set last_heartbeat_at = last_heartbeat_at where id = {}",
+        state.db.placeholder(1)
+    );
+    sqlx::query(&worker_lock_sql)
+        .bind(lease.worker_id.to_string())
+        .execute(&mut *tx)
+        .await?;
     let cancel_sql = format!(
         "select cancel_requested_at, cancel_reason from job_leases where id = {}",
         state.db.placeholder(1)
     );
     if let Some(row) = sqlx::query(&cancel_sql)
         .bind(lease_id.to_string())
-        .fetch_optional(&state.db.pool)
+        .fetch_optional(&mut *tx)
         .await?
     {
         let cancel_requested_at: Option<String> = row.try_get("cancel_requested_at")?;
@@ -860,8 +872,36 @@ pub(crate) async fn renew_lease(
         }
     }
     let now = Utc::now();
-    let expires_at =
+    let requested_expires_at =
         now + chrono::Duration::seconds(effective_lease_seconds(request.lease_seconds) as i64);
+    let deadline_sql = format!(
+        "select hard_deadline from worker_drain_lease_fences
+         where lease_id = {} and worker_id = {} and job_id = {} and attempt = {}
+           and resolved_at is null
+         order by hard_deadline asc limit 1",
+        state.db.placeholder(1),
+        state.db.placeholder(2),
+        state.db.placeholder(3),
+        state.db.placeholder(4)
+    );
+    let hard_deadline = sqlx::query(&deadline_sql)
+        .bind(lease.id.to_string())
+        .bind(lease.worker_id.to_string())
+        .bind(lease.job_id.to_string())
+        .bind(lease.attempt)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| parse_timestamp(row.try_get("hard_deadline")?))
+        .transpose()?;
+    if hard_deadline.is_some_and(|deadline| deadline <= now) {
+        return Err(ApiError::conflict_code(
+            "worker_drain_deadline_elapsed",
+            "worker drain deadline has elapsed",
+        ));
+    }
+    let expires_at = hard_deadline
+        .map(|deadline| requested_expires_at.min(deadline))
+        .unwrap_or(requested_expires_at);
     let sql = format!(
         "update job_leases
          set expires_at = {}
@@ -873,7 +913,7 @@ pub(crate) async fn renew_lease(
     let result = sqlx::query(&sql)
         .bind(expires_at.to_rfc3339())
         .bind(lease_id.to_string())
-        .execute(&state.db.pool)
+        .execute(&mut *tx)
         .await?;
     if result.rows_affected() == 0 {
         // Distinguish cancellation (race with stop) from ordinary expiry.
@@ -883,7 +923,7 @@ pub(crate) async fn renew_lease(
         );
         if let Some(row) = sqlx::query(&cancel_sql)
             .bind(lease_id.to_string())
-            .fetch_optional(&state.db.pool)
+            .fetch_optional(&mut *tx)
             .await?
         {
             let cancel_requested_at: Option<String> = row.try_get("cancel_requested_at")?;
@@ -896,6 +936,7 @@ pub(crate) async fn renew_lease(
         }
         return Err(ApiError::not_found("active lease not found"));
     }
+    tx.commit().await?;
     if lease.job.kind == JobKind::RunResidentProcess {
         let stopped_sql = format!(
             "select 1 from resident_processes where id = {} and desired_state = 'stopped'",
@@ -1494,6 +1535,11 @@ pub(crate) async fn complete_lease_in_transaction(
 
     let completed = async {
         let lease = fetch_lease_on_connection(db, &mut tx, lease_id).await?;
+        lock_worker_for_lease_terminalization_on_connection(db, &mut tx, lease.worker_id).await?;
+        // Drain capture owns the same worker-row lock. Re-read after acquiring
+        // it so a terminal transition that waited for drain observes the
+        // committed fence and resolves it in this transaction.
+        let lease = fetch_lease_on_connection(db, &mut tx, lease_id).await?;
         if lease.status == LeaseStatus::Completed {
             let stored_fingerprint: Option<String> = sqlx::query_scalar(&format!(
                 "select completion_fingerprint from job_leases where id = {}",
@@ -1556,6 +1602,8 @@ pub(crate) async fn complete_lease_in_transaction(
         update_job_status_on_connection(db, &mut tx, lease.job_id, JobStatus::Succeeded, None, now)
             .await?;
         record_terminal_slo_observation(db, &mut tx, &lease, successful, now).await?;
+        resolve_captured_worker_drain_fence_on_connection(db, &mut tx, &lease, "completed", now)
+            .await?;
 
         // Reflect durable transitions in the response without a third lease+job
         // SELECT (auth path already loaded once; completion mutates known fields).
@@ -1640,6 +1688,8 @@ pub(crate) async fn fail_lease_in_transaction(
 
     let failed = async {
         let lease = fetch_lease_on_connection(db, &mut tx, lease_id).await?;
+        lock_worker_for_lease_terminalization_on_connection(db, &mut tx, lease.worker_id).await?;
+        let lease = fetch_lease_on_connection(db, &mut tx, lease_id).await?;
         if lease.status == LeaseStatus::Failed {
             return Ok(lease);
         }
@@ -1686,6 +1736,8 @@ pub(crate) async fn fail_lease_in_transaction(
         lease.error = Some(error.to_string());
         lease.job.updated_at = now;
         lease.job.last_error = Some(error.to_string());
+        resolve_captured_worker_drain_fence_on_connection(db, &mut tx, &lease, "failed", now)
+            .await?;
         Ok(lease)
     }
     .await;
@@ -1758,6 +1810,105 @@ pub(crate) async fn expire_due_leases(db: &Database) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Resolves durable drain obligations after their hard deadline. The stored
+/// worker/job/attempt tuple is checked before the lease transition so a stale
+/// receipt can never act on replacement authority.
+pub(crate) async fn reconcile_due_worker_drain_fences(db: &Database) -> Result<(), ApiError> {
+    const DRAIN_FENCE_BATCH_SIZE: u32 = 1_000;
+    let now = Utc::now();
+    let due_sql = format!(
+        "select shutdown_id, lease_id, worker_id, job_id, attempt
+         from worker_drain_lease_fences
+         where resolved_at is null and hard_deadline <= {}
+         order by hard_deadline asc, lease_id asc
+         limit {DRAIN_FENCE_BATCH_SIZE}",
+        db.placeholder(1)
+    );
+    let rows = sqlx::query(&due_sql)
+        .bind(now.to_rfc3339())
+        .fetch_all(&db.pool)
+        .await?;
+
+    for row in rows {
+        let shutdown_id: String = row.try_get("shutdown_id")?;
+        let lease_id = LeaseId(parse_uuid(row.try_get("lease_id")?)?);
+        let expected_worker_id: String = row.try_get("worker_id")?;
+        let expected_job_id: String = row.try_get("job_id")?;
+        let expected_attempt: i64 = row.try_get("attempt")?;
+        let lease_sql = format!(
+            "select worker_id, job_id, attempt, status from job_leases where id = {}",
+            db.placeholder(1)
+        );
+        let Some(lease_row) = sqlx::query(&lease_sql)
+            .bind(lease_id.to_string())
+            .fetch_optional(&db.pool)
+            .await?
+        else {
+            continue;
+        };
+        let tuple_matches = lease_row.try_get::<String, _>("worker_id")? == expected_worker_id
+            && lease_row.try_get::<String, _>("job_id")? == expected_job_id
+            && lease_row.try_get::<i64, _>("attempt")? == expected_attempt;
+        let mut status: String = lease_row.try_get("status")?;
+        if !tuple_matches {
+            resolve_worker_drain_fence(db, &shutdown_id, lease_id, "stale_fence", now).await?;
+            continue;
+        }
+        if status == "active" {
+            expire_lease_if_still_active(db, lease_id, now).await?;
+            status = sqlx::query(&lease_sql)
+                .bind(lease_id.to_string())
+                .fetch_one(&db.pool)
+                .await?
+                .try_get("status")?;
+        }
+        if status != "active" {
+            resolve_worker_drain_fence(db, &shutdown_id, lease_id, &status, now).await?;
+        }
+    }
+    let retire_sql = format!(
+        "update worker_drain_receipts set retired_at = {}
+         where retired_at is null and hard_deadline <= {}
+           and not exists (
+             select 1 from worker_drain_lease_fences
+             where shutdown_id = worker_drain_receipts.shutdown_id and resolved_at is null
+           )",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    sqlx::query(&retire_sql)
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+async fn resolve_worker_drain_fence(
+    db: &Database,
+    shutdown_id: &str,
+    lease_id: LeaseId,
+    outcome: &str,
+    resolved_at: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "update worker_drain_lease_fences set outcome = {}, resolved_at = {}
+         where shutdown_id = {} and lease_id = {} and resolved_at is null",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4)
+    );
+    sqlx::query(&sql)
+        .bind(outcome)
+        .bind(resolved_at.to_rfc3339())
+        .bind(shutdown_id)
+        .bind(lease_id.to_string())
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
 /// Atomically transitions a single lease from `active` to `expired` and, only if
 /// this caller actually won that transition, applies the job re-queue/fail side
 /// effects. Concurrent callers racing on the same expired lease (e.g. multiple
@@ -1771,6 +1922,8 @@ pub(crate) async fn expire_lease_if_still_active(
 ) -> Result<(), ApiError> {
     let mut tx = db.pool.begin().await?;
     let outcome = async {
+        let lease = fetch_lease_on_connection(db, &mut tx, lease_id).await?;
+        lock_worker_for_lease_terminalization_on_connection(db, &mut tx, lease.worker_id).await?;
         let won_transition =
             expire_active_lease_on_connection(db, &mut tx, lease_id, now, "lease expired").await?;
         if !won_transition {
@@ -1780,6 +1933,8 @@ pub(crate) async fn expire_lease_if_still_active(
         }
 
         let lease = fetch_lease_on_connection(db, &mut tx, lease_id).await?;
+        resolve_captured_worker_drain_fence_on_connection(db, &mut tx, &lease, "expired", now)
+            .await?;
         let job = lease.job.clone();
         if resident_process_desires_stop(db, &mut tx, &job).await? {
             let process_id = resident_process_id_from_job(&job)?;
@@ -1840,6 +1995,55 @@ pub(crate) async fn expire_lease_if_still_active(
             Err(error)
         }
     }
+}
+
+async fn resolve_captured_worker_drain_fence_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    lease: &JobLease,
+    outcome: &str,
+    resolved_at: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "update worker_drain_lease_fences set outcome = {}, resolved_at = {}
+         where lease_id = {} and worker_id = {} and job_id = {} and attempt = {}
+           and resolved_at is null",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4),
+        db.placeholder(5),
+        db.placeholder(6)
+    );
+    sqlx::query(&sql)
+        .bind(outcome)
+        .bind(resolved_at.to_rfc3339())
+        .bind(lease.id.to_string())
+        .bind(lease.worker_id.to_string())
+        .bind(lease.job_id.to_string())
+        .bind(lease.attempt)
+        .execute(&mut *connection)
+        .await?;
+    Ok(())
+}
+
+async fn lock_worker_for_lease_terminalization_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    worker_id: WorkerId,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "update workers set last_heartbeat_at = last_heartbeat_at where id = {}",
+        db.placeholder(1)
+    );
+    let locked = sqlx::query(&sql)
+        .bind(worker_id.to_string())
+        .execute(&mut *connection)
+        .await?;
+    if locked.rows_affected() != 1 {
+        return Err(ApiError::not_found("worker not found"));
+    }
+    Ok(())
 }
 
 async fn resident_process_desires_stop(

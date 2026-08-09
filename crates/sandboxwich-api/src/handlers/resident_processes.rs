@@ -996,7 +996,9 @@ pub(crate) async fn put_resident_process(
         });
     let is_maestro_hosted_runner = name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME;
 
-    if let Ok(current) = fetch_named_resident_process(&state.db, sandbox_id, &name).await {
+    let replacement = if let Ok(current) =
+        fetch_named_resident_process(&state.db, sandbox_id, &name).await
+    {
         if matches!(
             name.as_str(),
             ORB_SIDECAR_RESIDENT_PROCESS_NAME | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
@@ -1008,13 +1010,14 @@ pub(crate) async fn put_resident_process(
                 "the existing orb-sidecar predates supported provider isolation and cannot be reused",
             ));
         }
-        if request.expected_generation != current.generation {
-            return Err(ApiError::conflict_code(
-                "resident_process_generation_conflict",
-                "resident process generation changed",
-            ));
-        }
-        if same_spec(&current, &request, bootstrap_digest.as_deref()) {
+        let same_spec = same_spec(&current, &request, bootstrap_digest.as_deref());
+        let exact_replay = request.expected_generation == current.generation
+            || (request.replace_terminal
+                && request
+                    .expected_generation
+                    .checked_add(1)
+                    .is_some_and(|generation| generation == current.generation));
+        if same_spec && exact_replay {
             if let Some(activation) = request.sterile_activation.as_ref() {
                 validate_sterile_resident_activation_replay(
                     &state.db,
@@ -1035,20 +1038,69 @@ pub(crate) async fn put_resident_process(
                 }),
             ));
         }
+        if request.expected_generation != current.generation {
+            return Err(ApiError::conflict_code(
+                "resident_process_generation_conflict",
+                "resident process generation changed",
+            ));
+        }
+        if !request.replace_terminal {
+            return Err(ApiError::conflict_code(
+                "resident_process_spec_conflict",
+                "resident process already exists with a different specification",
+            ));
+        }
+        if current.active_lease_id.is_some()
+            || !matches!(
+                current.observed_state,
+                ResidentProcessObservedState::Failed
+                    | ResidentProcessObservedState::Stopped
+                    | ResidentProcessObservedState::Lost
+            )
+        {
+            return Err(ApiError::conflict_code(
+                "resident_process_replacement_not_terminal",
+                "resident process replacement requires a terminal process with no active lease",
+            ));
+        }
+        if current.sterile_cell_id.is_some() || request.sterile_activation.is_some() {
+            return Err(ApiError::conflict_code(
+                "sterile_resident_replacement_unsupported",
+                "sterile resident activation cannot be replaced in place",
+            ));
+        }
+        Some(current)
+    } else {
+        None
+    };
+    if replacement.is_none() && request.replace_terminal {
         return Err(ApiError::conflict_code(
-            "resident_process_spec_conflict",
-            "resident process already exists with a different specification",
+            "resident_process_replacement_target_missing",
+            "terminal replacement requires an existing resident process",
         ));
     }
-    if request.expected_generation != 0 {
+    if replacement.is_none() && request.expected_generation != 0 {
         return Err(ApiError::conflict_code(
             "resident_process_generation_conflict",
             "new resident process requires expectedGeneration=0",
         ));
     }
     let now = Utc::now();
+    let (process_id, process_generation, process_created_at) = match replacement.as_ref() {
+        Some(current) => (
+            current.id,
+            current.generation.checked_add(1).ok_or_else(|| {
+                ApiError::conflict_code(
+                    "resident_process_generation_conflict",
+                    "resident process generation cannot advance",
+                )
+            })?,
+            current.created_at,
+        ),
+        None => (ResidentProcessId::new(), 1, now),
+    };
     let process = ResidentProcess {
-        id: ResidentProcessId::new(),
+        id: process_id,
         sandbox_id,
         tenant_id: sandbox.tenant_id.clone(),
         name,
@@ -1080,7 +1132,7 @@ pub(crate) async fn put_resident_process(
         restart_policy: request.restart_policy,
         desired_state: ResidentProcessDesiredState::Running,
         observed_state: ResidentProcessObservedState::Pending,
-        generation: 1,
+        generation: process_generation,
         active_lease_id: None,
         pid: None,
         started_at: None,
@@ -1090,7 +1142,7 @@ pub(crate) async fn put_resident_process(
         last_error_class: None,
         last_error_code: None,
         last_error: None,
-        created_at: now,
+        created_at: process_created_at,
         updated_at: now,
     };
     let mut job = Job {
@@ -1161,8 +1213,8 @@ pub(crate) async fn put_resident_process(
     }
 
     let sterile_activation = request.sterile_activation.take();
-    let bootstrap_reservation = match request.bootstrap.take() {
-        Some(bootstrap) => Some(state.resident_bootstraps.reserve(LiveResidentBootstrap {
+    let reserve_bootstrap = |bootstrap: ResidentProcessBootstrap| {
+        let bootstrap = LiveResidentBootstrap {
             tenant_id: process.tenant_id.clone(),
             content: bootstrap.content,
             sha256: bootstrap_digest.clone().unwrap_or_default(),
@@ -1170,7 +1222,18 @@ pub(crate) async fn put_resident_process(
             mode: bootstrap.mode,
             generation: process.generation,
             sterile_activation: sterile_activation.clone(),
-        })),
+        };
+        match replacement.as_ref() {
+            Some(current) => state.resident_bootstraps.reserve_replacement(
+                bootstrap,
+                process.id,
+                current.generation,
+            ),
+            None => state.resident_bootstraps.reserve(bootstrap),
+        }
+    };
+    let bootstrap_reservation = match request.bootstrap.take() {
+        Some(bootstrap) => Some(reserve_bootstrap(bootstrap)),
         None => sterile_activation.clone().map(|activation| {
             state.resident_bootstraps.reserve(LiveResidentBootstrap {
                 tenant_id: process.tenant_id.clone(),
@@ -1219,39 +1282,101 @@ pub(crate) async fn put_resident_process(
         )
         .await?;
     }
-    sqlx::query(&insert_sql)
-        .bind(process.id.to_string())
-        .bind(process.sandbox_id.to_string())
-        .bind(&process.tenant_id)
-        .bind(&process.name)
-        .bind(serde_json::to_string(&process.argv)?)
-        .bind(&process.cwd)
-        .bind(serde_json::to_string(&process.env)?)
-        .bind(&process.bootstrap_sha256)
-        .bind(process.bootstrap_byte_count.map(|value| value as i64))
-        .bind(&process.bootstrap_target_file)
-        .bind(process.bootstrap_mode.map(i64::from))
-        .bind(process.restart_policy.as_db_str())
-        .bind(process.desired_state.as_db_str())
-        .bind(process.observed_state.as_db_str())
-        .bind(process.generation as i64)
-        .bind(
-            if matches!(
-                process.name.as_str(),
-                ORB_SIDECAR_RESIDENT_PROCESS_NAME | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
-            ) {
-                i64::from(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION)
-            } else {
-                0
-            },
-        )
-        .bind(process.sterile_cell_id.map(|value| value.to_string()))
-        .bind(process.sterile_lease_id.map(|value| value.to_string()))
-        .bind(process.sterile_lease_generation.map(|value| value as i64))
-        .bind(process.created_at.to_rfc3339())
-        .bind(process.updated_at.to_rfc3339())
-        .execute(&mut *tx)
-        .await?;
+    if let Some(current) = replacement.as_ref() {
+        let update_sql = format!(
+            "update resident_processes
+             set argv = {}, cwd = {}, env = {}, bootstrap_sha256 = {},
+                 bootstrap_byte_count = {}, bootstrap_target_file = {}, bootstrap_mode = {},
+                 restart_policy = {}, desired_state = 'running', observed_state = 'pending',
+                 generation = {}, active_lease_id = null, pid = null,
+                 started_at = null, ready_at = null, exited_at = null, exit_code = null,
+                 last_error_class = null, last_error_code = null, last_error = null,
+                 bootstrap_consumed_at = null, bootstrap_delivered_generation = null,
+                 bootstrap_delivered_lease_id = null, bootstrap_delivered_sha256 = null,
+                 bootstrap_acknowledged_at = null, provider_pod_name = null,
+                 provider_pod_uid = null, updated_at = {}
+             where id = {} and tenant_id = {} and generation = {}
+               and active_lease_id is null
+               and observed_state in ('failed', 'stopped', 'lost')",
+            state.db.placeholder(1),
+            state.db.placeholder(2),
+            state.db.placeholder(3),
+            state.db.placeholder(4),
+            state.db.placeholder(5),
+            state.db.placeholder(6),
+            state.db.placeholder(7),
+            state.db.placeholder(8),
+            state.db.placeholder(9),
+            state.db.placeholder(10),
+            state.db.placeholder(11),
+            state.db.placeholder(12),
+            state.db.placeholder(13),
+        );
+        let updated = sqlx::query(&update_sql)
+            .bind(serde_json::to_string(&process.argv)?)
+            .bind(&process.cwd)
+            .bind(serde_json::to_string(&process.env)?)
+            .bind(&process.bootstrap_sha256)
+            .bind(process.bootstrap_byte_count.map(|value| value as i64))
+            .bind(&process.bootstrap_target_file)
+            .bind(process.bootstrap_mode.map(i64::from))
+            .bind(process.restart_policy.as_db_str())
+            .bind(process.generation as i64)
+            .bind(process.updated_at.to_rfc3339())
+            .bind(process.id.to_string())
+            .bind(&process.tenant_id)
+            .bind(current.generation as i64)
+            .execute(&mut *tx)
+            .await?;
+        if updated.rows_affected() != 1 {
+            return Err(ApiError::conflict_code(
+                "resident_process_generation_conflict",
+                "resident process changed before terminal replacement",
+            ));
+        }
+        let delete_handoff_sql = format!(
+            "delete from resident_bootstrap_handoffs where resident_process_id = {}",
+            state.db.placeholder(1)
+        );
+        sqlx::query(&delete_handoff_sql)
+            .bind(process.id.to_string())
+            .execute(&mut *tx)
+            .await?;
+    } else {
+        sqlx::query(&insert_sql)
+            .bind(process.id.to_string())
+            .bind(process.sandbox_id.to_string())
+            .bind(&process.tenant_id)
+            .bind(&process.name)
+            .bind(serde_json::to_string(&process.argv)?)
+            .bind(&process.cwd)
+            .bind(serde_json::to_string(&process.env)?)
+            .bind(&process.bootstrap_sha256)
+            .bind(process.bootstrap_byte_count.map(|value| value as i64))
+            .bind(&process.bootstrap_target_file)
+            .bind(process.bootstrap_mode.map(i64::from))
+            .bind(process.restart_policy.as_db_str())
+            .bind(process.desired_state.as_db_str())
+            .bind(process.observed_state.as_db_str())
+            .bind(process.generation as i64)
+            .bind(
+                if matches!(
+                    process.name.as_str(),
+                    ORB_SIDECAR_RESIDENT_PROCESS_NAME | MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME
+                ) {
+                    i64::from(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION)
+                } else {
+                    0
+                },
+            )
+            .bind(process.sterile_cell_id.map(|value| value.to_string()))
+            .bind(process.sterile_lease_id.map(|value| value.to_string()))
+            .bind(process.sterile_lease_generation.map(|value| value as i64))
+            .bind(process.created_at.to_rfc3339())
+            .bind(process.updated_at.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+    }
     insert_job_on_connection(&state.db, &mut tx, &job).await?;
     // Seal the shared ephemeral copy in the same transaction as the row it
     // belongs to, so a crash between the two can never leave a resident
@@ -1277,8 +1402,28 @@ pub(crate) async fn put_resident_process(
     }
     drop(handoff_bootstrap);
     tx.commit().await?;
-    if let Some(reservation) = bootstrap_reservation {
-        reservation.publish(process.id);
+    match (bootstrap_reservation, replacement.as_ref()) {
+        (Some(reservation), Some(current)) => {
+            if reservation
+                .publish_replacement(process.id, current.generation)
+                .is_err()
+            {
+                tracing::error!(
+                    resident_process_id = %process.id,
+                    generation = process.generation,
+                    "durable resident replacement could not publish its process-local bootstrap"
+                );
+            }
+        }
+        (Some(reservation), None) => {
+            reservation.publish(process.id);
+        }
+        (None, Some(current)) => {
+            state
+                .resident_bootstraps
+                .discard_generation(&process.id, current.generation);
+        }
+        (None, None) => {}
     }
 
     let process_id = process.id.0;
