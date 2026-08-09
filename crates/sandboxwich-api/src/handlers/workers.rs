@@ -32,6 +32,10 @@ pub(crate) struct DrainLeaseFence {
     #[schema(value_type = Uuid)]
     pub(crate) job_id: JobId,
     pub(crate) attempt: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) resolved_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
@@ -788,7 +792,8 @@ async fn fetch_drain_receipt_on_connection(
     let worker_id = WorkerId(parse_uuid(row.try_get::<&str, _>("worker_id")?)?);
     let hard_deadline = parse_timestamp(row.try_get("hard_deadline")?)?;
     let leases_sql = format!(
-        "select lease_id, job_id, attempt from worker_drain_lease_fences
+        "select lease_id, job_id, attempt, outcome, resolved_at
+         from worker_drain_lease_fences
          where shutdown_id = {} order by lease_id asc",
         db.placeholder(1)
     );
@@ -798,10 +803,16 @@ async fn fetch_drain_receipt_on_connection(
         .await?
         .into_iter()
         .map(|row| {
+            let resolved_at = row
+                .try_get::<Option<String>, _>("resolved_at")?
+                .map(|value| parse_timestamp(&value))
+                .transpose()?;
             Ok(DrainLeaseFence {
                 lease_id: LeaseId(parse_uuid(row.try_get::<&str, _>("lease_id")?)?),
                 job_id: JobId(parse_uuid(row.try_get::<&str, _>("job_id")?)?),
                 attempt: row.try_get("attempt")?,
+                outcome: row.try_get("outcome")?,
+                resolved_at,
             })
         })
         .collect::<Result<Vec<_>, ApiError>>()?;

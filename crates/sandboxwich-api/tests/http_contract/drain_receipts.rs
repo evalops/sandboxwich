@@ -35,6 +35,10 @@ struct DrainLeaseFence {
     lease_id: LeaseId,
     job_id: JobId,
     attempt: i64,
+    #[serde(default)]
+    outcome: Option<String>,
+    #[serde(default)]
+    resolved_at: Option<DateTime<Utc>>,
 }
 
 async fn register_worker(server: &TestServer, name: &str) -> WorkerResponse {
@@ -357,6 +361,12 @@ async fn deadline_sweeper_resolves_the_exact_fenced_lease_and_records_receipt_pr
             .unwrap()
             .is_some()
     );
+    let replay = drain(&server, &worker, &request).await;
+    assert_eq!(
+        replay.drain_receipt.leases[0].outcome.as_deref(),
+        Some("expired")
+    );
+    assert!(replay.drain_receipt.leases[0].resolved_at.is_some());
 }
 
 #[tokio::test]
