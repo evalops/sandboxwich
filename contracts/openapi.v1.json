@@ -2264,6 +2264,10 @@
             "minimum": 0,
             "type": "integer"
           },
+          "replaceTerminal": {
+            "description": "Explicitly replace an authoritative terminal resident at\n`expected_generation`. Live or leased residents always reject this.",
+            "type": "boolean"
+          },
           "restartPolicy": {
             "$ref": "#/components/schemas/ResidentProcessRestartPolicy"
           },
