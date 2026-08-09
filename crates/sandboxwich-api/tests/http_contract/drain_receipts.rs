@@ -217,6 +217,31 @@ async fn drain_receipt_is_idempotent_and_captures_exact_active_leases() {
 }
 
 #[tokio::test]
+async fn drain_receipt_replay_remains_available_after_the_hard_deadline() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("late-replay.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let worker = register_worker(&server, "late-replay-worker").await;
+    let request = DrainWorkerRequest {
+        shutdown_id: Uuid::new_v4(),
+        hard_deadline: Utc::now() + ChronoDuration::seconds(1),
+    };
+    let first = drain(&server, &worker, &request).await;
+
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    let replay = drain(&server, &worker, &request).await;
+    assert_eq!(
+        replay.drain_receipt.shutdown_id,
+        first.drain_receipt.shutdown_id
+    );
+    assert_eq!(replay.drain_receipt.hard_deadline, request.hard_deadline);
+}
+
+#[tokio::test]
 async fn draining_worker_cannot_claim_jobs_created_after_admission_closes() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!(

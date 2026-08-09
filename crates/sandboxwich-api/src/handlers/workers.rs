@@ -636,17 +636,6 @@ pub(crate) async fn drain_worker(
         }));
     };
     let now = Utc::now();
-    if request.hard_deadline <= now {
-        return Err(ApiError::bad_request(
-            "drain hard deadline must be in the future",
-        ));
-    }
-    if request.hard_deadline > now + chrono::Duration::hours(1) {
-        return Err(ApiError::bad_request(
-            "drain hard deadline cannot exceed one hour",
-        ));
-    }
-
     let mut tx = state.db.pool.begin().await?;
     let receipt = async {
         let existing_sql = format!(
@@ -672,6 +661,16 @@ pub(crate) async fn drain_worker(
                 ));
             }
         } else {
+            if request.hard_deadline <= now {
+                return Err(ApiError::bad_request(
+                    "drain hard deadline must be in the future",
+                ));
+            }
+            if request.hard_deadline > now + chrono::Duration::hours(1) {
+                return Err(ApiError::bad_request(
+                    "drain hard deadline cannot exceed one hour",
+                ));
+            }
             // This write is the claim/drain serialization point. A claim that
             // commits first is captured below; a drain that commits first
             // prevents the claim's online-only lock from succeeding.
