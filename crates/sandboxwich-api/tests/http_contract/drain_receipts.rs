@@ -347,6 +347,133 @@ async fn draining_worker_renewal_is_capped_at_the_receipt_deadline() {
 }
 
 #[tokio::test]
+async fn captured_leases_resolve_receipt_progress_when_they_finish_before_deadline() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("early-terminal.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let worker = register_worker(&server, "early-terminal-worker").await;
+    let completed_sandbox = create_provision_job(&server, "completed-sandbox").await;
+    let failed_sandbox = create_provision_job(&server, "failed-sandbox").await;
+    let completed_lease = claim_provision_job(&server, &worker, completed_sandbox.sandbox.id)
+        .await
+        .unwrap();
+    let failed_lease = claim_provision_job(&server, &worker, failed_sandbox.sandbox.id)
+        .await
+        .unwrap();
+    let request = DrainWorkerRequest {
+        shutdown_id: Uuid::new_v4(),
+        hard_deadline: Utc::now() + ChronoDuration::seconds(30),
+    };
+    drain(&server, &worker, &request).await;
+
+    worker_client(&worker)
+        .post(format!(
+            "{}/leases/{}/complete",
+            server.base_url, completed_lease.id
+        ))
+        .json(&CompleteLeaseRequest {
+            result: Some(WorkerJobResult::ProvisionSandbox {
+                handle: ProviderSandboxHandle {
+                    provider: "kubernetes".to_string(),
+                    sandbox_id: completed_sandbox.sandbox.id,
+                    resources: provision_resources(completed_sandbox.sandbox.id),
+                    metadata: serde_json::json!({}),
+                },
+            }),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    worker_client(&worker)
+        .post(format!(
+            "{}/leases/{}/fail",
+            server.base_url, failed_lease.id
+        ))
+        .json(&FailLeaseRequest {
+            error: "provider unavailable".to_string(),
+            retry: true,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let replay = drain(&server, &worker, &request).await;
+    let completed = replay
+        .drain_receipt
+        .leases
+        .iter()
+        .find(|fence| fence.lease_id == completed_lease.id)
+        .unwrap();
+    assert_eq!(completed.outcome.as_deref(), Some("completed"));
+    assert!(completed.resolved_at.is_some());
+    let failed = replay
+        .drain_receipt
+        .leases
+        .iter()
+        .find(|fence| fence.lease_id == failed_lease.id)
+        .unwrap();
+    assert_eq!(failed.outcome.as_deref(), Some("failed"));
+    assert!(failed.resolved_at.is_some());
+}
+
+#[tokio::test]
+async fn terminalizing_a_noncaptured_lease_does_not_resolve_the_receipt() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("noncaptured-terminal.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let draining_worker = register_worker(&server, "draining-worker").await;
+    let other_worker = register_worker(&server, "other-worker").await;
+    let captured_sandbox = create_provision_job(&server, "captured-sandbox").await;
+    let other_sandbox = create_provision_job(&server, "other-sandbox").await;
+    let captured = claim_provision_job(&server, &draining_worker, captured_sandbox.sandbox.id)
+        .await
+        .unwrap();
+    let noncaptured = claim_provision_job(&server, &other_worker, other_sandbox.sandbox.id)
+        .await
+        .unwrap();
+    let request = DrainWorkerRequest {
+        shutdown_id: Uuid::new_v4(),
+        hard_deadline: Utc::now() + ChronoDuration::seconds(30),
+    };
+    drain(&server, &draining_worker, &request).await;
+
+    worker_client(&other_worker)
+        .post(format!(
+            "{}/leases/{}/fail",
+            server.base_url, noncaptured.id
+        ))
+        .json(&FailLeaseRequest {
+            error: "unrelated failure".to_string(),
+            retry: false,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let replay = drain(&server, &draining_worker, &request).await;
+    let captured = replay
+        .drain_receipt
+        .leases
+        .iter()
+        .find(|fence| fence.lease_id == captured.id)
+        .unwrap();
+    assert!(captured.outcome.is_none());
+    assert!(captured.resolved_at.is_none());
+}
+
+#[tokio::test]
 async fn deadline_sweeper_resolves_the_exact_fenced_lease_and_records_receipt_progress() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!("sqlite://{}", data_dir.path().join("sweep.db").display());

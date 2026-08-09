@@ -1591,6 +1591,8 @@ pub(crate) async fn complete_lease_in_transaction(
         update_job_status_on_connection(db, &mut tx, lease.job_id, JobStatus::Succeeded, None, now)
             .await?;
         record_terminal_slo_observation(db, &mut tx, &lease, successful, now).await?;
+        resolve_captured_worker_drain_fence_on_connection(db, &mut tx, &lease, "completed", now)
+            .await?;
 
         // Reflect durable transitions in the response without a third lease+job
         // SELECT (auth path already loaded once; completion mutates known fields).
@@ -1721,6 +1723,8 @@ pub(crate) async fn fail_lease_in_transaction(
         lease.error = Some(error.to_string());
         lease.job.updated_at = now;
         lease.job.last_error = Some(error.to_string());
+        resolve_captured_worker_drain_fence_on_connection(db, &mut tx, &lease, "failed", now)
+            .await?;
         Ok(lease)
     }
     .await;
@@ -1899,6 +1903,8 @@ pub(crate) async fn expire_lease_if_still_active(
         }
 
         let lease = fetch_lease_on_connection(db, &mut tx, lease_id).await?;
+        resolve_captured_worker_drain_fence_on_connection(db, &mut tx, &lease, "expired", now)
+            .await?;
         let job = lease.job.clone();
         if resident_process_desires_stop(db, &mut tx, &job).await? {
             let process_id = resident_process_id_from_job(&job)?;
@@ -1959,6 +1965,36 @@ pub(crate) async fn expire_lease_if_still_active(
             Err(error)
         }
     }
+}
+
+async fn resolve_captured_worker_drain_fence_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    lease: &JobLease,
+    outcome: &str,
+    resolved_at: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    let sql = format!(
+        "update worker_drain_lease_fences set outcome = {}, resolved_at = {}
+         where lease_id = {} and worker_id = {} and job_id = {} and attempt = {}
+           and resolved_at is null",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4),
+        db.placeholder(5),
+        db.placeholder(6)
+    );
+    sqlx::query(&sql)
+        .bind(outcome)
+        .bind(resolved_at.to_rfc3339())
+        .bind(lease.id.to_string())
+        .bind(lease.worker_id.to_string())
+        .bind(lease.job_id.to_string())
+        .bind(lease.attempt)
+        .execute(&mut *connection)
+        .await?;
+    Ok(())
 }
 
 async fn resident_process_desires_stop(

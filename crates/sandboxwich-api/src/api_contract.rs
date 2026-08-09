@@ -130,6 +130,7 @@ use sandboxwich_core::{
         ,crate::handlers::workers::DrainWorkerRequest
         ,crate::handlers::workers::DrainLeaseFence
         ,crate::handlers::workers::DrainReceipt
+        ,crate::handlers::workers::DrainWorkerResponse
     )),
     tags((name = "operations", description = "Asynchronous operation lifecycle"))
 )]
@@ -534,5 +535,20 @@ mod tests {
             "Invalid request, including a missing or empty orb-sidecar bootstrap"
         );
         assert!(operation["responses"]["503"].is_object());
+    }
+
+    #[test]
+    fn worker_drain_documents_typed_receipt_response() {
+        let document = serde_json::to_value(super::openapi_document()).unwrap();
+        let operation = &document["paths"]["/v1/workers/{worker_id}/drain"]["post"];
+        assert_eq!(
+            operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/DrainWorkerResponse"
+        );
+        assert_eq!(
+            document["components"]["schemas"]["DrainWorkerResponse"]["properties"]["drainReceipt"]
+                ["oneOf"][1]["$ref"],
+            "#/components/schemas/DrainReceipt"
+        );
     }
 }

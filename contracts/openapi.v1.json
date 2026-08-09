@@ -810,6 +810,37 @@
         ],
         "type": "object"
       },
+      "DrainWorkerResponse": {
+        "properties": {
+          "drainReceipt": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DrainReceipt"
+              }
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "worker": {
+            "type": "object"
+          },
+          "workerToken": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "ok",
+          "worker"
+        ],
+        "type": "object"
+      },
       "ErrorEnvelope": {
         "properties": {
           "code": {
@@ -5731,6 +5762,13 @@
         },
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DrainWorkerResponse"
+                }
+              }
+            },
             "description": "Worker admission closed; typed requests return a durable drain receipt"
           }
         },

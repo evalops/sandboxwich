@@ -48,10 +48,11 @@ pub(crate) struct DrainReceipt {
     pub(crate) leases: Vec<DrainLeaseFence>,
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DrainWorkerResponse {
     pub(crate) ok: bool,
+    #[schema(value_type = Object)]
     pub(crate) worker: Worker,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) worker_token: Option<String>,
@@ -611,7 +612,7 @@ async fn fetch_worker_by_logical_identity(
     path = "/v1/workers/{worker_id}/drain",
     params(("worker_id" = Uuid, Path)),
     request_body = Option<DrainWorkerRequest>,
-    responses((status = 200, description = "Worker admission closed; typed requests return a durable drain receipt"))
+    responses((status = 200, description = "Worker admission closed; typed requests return a durable drain receipt", body = DrainWorkerResponse))
 )]
 pub(crate) async fn drain_worker(
     State(state): State<AppState>,
