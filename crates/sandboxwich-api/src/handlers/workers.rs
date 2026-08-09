@@ -642,6 +642,21 @@ pub(crate) async fn drain_worker(
     let now = Utc::now();
     let mut tx = state.db.pool.begin().await?;
     let receipt = async {
+        // Serialize before receipt lookup. Under PostgreSQL, two concurrent
+        // retries can both observe no receipt under READ COMMITTED unless the
+        // worker row is locked first; ordering here makes the second request
+        // observe and replay the first committed receipt.
+        let serialize_sql = format!(
+            "update workers set last_heartbeat_at = last_heartbeat_at where id = {}",
+            state.db.placeholder(1)
+        );
+        let serialized = sqlx::query(&serialize_sql)
+            .bind(worker_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        if serialized.rows_affected() != 1 {
+            return Err(ApiError::not_found("worker not found"));
+        }
         let existing_sql = format!(
             "select worker_id, tenant_id, hard_deadline from worker_drain_receipts
              where shutdown_id = {}",

@@ -246,6 +246,33 @@ async fn drain_receipt_replay_remains_available_after_the_hard_deadline() {
 }
 
 #[tokio::test]
+async fn concurrent_exact_drain_retries_return_one_receipt() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("concurrent-replay.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let worker = register_worker(&server, "concurrent-replay-worker").await;
+    let request = DrainWorkerRequest {
+        shutdown_id: Uuid::new_v4(),
+        hard_deadline: Utc::now() + ChronoDuration::seconds(30),
+    };
+
+    let (first, second) = tokio::join!(
+        drain(&server, &worker, &request),
+        drain(&server, &worker, &request)
+    );
+
+    assert_eq!(first.drain_receipt.shutdown_id, request.shutdown_id);
+    assert_eq!(second.drain_receipt.shutdown_id, request.shutdown_id);
+    assert_eq!(
+        first.drain_receipt.hard_deadline,
+        second.drain_receipt.hard_deadline
+    );
+}
+
+#[tokio::test]
 async fn draining_worker_cannot_claim_jobs_created_after_admission_closes() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!(
