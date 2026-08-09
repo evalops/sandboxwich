@@ -1687,6 +1687,71 @@ async fn resident_shutdown_drain_releases_the_exact_lease_before_the_deadline() 
 }
 
 #[tokio::test]
+async fn resident_shutdown_drain_does_not_cancel_a_cleanly_reaped_peer() {
+    let clean_cancellation = LeaseCancellation::new();
+    let pending_cancellation = LeaseCancellation::new();
+    let clean_release = Arc::new(tokio::sync::Notify::new());
+    let mut tasks = tokio::task::JoinSet::new();
+    let clean_task = tasks.spawn({
+        let cancellation = clean_cancellation.clone();
+        let release = clean_release.clone();
+        async move {
+            release.notified().await;
+            cancellation.reason()
+        }
+    });
+    let pending_task = tasks.spawn({
+        let cancellation = pending_cancellation.clone();
+        async move {
+            while !cancellation.signal.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+            cancellation.reason()
+        }
+    });
+    let metadata = std::collections::HashMap::from([
+        (
+            clean_task.id(),
+            ResidentTaskMetadata {
+                lease_id: sandboxwich_core::LeaseId::new(),
+                process_id: Uuid::new_v4(),
+                generation: 23,
+                cancellation: clean_cancellation.clone(),
+            },
+        ),
+        (
+            pending_task.id(),
+            ResidentTaskMetadata {
+                lease_id: sandboxwich_core::LeaseId::new(),
+                process_id: Uuid::new_v4(),
+                generation: 29,
+                cancellation: pending_cancellation.clone(),
+            },
+        ),
+    ]);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        clean_release.notify_one();
+    });
+
+    let drain = drain_resident_tasks_until_deadline(
+        &mut tasks,
+        &metadata,
+        Instant::now() + Duration::from_millis(150),
+        Duration::from_millis(100),
+    )
+    .await;
+
+    assert!(drain.forced_release);
+    assert!(!drain.timed_out);
+    assert_eq!(clean_cancellation.reason(), LeaseCancellationReason::None);
+    assert_eq!(
+        pending_cancellation.reason(),
+        LeaseCancellationReason::Shutdown
+    );
+}
+
+#[tokio::test]
 async fn production_resident_task_result_dispatches_failure_and_panic_reconciliation() {
     use axum::{
         Router,

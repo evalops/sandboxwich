@@ -2000,7 +2000,17 @@ async fn drain_resident_tasks_until_deadline<T: 'static>(
     }
     let forced_release = !tasks.is_empty();
     if forced_release {
-        for metadata in metadata_by_task.values() {
+        let completed_task_ids: std::collections::HashSet<_> = results
+            .iter()
+            .map(|result| match result {
+                Ok((task_id, _)) => *task_id,
+                Err(error) => error.id(),
+            })
+            .collect();
+        for (task_id, metadata) in metadata_by_task {
+            if completed_task_ids.contains(task_id) {
+                continue;
+            }
             metadata
                 .cancellation
                 .cancel(LeaseCancellationReason::Shutdown);
