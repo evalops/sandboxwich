@@ -17,6 +17,41 @@ use sqlx::Row;
 use std::time::Instant;
 use uuid::Uuid;
 
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DrainWorkerRequest {
+    pub(crate) shutdown_id: Uuid,
+    pub(crate) hard_deadline: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DrainLeaseFence {
+    pub(crate) lease_id: LeaseId,
+    pub(crate) job_id: JobId,
+    pub(crate) attempt: i64,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DrainReceipt {
+    pub(crate) shutdown_id: Uuid,
+    pub(crate) worker_id: WorkerId,
+    pub(crate) hard_deadline: DateTime<Utc>,
+    pub(crate) leases: Vec<DrainLeaseFence>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DrainWorkerResponse {
+    pub(crate) ok: bool,
+    pub(crate) worker: Worker,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) worker_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) drain_receipt: Option<DrainReceipt>,
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct RuntimeResourceInventoryQuery {
     namespace: String,
@@ -568,24 +603,205 @@ pub(crate) async fn drain_worker(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
     Path(worker_id): Path<Uuid>,
-) -> Result<Json<WorkerResponse>, ApiError> {
+    request: Option<Json<DrainWorkerRequest>>,
+) -> Result<Json<DrainWorkerResponse>, ApiError> {
     let worker_id = WorkerId(worker_id);
     ensure_worker_tenant(&state.db, worker_id, &ctx).await?;
-    let sql = format!(
-        "update workers set status = {} where id = {}",
-        state.db.placeholder(1),
-        state.db.placeholder(2)
-    );
-    sqlx::query(&sql)
-        .bind(worker_status_to_str(&WorkerStatus::Draining))
-        .bind(worker_id.to_string())
-        .execute(&state.db.pool)
-        .await?;
-    Ok(Json(WorkerResponse {
+    let Some(Json(request)) = request else {
+        let sql = format!(
+            "update workers set status = {} where id = {}",
+            state.db.placeholder(1),
+            state.db.placeholder(2)
+        );
+        sqlx::query(&sql)
+            .bind(worker_status_to_str(&WorkerStatus::Draining))
+            .bind(worker_id.to_string())
+            .execute(&state.db.pool)
+            .await?;
+        return Ok(Json(DrainWorkerResponse {
+            ok: true,
+            worker: fetch_worker(&state.db, worker_id).await?,
+            worker_token: None,
+            drain_receipt: None,
+        }));
+    };
+    let now = Utc::now();
+    if request.hard_deadline <= now {
+        return Err(ApiError::bad_request(
+            "drain hard deadline must be in the future",
+        ));
+    }
+    if request.hard_deadline > now + chrono::Duration::hours(1) {
+        return Err(ApiError::bad_request(
+            "drain hard deadline cannot exceed one hour",
+        ));
+    }
+
+    let mut tx = state.db.pool.begin().await?;
+    let receipt = async {
+        let existing_sql = format!(
+            "select worker_id, tenant_id, hard_deadline from worker_drain_receipts
+             where shutdown_id = {}",
+            state.db.placeholder(1)
+        );
+        if let Some(row) = sqlx::query(&existing_sql)
+            .bind(request.shutdown_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            let existing_worker_id: String = row.try_get("worker_id")?;
+            let existing_tenant_id: String = row.try_get("tenant_id")?;
+            let existing_deadline: String = row.try_get("hard_deadline")?;
+            if existing_worker_id != worker_id.to_string()
+                || existing_tenant_id != ctx.tenant_id
+                || parse_timestamp(&existing_deadline)? != request.hard_deadline
+            {
+                return Err(ApiError::conflict_code(
+                    "worker_drain_receipt_conflict",
+                    "shutdown id is already bound to a different drain fence",
+                ));
+            }
+        } else {
+            // This write is the claim/drain serialization point. A claim that
+            // commits first is captured below; a drain that commits first
+            // prevents the claim's online-only lock from succeeding.
+            let worker_sql = format!(
+                "update workers set status = {}
+                 where id = {} and status in ('registered', 'online')",
+                state.db.placeholder(1),
+                state.db.placeholder(2)
+            );
+            let result = sqlx::query(&worker_sql)
+                .bind(worker_status_to_str(&WorkerStatus::Draining))
+                .bind(worker_id.to_string())
+                .execute(&mut *tx)
+                .await?;
+            if result.rows_affected() != 1 {
+                return Err(ApiError::conflict_code(
+                    "worker_not_drainable",
+                    "worker is not online or draining",
+                ));
+            }
+            let insert_sql = format!(
+                "insert into worker_drain_receipts
+                 (shutdown_id, worker_id, tenant_id, hard_deadline, created_at)
+                 values ({})",
+                state.db.placeholders(5)
+            );
+            sqlx::query(&insert_sql)
+                .bind(request.shutdown_id.to_string())
+                .bind(worker_id.to_string())
+                .bind(&ctx.tenant_id)
+                .bind(request.hard_deadline.to_rfc3339())
+                .bind(now.to_rfc3339())
+                .execute(&mut *tx)
+                .await?;
+
+            let leases_sql = format!(
+                "select id, job_id, attempt from job_leases
+                 where worker_id = {} and status = 'active'
+                 order by id asc",
+                state.db.placeholder(1)
+            );
+            let active_leases = sqlx::query(&leases_sql)
+                .bind(worker_id.to_string())
+                .fetch_all(&mut *tx)
+                .await?;
+            let fence_sql = format!(
+                "insert into worker_drain_lease_fences
+                 (shutdown_id, lease_id, worker_id, job_id, attempt, hard_deadline)
+                 values ({})",
+                state.db.placeholders(6)
+            );
+            for lease in active_leases {
+                sqlx::query(&fence_sql)
+                    .bind(request.shutdown_id.to_string())
+                    .bind(lease.try_get::<String, _>("id")?)
+                    .bind(worker_id.to_string())
+                    .bind(lease.try_get::<String, _>("job_id")?)
+                    .bind(lease.try_get::<i64, _>("attempt")?)
+                    .bind(request.hard_deadline.to_rfc3339())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            let cap_sql = format!(
+                "update job_leases set expires_at = {}
+                 where worker_id = {} and status = 'active' and expires_at > {}",
+                state.db.placeholder(1),
+                state.db.placeholder(2),
+                state.db.placeholder(3)
+            );
+            sqlx::query(&cap_sql)
+                .bind(request.hard_deadline.to_rfc3339())
+                .bind(worker_id.to_string())
+                .bind(request.hard_deadline.to_rfc3339())
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        fetch_drain_receipt_on_connection(&state.db, &mut tx, request.shutdown_id).await
+    }
+    .await;
+    let receipt = match receipt {
+        Ok(receipt) => {
+            tx.commit().await?;
+            receipt
+        }
+        Err(error) => {
+            if let Err(rollback_error) = tx.rollback().await {
+                tracing::warn!(%rollback_error, "failed to roll back worker drain receipt");
+            }
+            return Err(error);
+        }
+    };
+
+    Ok(Json(DrainWorkerResponse {
         ok: true,
         worker: fetch_worker(&state.db, worker_id).await?,
         worker_token: None,
+        drain_receipt: Some(receipt),
     }))
+}
+
+async fn fetch_drain_receipt_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    shutdown_id: Uuid,
+) -> Result<DrainReceipt, ApiError> {
+    let sql = format!(
+        "select worker_id, hard_deadline from worker_drain_receipts where shutdown_id = {}",
+        db.placeholder(1)
+    );
+    let row = sqlx::query(&sql)
+        .bind(shutdown_id.to_string())
+        .fetch_one(&mut *connection)
+        .await?;
+    let worker_id = WorkerId(parse_uuid(row.try_get::<&str, _>("worker_id")?)?);
+    let hard_deadline = parse_timestamp(row.try_get("hard_deadline")?)?;
+    let leases_sql = format!(
+        "select lease_id, job_id, attempt from worker_drain_lease_fences
+         where shutdown_id = {} order by lease_id asc",
+        db.placeholder(1)
+    );
+    let leases = sqlx::query(&leases_sql)
+        .bind(shutdown_id.to_string())
+        .fetch_all(&mut *connection)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(DrainLeaseFence {
+                lease_id: LeaseId(parse_uuid(row.try_get::<&str, _>("lease_id")?)?),
+                job_id: JobId(parse_uuid(row.try_get::<&str, _>("job_id")?)?),
+                attempt: row.try_get("attempt")?,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok(DrainReceipt {
+        shutdown_id,
+        worker_id,
+        hard_deadline,
+        leases,
+    })
 }
 
 pub(crate) async fn heartbeat_worker(
@@ -615,7 +831,8 @@ pub(crate) async fn heartbeat_worker(
         (Some(max_concurrent_jobs), Some(envelope)) => {
             let sql = format!(
                 "update workers
-                 set status = {}, last_heartbeat_at = {}, labels = {},
+                 set status = case when status = 'draining' then status else {} end,
+                     last_heartbeat_at = {}, labels = {},
                      max_concurrent_jobs = {}, resource_envelope = {}
                  where id = {}",
                 state.db.placeholder(1),
@@ -638,7 +855,8 @@ pub(crate) async fn heartbeat_worker(
         (Some(max_concurrent_jobs), None) => {
             let sql = format!(
                 "update workers
-                 set status = {}, last_heartbeat_at = {}, labels = {}, max_concurrent_jobs = {}
+                 set status = case when status = 'draining' then status else {} end,
+                     last_heartbeat_at = {}, labels = {}, max_concurrent_jobs = {}
                  where id = {}",
                 state.db.placeholder(1),
                 state.db.placeholder(2),
@@ -658,7 +876,8 @@ pub(crate) async fn heartbeat_worker(
         (None, Some(envelope)) => {
             let sql = format!(
                 "update workers
-                 set status = {}, last_heartbeat_at = {}, labels = {}, resource_envelope = {}
+                 set status = case when status = 'draining' then status else {} end,
+                     last_heartbeat_at = {}, labels = {}, resource_envelope = {}
                  where id = {}",
                 state.db.placeholder(1),
                 state.db.placeholder(2),
@@ -678,7 +897,8 @@ pub(crate) async fn heartbeat_worker(
         (None, None) => {
             let sql = format!(
                 "update workers
-                 set status = {}, last_heartbeat_at = {}, labels = {}
+                 set status = case when status = 'draining' then status else {} end,
+                     last_heartbeat_at = {}, labels = {}
                  where id = {}",
                 state.db.placeholder(1),
                 state.db.placeholder(2),
