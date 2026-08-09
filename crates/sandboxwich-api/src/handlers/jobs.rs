@@ -1262,7 +1262,9 @@ pub(crate) async fn try_claim_job(
     }
     let mut tx = db.pool.begin().await?;
     let claimed = async {
-        lock_worker_for_claim_on_connection(db, &mut tx, worker.id).await?;
+        if !lock_worker_for_claim_on_connection(db, &mut tx, worker.id).await? {
+            return Ok(None);
+        }
         if !lock_apex_instruction_placement_on_connection(db, &mut tx, worker, job).await? {
             return Ok(None);
         }
@@ -1476,21 +1478,18 @@ pub(crate) async fn lock_worker_for_claim_on_connection(
     db: &Database,
     connection: &mut AnyConnection,
     worker_id: WorkerId,
-) -> Result<(), ApiError> {
+) -> Result<bool, ApiError> {
     let sql = format!(
         "update workers
          set last_heartbeat_at = last_heartbeat_at
-         where id = {}",
+         where id = {} and status in ('registered', 'online')",
         db.placeholder(1)
     );
     let result = sqlx::query(&sql)
         .bind(worker_id.to_string())
         .execute(&mut *connection)
         .await?;
-    if result.rows_affected() == 0 {
-        return Err(ApiError::not_found("worker not found"));
-    }
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
 pub(crate) async fn fetch_job(db: &Database, job_id: JobId) -> Result<Job, ApiError> {

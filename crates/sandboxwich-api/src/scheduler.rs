@@ -58,6 +58,9 @@ pub(crate) fn spawn_expiry_sweeper(
             if let Err(error) = expire_due_leases(&db).await {
                 tracing::warn!(?error, "lease expiry sweep failed");
             }
+            if let Err(error) = reconcile_due_worker_drain_fences(&db).await {
+                tracing::warn!(?error, "worker drain fence reconciliation failed");
+            }
             if let Err(error) = expire_due_snapshots(&db).await {
                 tracing::warn!(?error, "snapshot expiry sweep failed");
             }
