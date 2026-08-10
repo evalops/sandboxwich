@@ -210,6 +210,16 @@ spec:
               value: sandboxwich-sandboxes
             - name: SANDBOXWICH_STORAGE_CLASS
               value: local-path
+            # Snapshot class is empty on purpose for this local-path/k3s starter
+            # (no CSI VolumeSnapshotClass required for command/exec smoke).
+            #
+            # Do not copy an empty value to GKE or any cluster without a
+            # *default* VolumeSnapshotClass: VolumeSnapshots will never bind,
+            # resume/fork PVCs stay Pending on an unbound dataSource, and
+            # guests never schedule. See docs/kubernetes.md section
+            # "Production GKE: pin SANDBOXWICH_SNAPSHOT_CLASS (2026-08-10)".
+            # Production pin (evalops/deploy): gke-pd-csi on the runners
+            # domain / remote-runner sandboxwich worker manifests.
             - name: SANDBOXWICH_SNAPSHOT_CLASS
               value: ""
             - name: SANDBOXWICH_WORKSPACE_STORAGE
@@ -290,6 +300,9 @@ spec:
             - $(SANDBOXWICH_SANDBOX_NAMESPACE)
             - --storage-class
             - $(SANDBOXWICH_STORAGE_CLASS)
+            # Expands SANDBOXWICH_SNAPSHOT_CLASS above. Empty is OK only when
+            # snapshots are unused (this starter). On GKE set the env to a real
+            # class (e.g. gke-pd-csi); see docs/kubernetes.md.
             - --snapshot-class
             - $(SANDBOXWICH_SNAPSHOT_CLASS)
             - --workspace-storage

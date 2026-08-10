@@ -511,6 +511,10 @@ kubectl -n evalops-sandboxes delete pvc sandboxwich-pvc-<id> --wait=false
 Do not mark a snapshot durable-ready in the control plane unless
 `status.readyToUse=true` on the VolumeSnapshot object.
 
+The starter `deploy/kubernetes/worker.yaml` keeps an empty snapshot class for
+local-path/k3s command smoke only; comments there point here so the empty
+default is not copied into GKE.
+
 ## Health, Metrics, And Smoke
 
 The API exposes:
