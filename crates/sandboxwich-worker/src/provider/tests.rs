@@ -4973,6 +4973,7 @@ fn agent_sandbox_named_kubectl_commands_do_not_use_manifest_stdin() {
         image_digest: "image@sha256:abc".into(),
         bootstrap_digest: "sha256:bootstrap".into(),
         policy_digest: "sha256:policy".into(),
+        applied_policy_digest: "sha256:applied-policy".into(),
         expires_at: chrono::Utc::now() + chrono::Duration::minutes(1),
         nonce: "00000000-0000-4000-8000-000000000001".into(),
         signature: "sig".into(),
@@ -4994,23 +4995,29 @@ fn agent_sandbox_named_kubectl_commands_do_not_use_manifest_stdin() {
     let activation_args = apply
         .kubectl_args_for_activation("pod-1", &activation, "agent-sandbox-activate")
         .unwrap();
-    assert!(
-        activation_args[activation_args.len() - 9]
-            .contains("SANDBOXWICH_AGENT_SANDBOX_EXPECTED_POLICY_DIGEST=\"$6\"")
-    );
+    let script = activation_args
+        .iter()
+        .find(|arg| arg.contains("SANDBOXWICH_AGENT_SANDBOX_EXPECTED_CLAIM_UID"))
+        .expect("activation script");
+    assert!(script.contains(
+        "SANDBOXWICH_AGENT_SANDBOX_EXPECTED_CLAIM_UID=\"$1\" SANDBOXWICH_AGENT_SANDBOX_EXPECTED_SANDBOX_UID=\"$2\""
+    ));
+    for forbidden in [
+        "EXPECTED_POD_UID=",
+        "EXPECTED_IMAGE_DIGEST=",
+        "EXPECTED_BOOTSTRAP_DIGEST=",
+        "EXPECTED_POLICY_DIGEST=",
+    ] {
+        assert!(
+            !script.contains(forbidden),
+            "activation overrides {forbidden}"
+        );
+    }
     assert_eq!(
-        &activation_args[activation_args.len() - 7..],
-        [
-            "claim-1",
-            "sandbox-1",
-            "pod-uid-1",
-            "image@sha256:abc",
-            "sha256:bootstrap",
-            "sha256:policy",
-            "agent-sandbox-activate",
-        ]
-        .map(str::to_string)
-        .as_slice()
+        &activation_args[activation_args.len() - 3..],
+        ["claim-1", "sandbox-1", "agent-sandbox-activate",]
+            .map(str::to_string)
+            .as_slice()
     );
     assert!(
         super::agent_sandbox_launch_script(
@@ -6030,6 +6037,30 @@ fn adoption_contract_rejects_immutable_or_security_drift_for_every_resource_kind
                 | sandboxwich_core::ProvisioningErrorClass::TerminalSecurity
         ));
     }
+}
+
+#[test]
+fn agent_sandbox_post_claim_policy_digest_uses_applied_manifest() {
+    let provider =
+        KubernetesDryRunProvider::with_snapshot_class("gke-ci", "evalops-sandboxes", None, None);
+    let sandbox_id = SandboxId::new();
+    let allow_all = provider
+        .network_policy_manifest(sandbox_id, &NetworkEgress::AllowAll)
+        .expect("allow-all post-claim policy renders");
+    let deny_all = provider
+        .network_policy_manifest(sandbox_id, &NetworkEgress::DenyAll)
+        .expect("deny-all post-claim policy renders");
+    let allow_digest = sha256_hex(serde_json::to_string(&allow_all).unwrap().as_bytes());
+    let deny_digest = sha256_hex(serde_json::to_string(&deny_all).unwrap().as_bytes());
+    assert_ne!(allow_digest, deny_digest);
+    assert_eq!(
+        allow_all["metadata"]["name"],
+        format!("sandboxwich-egress-{sandbox_id}")
+    );
+    assert_eq!(
+        allow_all["spec"]["podSelector"]["matchLabels"]["sandboxwich.dev/sandbox-id"],
+        sandbox_id.to_string()
+    );
 }
 
 #[test]
@@ -7826,7 +7857,11 @@ fn agent_sandbox_detached_launch_preserves_nonzero_exit_code() {
     let bin = root.path().join("bin");
     std::fs::create_dir(&bin).expect("create test PATH");
     let fake_setsid = bin.join("setsid");
-    std::fs::write(&fake_setsid, "#!/bin/sh\nexec \"$@\"\n").expect("write setsid shim");
+    std::fs::write(
+        &fake_setsid,
+        "#!/bin/sh\nif [ \"$1\" = --wait ]; then shift; fi\nexec \"$@\"\n",
+    )
+    .expect("write setsid shim");
     let mut permissions = std::fs::metadata(&fake_setsid).unwrap().permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&fake_setsid, permissions).expect("make setsid shim executable");

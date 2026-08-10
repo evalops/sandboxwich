@@ -5690,6 +5690,7 @@ mod tests {
             image_digest: "sha256:image".into(),
             bootstrap_digest: "sha256:bootstrap".into(),
             policy_digest: "sha256:policy".into(),
+            applied_policy_digest: "sha256:applied-policy".into(),
             expires_at: Utc::now() + chrono::Duration::minutes(1),
             nonce: "00000000-0000-4000-8000-000000000001".into(),
             signature: "sig".into(),

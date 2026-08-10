@@ -492,7 +492,7 @@ fn agent_sandbox_launch_script(
         validate_shell_path(value, field)?;
     }
     Ok(format!(
-        "set -eu; umask 077; d={state_dir}; mkdir -p \"$d\"; rm -f \"$d/pid\" \"$d/exit\" \"$d/status\"; (set +e; if ! command -v setsid >/dev/null 2>&1; then printf '%s' 127 >\"{exit_file}\"; exit 0; fi; setsid \"$@\" >\"{log_file}\" 2>&1 & child=$!; printf '%s' \"$child\" >\"{pid_file}\"; wait \"$child\"; rc=$?; printf '%s' \"$rc\" >\"{exit_file}\") & printf '%s' running >\"$d/status\""
+        "set -eu; umask 077; d={state_dir}; mkdir -p \"$d\"; rm -f \"$d/pid\" \"$d/exit\" \"$d/status\"; (set +e; if ! command -v setsid >/dev/null 2>&1; then printf '%s' 127 >\"{exit_file}\"; exit 0; fi; setsid --wait sh -c 'pid_file=$1; shift; printf %s \"$$\" >\"$pid_file\"; exec \"$@\"' sandboxwich-agent-process \"{pid_file}\" \"$@\" >\"{log_file}\" 2>&1; rc=$?; printf '%s' \"$rc\" >\"{exit_file}\") & printf '%s' running >\"$d/status\""
     ))
 }
 
@@ -4506,6 +4506,20 @@ impl KubernetesApplyProvider {
         ) {
             tracing::warn!(sandbox_id = %sandbox_id, %error, "agent_sandbox_claim_rollback_failed");
         }
+        let policy_args = self.kubectl_args_for_named_delete(
+            "networkpolicy",
+            &format!("sandboxwich-egress-{sandbox_id}"),
+        );
+        if let Err(error) = run_kubectl_command(
+            &self.kubectl,
+            &policy_args,
+            "rollback Agent Sandbox network policy",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        ) {
+            tracing::warn!(sandbox_id = %sandbox_id, %error, "agent_sandbox_network_policy_rollback_failed");
+        }
         let custody_args = self
             .kubectl_args_for_named_delete("configmap", &Self::custody_configmap_name(sandbox_id));
         if let Err(error) = run_kubectl_command(
@@ -4518,6 +4532,38 @@ impl KubernetesApplyProvider {
         ) {
             tracing::warn!(sandbox_id = %sandbox_id, %error, "agent_sandbox_custody_rollback_failed");
         }
+    }
+
+    fn label_agent_sandbox_pod(
+        &self,
+        sandbox_id: SandboxId,
+        pod_name: &str,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<()> {
+        validate_shell_identifier(pod_name, "pod_name")?;
+        let mut args = self.kubectl_base_args();
+        args.extend([
+            "label".to_string(),
+            "pod".to_string(),
+            pod_name.to_string(),
+            format!("sandboxwich.dev/sandbox-id={sandbox_id}"),
+            "sandboxwich.dev/component=runtime".to_string(),
+            "--overwrite".to_string(),
+        ]);
+        let output = run_kubectl_command(
+            &self.kubectl,
+            &args,
+            "label Agent Sandbox claimed pod",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        anyhow::ensure!(
+            output.success,
+            "Agent Sandbox claimed pod labeling failed: {}",
+            output.stderr
+        );
+        Ok(())
     }
 
     fn provision_agent_sandbox_inner(
@@ -4685,6 +4731,25 @@ impl KubernetesApplyProvider {
         ] {
             validate_shell_identifier(value, field)?;
         }
+        self.label_agent_sandbox_pod(sandbox_id, &pod_name, cancelled)?;
+        let network_policy = self
+            .dry_run
+            .network_policy_manifest(sandbox_id, &spec.network_egress)?;
+        let policy_output = run_kubectl_documents(
+            &self.kubectl,
+            &self.kubectl_args("apply"),
+            std::slice::from_ref(&network_policy),
+            "apply Agent Sandbox post-claim network policy",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        anyhow::ensure!(
+            policy_output.success,
+            "Agent Sandbox post-claim network policy failed: {}",
+            policy_output.stderr
+        );
+        let policy_digest = sha256_hex(serde_json::to_string(&network_policy)?.as_bytes());
         let mut activation = sandboxwich_core::AgentSandboxActivationV1 {
             version: sandboxwich_core::AgentSandboxActivationV1::VERSION,
             claim_uid: claim_uid.to_string(),
@@ -4692,7 +4757,8 @@ impl KubernetesApplyProvider {
             pod_uid: pod_uid.to_string(),
             image_digest: self.dry_run.runtime_image.clone(),
             bootstrap_digest: sha256_hex(b"sandboxwich-agent:agent-sandbox-v1"),
-            policy_digest: sha256_hex(serde_json::to_string(&spec.network_egress)?.as_bytes()),
+            policy_digest: sandboxwich_core::AgentSandboxActivationV1::BASE_POLICY_DIGEST.into(),
+            applied_policy_digest: policy_digest,
             expires_at: Utc::now() + chrono::Duration::minutes(5),
             nonce: Uuid::now_v7().to_string(),
             signature: String::new(),
@@ -4757,10 +4823,25 @@ impl KubernetesApplyProvider {
         );
         sandbox_resource.provider = "agent_sandbox".to_string();
         sandbox_resource.ready_at = Some(Utc::now());
+        let mut policy_resource = self.dry_run.base_resource(
+            sandbox_id,
+            None,
+            RuntimeResourceKind::NetworkPolicy,
+            RuntimeResourcePurpose::Network,
+            format!("sandboxwich-egress-{sandbox_id}"),
+            RuntimeResourceStatus::Ready,
+        );
+        policy_resource.provider = "agent_sandbox".to_string();
+        policy_resource.ready_at = Some(Utc::now());
         Ok(ProviderSandboxHandle {
             provider: "agent_sandbox".into(),
             sandbox_id,
-            resources: vec![claim_resource, sandbox_resource, pod_resource],
+            resources: vec![
+                claim_resource,
+                sandbox_resource,
+                pod_resource,
+                policy_resource,
+            ],
             metadata: json!({
                 "claimName": claim_name,
                 "claimUid": claim_uid,
@@ -6326,17 +6407,10 @@ impl KubernetesApplyProvider {
         validate_shell_identifier(&activation.claim_uid, "claim_uid")?;
         validate_shell_identifier(&activation.sandbox_uid, "sandbox_uid")?;
         validate_shell_identifier(command, "activation_command")?;
-        for (field, value) in [
-            ("pod_uid", activation.pod_uid.as_str()),
-            ("image_digest", activation.image_digest.as_str()),
-            ("bootstrap_digest", activation.bootstrap_digest.as_str()),
-            ("policy_digest", activation.policy_digest.as_str()),
-        ] {
-            anyhow::ensure!(
-                !value.is_empty() && !value.contains('\0'),
-                "unsafe Agent Sandbox {field} value"
-            );
-        }
+        anyhow::ensure!(
+            !activation.pod_uid.is_empty() && !activation.pod_uid.contains('\0'),
+            "unsafe Agent Sandbox pod_uid value"
+        );
         let mut args = self.kubectl_base_args();
         args.push("exec".to_string());
         args.extend([
@@ -6344,14 +6418,10 @@ impl KubernetesApplyProvider {
             "--".to_string(),
             "/bin/sh".to_string(),
             "-c".to_string(),
-            "umask 077; cat > /run/sandboxwich/activation.json; exec env SANDBOXWICH_AGENT_SANDBOX_EXPECTED_CLAIM_UID=\"$1\" SANDBOXWICH_AGENT_SANDBOX_EXPECTED_SANDBOX_UID=\"$2\" SANDBOXWICH_AGENT_SANDBOX_EXPECTED_POD_UID=\"$3\" SANDBOXWICH_AGENT_SANDBOX_EXPECTED_IMAGE_DIGEST=\"$4\" SANDBOXWICH_AGENT_SANDBOX_EXPECTED_BOOTSTRAP_DIGEST=\"$5\" SANDBOXWICH_AGENT_SANDBOX_EXPECTED_POLICY_DIGEST=\"$6\" /usr/local/bin/sandboxwich-agent \"$7\" --bundle /run/sandboxwich/activation.json --public-key \"$SANDBOXWICH_AGENT_SANDBOX_PUBLIC_KEY_FILE\"".to_string(),
+            "umask 077; cat > /run/sandboxwich/activation.json; exec env SANDBOXWICH_AGENT_SANDBOX_EXPECTED_CLAIM_UID=\"$1\" SANDBOXWICH_AGENT_SANDBOX_EXPECTED_SANDBOX_UID=\"$2\" /usr/local/bin/sandboxwich-agent \"$3\" --bundle /run/sandboxwich/activation.json --public-key \"$SANDBOXWICH_AGENT_SANDBOX_PUBLIC_KEY_FILE\"".to_string(),
             "--".to_string(),
             activation.claim_uid.clone(),
             activation.sandbox_uid.clone(),
-            activation.pod_uid.clone(),
-            activation.image_digest.clone(),
-            activation.bootstrap_digest.clone(),
-            activation.policy_digest.clone(),
             command.to_string(),
         ]);
         Ok(args)
@@ -9861,6 +9931,24 @@ impl SandboxProvider for KubernetesApplyProvider {
             )?;
             if !output.success {
                 bail!("Agent Sandbox claim cleanup failed: {}", output.stderr);
+            }
+            let policy_args = self.kubectl_args_for_named_delete(
+                "networkpolicy",
+                &format!("sandboxwich-egress-{sandbox_id}"),
+            );
+            let policy_output = run_kubectl_command(
+                &self.kubectl,
+                &policy_args,
+                "delete Agent Sandbox network policy",
+                self.kubectl_command_timeout,
+                Some(cancelled),
+                self.max_captured_output_bytes,
+            )?;
+            if !policy_output.success {
+                bail!(
+                    "Agent Sandbox network policy cleanup failed: {}",
+                    policy_output.stderr
+                );
             }
             if let Some(mut receipt_value) = receipt.take() {
                 receipt_value.released_at = Some(Utc::now());
