@@ -5096,6 +5096,13 @@ fn agent_sandbox_named_kubectl_commands_do_not_use_manifest_stdin() {
     let activation_args = apply
         .kubectl_args_for_activation("pod-1", &activation, "agent-sandbox-activate")
         .unwrap();
+    assert_eq!(
+        format!(
+            "sha256:{}",
+            super::sha256_hex(b"sandboxwich-agent:agent-sandbox-v1")
+        ),
+        "sha256:3b1ae75c66004e9bae7535acfb7765cca88d2da7f8958cf969171c0bd8bbe715"
+    );
     let expected_exec_stdin = ["pod-1", "-i", "--"].map(str::to_string);
     assert!(
         activation_args
