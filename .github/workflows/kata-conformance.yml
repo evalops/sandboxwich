@@ -79,7 +79,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Fetch credentials for the disposable cluster
-        if: inputs.gke_cluster != ''
+        # Triggered by any of the three so that partial coordinates fail loudly
+        # below instead of silently skipping the fetch and running the gate
+        # against whatever context the runner happened to hold.
+        if: inputs.gke_cluster != '' || inputs.gke_location != '' || inputs.gke_project != ''
         shell: bash
         env:
           GKE_CLUSTER: ${{ inputs.gke_cluster }}
@@ -88,21 +91,25 @@ jobs:
           KUBE_CONTEXT: ${{ inputs.kube_context }}
         run: |
           set -euo pipefail
-          # Partial coordinates would silently resolve against whatever the
-          # runner's ambient gcloud config happens to name, so require all
-          # three together.
-          for value in "${GKE_LOCATION}" "${GKE_PROJECT}"; do
+          for value in "${GKE_CLUSTER}" "${GKE_LOCATION}" "${GKE_PROJECT}"; do
             [[ -n "${value}" ]] || {
-              echo "gke_cluster requires gke_location and gke_project" >&2
+              echo "gke_cluster, gke_location and gke_project must be set together" >&2
               exit 1
             }
           done
+          # Fetch into a per-run kubeconfig. The runner's shared one would keep
+          # this context after the disposable cluster is deleted, and the check
+          # below would then happily match that stale entry on a later run.
+          kubeconfig="${RUNNER_TEMP}/kubeconfig-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export KUBECONFIG="${kubeconfig}"
+          echo "KUBECONFIG=${kubeconfig}" >>"${GITHUB_ENV}"
           gcloud container clusters get-credentials "${GKE_CLUSTER}" \
             --location "${GKE_LOCATION}" --project "${GKE_PROJECT}"
           # The gate selects its cluster by context name only. If the fetched
           # credentials landed under a different name, every later step would
           # run against whatever else that name refers to.
-          kubectl config get-contexts -o name | grep -Fxq "${KUBE_CONTEXT}"
+          contexts="$(kubectl config get-contexts -o name)"
+          grep -Fxq "${KUBE_CONTEXT}" <<<"${contexts}"
       - name: Resolve digest-pinned images from the deployed manifests
         shell: bash
         run: |
