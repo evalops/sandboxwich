@@ -7663,3 +7663,36 @@ fn cloudflare_create_key_is_stable_for_lost_create_retries() {
         create_idempotency_key(sandbox_id)
     );
 }
+
+#[test]
+fn agent_sandbox_detached_launch_preserves_nonzero_exit_code() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let state_dir = root.path().join("resident");
+    let pid_file = state_dir.join("pid");
+    let exit_file = state_dir.join("exit");
+    let log_file = state_dir.join("log");
+    let script = super::agent_sandbox_launch_script(
+        state_dir.to_str().unwrap(),
+        pid_file.to_str().unwrap(),
+        exit_file.to_str().unwrap(),
+        log_file.to_str().unwrap(),
+    );
+    std::process::Command::new("sh")
+        .args([
+            "-lc",
+            &script,
+            "sandboxwich-agent-resident",
+            "sh",
+            "-c",
+            "exit 23",
+        ])
+        .status()
+        .expect("launch detached process");
+    for _ in 0..20 {
+        if exit_file.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(std::fs::read_to_string(exit_file).unwrap(), "23");
+}

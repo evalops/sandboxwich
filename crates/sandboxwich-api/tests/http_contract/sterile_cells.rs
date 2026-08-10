@@ -352,6 +352,7 @@ async fn tenant_release_and_status_are_exactly_fenced_and_provider_terminal() {
             result: Some(WorkerJobResult::StopSandbox {
                 provider: "kubernetes".into(),
                 sandbox_id: created.sandbox.id,
+                custody_receipt: None,
             }),
         })
         .send()
@@ -368,6 +369,7 @@ async fn tenant_release_and_status_are_exactly_fenced_and_provider_terminal() {
             result: Some(WorkerJobResult::StopSandbox {
                 provider: "kubernetes".into(),
                 sandbox_id: created.sandbox.id,
+                custody_receipt: None,
             }),
         })
         .send()

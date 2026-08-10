@@ -1212,16 +1212,81 @@ pub enum ProviderPreference {
     #[default]
     Any,
     Kubernetes,
+    AgentSandbox,
     Cloudflare,
 }
 
+/// One-shot identity handoff from Sandboxwich's controller to a generic
+/// managed Agent Sandbox pod. The pod receives this only after Claim binding;
+/// no tenant material is present in the warm pool or template.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentSandboxActivationV1 {
+    pub version: u8,
+    pub claim_uid: String,
+    pub sandbox_uid: String,
+    pub pod_uid: String,
+    pub image_digest: String,
+    pub bootstrap_digest: String,
+    pub policy_digest: String,
+    pub expires_at: DateTime<Utc>,
+    pub nonce: String,
+    pub signature: String,
+}
+
+impl AgentSandboxActivationV1 {
+    pub const VERSION: u8 = 1;
+
+    /// Canonical bytes signed by the controller and verified by the launcher.
+    /// The signature is deliberately excluded from the signed payload.
+    pub fn signing_payload(&self) -> Result<Vec<u8>, serde_json::Error> {
+        let mut unsigned = self.clone();
+        unsigned.signature.clear();
+        serde_json::to_vec(&unsigned)
+    }
+
+    pub fn validate_shape(&self, now: DateTime<Utc>) -> Result<(), String> {
+        if self.version != Self::VERSION {
+            return Err("agent_sandbox_activation_version_invalid".into());
+        }
+        for (name, value) in [
+            ("claim_uid", &self.claim_uid),
+            ("sandbox_uid", &self.sandbox_uid),
+            ("pod_uid", &self.pod_uid),
+            ("image_digest", &self.image_digest),
+            ("bootstrap_digest", &self.bootstrap_digest),
+            ("policy_digest", &self.policy_digest),
+            ("nonce", &self.nonce),
+            ("signature", &self.signature),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("agent_sandbox_activation_{name}_missing"));
+            }
+        }
+        if self.expires_at <= now {
+            return Err("agent_sandbox_activation_expired".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSandboxCustodyReceiptV1 {
+    pub activation: AgentSandboxActivationV1,
+    pub activated_at: DateTime<Utc>,
+    pub released_at: Option<DateTime<Utc>>,
+    pub replay_rejected: bool,
+}
+
 impl DbVariant for ProviderPreference {
-    const VALUES: &'static [&'static str] = &["any", "kubernetes", "cloudflare"];
+    const VALUES: &'static [&'static str] = &["any", "kubernetes", "agent_sandbox", "cloudflare"];
 
     fn as_db_str(&self) -> &'static str {
         match self {
             Self::Any => "any",
             Self::Kubernetes => "kubernetes",
+            Self::AgentSandbox => "agent_sandbox",
             Self::Cloudflare => "cloudflare",
         }
     }
@@ -1230,6 +1295,7 @@ impl DbVariant for ProviderPreference {
         match value {
             "any" => Ok(Self::Any),
             "kubernetes" => Ok(Self::Kubernetes),
+            "agent_sandbox" => Ok(Self::AgentSandbox),
             "cloudflare" => Ok(Self::Cloudflare),
             _ => Err(DbVariantError {
                 enum_name: "ProviderPreference",
@@ -3834,6 +3900,8 @@ pub enum WorkerJobResult {
     StopSandbox {
         provider: String,
         sandbox_id: SandboxId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custody_receipt: Option<AgentSandboxCustodyReceiptV1>,
     },
     ResumeSandbox {
         handle: ProviderResumeHandle,
@@ -4428,6 +4496,29 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(decoded.provider_preference, ProviderPreference::Cloudflare);
+    }
+
+    #[test]
+    fn agent_sandbox_activation_binds_claim_sandbox_and_pod() {
+        let activation = AgentSandboxActivationV1 {
+            version: AgentSandboxActivationV1::VERSION,
+            claim_uid: "claim-uid".into(),
+            sandbox_uid: "sandbox-uid".into(),
+            pod_uid: "pod-uid".into(),
+            image_digest: "sha256:image".into(),
+            bootstrap_digest: "sha256:bootstrap".into(),
+            policy_digest: "sha256:policy".into(),
+            expires_at: Utc::now() + chrono::Duration::minutes(1),
+            nonce: "nonce".into(),
+            signature: "signature".into(),
+        };
+        assert!(activation.validate_shape(Utc::now()).is_ok());
+        let payload = activation.signing_payload().expect("canonical payload");
+        let unsigned: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(unsigned["signature"], "");
+        assert_eq!(unsigned["claimUid"], "claim-uid");
+        assert_eq!(unsigned["sandboxUid"], "sandbox-uid");
+        assert_eq!(unsigned["podUid"], "pod-uid");
     }
 
     #[test]

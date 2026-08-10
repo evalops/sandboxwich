@@ -19,6 +19,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose, PublicKeyData, SanType, string::Ia5String,
 };
+use ring::signature::Ed25519KeyPair;
 use sandboxwich_core::lifecycle_contract::LifecycleReasonCode;
 use sandboxwich_core::{
     AgentCommandRequest, AgentCommandResult, DbVariant, ExecutionClass, HomeId,
@@ -476,6 +477,17 @@ pub(crate) fn isolated_resident_process_pod_name(spec: &IsolatedResidentProcessS
     format!("sw-sc-{}", isolated_resident_process_fence_suffix(spec))
 }
 
+fn agent_sandbox_launch_script(
+    state_dir: &str,
+    pid_file: &str,
+    exit_file: &str,
+    log_file: &str,
+) -> String {
+    format!(
+        "set -eu; umask 077; d={state_dir}; mkdir -p \"$d\"; rm -f \"$d/pid\" \"$d/exit\" \"$d/status\"; (set +e; \"$@\" >\"{log_file}\" 2>&1; rc=$?; printf '%s' \"$rc\" >\"{exit_file}\") & p=$!; printf '%s' \"$p\" >\"{pid_file}\"; printf '%s' running >\"$d/status\""
+    )
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IsolatedResidentProcessResult {
     pub final_observation: IsolatedResidentProcessObservation,
@@ -611,6 +623,13 @@ pub trait SandboxProvider {
         spec: &SandboxTeardownSpec,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<()>;
+    fn custody_receipt(
+        &self,
+        _sandbox_id: SandboxId,
+        _cancelled: &CancelSignal,
+    ) -> anyhow::Result<Option<sandboxwich_core::AgentSandboxCustodyReceiptV1>> {
+        Ok(None)
+    }
     fn delete_home(&self, home_id: HomeId, cancelled: &CancelSignal) -> anyhow::Result<()> {
         let _ = (home_id, cancelled);
         anyhow::bail!("provider does not support managed home deletion")
@@ -3184,7 +3203,7 @@ impl KubernetesDryRunProvider {
         status: RuntimeResourceStatus,
     ) -> anyhow::Result<ProviderSandboxHandle> {
         let mut handle = ProviderSandboxHandle {
-            provider: "kubernetes".to_string(),
+            provider: self.provider_name().to_string(),
             sandbox_id,
             resources: self.sandbox_resources(sandbox_id, spec, status),
             metadata: self.metadata(sandbox_id, "provision", spec)?,
@@ -3445,6 +3464,7 @@ pub struct KubernetesApplyProvider {
     max_captured_output_bytes: u64,
     isolated_resident_process_image: Option<String>,
     maestro_hosted_runner_image: Option<String>,
+    agent_sandbox_mode: bool,
     isolated_resident_process_startup_timeout: Duration,
     isolated_resident_process_poll_interval: Duration,
     isolated_resident_process_max_poll_interval: Duration,
@@ -4309,6 +4329,7 @@ impl KubernetesApplyProvider {
             max_captured_output_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
             isolated_resident_process_image: None,
             maestro_hosted_runner_image: None,
+            agent_sandbox_mode: false,
             isolated_resident_process_startup_timeout: Duration::from_secs(
                 DEFAULT_ISOLATED_RESIDENT_PROCESS_STARTUP_TIMEOUT_SECS,
             ),
@@ -4391,6 +4412,389 @@ impl KubernetesApplyProvider {
             (!image.is_empty()).then(|| image.to_string())
         });
         self
+    }
+
+    pub fn with_agent_sandbox_mode(mut self, enabled: bool) -> Self {
+        self.agent_sandbox_mode = enabled;
+        self
+    }
+
+    fn provision_agent_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<ProviderSandboxHandle> {
+        let result = self.provision_agent_sandbox_inner(sandbox_id, spec, cancelled);
+        if result.is_err() {
+            self.delete_agent_sandbox_claim(sandbox_id, cancelled);
+        }
+        result
+    }
+
+    fn delete_agent_sandbox_claim(&self, sandbox_id: SandboxId, cancelled: &CancelSignal) {
+        let claim_name = format!("sandboxwich-agent-claim-{sandbox_id}");
+        let mut args = self.kubectl_args("delete");
+        args.extend([
+            "sandboxclaim".to_string(),
+            claim_name,
+            "--ignore-not-found=true".to_string(),
+            "--wait=true".to_string(),
+        ]);
+        if let Err(error) = run_kubectl_command(
+            &self.kubectl,
+            &args,
+            "rollback Agent Sandbox claim",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        ) {
+            tracing::warn!(sandbox_id = %sandbox_id, %error, "agent_sandbox_claim_rollback_failed");
+        }
+    }
+
+    fn provision_agent_sandbox_inner(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxProvisionSpec,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<ProviderSandboxHandle> {
+        anyhow::ensure!(
+            matches!(
+                spec.workspace_mode,
+                WorkspaceMode::Ephemeral | WorkspaceMode::GenericEphemeral
+            ),
+            "agent_sandbox only supports ephemeral workspace modes"
+        );
+        anyhow::ensure!(
+            spec.secret_mounts.is_empty(),
+            "agent_sandbox warm pods must be secretless before activation"
+        );
+        anyhow::ensure!(
+            matches!(spec.network_egress, NetworkEgress::DenyAll),
+            "agent_sandbox requires managed default-deny networking"
+        );
+        anyhow::ensure!(
+            spec.sterile_pool_candidate.is_none(),
+            "agent_sandbox cannot combine with sterile pool candidates"
+        );
+        Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
+
+        let claim_name = format!("sandboxwich-agent-claim-{sandbox_id}");
+        let claim = json!({
+            "apiVersion": "extensions.agents.x-k8s.io/v1alpha1",
+            "kind": "SandboxClaim",
+            "metadata": {
+                "name": claim_name,
+                "namespace": self.dry_run.effective_sandbox_namespace(),
+                "labels": {
+                    "sandboxwich.dev/sandbox-id": sandbox_id.to_string(),
+                    "sandboxwich.dev/provider": "agent_sandbox"
+                }
+            },
+            "spec": {
+                "sandboxTemplateRef": {"name": "sandboxwich-agent-sandbox"},
+                "lifecycle": {"shutdownPolicy": "DeleteForeground"}
+            }
+        });
+        let applied = run_kubectl_documents(
+            &self.kubectl,
+            &self.kubectl_args("apply"),
+            std::slice::from_ref(&claim),
+            "apply Agent Sandbox claim",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        if !applied.success {
+            bail!("Agent Sandbox claim apply failed: {}", applied.stderr);
+        }
+
+        let deadline = Instant::now() + self.kubectl_command_timeout;
+        let mut claim_json = Value::Null;
+        let mut sandbox_name = None;
+        let mut pod_name = None;
+        let mut pod_uid = None;
+        while Instant::now() < deadline {
+            if cancelled.is_cancelled() {
+                bail!("Agent Sandbox claim provisioning cancelled");
+            }
+            let output = run_kubectl_command(
+                &self.kubectl,
+                &self.kubectl_args_for_get("sandboxclaim", &claim_name),
+                "read Agent Sandbox claim",
+                self.kubectl_command_timeout,
+                Some(cancelled),
+                self.max_captured_output_bytes,
+            )?;
+            if output.success {
+                claim_json =
+                    serde_json::from_str(&output.stdout).context("decode Agent Sandbox claim")?;
+                sandbox_name = claim_json
+                    .pointer("/status/sandbox/name")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if let Some(name) = sandbox_name.as_deref() {
+                    let sandbox = run_kubectl_command(
+                        &self.kubectl,
+                        &self.kubectl_args_for_get_core("sandbox", name),
+                        "read Agent Sandbox",
+                        self.kubectl_command_timeout,
+                        Some(cancelled),
+                        self.max_captured_output_bytes,
+                    )?;
+                    if sandbox.success {
+                        let sandbox_json: Value = serde_json::from_str(&sandbox.stdout)
+                            .context("decode Agent Sandbox")?;
+                        let selector = sandbox_json
+                            .pointer("/status/selector")
+                            .and_then(Value::as_str);
+                        if let Some(selector) = selector {
+                            let pods = self.kubectl_args_for_selector("pods", selector);
+                            let pod_output = run_kubectl_command(
+                                &self.kubectl,
+                                &pods,
+                                "read Agent Sandbox pod",
+                                self.kubectl_command_timeout,
+                                Some(cancelled),
+                                self.max_captured_output_bytes,
+                            )?;
+                            if pod_output.success {
+                                let pod_list: Value = serde_json::from_str(&pod_output.stdout)
+                                    .context("decode Agent Sandbox pod list")?;
+                                if let Some(pod) = pod_list.pointer("/items/0").filter(|pod| {
+                                    pod.pointer("/status/phase").and_then(Value::as_str)
+                                        == Some("Running")
+                                }) {
+                                    pod_uid = pod
+                                        .pointer("/metadata/uid")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_owned);
+                                    pod_name = pod
+                                        .pointer("/metadata/name")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_owned);
+                                    if pod_uid.is_some() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let sandbox_name = sandbox_name.context("Agent Sandbox claim never bound")?;
+        let pod_uid = pod_uid.context("Agent Sandbox pod never became ready")?;
+        let pod_name = pod_name.context("Agent Sandbox pod name missing")?;
+        let claim_uid = claim_json
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .context("Agent Sandbox claim UID missing")?;
+        let sandbox = run_kubectl_command(
+            &self.kubectl,
+            &self.kubectl_args_for_get_core("sandbox", &sandbox_name),
+            "read bound Agent Sandbox UID",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        let sandbox_json: Value = serde_json::from_str(&sandbox.stdout)?;
+        let sandbox_uid = sandbox_json
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .context("Agent Sandbox UID missing")?;
+        let mut activation = sandboxwich_core::AgentSandboxActivationV1 {
+            version: sandboxwich_core::AgentSandboxActivationV1::VERSION,
+            claim_uid: claim_uid.to_string(),
+            sandbox_uid: sandbox_uid.to_string(),
+            pod_uid: pod_uid.to_string(),
+            image_digest: self.dry_run.runtime_image.clone(),
+            bootstrap_digest: sha256_hex(b"sandboxwich-agent:agent-sandbox-v1"),
+            policy_digest: sha256_hex(serde_json::to_string(&spec.network_egress)?.as_bytes()),
+            expires_at: Utc::now() + chrono::Duration::minutes(5),
+            nonce: Uuid::now_v7().to_string(),
+            signature: String::new(),
+        };
+        let signing_key_file = std::env::var("SANDBOXWICH_AGENT_SANDBOX_SIGNING_KEY_FILE")
+            .context("Agent Sandbox signing key file is not configured")?;
+        let key_bytes = general_purpose::STANDARD
+            .decode(std::fs::read_to_string(signing_key_file)?.trim())
+            .context("decode Agent Sandbox signing key")?;
+        let key = Ed25519KeyPair::from_pkcs8(&key_bytes)
+            .map_err(|_| anyhow::anyhow!("invalid Agent Sandbox signing key"))?;
+        activation.signature =
+            general_purpose::STANDARD.encode(key.sign(&activation.signing_payload()?));
+        let activation_json = serde_json::to_vec(&activation)?;
+        let exec = run_kubectl_command_with_stdin(
+            &self.kubectl,
+            &self.kubectl_args_for_activation(
+                &pod_name,
+                claim_uid,
+                sandbox_uid,
+                "agent-sandbox-activate",
+            ),
+            Some(&activation_json),
+            "activate Agent Sandbox",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        if !exec.success {
+            bail!("Agent Sandbox activation failed: {}", exec.stderr);
+        }
+        let custody_receipt = sandboxwich_core::AgentSandboxCustodyReceiptV1 {
+            activation: activation.clone(),
+            activated_at: Utc::now(),
+            released_at: None,
+            replay_rejected: false,
+        };
+        self.write_agent_custody_receipt(sandbox_id, &custody_receipt, cancelled)?;
+        Ok(ProviderSandboxHandle {
+            provider: "agent_sandbox".into(),
+            sandbox_id,
+            resources: Vec::new(),
+            metadata: json!({
+                "claimName": claim_name,
+                "claimUid": claim_uid,
+                "sandboxName": sandbox_name,
+                "sandboxUid": sandbox_uid,
+                "podName": pod_name,
+                "podUid": pod_uid,
+                "activation": activation,
+                "custodyReceipt": custody_receipt,
+                "fallbackProvider": "kubernetes"
+            }),
+        })
+    }
+
+    fn custody_configmap_name(sandbox_id: SandboxId) -> String {
+        format!("sandboxwich-agent-custody-{sandbox_id}")
+    }
+
+    fn write_agent_custody_receipt(
+        &self,
+        sandbox_id: SandboxId,
+        receipt: &sandboxwich_core::AgentSandboxCustodyReceiptV1,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<()> {
+        let manifest = json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": Self::custody_configmap_name(sandbox_id),
+                "namespace": self.dry_run.effective_sandbox_namespace(),
+                "labels": {
+                    "sandboxwich.dev/sandbox-id": sandbox_id.to_string(),
+                    "sandboxwich.dev/purpose": "agent-sandbox-custody"
+                }
+            },
+            "data": {"receipt": serde_json::to_string(receipt)?}
+        });
+        let output = run_kubectl_documents(
+            &self.kubectl,
+            &self.kubectl_args("apply"),
+            std::slice::from_ref(&manifest),
+            "write Agent Sandbox custody receipt",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        anyhow::ensure!(
+            output.success,
+            "Agent Sandbox custody receipt write failed: {}",
+            output.stderr
+        );
+        Ok(())
+    }
+
+    fn read_agent_custody_receipt(
+        &self,
+        sandbox_id: SandboxId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<Option<sandboxwich_core::AgentSandboxCustodyReceiptV1>> {
+        let output = run_kubectl_command(
+            &self.kubectl,
+            &self.kubectl_args_for_get("configmap", &Self::custody_configmap_name(sandbox_id)),
+            "read Agent Sandbox custody receipt",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        if !output.success {
+            return Ok(None);
+        }
+        let configmap: Value = serde_json::from_str(&output.stdout)?;
+        let Some(receipt) = configmap.pointer("/data/receipt").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_str(receipt)?))
+    }
+
+    fn agent_sandbox_pod_name(
+        &self,
+        sandbox_id: SandboxId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<String> {
+        Ok(self.agent_sandbox_pod_identity(sandbox_id, cancelled)?.0)
+    }
+
+    fn agent_sandbox_pod_identity(
+        &self,
+        sandbox_id: SandboxId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<(String, String)> {
+        let claim_name = format!("sandboxwich-agent-claim-{sandbox_id}");
+        let claim = run_kubectl_command(
+            &self.kubectl,
+            &self.kubectl_args_for_get("sandboxclaim", &claim_name),
+            "read Agent Sandbox claim for exec",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        let claim: Value = serde_json::from_str(&claim.stdout)?;
+        let sandbox_name = claim
+            .pointer("/status/sandbox/name")
+            .and_then(Value::as_str)
+            .context("Agent Sandbox claim is not bound")?;
+        let sandbox = run_kubectl_command(
+            &self.kubectl,
+            &self.kubectl_args_for_get_core("sandbox", sandbox_name),
+            "read Agent Sandbox for exec",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        let sandbox: Value = serde_json::from_str(&sandbox.stdout)?;
+        let selector = sandbox
+            .pointer("/status/selector")
+            .and_then(Value::as_str)
+            .context("Agent Sandbox selector is missing")?;
+        let pods = run_kubectl_command(
+            &self.kubectl,
+            &self.kubectl_args_for_selector("pods", selector),
+            "read Agent Sandbox pod for exec",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        let pods: Value = serde_json::from_str(&pods.stdout)?;
+        let pod = pods
+            .pointer("/items/0")
+            .context("Agent Sandbox pod is missing")?;
+        let name = pod
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .context("Agent Sandbox pod name is missing")?;
+        let uid = pod
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .context("Agent Sandbox pod UID is missing")?;
+        Ok((name, uid))
     }
 
     pub fn with_isolated_resident_process_startup_timeout(mut self, timeout: Duration) -> Self {
@@ -5724,6 +6128,53 @@ impl KubernetesApplyProvider {
     fn kubectl_args(&self, verb: &str) -> Vec<String> {
         let mut args = self.kubectl_base_args();
         args.extend([verb.to_string(), "-f".to_string(), "-".to_string()]);
+        args
+    }
+
+    fn kubectl_args_for_get(&self, kind: &str, name: &str) -> Vec<String> {
+        let mut args = self.kubectl_args("get");
+        args.extend([
+            kind.to_string(),
+            name.to_string(),
+            "-o".to_string(),
+            "json".to_string(),
+        ]);
+        args
+    }
+
+    fn kubectl_args_for_get_core(&self, kind: &str, name: &str) -> Vec<String> {
+        self.kubectl_args_for_get(kind, name)
+    }
+
+    fn kubectl_args_for_selector(&self, kind: &str, selector: &str) -> Vec<String> {
+        let mut args = self.kubectl_args("get");
+        args.extend([
+            kind.to_string(),
+            "-l".to_string(),
+            selector.to_string(),
+            "-o".to_string(),
+            "json".to_string(),
+        ]);
+        args
+    }
+
+    fn kubectl_args_for_activation(
+        &self,
+        pod_name: &str,
+        claim_uid: &str,
+        sandbox_uid: &str,
+        command: &str,
+    ) -> Vec<String> {
+        let mut args = self.kubectl_args("exec");
+        args.extend([
+            pod_name.to_string(),
+            "--".to_string(),
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "umask 077; cat > /run/sandboxwich/activation.json; SANDBOXWICH_AGENT_SANDBOX_EXPECTED_CLAIM_UID='{claim_uid}' SANDBOXWICH_AGENT_SANDBOX_EXPECTED_SANDBOX_UID='{sandbox_uid}' /usr/local/bin/sandboxwich-agent {command} --bundle /run/sandboxwich/activation.json --public-key \"$SANDBOXWICH_AGENT_SANDBOX_PUBLIC_KEY_FILE\""
+            ),
+        ]);
         args
     }
 
@@ -7938,7 +8389,7 @@ impl SandboxProvider for KubernetesDryRunProvider {
 
     fn health_report(&self) -> ProviderHealthReport {
         ProviderHealthReport {
-            provider: "kubernetes".to_string(),
+            provider: self.provider_name().to_string(),
             status: ProviderHealthStatus::Healthy,
             checked_at: Utc::now(),
             labels: self.labels(),
@@ -8190,8 +8641,22 @@ impl SandboxProvider for KubernetesDryRunProvider {
 }
 
 impl SandboxProvider for KubernetesApplyProvider {
+    fn provider_name(&self) -> &'static str {
+        if self.agent_sandbox_mode {
+            "agent_sandbox"
+        } else {
+            "kubernetes"
+        }
+    }
+
     fn capability_report(&self) -> ProviderCapabilityReport {
         let mut report = self.dry_run.capability_report();
+        if self.agent_sandbox_mode {
+            report.provider = "agent_sandbox".to_string();
+            report
+                .labels
+                .insert("agent_sandbox_mode".to_string(), "enabled".to_string());
+        }
         report.capabilities.push(WorkerCapability::MaterializeFile);
         if self.dry_run.advertises_virtual_machine() {
             report.capabilities.push(WorkerCapability::VirtualMachine);
@@ -8221,7 +8686,7 @@ impl SandboxProvider for KubernetesApplyProvider {
             self.mutation_enabled.to_string(),
         );
         ProviderHealthReport {
-            provider: "kubernetes".to_string(),
+            provider: self.provider_name().to_string(),
             status: if self.confirm_apply && self.mutation_enabled {
                 ProviderHealthStatus::Healthy
             } else {
@@ -8241,6 +8706,13 @@ impl SandboxProvider for KubernetesApplyProvider {
         spec: &SandboxProvisionSpec,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<ProviderSandboxHandle> {
+        if spec.provider_preference == sandboxwich_core::ProviderPreference::AgentSandbox {
+            anyhow::ensure!(
+                self.agent_sandbox_mode,
+                "agent_sandbox placement requires the dedicated agent_sandbox worker"
+            );
+            return self.provision_agent_sandbox(sandbox_id, spec, cancelled);
+        }
         let span = tracing::info_span!(
             "sandboxwich.provider.provision",
             operation = "provision",
@@ -8353,6 +8825,11 @@ impl SandboxProvider for KubernetesApplyProvider {
         cancelled: &CancelSignal,
         report: &mut dyn FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
     ) -> anyhow::Result<ProviderSandboxHandle> {
+        if spec.provider_preference == sandboxwich_core::ProviderPreference::AgentSandbox {
+            let handle = self.provision(sandbox_id, spec, cancelled)?;
+            report(stage_update(ProvisioningStage::SandboxReady, None))?;
+            return Ok(handle);
+        }
         KubernetesApplyProvider::provision_staged(self, sandbox_id, spec, cancelled, report)
     }
 
@@ -8364,6 +8841,38 @@ impl SandboxProvider for KubernetesApplyProvider {
         cancelled: &CancelSignal,
     ) -> anyhow::Result<AgentCommandResult> {
         validate_agent_command_request(&request)?;
+        if spec.provider_preference == sandboxwich_core::ProviderPreference::AgentSandbox {
+            let pod_name = self.agent_sandbox_pod_name(sandbox_id, cancelled)?;
+            let started_at = Utc::now();
+            let timeout = request
+                .timeout_secs
+                .map(Duration::from_secs)
+                .unwrap_or(self.kubectl_command_timeout);
+            let stdin_payload = Self::exec_stdin_payload(&request);
+            let mut args = self.exec_args(sandbox_id, &request);
+            if let Some(index) = args
+                .iter()
+                .position(|value| value == &self.pod_name(sandbox_id))
+            {
+                args[index] = pod_name;
+            }
+            let output = run_kubectl_command_with_stdin(
+                &self.kubectl,
+                &args,
+                stdin_payload.as_deref(),
+                "execute Agent Sandbox command",
+                timeout,
+                Some(cancelled),
+                self.max_captured_output_bytes,
+            )?;
+            return Ok(AgentCommandResult {
+                exit_code: output.code.or(Some(if output.success { 0 } else { 1 })),
+                stdout: output.stdout,
+                stderr: output.stderr,
+                started_at,
+                finished_at: Utc::now(),
+            });
+        }
         // Only provision when the pod is actually missing. Re-applying the full
         // manifest set (and re-waiting up to 120s) before every command is both slow
         // and unsafe: Pod `resources` are immutable, so an exec whose spec drifts from
@@ -8411,6 +8920,201 @@ impl SandboxProvider for KubernetesApplyProvider {
         cancelled: &CancelSignal,
         observe: &mut dyn FnMut(IsolatedResidentProcessObservation) -> anyhow::Result<()>,
     ) -> anyhow::Result<IsolatedResidentProcessResult> {
+        if self.agent_sandbox_mode {
+            // Agent Sandbox owns the execution pod. Do not call
+            // isolated_resident_process_manifests here: that would create a
+            // second ordinary resident Pod and silently bypass the claimed
+            // warm cell.
+            let (pod_name, pod_uid) =
+                self.agent_sandbox_pod_identity(spec.sandbox_id, cancelled)?;
+            let starting = IsolatedResidentProcessObservation {
+                state: IsolatedResidentProcessState::Starting,
+                pod_name: pod_name.clone(),
+                pod_uid: Some(pod_uid.clone()),
+                ready: false,
+                exit_code: None,
+            };
+            observe(starting)?;
+            let provision_spec = SandboxProvisionSpec {
+                provider_preference: sandboxwich_core::ProviderPreference::AgentSandbox,
+                workspace_mode: spec.workspace_mode.clone(),
+                ..SandboxProvisionSpec::default()
+            };
+            if let Some(bootstrap) = spec.bootstrap.as_ref() {
+                let bootstrap_request = AgentCommandRequest {
+                    argv: vec![
+                        "sh".into(),
+                        "-lc".into(),
+                        format!(
+                            "umask 077; cat > '{}' && chmod {:o} '{}'",
+                            bootstrap.target_file, bootstrap.mode, bootstrap.target_file
+                        ),
+                    ],
+                    cwd: None,
+                    env: BTreeMap::new(),
+                    stdin: Some(bootstrap.content.clone()),
+                    timeout_secs: Some(30),
+                };
+                self.exec_handoff(
+                    spec.sandbox_id,
+                    &provision_spec,
+                    bootstrap_request,
+                    cancelled,
+                )?;
+            }
+            let fence = isolated_resident_process_fence_suffix(spec);
+            let state_dir = format!("/run/sandboxwich/residents/{fence}");
+            let pid_file = format!("{state_dir}/pid");
+            let exit_file = format!("{state_dir}/exit");
+            let log_file = format!("{state_dir}/stdout-stderr.log");
+            let launch_script =
+                agent_sandbox_launch_script(&state_dir, &pid_file, &exit_file, &log_file);
+            let mut launch_argv = vec![
+                "sh".to_string(),
+                "-lc".to_string(),
+                launch_script,
+                "sandboxwich-agent-resident".to_string(),
+            ];
+            launch_argv.extend(spec.argv.clone());
+            let launch_request = AgentCommandRequest {
+                argv: launch_argv,
+                cwd: spec.cwd.clone(),
+                env: spec.env.clone(),
+                stdin: None,
+                timeout_secs: Some(15),
+            };
+            let mut launch_args = self.exec_args(spec.sandbox_id, &launch_request);
+            if let Some(pod_index) = launch_args
+                .iter()
+                .position(|arg| arg == &self.pod_name(spec.sandbox_id))
+            {
+                launch_args[pod_index] = pod_name.clone();
+            }
+            let launch_output = run_kubectl_command_with_stdin(
+                &self.kubectl,
+                &launch_args,
+                Self::exec_stdin_payload(&launch_request).as_deref(),
+                "start Agent Sandbox resident process",
+                Duration::from_secs(15),
+                Some(cancelled),
+                self.max_captured_output_bytes,
+            )?;
+            anyhow::ensure!(
+                launch_output.success,
+                "Agent Sandbox resident process failed to start: {}",
+                launch_output.stderr
+            );
+            let running = IsolatedResidentProcessObservation {
+                state: IsolatedResidentProcessState::Running,
+                pod_name: pod_name.clone(),
+                pod_uid: Some(pod_uid.clone()),
+                ready: true,
+                exit_code: None,
+            };
+            observe(running)?;
+            let mut poll_interval = self.isolated_resident_process_poll_interval;
+            loop {
+                if cancelled.is_cancelled() {
+                    let kill_request = AgentCommandRequest {
+                        argv: vec![
+                            "sh".into(),
+                            "-lc".into(),
+                            format!(
+                                "test -r '{pid_file}' && kill \"$(cat '{pid_file}')\" 2>/dev/null || true"
+                            ),
+                        ],
+                        cwd: None,
+                        env: BTreeMap::new(),
+                        stdin: None,
+                        timeout_secs: Some(15),
+                    };
+                    let mut kill_args = self.exec_args(spec.sandbox_id, &kill_request);
+                    if let Some(index) = kill_args
+                        .iter()
+                        .position(|arg| arg == &self.pod_name(spec.sandbox_id))
+                    {
+                        kill_args[index] = pod_name.clone();
+                    }
+                    let _ = run_kubectl_command(
+                        &self.kubectl,
+                        &kill_args,
+                        "stop cancelled Agent Sandbox resident process",
+                        Duration::from_secs(15),
+                        None,
+                        self.max_captured_output_bytes,
+                    );
+                    anyhow::bail!(
+                        "Agent Sandbox resident-process execution cancelled after lease loss"
+                    );
+                }
+                let status_request = AgentCommandRequest {
+                    argv: vec![
+                        "sh".into(),
+                        "-lc".into(),
+                        format!(
+                            "if test -r '{exit_file}'; then printf 'exit:'; cat '{exit_file}'; elif test -r '{pid_file}' && kill -0 \"$(cat '{pid_file}')\" 2>/dev/null; then printf running; else printf failed; fi"
+                        ),
+                    ],
+                    cwd: None,
+                    env: BTreeMap::new(),
+                    stdin: None,
+                    timeout_secs: Some(15),
+                };
+                let mut status_args = self.exec_args(spec.sandbox_id, &status_request);
+                if let Some(index) = status_args
+                    .iter()
+                    .position(|arg| arg == &self.pod_name(spec.sandbox_id))
+                {
+                    status_args[index] = pod_name.clone();
+                }
+                let status = run_kubectl_command(
+                    &self.kubectl,
+                    &status_args,
+                    "observe Agent Sandbox resident process",
+                    Duration::from_secs(15),
+                    Some(cancelled),
+                    self.max_captured_output_bytes,
+                )?;
+                let value = status.stdout.trim();
+                if let Some(code) = value
+                    .strip_prefix("exit:")
+                    .and_then(|v| v.parse::<i32>().ok())
+                {
+                    let terminal = IsolatedResidentProcessObservation {
+                        state: if code == 0 {
+                            IsolatedResidentProcessState::Succeeded
+                        } else {
+                            IsolatedResidentProcessState::Failed
+                        },
+                        pod_name: pod_name.clone(),
+                        pod_uid: Some(pod_uid.clone()),
+                        ready: true,
+                        exit_code: Some(code),
+                    };
+                    observe(terminal.clone())?;
+                    return Ok(IsolatedResidentProcessResult {
+                        final_observation: terminal,
+                    });
+                }
+                if value == "failed" {
+                    let terminal = IsolatedResidentProcessObservation {
+                        state: IsolatedResidentProcessState::Failed,
+                        pod_name: pod_name.clone(),
+                        pod_uid: Some(pod_uid.clone()),
+                        ready: true,
+                        exit_code: None,
+                    };
+                    observe(terminal.clone())?;
+                    return Ok(IsolatedResidentProcessResult {
+                        final_observation: terminal,
+                    });
+                }
+                sleep_with_cancellation(poll_interval, cancelled)?;
+                poll_interval = poll_interval
+                    .saturating_mul(2)
+                    .min(self.isolated_resident_process_max_poll_interval);
+            }
+        }
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
         let manifests = self.isolated_resident_process_manifests(spec)?;
         let cleanup_manifests = self.isolated_resident_process_cleanup_manifests(spec);
@@ -8958,6 +9662,34 @@ impl SandboxProvider for KubernetesApplyProvider {
         spec: &SandboxTeardownSpec,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<()> {
+        if self.agent_sandbox_mode {
+            Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
+            let mut receipt = self.read_agent_custody_receipt(sandbox_id, cancelled)?;
+            let claim_name = format!("sandboxwich-agent-claim-{sandbox_id}");
+            let mut args = self.kubectl_args("delete");
+            args.extend([
+                "sandboxclaim".to_string(),
+                claim_name,
+                "--ignore-not-found=true".to_string(),
+                "--wait=true".to_string(),
+            ]);
+            let output = run_kubectl_command(
+                &self.kubectl,
+                &args,
+                "delete Agent Sandbox claim",
+                self.kubectl_command_timeout,
+                Some(cancelled),
+                self.max_captured_output_bytes,
+            )?;
+            if !output.success {
+                bail!("Agent Sandbox claim cleanup failed: {}", output.stderr);
+            }
+            if let Some(mut receipt_value) = receipt.take() {
+                receipt_value.released_at = Some(Utc::now());
+                self.write_agent_custody_receipt(sandbox_id, &receipt_value, cancelled)?;
+            }
+            return Ok(());
+        }
         let span = tracing::info_span!(
             "sandboxwich.provider.cleanup",
             operation = "stop",
@@ -9098,6 +9830,14 @@ impl SandboxProvider for KubernetesApplyProvider {
             "sandboxwich_cleanup_completed"
         );
         Ok(())
+    }
+
+    fn custody_receipt(
+        &self,
+        sandbox_id: SandboxId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<Option<sandboxwich_core::AgentSandboxCustodyReceiptV1>> {
+        self.read_agent_custody_receipt(sandbox_id, cancelled)
     }
 
     fn delete_home(&self, home_id: HomeId, cancelled: &CancelSignal) -> anyhow::Result<()> {

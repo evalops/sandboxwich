@@ -694,6 +694,7 @@ async fn stop_before_first_provision_waits_for_placement_and_cannot_be_undone() 
             result: Some(WorkerJobResult::StopSandbox {
                 provider: "kubernetes".to_string(),
                 sandbox_id: created.sandbox.id,
+                custody_receipt: None,
             }),
         })
         .send()
@@ -1247,6 +1248,7 @@ pub(crate) async fn assert_job_completion_does_not_resurrect_concurrently_archiv
             result: Some(WorkerJobResult::StopSandbox {
                 provider: "kubernetes".to_string(),
                 sandbox_id: forked.sandbox.id,
+                custody_receipt: None,
             }),
         })
         .send()

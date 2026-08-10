@@ -57,7 +57,9 @@ pub(crate) fn worker_matches_provider_preference(
     // preferences match only the named provider.
     match preference {
         ProviderPreference::Any => worker_provider.eq_ignore_ascii_case("kubernetes"),
-        ProviderPreference::Kubernetes | ProviderPreference::Cloudflare => {
+        ProviderPreference::Kubernetes
+        | ProviderPreference::Cloudflare
+        | ProviderPreference::AgentSandbox => {
             preference.as_db_str().eq_ignore_ascii_case(worker_provider)
         }
     }

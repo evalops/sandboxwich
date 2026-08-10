@@ -16,6 +16,7 @@ chrono.workspace = true
 clap.workspace = true
 ipnet.workspace = true
 reqwest.workspace = true
+ring.workspace = true
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 rustls-pemfile.workspace = true
 sandboxwich-core.workspace = true

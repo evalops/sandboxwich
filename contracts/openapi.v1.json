@@ -1584,6 +1584,7 @@
         "enum": [
           "any",
           "kubernetes",
+          "agent_sandbox",
           "cloudflare"
         ],
         "type": "string"

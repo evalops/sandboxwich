@@ -762,6 +762,7 @@ pub(crate) async fn run_contract(server: TestServer) {
             result: Some(WorkerJobResult::StopSandbox {
                 sandbox_id: created.sandbox.id,
                 provider: "kubernetes".to_string(),
+                custody_receipt: None,
             }),
         })
         .send()
