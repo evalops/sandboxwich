@@ -4537,10 +4537,9 @@ impl KubernetesApplyProvider {
             spec.secret_mounts.is_empty(),
             "agent_sandbox warm pods must be secretless before activation"
         );
-        anyhow::ensure!(
-            matches!(spec.network_egress, NetworkEgress::DenyAll),
-            "agent_sandbox requires managed default-deny networking"
-        );
+        // The managed SandboxTemplate owns the pre-claim default-deny policy.
+        // Keep the requested egress untouched so a failed Agent Sandbox
+        // attempt can fall back to the ordinary Kubernetes profile contract.
         anyhow::ensure!(
             spec.sterile_pool_candidate.is_none(),
             "agent_sandbox cannot combine with sterile pool candidates"
@@ -4710,16 +4709,7 @@ impl KubernetesApplyProvider {
         let activation_json = serde_json::to_vec(&activation)?;
         let exec = run_kubectl_command_with_stdin(
             &self.kubectl,
-            &self.kubectl_args_for_activation(
-                &pod_name,
-                claim_uid,
-                sandbox_uid,
-                &pod_uid,
-                &activation.image_digest,
-                &activation.bootstrap_digest,
-                &activation.policy_digest,
-                "agent-sandbox-activate",
-            )?,
+            &self.kubectl_args_for_activation(&pod_name, &activation, "agent-sandbox-activate")?,
             Some(&activation_json),
             "activate Agent Sandbox",
             self.kubectl_command_timeout,
@@ -6330,22 +6320,17 @@ impl KubernetesApplyProvider {
     fn kubectl_args_for_activation(
         &self,
         pod_name: &str,
-        claim_uid: &str,
-        sandbox_uid: &str,
-        pod_uid: &str,
-        image_digest: &str,
-        bootstrap_digest: &str,
-        policy_digest: &str,
+        activation: &sandboxwich_core::AgentSandboxActivationV1,
         command: &str,
     ) -> anyhow::Result<Vec<String>> {
-        validate_shell_identifier(claim_uid, "claim_uid")?;
-        validate_shell_identifier(sandbox_uid, "sandbox_uid")?;
+        validate_shell_identifier(&activation.claim_uid, "claim_uid")?;
+        validate_shell_identifier(&activation.sandbox_uid, "sandbox_uid")?;
         validate_shell_identifier(command, "activation_command")?;
         for (field, value) in [
-            ("pod_uid", pod_uid),
-            ("image_digest", image_digest),
-            ("bootstrap_digest", bootstrap_digest),
-            ("policy_digest", policy_digest),
+            ("pod_uid", activation.pod_uid.as_str()),
+            ("image_digest", activation.image_digest.as_str()),
+            ("bootstrap_digest", activation.bootstrap_digest.as_str()),
+            ("policy_digest", activation.policy_digest.as_str()),
         ] {
             anyhow::ensure!(
                 !value.is_empty() && !value.contains('\0'),
@@ -6361,12 +6346,12 @@ impl KubernetesApplyProvider {
             "-c".to_string(),
             "umask 077; cat > /run/sandboxwich/activation.json; exec env SANDBOXWICH_AGENT_SANDBOX_EXPECTED_CLAIM_UID=\"$1\" SANDBOXWICH_AGENT_SANDBOX_EXPECTED_SANDBOX_UID=\"$2\" SANDBOXWICH_AGENT_SANDBOX_EXPECTED_POD_UID=\"$3\" SANDBOXWICH_AGENT_SANDBOX_EXPECTED_IMAGE_DIGEST=\"$4\" SANDBOXWICH_AGENT_SANDBOX_EXPECTED_BOOTSTRAP_DIGEST=\"$5\" SANDBOXWICH_AGENT_SANDBOX_EXPECTED_POLICY_DIGEST=\"$6\" /usr/local/bin/sandboxwich-agent \"$7\" --bundle /run/sandboxwich/activation.json --public-key \"$SANDBOXWICH_AGENT_SANDBOX_PUBLIC_KEY_FILE\"".to_string(),
             "--".to_string(),
-            claim_uid.to_string(),
-            sandbox_uid.to_string(),
-            pod_uid.to_string(),
-            image_digest.to_string(),
-            bootstrap_digest.to_string(),
-            policy_digest.to_string(),
+            activation.claim_uid.clone(),
+            activation.sandbox_uid.clone(),
+            activation.pod_uid.clone(),
+            activation.image_digest.clone(),
+            activation.bootstrap_digest.clone(),
+            activation.policy_digest.clone(),
             command.to_string(),
         ]);
         Ok(args)

@@ -4965,31 +4965,34 @@ fn agent_sandbox_named_kubectl_commands_do_not_use_manifest_stdin() {
         .map(str::to_string)
         .collect::<Vec<_>>()
     );
+    let malicious_activation = sandboxwich_core::AgentSandboxActivationV1 {
+        version: sandboxwich_core::AgentSandboxActivationV1::VERSION,
+        claim_uid: "claim'breakout".into(),
+        sandbox_uid: "sandbox-1".into(),
+        pod_uid: "pod-1".into(),
+        image_digest: "image@sha256:abc".into(),
+        bootstrap_digest: "sha256:bootstrap".into(),
+        policy_digest: "sha256:policy".into(),
+        expires_at: chrono::Utc::now() + chrono::Duration::minutes(1),
+        nonce: "00000000-0000-4000-8000-000000000001".into(),
+        signature: "sig".into(),
+    };
     assert!(
         apply
-            .kubectl_args_for_activation(
-                "pod-1",
-                "claim'breakout",
-                "sandbox-1",
-                "pod-1",
-                "image@sha256:abc",
-                "sha256:bootstrap",
-                "sha256:policy",
-                "agent-sandbox-activate",
-            )
+            .kubectl_args_for_activation("pod-1", &malicious_activation, "agent-sandbox-activate")
             .is_err()
     );
+    let activation = sandboxwich_core::AgentSandboxActivationV1 {
+        claim_uid: "claim-1".into(),
+        sandbox_uid: "sandbox-1".into(),
+        pod_uid: "pod-uid-1".into(),
+        image_digest: "image@sha256:abc".into(),
+        bootstrap_digest: "sha256:bootstrap".into(),
+        policy_digest: "sha256:policy".into(),
+        ..malicious_activation.clone()
+    };
     let activation_args = apply
-        .kubectl_args_for_activation(
-            "pod-1",
-            "claim-1",
-            "sandbox-1",
-            "pod-uid-1",
-            "image@sha256:abc",
-            "sha256:bootstrap",
-            "sha256:policy",
-            "agent-sandbox-activate",
-        )
+        .kubectl_args_for_activation("pod-1", &activation, "agent-sandbox-activate")
         .unwrap();
     assert!(
         activation_args[activation_args.len() - 9]
