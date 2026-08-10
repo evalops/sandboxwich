@@ -2144,6 +2144,11 @@ set -eu
 printf '%s\n' "$*" >> "{log}"
 case " $* " in
   *runtimeClassName*) printf '%s' '{observed}' ;;
+  *" get volumesnapshot "*|*" get volumesnapshot/"*)
+    case " $* " in
+      *readyToUse*) printf 'true' ;;
+    esac
+    ;;
   *" get pod "*) printf '%s' '{existing}' ;;
   *" exec "*) cat >/dev/null 2>&1 || true; printf 'guest-ran' ;;
   *) cat >/dev/null 2>&1 || true ;;
@@ -2172,9 +2177,14 @@ esac
 
 fn kata_apply_provider(kubectl: &std::path::Path) -> KubernetesApplyProvider {
     KubernetesApplyProvider::new(
-        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
-            .with_isolation_profile(IsolationProfile::Kata)
-            .with_runtime_class_name(Some("kata-qemu".to_string())),
+        KubernetesDryRunProvider::with_snapshot_class(
+            "k3s-ci",
+            "sandboxwich-ci",
+            None,
+            Some("local-path-snapshot".to_string()),
+        )
+        .with_isolation_profile(IsolationProfile::Kata)
+        .with_runtime_class_name(Some("kata-qemu".to_string())),
         kubectl.to_string_lossy().into_owned(),
     )
     .with_kubectl_context(Some("in-cluster".to_string()))
@@ -3068,6 +3078,289 @@ fn kubernetes_pod_mounts_authorized_keys_secret_by_reference() {
             .expect("pod manifest should serialize")
             .contains("ssh-rsa")
     );
+}
+
+#[test]
+fn volume_snapshot_manifest_pins_configured_snapshot_class() {
+    let with_class = KubernetesDryRunProvider::with_snapshot_class(
+        "k3s-ci",
+        "sandboxwich-ci",
+        Some("standard-rwo".to_string()),
+        Some("gke-pd-csi".to_string()),
+    );
+    let without_class =
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+    let snapshot_id = SnapshotId::new();
+    let sandbox_id = SandboxId::new();
+
+    let pinned = with_class.volume_snapshot_manifest(sandbox_id, snapshot_id);
+    assert_eq!(pinned["spec"]["volumeSnapshotClassName"], "gke-pd-csi");
+    assert_eq!(
+        pinned["spec"]["source"]["persistentVolumeClaimName"],
+        format!("sandboxwich-pvc-{sandbox_id}")
+    );
+
+    let unpinned = without_class.volume_snapshot_manifest(sandbox_id, snapshot_id);
+    assert!(
+        unpinned["spec"].get("volumeSnapshotClassName").is_none(),
+        "omitting the class must leave volumeSnapshotClassName unset so dry-run plans stay honest: {unpinned}"
+    );
+}
+
+#[test]
+fn apply_create_snapshot_refuses_when_snapshot_class_is_unconfigured() {
+    let (kubectl, log_path) = write_fake_kubectl(None);
+    let provider = apply_provider_with_fake_kubectl_and_snapshot_class(&kubectl, None);
+
+    let error = provider
+        .create_snapshot(
+            SandboxId::new(),
+            SnapshotId::new(),
+            &CancelSignal::never_cancelled(),
+        )
+        .expect_err("apply mode must fail closed without a CSI VolumeSnapshotClass");
+    assert!(
+        error
+            .to_string()
+            .contains("snapshot class is not configured"),
+        "expected a configuration error, got: {error}"
+    );
+    assert!(
+        !log_path.exists()
+            || std::fs::read_to_string(&log_path)
+                .unwrap_or_default()
+                .is_empty(),
+        "no kubectl mutation may run before the class gate"
+    );
+    let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+#[test]
+fn apply_create_snapshot_waits_for_ready_to_use_before_success() {
+    let (kubectl, log_path) = write_fake_kubectl(None);
+    let provider = apply_provider_with_fake_kubectl(&kubectl);
+    let sandbox_id = SandboxId::new();
+    let snapshot_id = SnapshotId::new();
+
+    let handle = provider
+        .create_snapshot(sandbox_id, snapshot_id, &CancelSignal::never_cancelled())
+        .expect("configured apply snapshot should succeed once readyToUse");
+    assert!(
+        handle
+            .resources
+            .iter()
+            .all(|resource| resource.status == RuntimeResourceStatus::Ready),
+        "snapshot resources must be Ready only after readyToUse, got: {:?}",
+        handle.resources
+    );
+    assert_eq!(handle.metadata["mode"], "apply");
+    assert!(handle.metadata.get("waitStatus").is_some());
+
+    let log = std::fs::read_to_string(&log_path).expect("read fake kubectl log");
+    assert!(
+        log.contains(" apply "),
+        "snapshot object must be applied: {log}"
+    );
+    assert!(
+        log.contains(" wait ")
+            && log.contains("readyToUse")
+            && log.contains(&format!(
+                "volumesnapshot/sandboxwich-snapshot-{snapshot_id}"
+            )),
+        "create_snapshot must wait for readyToUse on the applied VolumeSnapshot: {log}"
+    );
+    let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+#[test]
+fn apply_create_snapshot_fails_when_ready_to_use_wait_fails() {
+    let (kubectl, log_path) = write_fake_kubectl(Some("wait"));
+    let provider = apply_provider_with_fake_kubectl(&kubectl);
+
+    let error = provider
+        .create_snapshot(
+            SandboxId::new(),
+            SnapshotId::new(),
+            &CancelSignal::never_cancelled(),
+        )
+        .expect_err("a VolumeSnapshot that never becomes readyToUse must fail the job");
+    assert!(
+        error.to_string().contains("readyToUse"),
+        "expected a readyToUse wait failure, got: {error}"
+    );
+    let log = std::fs::read_to_string(&log_path).expect("read fake kubectl log");
+    assert!(
+        log.contains(" apply "),
+        "apply should have run before wait: {log}"
+    );
+    assert!(
+        log.contains(" wait "),
+        "wait should have been attempted: {log}"
+    );
+    let _ = std::fs::remove_dir_all(kubectl.parent().expect("fake kubectl parent"));
+}
+
+#[test]
+fn apply_fork_refuses_unready_volume_snapshot() {
+    let dir = std::env::temp_dir().join(format!(
+        "sandboxwich-fake-kubectl-unready-snap-{}",
+        SandboxId::new()
+    ));
+    std::fs::create_dir_all(&dir).expect("create fake kubectl dir");
+    let log_path = dir.join("log.txt");
+    let script_path = dir.join("kubectl");
+    let script = format!(
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$*\" >> \"{log}\"\n\
+         case \" $* \" in\n\
+         *readyToUse*) printf 'false' ;;\n\
+         *\" apply \"*) cat >/dev/null 2>&1 || true ;;\n\
+         esac\n\
+         exit 0\n",
+        log = log_path.display(),
+    );
+    std::fs::write(&script_path, script).expect("write fake kubectl");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat fake kubectl")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod fake kubectl");
+    }
+    let provider = apply_provider_with_fake_kubectl(&script_path);
+    let snapshot_id = SnapshotId::new();
+
+    let error = provider
+        .fork(
+            SandboxId::new(),
+            SandboxId::new(),
+            snapshot_id,
+            &SandboxProvisionSpec::default(),
+            &CancelSignal::never_cancelled(),
+        )
+        .expect_err("fork must not apply a PVC against an unbound VolumeSnapshot");
+    assert!(
+        error.to_string().contains("not readyToUse"),
+        "expected unbound-snapshot refusal, got: {error}"
+    );
+    let log = std::fs::read_to_string(&log_path).expect("read fake kubectl log");
+    assert!(
+        !log.contains(" apply "),
+        "no fork manifests may be applied when the snapshot is unbound: {log}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn apply_resume_refuses_unready_volume_snapshot() {
+    let dir = std::env::temp_dir().join(format!(
+        "sandboxwich-fake-kubectl-unready-resume-{}",
+        SandboxId::new()
+    ));
+    std::fs::create_dir_all(&dir).expect("create fake kubectl dir");
+    let log_path = dir.join("log.txt");
+    let script_path = dir.join("kubectl");
+    let script = format!(
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$*\" >> \"{log}\"\n\
+         case \" $* \" in\n\
+         *readyToUse*) printf 'false' ;;\n\
+         *\" apply \"*) cat >/dev/null 2>&1 || true ;;\n\
+         esac\n\
+         exit 0\n",
+        log = log_path.display(),
+    );
+    std::fs::write(&script_path, script).expect("write fake kubectl");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat fake kubectl")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod fake kubectl");
+    }
+    let provider = apply_provider_with_fake_kubectl(&script_path);
+    let snapshot_id = SnapshotId::new();
+
+    let error = provider
+        .resume(
+            SandboxId::new(),
+            snapshot_id,
+            &SandboxProvisionSpec {
+                workspace_mode: WorkspaceMode::Persistent,
+                ..SandboxProvisionSpec::default()
+            },
+            &CancelSignal::never_cancelled(),
+        )
+        .expect_err("resume must not apply a PVC against an unbound VolumeSnapshot");
+    assert!(
+        error.to_string().contains("not readyToUse"),
+        "expected unbound-snapshot refusal, got: {error}"
+    );
+    let log = std::fs::read_to_string(&log_path).expect("read fake kubectl log");
+    assert!(
+        !log.contains(" apply "),
+        "no resume manifests may be applied when the snapshot is unbound: {log}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn apply_stop_waits_for_sandbox_volume_snapshots_before_deleting_pvc() {
+    let dir = std::env::temp_dir().join(format!(
+        "sandboxwich-fake-kubectl-stop-snap-{}",
+        SandboxId::new()
+    ));
+    std::fs::create_dir_all(&dir).expect("create fake kubectl dir");
+    let log_path = dir.join("log.txt");
+    let script_path = dir.join("kubectl");
+    let script = format!(
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$*\" >> \"{log}\"\n\
+         case \" $* \" in\n\
+         *\" get volumesnapshot \"*) printf 'sandboxwich-snapshot-pending\\n' ;;\n\
+         *\" wait \"*) ;;\n\
+         *\" delete \"*) ;;\n\
+         esac\n\
+         exit 0\n",
+        log = log_path.display(),
+    );
+    std::fs::write(&script_path, script).expect("write fake kubectl");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat fake kubectl")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod fake kubectl");
+    }
+    let provider = apply_provider_with_fake_kubectl(&script_path);
+    let sandbox_id = SandboxId::new();
+
+    provider
+        .stop(
+            sandbox_id,
+            &SandboxTeardownSpec::default(),
+            &CancelSignal::never_cancelled(),
+        )
+        .expect("stop should succeed after waiting for listed VolumeSnapshots");
+
+    let log = std::fs::read_to_string(&log_path).expect("read fake kubectl log");
+    let get_pos = log.find(" get volumesnapshot ").unwrap_or_else(|| {
+        panic!("stop must list VolumeSnapshots first: {log}");
+    });
+    let wait_pos = log
+        .find("volumesnapshot/sandboxwich-snapshot-pending")
+        .unwrap_or_else(|| panic!("stop must wait on listed VolumeSnapshots: {log}"));
+    let delete_pos = log
+        .find(" delete ")
+        .unwrap_or_else(|| panic!("stop must still delete core resources: {log}"));
+    assert!(
+        get_pos < wait_pos && wait_pos < delete_pos,
+        "ordering must be list, then wait readyToUse, then delete PVC; log: {log}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -4547,6 +4840,11 @@ fn write_fake_kubectl(fail_verb: Option<&'static str>) -> (std::path::PathBuf, s
              {fail_check}\
              case \" $* \" in\n\
              \x20\x20*\" apply \"*) cat >/dev/null 2>&1 || true ;;\n\
+             \x20\x20*readyToUse*)\n\
+             \x20\x20  case \" $* \" in\n\
+             \x20\x20  *\" get \"*) printf 'true' ;;\n\
+             \x20\x20  esac\n\
+             \x20\x20  ;;\n\
              esac\n\
              exit 0\n",
         log = log_path.display(),
@@ -4598,8 +4896,19 @@ fn write_fake_kubectl_missing_optional_resource() -> (std::path::PathBuf, std::p
 }
 
 fn apply_provider_with_fake_kubectl(kubectl: &std::path::Path) -> KubernetesApplyProvider {
-    let dry_run =
-        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
+    apply_provider_with_fake_kubectl_and_snapshot_class(kubectl, Some("local-path-snapshot"))
+}
+
+fn apply_provider_with_fake_kubectl_and_snapshot_class(
+    kubectl: &std::path::Path,
+    snapshot_class: Option<&str>,
+) -> KubernetesApplyProvider {
+    let dry_run = KubernetesDryRunProvider::with_snapshot_class(
+        "k3s-ci",
+        "sandboxwich-ci",
+        None,
+        snapshot_class.map(str::to_string),
+    );
     KubernetesApplyProvider::new(dry_run, kubectl.to_string_lossy().into_owned())
         .with_kubectl_context(Some("in-cluster".to_string()))
         .with_mutation_gate(true, true)
@@ -4638,6 +4947,12 @@ for arg in args[get_index + 1:]:
     if arg.startswith("-"):
         break
     resource_args.append(arg)
+# Label/list form: `get volumesnapshot -l ...` has only a kind and no name.
+# Stop's pre-delete snapshot wait uses that shape with a jsonpath that emits
+# one name per line. This fake tracks objects by concrete name only, so an
+# unlabeled inventory is empty stdout (zero names).
+if len(resource_args) == 1 and "/" not in resource_args[0]:
+    raise SystemExit(0)
 requested_count = sum(1 for arg in resource_args if "/" in arg) or len(resource_args) // 2
 resources = []
 while resource_args:
