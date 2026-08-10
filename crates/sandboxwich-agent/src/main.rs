@@ -177,6 +177,8 @@ struct AgentSandboxLauncherArgs {
     bundle: PathBuf,
     #[arg(long, default_value = "/run/sandboxwich/agent-sandbox-ready")]
     ready_file: PathBuf,
+    #[arg(long, default_value = "/run/sandboxwich/activation.ready")]
+    activation_marker: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -185,6 +187,8 @@ struct AgentSandboxPreclaimArgs {
     bundle: PathBuf,
     #[arg(long, default_value = "/run/sandboxwich/agent-sandbox-ready")]
     ready_file: PathBuf,
+    #[arg(long, default_value = "/run/sandboxwich/activation.ready")]
+    activation_marker: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -733,7 +737,14 @@ fn agent_sandbox_activate(args: AgentSandboxActivateArgs) -> anyhow::Result<()> 
     // The warm pod's long-lived entrypoint is waiting on this bundle. Once
     // the signed one-shot has been consumed, that entrypoint execs the real
     // launcher in the claimed pod; activation itself returns promptly.
-    std::fs::write("/run/sandboxwich/activation.ready", bundle.nonce.as_bytes())?;
+    let marker = Path::new("/run/sandboxwich/activation.ready");
+    let mut marker_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+        .context("create one-shot Agent Sandbox activation marker")?;
+    marker_file.write_all(bundle.nonce.as_bytes())?;
+    marker_file.sync_all()?;
     println!("{}", serde_json::to_string(&bundle)?);
     Ok(())
 }
@@ -766,6 +777,11 @@ fn agent_sandbox_launcher(args: AgentSandboxLauncherArgs) -> anyhow::Result<()> 
     bundle
         .validate_shape(Utc::now())
         .map_err(|error| anyhow::anyhow!(error))?;
+    let marker_nonce = std::fs::read_to_string(&args.activation_marker)?;
+    anyhow::ensure!(
+        marker_nonce == bundle.nonce,
+        "agent_sandbox_activation_marker_mismatch"
+    );
     std::fs::write(&args.ready_file, bundle.pod_uid.as_bytes())?;
     loop {
         std::thread::sleep(Duration::from_secs(30));
@@ -774,10 +790,11 @@ fn agent_sandbox_launcher(args: AgentSandboxLauncherArgs) -> anyhow::Result<()> 
 
 fn agent_sandbox_preclaim(args: AgentSandboxPreclaimArgs) -> anyhow::Result<()> {
     loop {
-        if args.bundle.is_file() {
+        if args.activation_marker.is_file() {
             return agent_sandbox_launcher(AgentSandboxLauncherArgs {
                 bundle: args.bundle,
                 ready_file: args.ready_file,
+                activation_marker: args.activation_marker,
             });
         }
         std::thread::sleep(Duration::from_millis(100));

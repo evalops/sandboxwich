@@ -7,6 +7,7 @@ use sandboxwich_core::AgentSandboxActivationV1;
 fn preclaim_pid1_waits_for_activation_then_reports_pod_bound_ready() {
     let root = tempfile::tempdir().expect("tempdir");
     let bundle = root.path().join("activation.json");
+    let marker = root.path().join("activation.ready");
     let ready = root.path().join("ready");
     let activation = AgentSandboxActivationV1 {
         version: AgentSandboxActivationV1::VERSION,
@@ -27,6 +28,8 @@ fn preclaim_pid1_waits_for_activation_then_reports_pod_bound_ready() {
             bundle.to_str().unwrap(),
             "--ready-file",
             ready.to_str().unwrap(),
+            "--activation-marker",
+            marker.to_str().unwrap(),
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -38,7 +41,13 @@ fn preclaim_pid1_waits_for_activation_then_reports_pod_bound_ready() {
         !ready.exists(),
         "preclaim must not report ready before claim activation"
     );
+    let mut invalid = activation.clone();
+    invalid.nonce = "invalid".into();
+    std::fs::write(&bundle, serde_json::to_vec(&invalid).unwrap()).unwrap();
+    thread::sleep(Duration::from_millis(150));
+    assert!(!ready.exists(), "unverified bundle must not launch");
     std::fs::write(&bundle, serde_json::to_vec(&activation).unwrap()).unwrap();
+    std::fs::write(&marker, activation.nonce.as_bytes()).unwrap();
     for _ in 0..30 {
         if ready.exists() {
             break;
