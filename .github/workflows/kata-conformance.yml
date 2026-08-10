@@ -12,6 +12,11 @@ name: kata-conformance
 # Run it against a disposable, Kata-capable cluster (see docs/kubernetes.md).
 # A green run is the evidence required to promote the class; until this runs
 # green on real Kata nodes, virtual_machine stays experimental.
+#
+# evalops/deploy provisions such a cluster with
+# `scripts/sandboxwich-kata-conformance-cluster.sh create`, which also prints
+# the dispatch below with the right inputs. See that repository's
+# docs/operations/sandboxwich-kata-conformance.md.
 
 on:
   workflow_dispatch:
@@ -34,6 +39,25 @@ on:
         required: false
         default: standard
         type: string
+      gke_cluster:
+        description: >-
+          Optional GKE cluster to fetch credentials for before the gate runs.
+          Set this when the runner can reach the cluster but does not already
+          hold its context, which is the normal case for a disposable cluster
+          created after the runner started.
+        required: false
+        default: ""
+        type: string
+      gke_location:
+        description: Zone or region of gke_cluster; required with gke_cluster
+        required: false
+        default: ""
+        type: string
+      gke_project:
+        description: Project of gke_cluster; required with gke_cluster
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -54,6 +78,38 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Fetch credentials for the disposable cluster
+        # Triggered by any of the three so that partial coordinates fail loudly
+        # below instead of silently skipping the fetch and running the gate
+        # against whatever context the runner happened to hold.
+        if: inputs.gke_cluster != '' || inputs.gke_location != '' || inputs.gke_project != ''
+        shell: bash
+        env:
+          GKE_CLUSTER: ${{ inputs.gke_cluster }}
+          GKE_LOCATION: ${{ inputs.gke_location }}
+          GKE_PROJECT: ${{ inputs.gke_project }}
+          KUBE_CONTEXT: ${{ inputs.kube_context }}
+        run: |
+          set -euo pipefail
+          for value in "${GKE_CLUSTER}" "${GKE_LOCATION}" "${GKE_PROJECT}"; do
+            [[ -n "${value}" ]] || {
+              echo "gke_cluster, gke_location and gke_project must be set together" >&2
+              exit 1
+            }
+          done
+          # Fetch into a per-run kubeconfig. The runner's shared one would keep
+          # this context after the disposable cluster is deleted, and the check
+          # below would then happily match that stale entry on a later run.
+          kubeconfig="${RUNNER_TEMP}/kubeconfig-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export KUBECONFIG="${kubeconfig}"
+          echo "KUBECONFIG=${kubeconfig}" >>"${GITHUB_ENV}"
+          gcloud container clusters get-credentials "${GKE_CLUSTER}" \
+            --location "${GKE_LOCATION}" --project "${GKE_PROJECT}"
+          # The gate selects its cluster by context name only. If the fetched
+          # credentials landed under a different name, every later step would
+          # run against whatever else that name refers to.
+          contexts="$(kubectl config get-contexts -o name)"
+          grep -Fxq "${KUBE_CONTEXT}" <<<"${contexts}"
       - name: Resolve digest-pinned images from the deployed manifests
         shell: bash
         run: |

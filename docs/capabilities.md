@@ -141,9 +141,12 @@ It has no skip path.
 
 Remaining for certification:
 
-1. A Kata-capable disposable cluster in CI. No GitHub-hosted runner exposes
+1. A Kata-capable disposable cluster. No GitHub-hosted runner exposes
    `/dev/kvm`, so `.github/workflows/kata-conformance.yml` is manual dispatch
-   against a self-hosted runner and is not a required check.
+   against a self-hosted runner and is not a required check. evalops/deploy's
+   `scripts/sandboxwich-kata-conformance-cluster.sh` now creates such a
+   cluster on GKE (nested virtualization, Intel N2, `kata-deploy`), so this is
+   a run to perform rather than infrastructure to design.
 2. A green run of that workflow on a release commit, recorded here.
 3. Deploy-side Kata nodes and RuntimeClass (evalops/deploy) for any
    non-disposable cluster that should serve the class.
