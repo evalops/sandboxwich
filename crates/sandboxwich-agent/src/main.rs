@@ -702,21 +702,7 @@ fn agent_sandbox_activate(args: AgentSandboxActivateArgs) -> anyhow::Result<()> 
             bundle.policy_digest.as_str(),
         ),
     ];
-    for (name, value, actual) in expected {
-        let value = value.context(format!("agent_sandbox_expected_{name}_missing"))?;
-        if value != actual {
-            bail!("agent_sandbox_activation_{name}_mismatch");
-        }
-    }
-    if bundle.nonce.len() > 128
-        || bundle.nonce.is_empty()
-        || !bundle
-            .nonce
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-    {
-        bail!("agent_sandbox_activation_nonce_invalid");
-    }
+    validate_agent_sandbox_bindings(&bundle, expected)?;
     let public_key = BASE64.decode(std::fs::read_to_string(&args.public_key)?.trim())?;
     let signature = BASE64.decode(bundle.signature.trim())?;
     let payload = bundle.signing_payload()?;
@@ -737,6 +723,28 @@ fn agent_sandbox_activate(args: AgentSandboxActivateArgs) -> anyhow::Result<()> 
     // launcher in the claimed pod; activation itself returns promptly.
     std::fs::write("/run/sandboxwich/activation.ready", bundle.nonce.as_bytes())?;
     println!("{}", serde_json::to_string(&bundle)?);
+    Ok(())
+}
+
+fn validate_agent_sandbox_bindings(
+    bundle: &sandboxwich_core::AgentSandboxActivationV1,
+    expected: [(&str, Option<&str>, &str); 6],
+) -> anyhow::Result<()> {
+    for (name, value, actual) in expected {
+        let value = value.context(format!("agent_sandbox_expected_{name}_missing"))?;
+        if value != actual {
+            bail!("agent_sandbox_activation_{name}_mismatch");
+        }
+    }
+    if bundle.nonce.len() > 128
+        || bundle.nonce.is_empty()
+        || !bundle
+            .nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!("agent_sandbox_activation_nonce_invalid");
+    }
     Ok(())
 }
 
@@ -5612,5 +5620,109 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(output.stdout, b"sidecar-bootstrap-canary");
         std::fs::remove_file(target).expect("remove sidecar bootstrap fixture");
+    }
+
+    fn test_agent_activation() -> sandboxwich_core::AgentSandboxActivationV1 {
+        sandboxwich_core::AgentSandboxActivationV1 {
+            version: sandboxwich_core::AgentSandboxActivationV1::VERSION,
+            claim_uid: "claim".into(),
+            sandbox_uid: "sandbox".into(),
+            pod_uid: "pod".into(),
+            image_digest: "sha256:image".into(),
+            bootstrap_digest: "sha256:bootstrap".into(),
+            policy_digest: "sha256:policy".into(),
+            expires_at: Utc::now() + chrono::Duration::minutes(1),
+            nonce: "nonce-1".into(),
+            signature: "sig".into(),
+        }
+    }
+
+    #[test]
+    fn agent_activation_verifies_with_raw_committed_public_key_bytes() {
+        use ring::{rand::SystemRandom, signature::KeyPair};
+        let key = ring::signature::Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let key = ring::signature::Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
+        let mut activation = test_agent_activation();
+        activation.signature =
+            BASE64.encode(key.sign(&activation.signing_payload().unwrap()).as_ref());
+        let signature = BASE64.decode(&activation.signature).unwrap();
+        UnparsedPublicKey::new(&ED25519, key.public_key().as_ref())
+            .verify(&activation.signing_payload().unwrap(), &signature)
+            .expect("raw 32-byte public key verifies");
+    }
+
+    #[test]
+    fn agent_activation_rejects_binding_mismatch_expiry_and_unsafe_nonce() {
+        let activation = test_agent_activation();
+        let expected = [
+            ("claim_uid", Some("wrong"), activation.claim_uid.as_str()),
+            (
+                "sandbox_uid",
+                Some("sandbox"),
+                activation.sandbox_uid.as_str(),
+            ),
+            ("pod_uid", Some("pod"), activation.pod_uid.as_str()),
+            (
+                "image_digest",
+                Some("sha256:image"),
+                activation.image_digest.as_str(),
+            ),
+            (
+                "bootstrap_digest",
+                Some("sha256:bootstrap"),
+                activation.bootstrap_digest.as_str(),
+            ),
+            (
+                "policy_digest",
+                Some("sha256:policy"),
+                activation.policy_digest.as_str(),
+            ),
+        ];
+        assert_eq!(
+            validate_agent_sandbox_bindings(&activation, expected)
+                .unwrap_err()
+                .to_string(),
+            "agent_sandbox_activation_claim_uid_mismatch"
+        );
+
+        let mut expired = activation.clone();
+        expired.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        assert_eq!(
+            expired.validate_shape(Utc::now()).unwrap_err(),
+            "agent_sandbox_activation_expired"
+        );
+
+        let mut unsafe_nonce = activation;
+        unsafe_nonce.nonce = "../replay".into();
+        let expected = [
+            ("claim_uid", Some("claim"), unsafe_nonce.claim_uid.as_str()),
+            (
+                "sandbox_uid",
+                Some("sandbox"),
+                unsafe_nonce.sandbox_uid.as_str(),
+            ),
+            ("pod_uid", Some("pod"), unsafe_nonce.pod_uid.as_str()),
+            (
+                "image_digest",
+                Some("sha256:image"),
+                unsafe_nonce.image_digest.as_str(),
+            ),
+            (
+                "bootstrap_digest",
+                Some("sha256:bootstrap"),
+                unsafe_nonce.bootstrap_digest.as_str(),
+            ),
+            (
+                "policy_digest",
+                Some("sha256:policy"),
+                unsafe_nonce.policy_digest.as_str(),
+            ),
+        ];
+        assert_eq!(
+            validate_agent_sandbox_bindings(&unsafe_nonce, expected)
+                .unwrap_err()
+                .to_string(),
+            "agent_sandbox_activation_nonce_invalid"
+        );
     }
 }
