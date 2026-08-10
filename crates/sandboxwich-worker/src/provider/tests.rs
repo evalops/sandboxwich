@@ -5096,6 +5096,13 @@ fn agent_sandbox_named_kubectl_commands_do_not_use_manifest_stdin() {
     let activation_args = apply
         .kubectl_args_for_activation("pod-1", &activation, "agent-sandbox-activate")
         .unwrap();
+    let expected_exec_stdin = ["pod-1", "-i", "--"].map(str::to_string);
+    assert!(
+        activation_args
+            .windows(expected_exec_stdin.len())
+            .any(|window| window == expected_exec_stdin.as_slice()),
+        "activation kubectl exec must attach stdin"
+    );
     let script = activation_args
         .iter()
         .find(|arg| arg.contains("SANDBOXWICH_AGENT_SANDBOX_EXPECTED_CLAIM_UID"))
