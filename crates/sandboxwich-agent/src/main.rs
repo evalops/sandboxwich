@@ -729,20 +729,9 @@ fn agent_sandbox_activate(args: AgentSandboxActivateArgs) -> anyhow::Result<()> 
         .map_err(|_| anyhow::anyhow!("agent_sandbox_activation_signature_invalid"))?;
     std::fs::create_dir_all(&args.nonce_dir)?;
     let nonce_path = args.nonce_dir.join(&bundle.nonce);
-    let created = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&nonce_path);
-    match created {
-        Ok(file) => drop(file),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(anyhow::anyhow!("agent_sandbox_activation_replay"));
-        }
-        Err(error) => return Err(error).context("create Agent Sandbox activation nonce"),
-    }
-    // The warm pod's long-lived entrypoint is waiting on this bundle. Once
-    // the signed one-shot has been consumed, that entrypoint execs the real
-    // launcher in the claimed pod; activation itself returns promptly.
+    // Stage the marker completely before consuming the nonce. The final
+    // rename is the visibility commit: PID1 cannot observe an empty marker,
+    // and every failure before that commit remains retryable.
     let marker = Path::new("/run/sandboxwich/activation.ready");
     let marker_tmp = marker.with_extension("ready.tmp");
     let mut marker_file = match std::fs::OpenOptions::new()
@@ -751,20 +740,31 @@ fn agent_sandbox_activate(args: AgentSandboxActivateArgs) -> anyhow::Result<()> 
         .open(&marker_tmp)
     {
         Ok(file) => file,
-        Err(error) => {
-            let _ = std::fs::remove_file(&nonce_path);
-            return Err(error).context("stage one-shot Agent Sandbox activation marker");
-        }
+        Err(error) => return Err(error).context("stage one-shot Agent Sandbox activation marker"),
     };
     if let Err(error) = marker_file
         .write_all(bundle.nonce.as_bytes())
         .and_then(|_| marker_file.sync_all())
     {
         let _ = std::fs::remove_file(&marker_tmp);
-        let _ = std::fs::remove_file(&nonce_path);
         return Err(error).context("write one-shot Agent Sandbox activation marker");
     }
     drop(marker_file);
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&nonce_path);
+    match created {
+        Ok(file) => drop(file),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&marker_tmp);
+            return Err(anyhow::anyhow!("agent_sandbox_activation_replay"));
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&marker_tmp);
+            return Err(error).context("create Agent Sandbox activation nonce");
+        }
+    }
     if let Err(error) = std::fs::rename(&marker_tmp, marker) {
         let _ = std::fs::remove_file(&marker_tmp);
         let _ = std::fs::remove_file(&nonce_path);
