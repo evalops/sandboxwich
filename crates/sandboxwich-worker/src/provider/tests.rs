@@ -5028,6 +5028,21 @@ fn agent_sandbox_named_kubectl_commands_do_not_use_manifest_stdin() {
         )
         .is_err()
     );
+    for malicious_path in [
+        "/run/sandboxwich/residents/ok/pid\"breakout",
+        "/run/sandboxwich/residents/ok/$({ touch /tmp/pwned })",
+    ] {
+        assert!(
+            super::agent_sandbox_launch_script(
+                "/run/sandboxwich/residents/ok",
+                malicious_path,
+                "/run/sandboxwich/residents/ok/exit",
+                "/run/sandboxwich/residents/ok/log",
+            )
+            .is_err(),
+            "shell metacharacters must be rejected: {malicious_path}"
+        );
+    }
 }
 
 #[test]

@@ -4365,12 +4365,14 @@ fn validate_shell_identifier(value: &str, field: &str) -> anyhow::Result<()> {
 fn validate_shell_path(value: &str, field: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         value.starts_with('/')
-            && !value.contains('\'')
-            && !value.contains('\n')
-            && !value
-                .split('/')
-                .skip(1)
-                .any(|component| component.is_empty() || component == "." || component == ".."),
+            && value.split('/').skip(1).all(|component| {
+                !component.is_empty()
+                    && component != "."
+                    && component != ".."
+                    && component.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                    })
+            }),
         "unsafe Agent Sandbox {field} path"
     );
     Ok(())
