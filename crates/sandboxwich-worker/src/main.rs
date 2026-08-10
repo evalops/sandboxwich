@@ -826,19 +826,28 @@ impl SandboxProvider for RuntimeProvider {
                     == sandboxwich_core::ProviderPreference::AgentSandbox
                     && provider.provider_name() == "agent_sandbox" =>
             {
+                let mut report_stage = |stage| {
+                    report(ProvisioningStageUpdateRequest {
+                        stage,
+                        resource_kind: None,
+                        resource_namespace: None,
+                        resource_name: None,
+                        resource_uid: None,
+                        observed_generation: None,
+                        attempt_count: 1,
+                        last_error_class: None,
+                        last_error_code: None,
+                        last_error: None,
+                    })
+                };
+                report_stage(ProvisioningStage::WorkspacePlanned)?;
+                report_stage(ProvisioningStage::WorkspaceReady)?;
+                report_stage(ProvisioningStage::NetworkPolicyReady)?;
+                report_stage(ProvisioningStage::CredentialsReady)?;
                 let handle = self.provision(sandbox_id, spec, cancelled)?;
-                report(ProvisioningStageUpdateRequest {
-                    stage: ProvisioningStage::SandboxReady,
-                    resource_kind: None,
-                    resource_namespace: None,
-                    resource_name: None,
-                    resource_uid: None,
-                    observed_generation: None,
-                    attempt_count: 1,
-                    last_error_class: None,
-                    last_error_code: None,
-                    last_error: None,
-                })?;
+                report_stage(ProvisioningStage::PodReady)?;
+                report_stage(ProvisioningStage::ServiceReady)?;
+                report_stage(ProvisioningStage::SandboxReady)?;
                 Ok(handle)
             }
             Self::Apply(provider) => provider.provision_staged(sandbox_id, spec, cancelled, report),

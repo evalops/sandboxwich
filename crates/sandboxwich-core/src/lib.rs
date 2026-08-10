@@ -774,6 +774,8 @@ pub enum DesktopTransportKind {
 db_variant_enum! {
 pub enum RuntimeResourceKind {
     Pod => "pod",
+    SandboxClaim => "sandbox_claim",
+    Sandbox => "sandbox",
     PersistentVolumeClaim => "persistent_volume_claim",
     Service => "service",
     Secret => "secret",

@@ -67,6 +67,7 @@ RUN apt-get update \
         novnc \
         openssh-server \
         procps \
+        util-linux \
         python3 \
         python3-pip \
         rustc \

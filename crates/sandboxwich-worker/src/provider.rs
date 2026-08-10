@@ -484,7 +484,7 @@ fn agent_sandbox_launch_script(
     log_file: &str,
 ) -> String {
     format!(
-        "set -eu; umask 077; d={state_dir}; mkdir -p \"$d\"; rm -f \"$d/pid\" \"$d/exit\" \"$d/status\"; (set +e; if command -v setsid >/dev/null 2>&1; then setsid \"$@\" >\"{log_file}\" 2>&1 & child=$!; else \"$@\" >\"{log_file}\" 2>&1 & child=$!; fi; printf '%s' \"$child\" >\"{pid_file}\"; wait \"$child\"; rc=$?; printf '%s' \"$rc\" >\"{exit_file}\") & printf '%s' running >\"$d/status\""
+        "set -eu; umask 077; d={state_dir}; mkdir -p \"$d\"; rm -f \"$d/pid\" \"$d/exit\" \"$d/status\"; (set +e; if ! command -v setsid >/dev/null 2>&1; then printf '%s' 127 >\"{exit_file}\"; exit 0; fi; setsid \"$@\" >\"{log_file}\" 2>&1 & child=$!; printf '%s' \"$child\" >\"{pid_file}\"; wait \"$child\"; rc=$?; printf '%s' \"$rc\" >\"{exit_file}\") & printf '%s' running >\"$d/status\""
     )
 }
 
@@ -3815,6 +3815,18 @@ fn plan_orphan_reconciliation(
 fn kubernetes_delete_path(resource: &ObservedKubernetesResource) -> anyhow::Result<String> {
     let plural = match resource.resource_kind {
         RuntimeResourceKind::Pod => "pods",
+        RuntimeResourceKind::SandboxClaim => {
+            return Ok(format!(
+                "/apis/extensions.agents.x-k8s.io/v1alpha1/namespaces/{}/sandboxclaims/{}",
+                resource.namespace, resource.name
+            ));
+        }
+        RuntimeResourceKind::Sandbox => {
+            return Ok(format!(
+                "/apis/agents.x-k8s.io/v1alpha1/namespaces/{}/sandboxes/{}",
+                resource.namespace, resource.name
+            ));
+        }
         RuntimeResourceKind::PersistentVolumeClaim => "persistentvolumeclaims",
         RuntimeResourceKind::Service => "services",
         RuntimeResourceKind::Secret => "secrets",
@@ -3845,12 +3857,18 @@ fn kubernetes_delete_options(resource: &ObservedKubernetesResource) -> Value {
         "apiVersion": "v1",
         "kind": "DeleteOptions",
         "preconditions": { "uid": resource.uid },
-        "propagationPolicy": "Background"
+        "propagationPolicy": if resource.resource_kind == RuntimeResourceKind::SandboxClaim {
+            "Foreground"
+        } else {
+            "Background"
+        }
     })
 }
 
 fn runtime_resource_kind_for_kubernetes_kind(kind: &str) -> anyhow::Result<RuntimeResourceKind> {
     match kind {
+        "SandboxClaim" => Ok(RuntimeResourceKind::SandboxClaim),
+        "Sandbox" => Ok(RuntimeResourceKind::Sandbox),
         "PersistentVolumeClaim" => Ok(RuntimeResourceKind::PersistentVolumeClaim),
         "NetworkPolicy" | "FQDNNetworkPolicy" => Ok(RuntimeResourceKind::NetworkPolicy),
         "Secret" => Ok(RuntimeResourceKind::Secret),
@@ -4441,13 +4459,8 @@ impl KubernetesApplyProvider {
 
     fn delete_agent_sandbox_claim(&self, sandbox_id: SandboxId, cancelled: &CancelSignal) {
         let claim_name = format!("sandboxwich-agent-claim-{sandbox_id}");
-        let mut args = self.kubectl_args("delete");
-        args.extend([
-            "sandboxclaim".to_string(),
-            claim_name,
-            "--ignore-not-found=true".to_string(),
-            "--wait=true".to_string(),
-        ]);
+        let mut args = self.kubectl_args_for_named_delete("sandboxclaim", &claim_name);
+        args.push("--wait=true".to_string());
         if let Err(error) = run_kubectl_command(
             &self.kubectl,
             &args,
@@ -4457,6 +4470,18 @@ impl KubernetesApplyProvider {
             self.max_captured_output_bytes,
         ) {
             tracing::warn!(sandbox_id = %sandbox_id, %error, "agent_sandbox_claim_rollback_failed");
+        }
+        let custody_args = self
+            .kubectl_args_for_named_delete("configmap", &Self::custody_configmap_name(sandbox_id));
+        if let Err(error) = run_kubectl_command(
+            &self.kubectl,
+            &custody_args,
+            "rollback Agent Sandbox custody receipt",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        ) {
+            tracing::warn!(sandbox_id = %sandbox_id, %error, "agent_sandbox_custody_rollback_failed");
         }
     }
 
@@ -4517,7 +4542,7 @@ impl KubernetesApplyProvider {
             bail!("Agent Sandbox claim apply failed: {}", applied.stderr);
         }
 
-        let deadline = Instant::now() + self.kubectl_command_timeout;
+        let deadline = Instant::now() + Duration::from_secs(120);
         let mut claim_json = Value::Null;
         let mut sandbox_name = None;
         let mut pod_name = None;
@@ -4607,6 +4632,11 @@ impl KubernetesApplyProvider {
             Some(cancelled),
             self.max_captured_output_bytes,
         )?;
+        anyhow::ensure!(
+            sandbox.success,
+            "read bound Agent Sandbox UID failed: {}",
+            sandbox.stderr
+        );
         let sandbox_json: Value = serde_json::from_str(&sandbox.stdout)?;
         let sandbox_uid = sandbox_json
             .pointer("/metadata/uid")
@@ -4669,10 +4699,30 @@ impl KubernetesApplyProvider {
         pod_resource.provider = "agent_sandbox".to_string();
         pod_resource.runtime_image = Some(self.dry_run.runtime_image.clone());
         pod_resource.ready_at = Some(Utc::now());
+        let mut claim_resource = self.dry_run.base_resource(
+            sandbox_id,
+            None,
+            RuntimeResourceKind::SandboxClaim,
+            RuntimeResourcePurpose::Runtime,
+            claim_name.clone(),
+            RuntimeResourceStatus::Ready,
+        );
+        claim_resource.provider = "agent_sandbox".to_string();
+        claim_resource.ready_at = Some(Utc::now());
+        let mut sandbox_resource = self.dry_run.base_resource(
+            sandbox_id,
+            None,
+            RuntimeResourceKind::Sandbox,
+            RuntimeResourcePurpose::Runtime,
+            sandbox_name.clone(),
+            RuntimeResourceStatus::Ready,
+        );
+        sandbox_resource.provider = "agent_sandbox".to_string();
+        sandbox_resource.ready_at = Some(Utc::now());
         Ok(ProviderSandboxHandle {
             provider: "agent_sandbox".into(),
             sandbox_id,
-            resources: vec![pod_resource],
+            resources: vec![claim_resource, sandbox_resource, pod_resource],
             metadata: json!({
                 "claimName": claim_name,
                 "claimUid": claim_uid,
@@ -4797,6 +4847,11 @@ impl KubernetesApplyProvider {
             Some(cancelled),
             self.max_captured_output_bytes,
         )?;
+        anyhow::ensure!(
+            claim.success,
+            "read Agent Sandbox claim for exec failed: {}",
+            claim.stderr
+        );
         let claim: Value = serde_json::from_str(&claim.stdout)?;
         let sandbox_name = claim
             .pointer("/status/sandbox/name")
@@ -4810,6 +4865,11 @@ impl KubernetesApplyProvider {
             Some(cancelled),
             self.max_captured_output_bytes,
         )?;
+        anyhow::ensure!(
+            sandbox.success,
+            "read Agent Sandbox for exec failed: {}",
+            sandbox.stderr
+        );
         let sandbox: Value = serde_json::from_str(&sandbox.stdout)?;
         let selector = sandbox
             .pointer("/status/selector")
@@ -4823,6 +4883,11 @@ impl KubernetesApplyProvider {
             Some(cancelled),
             self.max_captured_output_bytes,
         )?;
+        anyhow::ensure!(
+            pods.success,
+            "read Agent Sandbox pod for exec failed: {}",
+            pods.stderr
+        );
         let pods: Value = serde_json::from_str(&pods.stdout)?;
         let pod = pods
             .pointer("/items/0")
@@ -6175,7 +6240,8 @@ impl KubernetesApplyProvider {
     }
 
     fn kubectl_args_for_get(&self, kind: &str, name: &str) -> Vec<String> {
-        let mut args = self.kubectl_args("get");
+        let mut args = self.kubectl_base_args();
+        args.push("get".to_string());
         args.extend([
             kind.to_string(),
             name.to_string(),
@@ -6190,13 +6256,25 @@ impl KubernetesApplyProvider {
     }
 
     fn kubectl_args_for_selector(&self, kind: &str, selector: &str) -> Vec<String> {
-        let mut args = self.kubectl_args("get");
+        let mut args = self.kubectl_base_args();
+        args.push("get".to_string());
         args.extend([
             kind.to_string(),
             "-l".to_string(),
             selector.to_string(),
             "-o".to_string(),
             "json".to_string(),
+        ]);
+        args
+    }
+
+    fn kubectl_args_for_named_delete(&self, kind: &str, name: &str) -> Vec<String> {
+        let mut args = self.kubectl_base_args();
+        args.extend([
+            "delete".to_string(),
+            kind.to_string(),
+            name.to_string(),
+            "--ignore-not-found=true".to_string(),
         ]);
         args
     }
@@ -6208,7 +6286,8 @@ impl KubernetesApplyProvider {
         sandbox_uid: &str,
         command: &str,
     ) -> Vec<String> {
-        let mut args = self.kubectl_args("exec");
+        let mut args = self.kubectl_base_args();
+        args.push("exec".to_string());
         args.extend([
             pod_name.to_string(),
             "--".to_string(),
@@ -9065,7 +9144,7 @@ impl SandboxProvider for KubernetesApplyProvider {
                             "sh".into(),
                             "-lc".into(),
                             format!(
-                                "if test -r '{pid_file}'; then p=\"$(cat '{pid_file}')\"; kill -TERM -- -\"$p\" 2>/dev/null || true; kill \"$p\" 2>/dev/null || true; fi"
+                                "if test -r '{pid_file}'; then p=\"$(cat '{pid_file}')\"; kill -TERM -- -\"$p\" 2>/dev/null || true; kill \"$p\" 2>/dev/null || true; for i in $(seq 1 40); do test -r '{exit_file}' && exit 0; sleep 0.05; done; kill -KILL -- -\"$p\" 2>/dev/null || true; kill -KILL \"$p\" 2>/dev/null || true; fi"
                             ),
                         ],
                         cwd: None,
@@ -9711,13 +9790,8 @@ impl SandboxProvider for KubernetesApplyProvider {
             Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
             let mut receipt = self.read_agent_custody_receipt(sandbox_id, cancelled)?;
             let claim_name = format!("sandboxwich-agent-claim-{sandbox_id}");
-            let mut args = self.kubectl_args("delete");
-            args.extend([
-                "sandboxclaim".to_string(),
-                claim_name,
-                "--ignore-not-found=true".to_string(),
-                "--wait=true".to_string(),
-            ]);
+            let mut args = self.kubectl_args_for_named_delete("sandboxclaim", &claim_name);
+            args.push("--wait=true".to_string());
             let output = run_kubectl_command(
                 &self.kubectl,
                 &args,
@@ -9895,12 +9969,10 @@ impl SandboxProvider for KubernetesApplyProvider {
     ) -> anyhow::Result<Option<sandboxwich_core::AgentSandboxCustodyReceiptV1>> {
         let receipt = self.custody_receipt(sandbox_id, cancelled)?;
         if receipt.is_some() {
-            let mut args = self.kubectl_args("delete");
-            args.extend([
-                "configmap".to_string(),
-                Self::custody_configmap_name(sandbox_id),
-                "--ignore-not-found=true".to_string(),
-            ]);
+            let args = self.kubectl_args_for_named_delete(
+                "configmap",
+                &Self::custody_configmap_name(sandbox_id),
+            );
             let output = run_kubectl_command(
                 &self.kubectl,
                 &args,

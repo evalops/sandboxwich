@@ -4,6 +4,8 @@ use sandboxwich_core::{
     SterileCellReleaseTrustClassV1, SterileCellRuntimeClass, SterilePoolCandidateV1,
 };
 use sandboxwich_core::{SandboxSecretMount, SecretRef, SecretRefId, SecretRefState, SecretSource};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 fn sterile_maestro_candidate(sandbox_id: SandboxId) -> SterilePoolCandidateV1 {
     SterilePoolCandidateV1 {
@@ -4868,6 +4870,104 @@ fn teardown_args_omit_context_flag_for_in_cluster_service_account() {
 }
 
 #[test]
+fn agent_sandbox_named_kubectl_commands_do_not_use_manifest_stdin() {
+    let provider = KubernetesDryRunProvider::with_snapshot_class("gke-ci", "evalops", None, None);
+    let apply = KubernetesApplyProvider::new(provider, "kubectl")
+        .with_kubectl_context(Some("gke-ci".to_string()));
+
+    assert_eq!(
+        apply.kubectl_args_for_get("sandboxclaim", "claim-1"),
+        [
+            "--context",
+            "gke-ci",
+            "-n",
+            "evalops",
+            "get",
+            "sandboxclaim",
+            "claim-1",
+            "-o",
+            "json",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        apply.kubectl_args_for_get_core("sandbox", "sandbox-1"),
+        [
+            "--context",
+            "gke-ci",
+            "-n",
+            "evalops",
+            "get",
+            "sandbox",
+            "sandbox-1",
+            "-o",
+            "json",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        apply.kubectl_args_for_selector("pods", "sandboxwich.dev/provider=agent_sandbox"),
+        [
+            "--context",
+            "gke-ci",
+            "-n",
+            "evalops",
+            "get",
+            "pods",
+            "-l",
+            "sandboxwich.dev/provider=agent_sandbox",
+            "-o",
+            "json",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+    );
+    assert!(
+        apply
+            .kubectl_args_for_get("sandboxclaim", "claim-1")
+            .iter()
+            .all(|arg| arg != "-f")
+    );
+    assert_eq!(
+        apply.kubectl_args_for_named_delete("sandboxclaim", "claim-1"),
+        [
+            "--context",
+            "gke-ci",
+            "-n",
+            "evalops",
+            "delete",
+            "sandboxclaim",
+            "claim-1",
+            "--ignore-not-found=true",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        apply.kubectl_args_for_named_delete("configmap", "custody-1"),
+        [
+            "--context",
+            "gke-ci",
+            "-n",
+            "evalops",
+            "delete",
+            "configmap",
+            "custody-1",
+            "--ignore-not-found=true",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn stop_refuses_to_mutate_without_confirm_apply_gate() {
     let provider =
         KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None);
@@ -7667,6 +7767,13 @@ fn cloudflare_create_key_is_stable_for_lost_create_retries() {
 #[test]
 fn agent_sandbox_detached_launch_preserves_nonzero_exit_code() {
     let root = tempfile::tempdir().expect("tempdir");
+    let bin = root.path().join("bin");
+    std::fs::create_dir(&bin).expect("create test PATH");
+    let fake_setsid = bin.join("setsid");
+    std::fs::write(&fake_setsid, "#!/bin/sh\nexec \"$@\"\n").expect("write setsid shim");
+    let mut permissions = std::fs::metadata(&fake_setsid).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_setsid, permissions).expect("make setsid shim executable");
     let state_dir = root.path().join("resident");
     let pid_file = state_dir.join("pid");
     let exit_file = state_dir.join("exit");
@@ -7677,9 +7784,10 @@ fn agent_sandbox_detached_launch_preserves_nonzero_exit_code() {
         exit_file.to_str().unwrap(),
         log_file.to_str().unwrap(),
     );
-    std::process::Command::new("sh")
+    std::process::Command::new("/bin/sh")
+        .env("PATH", format!("{}:/bin:/usr/bin", bin.display()))
         .args([
-            "-lc",
+            "-c",
             &script,
             "sandboxwich-agent-resident",
             "sh",
@@ -7697,17 +7805,17 @@ fn agent_sandbox_detached_launch_preserves_nonzero_exit_code() {
     assert_eq!(std::fs::read_to_string(exit_file).unwrap(), "23");
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn agent_sandbox_process_group_cancellation_kills_child_workload() {
-    if std::process::Command::new("sh")
+    let setsid_available = std::process::Command::new("sh")
         .args(["-lc", "command -v setsid"])
         .output()
-        .map(|output| !output.status.success())
-        .unwrap_or(true)
-    {
-        return;
-    }
+        .expect("check setsid");
+    assert!(
+        setsid_available.status.success(),
+        "runtime image must provide setsid"
+    );
     let root = tempfile::tempdir().expect("tempdir");
     let state_dir = root.path().join("resident");
     let pid_file = state_dir.join("pid");
@@ -7749,14 +7857,70 @@ fn agent_sandbox_process_group_cancellation_kills_child_workload() {
         ])
         .status()
         .expect("kill process group");
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    let still_alive = std::process::Command::new("sh")
-        .args(["-lc", &format!("kill -0 {} 2>/dev/null", child_id)])
-        .status()
-        .unwrap()
-        .success();
+    let mut still_alive = true;
+    for _ in 0..40 {
+        let status = std::process::Command::new("sh")
+            .args(["-lc", &format!("kill -0 {} 2>/dev/null", child_id)])
+            .status()
+            .unwrap()
+            .success();
+        let zombie = std::fs::read_to_string(format!("/proc/{child_id}/stat"))
+            .ok()
+            .and_then(|stat| stat.split_whitespace().nth(2).map(|state| state == "Z"))
+            .unwrap_or(false);
+        still_alive = status && !zombie;
+        if !still_alive {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     assert!(
         !still_alive,
         "group cancellation must kill the child workload"
+    );
+}
+
+#[test]
+fn agent_sandbox_launch_fails_closed_without_setsid() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let bin = root.path().join("bin");
+    std::fs::create_dir(&bin).expect("create test PATH");
+    for command in ["mkdir", "rm"] {
+        std::os::unix::fs::symlink(format!("/bin/{command}"), bin.join(command))
+            .expect("link shell utility");
+    }
+    let state_dir = root.path().join("resident");
+    let pid_file = state_dir.join("pid");
+    let exit_file = state_dir.join("exit");
+    let log_file = state_dir.join("log");
+    let started_file = root.path().join("started");
+    let script = super::agent_sandbox_launch_script(
+        state_dir.to_str().unwrap(),
+        pid_file.to_str().unwrap(),
+        exit_file.to_str().unwrap(),
+        log_file.to_str().unwrap(),
+    );
+    std::process::Command::new("/bin/sh")
+        .env("PATH", &bin)
+        .args([
+            "-c",
+            &script,
+            "sandboxwich-agent-resident",
+            "/bin/sh",
+            "-c",
+            &format!("echo started > '{}'", started_file.display()),
+        ])
+        .status()
+        .expect("run fail-closed launcher");
+    for _ in 0..20 {
+        if exit_file.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(std::fs::read_to_string(exit_file).unwrap(), "127");
+    assert!(
+        !started_file.exists(),
+        "workload must not start without setsid"
     );
 }
