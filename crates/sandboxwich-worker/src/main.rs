@@ -1064,6 +1064,18 @@ impl SandboxProvider for RuntimeProvider {
         }
     }
 
+    fn take_custody_receipt(
+        &self,
+        sandbox_id: sandboxwich_core::SandboxId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<Option<sandboxwich_core::AgentSandboxCustodyReceiptV1>> {
+        match self {
+            Self::DryRun(provider) => provider.take_custody_receipt(sandbox_id, cancelled),
+            Self::Apply(provider) => provider.take_custody_receipt(sandbox_id, cancelled),
+            Self::Cloudflare(provider) => provider.take_custody_receipt(sandbox_id, cancelled),
+        }
+    }
+
     fn delete_home(&self, home_id: HomeId, cancelled: &CancelSignal) -> anyhow::Result<()> {
         match self {
             Self::DryRun(provider) => provider.delete_home(home_id, cancelled),
@@ -4613,7 +4625,7 @@ fn execute_job_with_reporter(
             // the job is failed (and retried per its classification) instead of the
             // control plane recording a "stopped" sandbox that keeps running.
             provider.stop(sandbox_id, &teardown_spec, cancelled)?;
-            let custody_receipt = provider.custody_receipt(sandbox_id, cancelled)?;
+            let custody_receipt = provider.take_custody_receipt(sandbox_id, cancelled)?;
             Ok(WorkerJobOutcome::Complete(WorkerJobResult::StopSandbox {
                 provider: provider.provider_name().to_string(),
                 sandbox_id,

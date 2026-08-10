@@ -630,6 +630,13 @@ pub trait SandboxProvider {
     ) -> anyhow::Result<Option<sandboxwich_core::AgentSandboxCustodyReceiptV1>> {
         Ok(None)
     }
+    fn take_custody_receipt(
+        &self,
+        sandbox_id: SandboxId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<Option<sandboxwich_core::AgentSandboxCustodyReceiptV1>> {
+        self.custody_receipt(sandbox_id, cancelled)
+    }
     fn delete_home(&self, home_id: HomeId, cancelled: &CancelSignal) -> anyhow::Result<()> {
         let _ = (home_id, cancelled);
         anyhow::bail!("provider does not support managed home deletion")
@@ -4651,10 +4658,21 @@ impl KubernetesApplyProvider {
             replay_rejected: false,
         };
         self.write_agent_custody_receipt(sandbox_id, &custody_receipt, cancelled)?;
+        let mut pod_resource = self.dry_run.base_resource(
+            sandbox_id,
+            None,
+            RuntimeResourceKind::Pod,
+            RuntimeResourcePurpose::Runtime,
+            pod_name.clone(),
+            RuntimeResourceStatus::Ready,
+        );
+        pod_resource.provider = "agent_sandbox".to_string();
+        pod_resource.runtime_image = Some(self.dry_run.runtime_image.clone());
+        pod_resource.ready_at = Some(Utc::now());
         Ok(ProviderSandboxHandle {
             provider: "agent_sandbox".into(),
             sandbox_id,
-            resources: Vec::new(),
+            resources: vec![pod_resource],
             metadata: json!({
                 "claimName": claim_name,
                 "claimUid": claim_uid,
@@ -9864,7 +9882,40 @@ impl SandboxProvider for KubernetesApplyProvider {
         sandbox_id: SandboxId,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<Option<sandboxwich_core::AgentSandboxCustodyReceiptV1>> {
+        if !self.agent_sandbox_mode {
+            return Ok(None);
+        }
         self.read_agent_custody_receipt(sandbox_id, cancelled)
+    }
+
+    fn take_custody_receipt(
+        &self,
+        sandbox_id: SandboxId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<Option<sandboxwich_core::AgentSandboxCustodyReceiptV1>> {
+        let receipt = self.custody_receipt(sandbox_id, cancelled)?;
+        if receipt.is_some() {
+            let mut args = self.kubectl_args("delete");
+            args.extend([
+                "configmap".to_string(),
+                Self::custody_configmap_name(sandbox_id),
+                "--ignore-not-found=true".to_string(),
+            ]);
+            let output = run_kubectl_command(
+                &self.kubectl,
+                &args,
+                "delete Agent Sandbox custody receipt",
+                self.kubectl_command_timeout,
+                Some(cancelled),
+                self.max_captured_output_bytes,
+            )?;
+            anyhow::ensure!(
+                output.success,
+                "Agent Sandbox custody receipt cleanup failed: {}",
+                output.stderr
+            );
+        }
+        Ok(receipt)
     }
 
     fn delete_home(&self, home_id: HomeId, cancelled: &CancelSignal) -> anyhow::Result<()> {

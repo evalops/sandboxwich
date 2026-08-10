@@ -686,6 +686,8 @@ fn agent_sandbox_activate(args: AgentSandboxActivateArgs) -> anyhow::Result<()> 
     bundle
         .validate_shape(Utc::now())
         .map_err(|error| anyhow::anyhow!(error))?;
+    Uuid::parse_str(&bundle.nonce)
+        .map_err(|_| anyhow::anyhow!("agent_sandbox_activation_nonce_invalid"))?;
     let expected = [
         (
             "claim_uid",

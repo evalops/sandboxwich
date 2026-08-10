@@ -1240,9 +1240,32 @@ impl AgentSandboxActivationV1 {
     /// Canonical bytes signed by the controller and verified by the launcher.
     /// The signature is deliberately excluded from the signed payload.
     pub fn signing_payload(&self) -> Result<Vec<u8>, serde_json::Error> {
-        let mut unsigned = self.clone();
-        unsigned.signature.clear();
-        serde_json::to_vec(&unsigned)
+        // This is deliberately an explicit, versioned wire form rather than
+        // serde's struct serialization. Every field is length-delimited so
+        // independent worker/launcher implementations cannot disagree on
+        // escaping, ordering, or optional-field behavior.
+        let expiry = self
+            .expires_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let fields = [
+            self.version.to_string(),
+            self.claim_uid.clone(),
+            self.sandbox_uid.clone(),
+            self.pod_uid.clone(),
+            self.image_digest.clone(),
+            self.bootstrap_digest.clone(),
+            self.policy_digest.clone(),
+            expiry,
+            self.nonce.clone(),
+        ];
+        let mut payload = b"sandboxwich-agent-sandbox-activation-v1\n".to_vec();
+        for field in fields {
+            payload.extend_from_slice(field.len().to_string().as_bytes());
+            payload.push(b':');
+            payload.extend_from_slice(field.as_bytes());
+            payload.push(b'\n');
+        }
+        Ok(payload)
     }
 
     pub fn validate_shape(&self, now: DateTime<Utc>) -> Result<(), String> {
@@ -4514,11 +4537,18 @@ mod tests {
         };
         assert!(activation.validate_shape(Utc::now()).is_ok());
         let payload = activation.signing_payload().expect("canonical payload");
-        let unsigned: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(unsigned["signature"], "");
-        assert_eq!(unsigned["claimUid"], "claim-uid");
-        assert_eq!(unsigned["sandboxUid"], "sandbox-uid");
-        assert_eq!(unsigned["podUid"], "pod-uid");
+        assert!(payload.starts_with(b"sandboxwich-agent-sandbox-activation-v1\n"));
+        assert!(
+            payload
+                .windows(b"claim-uid".len())
+                .any(|w| w == b"claim-uid")
+        );
+        assert!(
+            payload
+                .windows(b"sandbox-uid".len())
+                .any(|w| w == b"sandbox-uid")
+        );
+        assert!(payload.windows(b"pod-uid".len()).any(|w| w == b"pod-uid"));
     }
 
     #[test]

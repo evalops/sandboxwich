@@ -2907,7 +2907,14 @@ pub(crate) async fn apply_completed_job_on_connection(
                     .await?;
             }
         }
-        (JobKind::StopSandbox, WorkerJobResult::StopSandbox { sandbox_id, .. }) => {
+        (
+            JobKind::StopSandbox,
+            WorkerJobResult::StopSandbox {
+                sandbox_id,
+                custody_receipt,
+                ..
+            },
+        ) => {
             if sandbox_id != sandbox_id_from_job(job)? {
                 return Err(ApiError::bad_request(
                     "stop completion result does not match job sandbox",
@@ -2919,7 +2926,11 @@ pub(crate) async fn apply_completed_job_on_connection(
                 sandbox_id,
                 SandboxState::STOP_COMPLETED_LEGAL_FROM,
                 SandboxState::Archived,
-                json!({"state": SandboxState::Archived, "reason": "stop_completed"}),
+                json!({
+                    "state": SandboxState::Archived,
+                    "reason": "stop_completed",
+                    "custodyReceipt": custody_receipt,
+                }),
             )
             .await?;
             // Provider teardown is the authority for retiring runtime rows.
