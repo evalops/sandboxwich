@@ -1362,13 +1362,19 @@ pub(crate) async fn insert_worker_heartbeat(
 /// Reconciles liveness from durable heartbeat timestamps and bounds the
 /// append-only heartbeat history. This is deliberately idempotent so every
 /// API replica may run the periodic controller safely.
+///
+/// A null `last_heartbeat_at` is not immediately stale: re-register during an
+/// open drain receipt clears the heartbeat while keeping status `draining`, and
+/// a worker that has never heartbeated is still within the registration grace
+/// window. Use `coalesce(last_heartbeat_at, registered_at)` so those rows stay
+/// online/draining until the 90s deadline elapses from the later of the two.
 pub(crate) async fn reconcile_worker_liveness(db: &Database) -> Result<(), ApiError> {
     let now = Utc::now();
     let offline_before = now - chrono::Duration::seconds(90);
     let sql = format!(
         "update workers set status = {}
          where status in ('online', 'draining')
-           and (last_heartbeat_at is null or last_heartbeat_at < {})",
+           and coalesce(last_heartbeat_at, registered_at) < {}",
         db.placeholder(1),
         db.placeholder(2)
     );
