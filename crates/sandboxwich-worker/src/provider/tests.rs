@@ -733,12 +733,12 @@ fn agent_sandbox_maestro_uses_only_verified_pod_owned_workspace_and_affinity() {
         "kubectl",
     )
     .with_maestro_hosted_runner_image(Some(image));
-    provider.agent_sandbox_resident_placement = Some(AgentSandboxPlacement {
+    provider.agent_sandbox_resident_placement = Some(Box::new(AgentSandboxPlacement {
         pod_name: "agent-pod".into(),
         pod_uid: "pod-uid".into(),
         node_name: "node-a".into(),
         workspace_pvc: "agent-pod-sandboxwich-workspace".into(),
-    });
+    }));
     let manifests = provider
         .isolated_resident_process_manifests(&spec)
         .expect("verified Agent Sandbox placement should render");

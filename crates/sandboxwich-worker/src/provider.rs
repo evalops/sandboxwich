@@ -3481,7 +3481,7 @@ pub struct KubernetesApplyProvider {
     isolated_resident_process_image: Option<String>,
     maestro_hosted_runner_image: Option<String>,
     agent_sandbox_mode: bool,
-    agent_sandbox_resident_placement: Option<AgentSandboxPlacement>,
+    agent_sandbox_resident_placement: Option<Box<AgentSandboxPlacement>>,
     isolated_resident_process_startup_timeout: Duration,
     isolated_resident_process_poll_interval: Duration,
     isolated_resident_process_max_poll_interval: Duration,
@@ -9303,7 +9303,7 @@ impl SandboxProvider for KubernetesApplyProvider {
             maestro_spec.workspace_claim_name = Some(placement.workspace_pvc.clone());
             let mut maestro_provider = self.clone();
             maestro_provider.agent_sandbox_mode = false;
-            maestro_provider.agent_sandbox_resident_placement = Some(placement);
+            maestro_provider.agent_sandbox_resident_placement = Some(Box::new(placement));
             return maestro_provider.run_isolated_resident_process(
                 &maestro_spec,
                 cancelled,
