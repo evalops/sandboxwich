@@ -9,6 +9,90 @@
         ],
         "type": "string"
       },
+      "AgentSandboxActivationV1": {
+        "additionalProperties": false,
+        "description": "One-shot identity handoff from Sandboxwich's controller to a generic\nmanaged Agent Sandbox pod. The pod receives this only after Claim binding;\nno tenant material is present in the warm pool or template.",
+        "properties": {
+          "appliedPolicyDigest": {
+            "description": "Digest of the post-claim, profile-specific policy applied by the\ncontroller. The launcher verifies the immutable template policy above;\nthis field is signed for custody/audit and is never supplied by the pod.",
+            "type": "string"
+          },
+          "bootstrapDigest": {
+            "type": "string"
+          },
+          "claimUid": {
+            "type": "string"
+          },
+          "expiresAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "imageDigest": {
+            "type": "string"
+          },
+          "nonce": {
+            "type": "string"
+          },
+          "podUid": {
+            "type": "string"
+          },
+          "policyDigest": {
+            "type": "string"
+          },
+          "sandboxUid": {
+            "type": "string"
+          },
+          "signature": {
+            "type": "string"
+          },
+          "version": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "claimUid",
+          "sandboxUid",
+          "podUid",
+          "imageDigest",
+          "bootstrapDigest",
+          "policyDigest",
+          "appliedPolicyDigest",
+          "expiresAt",
+          "nonce",
+          "signature"
+        ],
+        "type": "object"
+      },
+      "AgentSandboxCustodyReceiptV1": {
+        "properties": {
+          "activatedAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "activation": {
+            "$ref": "#/components/schemas/AgentSandboxActivationV1"
+          },
+          "releasedAt": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replayRejected": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "activation",
+          "activatedAt",
+          "replayRejected"
+        ],
+        "type": "object"
+      },
       "ApexTaskInstructionsReadRequest": {
         "additionalProperties": false,
         "properties": {
