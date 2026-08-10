@@ -9207,9 +9207,10 @@ impl SandboxProvider for KubernetesApplyProvider {
         cancelled: &CancelSignal,
     ) -> anyhow::Result<AgentCommandResult> {
         validate_agent_command_request(&request)?;
-        if spec.provider_preference == sandboxwich_core::ProviderPreference::AgentSandbox
-            && self.agent_sandbox_claim_exists(sandbox_id, cancelled)?
-        {
+        let agent_claim_exists = spec.provider_preference
+            == sandboxwich_core::ProviderPreference::AgentSandbox
+            && self.agent_sandbox_claim_exists(sandbox_id, cancelled)?;
+        if agent_claim_exists {
             let pod_name = self.agent_sandbox_pod_name(sandbox_id, cancelled)?;
             let started_at = Utc::now();
             let timeout = request
@@ -9241,6 +9242,18 @@ impl SandboxProvider for KubernetesApplyProvider {
                 finished_at: Utc::now(),
             });
         }
+        // A failed Agent Sandbox attempt is deliberately retried on the
+        // ordinary dynamic provider. The absence of the authoritative Claim
+        // is the durable placement evidence: use the Kubernetes spec for all
+        // subsequent exec/verification instead of re-selecting Agent Sandbox
+        // from the original requested preference.
+        let fallback_spec = (spec.provider_preference
+            == sandboxwich_core::ProviderPreference::AgentSandbox)
+            .then(|| SandboxProvisionSpec {
+                provider_preference: sandboxwich_core::ProviderPreference::Kubernetes,
+                ..spec.clone()
+            });
+        let effective_spec = fallback_spec.as_ref().unwrap_or(spec);
         // Only provision when the pod is actually missing. Re-applying the full
         // manifest set (and re-waiting up to 120s) before every command is both slow
         // and unsafe: Pod `resources` are immutable, so an exec whose spec drifts from
@@ -9249,9 +9262,9 @@ impl SandboxProvider for KubernetesApplyProvider {
             // An existing Pod was not necessarily rendered by this provider's
             // current configuration, so re-verify the isolation boundary
             // rather than inheriting whatever Pod is present.
-            self.verify_pod_runtime_class(sandbox_id, spec, cancelled)?;
+            self.verify_pod_runtime_class(sandbox_id, effective_spec, cancelled)?;
         } else {
-            self.provision(sandbox_id, spec, cancelled)?;
+            self.provision(sandbox_id, effective_spec, cancelled)?;
         }
         let started_at = Utc::now();
         // A per-command `timeout_secs` (see `AgentCommandRequest`) takes
