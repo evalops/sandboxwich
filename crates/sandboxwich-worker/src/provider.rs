@@ -9192,7 +9192,18 @@ impl SandboxProvider for KubernetesApplyProvider {
         report: &mut dyn FnMut(ProvisioningStageUpdateRequest) -> anyhow::Result<()>,
     ) -> anyhow::Result<ProviderSandboxHandle> {
         if spec.provider_preference == sandboxwich_core::ProviderPreference::AgentSandbox {
+            for stage in [
+                ProvisioningStage::WorkspacePlanned,
+                ProvisioningStage::WorkspaceReady,
+                ProvisioningStage::NetworkPolicyReady,
+                ProvisioningStage::CredentialsReady,
+            ] {
+                report(stage_update(stage, None))?;
+            }
             let handle = self.provision(sandbox_id, spec, cancelled)?;
+            for stage in [ProvisioningStage::PodReady, ProvisioningStage::ServiceReady] {
+                report(stage_update(stage, None))?;
+            }
             report(stage_update(ProvisioningStage::SandboxReady, None))?;
             return Ok(handle);
         }

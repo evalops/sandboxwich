@@ -761,49 +761,6 @@ impl SandboxProvider for RuntimeProvider {
     ) -> anyhow::Result<sandboxwich_core::ProviderSandboxHandle> {
         match self {
             Self::DryRun(provider) => provider.provision(sandbox_id, spec, cancelled),
-            Self::Apply(provider)
-                if spec.provider_preference
-                    == sandboxwich_core::ProviderPreference::AgentSandbox
-                    && provider.provider_name() == "agent_sandbox" =>
-            {
-                let rollback = std::env::var("SANDBOXWICH_AGENT_SANDBOX_ROLLBACK")
-                    .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes"));
-                if rollback {
-                    let mut fallback_spec = spec.clone();
-                    fallback_spec.provider_preference =
-                        sandboxwich_core::ProviderPreference::Kubernetes;
-                    let mut handle = provider.clone().with_agent_sandbox_mode(false).provision(
-                        sandbox_id,
-                        &fallback_spec,
-                        cancelled,
-                    )?;
-                    if let Some(metadata) = handle.metadata.as_object_mut() {
-                        metadata.insert("agentSandboxRollback".to_string(), json!(true));
-                    }
-                    return Ok(handle);
-                }
-                match provider.provision(sandbox_id, spec, cancelled) {
-                    Ok(handle) => Ok(handle),
-                    Err(error) => {
-                        tracing::warn!(sandbox_id = %sandbox_id, %error, "agent_sandbox_fallback_to_kubernetes");
-                        let mut fallback_spec = spec.clone();
-                        fallback_spec.provider_preference =
-                            sandboxwich_core::ProviderPreference::Kubernetes;
-                        let mut handle = provider
-                            .clone()
-                            .with_agent_sandbox_mode(false)
-                            .provision(sandbox_id, &fallback_spec, cancelled)?;
-                        if let Some(metadata) = handle.metadata.as_object_mut() {
-                            metadata.insert("agentSandboxFallback".to_string(), json!(true));
-                            metadata.insert(
-                                "agentSandboxFallbackReason".to_string(),
-                                json!(error.to_string()),
-                            );
-                        }
-                        Ok(handle)
-                    }
-                }
-            }
             Self::Apply(provider) => provider.provision(sandbox_id, spec, cancelled),
             Self::Cloudflare(provider) => provider.provision(sandbox_id, spec, cancelled),
         }
