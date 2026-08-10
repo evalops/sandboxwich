@@ -131,6 +131,9 @@ enum Command {
     AgentSandboxActivate(AgentSandboxActivateArgs),
     /// Keep the post-claim generic launcher alive inside the claimed pod.
     AgentSandboxLauncher(AgentSandboxLauncherArgs),
+    /// Secretless PID1 for a warm pod; waits for the post-claim bundle before
+    /// entering the long-lived launcher.
+    AgentSandboxPreclaim(AgentSandboxPreclaimArgs),
     Exec(ExecArgs),
     WriteFile(FileWriteArgs),
     ReadFile(FileReadArgs),
@@ -170,6 +173,14 @@ struct AgentSandboxActivateArgs {
 
 #[derive(Debug, Args)]
 struct AgentSandboxLauncherArgs {
+    #[arg(long)]
+    bundle: PathBuf,
+    #[arg(long, default_value = "/run/sandboxwich/agent-sandbox-ready")]
+    ready_file: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct AgentSandboxPreclaimArgs {
     #[arg(long)]
     bundle: PathBuf,
     #[arg(long, default_value = "/run/sandboxwich/agent-sandbox-ready")]
@@ -646,6 +657,7 @@ async fn main() -> anyhow::Result<()> {
         Command::SterileLauncher(args) => sterile_launcher(args).await,
         Command::AgentSandboxActivate(args) => agent_sandbox_activate(args),
         Command::AgentSandboxLauncher(args) => agent_sandbox_launcher(args),
+        Command::AgentSandboxPreclaim(args) => agent_sandbox_preclaim(args),
         Command::Exec(args) => exec(args).await,
         Command::WriteFile(args) => write_file(args).await,
         Command::ReadFile(args) => read_file(args).await,
@@ -757,6 +769,18 @@ fn agent_sandbox_launcher(args: AgentSandboxLauncherArgs) -> anyhow::Result<()> 
     std::fs::write(&args.ready_file, bundle.pod_uid.as_bytes())?;
     loop {
         std::thread::sleep(Duration::from_secs(30));
+    }
+}
+
+fn agent_sandbox_preclaim(args: AgentSandboxPreclaimArgs) -> anyhow::Result<()> {
+    loop {
+        if args.bundle.is_file() {
+            return agent_sandbox_launcher(AgentSandboxLauncherArgs {
+                bundle: args.bundle,
+                ready_file: args.ready_file,
+            });
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
