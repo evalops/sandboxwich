@@ -473,6 +473,20 @@ fn isolated_resident_process_fence_suffix(spec: &IsolatedResidentProcessSpec) ->
     )
 }
 
+fn load_agent_sandbox_signing_key(path: &str) -> anyhow::Result<Ed25519KeyPair> {
+    let key_bytes = general_purpose::STANDARD
+        .decode(std::fs::read_to_string(path)?.trim())
+        .context("decode Agent Sandbox signing key")?;
+    // Secret Manager currently stores the standard PKCS#8 v1 Ed25519 form,
+    // which contains the seed but not the public key. The launcher remains
+    // the trust boundary: it verifies the resulting signature against the
+    // immutable public-key ConfigMap mounted in every claimed pod. The
+    // unchecked parser is therefore required for this server-owned v1 key
+    // format; it still rejects malformed DER and wrong algorithm identifiers.
+    Ed25519KeyPair::from_pkcs8_maybe_unchecked(&key_bytes)
+        .map_err(|_| anyhow::anyhow!("invalid Agent Sandbox signing key"))
+}
+
 pub(crate) fn isolated_resident_process_pod_name(spec: &IsolatedResidentProcessSpec) -> String {
     format!("sw-sc-{}", isolated_resident_process_fence_suffix(spec))
 }
@@ -4857,11 +4871,7 @@ impl KubernetesApplyProvider {
         };
         let signing_key_file = std::env::var("SANDBOXWICH_AGENT_SANDBOX_SIGNING_KEY_FILE")
             .context("Agent Sandbox signing key file is not configured")?;
-        let key_bytes = general_purpose::STANDARD
-            .decode(std::fs::read_to_string(signing_key_file)?.trim())
-            .context("decode Agent Sandbox signing key")?;
-        let key = Ed25519KeyPair::from_pkcs8(&key_bytes)
-            .map_err(|_| anyhow::anyhow!("invalid Agent Sandbox signing key"))?;
+        let key = load_agent_sandbox_signing_key(&signing_key_file)?;
         activation.signature =
             general_purpose::STANDARD.encode(key.sign(&activation.signing_payload()?));
         let activation_json = serde_json::to_vec(&activation)?;
