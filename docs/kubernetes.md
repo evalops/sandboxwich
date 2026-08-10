@@ -284,6 +284,16 @@ a green run is the only certification evidence, so it must never be satisfiable
 by a cluster that cannot run VMs. `.github/workflows/kata-conformance.yml` runs
 it on manual dispatch against a self-hosted runner with such a cluster.
 
+evalops/deploy provisions that cluster:
+`scripts/sandboxwich-kata-conformance-cluster.sh create` creates a disposable
+GKE cluster with nested virtualization on Intel N2 nodes, installs
+`kata-deploy`, registers the `kata-qemu` RuntimeClass, and prints the exact
+`gh workflow run` dispatch for this workflow. Its runbook is
+`docs/operations/sandboxwich-kata-conformance.md` in that repository. Pass
+`gke_cluster`/`gke_location`/`gke_project` to the workflow when the runner can
+reach the cluster but does not already hold its context, which is the normal
+case for a cluster created after the runner started.
+
 Inspect the persisted runtime view with:
 
 ```sh
