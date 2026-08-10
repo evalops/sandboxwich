@@ -7696,3 +7696,67 @@ fn agent_sandbox_detached_launch_preserves_nonzero_exit_code() {
     }
     assert_eq!(std::fs::read_to_string(exit_file).unwrap(), "23");
 }
+
+#[cfg(unix)]
+#[test]
+fn agent_sandbox_process_group_cancellation_kills_child_workload() {
+    if std::process::Command::new("sh")
+        .args(["-lc", "command -v setsid"])
+        .output()
+        .map(|output| !output.status.success())
+        .unwrap_or(true)
+    {
+        return;
+    }
+    let root = tempfile::tempdir().expect("tempdir");
+    let state_dir = root.path().join("resident");
+    let pid_file = state_dir.join("pid");
+    let exit_file = state_dir.join("exit");
+    let log_file = state_dir.join("log");
+    let child_file = state_dir.join("child");
+    let script = super::agent_sandbox_launch_script(
+        state_dir.to_str().unwrap(),
+        pid_file.to_str().unwrap(),
+        exit_file.to_str().unwrap(),
+        log_file.to_str().unwrap(),
+    );
+    std::process::Command::new("sh")
+        .args([
+            "-lc",
+            &script,
+            "sandboxwich-agent-resident",
+            "sh",
+            "-c",
+            &format!(
+                "sleep 30 & printf '%s' $! > '{}'; wait",
+                child_file.display()
+            ),
+        ])
+        .status()
+        .expect("launch process group");
+    for _ in 0..20 {
+        if child_file.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let group_id = std::fs::read_to_string(&pid_file).unwrap();
+    let child_id = std::fs::read_to_string(&child_file).unwrap();
+    std::process::Command::new("sh")
+        .args([
+            "-lc",
+            &format!("kill -TERM -- -{} 2>/dev/null || true", group_id),
+        ])
+        .status()
+        .expect("kill process group");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let still_alive = std::process::Command::new("sh")
+        .args(["-lc", &format!("kill -0 {} 2>/dev/null", child_id)])
+        .status()
+        .unwrap()
+        .success();
+    assert!(
+        !still_alive,
+        "group cancellation must kill the child workload"
+    );
+}

@@ -484,7 +484,7 @@ fn agent_sandbox_launch_script(
     log_file: &str,
 ) -> String {
     format!(
-        "set -eu; umask 077; d={state_dir}; mkdir -p \"$d\"; rm -f \"$d/pid\" \"$d/exit\" \"$d/status\"; (set +e; \"$@\" >\"{log_file}\" 2>&1; rc=$?; printf '%s' \"$rc\" >\"{exit_file}\") & p=$!; printf '%s' \"$p\" >\"{pid_file}\"; printf '%s' running >\"$d/status\""
+        "set -eu; umask 077; d={state_dir}; mkdir -p \"$d\"; rm -f \"$d/pid\" \"$d/exit\" \"$d/status\"; (set +e; if command -v setsid >/dev/null 2>&1; then setsid \"$@\" >\"{log_file}\" 2>&1 & child=$!; else \"$@\" >\"{log_file}\" 2>&1 & child=$!; fi; printf '%s' \"$child\" >\"{pid_file}\"; wait \"$child\"; rc=$?; printf '%s' \"$rc\" >\"{exit_file}\") & printf '%s' running >\"$d/status\""
     )
 }
 
@@ -9065,7 +9065,7 @@ impl SandboxProvider for KubernetesApplyProvider {
                             "sh".into(),
                             "-lc".into(),
                             format!(
-                                "test -r '{pid_file}' && kill \"$(cat '{pid_file}')\" 2>/dev/null || true"
+                                "if test -r '{pid_file}'; then p=\"$(cat '{pid_file}')\"; kill -TERM -- -\"$p\" 2>/dev/null || true; kill \"$p\" 2>/dev/null || true; fi"
                             ),
                         ],
                         cwd: None,
