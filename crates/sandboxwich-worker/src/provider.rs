@@ -6052,42 +6052,71 @@ impl KubernetesApplyProvider {
     }
 
     /// Fail closed when the VolumeSnapshot that a restore will dataSource is
-    /// missing or not yet ready. Applying a PVC against an unbound snapshot
-    /// leaves the guest Pending forever under WaitForFirstConsumer storage.
+    /// not proven usable. Industry restore guidance requires readyToUse **and**
+    /// a bound VolumeSnapshotContent (and preferably a non-empty class). Applying
+    /// a PVC against a partial snapshot leaves the guest Pending forever under
+    /// WaitForFirstConsumer storage.
     fn require_ready_volume_snapshot(
         &self,
         snapshot_id: SnapshotId,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<()> {
         let name = Self::volume_snapshot_name(snapshot_id);
+        // One get with delimited fields avoids a race between separate reads of
+        // readyToUse and boundVolumeSnapshotContentName.
         let mut args = self.kubectl_base_args();
         args.extend([
             "get".to_string(),
             "volumesnapshot".to_string(),
             name.clone(),
             "-o".to_string(),
-            "jsonpath={.status.readyToUse}".to_string(),
+            "jsonpath={.status.readyToUse}|{.status.boundVolumeSnapshotContentName}|{.spec.volumeSnapshotClassName}|{.status.error.message}"
+                .to_string(),
         ]);
         let output = run_kubectl_command(
             &self.kubectl,
             &args,
-            "read volume snapshot readyToUse",
+            "read volume snapshot restore readiness fields",
             self.kubectl_command_timeout,
             Some(cancelled),
             self.max_captured_output_bytes,
         )?;
         if !output.success {
             bail!(
-                "volume snapshot {name} is not restorable: kubectl get failed with {}: {}",
+                "volume snapshot {name} is not restorable (error_category=snapshot_not_found): \
+                 kubectl get failed with {}: {}",
                 output.status,
                 output.stderr
             );
         }
-        let ready = output.stdout.trim();
+        let mut parts = output.stdout.trim().splitn(4, '|');
+        let ready = parts.next().unwrap_or("").trim();
+        let bound_content = parts.next().unwrap_or("").trim();
+        let class_name = parts.next().unwrap_or("").trim();
+        let error_message = parts.next().unwrap_or("").trim();
+
+        if !error_message.is_empty() {
+            bail!(
+                "volume snapshot {name} is not restorable (error_category=snapshot_poison): \
+                 status.error={error_message:?}"
+            );
+        }
+        if class_name.is_empty() {
+            bail!(
+                "volume snapshot {name} is not restorable (error_category=snapshot_class_missing): \
+                 volumeSnapshotClassName is empty; refuse to restore from a poison VolumeSnapshot"
+            );
+        }
         if ready != "true" {
             bail!(
-                "volume snapshot {name} is not readyToUse (observed {ready:?}); refuse to \
-                 restore a workspace from an unbound VolumeSnapshot"
+                "volume snapshot {name} is not restorable (error_category=snapshot_not_ready): \
+                 readyToUse observed {ready:?}; refuse to restore a workspace from an unbound VolumeSnapshot"
+            );
+        }
+        if bound_content.is_empty() {
+            bail!(
+                "volume snapshot {name} is not restorable (error_category=snapshot_unbound): \
+                 readyToUse is true but boundVolumeSnapshotContentName is empty"
             );
         }
         Ok(())
