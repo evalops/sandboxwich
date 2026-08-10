@@ -105,6 +105,8 @@ use sandboxwich_core::{
         ,sandboxwich_core::SecretRefListResponse
         ,sandboxwich_core::SandboxSecretMount
         ,sandboxwich_core::CreateSandboxRequest
+        ,sandboxwich_core::AgentSandboxActivationV1
+        ,sandboxwich_core::AgentSandboxCustodyReceiptV1
         ,sandboxwich_core::ApexTaskInstructionsReadRequest
         ,sandboxwich_core::ApexTaskInstructionsReadResponse
         ,sandboxwich_core::SterileCellId

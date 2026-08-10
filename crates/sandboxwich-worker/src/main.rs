@@ -32,7 +32,7 @@ use sandboxwich_core::{
     PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL,
     PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL_VALUE, PROVIDER_SECRET_DELIVERY_LABEL,
     PROVIDER_SECRET_DELIVERY_LABEL_VALUE, ProviderCapabilityReport, ProvisioningOperationResponse,
-    ProvisioningStageUpdateRequest, RegisterWorkerRequest, RenewLeaseRequest,
+    ProvisioningStage, ProvisioningStageUpdateRequest, RegisterWorkerRequest, RenewLeaseRequest,
     ResidentProcessBootstrapReadRequest, ResidentProcessBootstrapReadResponse, ResidentProcessId,
     ResidentProcessObservationRequest, ResidentProcessObservedState, ResidentProcessRestartPolicy,
     RuntimeResourceInventoryResponse, SandboxId, SandboxProvisionSpec, WorkerCapability,
@@ -682,6 +682,7 @@ enum ProviderModeArg {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum RuntimeProviderKind {
     Kubernetes,
+    AgentSandbox,
     Cloudflare,
 }
 
@@ -775,6 +776,35 @@ impl SandboxProvider for RuntimeProvider {
         match self {
             Self::DryRun(provider) => {
                 provider.provision_staged(sandbox_id, spec, cancelled, report)
+            }
+            Self::Apply(provider)
+                if spec.provider_preference
+                    == sandboxwich_core::ProviderPreference::AgentSandbox
+                    && provider.provider_name() == "agent_sandbox" =>
+            {
+                let mut report_stage = |stage| {
+                    report(ProvisioningStageUpdateRequest {
+                        stage,
+                        resource_kind: None,
+                        resource_namespace: None,
+                        resource_name: None,
+                        resource_uid: None,
+                        observed_generation: None,
+                        attempt_count: 1,
+                        last_error_class: None,
+                        last_error_code: None,
+                        last_error: None,
+                    })
+                };
+                report_stage(ProvisioningStage::WorkspacePlanned)?;
+                report_stage(ProvisioningStage::WorkspaceReady)?;
+                report_stage(ProvisioningStage::NetworkPolicyReady)?;
+                report_stage(ProvisioningStage::CredentialsReady)?;
+                let handle = self.provision(sandbox_id, spec, cancelled)?;
+                report_stage(ProvisioningStage::PodReady)?;
+                report_stage(ProvisioningStage::ServiceReady)?;
+                report_stage(ProvisioningStage::SandboxReady)?;
+                Ok(handle)
             }
             Self::Apply(provider) => provider.provision_staged(sandbox_id, spec, cancelled, report),
             Self::Cloudflare(provider) => {
@@ -984,6 +1014,30 @@ impl SandboxProvider for RuntimeProvider {
             Self::DryRun(provider) => provider.stop(sandbox_id, spec, cancelled),
             Self::Apply(provider) => provider.stop(sandbox_id, spec, cancelled),
             Self::Cloudflare(provider) => provider.stop(sandbox_id, spec, cancelled),
+        }
+    }
+
+    fn custody_receipt(
+        &self,
+        sandbox_id: sandboxwich_core::SandboxId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<Option<sandboxwich_core::AgentSandboxCustodyReceiptV1>> {
+        match self {
+            Self::DryRun(provider) => provider.custody_receipt(sandbox_id, cancelled),
+            Self::Apply(provider) => provider.custody_receipt(sandbox_id, cancelled),
+            Self::Cloudflare(provider) => provider.custody_receipt(sandbox_id, cancelled),
+        }
+    }
+
+    fn take_custody_receipt(
+        &self,
+        sandbox_id: sandboxwich_core::SandboxId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<Option<sandboxwich_core::AgentSandboxCustodyReceiptV1>> {
+        match self {
+            Self::DryRun(provider) => provider.take_custody_receipt(sandbox_id, cancelled),
+            Self::Apply(provider) => provider.take_custody_receipt(sandbox_id, cancelled),
+            Self::Cloudflare(provider) => provider.take_custody_receipt(sandbox_id, cancelled),
         }
     }
 
@@ -1685,6 +1739,7 @@ fn runtime_provider_from_args(args: RuntimeProviderArgs) -> anyhow::Result<Runti
         maestro_hosted_runner_image.as_deref(),
     )?;
     let provider = provider_from_args(args.provider)?;
+    let agent_sandbox = args.runtime_provider == RuntimeProviderKind::AgentSandbox;
     Ok(match args.provider_mode {
         ProviderModeArg::DryRun => RuntimeProvider::DryRun(provider),
         ProviderModeArg::Apply => {
@@ -1698,6 +1753,7 @@ fn runtime_provider_from_args(args: RuntimeProviderArgs) -> anyhow::Result<Runti
             }
             RuntimeProvider::Apply(
                 KubernetesApplyProvider::new(provider, args.kubectl)
+                    .with_agent_sandbox_mode(agent_sandbox)
                     .with_kubectl_context(args.kubectl_context)
                     .with_mutation_gate(args.confirm_apply, mutation_enabled)
                     .with_kubectl_command_timeout(kubectl_command_timeout(
@@ -4534,9 +4590,11 @@ fn execute_job_with_reporter(
             // the job is failed (and retried per its classification) instead of the
             // control plane recording a "stopped" sandbox that keeps running.
             provider.stop(sandbox_id, &teardown_spec, cancelled)?;
+            let custody_receipt = provider.take_custody_receipt(sandbox_id, cancelled)?;
             Ok(WorkerJobOutcome::Complete(WorkerJobResult::StopSandbox {
                 provider: provider.provider_name().to_string(),
                 sandbox_id,
+                custody_receipt,
             }))
         }
         JobKind::ResumeSandbox => {

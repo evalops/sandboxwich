@@ -3031,6 +3031,7 @@ async fn late_provision_completion_persists_resources_and_queues_idempotent_tear
         WorkerJobResult::StopSandbox {
             provider: "kubernetes".to_string(),
             sandbox_id: sandbox.id,
+            custody_receipt: None,
         },
     )
     .await
@@ -3115,6 +3116,7 @@ async fn stale_stop_completion_cannot_retire_a_resumed_runtime_generation() {
         WorkerJobResult::StopSandbox {
             provider: "kubernetes".to_string(),
             sandbox_id: sandbox.id,
+            custody_receipt: None,
         },
     )
     .await
@@ -3230,6 +3232,7 @@ async fn stop_completion_for_a_purged_sandbox_is_idempotently_acknowledged() {
         WorkerJobResult::StopSandbox {
             provider: "kubernetes".to_string(),
             sandbox_id: sandbox.id,
+            custody_receipt: None,
         },
     )
     .await

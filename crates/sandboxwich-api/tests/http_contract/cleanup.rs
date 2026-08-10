@@ -172,6 +172,7 @@ async fn archived_sandbox_cleanup_cascades_dependent_rows_on_sqlite() {
             result: Some(WorkerJobResult::StopSandbox {
                 provider: "kubernetes".to_string(),
                 sandbox_id,
+                custody_receipt: None,
             }),
         })
         .send()

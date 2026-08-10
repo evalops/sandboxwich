@@ -21,12 +21,14 @@ use axum::{
     routing::{get, put},
 };
 use axum_server::tls_rustls::RustlsConfig;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use cap_std::{
     ambient_authority,
     fs::{Dir, OpenOptions},
 };
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
+use ring::signature::{ED25519, UnparsedPublicKey};
 use rustls::{
     CertificateError, DigitallySignedStruct, DistinguishedName, RootCertStore, ServerConfig,
     SignatureScheme,
@@ -55,7 +57,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    process::Command as ProcessCommand,
+    process::Command as TokioProcessCommand,
     sync::Mutex,
 };
 use uuid::Uuid;
@@ -124,6 +126,14 @@ enum Command {
     Daemon(Box<DaemonArgs>),
     /// Consume one validated sterile activation bundle and supervise Maestro.
     SterileLauncher(SterileLauncherArgs),
+    /// Verify one controller-signed Agent Sandbox activation and atomically
+    /// consume its nonce before tenant material is admitted.
+    AgentSandboxActivate(AgentSandboxActivateArgs),
+    /// Keep the post-claim generic launcher alive inside the claimed pod.
+    AgentSandboxLauncher(AgentSandboxLauncherArgs),
+    /// Secretless PID1 for a warm pod; waits for the post-claim bundle before
+    /// entering the long-lived launcher.
+    AgentSandboxPreclaim(AgentSandboxPreclaimArgs),
     Exec(ExecArgs),
     WriteFile(FileWriteArgs),
     ReadFile(FileReadArgs),
@@ -137,6 +147,48 @@ enum Command {
     CompilerCacheHelper,
     /// Stage a bounded archive at the helper's fixed private path.
     CompilerCacheStageArchive(CompilerCacheStageArchiveArgs),
+}
+
+#[derive(Debug, Args)]
+struct AgentSandboxActivateArgs {
+    #[arg(long)]
+    bundle: PathBuf,
+    #[arg(long, env = "SANDBOXWICH_AGENT_SANDBOX_PUBLIC_KEY_FILE")]
+    public_key: PathBuf,
+    #[arg(long, default_value = "/run/sandboxwich/activation-nonces")]
+    nonce_dir: PathBuf,
+    #[arg(long, env = "SANDBOXWICH_AGENT_SANDBOX_EXPECTED_CLAIM_UID")]
+    expected_claim_uid: Option<String>,
+    #[arg(long, env = "SANDBOXWICH_AGENT_SANDBOX_EXPECTED_SANDBOX_UID")]
+    expected_sandbox_uid: Option<String>,
+    #[arg(long, env = "SANDBOXWICH_AGENT_SANDBOX_EXPECTED_POD_UID")]
+    expected_pod_uid: Option<String>,
+    #[arg(long, env = "SANDBOXWICH_AGENT_SANDBOX_EXPECTED_IMAGE_DIGEST")]
+    expected_image_digest: Option<String>,
+    #[arg(long, env = "SANDBOXWICH_AGENT_SANDBOX_EXPECTED_BOOTSTRAP_DIGEST")]
+    expected_bootstrap_digest: Option<String>,
+    #[arg(long, env = "SANDBOXWICH_AGENT_SANDBOX_EXPECTED_POLICY_DIGEST")]
+    expected_policy_digest: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct AgentSandboxLauncherArgs {
+    #[arg(long)]
+    bundle: PathBuf,
+    #[arg(long, default_value = "/run/sandboxwich/agent-sandbox-ready")]
+    ready_file: PathBuf,
+    #[arg(long, default_value = "/run/sandboxwich/activation.ready")]
+    activation_marker: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct AgentSandboxPreclaimArgs {
+    #[arg(long)]
+    bundle: PathBuf,
+    #[arg(long, default_value = "/run/sandboxwich/agent-sandbox-ready")]
+    ready_file: PathBuf,
+    #[arg(long, default_value = "/run/sandboxwich/activation.ready")]
+    activation_marker: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -607,6 +659,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Heartbeat(args) => heartbeat(args).await,
         Command::Daemon(args) => daemon(*args).await,
         Command::SterileLauncher(args) => sterile_launcher(args).await,
+        Command::AgentSandboxActivate(args) => agent_sandbox_activate(args),
+        Command::AgentSandboxLauncher(args) => agent_sandbox_launcher(args),
+        Command::AgentSandboxPreclaim(args) => agent_sandbox_preclaim(args),
         Command::Exec(args) => exec(args).await,
         Command::WriteFile(args) => write_file(args).await,
         Command::ReadFile(args) => read_file(args).await,
@@ -621,6 +676,146 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string(&summary)?);
             Ok(())
         }
+    }
+}
+
+fn agent_sandbox_activate(args: AgentSandboxActivateArgs) -> anyhow::Result<()> {
+    let bundle: sandboxwich_core::AgentSandboxActivationV1 =
+        serde_json::from_slice(&std::fs::read(&args.bundle)?)
+            .context("decode Agent Sandbox activation bundle")?;
+    bundle
+        .validate_shape(Utc::now())
+        .map_err(|error| anyhow::anyhow!(error))?;
+    Uuid::parse_str(&bundle.nonce)
+        .map_err(|_| anyhow::anyhow!("agent_sandbox_activation_nonce_invalid"))?;
+    let expected = [
+        (
+            "claim_uid",
+            args.expected_claim_uid.as_deref(),
+            bundle.claim_uid.as_str(),
+        ),
+        (
+            "sandbox_uid",
+            args.expected_sandbox_uid.as_deref(),
+            bundle.sandbox_uid.as_str(),
+        ),
+        (
+            "pod_uid",
+            args.expected_pod_uid.as_deref(),
+            bundle.pod_uid.as_str(),
+        ),
+        (
+            "image_digest",
+            args.expected_image_digest.as_deref(),
+            bundle.image_digest.as_str(),
+        ),
+        (
+            "bootstrap_digest",
+            args.expected_bootstrap_digest.as_deref(),
+            bundle.bootstrap_digest.as_str(),
+        ),
+        (
+            "policy_digest",
+            args.expected_policy_digest.as_deref(),
+            bundle.policy_digest.as_str(),
+        ),
+    ];
+    validate_agent_sandbox_bindings(&bundle, expected)?;
+    let public_key = BASE64.decode(std::fs::read_to_string(&args.public_key)?.trim())?;
+    let signature = BASE64.decode(bundle.signature.trim())?;
+    let payload = bundle.signing_payload()?;
+    UnparsedPublicKey::new(&ED25519, public_key.as_slice())
+        .verify(&payload, &signature)
+        .map_err(|_| anyhow::anyhow!("agent_sandbox_activation_signature_invalid"))?;
+    std::fs::create_dir_all(&args.nonce_dir)?;
+    let nonce_path = args.nonce_dir.join(&bundle.nonce);
+    // Stage the marker completely before consuming the nonce. The final
+    // rename is the visibility commit: PID1 cannot observe an empty marker,
+    // and every failure before that commit remains retryable.
+    let marker = Path::new("/run/sandboxwich/activation.ready");
+    let marker_tmp = marker.with_extension("ready.tmp");
+    let mut marker_file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker_tmp)
+    {
+        Ok(file) => file,
+        Err(error) => return Err(error).context("stage one-shot Agent Sandbox activation marker"),
+    };
+    if let Err(error) = marker_file
+        .write_all(bundle.nonce.as_bytes())
+        .and_then(|_| marker_file.sync_all())
+    {
+        let _ = std::fs::remove_file(&marker_tmp);
+        return Err(error).context("write one-shot Agent Sandbox activation marker");
+    }
+    drop(marker_file);
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&nonce_path);
+    match created {
+        Ok(file) => drop(file),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&marker_tmp);
+            return Err(anyhow::anyhow!("agent_sandbox_activation_replay"));
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&marker_tmp);
+            return Err(error).context("create Agent Sandbox activation nonce");
+        }
+    }
+    if let Err(error) = std::fs::rename(&marker_tmp, marker) {
+        let _ = std::fs::remove_file(&marker_tmp);
+        let _ = std::fs::remove_file(&nonce_path);
+        return Err(error).context("commit one-shot Agent Sandbox activation marker");
+    }
+    println!("{}", serde_json::to_string(&bundle)?);
+    Ok(())
+}
+
+fn validate_agent_sandbox_bindings(
+    bundle: &sandboxwich_core::AgentSandboxActivationV1,
+    expected: [(&str, Option<&str>, &str); 6],
+) -> anyhow::Result<()> {
+    for (name, value, actual) in expected {
+        let value = value.context(format!("agent_sandbox_expected_{name}_missing"))?;
+        if value != actual {
+            bail!("agent_sandbox_activation_{name}_mismatch");
+        }
+    }
+    Uuid::parse_str(&bundle.nonce)
+        .map_err(|_| anyhow::anyhow!("agent_sandbox_activation_nonce_invalid"))?;
+    Ok(())
+}
+
+fn agent_sandbox_launcher(args: AgentSandboxLauncherArgs) -> anyhow::Result<()> {
+    let bundle: sandboxwich_core::AgentSandboxActivationV1 =
+        serde_json::from_slice(&std::fs::read(&args.bundle)?)?;
+    bundle
+        .validate_shape(Utc::now())
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let marker_nonce = std::fs::read_to_string(&args.activation_marker)?;
+    anyhow::ensure!(
+        marker_nonce == bundle.nonce,
+        "agent_sandbox_activation_marker_mismatch"
+    );
+    std::fs::write(&args.ready_file, bundle.pod_uid.as_bytes())?;
+    loop {
+        std::thread::sleep(Duration::from_secs(30));
+    }
+}
+
+fn agent_sandbox_preclaim(args: AgentSandboxPreclaimArgs) -> anyhow::Result<()> {
+    loop {
+        if args.activation_marker.is_file() {
+            return agent_sandbox_launcher(AgentSandboxLauncherArgs {
+                bundle: args.bundle,
+                ready_file: args.ready_file,
+                activation_marker: args.activation_marker,
+            });
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -2132,7 +2327,7 @@ async fn post_resident_observation(
 /// fails outright with a permission error rather than silently running the
 /// sidecar under the workload's own uid -- callers must treat that as the
 /// sidecar being unavailable, not as a degraded-but-working sidecar.
-fn apply_resident_process_run_as_uid(command: &mut ProcessCommand, run_as_uid: Option<u32>) {
+fn apply_resident_process_run_as_uid(command: &mut TokioProcessCommand, run_as_uid: Option<u32>) {
     #[cfg(unix)]
     if let Some(uid) = run_as_uid {
         command.uid(uid);
@@ -2683,7 +2878,7 @@ async fn spawn_and_wait_sterile_maestro(
         .argv
         .split_first()
         .context("sterile launcher argv is empty")?;
-    let mut command = ProcessCommand::new(program);
+    let mut command = TokioProcessCommand::new(program);
     command
         .args(argv)
         .envs(bundle.env)
@@ -3274,7 +3469,7 @@ async fn handle_resident_process_with_bootstrap_root(
                 delivered_sterile_activation.as_ref(),
             )
             .await?;
-            let mut command = ProcessCommand::new(program);
+            let mut command = TokioProcessCommand::new(program);
             command.args(args).envs(&env);
             if let Some(cwd) = &cwd {
                 command.current_dir(cwd);
@@ -3480,7 +3675,7 @@ async fn execute_streaming(
     let timeout = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS));
 
     let started_at = Utc::now();
-    let mut command = ProcessCommand::new(program);
+    let mut command = TokioProcessCommand::new(program);
     command.args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
@@ -5370,7 +5565,7 @@ mod tests {
             ),
             None
         );
-        let mut command = ProcessCommand::new("id");
+        let mut command = TokioProcessCommand::new("id");
         command.arg("-u");
         apply_resident_process_run_as_uid(&mut command, None);
         let output = command.output().await.expect("spawn `id -u` unmodified");
@@ -5402,7 +5597,7 @@ mod tests {
         );
 
         let euid = current_uid();
-        let mut command = ProcessCommand::new("id");
+        let mut command = TokioProcessCommand::new("id");
         command.arg("-u");
         apply_resident_process_run_as_uid(&mut command, Some(sidecar_uid));
         let result = command.output().await;
@@ -5474,7 +5669,7 @@ mod tests {
             .expect("transfer bootstrap to sidecar uid");
         drop(file);
 
-        let mut command = ProcessCommand::new("cat");
+        let mut command = TokioProcessCommand::new("cat");
         command.arg(&target);
         apply_resident_process_run_as_uid(&mut command, Some(sidecar_uid));
         let output = command
@@ -5484,5 +5679,144 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(output.stdout, b"sidecar-bootstrap-canary");
         std::fs::remove_file(target).expect("remove sidecar bootstrap fixture");
+    }
+
+    fn test_agent_activation() -> sandboxwich_core::AgentSandboxActivationV1 {
+        sandboxwich_core::AgentSandboxActivationV1 {
+            version: sandboxwich_core::AgentSandboxActivationV1::VERSION,
+            claim_uid: "claim".into(),
+            sandbox_uid: "sandbox".into(),
+            pod_uid: "pod".into(),
+            image_digest: "sha256:image".into(),
+            bootstrap_digest: "sha256:bootstrap".into(),
+            policy_digest: "sha256:policy".into(),
+            applied_policy_digest: "sha256:applied-policy".into(),
+            expires_at: Utc::now() + chrono::Duration::minutes(1),
+            nonce: "00000000-0000-4000-8000-000000000001".into(),
+            signature: "sig".into(),
+        }
+    }
+
+    #[test]
+    fn agent_activation_verifies_with_raw_committed_public_key_bytes() {
+        use ring::{rand::SystemRandom, signature::KeyPair};
+        let key = ring::signature::Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let key = ring::signature::Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
+        let mut activation = test_agent_activation();
+        activation.signature =
+            BASE64.encode(key.sign(&activation.signing_payload().unwrap()).as_ref());
+        let signature = BASE64.decode(&activation.signature).unwrap();
+        UnparsedPublicKey::new(&ED25519, key.public_key().as_ref())
+            .verify(&activation.signing_payload().unwrap(), &signature)
+            .expect("raw 32-byte public key verifies");
+    }
+
+    #[test]
+    fn agent_activation_rejects_binding_mismatch_expiry_and_unsafe_nonce() {
+        let activation = test_agent_activation();
+        let expected = [
+            ("claim_uid", Some("wrong"), activation.claim_uid.as_str()),
+            (
+                "sandbox_uid",
+                Some("sandbox"),
+                activation.sandbox_uid.as_str(),
+            ),
+            ("pod_uid", Some("pod"), activation.pod_uid.as_str()),
+            (
+                "image_digest",
+                Some("sha256:image"),
+                activation.image_digest.as_str(),
+            ),
+            (
+                "bootstrap_digest",
+                Some("sha256:bootstrap"),
+                activation.bootstrap_digest.as_str(),
+            ),
+            (
+                "policy_digest",
+                Some("sha256:policy"),
+                activation.policy_digest.as_str(),
+            ),
+        ];
+        assert_eq!(
+            validate_agent_sandbox_bindings(&activation, expected)
+                .unwrap_err()
+                .to_string(),
+            "agent_sandbox_activation_claim_uid_mismatch"
+        );
+
+        let mut expired = activation.clone();
+        expired.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        assert_eq!(
+            expired.validate_shape(Utc::now()).unwrap_err(),
+            "agent_sandbox_activation_expired"
+        );
+
+        let mut unsafe_nonce = activation;
+        unsafe_nonce.nonce = "../replay".into();
+        let expected = [
+            ("claim_uid", Some("claim"), unsafe_nonce.claim_uid.as_str()),
+            (
+                "sandbox_uid",
+                Some("sandbox"),
+                unsafe_nonce.sandbox_uid.as_str(),
+            ),
+            ("pod_uid", Some("pod"), unsafe_nonce.pod_uid.as_str()),
+            (
+                "image_digest",
+                Some("sha256:image"),
+                unsafe_nonce.image_digest.as_str(),
+            ),
+            (
+                "bootstrap_digest",
+                Some("sha256:bootstrap"),
+                unsafe_nonce.bootstrap_digest.as_str(),
+            ),
+            (
+                "policy_digest",
+                Some("sha256:policy"),
+                unsafe_nonce.policy_digest.as_str(),
+            ),
+        ];
+        assert_eq!(
+            validate_agent_sandbox_bindings(&unsafe_nonce, expected)
+                .unwrap_err()
+                .to_string(),
+            "agent_sandbox_activation_nonce_invalid"
+        );
+        for nonce in [".", ".."] {
+            let mut dot_nonce = unsafe_nonce.clone();
+            dot_nonce.nonce = nonce.into();
+            let expected = [
+                ("claim_uid", Some("claim"), dot_nonce.claim_uid.as_str()),
+                (
+                    "sandbox_uid",
+                    Some("sandbox"),
+                    dot_nonce.sandbox_uid.as_str(),
+                ),
+                ("pod_uid", Some("pod"), dot_nonce.pod_uid.as_str()),
+                (
+                    "image_digest",
+                    Some("sha256:image"),
+                    dot_nonce.image_digest.as_str(),
+                ),
+                (
+                    "bootstrap_digest",
+                    Some("sha256:bootstrap"),
+                    dot_nonce.bootstrap_digest.as_str(),
+                ),
+                (
+                    "policy_digest",
+                    Some("sha256:policy"),
+                    dot_nonce.policy_digest.as_str(),
+                ),
+            ];
+            assert_eq!(
+                validate_agent_sandbox_bindings(&dot_nonce, expected)
+                    .unwrap_err()
+                    .to_string(),
+                "agent_sandbox_activation_nonce_invalid"
+            );
+        }
     }
 }

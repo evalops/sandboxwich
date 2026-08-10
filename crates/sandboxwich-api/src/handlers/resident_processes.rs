@@ -205,7 +205,7 @@ async fn placed_worker_supports_provider_isolated_resident_process(
     process_name: &str,
 ) -> Result<ProviderIsolatedPlacement, ApiError> {
     let sql = format!(
-        "select w.labels, p.generation
+        "select w.labels, w.provider, p.generation
          from sandbox_placements p
          join workers w on w.id = p.worker_id
          where p.sandbox_id = {} and w.tenant_id = {}",
@@ -224,6 +224,7 @@ async fn placed_worker_supports_provider_isolated_resident_process(
         .try_get::<String, _>("labels")
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    let provider = row.try_get::<String, _>("provider").unwrap_or_default();
     let version_supported = labels
         .as_ref()
         .and_then(|labels| labels.get(PROVIDER_ISOLATED_RESIDENT_PROCESS_VERSION_LABEL))
@@ -246,13 +247,19 @@ async fn placed_worker_supports_provider_isolated_resident_process(
         .ok()
         .filter(|generation| *generation > 0)
         .ok_or_else(|| ApiError::internal("sandbox placement generation is invalid"))?;
-    Ok(ProviderIsolatedPlacement::Supported(generation))
+    Ok(ProviderIsolatedPlacement::Supported {
+        generation,
+        agent_sandbox: provider == "agent_sandbox",
+    })
 }
 
 enum ProviderIsolatedPlacement {
     Pending,
     Unsupported,
-    Supported(u64),
+    Supported {
+        generation: u64,
+        agent_sandbox: bool,
+    },
 }
 
 async fn authoritative_workspace_claim_name(
@@ -930,13 +937,26 @@ pub(crate) async fn put_resident_process(
         ensure_sandbox_tenant(&state.db, sandbox_id, &ctx).await?
     };
     let workspace_claim_name = if name == MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME {
-        if sandbox.workspace_mode != WorkspaceMode::Persistent {
+        if !matches!(
+            sandbox.workspace_mode,
+            WorkspaceMode::Persistent | WorkspaceMode::GenericEphemeral
+        ) {
             return Err(ApiError::bad_request_code(
                 "maestro_workspace_mode_invalid",
-                "maestro-hosted-runner requires workspace_mode=persistent",
+                "maestro-hosted-runner requires workspace_mode=persistent or generic_ephemeral",
             ));
         }
-        Some(authoritative_workspace_claim_name(&state.db, sandbox_id, &sandbox.tenant_id).await?)
+        if sandbox.workspace_mode == WorkspaceMode::Persistent {
+            Some(
+                authoritative_workspace_claim_name(&state.db, sandbox_id, &sandbox.tenant_id)
+                    .await?,
+            )
+        } else {
+            // Generic ephemeral Agent Sandbox placement owns the PVC through
+            // the claimed Pod. The worker discovers and verifies that PVC;
+            // the API must never accept a tenant-supplied claim name.
+            None
+        }
     } else {
         None
     };
@@ -966,7 +986,18 @@ pub(crate) async fn put_resident_process(
                 message: "the resident sidecar requires its placed worker to advertise the matching digest-pinned provider-isolated v2 runtime".into(),
                 });
             }
-            ProviderIsolatedPlacement::Supported(generation) => generation,
+            ProviderIsolatedPlacement::Supported {
+                generation,
+                agent_sandbox,
+            } => {
+                if sandbox.workspace_mode == WorkspaceMode::GenericEphemeral && !agent_sandbox {
+                    return Err(ApiError::bad_request_code(
+                        "maestro_generic_ephemeral_provider_mismatch",
+                        "generic_ephemeral Maestro workspaces require an Agent Sandbox placement",
+                    ));
+                }
+                generation
+            }
         })
     } else {
         None

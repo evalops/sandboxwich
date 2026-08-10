@@ -1149,6 +1149,7 @@ pub(crate) async fn assert_snapshot_fork_and_cleanup_lifecycle(
             result: Some(WorkerJobResult::StopSandbox {
                 provider: "kubernetes".to_string(),
                 sandbox_id: archived.sandbox.id,
+                custody_receipt: None,
             }),
         })
         .send()
@@ -1875,6 +1876,7 @@ pub(crate) async fn assert_snapshot_backed_resume_lifecycle(
             result: Some(WorkerJobResult::StopSandbox {
                 provider: "kubernetes".to_string(),
                 sandbox_id: sandbox.sandbox.id,
+                custody_receipt: None,
             }),
         })
         .send()
@@ -2238,6 +2240,7 @@ async fn archive_sandbox(
             result: Some(WorkerJobResult::StopSandbox {
                 provider: "kubernetes".to_string(),
                 sandbox_id: sandbox.sandbox.id,
+                custody_receipt: None,
             }),
         })
         .send()
