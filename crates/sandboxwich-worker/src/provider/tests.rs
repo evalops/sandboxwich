@@ -3209,10 +3209,12 @@ fn apply_fork_refuses_unready_volume_snapshot() {
     std::fs::create_dir_all(&dir).expect("create fake kubectl dir");
     let log_path = dir.join("log.txt");
     let script_path = dir.join("kubectl");
+    // ready|boundContent|class|error — not ready
     let script = format!(
         "#!/bin/sh\n\
          printf '%s\\n' \"$*\" >> \"{log}\"\n\
          case \" $* \" in\n\
+         *boundVolumeSnapshotContentName*) printf 'false|snapcontent-x|local-path-snapshot|' ;;\n\
          *readyToUse*) printf 'false' ;;\n\
          *\" apply \"*) cat >/dev/null 2>&1 || true ;;\n\
          esac\n\
@@ -3241,13 +3243,114 @@ fn apply_fork_refuses_unready_volume_snapshot() {
         )
         .expect_err("fork must not apply a PVC against an unbound VolumeSnapshot");
     assert!(
-        error.to_string().contains("not readyToUse"),
+        error.to_string().contains("snapshot_not_ready")
+            || error.to_string().contains("not readyToUse")
+            || error.to_string().contains("not restorable"),
         "expected unbound-snapshot refusal, got: {error}"
     );
     let log = std::fs::read_to_string(&log_path).expect("read fake kubectl log");
     assert!(
         !log.contains(" apply "),
         "no fork manifests may be applied when the snapshot is unbound: {log}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn apply_fork_refuses_ready_but_unbound_volume_snapshot() {
+    let dir = std::env::temp_dir().join(format!(
+        "sandboxwich-fake-kubectl-unbound-content-{}",
+        SandboxId::new()
+    ));
+    std::fs::create_dir_all(&dir).expect("create fake kubectl dir");
+    let log_path = dir.join("log.txt");
+    let script_path = dir.join("kubectl");
+    let script = format!(
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$*\" >> \"{log}\"\n\
+         case \" $* \" in\n\
+         *boundVolumeSnapshotContentName*) printf 'true||local-path-snapshot|' ;;\n\
+         *\" apply \"*) cat >/dev/null 2>&1 || true ;;\n\
+         esac\n\
+         exit 0\n",
+        log = log_path.display(),
+    );
+    std::fs::write(&script_path, script).expect("write fake kubectl");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat fake kubectl")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod fake kubectl");
+    }
+    let provider = apply_provider_with_fake_kubectl(&script_path);
+
+    let error = provider
+        .fork(
+            SandboxId::new(),
+            SandboxId::new(),
+            SnapshotId::new(),
+            &SandboxProvisionSpec::default(),
+            &CancelSignal::never_cancelled(),
+        )
+        .expect_err("fork must refuse when bound content is missing");
+    assert!(
+        error.to_string().contains("snapshot_unbound")
+            || error.to_string().contains("boundVolumeSnapshotContentName"),
+        "expected unbound-content refusal, got: {error}"
+    );
+    let log = std::fs::read_to_string(&log_path).expect("read fake kubectl log");
+    assert!(
+        !log.contains(" apply "),
+        "no fork manifests may be applied without bound content: {log}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn apply_fork_refuses_poison_volume_snapshot_with_status_error() {
+    let dir = std::env::temp_dir().join(format!(
+        "sandboxwich-fake-kubectl-poison-snap-{}",
+        SandboxId::new()
+    ));
+    std::fs::create_dir_all(&dir).expect("create fake kubectl dir");
+    let log_path = dir.join("log.txt");
+    let script_path = dir.join("kubectl");
+    let script = format!(
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$*\" >> \"{log}\"\n\
+         case \" $* \" in\n\
+         *boundVolumeSnapshotContentName*) printf 'false|||Failed to set default snapshot class' ;;\n\
+         *\" apply \"*) cat >/dev/null 2>&1 || true ;;\n\
+         esac\n\
+         exit 0\n",
+        log = log_path.display(),
+    );
+    std::fs::write(&script_path, script).expect("write fake kubectl");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat fake kubectl")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod fake kubectl");
+    }
+    let provider = apply_provider_with_fake_kubectl(&script_path);
+
+    let error = provider
+        .fork(
+            SandboxId::new(),
+            SandboxId::new(),
+            SnapshotId::new(),
+            &SandboxProvisionSpec::default(),
+            &CancelSignal::never_cancelled(),
+        )
+        .expect_err("fork must refuse poison snapshots");
+    assert!(
+        error.to_string().contains("snapshot_poison")
+            || error.to_string().contains("status.error"),
+        "expected poison refusal, got: {error}"
     );
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -3265,6 +3368,7 @@ fn apply_resume_refuses_unready_volume_snapshot() {
         "#!/bin/sh\n\
          printf '%s\\n' \"$*\" >> \"{log}\"\n\
          case \" $* \" in\n\
+         *boundVolumeSnapshotContentName*) printf 'false|snapcontent-x|local-path-snapshot|' ;;\n\
          *readyToUse*) printf 'false' ;;\n\
          *\" apply \"*) cat >/dev/null 2>&1 || true ;;\n\
          esac\n\
@@ -3295,7 +3399,9 @@ fn apply_resume_refuses_unready_volume_snapshot() {
         )
         .expect_err("resume must not apply a PVC against an unbound VolumeSnapshot");
     assert!(
-        error.to_string().contains("not readyToUse"),
+        error.to_string().contains("snapshot_not_ready")
+            || error.to_string().contains("not readyToUse")
+            || error.to_string().contains("not restorable"),
         "expected unbound-snapshot refusal, got: {error}"
     );
     let log = std::fs::read_to_string(&log_path).expect("read fake kubectl log");
@@ -4840,6 +4946,11 @@ fn write_fake_kubectl(fail_verb: Option<&'static str>) -> (std::path::PathBuf, s
              {fail_check}\
              case \" $* \" in\n\
              \x20\x20*\" apply \"*) cat >/dev/null 2>&1 || true ;;\n\
+             \x20\x20*boundVolumeSnapshotContentName*)\n\
+             \x20\x20  case \" $* \" in\n\
+             \x20\x20  *\" get \"*) printf 'true|snapcontent-test|local-path-snapshot|' ;;\n\
+             \x20\x20  esac\n\
+             \x20\x20  ;;\n\
              \x20\x20*readyToUse*)\n\
              \x20\x20  case \" $* \" in\n\
              \x20\x20  *\" get \"*) printf 'true' ;;\n\
