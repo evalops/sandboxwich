@@ -4862,7 +4862,10 @@ impl KubernetesApplyProvider {
             sandbox_uid: sandbox_uid.to_string(),
             pod_uid: pod_uid.to_string(),
             image_digest: self.dry_run.runtime_image.clone(),
-            bootstrap_digest: sha256_hex(b"sandboxwich-agent:agent-sandbox-v1"),
+            bootstrap_digest: format!(
+                "sha256:{}",
+                sha256_hex(b"sandboxwich-agent:agent-sandbox-v1")
+            ),
             policy_digest: sandboxwich_core::AgentSandboxActivationV1::BASE_POLICY_DIGEST.into(),
             applied_policy_digest: policy_digest,
             expires_at: Utc::now() + chrono::Duration::minutes(5),
