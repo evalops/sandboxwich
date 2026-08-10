@@ -458,6 +458,63 @@ By default the smoke command deletes the resources it created with `kubectl dele
 
 Clusters without a CSI `VolumeSnapshotClass` should use the long-running apply-mode worker for pod/exec smoke and skip the standalone full apply smoke, or pass a real snapshot class. The command execution path does not require snapshots.
 
+### Production GKE: pin `SANDBOXWICH_SNAPSHOT_CLASS` (2026-08-10)
+
+GKE production (`evalops-sandboxes`) has `VolumeSnapshotClass/gke-pd-csi`
+(driver `pd.csi.storage.gke.io`) but **no default** class. When the worker is
+deployed with an empty `--snapshot-class` / `SANDBOXWICH_SNAPSHOT_CLASS`,
+VolumeSnapshot objects are created without `volumeSnapshotClassName`. CSI then
+never binds them (`status.readyToUse` never becomes true). Stop may delete the
+source PVC while the snapshot is still incomplete, which freezes the snapshot
+in error (`Failed to set default snapshot class` / source PVC not found).
+
+Resume and fork create workspace PVCs with
+`dataSource.kind=VolumeSnapshot`. Against an unbound snapshot the provisioner
+emits:
+
+```
+ProvisioningFailed: snapshot ... not bound
+```
+
+The guest Pod stays **Pending** (WaitForFirstConsumer). From the platform
+side that surfaces as:
+
+- Runner Host `runtime.identity` transport errors (~750ms probe timeouts)
+  while the resident mTLS endpoint never comes up
+- Operating runtime `thread.binding` **503** `runner_not_ready`
+- Parked not-ready claims / product canary `runtime_dispatched_unanswered`
+
+**Required deploy pin** (evalops/deploy runners domain):
+
+```yaml
+- name: SANDBOXWICH_SNAPSHOT_CLASS
+  value: gke-pd-csi
+```
+
+Also present as Velero's CSI snapshot class. Worker code
+(`require_configured_snapshot_class`, `require_ready_volume_snapshot`, wait
+for readyToUse before stop) fails closed when the class is missing or the
+snapshot is not ready — but an empty class + historical unbound snapshots
+still leave Pending PVC/pod pairs that need one-shot cleanup.
+
+**Ops cleanup** for a stuck restore/fork:
+
+```sh
+# confirm dataSource points at unbound snapshot
+kubectl -n evalops-sandboxes describe pvc sandboxwich-pvc-<id>
+kubectl -n evalops-sandboxes get volumesnapshot -o wide
+# tear down the stuck pair (worker may also roll back on job failure)
+kubectl -n evalops-sandboxes delete pod sandboxwich-<id> --wait=false
+kubectl -n evalops-sandboxes delete pvc sandboxwich-pvc-<id> --wait=false
+```
+
+Do not mark a snapshot durable-ready in the control plane unless
+`status.readyToUse=true` on the VolumeSnapshot object.
+
+The starter `deploy/kubernetes/worker.yaml` keeps an empty snapshot class for
+local-path/k3s command smoke only; comments there point here so the empty
+default is not copied into GKE.
+
 ## Health, Metrics, And Smoke
 
 The API exposes:

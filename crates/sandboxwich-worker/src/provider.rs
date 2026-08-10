@@ -6005,6 +6005,199 @@ impl KubernetesApplyProvider {
         )
     }
 
+    /// Name of the VolumeSnapshot object rendered for `snapshot_id`.
+    fn volume_snapshot_name(snapshot_id: SnapshotId) -> String {
+        format!("sandboxwich-snapshot-{snapshot_id}")
+    }
+
+    /// Apply-mode snapshot/restore requires an explicit CSI VolumeSnapshotClass.
+    /// Clusters without a default class (production GKE) leave VolumeSnapshots
+    /// unbound forever when `volumeSnapshotClassName` is omitted, and resume/fork
+    /// then create Pending workspace claims from an unbound dataSource.
+    fn require_configured_snapshot_class(&self) -> anyhow::Result<()> {
+        match self.dry_run.snapshot_class.as_deref() {
+            Some(class) if !class.trim().is_empty() => Ok(()),
+            _ => bail!(
+                "snapshot class is not configured; set --snapshot-class (or \
+                 SANDBOXWICH_SNAPSHOT_CLASS) to a CSI VolumeSnapshotClass compatible \
+                 with the workspace StorageClass before creating or restoring snapshots"
+            ),
+        }
+    }
+
+    /// Blocks until the named VolumeSnapshot reports `status.readyToUse=true`.
+    /// Returning success before that lets stop delete the source PVC while CSI
+    /// still needs it, and lets resume/fork bind a PVC to an unbound snapshot.
+    fn wait_for_volume_snapshot_ready(
+        &self,
+        snapshot_id: SnapshotId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<KubectlOutput> {
+        let name = Self::volume_snapshot_name(snapshot_id);
+        let mut args = self.kubectl_base_args();
+        args.extend([
+            "wait".to_string(),
+            "--for=jsonpath={.status.readyToUse}=true".to_string(),
+            format!("volumesnapshot/{name}"),
+            self.pod_ready_timeout_arg(),
+        ]);
+        run_kubectl_command(
+            &self.kubectl,
+            &args,
+            "wait for volume snapshot readyToUse",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )
+    }
+
+    /// Fail closed when the VolumeSnapshot that a restore will dataSource is
+    /// not proven usable. Industry restore guidance requires readyToUse **and**
+    /// a bound VolumeSnapshotContent (and preferably a non-empty class). Applying
+    /// a PVC against a partial snapshot leaves the guest Pending forever under
+    /// WaitForFirstConsumer storage.
+    fn require_ready_volume_snapshot(
+        &self,
+        snapshot_id: SnapshotId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<()> {
+        let name = Self::volume_snapshot_name(snapshot_id);
+        // One get with delimited fields avoids a race between separate reads of
+        // readyToUse and boundVolumeSnapshotContentName.
+        let mut args = self.kubectl_base_args();
+        args.extend([
+            "get".to_string(),
+            "volumesnapshot".to_string(),
+            name.clone(),
+            "-o".to_string(),
+            "jsonpath={.status.readyToUse}|{.status.boundVolumeSnapshotContentName}|{.spec.volumeSnapshotClassName}|{.status.error.message}"
+                .to_string(),
+        ]);
+        let output = run_kubectl_command(
+            &self.kubectl,
+            &args,
+            "read volume snapshot restore readiness fields",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        if !output.success {
+            bail!(
+                "volume snapshot {name} is not restorable (error_category=snapshot_not_found): \
+                 kubectl get failed with {}: {}",
+                output.status,
+                output.stderr
+            );
+        }
+        let mut parts = output.stdout.trim().splitn(4, '|');
+        let ready = parts.next().unwrap_or("").trim();
+        let bound_content = parts.next().unwrap_or("").trim();
+        let class_name = parts.next().unwrap_or("").trim();
+        let error_message = parts.next().unwrap_or("").trim();
+
+        if !error_message.is_empty() {
+            bail!(
+                "volume snapshot {name} is not restorable (error_category=snapshot_poison): \
+                 status.error={error_message:?}"
+            );
+        }
+        if class_name.is_empty() {
+            bail!(
+                "volume snapshot {name} is not restorable (error_category=snapshot_class_missing): \
+                 volumeSnapshotClassName is empty; refuse to restore from a poison VolumeSnapshot"
+            );
+        }
+        if ready != "true" {
+            bail!(
+                "volume snapshot {name} is not restorable (error_category=snapshot_not_ready): \
+                 readyToUse observed {ready:?}; refuse to restore a workspace from an unbound VolumeSnapshot"
+            );
+        }
+        if bound_content.is_empty() {
+            bail!(
+                "volume snapshot {name} is not restorable (error_category=snapshot_unbound): \
+                 readyToUse is true but boundVolumeSnapshotContentName is empty"
+            );
+        }
+        Ok(())
+    }
+
+    /// Before deleting a sandbox's workspace PVC, wait for any VolumeSnapshots
+    /// labeled with this sandbox id to reach readyToUse. CSI still needs the
+    /// source claim while a snapshot is incomplete; tearing the claim down
+    /// early freezes the snapshot unbound and poisons later resume/fork.
+    fn wait_for_sandbox_volume_snapshots_ready(
+        &self,
+        sandbox_id: SandboxId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<()> {
+        let mut list_args = self.kubectl_base_args();
+        list_args.extend([
+            "get".to_string(),
+            "volumesnapshot".to_string(),
+            "-l".to_string(),
+            format!("sandboxwich.dev/sandbox-id={sandbox_id}"),
+            "-o".to_string(),
+            "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}".to_string(),
+        ]);
+        let listed = run_kubectl_command(
+            &self.kubectl,
+            &list_args,
+            "list sandbox volume snapshots before stop",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        // Missing CRD or empty inventory is not a stop failure: clusters without
+        // the snapshot API simply never create these objects.
+        if !listed.success {
+            let stderr = listed.stderr.to_lowercase();
+            if stderr.contains("the server doesn't have a resource type")
+                || stderr.contains("could not find")
+                || stderr.contains("no matches for kind")
+                || stderr.contains("not found")
+            {
+                return Ok(());
+            }
+            bail!(
+                "kubectl list volume snapshots before stop failed with {}: {}",
+                listed.status,
+                listed.stderr
+            );
+        }
+        for name in listed
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            let mut wait_args = self.kubectl_base_args();
+            wait_args.extend([
+                "wait".to_string(),
+                "--for=jsonpath={.status.readyToUse}=true".to_string(),
+                format!("volumesnapshot/{name}"),
+                self.pod_ready_timeout_arg(),
+            ]);
+            let wait = run_kubectl_command(
+                &self.kubectl,
+                &wait_args,
+                "wait for sandbox volume snapshot readyToUse before stop",
+                self.kubectl_command_timeout,
+                Some(cancelled),
+                self.max_captured_output_bytes,
+            )?;
+            if !wait.success {
+                bail!(
+                    "volume snapshot {name} for sandbox {sandbox_id} did not become readyToUse \
+                     before stop deleted the source PVC ({}): {}",
+                    wait.status,
+                    wait.stderr
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn wait_for_gateway_ready_if_needed(
         &self,
         sandbox_id: SandboxId,
@@ -8545,6 +8738,9 @@ impl SandboxProvider for KubernetesApplyProvider {
         cancelled: &CancelSignal,
     ) -> anyhow::Result<ProviderSnapshotHandle> {
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
+        // Fail closed before mutating: without a class the VolumeSnapshot never
+        // binds on clusters that lack a default VolumeSnapshotClass (GKE).
+        self.require_configured_snapshot_class()?;
         let snapshot = self
             .dry_run
             .volume_snapshot_manifest(sandbox_id, snapshot_id);
@@ -8564,18 +8760,31 @@ impl SandboxProvider for KubernetesApplyProvider {
                 apply.stderr
             );
         }
+        // Must observe readyToUse before declaring the snapshot usable. Apply
+        // alone only creates the object; CSI still needs the source PVC until
+        // readyToUse flips, and stop deletes that PVC.
+        let wait = self.wait_for_volume_snapshot_ready(snapshot_id, cancelled)?;
+        if !wait.success {
+            bail!(
+                "volume snapshot did not become readyToUse with {}: {}",
+                wait.status,
+                wait.stderr
+            );
+        }
         let mut handle = self
             .dry_run
             .create_snapshot(sandbox_id, snapshot_id, cancelled)?;
         mark_resources(
             &mut handle.resources,
-            RuntimeResourceStatus::Applied,
+            RuntimeResourceStatus::Ready,
             Some(Utc::now()),
         );
         if let Some(metadata) = handle.metadata.as_object_mut() {
             metadata.insert("mode".to_string(), json!("apply"));
             metadata.insert("applyStatus".to_string(), json!(apply.status));
             metadata.insert("applyStdout".to_string(), json!(apply.stdout));
+            metadata.insert("waitStatus".to_string(), json!(wait.status));
+            metadata.insert("waitStdout".to_string(), json!(wait.stdout));
         }
         Ok(handle)
     }
@@ -8591,6 +8800,8 @@ impl SandboxProvider for KubernetesApplyProvider {
         self.dry_run
             .validate_network_policy_egress(&spec.network_egress)?;
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
+        // Refuse to apply a dataSource PVC against an unbound VolumeSnapshot.
+        self.require_ready_volume_snapshot(snapshot_id, cancelled)?;
         let manifests = self.fork_manifests(child_sandbox_id, snapshot_id, spec)?;
         let apply = run_kubectl_documents(
             &self.kubectl,
@@ -8676,6 +8887,9 @@ impl SandboxProvider for KubernetesApplyProvider {
         // The restore manifests are the fork manifests: a fork's child and a
         // resumed sandbox are both "a runtime whose PVC is cloned from a
         // VolumeSnapshot", they just differ in which sandbox id they carry.
+        // Fail closed if that VolumeSnapshot is not readyToUse so we never
+        // leave a Pending PVC from an unbound dataSource.
+        self.require_ready_volume_snapshot(snapshot_id, cancelled)?;
         let manifests = self.fork_manifests(sandbox_id, snapshot_id, spec)?;
         let apply = run_kubectl_documents(
             &self.kubectl,
@@ -8757,6 +8971,22 @@ impl SandboxProvider for KubernetesApplyProvider {
         let started = Instant::now();
         tracing::info!(sandbox_id = %sandbox_id, "sandboxwich_cleanup_started");
         Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
+        // Hold the source PVC until every sandbox-labeled VolumeSnapshot is
+        // readyToUse. Teardown does not delete VolumeSnapshots, but it does
+        // delete the PVC CSI still needs while a snapshot is incomplete.
+        if let Err(error) = self.wait_for_sandbox_volume_snapshots_ready(sandbox_id, cancelled) {
+            span.record("duration_ms", started.elapsed().as_millis() as u64);
+            span.record("outcome", "error");
+            span.record("error_category", "snapshot_not_ready");
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                error_category = "snapshot_not_ready",
+                duration_ms = started.elapsed().as_millis() as u64,
+                error = %error,
+                "sandboxwich_cleanup_failed"
+            );
+            return Err(error);
+        }
         // Built-in resources must be deleted separately from optional CRDs.
         // `kubectl delete a,b` aborts the whole request if either API kind is
         // undiscoverable, even with `--ignore-not-found`.

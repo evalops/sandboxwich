@@ -74,3 +74,8 @@ jobs:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ steps.bot-token.outputs.token }}
+          # Git-only baselines use isolated worktrees, but each packages the
+          # same workspace. Share compiled artifacts outside every worktree;
+          # keeping this under runner.temp also keeps packaged manifests from
+          # inheriting the live Cargo workspace.
+          CARGO_TARGET_DIR: ${{ runner.temp }}/release-plz-target

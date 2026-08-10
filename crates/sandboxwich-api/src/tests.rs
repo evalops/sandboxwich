@@ -3587,6 +3587,80 @@ async fn worker_liveness_reconciliation_batch_deletes_only_expired_history() {
 }
 
 #[tokio::test]
+async fn worker_liveness_gives_recent_null_heartbeat_workers_registration_grace() {
+    // Re-register during an open drain receipt sets status=draining and
+    // last_heartbeat_at=null. The expiry sweeper must not immediately mark
+    // that row Offline; grace is measured from registered_at until the first
+    // heartbeat lands.
+    let db = test_sqlite_db().await;
+    let now = Utc::now();
+    let fresh = Worker {
+        id: WorkerId::new(),
+        tenant_id: "default".to_string(),
+        name: "fresh-null-heartbeat".to_string(),
+        status: WorkerStatus::Draining,
+        provider: "test".to_string(),
+        capabilities: vec![WorkerCapability::ProvisionSandbox],
+        max_concurrent_jobs: 1,
+        labels: BTreeMap::new(),
+        resource_envelope: None,
+        registered_at: now,
+        last_heartbeat_at: None,
+    };
+    insert_worker(
+        &db,
+        &fresh,
+        &hash_worker_token(&format!("test-token-{}", fresh.id)),
+    )
+    .await
+    .expect("insert fresh draining worker");
+
+    let stale = Worker {
+        id: WorkerId::new(),
+        tenant_id: "default".to_string(),
+        name: "stale-null-heartbeat".to_string(),
+        status: WorkerStatus::Draining,
+        provider: "test".to_string(),
+        capabilities: vec![WorkerCapability::ProvisionSandbox],
+        max_concurrent_jobs: 1,
+        labels: BTreeMap::new(),
+        resource_envelope: None,
+        registered_at: now - chrono::Duration::seconds(120),
+        last_heartbeat_at: None,
+    };
+    insert_worker(
+        &db,
+        &stale,
+        &hash_worker_token(&format!("test-token-{}", stale.id)),
+    )
+    .await
+    .expect("insert stale draining worker");
+
+    reconcile_worker_liveness(&db)
+        .await
+        .expect("reconcile liveness");
+
+    let fresh_status: String = sqlx::query_scalar("select status from workers where id = ?")
+        .bind(fresh.id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read fresh status");
+    let stale_status: String = sqlx::query_scalar("select status from workers where id = ?")
+        .bind(stale.id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read stale status");
+    assert_eq!(
+        fresh_status, "draining",
+        "recent re-register during drain must keep draining until the 90s grace elapses"
+    );
+    assert_eq!(
+        stale_status, "offline",
+        "a draining worker with no heartbeat past the 90s window must go offline"
+    );
+}
+
+#[tokio::test]
 async fn cleanup_archived_sandboxes_never_deletes_a_sandbox_with_a_live_restore_reference() {
     // `cleanup_archived_sandboxes`'s authoritative reference check now runs
     // on the same connection as the delete, immediately before it, instead

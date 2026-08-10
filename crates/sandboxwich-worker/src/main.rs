@@ -2015,6 +2015,17 @@ fn validate_worker_drain_receipt(
         .collect())
 }
 
+fn revoke_uncaptured_resident_authority(
+    resident_authority: Vec<(sandboxwich_core::LeaseId, LeaseCancellation)>,
+    captured_lease_ids: &std::collections::HashSet<sandboxwich_core::LeaseId>,
+) {
+    for (lease_id, cancellation) in resident_authority {
+        if !captured_lease_ids.contains(&lease_id) {
+            cancellation.cancel(LeaseCancellationReason::LeaseLost);
+        }
+    }
+}
+
 /// Maximum number of attempts (including the first) for a single bounded retry
 /// around a control-plane API call.
 const API_RETRY_ATTEMPTS: u32 = 5;
@@ -3110,11 +3121,7 @@ async fn work_loop(client: &reqwest::Client, api: &str, args: WorkLoopArgs) -> a
             }
         };
         if let Some(captured_lease_ids) = captured_lease_ids.as_ref() {
-            for (lease_id, cancellation) in resident_authority {
-                if !captured_lease_ids.contains(&lease_id) {
-                    cancellation.cancel(LeaseCancellationReason::LeaseLost);
-                }
-            }
+            revoke_uncaptured_resident_authority(resident_authority, captured_lease_ids);
         }
     };
     let resident_cancellations = resident_tasks_by_id
