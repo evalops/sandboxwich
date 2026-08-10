@@ -492,7 +492,7 @@ fn agent_sandbox_launch_script(
         validate_shell_path(value, field)?;
     }
     Ok(format!(
-        "set -eu; umask 077; d={state_dir}; mkdir -p \"$d\"; rm -f \"$d/pid\" \"$d/exit\" \"$d/status\"; (set +e; if ! command -v setsid >/dev/null 2>&1; then printf '%s' 127 >\"{exit_file}\"; exit 0; fi; setsid --wait sh -c 'pid_file=$1; shift; if test -r \"/proc/$$/stat\"; then IFS=\" \" read -r _ _ _ _ pgid _ < \"/proc/$$/stat\"; else pgid=$$; fi; test -n \"$pgid\" || exit 127; printf %s \"$pgid\" >\"$pid_file\"; exec \"$@\"' sandboxwich-agent-process \"{pid_file}\" \"$@\" >\"{log_file}\" 2>&1; rc=$?; printf '%s' \"$rc\" >\"{exit_file}\") & printf '%s' running >\"$d/status\""
+        "set -eu; umask 077; d={state_dir}; mkdir -p \"$d\"; rm -f \"$d/pid\" \"$d/session\" \"$d/exit\" \"$d/status\"; (set +e; if ! command -v setsid >/dev/null 2>&1; then printf '%s' 127 >\"{exit_file}\"; exit 0; fi; setsid --wait sh -c 'state_dir=$1; pid_file=$2; shift 2; if test -r \"/proc/$$/stat\"; then IFS=\" \" read -r _ _ _ _ pgid session _ < \"/proc/$$/stat\"; else pgid=$$; session=$$; fi; test -n \"$pgid\" && test -n \"$session\" || exit 127; printf %s \"$pgid\" >\"$pid_file\"; printf %s \"$session\" >\"$state_dir/session\"; exec \"$@\"' sandboxwich-agent-process \"{state_dir}\" \"{pid_file}\" \"$@\" >\"{log_file}\" 2>&1; rc=$?; printf '%s' \"$rc\" >\"{exit_file}\") & printf '%s' running >\"$d/status\""
     ))
 }
 
@@ -9220,6 +9220,7 @@ impl SandboxProvider for KubernetesApplyProvider {
             validate_shell_identifier(&fence, "resident fence")?;
             let state_dir = format!("/run/sandboxwich/residents/{fence}");
             let pid_file = format!("{state_dir}/pid");
+            let session_file = format!("{state_dir}/session");
             let exit_file = format!("{state_dir}/exit");
             let log_file = format!("{state_dir}/stdout-stderr.log");
             let launch_script =
@@ -9275,7 +9276,7 @@ impl SandboxProvider for KubernetesApplyProvider {
                             "sh".into(),
                             "-lc".into(),
                             format!(
-                                "if test -r '{pid_file}'; then p=\"$(cat '{pid_file}')\"; kill -TERM -- -\"$p\" 2>/dev/null || true; kill \"$p\" 2>/dev/null || true; for i in $(seq 1 40); do test -r '{exit_file}' && exit 0; sleep 0.05; done; kill -KILL -- -\"$p\" 2>/dev/null || true; kill -KILL \"$p\" 2>/dev/null || true; fi"
+                                "if test -r '{session_file}'; then s=\"$(cat '{session_file}')\"; signal_session() {{ sig=\"$1\"; for proc in /proc/[0-9]*; do test -r \"$proc/stat\" || continue; IFS=\" \" read -r _ _ _ _ member_pgid member_session _ < \"$proc/stat\" 2>/dev/null || continue; test \"$member_session\" = \"$s\" || continue; proc_pid=\"$(basename \"$proc\")\"; kill -$sig \"$proc_pid\" 2>/dev/null || true; done; }}; signal_session TERM; for i in $(seq 1 40); do test -r '{exit_file}' && exit 0; sleep 0.05; done; signal_session KILL; for i in $(seq 1 40); do test -r '{exit_file}' && exit 0; sleep 0.05; done; elif test -r '{pid_file}'; then p=\"$(cat '{pid_file}')\"; kill -KILL -- -\"$p\" 2>/dev/null || true; fi"
                             ),
                         ],
                         cwd: None,

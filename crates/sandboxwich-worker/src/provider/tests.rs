@@ -7926,6 +7926,7 @@ fn agent_sandbox_process_group_cancellation_kills_child_workload() {
     let root = tempfile::tempdir().expect("tempdir");
     let state_dir = root.path().join("resident");
     let pid_file = state_dir.join("pid");
+    let session_file = state_dir.join("session");
     let exit_file = state_dir.join("exit");
     let log_file = state_dir.join("log");
     let child_file = state_dir.join("child");
@@ -7957,17 +7958,35 @@ fn agent_sandbox_process_group_cancellation_kills_child_workload() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let group_id = std::fs::read_to_string(&pid_file).unwrap();
+    let session_id = std::fs::read_to_string(&session_file).unwrap();
     let child_id = std::fs::read_to_string(&child_file).unwrap();
     assert!(group_id.trim().parse::<u32>().is_ok());
+    assert!(session_id.trim().parse::<u32>().is_ok());
     assert_ne!(
         group_id.trim(),
         child_id.trim(),
-        "the durable cancellation identity must be the PGID, not the workload PID"
+        "PGID must not be the workload PID"
+    );
+    let child_stat = std::fs::read_to_string(format!("/proc/{}/stat", child_id.trim()))
+        .expect("read child process stat");
+    let child_fields: Vec<_> = child_stat.split_whitespace().collect();
+    assert_eq!(
+        child_fields.get(4).copied(),
+        Some(group_id.trim()),
+        "child PGID must match recorded PGID"
+    );
+    assert_eq!(
+        child_fields.get(5).copied(),
+        Some(session_id.trim()),
+        "child SID must match recorded session"
     );
     std::process::Command::new("sh")
         .args([
             "-lc",
-            &format!("kill -TERM -- -{} 2>/dev/null || true", group_id),
+            &format!(
+                "s={}; for proc in /proc/[0-9]*; do test -r \"$proc/stat\" || continue; IFS=\" \" read -r _ _ _ _ member_pgid member_session _ < \"$proc/stat\" 2>/dev/null || continue; test \"$member_session\" = \"$s\" || continue; kill -TERM \"$(basename \"$proc\")\" 2>/dev/null || true; done",
+                session_id.trim()
+            ),
         ])
         .status()
         .expect("kill process group");
