@@ -220,6 +220,10 @@ pub(crate) struct PlacementCacheEntry {
     pub sandbox: Sandbox,
     pub secret_mounts: Vec<SandboxSecretMount>,
     pub expected_provision_spec: serde_json::Value,
+    /// The server-owned provider selected for an already-placed sandbox.
+    /// `None` is intentional for a pre-placement provision job, where the
+    /// request's explicit preference remains authoritative until placement.
+    pub provider_preference: Option<ProviderPreference>,
     pub provider_external_id: Option<String>,
     pub provider_routing_scope: Option<String>,
     pub sterile_pool_candidate: Option<SterilePoolCandidateV1>,
@@ -275,13 +279,17 @@ fn apply_sandbox_placement(job: &mut Job, entry: &PlacementCacheEntry) -> Result
         return Ok(false);
     }
     job.required_execution_class = entry.sandbox.execution_class.clone();
-    let provider_preference = job
+    let requested_provider_preference = job
         .payload
         .get("provisionSpec")
         .cloned()
         .and_then(|value| serde_json::from_value::<SandboxProvisionSpec>(value).ok())
         .map(|spec| spec.provider_preference)
         .unwrap_or_default();
+    let provider_preference = entry
+        .provider_preference
+        .clone()
+        .unwrap_or(requested_provider_preference);
     add_provision_spec_to_payload_with_identity(
         job,
         &entry.sandbox,
@@ -336,7 +344,9 @@ pub(crate) fn placement_matches_sandbox(job: &Job, entry: &PlacementCacheEntry) 
     else {
         return false;
     };
-    expected.provider_preference = actual.provider_preference.clone();
+    if entry.provider_preference.is_none() {
+        expected.provider_preference = actual.provider_preference.clone();
+    }
     let Ok(actual) = serde_json::to_value(actual) else {
         return false;
     };
@@ -359,6 +369,7 @@ pub(crate) fn placement_matches_sandbox_parts(
             sandbox: sandbox.clone(),
             secret_mounts: secret_mounts.to_vec(),
             expected_provision_spec: expected,
+            provider_preference: None,
             provider_external_id: None,
             provider_routing_scope: None,
             sterile_pool_candidate: None,
@@ -407,6 +418,27 @@ async fn load_sandbox_placement_inputs(
     let provider_routing_scope = identity
         .as_ref()
         .and_then(|row| row.try_get("namespace").ok());
+    let placement_sql = format!(
+        "select provider from sandbox_placements where sandbox_id = {} order by updated_at desc limit 1",
+        db.placeholder(1)
+    );
+    let placement_provider = sqlx::query(&placement_sql)
+        .bind(sandbox_id.to_string())
+        .fetch_optional(db.read_pool())
+        .await?
+        .map(|row| row.try_get::<String, _>("provider"))
+        .transpose()?;
+    let provider_preference = placement_provider
+        .as_deref()
+        .map(|provider| match provider.to_ascii_lowercase().as_str() {
+            "agent_sandbox" => Ok(ProviderPreference::AgentSandbox),
+            "cloudflare" => Ok(ProviderPreference::Cloudflare),
+            "kubernetes" => Ok(ProviderPreference::Kubernetes),
+            other => Err(ApiError::internal(format!(
+                "unsupported persisted sandbox placement provider: {other}"
+            ))),
+        })
+        .transpose()?;
     let pool_sql = format!(
         "select release_set_id, runtime_class, policy_digest, release_signature,
                 candidate_agent_image, candidate_maestro_image, candidate_service_name
@@ -447,13 +479,14 @@ async fn load_sandbox_placement_inputs(
         tenant_id: Some(sandbox.tenant_id.clone()),
         provider_external_id: provider_external_id.clone(),
         provider_routing_scope: provider_routing_scope.clone(),
+        provider_preference: provider_preference.clone().unwrap_or_default(),
         sterile_pool_candidate: sterile_pool_candidate.clone(),
-        ..SandboxProvisionSpec::default()
     })?;
     let entry = PlacementCacheEntry {
         sandbox,
         secret_mounts,
         expected_provision_spec,
+        provider_preference,
         provider_external_id,
         provider_routing_scope,
         sterile_pool_candidate,
@@ -1611,6 +1644,7 @@ mod placement_match_tests {
             expected_provision_spec: expected_provision_spec_value(sandbox, &[]).unwrap(),
             sandbox: sandbox.clone(),
             secret_mounts: vec![],
+            provider_preference: None,
             provider_external_id: None,
             provider_routing_scope: None,
             sterile_pool_candidate: None,
@@ -1682,6 +1716,24 @@ mod placement_match_tests {
         job.payload["provisionSpec"]["provider_preference"] = json!("cloudflare");
         let entry = entry_for(&sandbox);
 
+        assert!(placement_matches_sandbox(&job, &entry));
+    }
+
+    #[test]
+    fn applied_placement_provider_overrides_command_default_any() {
+        let sandbox = sample_sandbox();
+        let mut job = base_job(&sandbox);
+        job.payload["provisionSpec"]["provider_preference"] = json!("any");
+        let mut entry = entry_for(&sandbox);
+        entry.provider_preference = Some(ProviderPreference::AgentSandbox);
+        entry.expected_provision_spec["provider_preference"] = json!("agent_sandbox");
+
+        assert!(!placement_matches_sandbox(&job, &entry));
+        assert!(apply_sandbox_placement(&mut job, &entry).unwrap());
+        assert_eq!(
+            job.payload["provisionSpec"]["provider_preference"],
+            json!("agent_sandbox")
+        );
         assert!(placement_matches_sandbox(&job, &entry));
     }
 }
