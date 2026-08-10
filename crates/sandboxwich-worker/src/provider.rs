@@ -492,7 +492,7 @@ fn agent_sandbox_launch_script(
         validate_shell_path(value, field)?;
     }
     Ok(format!(
-        "set -eu; umask 077; d={state_dir}; mkdir -p \"$d\"; rm -f \"$d/pid\" \"$d/exit\" \"$d/status\"; (set +e; if ! command -v setsid >/dev/null 2>&1; then printf '%s' 127 >\"{exit_file}\"; exit 0; fi; setsid --wait sh -c 'pid_file=$1; shift; printf %s \"$$\" >\"$pid_file\"; exec \"$@\"' sandboxwich-agent-process \"{pid_file}\" \"$@\" >\"{log_file}\" 2>&1; rc=$?; printf '%s' \"$rc\" >\"{exit_file}\") & printf '%s' running >\"$d/status\""
+        "set -eu; umask 077; d={state_dir}; mkdir -p \"$d\"; rm -f \"$d/pid\" \"$d/exit\" \"$d/status\"; (set +e; if ! command -v setsid >/dev/null 2>&1; then printf '%s' 127 >\"{exit_file}\"; exit 0; fi; setsid --wait sh -c 'pid_file=$1; shift; if test -r \"/proc/$$/stat\"; then IFS=\" \" read -r _ _ _ _ pgid _ < \"/proc/$$/stat\"; else pgid=$$; fi; test -n \"$pgid\" || exit 127; printf %s \"$pgid\" >\"$pid_file\"; exec \"$@\"' sandboxwich-agent-process \"{pid_file}\" \"$@\" >\"{log_file}\" 2>&1; rc=$?; printf '%s' \"$rc\" >\"{exit_file}\") & printf '%s' running >\"$d/status\""
     ))
 }
 

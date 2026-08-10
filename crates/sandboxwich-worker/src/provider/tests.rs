@@ -7958,6 +7958,12 @@ fn agent_sandbox_process_group_cancellation_kills_child_workload() {
     }
     let group_id = std::fs::read_to_string(&pid_file).unwrap();
     let child_id = std::fs::read_to_string(&child_file).unwrap();
+    assert!(group_id.trim().parse::<u32>().is_ok());
+    assert_ne!(
+        group_id.trim(),
+        child_id.trim(),
+        "the durable cancellation identity must be the PGID, not the workload PID"
+    );
     std::process::Command::new("sh")
         .args([
             "-lc",
