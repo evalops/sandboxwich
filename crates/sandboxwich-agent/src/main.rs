@@ -784,15 +784,8 @@ fn validate_agent_sandbox_bindings(
             bail!("agent_sandbox_activation_{name}_mismatch");
         }
     }
-    if bundle.nonce.len() > 128
-        || bundle.nonce.is_empty()
-        || !bundle
-            .nonce
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-    {
-        bail!("agent_sandbox_activation_nonce_invalid");
-    }
+    Uuid::parse_str(&bundle.nonce)
+        .map_err(|_| anyhow::anyhow!("agent_sandbox_activation_nonce_invalid"))?;
     Ok(())
 }
 
@@ -5698,7 +5691,7 @@ mod tests {
             bootstrap_digest: "sha256:bootstrap".into(),
             policy_digest: "sha256:policy".into(),
             expires_at: Utc::now() + chrono::Duration::minutes(1),
-            nonce: "nonce-1".into(),
+            nonce: "00000000-0000-4000-8000-000000000001".into(),
             signature: "sig".into(),
         }
     }
@@ -5790,5 +5783,39 @@ mod tests {
                 .to_string(),
             "agent_sandbox_activation_nonce_invalid"
         );
+        for nonce in [".", ".."] {
+            let mut dot_nonce = unsafe_nonce.clone();
+            dot_nonce.nonce = nonce.into();
+            let expected = [
+                ("claim_uid", Some("claim"), dot_nonce.claim_uid.as_str()),
+                (
+                    "sandbox_uid",
+                    Some("sandbox"),
+                    dot_nonce.sandbox_uid.as_str(),
+                ),
+                ("pod_uid", Some("pod"), dot_nonce.pod_uid.as_str()),
+                (
+                    "image_digest",
+                    Some("sha256:image"),
+                    dot_nonce.image_digest.as_str(),
+                ),
+                (
+                    "bootstrap_digest",
+                    Some("sha256:bootstrap"),
+                    dot_nonce.bootstrap_digest.as_str(),
+                ),
+                (
+                    "policy_digest",
+                    Some("sha256:policy"),
+                    dot_nonce.policy_digest.as_str(),
+                ),
+            ];
+            assert_eq!(
+                validate_agent_sandbox_bindings(&dot_nonce, expected)
+                    .unwrap_err()
+                    .to_string(),
+                "agent_sandbox_activation_nonce_invalid"
+            );
+        }
     }
 }

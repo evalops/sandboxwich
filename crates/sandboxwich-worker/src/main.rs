@@ -784,7 +784,7 @@ impl SandboxProvider for RuntimeProvider {
                 }
                 match provider.provision(sandbox_id, spec, cancelled) {
                     Ok(handle) => Ok(handle),
-                    Err(error) if !rollback => {
+                    Err(error) => {
                         tracing::warn!(sandbox_id = %sandbox_id, %error, "agent_sandbox_fallback_to_kubernetes");
                         let mut fallback_spec = spec.clone();
                         fallback_spec.provider_preference =
@@ -802,7 +802,6 @@ impl SandboxProvider for RuntimeProvider {
                         }
                         Ok(handle)
                     }
-                    Err(error) => Err(error),
                 }
             }
             Self::Apply(provider) => provider.provision(sandbox_id, spec, cancelled),

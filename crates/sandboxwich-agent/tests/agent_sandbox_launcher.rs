@@ -18,7 +18,7 @@ fn preclaim_pid1_waits_for_activation_then_reports_pod_bound_ready() {
         bootstrap_digest: "sha256:bootstrap".into(),
         policy_digest: "sha256:policy".into(),
         expires_at: Utc::now() + ChronoDuration::minutes(1),
-        nonce: "nonce".into(),
+        nonce: "00000000-0000-4000-8000-000000000001".into(),
         signature: "verified-before-pid1".into(),
     };
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_sandboxwich-agent"))

@@ -2450,6 +2450,8 @@
       "RuntimeResourceKind": {
         "enum": [
           "pod",
+          "sandbox_claim",
+          "sandbox",
           "persistent_volume_claim",
           "service",
           "secret",

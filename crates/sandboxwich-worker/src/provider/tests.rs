@@ -4965,6 +4965,59 @@ fn agent_sandbox_named_kubectl_commands_do_not_use_manifest_stdin() {
         .map(str::to_string)
         .collect::<Vec<_>>()
     );
+    assert!(
+        apply
+            .kubectl_args_for_activation(
+                "pod-1",
+                "claim'breakout",
+                "sandbox-1",
+                "pod-1",
+                "image@sha256:abc",
+                "sha256:bootstrap",
+                "sha256:policy",
+                "agent-sandbox-activate",
+            )
+            .is_err()
+    );
+    let activation_args = apply
+        .kubectl_args_for_activation(
+            "pod-1",
+            "claim-1",
+            "sandbox-1",
+            "pod-uid-1",
+            "image@sha256:abc",
+            "sha256:bootstrap",
+            "sha256:policy",
+            "agent-sandbox-activate",
+        )
+        .unwrap();
+    assert!(
+        activation_args[activation_args.len() - 9]
+            .contains("SANDBOXWICH_AGENT_SANDBOX_EXPECTED_POLICY_DIGEST=\"$6\"")
+    );
+    assert_eq!(
+        &activation_args[activation_args.len() - 7..],
+        [
+            "claim-1",
+            "sandbox-1",
+            "pod-uid-1",
+            "image@sha256:abc",
+            "sha256:bootstrap",
+            "sha256:policy",
+            "agent-sandbox-activate",
+        ]
+        .map(str::to_string)
+        .as_slice()
+    );
+    assert!(
+        super::agent_sandbox_launch_script(
+            "/run/sandboxwich/residents/ok",
+            "/run/sandboxwich/residents/ok/pid'breakout",
+            "/run/sandboxwich/residents/ok/exit",
+            "/run/sandboxwich/residents/ok/log",
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -7783,7 +7836,8 @@ fn agent_sandbox_detached_launch_preserves_nonzero_exit_code() {
         pid_file.to_str().unwrap(),
         exit_file.to_str().unwrap(),
         log_file.to_str().unwrap(),
-    );
+    )
+    .unwrap();
     std::process::Command::new("/bin/sh")
         .env("PATH", format!("{}:/bin:/usr/bin", bin.display()))
         .args([
@@ -7827,7 +7881,8 @@ fn agent_sandbox_process_group_cancellation_kills_child_workload() {
         pid_file.to_str().unwrap(),
         exit_file.to_str().unwrap(),
         log_file.to_str().unwrap(),
-    );
+    )
+    .unwrap();
     std::process::Command::new("sh")
         .args([
             "-lc",
@@ -7899,7 +7954,8 @@ fn agent_sandbox_launch_fails_closed_without_setsid() {
         pid_file.to_str().unwrap(),
         exit_file.to_str().unwrap(),
         log_file.to_str().unwrap(),
-    );
+    )
+    .unwrap();
     std::process::Command::new("/bin/sh")
         .env("PATH", &bin)
         .args([

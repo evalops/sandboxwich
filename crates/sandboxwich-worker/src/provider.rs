@@ -482,10 +482,18 @@ fn agent_sandbox_launch_script(
     pid_file: &str,
     exit_file: &str,
     log_file: &str,
-) -> String {
-    format!(
+) -> anyhow::Result<String> {
+    for (field, value) in [
+        ("state_dir", state_dir),
+        ("pid_file", pid_file),
+        ("exit_file", exit_file),
+        ("log_file", log_file),
+    ] {
+        validate_shell_path(value, field)?;
+    }
+    Ok(format!(
         "set -eu; umask 077; d={state_dir}; mkdir -p \"$d\"; rm -f \"$d/pid\" \"$d/exit\" \"$d/status\"; (set +e; if ! command -v setsid >/dev/null 2>&1; then printf '%s' 127 >\"{exit_file}\"; exit 0; fi; setsid \"$@\" >\"{log_file}\" 2>&1 & child=$!; printf '%s' \"$child\" >\"{pid_file}\"; wait \"$child\"; rc=$?; printf '%s' \"$rc\" >\"{exit_file}\") & printf '%s' running >\"$d/status\""
-    )
+    ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4341,6 +4349,33 @@ fn stage_update(
     }
 }
 
+fn validate_shell_identifier(value: &str, field: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !value.is_empty()
+            && value != "."
+            && value != ".."
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
+        "unsafe Agent Sandbox {field} identifier"
+    );
+    Ok(())
+}
+
+fn validate_shell_path(value: &str, field: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        value.starts_with('/')
+            && !value.contains('\'')
+            && !value.contains('\n')
+            && !value
+                .split('/')
+                .skip(1)
+                .any(|component| component.is_empty() || component == "." || component == ".."),
+        "unsafe Agent Sandbox {field} path"
+    );
+    Ok(())
+}
+
 impl KubernetesApplyProvider {
     pub fn new(dry_run: KubernetesDryRunProvider, kubectl: impl Into<String>) -> Self {
         let kubectl_context = Some(dry_run.cluster.clone());
@@ -4642,6 +4677,15 @@ impl KubernetesApplyProvider {
             .pointer("/metadata/uid")
             .and_then(Value::as_str)
             .context("Agent Sandbox UID missing")?;
+        for (field, value) in [
+            ("claim_uid", claim_uid),
+            ("sandbox_uid", sandbox_uid),
+            ("pod_uid", pod_uid.as_str()),
+            ("pod_name", pod_name.as_str()),
+            ("sandbox_name", sandbox_name.as_str()),
+        ] {
+            validate_shell_identifier(value, field)?;
+        }
         let mut activation = sandboxwich_core::AgentSandboxActivationV1 {
             version: sandboxwich_core::AgentSandboxActivationV1::VERSION,
             claim_uid: claim_uid.to_string(),
@@ -4670,8 +4714,12 @@ impl KubernetesApplyProvider {
                 &pod_name,
                 claim_uid,
                 sandbox_uid,
+                &pod_uid,
+                &activation.image_digest,
+                &activation.bootstrap_digest,
+                &activation.policy_digest,
                 "agent-sandbox-activate",
-            ),
+            )?,
             Some(&activation_json),
             "activate Agent Sandbox",
             self.kubectl_command_timeout,
@@ -6284,8 +6332,26 @@ impl KubernetesApplyProvider {
         pod_name: &str,
         claim_uid: &str,
         sandbox_uid: &str,
+        pod_uid: &str,
+        image_digest: &str,
+        bootstrap_digest: &str,
+        policy_digest: &str,
         command: &str,
-    ) -> Vec<String> {
+    ) -> anyhow::Result<Vec<String>> {
+        validate_shell_identifier(claim_uid, "claim_uid")?;
+        validate_shell_identifier(sandbox_uid, "sandbox_uid")?;
+        validate_shell_identifier(command, "activation_command")?;
+        for (field, value) in [
+            ("pod_uid", pod_uid),
+            ("image_digest", image_digest),
+            ("bootstrap_digest", bootstrap_digest),
+            ("policy_digest", policy_digest),
+        ] {
+            anyhow::ensure!(
+                !value.is_empty() && !value.contains('\0'),
+                "unsafe Agent Sandbox {field} value"
+            );
+        }
         let mut args = self.kubectl_base_args();
         args.push("exec".to_string());
         args.extend([
@@ -6293,11 +6359,17 @@ impl KubernetesApplyProvider {
             "--".to_string(),
             "/bin/sh".to_string(),
             "-c".to_string(),
-            format!(
-                "umask 077; cat > /run/sandboxwich/activation.json; SANDBOXWICH_AGENT_SANDBOX_EXPECTED_CLAIM_UID='{claim_uid}' SANDBOXWICH_AGENT_SANDBOX_EXPECTED_SANDBOX_UID='{sandbox_uid}' /usr/local/bin/sandboxwich-agent {command} --bundle /run/sandboxwich/activation.json --public-key \"$SANDBOXWICH_AGENT_SANDBOX_PUBLIC_KEY_FILE\""
-            ),
+            "umask 077; cat > /run/sandboxwich/activation.json; exec env SANDBOXWICH_AGENT_SANDBOX_EXPECTED_CLAIM_UID=\"$1\" SANDBOXWICH_AGENT_SANDBOX_EXPECTED_SANDBOX_UID=\"$2\" SANDBOXWICH_AGENT_SANDBOX_EXPECTED_POD_UID=\"$3\" SANDBOXWICH_AGENT_SANDBOX_EXPECTED_IMAGE_DIGEST=\"$4\" SANDBOXWICH_AGENT_SANDBOX_EXPECTED_BOOTSTRAP_DIGEST=\"$5\" SANDBOXWICH_AGENT_SANDBOX_EXPECTED_POLICY_DIGEST=\"$6\" /usr/local/bin/sandboxwich-agent \"$7\" --bundle /run/sandboxwich/activation.json --public-key \"$SANDBOXWICH_AGENT_SANDBOX_PUBLIC_KEY_FILE\"".to_string(),
+            "--".to_string(),
+            claim_uid.to_string(),
+            sandbox_uid.to_string(),
+            pod_uid.to_string(),
+            image_digest.to_string(),
+            bootstrap_digest.to_string(),
+            policy_digest.to_string(),
+            command.to_string(),
         ]);
-        args
+        Ok(args)
     }
 
     fn kubectl_delete_args(&self) -> Vec<String> {
@@ -9065,6 +9137,7 @@ impl SandboxProvider for KubernetesApplyProvider {
                 ..SandboxProvisionSpec::default()
             };
             if let Some(bootstrap) = spec.bootstrap.as_ref() {
+                validate_shell_path(&bootstrap.target_file, "bootstrap target")?;
                 let bootstrap_request = AgentCommandRequest {
                     argv: vec![
                         "sh".into(),
@@ -9087,12 +9160,13 @@ impl SandboxProvider for KubernetesApplyProvider {
                 )?;
             }
             let fence = isolated_resident_process_fence_suffix(spec);
+            validate_shell_identifier(&fence, "resident fence")?;
             let state_dir = format!("/run/sandboxwich/residents/{fence}");
             let pid_file = format!("{state_dir}/pid");
             let exit_file = format!("{state_dir}/exit");
             let log_file = format!("{state_dir}/stdout-stderr.log");
             let launch_script =
-                agent_sandbox_launch_script(&state_dir, &pid_file, &exit_file, &log_file);
+                agent_sandbox_launch_script(&state_dir, &pid_file, &exit_file, &log_file)?;
             let mut launch_argv = vec![
                 "sh".to_string(),
                 "-lc".to_string(),
