@@ -3348,8 +3348,7 @@ fn apply_fork_refuses_poison_volume_snapshot_with_status_error() {
         )
         .expect_err("fork must refuse poison snapshots");
     assert!(
-        error.to_string().contains("snapshot_poison")
-            || error.to_string().contains("status.error"),
+        error.to_string().contains("snapshot_poison") || error.to_string().contains("status.error"),
         "expected poison refusal, got: {error}"
     );
     let _ = std::fs::remove_dir_all(dir);
