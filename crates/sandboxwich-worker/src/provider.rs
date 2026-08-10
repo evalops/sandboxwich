@@ -6537,6 +6537,7 @@ impl KubernetesApplyProvider {
         args.push("exec".to_string());
         args.extend([
             pod_name.to_string(),
+            "-i".to_string(),
             "--".to_string(),
             "/bin/sh".to_string(),
             "-c".to_string(),
