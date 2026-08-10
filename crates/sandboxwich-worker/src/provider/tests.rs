@@ -28,6 +28,24 @@ fn sterile_maestro_candidate(sandbox_id: SandboxId) -> SterilePoolCandidateV1 {
 }
 
 #[test]
+fn agent_sandbox_claim_status_accepts_managed_name_shape_and_lowercase_compatibility() {
+    let managed = serde_json::json!({"status": {"sandbox": {"Name": "sandbox-managed"}}});
+    let lowercase = serde_json::json!({"status": {"sandbox": {"name": "sandbox-lower"}}});
+    assert_eq!(
+        agent_sandbox_claim_sandbox_name(&managed),
+        Some("sandbox-managed")
+    );
+    assert_eq!(
+        agent_sandbox_claim_sandbox_name(&lowercase),
+        Some("sandbox-lower")
+    );
+    assert_eq!(
+        agent_sandbox_claim_sandbox_name(&serde_json::json!({"status": {}})),
+        None
+    );
+}
+
+#[test]
 fn compiler_cache_materialization_stages_then_restores_before_success() {
     let dir = std::env::temp_dir().join(format!(
         "sandboxwich-cache-materialize-kubectl-{}",

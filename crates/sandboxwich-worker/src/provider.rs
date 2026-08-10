@@ -4389,6 +4389,13 @@ fn validate_shell_path(value: &str, field: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn agent_sandbox_claim_sandbox_name(claim: &Value) -> Option<&str> {
+    claim
+        .pointer("/status/sandbox/name")
+        .or_else(|| claim.pointer("/status/sandbox/Name"))
+        .and_then(Value::as_str)
+}
+
 impl KubernetesApplyProvider {
     pub fn new(dry_run: KubernetesDryRunProvider, kubectl: impl Into<String>) -> Self {
         let kubectl_context = Some(dry_run.cluster.clone());
@@ -4727,10 +4734,7 @@ impl KubernetesApplyProvider {
             if output.success {
                 claim_json =
                     serde_json::from_str(&output.stdout).context("decode Agent Sandbox claim")?;
-                sandbox_name = claim_json
-                    .pointer("/status/sandbox/name")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
+                sandbox_name = agent_sandbox_claim_sandbox_name(&claim_json).map(str::to_owned);
                 if let Some(name) = sandbox_name.as_deref() {
                     let sandbox = run_kubectl_command(
                         &self.kubectl,
@@ -5070,10 +5074,8 @@ impl KubernetesApplyProvider {
             claim.stderr
         );
         let claim: Value = serde_json::from_str(&claim.stdout)?;
-        let sandbox_name = claim
-            .pointer("/status/sandbox/name")
-            .and_then(Value::as_str)
-            .context("Agent Sandbox claim is not bound")?;
+        let sandbox_name =
+            agent_sandbox_claim_sandbox_name(&claim).context("Agent Sandbox claim is not bound")?;
         let sandbox = run_kubectl_command(
             &self.kubectl,
             &self.kubectl_args_for_get_core("sandbox", sandbox_name),
