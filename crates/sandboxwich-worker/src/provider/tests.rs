@@ -2146,6 +2146,7 @@ case " $* " in
   *runtimeClassName*) printf '%s' '{observed}' ;;
   *" get volumesnapshot "*|*" get volumesnapshot/"*)
     case " $* " in
+      *boundVolumeSnapshotContentName*) printf 'true|snapcontent-test|local-path-snapshot|' ;;
       *readyToUse*) printf 'true' ;;
     esac
     ;;
