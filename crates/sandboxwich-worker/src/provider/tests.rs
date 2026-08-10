@@ -720,6 +720,71 @@ fn maestro_hosted_runner_mounts_the_authoritative_managed_home_claim() {
 }
 
 #[test]
+fn agent_sandbox_maestro_uses_only_verified_pod_owned_workspace_and_affinity() {
+    let image = format!("ghcr.io/evalops/maestro@sha256:{}", "a".repeat(64));
+    let sandbox_id = SandboxId::new();
+    let mut spec = maestro_hosted_runner_spec();
+    spec.sandbox_id = sandbox_id;
+    spec.workspace_claim_name = Some("agent-pod-sandboxwich-workspace".into());
+    let mut provider = KubernetesApplyProvider::new(
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Gvisor)
+            .with_runtime_class_name(Some("gvisor".into())),
+        "kubectl",
+    )
+    .with_maestro_hosted_runner_image(Some(image));
+    provider.agent_sandbox_resident_placement = Some(AgentSandboxPlacement {
+        pod_name: "agent-pod".into(),
+        pod_uid: "pod-uid".into(),
+        node_name: "node-a".into(),
+        workspace_pvc: "agent-pod-sandboxwich-workspace".into(),
+    });
+    let manifests = provider
+        .isolated_resident_process_manifests(&spec)
+        .expect("verified Agent Sandbox placement should render");
+    let pod = manifests
+        .iter()
+        .find(|manifest| manifest["kind"] == "Pod")
+        .unwrap();
+    assert_eq!(
+        pod["spec"]["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|volume| volume["name"] == "workspace")
+            .unwrap()["persistentVolumeClaim"]["claimName"],
+        "agent-pod-sandboxwich-workspace"
+    );
+    assert_eq!(
+        pod["spec"]["affinity"]["podAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"][0]
+            ["labelSelector"]["matchLabels"]["sandboxwich.dev/sandbox-id"],
+        sandbox_id.to_string()
+    );
+    assert_eq!(
+        pod["spec"]["affinity"]["podAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"][0]
+            ["topologyKey"],
+        "kubernetes.io/hostname"
+    );
+}
+
+#[test]
+fn ordinary_maestro_rejects_agent_sandbox_workspace_claim() {
+    let provider = KubernetesApplyProvider::new(
+        KubernetesDryRunProvider::with_snapshot_class("k3s-ci", "sandboxwich-ci", None, None)
+            .with_isolation_profile(IsolationProfile::Gvisor)
+            .with_runtime_class_name(Some("gvisor".into())),
+        "kubectl",
+    )
+    .with_maestro_hosted_runner_image(Some(format!(
+        "ghcr.io/evalops/maestro@sha256:{}",
+        "a".repeat(64)
+    )));
+    let mut spec = maestro_hosted_runner_spec();
+    spec.workspace_claim_name = Some("agent-pod-sandboxwich-workspace".into());
+    assert!(provider.isolated_resident_process_manifests(&spec).is_err());
+}
+
+#[test]
 fn maestro_hosted_runner_uses_only_projected_identity_in_an_isolated_pod() {
     let image = format!("ghcr.io/evalops/maestro@sha256:{}", "a".repeat(64));
     let provider = KubernetesApplyProvider::new(
