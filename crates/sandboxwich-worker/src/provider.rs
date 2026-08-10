@@ -9276,7 +9276,10 @@ impl SandboxProvider for KubernetesApplyProvider {
                             "sh".into(),
                             "-lc".into(),
                             format!(
-                                "if test -r '{session_file}'; then s=\"$(cat '{session_file}')\"; signal_session() {{ sig=\"$1\"; for proc in /proc/[0-9]*; do test -r \"$proc/stat\" || continue; IFS=\" \" read -r _ _ _ _ member_pgid member_session _ < \"$proc/stat\" 2>/dev/null || continue; test \"$member_session\" = \"$s\" || continue; proc_pid=\"$(basename \"$proc\")\"; kill -$sig \"$proc_pid\" 2>/dev/null || true; done; }}; signal_session TERM; for i in $(seq 1 40); do test -r '{exit_file}' && exit 0; sleep 0.05; done; signal_session KILL; for i in $(seq 1 40); do test -r '{exit_file}' && exit 0; sleep 0.05; done; elif test -r '{pid_file}'; then p=\"$(cat '{pid_file}')\"; kill -KILL -- -\"$p\" 2>/dev/null || true; fi"
+                                // Prefer session membership so grandchildren are cancelled even
+                                // when they leave the leader PGID. Fallback uses dash-compatible
+                                // process-group kill (`kill -SIGNAL -PGID`; no `--`).
+                                "if test -r '{session_file}'; then s=\"$(cat '{session_file}')\"; signal_session() {{ sig=\"$1\"; for proc in /proc/[0-9]*; do test -r \"$proc/stat\" || continue; IFS=\" \" read -r _ _ _ _ member_pgid member_session _ < \"$proc/stat\" 2>/dev/null || continue; test \"$member_session\" = \"$s\" || continue; proc_pid=\"$(basename \"$proc\")\"; kill -$sig \"$proc_pid\" 2>/dev/null || true; done; }}; signal_session TERM; for i in $(seq 1 40); do test -r '{exit_file}' && exit 0; sleep 0.05; done; signal_session KILL; for i in $(seq 1 40); do test -r '{exit_file}' && exit 0; sleep 0.05; done; elif test -r '{pid_file}'; then p=\"$(cat '{pid_file}')\"; kill -KILL -\"$p\" 2>/dev/null || true; kill -KILL \"$p\" 2>/dev/null || true; fi"
                             ),
                         ],
                         cwd: None,

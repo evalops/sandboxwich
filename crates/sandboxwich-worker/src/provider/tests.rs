@@ -7980,6 +7980,8 @@ fn agent_sandbox_process_group_cancellation_kills_child_workload() {
         Some(session_id.trim()),
         "child SID must match recorded session"
     );
+    // Cancel by recorded session membership (production kill path). Per-pid
+    // `kill -TERM` is dash-safe; `kill -TERM -- -PGID` is not.
     std::process::Command::new("sh")
         .args([
             "-lc",
