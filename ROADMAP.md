@@ -66,6 +66,8 @@ These capabilities remain Experimental until every gate below passes for a named
    RuntimeClass. What is missing is the cluster: no GitHub-hosted runner
    exposes `/dev/kvm`, so the gate is manual-dispatch-only against a
    self-hosted, Kata-capable disposable cluster and has never run green.
+   evalops/deploy's `scripts/sandboxwich-kata-conformance-cluster.sh` creates
+   that cluster on GKE and prints the dispatch.
    The class stays Experimental until it does; see docs/capabilities.md,
    "SW-3: what remains before `virtual_machine` can be certified".
 3. Add a microVM provider and compare its lifecycle and recovery behavior with RuntimeClass-backed Kubernetes.
