@@ -731,20 +731,43 @@ fn agent_sandbox_activate(args: AgentSandboxActivateArgs) -> anyhow::Result<()> 
         .write(true)
         .create_new(true)
         .open(&nonce_path);
-    if created.is_err() {
-        return Err(anyhow::anyhow!("agent_sandbox_activation_replay"));
+    match created {
+        Ok(file) => drop(file),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(anyhow::anyhow!("agent_sandbox_activation_replay"));
+        }
+        Err(error) => return Err(error).context("create Agent Sandbox activation nonce"),
     }
     // The warm pod's long-lived entrypoint is waiting on this bundle. Once
     // the signed one-shot has been consumed, that entrypoint execs the real
     // launcher in the claimed pod; activation itself returns promptly.
     let marker = Path::new("/run/sandboxwich/activation.ready");
-    let mut marker_file = std::fs::OpenOptions::new()
+    let marker_tmp = marker.with_extension("ready.tmp");
+    let mut marker_file = match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(marker)
-        .context("create one-shot Agent Sandbox activation marker")?;
-    marker_file.write_all(bundle.nonce.as_bytes())?;
-    marker_file.sync_all()?;
+        .open(&marker_tmp)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = std::fs::remove_file(&nonce_path);
+            return Err(error).context("stage one-shot Agent Sandbox activation marker");
+        }
+    };
+    if let Err(error) = marker_file
+        .write_all(bundle.nonce.as_bytes())
+        .and_then(|_| marker_file.sync_all())
+    {
+        let _ = std::fs::remove_file(&marker_tmp);
+        let _ = std::fs::remove_file(&nonce_path);
+        return Err(error).context("write one-shot Agent Sandbox activation marker");
+    }
+    drop(marker_file);
+    if let Err(error) = std::fs::rename(&marker_tmp, marker) {
+        let _ = std::fs::remove_file(&marker_tmp);
+        let _ = std::fs::remove_file(&nonce_path);
+        return Err(error).context("commit one-shot Agent Sandbox activation marker");
+    }
     println!("{}", serde_json::to_string(&bundle)?);
     Ok(())
 }

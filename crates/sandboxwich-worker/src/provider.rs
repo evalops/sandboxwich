@@ -4740,6 +4740,31 @@ impl KubernetesApplyProvider {
         Ok(self.agent_sandbox_pod_identity(sandbox_id, cancelled)?.0)
     }
 
+    fn agent_sandbox_claim_exists(
+        &self,
+        sandbox_id: SandboxId,
+        cancelled: &CancelSignal,
+    ) -> anyhow::Result<bool> {
+        let claim_name = format!("sandboxwich-agent-claim-{sandbox_id}");
+        let output = run_kubectl_command(
+            &self.kubectl,
+            &self.kubectl_args_for_get("sandboxclaim", &claim_name),
+            "check Agent Sandbox claim",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        if output.success {
+            return Ok(true);
+        }
+        if output.stderr.to_ascii_lowercase().contains("notfound")
+            || output.stderr.to_ascii_lowercase().contains("not found")
+        {
+            return Ok(false);
+        }
+        anyhow::bail!("Agent Sandbox claim lookup failed: {}", output.stderr)
+    }
+
     fn agent_sandbox_pod_identity(
         &self,
         sandbox_id: SandboxId,
@@ -8841,7 +8866,9 @@ impl SandboxProvider for KubernetesApplyProvider {
         cancelled: &CancelSignal,
     ) -> anyhow::Result<AgentCommandResult> {
         validate_agent_command_request(&request)?;
-        if spec.provider_preference == sandboxwich_core::ProviderPreference::AgentSandbox {
+        if spec.provider_preference == sandboxwich_core::ProviderPreference::AgentSandbox
+            && self.agent_sandbox_claim_exists(sandbox_id, cancelled)?
+        {
             let pod_name = self.agent_sandbox_pod_name(sandbox_id, cancelled)?;
             let started_at = Utc::now();
             let timeout = request
@@ -8920,7 +8947,7 @@ impl SandboxProvider for KubernetesApplyProvider {
         cancelled: &CancelSignal,
         observe: &mut dyn FnMut(IsolatedResidentProcessObservation) -> anyhow::Result<()>,
     ) -> anyhow::Result<IsolatedResidentProcessResult> {
-        if self.agent_sandbox_mode {
+        if self.agent_sandbox_mode && self.agent_sandbox_claim_exists(spec.sandbox_id, cancelled)? {
             // Agent Sandbox owns the execution pod. Do not call
             // isolated_resident_process_manifests here: that would create a
             // second ordinary resident Pod and silently bypass the claimed
@@ -9662,7 +9689,7 @@ impl SandboxProvider for KubernetesApplyProvider {
         spec: &SandboxTeardownSpec,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<()> {
-        if self.agent_sandbox_mode {
+        if self.agent_sandbox_mode && self.agent_sandbox_claim_exists(sandbox_id, cancelled)? {
             Self::validate_apply_gate(self.confirm_apply, self.mutation_enabled)?;
             let mut receipt = self.read_agent_custody_receipt(sandbox_id, cancelled)?;
             let claim_name = format!("sandboxwich-agent-claim-{sandbox_id}");
