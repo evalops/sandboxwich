@@ -863,6 +863,10 @@ pub(crate) async fn put_resident_process(
             // below; either key on its own fails closed.
             "MAESTRO_RENDEZVOUS_ACTIVATION_ID",
             "MAESTRO_RENDEZVOUS_NONCE",
+            // Public-only, rotation-capable verification material for the
+            // Platform-signed governed tool grant. The resident contract
+            // continues to reject every other ambient or prefix-matching key.
+            "MAESTRO_PLATFORM_TOOL_GRANT_ED25519_PUBLIC_KEYS",
         ];
         const MAX_ENV_VALUE_BYTES: usize = 512;
         let env_ok = request.env.iter().all(|(key, value)| {
