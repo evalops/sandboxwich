@@ -7,6 +7,8 @@ use sqlx::AnyPool;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+const TEST_MAESTRO_TOOL_GRANT_PUBLIC_KEYS: &str = r#"{"keys":{"governed-presentation-test":{"state":"active","public_key":"dGVzdC1wdWJsaWMta2V5"}}}"#;
+
 fn signed_sterile_release() -> SterileCellReleaseTrustClassV1 {
     let release_set_id = "resident-activation-release".to_string();
     let runtime_class = SterileCellRuntimeClass::KataMicrovm;
@@ -436,6 +438,10 @@ fn maestro_hosted_runner_request_for_organization(
             (
                 "MAESTRO_RENDEZVOUS_NONCE".into(),
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7_u8; 32]),
+            ),
+            (
+                "MAESTRO_PLATFORM_TOOL_GRANT_ED25519_PUBLIC_KEYS".into(),
+                TEST_MAESTRO_TOOL_GRANT_PUBLIC_KEYS.into(),
             ),
         ]),
         restart_policy: ResidentProcessRestartPolicy::OnFailure,
@@ -1396,6 +1402,24 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
         .unwrap();
     assert_eq!(unknown.status(), reqwest::StatusCode::BAD_REQUEST);
 
+    // A similarly named key must not acquire authority through a prefix
+    // match; only the exact reviewed public verifier binding is admitted.
+    let mut unknown_grant_env = request.clone();
+    unknown_grant_env.env.insert(
+        "MAESTRO_PLATFORM_TOOL_GRANT_ED25519_PUBLIC_KEYS_EXTRA".into(),
+        TEST_MAESTRO_TOOL_GRANT_PUBLIC_KEYS.into(),
+    );
+    let unknown_grant = client
+        .put(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url
+        ))
+        .json(&unknown_grant_env)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown_grant.status(), reqwest::StatusCode::BAD_REQUEST);
+
     // A tenant-scoped gateway bearer must stay in the fixed bootstrap file,
     // never in persisted resident environment state.
     let mut raw_token_env = request.clone();
@@ -1466,6 +1490,15 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
             .map(String::as_str),
         Some("1"),
         "Sandboxwich must inject its canonical placement generation"
+    );
+    assert_eq!(
+        created
+            .resident_process
+            .env
+            .get("MAESTRO_PLATFORM_TOOL_GRANT_ED25519_PUBLIC_KEYS")
+            .map(String::as_str),
+        Some(TEST_MAESTRO_TOOL_GRANT_PUBLIC_KEYS),
+        "the exact public verifier set must survive resident admission"
     );
     let mut connection_binding_url = format!(
         "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}/connection-binding",
