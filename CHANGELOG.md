@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.1.16 - 2026-08-11
+### Added
+
+- Route eligible ephemeral sessions through managed Agent Sandbox ([#353](https://github.com/evalops/sandboxwich/pull/353))
+
 ## 0.1.15 - 2026-08-09
 ### Added
 

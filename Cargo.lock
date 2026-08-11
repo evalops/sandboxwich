@@ -1818,9 +1818,9 @@ dependencies = [
 
 [[package]]
 name = "rcgen"
-version = "0.14.8"
+version = "0.14.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57f6d249aad744e274e682777a50283a225a32705394ee6d5fcc01efa25e4055"
+checksum = "091e7a8e7d86e6feb87a27ce8e2cba29d49eff9507afeebefab7eeb2ca667fb4"
 dependencies = [
  "pem",
  "ring",
@@ -2035,7 +2035,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "sandboxwich-agent"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "axum",
@@ -2064,7 +2064,7 @@ dependencies = [
 
 [[package]]
 name = "sandboxwich-api"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2098,7 +2098,7 @@ dependencies = [
 
 [[package]]
 name = "sandboxwich-bench"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2113,7 +2113,7 @@ dependencies = [
 
 [[package]]
 name = "sandboxwich-cli"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2128,7 +2128,7 @@ dependencies = [
 
 [[package]]
 name = "sandboxwich-core"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "base64",
  "chrono",
@@ -2143,7 +2143,7 @@ dependencies = [
 
 [[package]]
 name = "sandboxwich-worker"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "axum",
