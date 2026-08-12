@@ -4386,6 +4386,31 @@ fn validate_shell_identifier(value: &str, field: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn agent_sandbox_workspace_pvc_name(pod: &Value, pod_name: &str) -> anyhow::Result<String> {
+    let workspace_volume = pod
+        .pointer("/spec/volumes")
+        .and_then(Value::as_array)
+        .and_then(|volumes| {
+            volumes.iter().find(|volume| {
+                volume.get("name").and_then(Value::as_str) == Some("sandboxwich-workspace")
+            })
+        })
+        .context("Agent Sandbox claimed pod has no workspace volume")?;
+    let expected = format!("{pod_name}-sandboxwich-workspace");
+    let inline_ephemeral = workspace_volume
+        .pointer("/ephemeral/volumeClaimTemplate")
+        .is_some();
+    let materialized_claim = workspace_volume
+        .pointer("/persistentVolumeClaim/claimName")
+        .and_then(Value::as_str);
+    anyhow::ensure!(
+        (inline_ephemeral && materialized_claim.is_none())
+            || (!inline_ephemeral && materialized_claim == Some(expected.as_str())),
+        "Agent Sandbox workspace is not the canonical generic ephemeral PVC"
+    );
+    Ok(expected)
+}
+
 #[cfg(test)]
 fn validate_shell_path(value: &str, field: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -4608,28 +4633,7 @@ impl KubernetesApplyProvider {
         pod_uid: &str,
         cancelled: &CancelSignal,
     ) -> anyhow::Result<String> {
-        let workspace_volume = pod
-            .pointer("/spec/volumes")
-            .and_then(Value::as_array)
-            .and_then(|volumes| {
-                volumes.iter().find(|volume| {
-                    volume
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .is_some_and(|name| name == "sandboxwich-workspace")
-                        && volume.pointer("/ephemeral/volumeClaimTemplate").is_some()
-                })
-            })
-            .context("Agent Sandbox claimed pod has no generic ephemeral workspace volume")?;
-        anyhow::ensure!(
-            workspace_volume.pointer("/persistentVolumeClaim").is_none(),
-            "Agent Sandbox workspace must be provider-owned generic ephemeral PVC"
-        );
-        let volume_name = workspace_volume
-            .get("name")
-            .and_then(Value::as_str)
-            .context("Agent Sandbox workspace volume name missing")?;
-        let pvc_name = format!("{pod_name}-{volume_name}");
+        let pvc_name = agent_sandbox_workspace_pvc_name(pod, pod_name)?;
         let output = run_kubectl_command(
             &self.kubectl,
             &self.kubectl_args_for_get("persistentvolumeclaim", &pvc_name),
