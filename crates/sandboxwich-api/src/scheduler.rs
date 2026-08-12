@@ -64,6 +64,18 @@ pub(crate) fn spawn_expiry_sweeper(
             if let Err(error) = expire_due_snapshots(&db).await {
                 tracing::warn!(?error, "snapshot expiry sweep failed");
             }
+            match terminalize_queued_snapshot_jobs_for_archived_sandboxes(&db).await {
+                Ok(terminalized) if terminalized > 0 => {
+                    tracing::warn!(
+                        terminalized,
+                        "terminalized queued snapshot jobs for archived sandboxes"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(?error, "archived snapshot job cleanup failed");
+                }
+            }
             if let Err(error) = expire_due_desktop_sessions(&db).await {
                 tracing::warn!(?error, "desktop session expiry sweep failed");
             }

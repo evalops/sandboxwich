@@ -174,6 +174,248 @@ pub(crate) async fn legacy_snapshot_reads_and_expiry_survive_missing_placement_b
 }
 
 #[tokio::test]
+async fn queued_snapshot_operation_cancellation_fails_snapshot_atomically() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("cancel-snapshot.db").display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let client = server.client();
+    let sandbox: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
+            name: Some("cancel-snapshot".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            workspace_mode: Some(WorkspaceMode::Persistent),
+            runtime_profile: None,
+            provider_preference: None,
+            ttl_seconds: None,
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+            execution_class: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let snapshot: SnapshotResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/snapshots",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&CreateSnapshotRequest {
+            label: Some("cancel-me".to_string()),
+            inventory: None,
+            provider_metadata: None,
+            ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let operation_id = snapshot.operation.as_ref().unwrap().id;
+
+    let cancelled: OperationResponse = client
+        .post(format!(
+            "{}/operations/{}/cancel",
+            server.base_url, operation_id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cancelled.operation.status, OperationStatus::Cancelled);
+
+    let job: JobResponse = client
+        .get(format!("{}/jobs/{}", server.base_url, operation_id))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(job.job.status, JobStatus::Cancelled);
+    assert_eq!(job.job.last_error.as_deref(), Some("operation_cancelled"));
+
+    let failed: SnapshotResponse = client
+        .get(format!(
+            "{}/snapshots/{}",
+            server.base_url, snapshot.snapshot.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(failed.snapshot.status, SnapshotStatus::Failed);
+    assert_eq!(
+        failed.snapshot.error.as_deref(),
+        Some("snapshot operation cancelled")
+    );
+}
+
+#[tokio::test]
+async fn archived_sandbox_terminalizes_legacy_queued_snapshot_job() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("archived-snapshot-job.db").display()
+        ),
+        Some(data_dir),
+    )
+    .await;
+    let client = server.client();
+    let sandbox: SandboxResponse = client
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
+            name: Some("archived-snapshot-job".to_string()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            workspace_mode: Some(WorkspaceMode::Persistent),
+            runtime_profile: None,
+            provider_preference: None,
+            ttl_seconds: None,
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+            execution_class: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let snapshot: SnapshotResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/snapshots",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .json(&CreateSnapshotRequest {
+            label: Some("legacy-queued".to_string()),
+            inventory: None,
+            provider_metadata: None,
+            ttl_seconds: None,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let snapshot_job_id = snapshot.operation.as_ref().unwrap().id;
+
+    let stopped: SandboxResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/stop",
+            server.base_url, sandbox.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stopped.sandbox.state, SandboxState::Archiving);
+
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .connect(&server.database_url)
+        .await
+        .unwrap();
+    sqlx::query(
+        "update jobs
+         set status = 'queued', last_error = null, cancel_requested_at = null,
+             cancel_reason = null
+         where id = ?",
+    )
+    .bind(snapshot_job_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let cleanup: SnapshotCleanupResponse = client
+        .post(format!("{}/snapshots/cleanup", server.base_url))
+        .header(OPERATOR_TOKEN_HEADER, TEST_OPERATOR_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cleanup.cleanup_run.status, CleanupRunStatus::Succeeded);
+
+    let dead_job: JobResponse = client
+        .get(format!("{}/jobs/{}", server.base_url, snapshot_job_id))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(dead_job.job.status, JobStatus::Dead);
+    assert_eq!(
+        dead_job.job.last_error.as_deref(),
+        Some("snapshot source sandbox archived before claim")
+    );
+
+    let failed: SnapshotResponse = client
+        .get(format!(
+            "{}/snapshots/{}",
+            server.base_url, snapshot.snapshot.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(failed.snapshot.status, SnapshotStatus::Failed);
+    assert_eq!(
+        failed.snapshot.error.as_deref(),
+        Some("snapshot source sandbox archived before claim")
+    );
+}
+
+#[tokio::test]
 pub(crate) async fn apex_snapshot_claim_requires_exact_profile_and_runtime_image() {
     let data_dir = tempfile::tempdir().unwrap();
     let server = TestServer::start(

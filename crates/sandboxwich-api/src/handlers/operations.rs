@@ -1,10 +1,11 @@
 use crate::db::Database;
 use crate::error::ApiError;
 use crate::error::provider_error_fields;
-use crate::handlers::commands::command_id_from_job;
+use crate::handlers::commands::{command_id_from_job, insert_event_on_connection};
 use crate::handlers::files::delete_sandbox_file_if_present_on_connection;
 use crate::handlers::jobs::{fetch_job, file_id_from_job, job_references};
 use crate::handlers::sandboxes::sandbox_id_from_job;
+use crate::handlers::snapshots::{fail_pending_snapshot_on_connection, snapshot_id_from_job};
 use crate::rows::job_status_to_str;
 use crate::state::{AppState, TenantContext};
 use async_stream::stream;
@@ -119,23 +120,35 @@ pub(crate) async fn cancel_operation(
             "only queued operations can be cancelled",
         ));
     }
-    if !matches!(job.kind, JobKind::RunCommand | JobKind::MaterializeFile) {
+    if !matches!(
+        job.kind,
+        JobKind::RunCommand | JobKind::MaterializeFile | JobKind::CreateSnapshot
+    ) {
         return Err(ApiError::conflict_code(
             "operation_not_cancellable",
             "this operation cannot be cancelled safely",
         ));
     }
     let sql = format!(
-        "update jobs set status = {}, updated_at = {} where id = {} and status = 'queued'",
+        "update jobs
+         set status = {}, updated_at = {}, last_error = {},
+             cancel_requested_at = {}, cancel_reason = {}
+         where id = {} and status = 'queued'",
         state.db.placeholder(1),
         state.db.placeholder(2),
-        state.db.placeholder(3)
+        state.db.placeholder(3),
+        state.db.placeholder(4),
+        state.db.placeholder(5),
+        state.db.placeholder(6)
     );
     let now = chrono::Utc::now();
     let mut tx = state.db.pool.begin().await?;
     let result = sqlx::query(&sql)
         .bind(job_status_to_str(&JobStatus::Cancelled))
         .bind(now.to_rfc3339())
+        .bind("operation_cancelled")
+        .bind(now.to_rfc3339())
+        .bind("operation_cancelled")
         .bind(job.id.to_string())
         .execute(&mut *tx)
         .await?;
@@ -169,6 +182,39 @@ pub(crate) async fn cancel_operation(
                 file_id_from_job(&job)?,
             )
             .await?;
+        }
+        JobKind::CreateSnapshot => {
+            let snapshot_id = snapshot_id_from_job(&job)?;
+            let snapshot_failed = fail_pending_snapshot_on_connection(
+                &state.db,
+                &mut tx,
+                snapshot_id,
+                "snapshot operation cancelled",
+            )
+            .await?;
+            if snapshot_failed {
+                let sandbox_id = sandbox_id_from_job(&job)?;
+                crate::handlers::snapshots::fail_sandboxes_waiting_on_snapshot_on_connection(
+                    &state.db,
+                    &mut tx,
+                    snapshot_id,
+                    "snapshot_operation_cancelled",
+                    "snapshot operation cancelled",
+                )
+                .await?;
+                insert_event_on_connection(
+                    &state.db,
+                    &mut tx,
+                    sandbox_id,
+                    SandboxEventKind::LifecycleChanged,
+                    serde_json::json!({
+                        "reason": "snapshot_operation_cancelled",
+                        "snapshotId": snapshot_id,
+                        "snapshotStatus": SnapshotStatus::Failed
+                    }),
+                )
+                .await?;
+            }
         }
         _ => unreachable!("cancellation kind was validated above"),
     }
