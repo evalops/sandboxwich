@@ -111,7 +111,7 @@ pub(crate) async fn runtime_resource_inventory(
                join sandboxes s on s.id = por.sandbox_id
                where jl.worker_id = w.id
                  and por.resource_namespace = {}
-                 and s.state != 'archived'
+                 and s.state not in ('archiving', 'archived')
              )
              or exists (
                select 1 from job_leases jl
@@ -178,7 +178,7 @@ pub(crate) async fn runtime_resource_inventory(
          join sandboxes s on s.id = por.sandbox_id
          where jl.worker_id in ({scope_placeholders})
            and por.resource_namespace = {}
-           and s.state != 'archived'
+           and s.state not in ('archiving', 'archived')
          ) inventory where 1 = 1",
         state.db.placeholder(scope_worker_ids.len() + 1),
     );
