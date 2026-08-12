@@ -212,6 +212,20 @@ pub(crate) async fn run_cleanup_controller(
     let mut archived_skipped_count = 0;
     let mut runtime_deleted_count = 0;
 
+    if let Err(error) = terminalize_queued_snapshot_jobs_for_archived_sandboxes(db).await {
+        mark_cleanup_run_failed(
+            db,
+            &cleanup_run,
+            expired_count,
+            archived_deleted_count,
+            archived_skipped_count,
+            runtime_deleted_count,
+            &error,
+        )
+        .await;
+        return Err(error);
+    }
+
     let expired = match expire_due_snapshots(db).await {
         Ok(expired) => {
             expired_count = expired.len() as u64;

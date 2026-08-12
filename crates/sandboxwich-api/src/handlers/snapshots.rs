@@ -4,7 +4,6 @@ use crate::db::*;
 use crate::error::*;
 use crate::handlers::commands::*;
 use crate::handlers::jobs::*;
-use crate::handlers::leases::*;
 use crate::handlers::operations::operation_from_job;
 use crate::handlers::sandboxes::*;
 use crate::handlers::secrets::fetch_sandbox_secret_mounts;
@@ -814,38 +813,182 @@ pub(crate) async fn update_snapshot_status_on_connection(
     Ok(())
 }
 
+/// Guarded `pending` -> `failed` transition for a snapshot operation that was
+/// cancelled before a worker claimed its job. A ready or expired snapshot is
+/// left untouched so a late cancellation request cannot erase a durable
+/// restore source that already completed.
+pub(crate) async fn fail_pending_snapshot_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    snapshot_id: SnapshotId,
+    error: &str,
+) -> Result<bool, ApiError> {
+    let sql = format!(
+        "update snapshots
+         set status = {}, error = {}
+         where id = {} and status = 'pending'",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3)
+    );
+    let result = sqlx::query(&sql)
+        .bind(snapshot_status_to_str(&SnapshotStatus::Failed))
+        .bind(error)
+        .bind(snapshot_id.to_string())
+        .execute(&mut *connection)
+        .await?;
+    if result.rows_affected() == 1 {
+        let restore_sql = format!(
+            "update snapshot_restore_sources set status = {} where snapshot_id = {}",
+            db.placeholder(1),
+            db.placeholder(2)
+        );
+        sqlx::query(&restore_sql)
+            .bind(snapshot_status_to_str(&SnapshotStatus::Failed))
+            .bind(snapshot_id.to_string())
+            .execute(&mut *connection)
+            .await?;
+    }
+    Ok(result.rows_affected() == 1)
+}
+
 pub(crate) async fn dead_queued_snapshot_jobs_on_connection(
     db: &Database,
     connection: &mut AnyConnection,
     snapshot_id: SnapshotId,
     error: &str,
-) -> Result<(), ApiError> {
+) -> Result<u64, ApiError> {
     let sql = format!(
-        "select id
-         from jobs
+        "update jobs
+         set status = {}, last_error = {}, updated_at = {}
          where kind = 'create_snapshot' and status = 'queued' and snapshot_id = {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4)
+    );
+    let result = sqlx::query(&sql)
+        .bind(job_status_to_str(&JobStatus::Dead))
+        .bind(error)
+        .bind(Utc::now().to_rfc3339())
+        .bind(snapshot_id.to_string())
+        .execute(&mut *connection)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+const ARCHIVED_SNAPSHOT_JOB_TERMINALIZATION_BATCH_SIZE: i64 = 100;
+
+/// Terminalizes legacy queued snapshot jobs whose source sandbox has already
+/// entered teardown. Claim-time placement filtering correctly refuses these
+/// jobs because an archived sandbox has no valid placement, but without this
+/// bounded repair loop the rows remain queued indefinitely and keep the queue
+/// oldest-age alert open forever.
+pub(crate) async fn terminalize_queued_snapshot_jobs_for_archived_sandboxes(
+    db: &Database,
+) -> Result<usize, ApiError> {
+    let candidate_sql = format!(
+        "select jobs.snapshot_id, snapshots.sandbox_id, jobs.payload
+         from jobs
+         join snapshots on snapshots.id = jobs.snapshot_id
+         join sandboxes on sandboxes.id = snapshots.sandbox_id
+         where jobs.kind = 'create_snapshot'
+           and jobs.status = 'queued'
+           and sandboxes.state in ('archiving', 'archived')
+         order by jobs.created_at asc, jobs.id asc
+         limit {}",
         db.placeholder(1)
     );
-    let rows = sqlx::query(&sql)
-        .bind(snapshot_id.to_string())
-        .fetch_all(&mut *connection)
+    let rows = sqlx::query(&candidate_sql)
+        .bind(ARCHIVED_SNAPSHOT_JOB_TERMINALIZATION_BATCH_SIZE)
+        .fetch_all(db.read_pool())
         .await?;
+    let mut terminalized = 0;
 
-    let now = Utc::now();
     for row in rows {
-        let job_id: String = row.try_get("id")?;
-        update_job_status_on_connection(
-            db,
-            connection,
-            JobId(parse_uuid(&job_id)?),
-            JobStatus::Dead,
-            Some(error),
-            now,
-        )
-        .await?;
+        let snapshot_id: String = row.try_get("snapshot_id")?;
+        let sandbox_id: String = row.try_get("sandbox_id")?;
+        let payload: String = row.try_get("payload")?;
+        let payload: serde_json::Value = serde_json::from_str(&payload)
+            .map_err(|_| ApiError::internal("database contains invalid snapshot job payload"))?;
+        // A fork from an archived sandbox is an intentional restore path: the
+        // snapshot job carries ForkSandbox operation metadata and remains
+        // claimable from its persisted snapshot placement. Only standalone
+        // snapshot operations are invalidated by source teardown.
+        if payload
+            .pointer("/operation/kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("fork_sandbox")
+        {
+            continue;
+        }
+        let snapshot_id = SnapshotId(parse_uuid(&snapshot_id)?);
+        let sandbox_id = SandboxId(parse_uuid(&sandbox_id)?);
+        let mut tx = db.pool.begin().await?;
+        let result = async {
+            let jobs = dead_queued_snapshot_jobs_on_connection(
+                db,
+                &mut tx,
+                snapshot_id,
+                "snapshot source sandbox archived before claim",
+            )
+            .await?;
+            if jobs == 0 {
+                return Ok::<u64, ApiError>(0);
+            }
+            let snapshot_failed = fail_pending_snapshot_on_connection(
+                db,
+                &mut tx,
+                snapshot_id,
+                "snapshot source sandbox archived before claim",
+            )
+            .await?;
+            if snapshot_failed {
+                fail_sandboxes_waiting_on_snapshot_on_connection(
+                    db,
+                    &mut tx,
+                    snapshot_id,
+                    "snapshot_source_sandbox_archived",
+                    "snapshot source sandbox archived before claim",
+                )
+                .await?;
+            }
+            let snapshot = fetch_snapshot_on_connection(db, &mut tx, snapshot_id).await?;
+            insert_event_on_connection(
+                db,
+                &mut tx,
+                sandbox_id,
+                SandboxEventKind::LifecycleChanged,
+                json!({
+                    "reason": "snapshot_job_terminalized_source_archived",
+                    "snapshotId": snapshot.id,
+                    "snapshotStatus": snapshot.status,
+                    "jobCount": jobs
+                }),
+            )
+            .await?;
+            Ok(jobs)
+        }
+        .await;
+        match result {
+            Ok(count) => {
+                tx.commit().await?;
+                terminalized += count as usize;
+            }
+            Err(error) => {
+                if let Err(rollback_error) = tx.rollback().await {
+                    tracing::warn!(
+                        %rollback_error,
+                        snapshot_id = %snapshot_id,
+                        "failed to roll back archived snapshot job terminalization"
+                    );
+                }
+                return Err(error);
+            }
+        }
     }
 
-    Ok(())
+    Ok(terminalized)
 }
 
 pub(crate) async fn cleanup_runtime_resources_for_expired_snapshots(
