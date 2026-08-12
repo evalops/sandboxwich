@@ -46,6 +46,33 @@ fn agent_sandbox_claim_status_accepts_managed_name_shape_and_lowercase_compatibi
 }
 
 #[test]
+fn agent_sandbox_workspace_accepts_inline_or_materialized_generic_ephemeral_pvc() {
+    let inline = serde_json::json!({"spec":{"volumes":[{
+        "name":"sandboxwich-workspace",
+        "ephemeral":{"volumeClaimTemplate":{"spec":{}}}
+    }]}});
+    let materialized = serde_json::json!({"spec":{"volumes":[{
+        "name":"sandboxwich-workspace",
+        "persistentVolumeClaim":{"claimName":"agent-pod-sandboxwich-workspace"}
+    }]}});
+    for pod in [&inline, &materialized] {
+        assert_eq!(
+            agent_sandbox_workspace_pvc_name(pod, "agent-pod").unwrap(),
+            "agent-pod-sandboxwich-workspace"
+        );
+    }
+}
+
+#[test]
+fn agent_sandbox_workspace_rejects_noncanonical_pvc_reference() {
+    let pod = serde_json::json!({"spec":{"volumes":[{
+        "name":"sandboxwich-workspace",
+        "persistentVolumeClaim":{"claimName":"foreign-claim"}
+    }]}});
+    assert!(agent_sandbox_workspace_pvc_name(&pod, "agent-pod").is_err());
+}
+
+#[test]
 fn agent_sandbox_signing_key_loader_accepts_pkcs8_v1_without_public_key() {
     let key_bytes = [
         0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
