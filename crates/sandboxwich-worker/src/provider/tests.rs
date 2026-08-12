@@ -7166,6 +7166,41 @@ fn stale_unbound_workspace_claims_are_reaped_and_every_other_claim_is_left_alone
 }
 
 #[test]
+fn archiving_sandbox_fence_preserves_unrecorded_bound_workspace_claim() {
+    // The API omits stale provisioning rows as soon as teardown starts, but
+    // keeps the archiving sandbox in `sandbox_ids`. That distinction must
+    // leave an unrecorded Bound claim indeterminate until StopSandbox owns
+    // its snapshot-safe teardown.
+    let now = Utc::now();
+    let sandbox_id = SandboxId::new();
+    let inventory = ReconciliationInventory {
+        sandbox_ids: std::collections::HashSet::from([sandbox_id]),
+        active_resident_lease_ids: std::collections::HashSet::new(),
+        resources: Vec::new(),
+    };
+    let observed = vec![observed_claim(
+        Some(sandbox_id),
+        format!("sandboxwich-pvc-{sandbox_id}"),
+        "uid-archiving-bound",
+        Some(VolumeClaimPhase::Bound),
+        now - chrono::Duration::hours(2),
+    )];
+
+    let decisions = classify_reconciliation(
+        &inventory,
+        &observed,
+        &std::collections::HashMap::new(),
+        now,
+    );
+
+    assert_eq!(
+        decisions[0].classification,
+        ReconciliationClassification::Indeterminate
+    );
+    assert!(!decisions[0].delete_allowed);
+}
+
+#[test]
 fn reconciliation_discovery_reads_claim_phase_from_kubectl() {
     let dir = std::env::temp_dir().join(format!("sandboxwich-claim-phase-{}", SandboxId::new()));
     std::fs::create_dir_all(&dir).expect("create claim phase fake dir");
