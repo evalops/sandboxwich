@@ -1,5 +1,5 @@
 use crate::common::*;
-use crate::types::{insert_job_lease_sql, insert_job_sql, insert_worker_sql};
+use crate::types::{insert_job_lease_sql, insert_job_sql, insert_sandbox_sql, insert_worker_sql};
 use chrono::{Duration, Utc};
 use sandboxwich_core::*;
 use sqlx::AnyPool;
@@ -365,6 +365,169 @@ async fn metrics_available_capacity_excludes_resident_process_leases() {
 }
 
 #[tokio::test]
+async fn recent_event_metrics_use_event_time_not_retained_row_counts() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("sandboxwich-recent-event-metrics.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    sqlx::any::install_default_drivers();
+    let pool = AnyPool::connect(&server.database_url).await.unwrap();
+    let recent = (Utc::now() - Duration::minutes(5)).to_rfc3339();
+    let stale = (Utc::now() - Duration::minutes(20)).to_rfc3339();
+    let future = (Utc::now() + Duration::hours(1)).to_rfc3339();
+
+    let sandbox_id = Uuid::now_v7().to_string();
+    sqlx::query(&insert_sandbox_sql(&server.database_url))
+        .bind(&sandbox_id)
+        .bind("recent-event-metrics")
+        .bind("ready")
+        .bind("ubuntu-dev")
+        .bind("1g")
+        .bind("deny_all")
+        .bind("persistent")
+        .bind("development_container")
+        .bind(&recent)
+        .bind(&recent)
+        .bind(120_i64)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let worker_id = Uuid::now_v7().to_string();
+    sqlx::query(&insert_worker_sql(&server.database_url))
+        .bind(&worker_id)
+        .bind("recent-event-metrics-worker")
+        .bind("online")
+        .bind("kubernetes")
+        .bind("[\"run_command\"]")
+        .bind("{}")
+        .bind(&recent)
+        .bind(&recent)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for (job_id, timestamp) in [
+        ("00000000-0000-0000-0000-000000000901", &recent),
+        ("00000000-0000-0000-0000-000000000902", &stale),
+    ] {
+        sqlx::query(&insert_job_sql(&server.database_url))
+            .bind(job_id)
+            .bind("run_command")
+            .bind("failed")
+            .bind("{}")
+            .bind("run_command")
+            .bind("development_container")
+            .bind(0_i64)
+            .bind(1_i64)
+            .bind(3_i64)
+            .bind(timestamp)
+            .bind(timestamp)
+            .bind(timestamp)
+            .bind(Option::<String>::None)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    for (lease_id, job_id, timestamp) in [
+        (
+            "00000000-0000-0000-0000-000000000911",
+            "00000000-0000-0000-0000-000000000901",
+            &recent,
+        ),
+        (
+            "00000000-0000-0000-0000-000000000912",
+            "00000000-0000-0000-0000-000000000902",
+            &stale,
+        ),
+    ] {
+        sqlx::query(&insert_job_lease_sql(&server.database_url))
+            .bind(lease_id)
+            .bind(job_id)
+            .bind(&worker_id)
+            .bind("expired")
+            .bind(1_i64)
+            .bind(timestamp)
+            .bind(timestamp)
+            .bind(Option::<String>::None)
+            .bind(Option::<String>::None)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    for (run_id, timestamp) in [
+        ("00000000-0000-0000-0000-000000000921", &recent),
+        ("00000000-0000-0000-0000-000000000922", &stale),
+    ] {
+        sqlx::query(
+            "insert into cleanup_runs
+             (id, status, started_at, finished_at, error)
+             values (?, 'failed', ?, ?, 'test failure')",
+        )
+        .bind(run_id)
+        .bind(timestamp)
+        .bind(timestamp)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    for (token_id, timestamp) in [
+        ("00000000-0000-0000-0000-000000000931", &recent),
+        ("00000000-0000-0000-0000-000000000932", &stale),
+    ] {
+        sqlx::query(
+            "insert into guest_tokens
+             (id, tenant_id, worker_id, sandbox_id, token_hash, expires_at, revoked_at, created_at)
+             values (?, 'default', ?, ?, ?, ?, null, ?)",
+        )
+        .bind(token_id)
+        .bind(&worker_id)
+        .bind(&sandbox_id)
+        .bind(format!("hash-{token_id}"))
+        .bind(&future)
+        .bind(timestamp)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let metrics = server
+        .client()
+        .get(format!("{}/metrics", server.base_url))
+        .header(OPERATOR_TOKEN_HEADER, TEST_OPERATOR_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        scalar_metric_value(&metrics, "sandboxwich_job_lease_expired_recent_count"),
+        1
+    );
+    assert_eq!(
+        scalar_metric_value(&metrics, "sandboxwich_cleanup_run_failed_recent_count"),
+        1
+    );
+    assert_eq!(
+        scalar_metric_value(&metrics, "sandboxwich_guest_token_issued_recent_count"),
+        1
+    );
+}
+
+#[tokio::test]
 async fn bootstrap_block_rollup_is_bounded_and_monotonic_over_sqlite() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!(
@@ -641,6 +804,15 @@ fn labeled_metric_value(metrics_text: &str, prefix: &str) -> i64 {
         .unwrap_or_else(|| panic!("{prefix} not found in:\n{metrics_text}"))
 }
 
+fn scalar_metric_value(metrics_text: &str, name: &str) -> i64 {
+    metrics_text
+        .lines()
+        .find(|line| line.starts_with(&format!("{name} ")))
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or_else(|| panic!("{name} not found in:\n{metrics_text}"))
+}
+
 /// Extracts the value of `sandboxwich_sandbox_count{state="ready"}` from a Prometheus text
 /// exposition body produced by `/metrics`.
 pub(crate) fn planning_sandbox_gauge(metrics_text: &str) -> i64 {
@@ -675,6 +847,9 @@ pub(crate) async fn assert_metrics_are_exposed(client: &reqwest::Client, server:
     assert!(metrics.contains("# TYPE sandboxwich_idempotency_record_count gauge"));
     assert!(metrics.contains("# TYPE sandboxwich_guest_token_count gauge"));
     assert!(metrics.contains("# TYPE sandboxwich_cleanup_run_count gauge"));
+    assert!(metrics.contains("# TYPE sandboxwich_job_lease_expired_recent_count gauge"));
+    assert!(metrics.contains("# TYPE sandboxwich_cleanup_run_failed_recent_count gauge"));
+    assert!(metrics.contains("# TYPE sandboxwich_guest_token_issued_recent_count gauge"));
     assert!(metrics.contains("# TYPE sandboxwich_resident_process_count gauge"));
     assert!(metrics.contains("# TYPE sandboxwich_sidecar_bootstrap_block_total counter"));
     assert!(metrics.contains("# TYPE sandboxwich_job_queue_oldest_seconds gauge"));

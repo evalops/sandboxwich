@@ -9,7 +9,7 @@ use axum::Json;
 use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use sandboxwich_core::*;
 use sqlx::Row;
 use std::collections::BTreeMap;
@@ -182,6 +182,24 @@ pub(crate) async fn collect_prometheus_metrics(
         "Operator cleanup runs by status.",
         "status",
         metrics.counts("cleanup_run"),
+    );
+    append_gauge(
+        &mut body,
+        "sandboxwich_job_lease_expired_recent_count",
+        "Job leases that expired during the last ten minutes.",
+        metrics.scalar("job_lease_expired_recent_count"),
+    );
+    append_gauge(
+        &mut body,
+        "sandboxwich_cleanup_run_failed_recent_count",
+        "Cleanup runs that failed during the last fifteen minutes.",
+        metrics.scalar("cleanup_run_failed_recent_count"),
+    );
+    append_gauge(
+        &mut body,
+        "sandboxwich_guest_token_issued_recent_count",
+        "Guest tokens created during the last ten minutes.",
+        metrics.scalar("guest_token_issued_recent_count"),
     );
     append_count_family(
         &mut body,
@@ -412,6 +430,7 @@ pub(crate) async fn fetch_prometheus_metrics(
             .or_insert_with(Vec::new)
             .push((label, value));
     }
+    append_recent_event_metrics(db, tenant_id, &mut values).await?;
     fetch_resident_observability_metrics(db, tenant_id, &mut values).await?;
     let queued_sql = match tenant_id {
         None => {
@@ -449,6 +468,113 @@ pub(crate) async fn fetch_prometheus_metrics(
         values.insert(family.to_string(), vec![(String::new(), age)]);
     }
     Ok(PrometheusMetrics { values })
+}
+
+/// Add bounded, windowed event counts for alerts that need event semantics.
+///
+/// The durable `*_count` families above are gauges representing the current
+/// number of retained rows. Applying Prometheus counter functions to those
+/// gauges turns ordinary retention/cleanup changes into false event bursts.
+/// These explicitly named gauges instead count rows whose durable event time
+/// falls inside the alert window, while keeping the same tenant boundary as
+/// the rest of the metrics endpoint.
+async fn append_recent_event_metrics(
+    db: &Database,
+    tenant_id: Option<&str>,
+    values: &mut BTreeMap<String, Vec<(String, i64)>>,
+) -> Result<(), ApiError> {
+    let now = Utc::now();
+    let lease_cutoff = (now - Duration::minutes(10)).to_rfc3339();
+    let cleanup_cutoff = (now - Duration::minutes(15)).to_rfc3339();
+    let guest_token_cutoff = (now - Duration::minutes(10)).to_rfc3339();
+
+    let lease_sql = match tenant_id {
+        None => format!(
+            "select count(*) as value
+             from job_leases
+             where status = 'expired' and expires_at >= {}",
+            db.placeholder(1)
+        ),
+        Some(_) => format!(
+            "select count(*) as value
+             from job_leases
+             join jobs on jobs.id = job_leases.job_id
+             where job_leases.status = 'expired'
+               and job_leases.expires_at >= {}
+               and jobs.tenant_id = {}",
+            db.placeholder(1),
+            db.placeholder(2)
+        ),
+    };
+    let mut lease_binds = vec![lease_cutoff];
+    if let Some(tenant_id) = tenant_id {
+        lease_binds.push(tenant_id.to_string());
+    }
+    values.insert(
+        "job_lease_expired_recent_count".into(),
+        vec![(
+            String::new(),
+            fetch_scalar_count(db, &lease_sql, &lease_binds).await?,
+        )],
+    );
+
+    // Cleanup runs are operator-global rows and intentionally remain absent
+    // from tenant-scoped metric results. The operator scrape is the only
+    // consumer of this signal.
+    if tenant_id.is_none() {
+        let cleanup_sql = format!(
+            "select count(*) as value
+             from cleanup_runs
+             where status = 'failed'
+               and coalesce(finished_at, started_at) >= {}",
+            db.placeholder(1)
+        );
+        values.insert(
+            "cleanup_run_failed_recent_count".into(),
+            vec![(
+                String::new(),
+                fetch_scalar_count(db, &cleanup_sql, &[cleanup_cutoff]).await?,
+            )],
+        );
+    }
+
+    let guest_token_sql = match tenant_id {
+        None => format!(
+            "select count(*) as value
+             from guest_tokens
+             where created_at >= {}",
+            db.placeholder(1)
+        ),
+        Some(_) => format!(
+            "select count(*) as value
+             from guest_tokens
+             where created_at >= {} and tenant_id = {}",
+            db.placeholder(1),
+            db.placeholder(2)
+        ),
+    };
+    let mut guest_token_binds = vec![guest_token_cutoff];
+    if let Some(tenant_id) = tenant_id {
+        guest_token_binds.push(tenant_id.to_string());
+    }
+    values.insert(
+        "guest_token_issued_recent_count".into(),
+        vec![(
+            String::new(),
+            fetch_scalar_count(db, &guest_token_sql, &guest_token_binds).await?,
+        )],
+    );
+
+    Ok(())
+}
+
+async fn fetch_scalar_count(db: &Database, sql: &str, binds: &[String]) -> Result<i64, ApiError> {
+    let mut query = sqlx::query(sql);
+    for bind in binds {
+        query = query.bind(bind);
+    }
+    let row = query.fetch_one(db.read_pool()).await?;
+    Ok(row.try_get("value")?)
 }
 
 /// PostgreSQL promotes `sum(bigint)` to `numeric`, which `sqlx::Any` cannot
