@@ -104,6 +104,37 @@ class RepositoryRulesTest(unittest.TestCase):
             r"RepoDigests\}\{\{println \.\}\}\{\{end\}\}' \| head -n1",
         )
 
+    def test_kubernetes_conformance_retries_pinned_kind_downloads(self) -> None:
+        conformance = (
+            ROOT / ".github/workflows/kubernetes-conformance.yml"
+        ).read_text()
+        download = (
+            "curl --retry 5 --retry-all-errors --retry-delay 2 -fsSLo kind"
+        )
+        direct_release = (
+            "https://github.com/kubernetes-sigs/kind/releases/download/"
+            "v0.29.0/kind-linux-amd64"
+        )
+        checksum = (
+            "c72eda46430f065fb45c5f70e7c957cc9209402ef309294821978677c8fb3284"
+        )
+        self.assertEqual(conformance.count(download), 2)
+        self.assertEqual(conformance.count(direct_release), 2)
+        self.assertEqual(conformance.count(checksum), 2)
+        self.assertNotIn("https://kind.sigs.k8s.io/dl/", conformance)
+
+    def test_kubernetes_conformance_diagnostics_tolerate_missing_clusters(self) -> None:
+        conformance = (
+            ROOT / ".github/workflows/kubernetes-conformance.yml"
+        ).read_text()
+        for cluster in ("sandboxwich-conformance", "sandboxwich-cilium"):
+            self.assertIn(
+                f"kind get clusters | grep -Fxq {cluster}",
+                conformance,
+            )
+        self.assertIn("kubectl get all -A -o wide || true", conformance)
+        self.assertIn("kubectl get nodes,pods -A -o wide || true", conformance)
+
     def test_release_plz_tags_only_sandboxwich_core(self) -> None:
         # Shared vX.Y.Z tags must be created once. Releasing every workspace
         # package tries a second create and fails with Reference already exists.
