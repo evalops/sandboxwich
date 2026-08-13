@@ -207,6 +207,11 @@ closed with a typed `409` when no matching snapshot exists. The prompt endpoint
 returns typed `501 agent_prompt_unavailable`, and workers do not advertise the
 prompt capability.
 
+Managed persistent homes enforce one live sandbox mount per home. Callers must
+adopt or wait for the authoritative mount and reconcile only the typed
+`409 home_already_mounted` conflict; see the
+[persistent home lifecycle contract](docs/persistent-home-lifecycle.md).
+
 ## Design principles
 
 - Typed state over text scraping.

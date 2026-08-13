@@ -192,6 +192,8 @@ async fn managed_home_is_tenant_scoped_and_single_mount() {
         .await
         .unwrap();
     assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    let conflict: ErrorEnvelope = conflict.json().await.unwrap();
+    assert_eq!(conflict.code, "home_already_mounted");
     assert_eq!(
         client
             .delete(format!("{}/homes/{}", server.base_url, created.home.id))
