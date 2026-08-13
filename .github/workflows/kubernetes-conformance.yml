@@ -82,7 +82,8 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Install pinned kind
         run: |
-          curl -fsSLo kind https://kind.sigs.k8s.io/dl/v0.29.0/kind-linux-amd64
+          curl --retry 5 --retry-all-errors --retry-delay 2 -fsSLo kind \
+            https://github.com/kubernetes-sigs/kind/releases/download/v0.29.0/kind-linux-amd64
           echo c72eda46430f065fb45c5f70e7c957cc9209402ef309294821978677c8fb3284  kind | sha256sum --check
           sudo install -m 0755 kind /usr/local/bin/kind
       - name: Pull published images and build the conformance binary
@@ -211,8 +212,12 @@ jobs:
       - name: Collect cluster diagnostics
         if: failure()
         run: |
-          kubectl get all -A -o wide
-          kubectl get events -A --sort-by=.lastTimestamp
+          if ! kind get clusters | grep -Fxq sandboxwich-conformance; then
+            echo "sandboxwich-conformance cluster was not created; no cluster diagnostics available"
+            exit 0
+          fi
+          kubectl get all -A -o wide || true
+          kubectl get events -A --sort-by=.lastTimestamp || true
           kubectl -n sandboxwich logs deployment/sandboxwich-api --tail=-1 --prefix || true
           kubectl -n sandboxwich logs deployment/sandboxwich-api --previous --tail=-1 --prefix || true
           kubectl -n sandboxwich logs deployment/sandboxwich-worker --tail=-1 --prefix || true
@@ -237,7 +242,8 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Install pinned kind
         run: |
-          curl -fsSLo kind https://kind.sigs.k8s.io/dl/v0.29.0/kind-linux-amd64
+          curl --retry 5 --retry-all-errors --retry-delay 2 -fsSLo kind \
+            https://github.com/kubernetes-sigs/kind/releases/download/v0.29.0/kind-linux-amd64
           echo c72eda46430f065fb45c5f70e7c957cc9209402ef309294821978677c8fb3284  kind | sha256sum --check
           sudo install -m 0755 kind /usr/local/bin/kind
       - name: Build the worker that renders the policy under test
@@ -265,7 +271,11 @@ jobs:
       - name: Collect Cilium diagnostics
         if: failure()
         run: |
-          kubectl get nodes,pods -A -o wide
+          if ! kind get clusters | grep -Fxq sandboxwich-cilium; then
+            echo "sandboxwich-cilium cluster was not created; no cluster diagnostics available"
+            exit 0
+          fi
+          kubectl get nodes,pods -A -o wide || true
           kubectl -n kube-system logs daemonset/cilium --tail=200 || true
           kubectl get ciliumnetworkpolicies -A -o yaml || true
           kubectl get ciliumendpoints -A -o wide || true
