@@ -319,7 +319,7 @@ async fn fetch_home_by_external_key(
 }
 
 /// Reports the sandbox currently holding this home's mount, if any, with its
-/// live state. Deliberately unfiltered: an `archived`/`error` mount row that
+/// live state. Deliberately unfiltered: an `archiving`/`archived`/`error` mount row that
 /// has not yet been lazily cleaned up (see `claim_home_mount_on_connection`)
 /// is still reported, so the client's view matches what a mount claim would
 /// actually encounter.
@@ -382,7 +382,7 @@ pub(crate) async fn claim_home_mount_on_connection(
     sandbox_id: SandboxId,
 ) -> Result<(), ApiError> {
     let cleanup_sql = format!(
-        "delete from sandbox_home_mounts where home_id = {} and sandbox_id in (select id from sandboxes where state in ('archived', 'error'))",
+        "delete from sandbox_home_mounts where home_id = {} and sandbox_id in (select id from sandboxes where state in ('archiving', 'archived', 'error'))",
         db.placeholder(1)
     );
     sqlx::query(&cleanup_sql)
