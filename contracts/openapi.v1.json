@@ -930,6 +930,7 @@
           "code": {
             "type": "string"
           },
+          "details": {},
           "message": {
             "type": "string"
           },
@@ -1007,6 +1008,23 @@
         "required": [
           "template",
           "memory_limit"
+        ],
+        "type": "object"
+      },
+      "HomeMountReconciliationResponse": {
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "removedMounts": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ok",
+          "removedMounts"
         ],
         "type": "object"
       },
@@ -4071,6 +4089,37 @@
             "description": "Successful response"
           }
         }
+      }
+    },
+    "/v1/operator/home-mounts/reconcile": {
+      "post": {
+        "operationId": "reconcile_home_mounts",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HomeMountReconciliationResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "summary": "Remove only mount rows whose sandbox lifecycle is already terminal. This\nis an idempotent, operator-gated repair for rows left behind by an\ninterrupted teardown; it never changes a sandbox or home state and never\ntouches a live mount.",
+        "tags": [
+          "operator"
+        ]
       }
     },
     "/v1/operator/tenant-policies/{tenant_id}": {

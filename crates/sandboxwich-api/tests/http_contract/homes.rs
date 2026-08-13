@@ -1,6 +1,7 @@
 use crate::common::*;
 use reqwest::StatusCode;
 use sandboxwich_core::*;
+use sqlx::AnyPool;
 
 fn persistent_sandbox(name: &str) -> CreateSandboxRequest {
     CreateSandboxRequest {
@@ -17,6 +18,57 @@ fn persistent_sandbox(name: &str) -> CreateSandboxRequest {
         max_lifetime_seconds: None,
         idle_ttl_seconds: None,
     }
+}
+
+async fn set_sandbox_state(server: &TestServer, sandbox_id: SandboxId, state: &SandboxState) {
+    sqlx::any::install_default_drivers();
+    let pool = AnyPool::connect(&server.database_url).await.unwrap();
+    let postgres = server.database_url.starts_with("postgres:")
+        || server.database_url.starts_with("postgresql:");
+    let (state_placeholder, id_placeholder) = if postgres { ("$1", "$2") } else { ("?", "?") };
+    sqlx::query(&format!(
+        "update sandboxes set state = {state_placeholder} where id = {id_placeholder}"
+    ))
+    .bind(state.as_db_str())
+    .bind(sandbox_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+}
+
+async fn create_home_with_mount_state(
+    server: &TestServer,
+    sandbox_name: &str,
+    state: SandboxState,
+) -> (HomeResponse, SandboxResponse) {
+    let client = server.client();
+    let home: HomeResponse = client
+        .post(format!("{}/homes", server.base_url))
+        .json(&CreateHomeRequest::default())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mounted: SandboxResponse = client
+        .post(format!(
+            "{}/homes/{}/sandboxes",
+            server.base_url, home.home.id
+        ))
+        .json(&persistent_sandbox(sandbox_name))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    set_sandbox_state(server, mounted.sandbox.id, &state).await;
+    (home, mounted)
 }
 
 #[tokio::test]
@@ -195,6 +247,12 @@ async fn managed_home_is_tenant_scoped_and_single_mount() {
     let conflict: ErrorEnvelope = conflict.json().await.unwrap();
     assert_eq!(conflict.code, "home_already_mounted");
     assert_eq!(
+        conflict.details.as_ref().and_then(|details| details
+            .get("reclaimable")
+            .and_then(serde_json::Value::as_bool)),
+        Some(false)
+    );
+    assert_eq!(
         client
             .delete(format!("{}/homes/{}", server.base_url, created.home.id))
             .send()
@@ -224,43 +282,9 @@ async fn managed_home_replaces_an_archiving_mount_before_claiming_next_sandbox()
         data_dir.path().join("managed-home-archiving.db").display()
     );
     let server = TestServer::start(database_url, Some(data_dir)).await;
+    let (created, first) =
+        create_home_with_mount_state(&server, "archiving-mount", SandboxState::Archiving).await;
     let client = server.client();
-    let created: HomeResponse = client
-        .post(format!("{}/homes", server.base_url))
-        .json(&CreateHomeRequest::default())
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-
-    let first: SandboxResponse = client
-        .post(format!(
-            "{}/homes/{}/sandboxes",
-            server.base_url, created.home.id
-        ))
-        .json(&persistent_sandbox("archiving-mount"))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-
-    let pool = sqlx::SqlitePool::connect(&server.database_url)
-        .await
-        .unwrap();
-    sqlx::query("update sandboxes set state = 'archiving' where id = ?")
-        .bind(first.sandbox.id.to_string())
-        .execute(&pool)
-        .await
-        .unwrap();
-    pool.close().await;
 
     let replacement: SandboxResponse = client
         .post(format!(
@@ -292,6 +316,233 @@ async fn managed_home_replaces_an_archiving_mount_before_claiming_next_sandbox()
         home.mounted_sandbox.map(|mount| mount.sandbox_id),
         Some(replacement.sandbox.id)
     );
+
+    // Exercise the complete managed-home file boundary after replacement:
+    // upload through the mounted sandbox, list it, then read the durable body.
+    let form = reqwest::multipart::Form::new()
+        .text("path", "/workspace/home-regression.txt")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"home replacement\n".to_vec())
+                .file_name("home-regression.txt")
+                .mime_str("text/plain")
+                .unwrap(),
+        );
+    let uploaded: FileResponse = client
+        .post(format!(
+            "{}/sandboxes/{}/files",
+            server.base_url, replacement.sandbox.id
+        ))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let listed: ListFilesResponse = client
+        .get(format!(
+            "{}/sandboxes/{}/files",
+            server.base_url, replacement.sandbox.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(listed.files.iter().any(|file| file.id == uploaded.file.id));
+    let downloaded = client
+        .get(format!(
+            "{}/sandboxes/{}/files/{}",
+            server.base_url, replacement.sandbox.id, uploaded.file.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(downloaded.as_ref(), b"home replacement\n");
+
+    let metrics = client
+        .get(format!("{}/metrics", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics.contains("sandboxwich_home_mount_count"));
+}
+
+#[tokio::test]
+async fn managed_home_mount_claim_has_one_winner_under_postgres_concurrency() {
+    let Ok(database_url) = std::env::var("SANDBOXWICH_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let server = TestServer::start(database_url, None).await;
+    let (home, _first) =
+        create_home_with_mount_state(&server, "postgres-archiving-mount", SandboxState::Archiving)
+            .await;
+    let client = server.client();
+    let url = format!("{}/homes/{}/sandboxes", server.base_url, home.home.id);
+    let left_request = client
+        .post(&url)
+        .json(&persistent_sandbox("postgres-race-left"));
+    let right_request = client
+        .post(&url)
+        .json(&persistent_sandbox("postgres-race-right"));
+    let (left, right) = tokio::join!(left_request.send(), right_request.send());
+    let (accepted_response, conflict_response) =
+        if left.as_ref().unwrap().status() == StatusCode::ACCEPTED {
+            (left.unwrap(), right.unwrap())
+        } else {
+            (right.unwrap(), left.unwrap())
+        };
+    assert_eq!(
+        accepted_response.status(),
+        StatusCode::ACCEPTED,
+        "exactly one concurrent creator must win"
+    );
+    assert_eq!(
+        conflict_response.status(),
+        StatusCode::CONFLICT,
+        "the loser must receive home_already_mounted"
+    );
+
+    let winner = accepted_response.json::<SandboxResponse>().await.unwrap();
+    let winner_id = winner.sandbox.id.to_string();
+    let conflict = conflict_response.json::<ErrorEnvelope>().await.unwrap();
+    assert_eq!(conflict.code, "home_already_mounted");
+    assert_eq!(
+        conflict.details.as_ref().and_then(|details| details
+            .get("mountedSandboxId")
+            .and_then(serde_json::Value::as_str)),
+        Some(winner_id.as_str())
+    );
+
+    let mounted: HomeResponse = client
+        .get(format!("{}/homes/{}", server.base_url, home.home.id))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        mounted.mounted_sandbox.map(|mount| mount.sandbox_id),
+        Some(winner.sandbox.id)
+    );
+}
+
+#[tokio::test]
+async fn operator_home_mount_reconciliation_is_terminal_only_and_idempotent() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("managed-home-reconcile.db").display()
+    );
+    let server = TestServer::start_with_auth(database_url, Some(data_dir), None).await;
+    let client = server.client();
+    let home: HomeResponse = client
+        .post(format!("{}/homes", server.base_url))
+        .json(&CreateHomeRequest::default())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mounted: SandboxResponse = client
+        .post(format!(
+            "{}/homes/{}/sandboxes",
+            server.base_url, home.home.id
+        ))
+        .json(&persistent_sandbox("operator-reconcile"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let pool = sqlx::SqlitePool::connect(&server.database_url)
+        .await
+        .unwrap();
+    sqlx::query("update sandboxes set state = 'error' where id = ?")
+        .bind(mounted.sandbox.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let unauthorized = client
+        .post(format!(
+            "{}/v1/operator/home-mounts/reconcile",
+            server.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let reconciled: serde_json::Value = client
+        .post(format!(
+            "{}/v1/operator/home-mounts/reconcile",
+            server.base_url
+        ))
+        .header(OPERATOR_TOKEN_HEADER, TEST_OPERATOR_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(reconciled["removedMounts"], 1);
+
+    let replay: serde_json::Value = client
+        .post(format!(
+            "{}/v1/operator/home-mounts/reconcile",
+            server.base_url
+        ))
+        .header(OPERATOR_TOKEN_HEADER, TEST_OPERATOR_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replay["removedMounts"], 0);
+
+    let fetched: HomeResponse = client
+        .get(format!("{}/homes/{}", server.base_url, home.home.id))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(fetched.mounted_sandbox.is_none());
 }
 
 #[tokio::test]

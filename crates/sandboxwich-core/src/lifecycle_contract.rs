@@ -435,6 +435,20 @@ mod tests {
     }
 
     #[test]
+    fn home_mount_reclaimability_matches_the_published_state_contract() {
+        for contract_state in SANDBOX_STATES {
+            let state = SandboxState::parse_db_str(contract_state.state)
+                .expect("published lifecycle state must parse");
+            assert_eq!(
+                state.is_home_mount_reclaimable(),
+                contract_state.disposition == SandboxStateDisposition::Terminal,
+                "home-mount reclaimability drifted from lifecycle disposition for {}",
+                contract_state.state
+            );
+        }
+    }
+
+    #[test]
     fn lifecycle_contract_exports_reverse_activation_authority_and_exact_fence() {
         let contract = lifecycle_contract();
         let activation = contract.maestro_hosted_runner_activation;

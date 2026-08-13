@@ -838,6 +838,7 @@ pub(crate) async fn assert_metrics_are_exposed(client: &reqwest::Client, server:
         .await
         .unwrap();
     assert!(metrics.contains("# TYPE sandboxwich_sandbox_count gauge"));
+    assert!(metrics.contains("# TYPE sandboxwich_home_mount_count gauge"));
     assert!(metrics.contains("sandboxwich_sandbox_count{state=\"planning\"}"));
     assert!(metrics.contains("# TYPE sandboxwich_archived_runtime_resource_count gauge"));
     assert!(metrics.contains("sandboxwich_worker_capacity_slots"));

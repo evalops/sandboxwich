@@ -93,6 +93,7 @@ fn unavailable() -> ApiError {
         status: StatusCode::NOT_FOUND,
         code: LifecycleReasonCode::PlacementAttestationNotFound.as_str(),
         message: "placement attestation was not found".into(),
+        details: None,
     }
 }
 
@@ -132,6 +133,7 @@ fn resident_not_ready_error(
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 code: LifecycleReasonCode::WorkspaceCapacityPending.as_str(),
                 message,
+                details: None,
             };
         }
         if has_error {
@@ -139,6 +141,7 @@ fn resident_not_ready_error(
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 code: LifecycleReasonCode::ResidentMaterializationPending.as_str(),
                 message,
+                details: None,
             };
         }
         return placement_pending();
@@ -151,6 +154,7 @@ fn resident_not_ready_error(
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: LifecycleReasonCode::WorkspaceCapacityExhausted.as_str(),
             message,
+            details: None,
         };
     }
     if code == Some(LifecycleReasonCode::IdentityExchangeFailed.as_str()) {
@@ -158,6 +162,7 @@ fn resident_not_ready_error(
             status: StatusCode::BAD_GATEWAY,
             code: LifecycleReasonCode::IdentityExchangeFailed.as_str(),
             message,
+            details: None,
         };
     }
     if error_class.as_ref() == Some(&ProvisioningErrorClass::TerminalSecurity) {
@@ -166,6 +171,7 @@ fn resident_not_ready_error(
                 status: StatusCode::FORBIDDEN,
                 code: LifecycleReasonCode::KubernetesPolicyDenied.as_str(),
                 message,
+                details: None,
             };
         }
         if code == Some(LifecycleReasonCode::RuntimeClassBoundaryUnverified.as_str()) {
@@ -173,6 +179,7 @@ fn resident_not_ready_error(
                 status: StatusCode::FORBIDDEN,
                 code: LifecycleReasonCode::RuntimeClassBoundaryUnverified.as_str(),
                 message,
+                details: None,
             };
         }
     }
@@ -182,6 +189,7 @@ fn resident_not_ready_error(
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 code: LifecycleReasonCode::KubernetesContractInvalid.as_str(),
                 message,
+                details: None,
             };
         }
         if code == Some(LifecycleReasonCode::ResourceContractConflict.as_str()) {
@@ -189,6 +197,7 @@ fn resident_not_ready_error(
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 code: LifecycleReasonCode::ResourceContractConflict.as_str(),
                 message,
+                details: None,
             };
         }
         if code == Some(LifecycleReasonCode::ResourceIdentityConflict.as_str()) {
@@ -196,6 +205,7 @@ fn resident_not_ready_error(
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 code: LifecycleReasonCode::ResourceIdentityConflict.as_str(),
                 message,
+                details: None,
             };
         }
         if code == Some(LifecycleReasonCode::PodUnschedulable.as_str()) {
@@ -203,6 +213,7 @@ fn resident_not_ready_error(
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 code: LifecycleReasonCode::PodUnschedulable.as_str(),
                 message,
+                details: None,
             };
         }
     }
@@ -210,6 +221,7 @@ fn resident_not_ready_error(
         status: StatusCode::BAD_GATEWAY,
         code: LifecycleReasonCode::ResidentMaterializationFailed.as_str(),
         message,
+        details: None,
     }
 }
 

@@ -590,6 +590,14 @@ impl SandboxState {
         SandboxState::Error,
     ];
 
+    /// A home mount may be reclaimed as soon as its sandbox has entered a
+    /// terminal teardown state. `archiving` is intentionally included: the
+    /// lifecycle contract treats it as terminal even while provider cleanup
+    /// finishes asynchronously.
+    pub const fn is_home_mount_reclaimable(self) -> bool {
+        matches!(self, Self::Archiving | Self::Archived | Self::Error)
+    }
+
     /// States from which a user-initiated `POST /sandboxes/{id}/stop` may
     /// legally move a sandbox to `Archived`. A sandbox that is already
     /// `Archived` is deliberately excluded: a double-stop surfaces as a 409
@@ -5301,6 +5309,17 @@ mod tests {
     }
 
     #[test]
+    fn terminal_home_mount_states_are_reclaimable() {
+        assert!(SandboxState::Archiving.is_home_mount_reclaimable());
+        assert!(SandboxState::Archived.is_home_mount_reclaimable());
+        assert!(SandboxState::Error.is_home_mount_reclaimable());
+        assert!(!SandboxState::Planning.is_home_mount_reclaimable());
+        assert!(!SandboxState::Ready.is_home_mount_reclaimable());
+        assert!(!SandboxState::Running.is_home_mount_reclaimable());
+        assert!(!SandboxState::Idle.is_home_mount_reclaimable());
+    }
+
+    #[test]
     fn provision_completed_excludes_archiving_and_archived() {
         for from in SandboxState::ALL {
             let expected = !matches!(from, SandboxState::Archiving | SandboxState::Archived);
@@ -5552,14 +5571,25 @@ pub struct ErrorEnvelope {
     pub ok: bool,
     pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 impl ErrorEnvelope {
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::with_details(code, message, None)
+    }
+
+    pub fn with_details(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        details: Option<serde_json::Value>,
+    ) -> Self {
         Self {
             ok: false,
             code: code.into(),
             message: message.into(),
+            details,
         }
     }
 }

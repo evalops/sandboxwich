@@ -54,6 +54,7 @@ use sandboxwich_core::{
         crate::handlers::divergence::append_tool_call_ledger,
         crate::handlers::divergence::reconcile_divergence,
         crate::handlers::divergence::list_divergence_findings,
+        crate::handlers::homes::reconcile_home_mounts,
         crate::limits::get_tenant_limit_policy,
         crate::limits::put_tenant_limit_policy
     ),
@@ -70,6 +71,7 @@ use sandboxwich_core::{
         ErrorEnvelope,
         Operation,
         OperationResponse,
+        crate::handlers::homes::HomeMountReconciliationResponse,
         SandboxObservedState,
         ReceiptScope,
         ToolCallLedgerEntryRequest,
@@ -253,6 +255,7 @@ const PUBLIC_V1_OPERATIONS: &[(&str, &str)] = &[
     ("post", "/v1/leases/{lease_id}/fail"),
     ("get", "/v1/operator/tenant-policies/{tenant_id}"),
     ("put", "/v1/operator/tenant-policies/{tenant_id}"),
+    ("post", "/v1/operator/home-mounts/reconcile"),
 ];
 
 pub(crate) fn openapi_document() -> OpenApiDocument {

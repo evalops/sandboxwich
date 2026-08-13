@@ -137,6 +137,7 @@ async fn block_executor_bootstrap(
         status: StatusCode::SERVICE_UNAVAILABLE,
         code: "resident_sidecar_unavailable",
         message,
+        details: None,
     })
 }
 
@@ -981,6 +982,7 @@ pub(crate) async fn put_resident_process(
                     status: StatusCode::SERVICE_UNAVAILABLE,
                     code: "resident_sidecar_placement_pending",
                     message: "the resident sidecar is waiting for the sandbox to receive a worker placement".into(),
+                    details: None,
                 });
             }
             ProviderIsolatedPlacement::Unsupported => {
@@ -988,6 +990,7 @@ pub(crate) async fn put_resident_process(
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 code: "resident_sidecar_worker_unsupported",
                 message: "the resident sidecar requires its placed worker to advertise the matching digest-pinned provider-isolated v2 runtime".into(),
+                details: None,
                 });
             }
             ProviderIsolatedPlacement::Supported {
@@ -1286,6 +1289,7 @@ pub(crate) async fn put_resident_process(
         status: StatusCode::SERVICE_UNAVAILABLE,
         code: "resident_bootstrap_capacity",
         message: "resident bootstrap capacity is exhausted".into(),
+        details: None,
     })?;
 
     let handoff_bootstrap = bootstrap_reservation
@@ -1733,6 +1737,7 @@ pub(crate) async fn read_resident_process_bootstrap(
                 status: StatusCode::GONE,
                 code: "resident_bootstrap_unavailable",
                 message: "resident bootstrap is unavailable or already acknowledged".into(),
+                details: None,
             });
         }
         let current = fetch_resident_process_by_id(&state.db, process_id).await?;
@@ -1774,6 +1779,7 @@ pub(crate) async fn read_resident_process_bootstrap(
             status: StatusCode::GONE,
             code: "resident_bootstrap_unavailable",
             message: "resident bootstrap is unavailable or already consumed".into(),
+            details: None,
         });
     }
     let placement_attestation = if process.name == ORB_SIDECAR_RESIDENT_PROCESS_NAME
@@ -1796,6 +1802,7 @@ pub(crate) async fn read_resident_process_bootstrap(
         status: StatusCode::GONE,
         code: "resident_bootstrap_unavailable",
         message: "resident bootstrap was acknowledged while delivery was in flight".into(),
+        details: None,
     })?;
     Ok(Json(ResidentProcessBootstrapReadResponse {
         ok: true,
@@ -1850,6 +1857,7 @@ async fn begin_bootstrap_delivery(
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 code: "resident_bootstrap_capacity",
                 message: "resident bootstrap capacity is exhausted".into(),
+                details: None,
             });
         }
         match state.resident_bootstraps.begin_delivery(&process.id, fence) {
@@ -1862,6 +1870,7 @@ async fn begin_bootstrap_delivery(
             status: StatusCode::GONE,
             code: "resident_bootstrap_unavailable",
             message: "resident bootstrap is unavailable or already acknowledged".into(),
+            details: None,
         },
         ResidentBootstrapDeliveryError::InFlight => ApiError::conflict_code(
             "resident_bootstrap_delivery_in_flight",

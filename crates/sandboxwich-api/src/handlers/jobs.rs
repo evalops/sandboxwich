@@ -760,6 +760,7 @@ pub(crate) fn bind_compiler_cache_identity_tenant(
             status: axum::http::StatusCode::BAD_REQUEST,
             code: "compiler_cache_identity_tenant_mismatch",
             message: "compilerCacheIdentity tenant must match the authenticated tenant".into(),
+            details: None,
         });
     }
     Ok(())

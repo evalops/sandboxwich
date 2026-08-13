@@ -1446,6 +1446,7 @@ fn desired_stop_cancellation_uses_the_typed_api_error_code() {
             ok: false,
             code: "resident_process_stopped".to_string(),
             message: "stopped".to_string(),
+            details: None,
         })
         .unwrap(),
     });
@@ -1466,6 +1467,7 @@ fn resident_observation_trace_extracts_only_the_stable_api_code() {
             ok: false,
             code: "placement_attestation_not_live".to_string(),
             message: "pod identity does not match".to_string(),
+            details: None,
         })
         .unwrap(),
     });
