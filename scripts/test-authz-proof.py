@@ -18,7 +18,7 @@ def normalize_route(path: str) -> str | None:
         return None
     if path.startswith("/v1/"):
         path = path[3:]
-    if path == "/tenant-policies/{tenant_id}":
+    if path in {"/tenant-policies/{tenant_id}", "/home-mounts/reconcile"}:
         path = "/operator" + path
     return re.sub(r"\{[^}]+\}", "*", path)
 
