@@ -215,6 +215,84 @@ async fn managed_home_is_tenant_scoped_and_single_mount() {
 }
 
 #[tokio::test]
+async fn managed_home_replaces_an_archiving_mount_before_claiming_next_sandbox() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("managed-home-archiving.db").display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+    let created: HomeResponse = client
+        .post(format!("{}/homes", server.base_url))
+        .json(&CreateHomeRequest::default())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let first: SandboxResponse = client
+        .post(format!(
+            "{}/homes/{}/sandboxes",
+            server.base_url, created.home.id
+        ))
+        .json(&persistent_sandbox("archiving-mount"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let pool = sqlx::SqlitePool::connect(&server.database_url)
+        .await
+        .unwrap();
+    sqlx::query("update sandboxes set state = 'archiving' where id = ?")
+        .bind(first.sandbox.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let replacement: SandboxResponse = client
+        .post(format!(
+            "{}/homes/{}/sandboxes",
+            server.base_url, created.home.id
+        ))
+        .json(&persistent_sandbox("replacement-mount"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_ne!(replacement.sandbox.id, first.sandbox.id);
+    let home: HomeResponse = client
+        .get(format!("{}/homes/{}", server.base_url, created.home.id))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        home.mounted_sandbox.map(|mount| mount.sandbox_id),
+        Some(replacement.sandbox.id)
+    );
+}
+
+#[tokio::test]
 async fn managed_home_requires_persistent_workspace() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!(
