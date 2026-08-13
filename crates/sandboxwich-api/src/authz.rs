@@ -721,6 +721,7 @@ mod tests {
         let claim = route_policy("POST", "/v1/workers/worker-1/leases/claim");
         let registration = route_policy("POST", "/v1/workers/register");
         let operator = route_policy("GET", "/v1/operator/tenant-policies/default");
+        let home_mount_reconcile = route_policy("POST", "/v1/operator/home-mounts/reconcile");
         let unknown_worker = route_policy("POST", "/v1/workers/worker-1/unknown");
         let unknown_route = route_policy("GET", "/v1/not-a-real-route");
         let identity_only = route_policy("POST", "/v1/maestro-workload-identities/validate");
@@ -732,6 +733,10 @@ mod tests {
             PrincipalRequirement::TenantOrOperator
         );
         assert_eq!(operator.requirement, PrincipalRequirement::Operator);
+        assert_eq!(
+            home_mount_reconcile.requirement,
+            PrincipalRequirement::Operator
+        );
         assert_eq!(unknown_worker.requirement, PrincipalRequirement::Deny);
         assert_eq!(unknown_route.requirement, PrincipalRequirement::Deny);
         assert_eq!(identity_only.requirement, PrincipalRequirement::NotExposed);
@@ -936,6 +941,7 @@ pub(crate) const AUTHORIZATION_ROUTE_MANIFEST: &[&str] = &[
     "/leases/*/fail",
     "/sandboxes/*/guest-token/refresh",
     "/operator/tenant-policies/*",
+    "/operator/home-mounts/reconcile",
 ];
 pub(crate) const AUTHORIZATION_NON_TENANT_ROUTE_MANIFEST: &[&str] =
     &["/maestro-workload-identities/validate"];

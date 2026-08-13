@@ -427,6 +427,7 @@ async fn revalidate_guest_token_lifecycle(
             status: axum::http::StatusCode::UNAUTHORIZED,
             code: "guest_token_revoked",
             message: "guest token sandbox is no longer authorized".into(),
+            details: None,
         });
     }
     if !matches!(
@@ -443,6 +444,7 @@ async fn revalidate_guest_token_lifecycle(
                 "sandbox is not active for guest token refresh (state={:?})",
                 sandbox.state
             ),
+            details: None,
         });
     }
     if let Some(max_lifetime) = sandbox.max_lifetime_seconds {
@@ -452,6 +454,7 @@ async fn revalidate_guest_token_lifecycle(
                 status: axum::http::StatusCode::UNAUTHORIZED,
                 code: "guest_token_revoked",
                 message: "sandbox hard lifetime has elapsed".into(),
+                details: None,
             });
         }
     }
@@ -468,6 +471,7 @@ async fn revalidate_guest_token_lifecycle(
             status: axum::http::StatusCode::UNAUTHORIZED,
             code: "guest_token_revoked",
             message: "sandbox has no active placement".into(),
+            details: None,
         });
     };
     let placed_worker: String = row.try_get("worker_id")?;
@@ -476,6 +480,7 @@ async fn revalidate_guest_token_lifecycle(
             status: axum::http::StatusCode::UNAUTHORIZED,
             code: "guest_token_revoked",
             message: "sandbox placement no longer matches this guest token".into(),
+            details: None,
         });
     }
     Ok(())

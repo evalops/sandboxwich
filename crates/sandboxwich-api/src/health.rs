@@ -106,6 +106,13 @@ pub(crate) async fn collect_prometheus_metrics(
     );
     append_count_family(
         &mut body,
+        "sandboxwich_home_mount_count",
+        "Managed home mounts by mounted sandbox lifecycle state.",
+        "state",
+        metrics.counts("home_mount"),
+    );
+    append_count_family(
+        &mut body,
         "sandboxwich_worker_count",
         "Workers by registration status.",
         "status",
@@ -277,6 +284,11 @@ pub(crate) async fn fetch_prometheus_metrics(
              from sandboxes
              group by state
              union all
+             select 'home_mount' as family, sandboxes.state as label, count(*) as value
+             from sandbox_home_mounts
+             join sandboxes on sandboxes.id = sandbox_home_mounts.sandbox_id
+             group by sandboxes.state
+             union all
              select 'worker' as family, status as label, count(*) as value
              from workers
              group by status
@@ -336,26 +348,32 @@ pub(crate) async fn fetch_prometheus_metrics(
              where tenant_id = {p1}
              group by state
              union all
+             select 'home_mount' as family, sandboxes.state as label, count(*) as value
+             from sandbox_home_mounts
+             join sandboxes on sandboxes.id = sandbox_home_mounts.sandbox_id
+             where sandbox_home_mounts.tenant_id = {p2}
+             group by sandboxes.state
+             union all
              select 'worker' as family, status as label, count(*) as value
              from workers
-             where tenant_id = {p2}
+             where tenant_id = {p3}
              group by status
              union all
              select 'job' as family, status as label, count(*) as value
              from jobs
-             where tenant_id = {p3}
+             where tenant_id = {p4}
              group by status
              union all
              select 'runtime_resource' as family, runtime_resources.status as label, count(*) as value
              from runtime_resources
              join sandboxes on sandboxes.id = runtime_resources.sandbox_id
-             where sandboxes.tenant_id = {p4}
+             where sandboxes.tenant_id = {p5}
              group by runtime_resources.status
              union all
              select 'archived_runtime_resources' as family, '' as label, count(*) as value
              from runtime_resources
              join sandboxes on sandboxes.id = runtime_resources.sandbox_id
-             where sandboxes.tenant_id = {p5}
+             where sandboxes.tenant_id = {p6}
                and sandboxes.state = 'archived'
                and runtime_resources.snapshot_id is null
                and runtime_resources.purpose <> 'snapshot'
@@ -364,34 +382,34 @@ pub(crate) async fn fetch_prometheus_metrics(
              select 'job_leases_active' as family, '' as label, count(*) as value
              from job_leases
              join jobs on jobs.id = job_leases.job_id
-             where job_leases.status = 'active' and jobs.tenant_id = {p6}
+             where job_leases.status = 'active' and jobs.tenant_id = {p7}
              union all
              select 'worker_capacity_slots' as family, '' as label, {worker_capacity_sum} as value
              from workers
-             where status = 'online' and tenant_id = {p7}
+             where status = 'online' and tenant_id = {p8}
              union all
              select 'worker_available_slots' as family, '' as label,
                     (select {worker_capacity_sum} from workers
-                     where status = 'online' and tenant_id = {p8})
+                     where status = 'online' and tenant_id = {p9})
                       - (select count(*) from job_leases join jobs on jobs.id = job_leases.job_id
                          where job_leases.status = 'active'
-                           and jobs.tenant_id = {p9}
+                           and jobs.tenant_id = {p10}
                            and jobs.kind != 'run_resident_process') as value
              union all
              select 'job_lease' as family, job_leases.status as label, count(*) as value
              from job_leases join jobs on jobs.id = job_leases.job_id
-             where jobs.tenant_id = {p10} group by job_leases.status
+             where jobs.tenant_id = {p11} group by job_leases.status
              union all
              select 'job_attempts' as family, '' as label, {job_attempts_sum} as value
-             from jobs where tenant_id = {p11}
+             from jobs where tenant_id = {p12}
              union all
              select 'idempotency_record' as family, state as label, count(*) as value
-             from idempotency_records where tenant_id = {p12} group by state
+             from idempotency_records where tenant_id = {p13} group by state
              union all
              select 'guest_token' as family,
                     case when revoked_at is null then 'issued' else 'revoked' end as label,
                     count(*) as value
-             from guest_tokens where tenant_id = {p13}
+             from guest_tokens where tenant_id = {p14}
              group by case when revoked_at is null then 'issued' else 'revoked' end
              order by family asc, label asc",
             p1 = db.placeholder(1),
@@ -407,12 +425,13 @@ pub(crate) async fn fetch_prometheus_metrics(
             p11 = db.placeholder(11),
             p12 = db.placeholder(12),
             p13 = db.placeholder(13),
+            p14 = db.placeholder(14),
         ),
     };
 
     let mut query = sqlx::query(&sql);
     if let Some(tenant_id) = tenant_id {
-        for _ in 0..13 {
+        for _ in 0..14 {
             query = query.bind(tenant_id.to_string());
         }
     }

@@ -166,6 +166,7 @@ async fn openapi_covers_every_public_v1_operation() {
         ),
         ("GET", "/v1/operator/tenant-policies/{tenant_id}"),
         ("PUT", "/v1/operator/tenant-policies/{tenant_id}"),
+        ("POST", "/v1/operator/home-mounts/reconcile"),
     ]
     .into_iter()
     .map(|(method, path)| (method.to_string(), path.to_string()))

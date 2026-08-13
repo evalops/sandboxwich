@@ -1663,6 +1663,7 @@ pub(crate) async fn reject_if_memory_exceeds_all_envelopes(
             max_ceiling.unwrap_or(0),
             evidence_age.unwrap_or_else(|| "unknown".into()),
         ),
+        details: None,
     })
 }
 

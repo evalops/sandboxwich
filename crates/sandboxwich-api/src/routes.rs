@@ -347,6 +347,7 @@ pub(crate) fn app(state: AppState) -> Router {
             "/tenant-policies/{tenant_id}",
             get(get_tenant_limit_policy).put(put_tenant_limit_policy),
         )
+        .route("/home-mounts/reconcile", post(reconcile_home_mounts))
         .route_layer(middleware::from_fn(require_tenant_principal));
 
     Router::new()

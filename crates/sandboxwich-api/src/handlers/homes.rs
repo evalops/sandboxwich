@@ -1,3 +1,4 @@
+use crate::auth::ensure_operator_authorized_for;
 use crate::authz::AuthorizationContext;
 use crate::db::Database;
 use crate::error::ApiError;
@@ -11,8 +12,14 @@ use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use chrono::Utc;
 use sandboxwich_core::*;
+use serde::Serialize;
+use serde_json::json;
 use sqlx::{AnyConnection, Row};
+use utoipa::ToSchema;
 use uuid::Uuid;
+
+const HOME_MOUNT_RECLAIMABLE_STATES_SQL: &str = "'archiving', 'archived', 'error'";
+const HOME_MOUNT_CLAIM_SAVEPOINT: &str = "sandbox_home_mount_claim";
 
 #[utoipa::path(post, path = "/v1/homes", request_body = CreateHomeRequest, responses((status = 201, body = HomeResponse), (status = 200, body = HomeResponse)))]
 pub(crate) async fn create_home(
@@ -246,6 +253,51 @@ pub(crate) async fn delete_home(
     ))
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct HomeMountReconciliationResponse {
+    pub(crate) ok: bool,
+    pub(crate) removed_mounts: u64,
+}
+
+/// Remove only mount rows whose sandbox lifecycle is already terminal. This
+/// is an idempotent, operator-gated repair for rows left behind by an
+/// interrupted teardown; it never changes a sandbox or home state and never
+/// touches a live mount.
+#[utoipa::path(
+    post,
+    path = "/v1/operator/home-mounts/reconcile",
+    tag = "operator",
+    responses(
+        (status = 200, body = HomeMountReconciliationResponse),
+        (status = 401, body = ErrorEnvelope)
+    )
+)]
+pub(crate) async fn reconcile_home_mounts(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<HomeMountReconciliationResponse>, ApiError> {
+    ensure_operator_authorized_for(
+        &state,
+        &headers,
+        "home mount reconciliation",
+        "/home-mounts/reconcile",
+    )?;
+    let sql = format!(
+        "delete from sandbox_home_mounts
+         where sandbox_id in (
+             select id from sandboxes where state in ({HOME_MOUNT_RECLAIMABLE_STATES_SQL})
+         )"
+    );
+    let result = sqlx::query(&sql).execute(&state.db.pool).await?;
+    let removed_mounts = result.rows_affected();
+    tracing::info!(removed_mounts, "home mount reconciliation completed");
+    Ok(Json(HomeMountReconciliationResponse {
+        ok: true,
+        removed_mounts,
+    }))
+}
+
 pub(crate) fn home_id_from_job(job: &Job) -> Result<HomeId, ApiError> {
     let value = job
         .payload
@@ -382,7 +434,7 @@ pub(crate) async fn claim_home_mount_on_connection(
     sandbox_id: SandboxId,
 ) -> Result<(), ApiError> {
     let cleanup_sql = format!(
-        "delete from sandbox_home_mounts where home_id = {} and sandbox_id in (select id from sandboxes where state in ('archiving', 'archived', 'error'))",
+        "delete from sandbox_home_mounts where home_id = {} and sandbox_id in (select id from sandboxes where state in ({HOME_MOUNT_RECLAIMABLE_STATES_SQL}))",
         db.placeholder(1)
     );
     sqlx::query(&cleanup_sql)
@@ -409,19 +461,105 @@ pub(crate) async fn claim_home_mount_on_connection(
         ));
     }
 
+    if let Some(mount) = fetch_home_mount_on_connection(db, connection, home_id, tenant_id).await? {
+        return Err(home_mount_conflict(Some(mount)));
+    }
+
     let insert_sql = format!(
         "insert into sandbox_home_mounts (sandbox_id, home_id, tenant_id, created_at) values ({})",
         db.placeholders(4)
     );
-    sqlx::query(&insert_sql)
+    sqlx::query(&format!("savepoint {HOME_MOUNT_CLAIM_SAVEPOINT}"))
+        .execute(&mut *connection)
+        .await?;
+    match sqlx::query(&insert_sql)
         .bind(sandbox_id.to_string())
         .bind(home_id.to_string())
         .bind(tenant_id)
         .bind(Utc::now().to_rfc3339())
         .execute(&mut *connection)
         .await
-        .map_err(|_| {
-            ApiError::conflict_code("home_already_mounted", "home already has a live sandbox")
-        })?;
-    Ok(())
+    {
+        Ok(_) => {
+            sqlx::query(&format!("release savepoint {HOME_MOUNT_CLAIM_SAVEPOINT}"))
+                .execute(&mut *connection)
+                .await?;
+            Ok(())
+        }
+        Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
+            sqlx::query(&format!(
+                "rollback to savepoint {HOME_MOUNT_CLAIM_SAVEPOINT}"
+            ))
+            .execute(&mut *connection)
+            .await?;
+            sqlx::query(&format!("release savepoint {HOME_MOUNT_CLAIM_SAVEPOINT}"))
+                .execute(&mut *connection)
+                .await?;
+            let mount = fetch_home_mount_on_connection(db, connection, home_id, tenant_id).await?;
+            Err(home_mount_conflict(mount))
+        }
+        Err(error) => {
+            let _ = sqlx::query(&format!(
+                "rollback to savepoint {HOME_MOUNT_CLAIM_SAVEPOINT}"
+            ))
+            .execute(&mut *connection)
+            .await;
+            let _ = sqlx::query(&format!("release savepoint {HOME_MOUNT_CLAIM_SAVEPOINT}"))
+                .execute(&mut *connection)
+                .await;
+            Err(error.into())
+        }
+    }
+}
+
+async fn fetch_home_mount_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+    home_id: HomeId,
+    tenant_id: &str,
+) -> Result<Option<HomeMount>, ApiError> {
+    let sql = format!(
+        "select m.sandbox_id, s.state
+         from sandbox_home_mounts m
+         join sandboxes s on s.id = m.sandbox_id
+         where m.home_id = {} and m.tenant_id = {}",
+        db.placeholder(1),
+        db.placeholder(2)
+    );
+    let Some(row) = sqlx::query(&sql)
+        .bind(home_id.to_string())
+        .bind(tenant_id)
+        .fetch_optional(&mut *connection)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let sandbox_id: String = row.try_get("sandbox_id")?;
+    let state: String = row.try_get("state")?;
+    Ok(Some(HomeMount {
+        sandbox_id: SandboxId(
+            Uuid::parse_str(&sandbox_id)
+                .map_err(|_| ApiError::internal("invalid mounted sandbox id"))?,
+        ),
+        sandbox_state: SandboxState::parse_db_str(&state)
+            .map_err(|error| ApiError::internal(error.to_string()))?,
+    }))
+}
+
+fn home_mount_conflict(mount: Option<HomeMount>) -> ApiError {
+    let details = mount
+        .as_ref()
+        .map(|mount| {
+            json!({
+                "mountedSandboxId": mount.sandbox_id,
+                "mountedSandboxState": mount.sandbox_state,
+                "reclaimable": mount.sandbox_state.clone().is_home_mount_reclaimable(),
+            })
+        })
+        .unwrap_or_else(|| json!({ "reclaimable": false }));
+    ApiError::conflict_code_with_details(
+        "home_already_mounted",
+        "home already has a mounted sandbox",
+        details,
+    )
 }

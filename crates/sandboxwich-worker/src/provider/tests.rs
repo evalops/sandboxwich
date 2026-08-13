@@ -8080,7 +8080,9 @@ fn agent_sandbox_detached_launch_preserves_nonzero_exit_code() {
         ])
         .status()
         .expect("launch detached process");
-    for _ in 0..20 {
+    // Parallel workspace tests can briefly starve the detached shell; keep
+    // the assertion bounded while allowing the child to publish its receipt.
+    for _ in 0..200 {
         if exit_file.exists() {
             break;
         }

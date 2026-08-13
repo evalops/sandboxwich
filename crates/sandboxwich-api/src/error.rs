@@ -41,6 +41,7 @@ pub(crate) struct ApiError {
     pub(crate) status: StatusCode,
     pub(crate) code: &'static str,
     pub(crate) message: String,
+    pub(crate) details: Option<serde_json::Value>,
 }
 
 impl ApiError {
@@ -49,6 +50,7 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             code: "bad_request",
             message: message.into(),
+            details: None,
         }
     }
 
@@ -60,6 +62,7 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             code,
             message: message.into(),
+            details: None,
         }
     }
 
@@ -68,6 +71,7 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             code: "not_found",
             message: message.into(),
+            details: None,
         }
     }
 
@@ -76,6 +80,7 @@ impl ApiError {
             status: StatusCode::UNAUTHORIZED,
             code: "unauthorized",
             message: message.into(),
+            details: None,
         }
     }
 
@@ -84,6 +89,7 @@ impl ApiError {
             status: StatusCode::FORBIDDEN,
             code: "authorization_denied",
             message: message.into(),
+            details: None,
         }
     }
 
@@ -92,6 +98,7 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             code: "conflict",
             message: message.into(),
+            details: None,
         }
     }
 
@@ -100,6 +107,20 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             code,
             message: message.into(),
+            details: None,
+        }
+    }
+
+    pub(crate) fn conflict_code_with_details(
+        code: &'static str,
+        message: impl Into<String>,
+        details: serde_json::Value,
+    ) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code,
+            message: message.into(),
+            details: Some(details),
         }
     }
 
@@ -108,6 +129,7 @@ impl ApiError {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             code,
             message: message.into(),
+            details: None,
         }
     }
 
@@ -116,6 +138,7 @@ impl ApiError {
             status: StatusCode::TOO_MANY_REQUESTS,
             code,
             message: message.into(),
+            details: None,
         }
     }
 
@@ -124,6 +147,7 @@ impl ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "internal",
             message: message.into(),
+            details: None,
         }
     }
 
@@ -132,6 +156,7 @@ impl ApiError {
             status: StatusCode::NOT_IMPLEMENTED,
             code,
             message: message.into(),
+            details: None,
         }
     }
 }
@@ -168,7 +193,11 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (
             self.status,
-            Json(ErrorEnvelope::new(self.code, self.message)),
+            Json(ErrorEnvelope::with_details(
+                self.code,
+                self.message,
+                self.details,
+            )),
         )
             .into_response()
     }

@@ -209,6 +209,7 @@ fn classify_live_error(error: ApiError) -> ApiError {
             status: error.status,
             code: NOT_LIVE,
             message: "Maestro activation authority was not found".into(),
+            details: None,
         };
     }
     ApiError::conflict_code(NOT_LIVE, "Maestro activation tuple is not live")
@@ -442,6 +443,7 @@ async fn lock_activation_sources(
             status: axum::http::StatusCode::NOT_FOUND,
             code: NOT_LIVE,
             message: "Maestro activation authority was not found".into(),
+            details: None,
         });
     }
     let placement_lock_sql = format!(
