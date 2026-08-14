@@ -673,6 +673,14 @@ impl SandboxState {
         SandboxState::Error,
     ];
 
+    /// A `ProvisionSandbox` job that exhausts its retries moves only a still-
+    /// pending sandbox to `Error`. A failed reprovision must not discard an
+    /// already usable `Ready`/`Running`/`Idle` sandbox, while leaving a new
+    /// sandbox in `Planning` or `Provisioning` would retain its home mount
+    /// forever with no job left that can make it ready.
+    pub const PROVISION_FAILED_LEGAL_FROM: &'static [SandboxState] =
+        &[SandboxState::Planning, SandboxState::Provisioning];
+
     /// A child sandbox still `Planning` (queued, waiting on its parent's
     /// snapshot) moves to `Error` when that parent's `CreateSnapshot` job
     /// fails.
@@ -685,11 +693,11 @@ impl SandboxState {
     /// |--------------|--------------|-------------------------------------------------------|
     /// | Planning     | Provisioning | `ForkSandbox` job claimed                              |
     /// | Planning     | Ready        | `ProvisionSandbox` job completed                       |
-    /// | Planning     | Error        | parent `CreateSnapshot` job failed                     |
+    /// | Planning     | Error        | parent snapshot or sandbox provision permanently failed |
     /// | Planning     | Archiving    | user stop requested                                    |
     /// | Provisioning | Ready        | `ForkSandbox`/`ProvisionSandbox`/`ResumeSandbox` completed |
     /// | Provisioning | Planning     | `ForkSandbox` job retried                              |
-    /// | Provisioning | Error        | `ForkSandbox` job permanently failed                    |
+    /// | Provisioning | Error        | fork or sandbox provision permanently failed             |
     /// | Provisioning | Archiving    | user stop requested                                    |
     /// | Provisioning | Archived     | `ResumeSandbox` job permanently failed                  |
     /// | Ready        | Ready        | `ProvisionSandbox` job completed (reprovision, no-op)   |
@@ -720,6 +728,7 @@ impl SandboxState {
             || (Self::FORK_RETRIED_LEGAL_FROM.contains(self) && *next == SandboxState::Planning)
             || (Self::FORK_FAILED_LEGAL_FROM.contains(self) && *next == SandboxState::Error)
             || (Self::PROVISION_COMPLETED_LEGAL_FROM.contains(self) && *next == SandboxState::Ready)
+            || (Self::PROVISION_FAILED_LEGAL_FROM.contains(self) && *next == SandboxState::Error)
             || (Self::SNAPSHOT_FAILED_CHILD_LEGAL_FROM.contains(self)
                 && *next == SandboxState::Error)
             || (Self::RESUME_LEGAL_FROM.contains(self) && *next == SandboxState::Provisioning)
@@ -5330,6 +5339,14 @@ mod tests {
                  completing ProvisionSandbox job: {from:?} should be {expected}"
             );
         }
+    }
+
+    #[test]
+    fn provision_failure_terminalizes_only_pending_sandboxes() {
+        assert_eq!(
+            SandboxState::PROVISION_FAILED_LEGAL_FROM,
+            [SandboxState::Planning, SandboxState::Provisioning].as_slice()
+        );
     }
 
     #[test]
