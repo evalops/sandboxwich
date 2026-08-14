@@ -1,5 +1,5 @@
 agents:
-  queue: "linux-medium"
+  queue: "hetzner-linux-medium"
   image: "evalops-platform-ci-v3"
 
 env:
@@ -24,7 +24,7 @@ steps:
     key: "tests"
     timeout_in_minutes: 90
     agents:
-      queue: "linux-large"
+      queue: "hetzner-linux-heavy"
       image: "evalops-platform-ci-v3"
     cache:
       name: "sandboxwich-tests-${BUILDKITE_PULL_REQUEST}"
@@ -36,7 +36,7 @@ steps:
     key: "clippy"
     timeout_in_minutes: 90
     agents:
-      queue: "linux-large"
+      queue: "hetzner-linux-heavy"
       image: "evalops-platform-ci-v3"
     cache:
       name: "sandboxwich-clippy-${BUILDKITE_PULL_REQUEST}"
