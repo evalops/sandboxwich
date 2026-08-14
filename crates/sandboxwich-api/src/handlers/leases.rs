@@ -3432,7 +3432,28 @@ pub(crate) async fn apply_failed_job_on_connection(
             )
             .await?;
         }
-        JobKind::ProvisionSandbox | JobKind::StopSandbox => {
+        JobKind::ProvisionSandbox => {
+            crate::sterile_pool::quarantine_failed_pool_job_on_connection(
+                db, connection, job, error,
+            )
+            .await?;
+            let sandbox_id = sandbox_id_from_job(job)?;
+            let next_state = SandboxState::Error;
+            set_sandbox_state_on_connection(
+                db,
+                connection,
+                sandbox_id,
+                SandboxState::PROVISION_FAILED_LEGAL_FROM,
+                next_state.clone(),
+                json!({
+                    "state": next_state,
+                    "reason": "provision_failed",
+                    "error": error
+                }),
+            )
+            .await?;
+        }
+        JobKind::StopSandbox => {
             crate::sterile_pool::quarantine_failed_pool_job_on_connection(
                 db, connection, job, error,
             )

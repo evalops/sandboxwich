@@ -2233,6 +2233,69 @@ async fn seed_sandbox_with_state(db: &Database, state: SandboxState) -> Sandbox 
     sandbox
 }
 
+#[tokio::test]
+async fn exhausted_provision_failure_terminalizes_the_pending_sandbox() {
+    let db = test_sqlite_db().await;
+    let sandbox = seed_sandbox_with_state(&db, SandboxState::Planning).await;
+    let worker_id = seed_worker(&db).await;
+    let now = Utc::now();
+    let job = Job {
+        id: JobId::new(),
+        tenant_id: sandbox.tenant_id.clone(),
+        kind: JobKind::ProvisionSandbox,
+        status: JobStatus::Leased,
+        payload: json!({ "sandboxId": sandbox.id }),
+        required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
+        priority: 0,
+        attempts: 3,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+    };
+    insert_job(&db, &job).await.expect("insert provision job");
+    let lease_id = LeaseId::new();
+    seed_expired_active_lease(
+        &db,
+        lease_id,
+        job.id,
+        worker_id,
+        now + chrono::Duration::minutes(1),
+    )
+    .await;
+
+    let failed = fail_lease_in_transaction(
+        &db,
+        lease_id,
+        true,
+        "provider_transient: cloudflare_create_outcome_unknown",
+    )
+    .await
+    .expect("terminal provision failure");
+    assert_eq!(failed.job.status, JobStatus::Failed);
+
+    let stored = fetch_sandbox(&db, sandbox.id).await.expect("fetch sandbox");
+    assert_eq!(
+        stored.state,
+        SandboxState::Error,
+        "an exhausted provision job must not leave its home-mounted sandbox pending forever"
+    );
+    let event: String = sqlx::query_scalar(
+        "select data from sandbox_events where sandbox_id = ? and kind = ? order by created_at desc limit 1",
+    )
+    .bind(sandbox.id.to_string())
+    .bind("lifecycle_changed")
+    .fetch_one(&db.pool)
+    .await
+    .expect("provision failure lifecycle event");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&event).unwrap()["reason"],
+        "provision_failed"
+    );
+}
+
 async fn insert_test_command(db: &Database, sandbox_id: SandboxId, created_at: DateTime<Utc>) {
     let mut tx = db.pool.begin().await.expect("begin command insert");
     insert_command_on_connection(
