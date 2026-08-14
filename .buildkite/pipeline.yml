@@ -1,0 +1,62 @@
+agents:
+  queue: "linux-medium"
+  image: "evalops-platform-ci-v3"
+
+env:
+  CI: "true"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_TARGET_DIR: ".buildkite/cache/cargo-target"
+
+steps:
+  - label: ":rust: Format and repository contracts"
+    key: "contracts"
+    timeout_in_minutes: 45
+    command: |
+      set -euo pipefail
+      cargo fmt --all -- --check
+      python3 scripts/test-repository-rules.py
+      python3 scripts/test-deployment-images.py
+      python3 scripts/test-release-readiness.py
+      python3 scripts/test-authz-proof.py
+
+  - label: ":test_tube: Rust workspace tests"
+    key: "tests"
+    timeout_in_minutes: 90
+    agents:
+      queue: "linux-large"
+      image: "evalops-platform-ci-v3"
+    cache:
+      name: "sandboxwich-tests-${BUILDKITE_PULL_REQUEST}"
+      size: "50g"
+      paths: [".buildkite/cache"]
+    command: cargo test --workspace --locked
+
+  - label: ":lint-roller: Clippy"
+    key: "clippy"
+    timeout_in_minutes: 90
+    agents:
+      queue: "linux-large"
+      image: "evalops-platform-ci-v3"
+    cache:
+      name: "sandboxwich-clippy-${BUILDKITE_PULL_REQUEST}"
+      size: "50g"
+      paths: [".buildkite/cache"]
+    command: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  - label: ":lock: Dependency audit"
+    key: "audit"
+    timeout_in_minutes: 30
+    command: |
+      set -euo pipefail
+      cargo install cargo-audit --locked
+      cargo audit --ignore RUSTSEC-2023-0071
+
+  - label: ":construction: Minimum Rust 1.95"
+    key: "msrv"
+    timeout_in_minutes: 60
+    cache:
+      name: "sandboxwich-msrv-${BUILDKITE_PULL_REQUEST}"
+      size: "30g"
+      paths: [".buildkite/cache"]
+    command: cargo check --workspace --all-targets --locked
