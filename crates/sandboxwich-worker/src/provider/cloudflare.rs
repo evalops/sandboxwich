@@ -120,6 +120,7 @@ trait CloudflareBridge: Send + Sync {
         request: &AgentCommandRequest,
     ) -> anyhow::Result<BridgeExecResult>;
     fn delete(&self, external_id: &str, routing_scope: &str) -> anyhow::Result<()>;
+    fn delete_recover(&self, external_id: &str, tenant_hint: &str) -> anyhow::Result<()>;
     fn health(&self) -> anyhow::Result<()>;
 }
 
@@ -186,6 +187,26 @@ impl HttpCloudflareBridge {
             .bearer_auth(&self.config.api_token)
             .header("x-organization-id", organization_id)
             .header("x-workspace-id", workspace_id))
+    }
+
+    fn recovery_request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        external_id: &str,
+        tenant_hint: &str,
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
+        anyhow::ensure!(
+            !tenant_hint.trim().is_empty() && !tenant_hint.chars().any(char::is_whitespace),
+            "Cloudflare recovery tenant hint is required"
+        );
+        Ok(self
+            .client
+            .request(method, api_endpoint(&self.config.base_url, path))
+            .bearer_auth(&self.config.api_token)
+            .header("x-sandboxwich-recover-identity", "stored")
+            .header("x-sandboxwich-sandbox-id", external_id)
+            .header("x-sandboxwich-recovery-tenant", tenant_hint))
     }
 
     async fn response_body(mut response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
@@ -360,6 +381,30 @@ impl CloudflareBridge for HttpCloudflareBridge {
                 .send()
                 .await
                 .context("Cloudflare Bridge request failed")
+        });
+        match response {
+            Ok(response) => match self.block_on(Self::response_body(response)) {
+                Ok(_) => Ok(()),
+                Err(error)
+                    if error
+                        .downcast_ref::<CloudflareHttpError>()
+                        .is_some_and(|e| e.status == 404) =>
+                {
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        }
+    }
+
+    fn delete_recover(&self, external_id: &str, tenant_hint: &str) -> anyhow::Result<()> {
+        let path = format!("/sandbox/{external_id}");
+        let response = self.block_on(async {
+            self.recovery_request(reqwest::Method::DELETE, &path, external_id, tenant_hint)?
+                .send()
+                .await
+                .context("Cloudflare Bridge recovery request failed")
         });
         match response {
             Ok(response) => match self.block_on(Self::response_body(response)) {
@@ -845,10 +890,16 @@ impl SandboxProvider for CloudflareSandboxProvider {
         let routing_scope = spec
             .provider_routing_scope
             .as_deref()
-            .context("Cloudflare stop requires persisted routing scope")?;
-        self.bridge
-            .delete(external_id, routing_scope)
-            .map_err(Self::provider_error)
+            .context("Cloudflare stop requires persisted routing scope or tenant hint")?;
+        if split_tenant_scope(routing_scope).is_some() {
+            self.bridge
+                .delete(external_id, routing_scope)
+                .map_err(Self::provider_error)
+        } else {
+            self.bridge
+                .delete_recover(&stable_external_id, routing_scope)
+                .map_err(Self::provider_error)
+        }
     }
 }
 
@@ -907,6 +958,16 @@ impl CloudflareBridge for FakeBridge {
             .lock()
             .unwrap()
             .push(format!("delete:{external_id}:{routing_scope}"));
+        if self.delete_fails {
+            anyhow::bail!("bridge unavailable");
+        }
+        Ok(())
+    }
+    fn delete_recover(&self, external_id: &str, tenant_hint: &str) -> anyhow::Result<()> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("delete-recover:{external_id}:{tenant_hint}"));
         if self.delete_fails {
             anyhow::bail!("bridge unavailable");
         }
@@ -1186,6 +1247,34 @@ mod tests {
     }
 
     #[test]
+    fn cloudflare_stop_recovers_legacy_tenant_from_bridge_stored_identity() {
+        let bridge = Arc::new(FakeBridge::default());
+        let provider = CloudflareSandboxProvider {
+            bridge: bridge.clone(),
+            readiness_timeout: Duration::from_millis(100),
+            replay_ledger_configured: true,
+        };
+        let sandbox_id = SandboxId::new();
+
+        provider
+            .stop(
+                sandbox_id,
+                &SandboxTeardownSpec {
+                    delete_gke_fqdn_policy: false,
+                    provider_external_id: None,
+                    provider_routing_scope: Some("evalops-platform".into()),
+                },
+                &CancelSignal::never_cancelled(),
+            )
+            .expect("legacy tenant hints must recover the stored bridge identity");
+
+        assert_eq!(
+            bridge.calls.lock().unwrap().as_slice(),
+            [format!("delete-recover:{sandbox_id}:evalops-platform")]
+        );
+    }
+
+    #[test]
     fn cloudflare_stop_keeps_bridge_failures_retryable_after_identity_recovery() {
         let provider = CloudflareSandboxProvider {
             bridge: Arc::new(FakeBridge {
@@ -1202,7 +1291,7 @@ mod tests {
                 &SandboxTeardownSpec {
                     delete_gke_fqdn_policy: false,
                     provider_external_id: None,
-                    provider_routing_scope: Some("org:workspace".into()),
+                    provider_routing_scope: Some("evalops-platform".into()),
                 },
                 &CancelSignal::never_cancelled(),
             )

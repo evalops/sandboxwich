@@ -37,6 +37,18 @@ export function requestIdentity(request, sandboxId) {
   return { organizationId, workspaceId, sandboxId };
 }
 
+export function recoveryIdentityRequest(request, sandboxId) {
+  if (request.headers.get("x-sandboxwich-recover-identity") !== "stored") return null;
+  if (request.headers.get("x-sandboxwich-sandbox-id") !== sandboxId) {
+    throw new BridgeContractError("sandbox_identity_mismatch", 409);
+  }
+  const tenantHint = request.headers.get("x-sandboxwich-recovery-tenant") ?? "";
+  if (!OPAQUE_ID.test(tenantHint)) {
+    throw new BridgeContractError("recovery_tenant_invalid", 400);
+  }
+  return { tenantHint };
+}
+
 export function normalizeCommand(body, identity, commandId) {
   if (!OPAQUE_ID.test(commandId)) throw new BridgeContractError("command_id_invalid", 400);
   if (!body || !Array.isArray(body.argv) || body.argv.length === 0 || body.argv.length > 256) {

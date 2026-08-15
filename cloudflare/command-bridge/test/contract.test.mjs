@@ -6,6 +6,7 @@ import {
   attachIntentDigest,
   capabilityReport,
   normalizeCommand,
+  recoveryIdentityRequest,
 } from "../src/contract.mjs";
 
 const bindings = {
@@ -14,6 +15,25 @@ const bindings = {
   DEX_COMPUTER_HOME: {},
   BRIDGE_TOKEN: "a-production-length-secret",
 };
+
+test("stored identity recovery is fenced by stable sandbox id and tenant hint", () => {
+  const request = new Request("https://bridge/v1/sandbox/sandbox-1", {
+    method: "DELETE",
+    headers: {
+      "x-sandboxwich-recover-identity": "stored",
+      "x-sandboxwich-sandbox-id": "sandbox-1",
+      "x-sandboxwich-recovery-tenant": "evalops-platform",
+    },
+  });
+
+  assert.deepEqual(recoveryIdentityRequest(request, "sandbox-1"), {
+    tenantHint: "evalops-platform",
+  });
+  assert.throws(
+    () => recoveryIdentityRequest(request, "sandbox-other"),
+    (error) => error instanceof BridgeContractError && error.code === "sandbox_identity_mismatch",
+  );
+});
 
 test("command capability is absent when any durable binding is missing", () => {
   for (const missing of Object.keys(bindings)) {

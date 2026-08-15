@@ -9,6 +9,7 @@ import {
   capabilityReport,
   jsonError,
   normalizeCommand,
+  recoveryIdentityRequest,
   requestIdentity,
 } from "./contract.mjs";
 import { DurableCommandLedger, DurableSandboxLedger, LedgerConflict } from "./ledger.mjs";
@@ -163,10 +164,22 @@ export class CommandLedger extends DurableObject<Env> {
   }
 
   private async destroySandbox(request: Request, sandboxId: string): Promise<Response> {
-    const identity = await this.requireStoredIdentity(request, sandboxId);
+    const recovery = recoveryIdentityRequest(request, sandboxId);
+    const identity = recovery
+      ? await this.requireRecoveryStoredIdentity(sandboxId)
+      : await this.requireStoredIdentity(request, sandboxId);
     await this.sandboxFor(identity).destroy();
     await this.ctx.storage.delete("sandbox:home-mounted");
     return Response.json({ ok: true, sandboxId });
+  }
+
+  private async requireRecoveryStoredIdentity(sandboxId: string) {
+    const stored = await new DurableSandboxLedger(this.ctx.storage).get();
+    if (!stored) throw new BridgeContractError("sandbox_not_found", 404);
+    if (stored.sandboxId !== sandboxId) {
+      throw new BridgeContractError("sandbox_identity_conflict", 409);
+    }
+    return stored;
   }
 
   private async requireStoredIdentity(request: Request, sandboxId: string) {
