@@ -29,10 +29,7 @@
         "do_not_enforce_on_create": false,
         "strict_required_status_checks_policy": true,
         "required_status_checks": [
-          {"context": "rust"},
-          {"context": "clippy"},
-          {"context": "audit"},
-          {"context": "msrv (1.95)"},
+          {"context": "buildkite/sandboxwich-ci"},
           {"context": "service image (sandboxwich-api)"},
           {"context": "service image (sandboxwich-worker)"},
           {"context": "runtime image (ubuntu-dev)"}
