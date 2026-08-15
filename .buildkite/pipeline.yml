@@ -32,7 +32,7 @@ steps:
     key: "tests"
     timeout_in_minutes: 90
     concurrency: 2
-    concurrency_group: "sandboxwich-heavy"
+    concurrency_group: "hetzner-linux-heavy-workloads"
     retry:
       automatic:
         - exit_status: -1
@@ -101,7 +101,7 @@ steps:
     key: "clippy"
     timeout_in_minutes: 90
     concurrency: 2
-    concurrency_group: "sandboxwich-heavy"
+    concurrency_group: "hetzner-linux-heavy-workloads"
     retry:
       automatic:
         - exit_status: -1
