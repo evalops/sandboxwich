@@ -41,7 +41,10 @@ class RepositoryRulesTest(unittest.TestCase):
 
     def test_buildkite_heavy_jobs_leave_shared_capacity_available(self) -> None:
         pipeline = (ROOT / ".buildkite/pipeline.yml").read_text()
-        self.assertEqual(pipeline.count('concurrency_group: "sandboxwich-heavy"'), 2)
+        self.assertEqual(
+            pipeline.count('concurrency_group: "hetzner-linux-heavy-workloads"'),
+            2,
+        )
         self.assertEqual(pipeline.count("concurrency: 2"), 2)
 
     def test_buildkite_retries_only_agent_loss_or_stop(self) -> None:
