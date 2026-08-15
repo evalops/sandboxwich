@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sandboxwich.dev/contracts/release-conformance.v1.json",
+  "title": "Sandboxwich release conformance attestation v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "commit",
+    "workflow",
+    "workflowRunId",
+    "workflowRunUrl",
+    "conclusion",
+    "verifiedAt"
+  ],
+  "properties": {
+    "schema": {
+      "const": "sandboxwich.release-conformance.v1"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "workflow": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255
+    },
+    "workflowRunId": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "workflowRunUrl": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://github\\.com/evalops/sandboxwich/actions/runs/[0-9]+$"
+    },
+    "conclusion": {
+      "const": "success"
+    },
+    "verifiedAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}
