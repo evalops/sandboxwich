@@ -81,7 +81,7 @@ async fn managed_home_preserves_explicit_cloudflare_provider_preference() {
         "sqlite://{}",
         data_dir.path().join("managed-home-provider.db").display()
     );
-    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let server = TestServer::start_with_provider_routing_auth(database_url, Some(data_dir)).await;
     let client = server.client();
     let home: HomeResponse = client
         .post(format!("{}/homes", server.base_url))
@@ -130,6 +130,7 @@ async fn managed_home_preserves_explicit_cloudflare_provider_preference() {
             "{}/homes/{}/sandboxes",
             server.base_url, home.home.id
         ))
+        .header("x-sandboxwich-provider-routing-scope", "org_1:workspace_1")
         .json(&request)
         .send()
         .await

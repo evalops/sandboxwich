@@ -369,6 +369,7 @@ mod tests {
             auth: AuthConfig {
                 shared_token: None,
                 tenant_tokens: vec![],
+                provider_routing_tokens: vec![],
                 operator_token: None,
                 allow_insecure_no_auth: false,
             },

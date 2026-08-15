@@ -1,4 +1,4 @@
-use crate::auth::ensure_operator_authorized_for;
+use crate::auth::{ProviderRoutingScope, ensure_operator_authorized_for};
 use crate::authz::AuthorizationContext;
 use crate::db::Database;
 use crate::error::ApiError;
@@ -142,10 +142,11 @@ pub(crate) async fn get_home(
     }))
 }
 
-#[utoipa::path(post, path = "/v1/homes/{home_id}/sandboxes", params(("home_id" = Uuid, Path)), request_body = CreateSandboxRequest, responses((status = 202, body = SandboxResponse), (status = 404), (status = 409)))]
+#[utoipa::path(post, path = "/v1/homes/{home_id}/sandboxes", params(("home_id" = Uuid, Path), ("X-Sandboxwich-Provider-Routing-Scope" = Option<String>, Header, description = "Required for cloudflare placement; exact organization:workspace provider scope")), request_body = CreateSandboxRequest, responses((status = 202, body = SandboxResponse), (status = 404), (status = 409)))]
 pub(crate) async fn create_home_sandbox(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
+    Extension(provider_routing_scope): Extension<ProviderRoutingScope>,
     Extension(authorization): Extension<AuthorizationContext>,
     Extension(trace): Extension<RequestTrace>,
     Path(home_id): Path<Uuid>,
@@ -158,6 +159,7 @@ pub(crate) async fn create_home_sandbox(
         Some(HomeId(home_id)),
         Some(authorization),
         trace,
+        provider_routing_scope,
     )
     .await
 }

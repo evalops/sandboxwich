@@ -189,6 +189,16 @@ impl HttpCloudflareBridge {
             .header("x-workspace-id", workspace_id))
     }
 
+    fn routing_scope(spec: &SandboxProvisionSpec) -> anyhow::Result<String> {
+        let scope = spec
+            .provider_routing_scope
+            .as_deref()
+            .context("Cloudflare provider routing scope is required")?;
+        split_tenant_scope(scope)
+            .context("Cloudflare provider routing scope must be exactly organization:workspace")?;
+        Ok(scope.to_string())
+    }
+
     fn recovery_request(
         &self,
         method: reqwest::Method,
@@ -274,17 +284,11 @@ impl CloudflareBridge for HttpCloudflareBridge {
         spec: &SandboxProvisionSpec,
         create_key: &str,
     ) -> anyhow::Result<BridgeSandbox> {
-        let scope = spec.tenant_id.as_deref().unwrap_or_default().to_string();
-        anyhow::ensure!(
-            spec.tenant_id
-                .as_deref()
-                .is_some_and(|id| !id.trim().is_empty()),
-            "Cloudflare tenant scope is required"
-        );
+        let scope = Self::routing_scope(spec)?;
         let body = json!({
             "sandboxId": sandbox_id,
             "homeId": home_id,
-            "tenantId": spec.tenant_id,
+            "tenantId": scope,
             "memoryLimit": spec.memory_limit,
             "networkEgress": spec.network_egress,
         });
@@ -689,22 +693,27 @@ impl CloudflareSandboxProvider {
             spec.provider_preference == ProviderPreference::Cloudflare,
             "Cloudflare worker received a non-Cloudflare placement request"
         );
-        anyhow::ensure!(
-            spec.tenant_id
-                .as_deref()
-                .is_some_and(|id| !id.trim().is_empty()),
-            "Cloudflare tenant scope is required"
-        );
+        let routing_scope = spec
+            .provider_routing_scope
+            .as_deref()
+            .filter(|scope| split_tenant_scope(scope).is_some())
+            .ok_or_else(|| {
+                anyhow::Error::new(ProviderError::classified(
+                    ProvisioningErrorClass::TerminalContract,
+                    LifecycleReasonCode::ResourceContractConflict,
+                    anyhow::anyhow!(
+                        "Cloudflare provider routing scope must be exactly organization:workspace"
+                    ),
+                ))
+            })?;
+        debug_assert!(!routing_scope.is_empty());
         anyhow::ensure!(!cancelled.is_cancelled(), "Cloudflare provision cancelled");
         let create_key = create_idempotency_key(sandbox_id);
         let sandbox = self
             .bridge
             .create(sandbox_id, home_id, spec, &create_key)
             .map_err(|error| {
-                if error
-                    .downcast_ref::<CloudflareHttpError>()
-                    .is_some_and(|http| http.code == "capacity_exceeded" || http.status == 429)
-                {
+                if error.downcast_ref::<CloudflareHttpError>().is_some() {
                     Self::provider_error(error)
                 } else {
                     anyhow::Error::new(ProviderError::retryable(anyhow::anyhow!(
@@ -948,7 +957,11 @@ impl CloudflareBridge for FakeBridge {
                 .create_external_id
                 .clone()
                 .unwrap_or_else(|| sandbox_id.to_string()),
-            routing_scope: spec.tenant_id.as_deref().unwrap_or("missing").to_string(),
+            routing_scope: spec
+                .provider_routing_scope
+                .as_deref()
+                .unwrap_or("missing")
+                .to_string(),
         })
     }
     fn ready(&self, external_id: &str, _routing_scope: &str) -> anyhow::Result<bool> {
@@ -1012,6 +1025,7 @@ mod tests {
         let spec = SandboxProvisionSpec {
             provider_preference: ProviderPreference::Cloudflare,
             tenant_id: Some("org:workspace".into()),
+            provider_routing_scope: Some("org:workspace".into()),
             workspace_mode: WorkspaceMode::Persistent,
             ..Default::default()
         };
@@ -1033,6 +1047,46 @@ mod tests {
         assert_eq!(handle.sandbox_id, sandbox_id);
         assert_eq!(handle.metadata["homeId"], home_id.to_string());
         assert_eq!(stages.last(), Some(&ProvisioningStage::SandboxReady));
+    }
+
+    #[test]
+    fn cloudflare_create_uses_provider_routing_scope_not_control_plane_tenant() {
+        let provider = CloudflareSandboxProvider::for_test_with_replay_ledger();
+        let spec = SandboxProvisionSpec {
+            provider_preference: ProviderPreference::Cloudflare,
+            tenant_id: Some("evalops-platform".into()),
+            provider_routing_scope: Some("org_1:workspace_1".into()),
+            workspace_mode: WorkspaceMode::Persistent,
+            ..Default::default()
+        };
+
+        let handle = provider
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+            .expect("authenticated control-plane tenant and provider routing scope are distinct");
+
+        assert_eq!(handle.resources[0].namespace, "org_1:workspace_1");
+    }
+
+    #[test]
+    fn cloudflare_missing_provider_routing_scope_is_terminal_contract_failure_before_create() {
+        let provider = CloudflareSandboxProvider::for_test_with_replay_ledger();
+        let spec = SandboxProvisionSpec {
+            provider_preference: ProviderPreference::Cloudflare,
+            tenant_id: Some("evalops-platform".into()),
+            workspace_mode: WorkspaceMode::Persistent,
+            ..Default::default()
+        };
+
+        let error = provider
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+            .expect_err("missing routing scope must fail before a bridge request");
+        let provider_error = error.downcast_ref::<ProviderError>().unwrap();
+        assert_eq!(
+            provider_error.error_class(),
+            ProvisioningErrorClass::TerminalContract
+        );
+        assert_eq!(provider_error.reason_code(), "resource_contract_conflict");
+        assert!(error.to_string().contains("provider routing scope"));
     }
 
     #[test]
@@ -1087,10 +1141,14 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let sandbox_id = SandboxId::new();
         let response_body = format!(r#"{{"id":"{sandbox_id}"}}"#);
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request).unwrap();
+            let request_len = stream.read(&mut request).unwrap();
+            request_tx
+                .send(String::from_utf8_lossy(&request[..request_len]).into_owned())
+                .unwrap();
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1111,7 +1169,8 @@ mod tests {
         .unwrap();
         let spec = SandboxProvisionSpec {
             provider_preference: ProviderPreference::Cloudflare,
-            tenant_id: Some("org:workspace".into()),
+            tenant_id: Some("evalops-platform".into()),
+            provider_routing_scope: Some("org:workspace".into()),
             ..Default::default()
         };
 
@@ -1119,6 +1178,11 @@ mod tests {
             .create(sandbox_id, None, &spec, "stable-create-key")
             .expect("response body must remain readable after response headers arrive");
         assert_eq!(created.external_id, sandbox_id.to_string());
+        let request = request_rx.recv().unwrap().to_ascii_lowercase();
+        assert!(request.contains("x-organization-id: org"));
+        assert!(request.contains("x-workspace-id: workspace"));
+        assert!(request.contains("\"tenantid\":\"org:workspace\""));
+        assert!(!request.contains("\"tenantid\":\"evalops-platform\""));
         server.join().unwrap();
     }
 
@@ -1171,6 +1235,7 @@ mod tests {
         let mut spec = SandboxProvisionSpec {
             provider_preference: ProviderPreference::Cloudflare,
             tenant_id: Some("org:workspace".into()),
+            provider_routing_scope: Some("org:workspace".into()),
             ..Default::default()
         };
         let handle = provider
@@ -1353,6 +1418,7 @@ mod tests {
         let spec = SandboxProvisionSpec {
             provider_preference: ProviderPreference::Cloudflare,
             tenant_id: Some("org:workspace".into()),
+            provider_routing_scope: Some("org:workspace".into()),
             ..Default::default()
         };
 
@@ -1380,6 +1446,7 @@ mod tests {
         let spec = SandboxProvisionSpec {
             provider_preference: ProviderPreference::Cloudflare,
             tenant_id: Some("org:workspace".into()),
+            provider_routing_scope: Some("org:workspace".into()),
             ..Default::default()
         };
 
@@ -1412,6 +1479,7 @@ mod tests {
         let scoped = SandboxProvisionSpec {
             provider_preference: ProviderPreference::Cloudflare,
             tenant_id: Some("org:workspace".into()),
+            provider_routing_scope: Some("org:workspace".into()),
             ..Default::default()
         };
         let handle = provider

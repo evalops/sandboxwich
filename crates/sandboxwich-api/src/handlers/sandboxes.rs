@@ -230,15 +230,15 @@ pub(crate) fn looks_like_cidr(value: &str) -> bool {
     }
 }
 
-#[utoipa::path(post, path = "/v1/sandboxes", request_body = CreateSandboxRequest, responses((status = 202, description = "Sandbox provisioning accepted", body = SandboxResponse), (status = 400, body = ErrorEnvelope)))]
+#[utoipa::path(post, path = "/v1/sandboxes", params(("X-Sandboxwich-Provider-Routing-Scope" = Option<String>, Header, description = "Required for cloudflare placement; exact organization:workspace provider scope")), request_body = CreateSandboxRequest, responses((status = 202, description = "Sandbox provisioning accepted", body = SandboxResponse), (status = 400, body = ErrorEnvelope)))]
 pub(crate) async fn create_sandbox(
     State(state): State<AppState>,
     Extension(ctx): Extension<TenantContext>,
+    Extension(provider_routing_scope): Extension<ProviderRoutingScope>,
     Extension(authorization): Extension<AuthorizationContext>,
     Extension(trace): Extension<RequestTrace>,
     Json(request): Json<CreateSandboxRequest>,
 ) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
-    let provider_preference = request.provider_preference.clone().unwrap_or_default();
     create_sandbox_with_home_and_provider(
         state,
         ctx,
@@ -246,7 +246,7 @@ pub(crate) async fn create_sandbox(
         None,
         Some(authorization),
         trace,
-        provider_preference,
+        provider_routing_scope,
     )
     .await
 }
@@ -258,8 +258,8 @@ pub(crate) async fn create_sandbox_with_home(
     home_id: Option<HomeId>,
     authorization: Option<AuthorizationContext>,
     trace: RequestTrace,
+    provider_routing_scope: ProviderRoutingScope,
 ) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
-    let provider_preference = request.provider_preference.clone().unwrap_or_default();
     create_sandbox_with_home_and_provider(
         state,
         ctx,
@@ -267,7 +267,7 @@ pub(crate) async fn create_sandbox_with_home(
         home_id,
         authorization,
         trace,
-        provider_preference,
+        provider_routing_scope,
     )
     .await
 }
@@ -279,13 +279,22 @@ async fn create_sandbox_with_home_and_provider(
     home_id: Option<HomeId>,
     authorization: Option<AuthorizationContext>,
     trace: RequestTrace,
-    provider_preference: ProviderPreference,
+    provider_routing_scope: ProviderRoutingScope,
 ) -> Result<(StatusCode, Json<SandboxResponse>), ApiError> {
     let now = Utc::now();
     let managed_home = home_id.is_some();
+    let provider_preference = request.provider_preference.clone().unwrap_or_default();
     let mut provision_spec =
         provision_spec_from_request_with_provider(&request, None, provider_preference)?;
     provision_spec.tenant_id = Some(ctx.tenant_id.clone());
+    if provision_spec.provider_preference == ProviderPreference::Cloudflare {
+        provision_spec.provider_routing_scope =
+            Some(provider_routing_scope.0.ok_or_else(|| {
+                ApiError::bad_request(
+                    "Cloudflare provider routing scope is required as organization:workspace",
+                )
+            })?);
+    }
     provision_spec.secret_mounts =
         resolve_secret_mounts(&state.db, &ctx.tenant_id, &request.secret_ref_ids).await?;
     if home_id.is_some() && provision_spec.workspace_mode != WorkspaceMode::Persistent {

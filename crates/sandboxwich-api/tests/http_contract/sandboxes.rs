@@ -5,6 +5,181 @@ use sqlx::any::AnyPoolOptions;
 use uuid::Uuid;
 
 #[tokio::test]
+async fn authenticated_cloudflare_create_preserves_provider_routing_scope_separately_from_tenant() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("cloudflare-routing-scope.db")
+            .display()
+    );
+    let server = TestServer::start_with_provider_routing_auth(database_url, Some(data_dir)).await;
+    let response = server
+        .client()
+        .post(format!("{}/sandboxes", server.base_url))
+        .header("x-sandboxwich-provider-routing-scope", "org_1:workspace_1")
+        .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
+            name: Some("cloudflare-routing-scope".into()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            workspace_mode: Some(WorkspaceMode::Persistent),
+            runtime_profile: None,
+            provider_preference: Some(ProviderPreference::Cloudflare),
+            ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+            execution_class: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new()
+        .connect(&server.database_url)
+        .await
+        .unwrap();
+    let payload: String = sqlx::query_scalar(
+        "select payload from jobs where kind = ? order by created_at desc limit 1",
+    )
+    .bind("provision_sandbox")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(payload["provisionSpec"]["tenant_id"], "default");
+    assert_eq!(
+        payload["provisionSpec"]["provider_routing_scope"],
+        "org_1:workspace_1"
+    );
+
+    let ordinary = reqwest::Client::new()
+        .post(format!("{}/sandboxes", server.base_url))
+        .bearer_auth(TEST_DEFAULT_TENANT_TOKEN)
+        .header(
+            "x-sandboxwich-provider-routing-scope",
+            "other_org:other_workspace",
+        )
+        .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
+            name: Some("ordinary-tenant-routing-attempt".into()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            workspace_mode: Some(WorkspaceMode::Persistent),
+            runtime_profile: None,
+            provider_preference: Some(ProviderPreference::Cloudflare),
+            ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+            execution_class: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ordinary.status(), StatusCode::FORBIDDEN);
+    let job_count: i64 = sqlx::query_scalar("select count(*) from jobs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        job_count, 1,
+        "ordinary tenant token must not enqueue routing work"
+    );
+
+    let rolling_upgrade = server
+        .client()
+        .post(format!("{}/sandboxes", server.base_url))
+        .header("x-sandboxwich-tenant", "org_legacy:workspace_legacy")
+        .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
+            name: Some("provider-routing-rolling-upgrade".into()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            workspace_mode: Some(WorkspaceMode::Persistent),
+            runtime_profile: None,
+            provider_preference: Some(ProviderPreference::Cloudflare),
+            ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+            execution_class: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rolling_upgrade.status(), StatusCode::ACCEPTED);
+    let rolling_payload: String = sqlx::query_scalar(
+        "select payload from jobs where kind = ? order by created_at desc limit 1",
+    )
+    .bind("provision_sandbox")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let rolling_payload: serde_json::Value = serde_json::from_str(&rolling_payload).unwrap();
+    assert_eq!(rolling_payload["provisionSpec"]["tenant_id"], "default");
+    assert_eq!(
+        rolling_payload["provisionSpec"]["provider_routing_scope"],
+        "org_legacy:workspace_legacy"
+    );
+
+    let malformed = server
+        .client()
+        .post(format!("{}/sandboxes", server.base_url))
+        .header("x-sandboxwich-provider-routing-scope", "missing-workspace")
+        .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
+            name: Some("malformed-cloudflare-routing-scope".into()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            workspace_mode: Some(WorkspaceMode::Persistent),
+            runtime_profile: None,
+            provider_preference: Some(ProviderPreference::Cloudflare),
+            ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+            execution_class: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+
+    let missing = server
+        .client()
+        .post(format!("{}/sandboxes", server.base_url))
+        .json(&CreateSandboxRequest {
+            secret_ref_ids: Vec::new(),
+            name: Some("missing-cloudflare-routing-scope".into()),
+            template: None,
+            memory_limit: None,
+            network_egress: None,
+            workspace_mode: Some(WorkspaceMode::Persistent),
+            runtime_profile: None,
+            provider_preference: Some(ProviderPreference::Cloudflare),
+            ttl_seconds: Some(120),
+            max_lifetime_seconds: None,
+            idle_ttl_seconds: None,
+            execution_class: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+    let missing: serde_json::Value = missing.json().await.unwrap();
+    assert_eq!(missing["code"], "bad_request");
+    assert_eq!(
+        missing["message"],
+        "Cloudflare provider routing scope is required as organization:workspace"
+    );
+}
+
+#[tokio::test]
 async fn sandbox_read_reports_actual_worker_placement_proof() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!(

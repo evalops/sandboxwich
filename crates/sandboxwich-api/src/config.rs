@@ -28,6 +28,9 @@ pub(crate) struct IdentityMtlsConfig {
 pub(crate) struct AuthConfig {
     pub(crate) shared_token: Option<String>,
     pub(crate) tenant_tokens: Vec<TenantToken>,
+    /// Service credentials allowed to bind a provider-specific organization/workspace
+    /// routing scope while retaining the configured Sandboxwich ownership tenant.
+    pub(crate) provider_routing_tokens: Vec<TenantToken>,
     /// Distinct from `shared_token`/`tenant_tokens`: gates operator-only routes
     /// (currently `/snapshots/cleanup`) that act across tenant boundaries.
     pub(crate) operator_token: Option<String>,
@@ -58,6 +61,7 @@ pub(crate) struct ApiConfig {
     pub(crate) auto_migrate: bool,
     pub(crate) shared_token: Option<String>,
     pub(crate) tenant_tokens: Vec<TenantToken>,
+    pub(crate) provider_routing_tokens: Vec<TenantToken>,
     pub(crate) operator_token: Option<String>,
     pub(crate) allow_insecure_no_auth: bool,
     pub(crate) default_tenant_id: String,
@@ -148,6 +152,12 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
         .filter(|token| !token.is_empty());
     let tenant_tokens =
         parse_tenant_tokens(std::env::var("SANDBOXWICH_TENANT_TOKENS").ok().as_deref())?;
+    let provider_routing_tokens = parse_scoped_tokens(
+        "SANDBOXWICH_PROVIDER_ROUTING_TOKENS",
+        std::env::var("SANDBOXWICH_PROVIDER_ROUTING_TOKENS")
+            .ok()
+            .as_deref(),
+    )?;
     let operator_token = std::env::var("SANDBOXWICH_OPERATOR_TOKEN")
         .ok()
         .map(|token| token.trim().to_string())
@@ -236,6 +246,7 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
         auto_migrate,
         shared_token,
         tenant_tokens,
+        provider_routing_tokens,
         operator_token,
         allow_insecure_no_auth,
         default_tenant_id,
@@ -503,6 +514,13 @@ pub(crate) fn parse_env_bool(name: &'static str, default: bool) -> anyhow::Resul
 }
 
 pub(crate) fn parse_tenant_tokens(value: Option<&str>) -> anyhow::Result<Vec<TenantToken>> {
+    parse_scoped_tokens("SANDBOXWICH_TENANT_TOKENS", value)
+}
+
+fn parse_scoped_tokens(
+    variable_name: &str,
+    value: Option<&str>,
+) -> anyhow::Result<Vec<TenantToken>> {
     let Some(value) = value else {
         return Ok(Vec::new());
     };
@@ -513,11 +531,11 @@ pub(crate) fn parse_tenant_tokens(value: Option<&str>) -> anyhow::Result<Vec<Ten
         .map(|entry| {
             let (tenant_id, token) = entry
                 .split_once('=')
-                .with_context(|| format!("invalid SANDBOXWICH_TENANT_TOKENS entry: {entry}"))?;
+                .with_context(|| format!("invalid {variable_name} entry: {entry}"))?;
             let tenant_id = tenant_id.trim();
             let token = token.trim();
             if tenant_id.is_empty() || token.is_empty() {
-                anyhow::bail!("invalid SANDBOXWICH_TENANT_TOKENS entry: {entry}");
+                anyhow::bail!("invalid {variable_name} entry: {entry}");
             }
             Ok(TenantToken {
                 tenant_id: tenant_id.to_string(),

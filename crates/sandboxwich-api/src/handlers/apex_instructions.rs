@@ -781,6 +781,7 @@ mod tests {
             auth: AuthConfig {
                 shared_token: Some(TEST_TENANT_TOKEN.into()),
                 tenant_tokens: Vec::new(),
+                provider_routing_tokens: Vec::new(),
                 operator_token: None,
                 allow_insecure_no_auth: true,
             },
