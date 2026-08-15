@@ -20,15 +20,24 @@ class RepositoryRulesTest(unittest.TestCase):
         self.assertEqual(
             contexts,
             {
-                "rust",
-                "clippy",
-                "audit",
-                "msrv (1.95)",
+                "buildkite/sandboxwich-ci",
                 "service image (sandboxwich-api)",
                 "service image (sandboxwich-worker)",
                 "runtime image (ubuntu-dev)",
             },
         )
+
+    def test_buildkite_rust_tests_are_postgres_backed(self) -> None:
+        pipeline = (ROOT / ".buildkite/pipeline.yml").read_text()
+        for marker in (
+            "mirror.gcr.io/library/postgres:17@sha256:0af65001d05296a2ead57ac4a6412433d8913d1bb5d0c88435a7d1e1ee5cb04b",
+            "pg_isready -U postgres -d sandboxwich",
+            "docker port",
+            "SANDBOXWICH_TEST_POSTGRES_URL",
+            "cargo test --workspace --locked",
+        ):
+            self.assertIn(marker, pipeline)
+        self.assertIn("docker rm -f", pipeline)
 
     def test_pr_workflows_run_for_every_pull_request(self) -> None:
         for relative in (
