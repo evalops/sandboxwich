@@ -23,6 +23,45 @@ pub(crate) const PROBE_PATHS: &[&str] = &["/healthz", "/readyz"];
 /// tenant/shared-token lists without needing to try both on every request.
 pub(crate) const WORKER_TOKEN_PREFIX: &str = "sbw_wtok_";
 pub(crate) const GUEST_TOKEN_PREFIX: &str = "sbw_gtok_";
+pub(crate) const PROVIDER_ROUTING_SCOPE_HEADER: &str = "x-sandboxwich-provider-routing-scope";
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProviderRoutingScope(pub(crate) Option<String>);
+
+fn provider_routing_scope(
+    request: &Request,
+    provider_routing_allowed: bool,
+) -> Result<ProviderRoutingScope, ApiError> {
+    let raw = request
+        .headers()
+        .get(PROVIDER_ROUTING_SCOPE_HEADER)
+        .or_else(|| {
+            provider_routing_allowed
+                .then(|| request.headers().get("x-sandboxwich-tenant"))
+                .flatten()
+        });
+    let Some(raw) = raw else {
+        return Ok(ProviderRoutingScope::default());
+    };
+    let scope = raw
+        .to_str()
+        .map_err(|_| ApiError::bad_request("provider routing scope header must be valid ASCII"))?
+        .trim();
+    let valid = scope
+        .split_once(char::from(58))
+        .is_some_and(|(organization_id, workspace_id)| {
+            !organization_id.is_empty()
+                && !workspace_id.is_empty()
+                && !workspace_id.contains(char::from(58))
+                && !scope.chars().any(char::is_whitespace)
+        });
+    if !valid {
+        return Err(ApiError::bad_request(
+            "provider routing scope must be exactly organization:workspace",
+        ));
+    }
+    Ok(ProviderRoutingScope(Some(scope.to_string())))
+}
 /// Prefix on every minted brokered-desktop-transport credential (ROADMAP
 /// #3). Unlike the worker/guest prefixes this token is never presented to
 /// this API as a bearer credential -- it is validated by the out-of-band
@@ -37,8 +76,8 @@ pub(crate) async fn auth_and_tenant(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    let (tenant_id, principal) = if PROBE_PATHS.contains(&path) {
-        (state.default_tenant_id.clone(), Principal::Tenant)
+    let (tenant_id, principal, provider_routing_allowed) = if PROBE_PATHS.contains(&path) {
+        (state.default_tenant_id.clone(), Principal::Tenant, false)
     } else if let Some(token) =
         bearer_token(&request).filter(|token| token.starts_with(GUEST_TOKEN_PREFIX))
     {
@@ -49,6 +88,7 @@ pub(crate) async fn auth_and_tenant(
                     worker_id,
                     sandbox_id,
                 },
+                false,
             ),
             Ok(None) => {
                 return ApiError::unauthorized("valid guest bearer token is required")
@@ -67,33 +107,42 @@ pub(crate) async fn auth_and_tenant(
         // through to the tenant-token checks below, which would let a
         // rejected worker-token attempt be retried as a tenant-wide lookup.
         match resolve_worker_token(&state.db, token).await {
-            Ok(Some((tenant_id, worker_id))) => (tenant_id, Principal::Worker(worker_id)),
+            Ok(Some((tenant_id, worker_id))) => (tenant_id, Principal::Worker(worker_id), false),
             Ok(None) => {
                 return ApiError::unauthorized("valid worker bearer token is required")
                     .into_response();
             }
             Err(error) => return error.into_response(),
         }
-    } else if !state.auth.tenant_tokens.is_empty() {
+    } else if !state.auth.provider_routing_tokens.is_empty() || !state.auth.tenant_tokens.is_empty()
+    {
         let Some(token) = bearer_token(&request) else {
             return ApiError::unauthorized("valid bearer token is required").into_response();
         };
-        let Some(tenant) = state
+        if let Some(tenant) = state
+            .auth
+            .provider_routing_tokens
+            .iter()
+            .find(|candidate| constant_time_eq(token.as_bytes(), candidate.token.as_bytes()))
+        {
+            (tenant.tenant_id.clone(), Principal::Tenant, true)
+        } else if let Some(tenant) = state
             .auth
             .tenant_tokens
             .iter()
             .find(|candidate| constant_time_eq(token.as_bytes(), candidate.token.as_bytes()))
-        else {
+        {
+            (tenant.tenant_id.clone(), Principal::Tenant, false)
+        } else {
             return ApiError::unauthorized("valid tenant bearer token is required").into_response();
-        };
-        (tenant.tenant_id.clone(), Principal::Tenant)
+        }
     } else if let Some(expected_token) = &state.auth.shared_token {
         let authorized = bearer_token(&request)
             .is_some_and(|token| constant_time_eq(token.as_bytes(), expected_token.as_bytes()));
         if !authorized {
             return ApiError::unauthorized("valid bearer token is required").into_response();
         }
-        (state.default_tenant_id.clone(), Principal::Tenant)
+        (state.default_tenant_id.clone(), Principal::Tenant, false)
     } else if state.auth.allow_insecure_no_auth {
         // Explicit, off-by-default opt-out (SANDBOXWICH_ALLOW_INSECURE_NO_AUTH) for
         // local development and benchmark harnesses: with no credential configured,
@@ -107,15 +156,16 @@ pub(crate) async fn auth_and_tenant(
             .filter(|tenant| !tenant.is_empty())
             .unwrap_or(&state.default_tenant_id)
             .to_string();
-        (tenant_id, Principal::Tenant)
+        (tenant_id, Principal::Tenant, false)
     } else {
-        // Fail closed: with no SANDBOXWICH_API_TOKEN and no SANDBOXWICH_TENANT_TOKENS
+        // Fail closed: with no shared, tenant, or provider-routing credential
         // configured, there is no credential to authenticate against, so we must
         // never trust a client-supplied tenant header to select tenant identity.
         // Refuse to serve any non-probe route rather than silently running open.
         return ApiError::internal(
             "sandboxwich-api has no authentication configured; set SANDBOXWICH_API_TOKEN \
-             (single-tenant) or SANDBOXWICH_TENANT_TOKENS (multi-tenant) to serve \
+             (single-tenant), SANDBOXWICH_TENANT_TOKENS (multi-tenant), or \
+             SANDBOXWICH_PROVIDER_ROUTING_TOKENS (trusted provider routing) to serve \
              authenticated routes (or SANDBOXWICH_ALLOW_INSECURE_NO_AUTH=true for local \
              development only)",
         )
@@ -181,6 +231,17 @@ pub(crate) async fn auth_and_tenant(
         return response;
     }
 
+    let provider_routing_scope = match provider_routing_scope(&request, provider_routing_allowed) {
+        Ok(scope) => scope,
+        Err(error) => return error.into_response(),
+    };
+    if provider_routing_scope.0.is_some() && !provider_routing_allowed {
+        return ApiError::forbidden(
+            "provider routing scope requires a provider-routing service credential",
+        )
+        .into_response();
+    }
+
     crate::authz::record_decision(true, false, authorization_started.elapsed());
     let span = tracing::Span::current();
     span.record(
@@ -232,6 +293,7 @@ pub(crate) async fn auth_and_tenant(
         "authenticated principal at authorization boundary"
     );
     request.extensions_mut().insert(authorization.clone());
+    request.extensions_mut().insert(provider_routing_scope);
     request.extensions_mut().insert(TenantContext {
         tenant_id,
         principal,

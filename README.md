@@ -87,6 +87,7 @@ Configure exactly one of:
 
 - `SANDBOXWICH_API_TOKEN` — a single shared bearer token. **This is single-tenant only**: every request that presents the token is treated as `SANDBOXWICH_DEFAULT_TENANT` (`default` unless overridden), regardless of any `x-sandboxwich-tenant` header a client sends. Do not run more than one tenant's data through a shared-token deployment.
 - `SANDBOXWICH_TENANT_TOKENS` — a comma-separated `tenant_id=token` list (e.g. `acme=abc123,globex=def456`) for real multi-tenant isolation. Tenant identity is derived from which bearer token matched, never from a client-supplied header.
+- `SANDBOXWICH_PROVIDER_ROUTING_TOKENS` — a comma-separated `tenant_id=service_token` list for trusted provisioning services that must bind a Cloudflare `organization:workspace` routing scope. Ordinary shared and tenant tokens cannot set `x-sandboxwich-provider-routing-scope`; the authenticated tenant remains the owner of every Sandboxwich row.
 
 If neither is set, the API fails closed: it refuses every non-probe request with an error rather than trusting a client-supplied `x-sandboxwich-tenant` header. There is no way to run sandboxwich-api unauthenticated.
 

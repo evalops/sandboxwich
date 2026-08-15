@@ -22,6 +22,7 @@ use uuid::Uuid;
 /// and `TEST_TENANT_B_TOKEN`) so that tests exercise the fail-closed auth
 /// path rather than the removed "trust the client header" fallback.
 pub(crate) const TEST_DEFAULT_TENANT_TOKEN: &str = "sandboxwich-test-default-tenant-token";
+pub(crate) const TEST_PROVIDER_ROUTING_TOKEN: &str = "sandboxwich-test-provider-routing-token";
 /// Bearer token for a second tenant ("tenant-b"), used to prove tenant
 /// isolation via real credentials instead of a spoofable header.
 pub(crate) const TEST_TENANT_B_TOKEN: &str = "sandboxwich-test-tenant-b-token";
@@ -1235,6 +1236,26 @@ impl TestServer {
         auth_token: Option<&str>,
     ) -> Self {
         Self::start_with_auth_and_auto_migrate(database_url, data_dir, auth_token, true).await
+    }
+
+    pub(crate) async fn start_with_provider_routing_auth(
+        database_url: String,
+        data_dir: Option<TempDir>,
+    ) -> Self {
+        Self::spawn(database_url, data_dir, true, false, |command| {
+            command
+                .env(
+                    "SANDBOXWICH_TENANT_TOKENS",
+                    format!("default={TEST_DEFAULT_TENANT_TOKEN},tenant-b={TEST_TENANT_B_TOKEN}"),
+                )
+                .env(
+                    "SANDBOXWICH_PROVIDER_ROUTING_TOKENS",
+                    format!("default={TEST_PROVIDER_ROUTING_TOKEN}"),
+                )
+                .env("SANDBOXWICH_OPERATOR_TOKEN", TEST_OPERATOR_TOKEN);
+        })
+        .await
+        .with_auth_token(Some(TEST_PROVIDER_ROUTING_TOKEN.to_string()))
     }
 
     pub(crate) async fn start_with_auth_and_auto_migrate(

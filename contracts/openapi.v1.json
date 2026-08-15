@@ -4341,6 +4341,20 @@
       },
       "post": {
         "operationId": "create_sandbox",
+        "parameters": [
+          {
+            "description": "Required for cloudflare placement; exact organization:workspace provider scope",
+            "in": "header",
+            "name": "X-Sandboxwich-Provider-Routing-Scope",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {

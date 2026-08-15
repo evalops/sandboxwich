@@ -89,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
     if config.allow_insecure_no_auth
         && config.shared_token.is_none()
         && config.tenant_tokens.is_empty()
+        && config.provider_routing_tokens.is_empty()
     {
         tracing::warn!(
             "SANDBOXWICH_ALLOW_INSECURE_NO_AUTH is set: serving with no authentication and \
@@ -147,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
         auth: AuthConfig {
             shared_token: config.shared_token,
             tenant_tokens: config.tenant_tokens,
+            provider_routing_tokens: config.provider_routing_tokens,
             operator_token: config.operator_token,
             allow_insecure_no_auth: config.allow_insecure_no_auth,
         },
