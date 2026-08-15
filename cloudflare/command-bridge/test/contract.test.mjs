@@ -6,6 +6,7 @@ import {
   attachIntentDigest,
   capabilityReport,
   normalizeCommand,
+  recoveryIdentityRequest,
 } from "../src/contract.mjs";
 
 const bindings = {
@@ -13,7 +14,36 @@ const bindings = {
   Sandbox: {},
   DEX_COMPUTER_HOME: {},
   BRIDGE_TOKEN: "a-production-length-secret",
+  RECOVERY_TENANT: "evalops-platform",
+  RECOVERY_SANDBOX_IDS: "sandbox-1",
 };
+
+test("stored identity recovery is fenced by stable sandbox id and tenant hint", () => {
+  const request = new Request("https://bridge/v1/sandbox/sandbox-1", {
+    method: "DELETE",
+    headers: {
+      "x-sandboxwich-recover-identity": "stored",
+      "x-sandboxwich-sandbox-id": "sandbox-1",
+      "x-sandboxwich-recovery-tenant": "evalops-platform",
+    },
+  });
+
+  assert.deepEqual(recoveryIdentityRequest(request, "sandbox-1", "evalops-platform", "sandbox-1"), {
+    tenantHint: "evalops-platform",
+  });
+  assert.throws(
+    () => recoveryIdentityRequest(request, "sandbox-1", "tenant-other", "sandbox-1"),
+    (error) => error instanceof BridgeContractError && error.code === "recovery_tenant_mismatch",
+  );
+  assert.throws(
+    () => recoveryIdentityRequest(request, "sandbox-other", "evalops-platform", "sandbox-1"),
+    (error) => error instanceof BridgeContractError && error.code === "sandbox_identity_mismatch",
+  );
+  assert.throws(
+    () => recoveryIdentityRequest(request, "sandbox-1", "evalops-platform", "sandbox-other"),
+    (error) => error instanceof BridgeContractError && error.code === "recovery_target_not_allowed",
+  );
+});
 
 test("command capability is absent when any durable binding is missing", () => {
   for (const missing of Object.keys(bindings)) {

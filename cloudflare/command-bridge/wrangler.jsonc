@@ -6,6 +6,10 @@
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
   "observability": { "enabled": true },
+  "vars": {
+    "RECOVERY_TENANT": "evalops-platform",
+    "RECOVERY_SANDBOX_IDS": "019ffc3d-3619-7d13-9cb3-f70aafbaf23c"
+  },
   "containers": [
     {
       "class_name": "Sandbox",

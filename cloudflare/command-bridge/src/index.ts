@@ -9,6 +9,7 @@ import {
   capabilityReport,
   jsonError,
   normalizeCommand,
+  recoveryIdentityRequest,
   requestIdentity,
 } from "./contract.mjs";
 import { DurableCommandLedger, DurableSandboxLedger, LedgerConflict } from "./ledger.mjs";
@@ -20,6 +21,8 @@ interface Env {
   COMMAND_LEDGER: DurableObjectNamespace<CommandLedger>;
   DEX_COMPUTER_HOME: R2Bucket;
   BRIDGE_TOKEN: string;
+  RECOVERY_TENANT: string;
+  RECOVERY_SANDBOX_IDS: string;
 }
 
 interface CreateBody {
@@ -163,10 +166,27 @@ export class CommandLedger extends DurableObject<Env> {
   }
 
   private async destroySandbox(request: Request, sandboxId: string): Promise<Response> {
-    const identity = await this.requireStoredIdentity(request, sandboxId);
+    const recovery = recoveryIdentityRequest(
+      request,
+      sandboxId,
+      this.env.RECOVERY_TENANT,
+      this.env.RECOVERY_SANDBOX_IDS,
+    );
+    const identity = recovery
+      ? await this.requireRecoveryStoredIdentity(sandboxId)
+      : await this.requireStoredIdentity(request, sandboxId);
     await this.sandboxFor(identity).destroy();
     await this.ctx.storage.delete("sandbox:home-mounted");
     return Response.json({ ok: true, sandboxId });
+  }
+
+  private async requireRecoveryStoredIdentity(sandboxId: string) {
+    const stored = await new DurableSandboxLedger(this.ctx.storage).get();
+    if (!stored) throw new BridgeContractError("sandbox_not_found", 404);
+    if (stored.sandboxId !== sandboxId) {
+      throw new BridgeContractError("sandbox_identity_conflict", 409);
+    }
+    return stored;
   }
 
   private async requireStoredIdentity(request: Request, sandboxId: string) {
