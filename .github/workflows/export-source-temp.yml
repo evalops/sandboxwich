@@ -20,3 +20,29 @@ jobs:
           name: sandboxwich-source-${{ github.sha }}
           path: ${{ runner.temp }}/sandboxwich-source.tar.gz
           retention-days: 1
+
+  toolchain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: "1.95"
+          components: rustfmt,clippy
+      - name: Package Rust toolchain
+        run: |
+          set -euo pipefail
+          tar -C "${HOME}" -czf "${RUNNER_TEMP}/rust-1.95-toolchain.tar.gz" \
+            .rustup \
+            .cargo/bin/cargo \
+            .cargo/bin/rustc \
+            .cargo/bin/rustdoc \
+            .cargo/bin/rustfmt \
+            .cargo/bin/cargo-fmt \
+            .cargo/bin/clippy-driver \
+            .cargo/bin/cargo-clippy \
+            .cargo/bin/rustup
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rust-1.95-toolchain-${{ github.sha }}
+          path: ${{ runner.temp }}/rust-1.95-toolchain.tar.gz
+          retention-days: 1
