@@ -67,6 +67,9 @@ async fn create_home_with_mount_state(
         .json()
         .await
         .unwrap();
+    if state == SandboxState::Archived {
+        set_sandbox_state(server, mounted.sandbox.id, &SandboxState::Archiving).await;
+    }
     set_sandbox_state(server, mounted.sandbox.id, &state).await;
     (home, mounted)
 }
