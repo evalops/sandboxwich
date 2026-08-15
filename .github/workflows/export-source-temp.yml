@@ -46,3 +46,26 @@ jobs:
           name: rust-1.95-toolchain-${{ github.sha }}
           path: ${{ runner.temp }}/rust-1.95-toolchain.tar.gz
           retention-days: 1
+
+  cargo-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: "1.95"
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Package Cargo registry
+        run: |
+          set -euo pipefail
+          paths=(.cargo/registry)
+          if [[ -d "${HOME}/.cargo/git" ]]; then
+            paths+=(.cargo/git)
+          fi
+          tar -C "${HOME}" -czf "${RUNNER_TEMP}/sandboxwich-cargo-cache.tar.gz" "${paths[@]}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sandboxwich-cargo-cache-${{ github.sha }}
+          path: ${{ runner.temp }}/sandboxwich-cargo-cache.tar.gz
+          retention-days: 1
