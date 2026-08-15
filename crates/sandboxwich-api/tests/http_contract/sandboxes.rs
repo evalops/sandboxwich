@@ -5,6 +5,35 @@ use sqlx::any::AnyPoolOptions;
 use uuid::Uuid;
 
 #[tokio::test]
+async fn provider_routing_credential_keeps_legacy_worker_tenant_header_as_ownership_only() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("provider-routing-worker.db").display()
+    );
+    let server = TestServer::start_with_provider_routing_auth(database_url, Some(data_dir)).await;
+
+    let response = server
+        .client()
+        .post(format!("{}/workers/register", server.base_url))
+        .header("x-sandboxwich-tenant", "evalops-platform")
+        .json(&RegisterWorkerRequest {
+            name: "provider-routing-general-worker".into(),
+            provider: "kubernetes".into(),
+            capabilities: vec![WorkerCapability::ProvisionSandbox],
+            max_concurrent_jobs: Some(1),
+            labels: Default::default(),
+        })
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let worker: WorkerResponse = response.json().await.unwrap();
+    assert_eq!(worker.worker.tenant_id, "default");
+}
+
+#[tokio::test]
 async fn authenticated_cloudflare_create_preserves_provider_routing_scope_separately_from_tenant() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!(

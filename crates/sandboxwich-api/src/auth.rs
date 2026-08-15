@@ -32,21 +32,22 @@ fn provider_routing_scope(
     request: &Request,
     provider_routing_allowed: bool,
 ) -> Result<ProviderRoutingScope, ApiError> {
-    let raw = request
-        .headers()
-        .get(PROVIDER_ROUTING_SCOPE_HEADER)
-        .or_else(|| {
-            provider_routing_allowed
-                .then(|| request.headers().get("x-sandboxwich-tenant"))
-                .flatten()
-        });
-    let Some(raw) = raw else {
+    let explicit = request.headers().get(PROVIDER_ROUTING_SCOPE_HEADER);
+    let legacy = provider_routing_allowed
+        .then(|| request.headers().get("x-sandboxwich-tenant"))
+        .flatten();
+    let Some(raw) = explicit.or(legacy) else {
         return Ok(ProviderRoutingScope::default());
     };
-    let scope = raw
-        .to_str()
-        .map_err(|_| ApiError::bad_request("provider routing scope header must be valid ASCII"))?
-        .trim();
+    let scope = match raw.to_str() {
+        Ok(scope) => scope.trim(),
+        Err(_) if explicit.is_none() => return Ok(ProviderRoutingScope::default()),
+        Err(_) => {
+            return Err(ApiError::bad_request(
+                "provider routing scope header must be valid ASCII",
+            ));
+        }
+    };
     let valid = scope
         .split_once(char::from(58))
         .is_some_and(|(organization_id, workspace_id)| {
@@ -56,6 +57,13 @@ fn provider_routing_scope(
                 && !scope.chars().any(char::is_whitespace)
         });
     if !valid {
+        if explicit.is_none() {
+            // During a rolling upgrade, privileged legacy clients still send
+            // their ownership tenant in x-sandboxwich-tenant on every API
+            // request. Only treat that header as the old routing contract when
+            // it already has the exact organization:workspace shape.
+            return Ok(ProviderRoutingScope::default());
+        }
         return Err(ApiError::bad_request(
             "provider routing scope must be exactly organization:workspace",
         ));
