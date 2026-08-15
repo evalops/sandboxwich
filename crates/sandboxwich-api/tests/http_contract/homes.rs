@@ -275,7 +275,7 @@ async fn managed_home_is_tenant_scoped_and_single_mount() {
 }
 
 #[tokio::test]
-async fn managed_home_replaces_an_archiving_mount_before_claiming_next_sandbox() {
+async fn managed_home_keeps_an_archiving_mount_until_provider_teardown_completes() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!(
         "sqlite://{}",
@@ -286,7 +286,7 @@ async fn managed_home_replaces_an_archiving_mount_before_claiming_next_sandbox()
         create_home_with_mount_state(&server, "archiving-mount", SandboxState::Archiving).await;
     let client = server.client();
 
-    let replacement: SandboxResponse = client
+    let response = client
         .post(format!(
             "{}/homes/{}/sandboxes",
             server.base_url, created.home.id
@@ -294,14 +294,16 @@ async fn managed_home_replaces_an_archiving_mount_before_claiming_next_sandbox()
         .json(&persistent_sandbox("replacement-mount"))
         .send()
         .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
         .unwrap();
-
-    assert_ne!(replacement.sandbox.id, first.sandbox.id);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let conflict: ErrorEnvelope = response.json().await.unwrap();
+    assert_eq!(conflict.code, "home_already_mounted");
+    assert_eq!(
+        conflict.details.as_ref().and_then(|details| details
+            .get("reclaimable")
+            .and_then(serde_json::Value::as_bool)),
+        Some(false)
+    );
     let home: HomeResponse = client
         .get(format!("{}/homes/{}", server.base_url, created.home.id))
         .send()
@@ -314,74 +316,8 @@ async fn managed_home_replaces_an_archiving_mount_before_claiming_next_sandbox()
         .unwrap();
     assert_eq!(
         home.mounted_sandbox.map(|mount| mount.sandbox_id),
-        Some(replacement.sandbox.id)
+        Some(first.sandbox.id)
     );
-
-    // Exercise the complete managed-home file boundary after replacement:
-    // upload through the mounted sandbox, list it, then read the durable body.
-    let form = reqwest::multipart::Form::new()
-        .text("path", "/workspace/home-regression.txt")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"home replacement\n".to_vec())
-                .file_name("home-regression.txt")
-                .mime_str("text/plain")
-                .unwrap(),
-        );
-    let uploaded: FileResponse = client
-        .post(format!(
-            "{}/sandboxes/{}/files",
-            server.base_url, replacement.sandbox.id
-        ))
-        .multipart(form)
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let listed: ListFilesResponse = client
-        .get(format!(
-            "{}/sandboxes/{}/files",
-            server.base_url, replacement.sandbox.id
-        ))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(listed.files.iter().any(|file| file.id == uploaded.file.id));
-    let downloaded = client
-        .get(format!(
-            "{}/sandboxes/{}/files/{}",
-            server.base_url, replacement.sandbox.id, uploaded.file.id
-        ))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .bytes()
-        .await
-        .unwrap();
-    assert_eq!(downloaded.as_ref(), b"home replacement\n");
-
-    let metrics = client
-        .get(format!("{}/metrics", server.base_url))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(metrics.contains("sandboxwich_home_mount_count"));
 }
 
 #[tokio::test]
@@ -391,7 +327,7 @@ async fn managed_home_mount_claim_has_one_winner_under_postgres_concurrency() {
     };
     let server = TestServer::start(database_url, None).await;
     let (home, _first) =
-        create_home_with_mount_state(&server, "postgres-archiving-mount", SandboxState::Archiving)
+        create_home_with_mount_state(&server, "postgres-archived-mount", SandboxState::Archived)
             .await;
     let client = server.client();
     let url = format!("{}/homes/{}/sandboxes", server.base_url, home.home.id);

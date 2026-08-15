@@ -645,6 +645,14 @@ impl CloudflareSandboxProvider {
                     )))
                 }
             })?;
+        if sandbox.external_id != sandbox_id.to_string() {
+            self.bridge
+                .delete(&sandbox.external_id, &sandbox.routing_scope)
+                .map_err(Self::provider_error)?;
+            anyhow::bail!(
+                "Cloudflare Bridge external identity does not match the requested sandbox identity"
+            );
+        }
         let started = Instant::now();
         while started.elapsed() < self.readiness_timeout {
             anyhow::ensure!(!cancelled.is_cancelled(), "Cloudflare provision cancelled");
@@ -822,14 +830,18 @@ impl SandboxProvider for CloudflareSandboxProvider {
     }
     fn stop(
         &self,
-        _sandbox_id: SandboxId,
+        sandbox_id: SandboxId,
         spec: &SandboxTeardownSpec,
         _cancelled: &CancelSignal,
     ) -> anyhow::Result<()> {
+        // Provision rejects any Bridge identity that differs from this stable
+        // control-plane ID. That makes the fallback safe after a create
+        // response is lost before its runtime-resource row can be persisted.
+        let stable_external_id = sandbox_id.to_string();
         let external_id = spec
             .provider_external_id
             .as_deref()
-            .context("Cloudflare stop requires persisted external sandbox identity")?;
+            .unwrap_or(&stable_external_id);
         let routing_scope = spec
             .provider_routing_scope
             .as_deref()
@@ -844,20 +856,25 @@ impl SandboxProvider for CloudflareSandboxProvider {
 #[derive(Default)]
 struct FakeBridge {
     calls: Mutex<Vec<String>>,
+    create_external_id: Option<String>,
+    delete_fails: bool,
 }
 
 #[cfg(test)]
 impl CloudflareBridge for FakeBridge {
     fn create(
         &self,
-        _sandbox_id: SandboxId,
+        sandbox_id: SandboxId,
         _home_id: Option<HomeId>,
         spec: &SandboxProvisionSpec,
         _create_key: &str,
     ) -> anyhow::Result<BridgeSandbox> {
         self.calls.lock().unwrap().push("create".into());
         Ok(BridgeSandbox {
-            external_id: "cf-external-1".into(),
+            external_id: self
+                .create_external_id
+                .clone()
+                .unwrap_or_else(|| sandbox_id.to_string()),
             routing_scope: spec.tenant_id.as_deref().unwrap_or("missing").to_string(),
         })
     }
@@ -890,6 +907,9 @@ impl CloudflareBridge for FakeBridge {
             .lock()
             .unwrap()
             .push(format!("delete:{external_id}:{routing_scope}"));
+        if self.delete_fails {
+            anyhow::bail!("bridge unavailable");
+        }
         Ok(())
     }
     fn health(&self) -> anyhow::Result<()> {
@@ -982,20 +1002,21 @@ mod tests {
 
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
+        let sandbox_id = SandboxId::new();
+        let response_body = format!(r#"{{"id":"{sandbox_id}"}}"#);
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0_u8; 4096];
             let _ = stream.read(&mut request).unwrap();
-            let body = br#"{"id":"stable-cloudflare-sandbox"}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
+                response_body.len()
             )
             .unwrap();
             stream.flush().unwrap();
             std::thread::sleep(Duration::from_millis(100));
-            stream.write_all(body).unwrap();
+            stream.write_all(response_body.as_bytes()).unwrap();
         });
         let bridge = HttpCloudflareBridge::new(CloudflareConfig {
             base_url: format!("http://{address}"),
@@ -1012,9 +1033,9 @@ mod tests {
         };
 
         let created = bridge
-            .create(SandboxId::new(), None, &spec, "stable-create-key")
+            .create(sandbox_id, None, &spec, "stable-create-key")
             .expect("response body must remain readable after response headers arrive");
-        assert_eq!(created.external_id, "stable-cloudflare-sandbox");
+        assert_eq!(created.external_id, sandbox_id.to_string());
         server.join().unwrap();
     }
 
@@ -1134,6 +1155,116 @@ mod tests {
                 &CancelSignal::never_cancelled(),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn cloudflare_stop_recovers_missing_persisted_identity_from_durable_scope() {
+        let bridge = Arc::new(FakeBridge::default());
+        let provider = CloudflareSandboxProvider {
+            bridge: bridge.clone(),
+            readiness_timeout: Duration::from_millis(100),
+            replay_ledger_configured: true,
+        };
+        let sandbox_id = SandboxId::new();
+
+        provider
+            .stop(
+                sandbox_id,
+                &SandboxTeardownSpec {
+                    delete_gke_fqdn_policy: false,
+                    provider_external_id: None,
+                    provider_routing_scope: Some("org:workspace".into()),
+                },
+                &CancelSignal::never_cancelled(),
+            )
+            .expect("stable Cloudflare identity must remain teardown-capable after a lost create response");
+
+        assert_eq!(
+            bridge.calls.lock().unwrap().as_slice(),
+            [format!("delete:{sandbox_id}:org:workspace")]
+        );
+    }
+
+    #[test]
+    fn cloudflare_stop_keeps_bridge_failures_retryable_after_identity_recovery() {
+        let provider = CloudflareSandboxProvider {
+            bridge: Arc::new(FakeBridge {
+                calls: Mutex::new(Vec::new()),
+                create_external_id: None,
+                delete_fails: true,
+            }),
+            readiness_timeout: Duration::from_millis(100),
+            replay_ledger_configured: true,
+        };
+        let error = provider
+            .stop(
+                SandboxId::new(),
+                &SandboxTeardownSpec {
+                    delete_gke_fqdn_policy: false,
+                    provider_external_id: None,
+                    provider_routing_scope: Some("org:workspace".into()),
+                },
+                &CancelSignal::never_cancelled(),
+            )
+            .expect_err("transient bridge deletion failure must remain retryable");
+        let provider_error = error
+            .downcast_ref::<ProviderError>()
+            .expect("bridge error must retain typed provider retry classification");
+        assert_eq!(provider_error.disposition(), RetryDisposition::Retryable);
+    }
+
+    #[test]
+    fn cloudflare_provision_rejects_bridge_identity_drift() {
+        let bridge = Arc::new(FakeBridge {
+            calls: Mutex::new(Vec::new()),
+            create_external_id: Some("different-provider-id".into()),
+            delete_fails: false,
+        });
+        let provider = CloudflareSandboxProvider {
+            bridge: bridge.clone(),
+            readiness_timeout: Duration::from_millis(100),
+            replay_ledger_configured: true,
+        };
+        let spec = SandboxProvisionSpec {
+            provider_preference: ProviderPreference::Cloudflare,
+            tenant_id: Some("org:workspace".into()),
+            ..Default::default()
+        };
+
+        let error = provider
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+            .expect_err("bridge identity drift would make deterministic teardown unsafe");
+        assert!(error.to_string().contains("identity"));
+        assert_eq!(
+            bridge.calls.lock().unwrap().as_slice(),
+            ["create", "delete:different-provider-id:org:workspace"]
+        );
+    }
+
+    #[test]
+    fn cloudflare_identity_drift_cleanup_failure_stays_retryable() {
+        let provider = CloudflareSandboxProvider {
+            bridge: Arc::new(FakeBridge {
+                calls: Mutex::new(Vec::new()),
+                create_external_id: Some("different-provider-id".into()),
+                delete_fails: true,
+            }),
+            readiness_timeout: Duration::from_millis(100),
+            replay_ledger_configured: true,
+        };
+        let spec = SandboxProvisionSpec {
+            provider_preference: ProviderPreference::Cloudflare,
+            tenant_id: Some("org:workspace".into()),
+            ..Default::default()
+        };
+
+        let error = provider
+            .provision(SandboxId::new(), &spec, &CancelSignal::never_cancelled())
+            .expect_err("failed cleanup must retry until the drifted sandbox is destroyed");
+        let provider_error = error
+            .downcast_ref::<ProviderError>()
+            .expect("cleanup failure must retain typed provider retry classification");
+        assert_eq!(provider_error.disposition(), RetryDisposition::Retryable);
     }
 
     #[test]

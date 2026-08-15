@@ -590,12 +590,11 @@ impl SandboxState {
         SandboxState::Error,
     ];
 
-    /// A home mount may be reclaimed as soon as its sandbox has entered a
-    /// terminal teardown state. `archiving` is intentionally included: the
-    /// lifecycle contract treats it as terminal even while provider cleanup
-    /// finishes asynchronously.
+    /// A home mount may be reclaimed only after provider teardown completed or
+    /// the sandbox entered an error state. `archiving` is terminal for sandbox
+    /// usability, but still owns its provider resources and home mount.
     pub const fn is_home_mount_reclaimable(self) -> bool {
-        matches!(self, Self::Archiving | Self::Archived | Self::Error)
+        matches!(self, Self::Archived | Self::Error)
     }
 
     /// States from which a user-initiated `POST /sandboxes/{id}/stop` may
@@ -5318,8 +5317,8 @@ mod tests {
     }
 
     #[test]
-    fn terminal_home_mount_states_are_reclaimable() {
-        assert!(SandboxState::Archiving.is_home_mount_reclaimable());
+    fn only_provider_released_home_mount_states_are_reclaimable() {
+        assert!(!SandboxState::Archiving.is_home_mount_reclaimable());
         assert!(SandboxState::Archived.is_home_mount_reclaimable());
         assert!(SandboxState::Error.is_home_mount_reclaimable());
         assert!(!SandboxState::Planning.is_home_mount_reclaimable());

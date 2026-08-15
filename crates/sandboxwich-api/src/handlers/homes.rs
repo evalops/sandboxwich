@@ -18,7 +18,7 @@ use sqlx::{AnyConnection, Row};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-const HOME_MOUNT_RECLAIMABLE_STATES_SQL: &str = "'archiving', 'archived', 'error'";
+const HOME_MOUNT_RECLAIMABLE_STATES_SQL: &str = "'archived', 'error'";
 const HOME_MOUNT_CLAIM_SAVEPOINT: &str = "sandbox_home_mount_claim";
 
 #[utoipa::path(post, path = "/v1/homes", request_body = CreateHomeRequest, responses((status = 201, body = HomeResponse), (status = 200, body = HomeResponse)))]
@@ -371,10 +371,10 @@ async fn fetch_home_by_external_key(
 }
 
 /// Reports the sandbox currently holding this home's mount, if any, with its
-/// live state. Deliberately unfiltered: an `archiving`/`archived`/`error` mount row that
-/// has not yet been lazily cleaned up (see `claim_home_mount_on_connection`)
-/// is still reported, so the client's view matches what a mount claim would
-/// actually encounter.
+/// live state. Deliberately unfiltered: `archiving` remains provider-owned,
+/// while an `archived`/`error` row may still await lazy cleanup in
+/// `claim_home_mount_on_connection`. Reporting every row keeps the caller's
+/// view aligned with the claim boundary.
 async fn fetch_home_mount(
     db: &Database,
     home_id: HomeId,

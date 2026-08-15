@@ -4958,6 +4958,12 @@ fn teardown_spec_from_payload(
             .get("provisionSpec")
             .and_then(|spec| spec.get("provider_routing_scope"))
             .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                payload
+                    .get("provisionSpec")
+                    .and_then(|spec| spec.get("tenant_id"))
+                    .and_then(serde_json::Value::as_str)
+            })
             .map(str::to_string),
     })
 }

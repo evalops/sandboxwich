@@ -17,20 +17,26 @@ const ARCHIVED_RUNTIME_RECONCILIATION_BATCH_SIZE: u32 = 100;
 /// the write FIFO for an entire TTL backlog (mirrors archived-runtime repair).
 const ARCHIVED_SANDBOX_CLEANUP_BATCH_SIZE: i64 = 100;
 
-/// Finds archived sandboxes that still have provider-owned runtime rows and
-/// queues an idempotent label-scoped stop job for each one. This is a repair
-/// loop, not the retention cleanup: it runs independently of TTL so a late
-/// provision completion cannot keep a Pod/PVC consuming capacity until the
-/// sandbox's normal retention window expires.
+/// Finds archived sandboxes that still have provider-owned runtime rows, plus
+/// archiving sandboxes whose last stop failed, and queues one idempotent stop
+/// job for each. This is a repair loop, not the retention cleanup: it runs
+/// independently of TTL so provider teardown cannot remain stranded.
 pub(crate) async fn reconcile_archived_runtime_resources(db: &Database) -> Result<usize, ApiError> {
     let candidate_sql = format!(
         "select distinct sandboxes.id
          from sandboxes
-         join runtime_resources on runtime_resources.sandbox_id = sandboxes.id
-         where sandboxes.state = 'archived'
-           and runtime_resources.snapshot_id is null
-           and runtime_resources.purpose <> 'snapshot'
-           and runtime_resources.status not in ('deleted', 'destroyed')
+         left join runtime_resources on runtime_resources.sandbox_id = sandboxes.id
+         where ((sandboxes.state = 'archived'
+                 and runtime_resources.snapshot_id is null
+                 and runtime_resources.purpose <> 'snapshot'
+                 and runtime_resources.status not in ('deleted', 'destroyed'))
+                or (sandboxes.state = 'archiving'
+                    and exists (
+                        select 1 from jobs failed_stops
+                        where failed_stops.sandbox_id = sandboxes.id
+                          and failed_stops.kind = 'stop_sandbox'
+                          and failed_stops.status = 'failed'
+                    )))
            and not exists (
              select 1 from jobs
              where jobs.sandbox_id = sandboxes.id
@@ -52,7 +58,14 @@ pub(crate) async fn reconcile_archived_runtime_resources(db: &Database) -> Resul
         let mut tx = db.pool.begin().await?;
         let result = async {
             let sandbox = match fetch_sandbox_on_connection(db, &mut tx, sandbox_id).await {
-                Ok(sandbox) if sandbox.state == SandboxState::Archived => sandbox,
+                Ok(sandbox)
+                    if matches!(
+                        sandbox.state,
+                        SandboxState::Archiving | SandboxState::Archived
+                    ) =>
+                {
+                    sandbox
+                }
                 Ok(_) => return Ok(false),
                 Err(error) if error.status == axum::http::StatusCode::NOT_FOUND => {
                     return Ok(false);
@@ -68,22 +81,22 @@ pub(crate) async fn reconcile_archived_runtime_resources(db: &Database) -> Resul
                  limit 1",
                 db.placeholder(1)
             );
-            if sqlx::query(&active_resource_sql)
-                .bind(sandbox_id.to_string())
-                .fetch_optional(&mut *tx)
-                .await?
-                .is_none()
+            if sandbox.state == SandboxState::Archived
+                && sqlx::query(&active_resource_sql)
+                    .bind(sandbox_id.to_string())
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .is_none()
             {
                 return Ok(false);
             }
-            enqueue_archived_runtime_cleanup_on_connection(
-                db,
-                &mut tx,
-                &sandbox,
-                None,
-                "archived_runtime_reconciliation",
-            )
-            .await
+            let reason = if sandbox.state == SandboxState::Archiving {
+                "failed_stop_reconciliation"
+            } else {
+                "archived_runtime_reconciliation"
+            };
+            enqueue_archived_runtime_cleanup_on_connection(db, &mut tx, &sandbox, None, reason)
+                .await
         }
         .await;
         match result {
