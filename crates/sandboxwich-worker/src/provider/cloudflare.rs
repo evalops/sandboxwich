@@ -644,14 +644,36 @@ impl CloudflareSandboxProvider {
     }
 
     fn provider_error(error: anyhow::Error) -> anyhow::Error {
-        if let Some(http) = error.downcast_ref::<CloudflareHttpError>()
-            && (http.code == "capacity_exceeded" || http.status == 429)
-        {
-            return anyhow::Error::new(ProviderError::classified(
-                ProvisioningErrorClass::RetryableCapacity,
-                LifecycleReasonCode::WorkspaceCapacityPending,
-                error,
-            ));
+        if let Some(http) = error.downcast_ref::<CloudflareHttpError>() {
+            if http.code == "capacity_exceeded" || http.status == 429 {
+                return anyhow::Error::new(ProviderError::classified(
+                    ProvisioningErrorClass::RetryableCapacity,
+                    LifecycleReasonCode::WorkspaceCapacityPending,
+                    error,
+                ));
+            }
+            let terminal = match http.status {
+                401 | 403 => Some((
+                    ProvisioningErrorClass::TerminalSecurity,
+                    LifecycleReasonCode::KubernetesPolicyDenied,
+                )),
+                409 => Some((
+                    ProvisioningErrorClass::TerminalContract,
+                    LifecycleReasonCode::ResourceIdentityConflict,
+                )),
+                400 | 422 => Some((
+                    ProvisioningErrorClass::TerminalContract,
+                    LifecycleReasonCode::ResourceContractConflict,
+                )),
+                _ => None,
+            };
+            if let Some((error_class, reason_code)) = terminal {
+                return anyhow::Error::new(ProviderError::classified(
+                    error_class,
+                    reason_code,
+                    error,
+                ));
+            }
         }
         anyhow::Error::new(ProviderError::retryable(error))
     }
@@ -1200,6 +1222,20 @@ mod tests {
             ProvisioningErrorClass::RetryableCapacity
         );
         assert_eq!(provider_error.reason_code(), "workspace_capacity_pending");
+    }
+
+    #[test]
+    fn cloudflare_contract_rejections_are_permanent() {
+        for status in [400, 401, 403, 409] {
+            let error = CloudflareSandboxProvider::provider_error(anyhow::Error::new(
+                CloudflareHttpError {
+                    status,
+                    code: "recovery_contract_rejected".into(),
+                },
+            ));
+            let provider_error = error.downcast_ref::<ProviderError>().unwrap();
+            assert_eq!(provider_error.disposition(), RetryDisposition::Permanent);
+        }
     }
 
     #[test]

@@ -21,6 +21,7 @@ interface Env {
   COMMAND_LEDGER: DurableObjectNamespace<CommandLedger>;
   DEX_COMPUTER_HOME: R2Bucket;
   BRIDGE_TOKEN: string;
+  RECOVERY_TENANT: string;
 }
 
 interface CreateBody {
@@ -164,7 +165,7 @@ export class CommandLedger extends DurableObject<Env> {
   }
 
   private async destroySandbox(request: Request, sandboxId: string): Promise<Response> {
-    const recovery = recoveryIdentityRequest(request, sandboxId);
+    const recovery = recoveryIdentityRequest(request, sandboxId, this.env.RECOVERY_TENANT);
     const identity = recovery
       ? await this.requireRecoveryStoredIdentity(sandboxId)
       : await this.requireStoredIdentity(request, sandboxId);
