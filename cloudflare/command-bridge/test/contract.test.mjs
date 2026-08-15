@@ -15,6 +15,7 @@ const bindings = {
   DEX_COMPUTER_HOME: {},
   BRIDGE_TOKEN: "a-production-length-secret",
   RECOVERY_TENANT: "evalops-platform",
+  RECOVERY_SANDBOX_IDS: "sandbox-1",
 };
 
 test("stored identity recovery is fenced by stable sandbox id and tenant hint", () => {
@@ -27,16 +28,20 @@ test("stored identity recovery is fenced by stable sandbox id and tenant hint", 
     },
   });
 
-  assert.deepEqual(recoveryIdentityRequest(request, "sandbox-1", "evalops-platform"), {
+  assert.deepEqual(recoveryIdentityRequest(request, "sandbox-1", "evalops-platform", "sandbox-1"), {
     tenantHint: "evalops-platform",
   });
   assert.throws(
-    () => recoveryIdentityRequest(request, "sandbox-1", "tenant-other"),
+    () => recoveryIdentityRequest(request, "sandbox-1", "tenant-other", "sandbox-1"),
     (error) => error instanceof BridgeContractError && error.code === "recovery_tenant_mismatch",
   );
   assert.throws(
-    () => recoveryIdentityRequest(request, "sandbox-other", "evalops-platform"),
+    () => recoveryIdentityRequest(request, "sandbox-other", "evalops-platform", "sandbox-1"),
     (error) => error instanceof BridgeContractError && error.code === "sandbox_identity_mismatch",
+  );
+  assert.throws(
+    () => recoveryIdentityRequest(request, "sandbox-1", "evalops-platform", "sandbox-other"),
+    (error) => error instanceof BridgeContractError && error.code === "recovery_target_not_allowed",
   );
 });
 

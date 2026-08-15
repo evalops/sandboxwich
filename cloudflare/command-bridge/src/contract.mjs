@@ -8,7 +8,8 @@ export function capabilityReport(env) {
   const token = typeof env?.BRIDGE_TOKEN === "string" && env.BRIDGE_TOKEN.length >= 24;
   const recoveryTenant =
     typeof env?.RECOVERY_TENANT === "string" && OPAQUE_ID.test(env.RECOVERY_TENANT);
-  const command = ledger && sandbox && home && token && recoveryTenant;
+  const recoveryTargets = typeof env?.RECOVERY_SANDBOX_IDS === "string";
+  const command = ledger && sandbox && home && token && recoveryTenant && recoveryTargets;
   return {
     ok: command,
     durableLedger: ledger,
@@ -16,6 +17,7 @@ export function capabilityReport(env) {
     homeBinding: home,
     tokenBinding: token,
     recoveryTenantBinding: recoveryTenant,
+    recoveryTargetsBinding: recoveryTargets,
     capabilities: command ? ["sandbox.create", "sandbox.exec", "sandbox.result-replay"] : [],
   };
 }
@@ -40,7 +42,7 @@ export function requestIdentity(request, sandboxId) {
   return { organizationId, workspaceId, sandboxId };
 }
 
-export function recoveryIdentityRequest(request, sandboxId, recoveryTenant) {
+export function recoveryIdentityRequest(request, sandboxId, recoveryTenant, recoverySandboxIds) {
   if (request.headers.get("x-sandboxwich-recover-identity") !== "stored") return null;
   if (request.headers.get("x-sandboxwich-sandbox-id") !== sandboxId) {
     throw new BridgeContractError("sandbox_identity_mismatch", 409);
@@ -51,6 +53,13 @@ export function recoveryIdentityRequest(request, sandboxId, recoveryTenant) {
   }
   if (tenantHint !== recoveryTenant) {
     throw new BridgeContractError("recovery_tenant_mismatch", 403);
+  }
+  const allowedSandboxIds = recoverySandboxIds
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => OPAQUE_ID.test(value));
+  if (!allowedSandboxIds.includes(sandboxId)) {
+    throw new BridgeContractError("recovery_target_not_allowed", 403);
   }
   return { tenantHint };
 }
