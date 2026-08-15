@@ -1,0 +1,22 @@
+name: export-source-temp
+
+on:
+  push:
+    branches:
+      - agent/harden-control-plane-stack-20260815
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Package source tree
+        run: tar --exclude=.git --exclude=sandboxwich-source.tar.gz -czf sandboxwich-source.tar.gz .
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sandboxwich-source-${{ github.sha }}
+          path: sandboxwich-source.tar.gz
+          retention-days: 1
