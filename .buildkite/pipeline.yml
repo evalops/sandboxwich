@@ -13,6 +13,13 @@ steps:
   - label: ":rust: Format and repository contracts"
     key: "contracts"
     timeout_in_minutes: 45
+    retry:
+      automatic:
+        - exit_status: -1
+          signal_reason: none
+          limit: 1
+        - signal_reason: agent_stop
+          limit: 1
     command: |
       set -euo pipefail
       cargo fmt --all -- --check
@@ -24,6 +31,15 @@ steps:
   - label: ":postgres: Rust workspace tests"
     key: "tests"
     timeout_in_minutes: 90
+    concurrency: 2
+    concurrency_group: "sandboxwich-heavy"
+    retry:
+      automatic:
+        - exit_status: -1
+          signal_reason: none
+          limit: 1
+        - signal_reason: agent_stop
+          limit: 1
     agents:
       queue: "hetzner-linux-heavy"
       image: "evalops-platform-ci-v3"
@@ -84,6 +100,15 @@ steps:
   - label: ":lint-roller: Clippy"
     key: "clippy"
     timeout_in_minutes: 90
+    concurrency: 2
+    concurrency_group: "sandboxwich-heavy"
+    retry:
+      automatic:
+        - exit_status: -1
+          signal_reason: none
+          limit: 1
+        - signal_reason: agent_stop
+          limit: 1
     agents:
       queue: "hetzner-linux-heavy"
       image: "evalops-platform-ci-v3"
@@ -96,6 +121,13 @@ steps:
   - label: ":lock: Dependency audit"
     key: "audit"
     timeout_in_minutes: 30
+    retry:
+      automatic:
+        - exit_status: -1
+          signal_reason: none
+          limit: 1
+        - signal_reason: agent_stop
+          limit: 1
     command: |
       set -euo pipefail
       cargo install cargo-audit --locked
@@ -104,6 +136,13 @@ steps:
   - label: ":construction: Minimum Rust 1.95"
     key: "msrv"
     timeout_in_minutes: 60
+    retry:
+      automatic:
+        - exit_status: -1
+          signal_reason: none
+          limit: 1
+        - signal_reason: agent_stop
+          limit: 1
     cache:
       name: "sandboxwich-msrv-${BUILDKITE_PULL_REQUEST}"
       size: "30g"

@@ -39,6 +39,18 @@ class RepositoryRulesTest(unittest.TestCase):
             self.assertIn(marker, pipeline)
         self.assertIn("docker rm -f", pipeline)
 
+    def test_buildkite_heavy_jobs_leave_shared_capacity_available(self) -> None:
+        pipeline = (ROOT / ".buildkite/pipeline.yml").read_text()
+        self.assertEqual(pipeline.count('concurrency_group: "sandboxwich-heavy"'), 2)
+        self.assertEqual(pipeline.count("concurrency: 2"), 2)
+
+    def test_buildkite_retries_only_agent_loss_or_stop(self) -> None:
+        pipeline = (ROOT / ".buildkite/pipeline.yml").read_text()
+        self.assertEqual(pipeline.count("exit_status: -1"), 5)
+        self.assertEqual(pipeline.count("signal_reason: none"), 5)
+        self.assertEqual(pipeline.count("signal_reason: agent_stop"), 5)
+        self.assertNotIn('exit_status: "*"', pipeline)
+
     def test_pr_workflows_run_for_every_pull_request(self) -> None:
         for relative in (
             ".github/workflows/ci.yml",
