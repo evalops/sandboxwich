@@ -6,6 +6,7 @@ env:
   CI: "true"
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
   CARGO_TARGET_DIR: ".buildkite/cache/cargo-target"
 
 steps:
@@ -20,7 +21,7 @@ steps:
       python3 scripts/test-release-readiness.py
       python3 scripts/test-authz-proof.py
 
-  - label: ":test_tube: Rust workspace tests"
+  - label: ":postgres: Rust workspace tests"
     key: "tests"
     timeout_in_minutes: 90
     agents:
@@ -30,7 +31,55 @@ steps:
       name: "sandboxwich-tests-${BUILDKITE_PULL_REQUEST}"
       size: "50g"
       paths: [".buildkite/cache"]
-    command: cargo test --workspace --locked
+    command: |
+      set -euo pipefail
+      container_name="sandboxwich-buildkite-postgres-$${BUILDKITE_JOB_ID//-/}"
+      postgres_image="mirror.gcr.io/library/postgres:17@sha256:0af65001d05296a2ead57ac4a6412433d8913d1bb5d0c88435a7d1e1ee5cb04b"
+      pulled=false
+      for attempt in $$(seq 1 5); do
+        if docker pull "$${postgres_image}"; then
+          pulled=true
+          break
+        fi
+        sleep "$$((attempt * 2))"
+      done
+      if [[ "$${pulled}" != true ]] && ! docker image inspect "$${postgres_image}" >/dev/null 2>&1; then
+        echo "failed to pull Postgres image and no cached image is available" >&2
+        exit 1
+      fi
+      docker run --detach --rm \
+        --name "$${container_name}" \
+        --env POSTGRES_USER=postgres \
+        --env POSTGRES_PASSWORD=postgres \
+        --env POSTGRES_DB=sandboxwich \
+        --publish 127.0.0.1::5432 \
+        --health-cmd "pg_isready -U postgres -d sandboxwich" \
+        --health-interval 2s \
+        --health-timeout 5s \
+        --health-retries 30 \
+        "$${postgres_image}"
+      trap 'docker rm -f "$${container_name}" >/dev/null 2>&1 || true' EXIT
+      postgres_ready=false
+      for _ in $$(seq 1 60); do
+        if [[ "$$(docker inspect --format='{{.State.Health.Status}}' "$${container_name}")" == healthy ]]; then
+          postgres_ready=true
+          break
+        fi
+        sleep 2
+      done
+      if [[ "$${postgres_ready}" != true ]]; then
+        echo "Postgres did not become healthy" >&2
+        docker logs "$${container_name}" >&2 || true
+        exit 1
+      fi
+      host_port="$$(docker port "$${container_name}" 5432/tcp | sed 's/.*://')"
+      if ! [[ "$${host_port}" =~ ^[0-9]+$$ ]]; then
+        echo "invalid Postgres host port: $${host_port}" >&2
+        docker logs "$${container_name}" >&2 || true
+        exit 1
+      fi
+      export SANDBOXWICH_TEST_POSTGRES_URL="postgres://postgres:postgres@127.0.0.1:$${host_port}/sandboxwich"
+      cargo test --workspace --locked
 
   - label: ":lint-roller: Clippy"
     key: "clippy"
