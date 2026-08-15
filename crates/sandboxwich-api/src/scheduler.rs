@@ -102,10 +102,7 @@ pub(crate) fn spawn_expiry_sweeper(
             {
                 match reconcile_archived_runtime_resources(&db).await {
                     Ok(enqueued) if enqueued > 0 => {
-                        tracing::warn!(
-                            enqueued,
-                            "queued teardown for archived sandboxes with live runtime resources"
-                        );
+                        tracing::warn!(enqueued, "queued teardown for stranded sandbox cleanup");
                     }
                     Ok(_) => {}
                     Err(error) => {

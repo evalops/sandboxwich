@@ -435,14 +435,15 @@ mod tests {
     }
 
     #[test]
-    fn home_mount_reclaimability_matches_the_published_state_contract() {
+    fn home_mount_reclaimability_is_narrower_than_terminal_sandbox_usability() {
         for contract_state in SANDBOX_STATES {
             let state = SandboxState::parse_db_str(contract_state.state)
                 .expect("published lifecycle state must parse");
+            let expected = matches!(state, SandboxState::Archived | SandboxState::Error);
             assert_eq!(
                 state.is_home_mount_reclaimable(),
-                contract_state.disposition == SandboxStateDisposition::Terminal,
-                "home-mount reclaimability drifted from lifecycle disposition for {}",
+                expected,
+                "home-mount reclaimability drifted from provider-release semantics for {}",
                 contract_state.state
             );
         }

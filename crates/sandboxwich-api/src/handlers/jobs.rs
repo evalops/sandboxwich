@@ -923,9 +923,10 @@ pub(crate) async fn insert_job_on_connection_if_absent(
 pub(crate) const ARCHIVED_RUNTIME_CLEANUP_MARKER: &str = "archivedRuntimeCleanup";
 
 /// Queue provider teardown for an archived sandbox whose runtime rows still
-/// describe live resources. The marker is intentionally in the payload (and
-/// indexed by a partial unique index) so this remains idempotent after API
-/// restarts, worker retries, and concurrent sweeper replicas.
+/// describe live resources, or an archiving sandbox whose stop failed. The
+/// marker is intentionally in the payload (and indexed by a partial unique
+/// index) so this remains idempotent after API restarts, worker retries, and
+/// concurrent sweeper replicas.
 pub(crate) async fn enqueue_archived_runtime_cleanup_on_connection(
     db: &Database,
     connection: &mut AnyConnection,

@@ -1056,6 +1056,24 @@ fn stop_sandbox_job_rejects_an_invalid_persisted_teardown_hint() {
 }
 
 #[test]
+fn stop_sandbox_uses_provision_tenant_when_routing_identity_was_not_persisted() {
+    let spec = teardown_spec_from_payload(&json!({
+        "provisionSpec": {
+            "provider_external_id": null,
+            "provider_routing_scope": null,
+            "tenant_id": "org:workspace"
+        }
+    }))
+    .expect("valid teardown payload");
+
+    assert_eq!(spec.provider_external_id, None);
+    assert_eq!(
+        spec.provider_routing_scope.as_deref(),
+        Some("org:workspace")
+    );
+}
+
+#[test]
 fn resume_sandbox_job_restores_the_workspace_from_its_snapshot() {
     let sandbox_id = SandboxId::new();
     let snapshot_id = SnapshotId::new();

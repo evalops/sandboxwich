@@ -3355,6 +3355,142 @@ async fn archived_runtime_reconciliation_recovers_existing_leaks_without_duplica
 }
 
 #[tokio::test]
+async fn archived_runtime_reconciliation_recovers_stale_archiving_home_after_failed_stop() {
+    let db = test_sqlite_db().await;
+    let sandbox = seed_sandbox_with_state(&db, SandboxState::Archiving).await;
+    let now = Utc::now();
+    let home_id = HomeId::new();
+    sqlx::query(
+        "insert into homes (id, tenant_id, state, created_at, updated_at, error) \
+         values (?, ?, 'ready', ?, ?, null)",
+    )
+    .bind(home_id.to_string())
+    .bind(&sandbox.tenant_id)
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into sandbox_home_mounts (sandbox_id, home_id, tenant_id, created_at) \
+         values (?, ?, ?, ?)",
+    )
+    .bind(sandbox.id.to_string())
+    .bind(home_id.to_string())
+    .bind(&sandbox.tenant_id)
+    .bind(now.to_rfc3339())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let failed_stop = Job {
+        id: JobId::new(),
+        tenant_id: sandbox.tenant_id.clone(),
+        kind: JobKind::StopSandbox,
+        status: JobStatus::Failed,
+        payload: json!({ "sandboxId": sandbox.id }),
+        required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: sandbox.execution_class.clone(),
+        priority: 100,
+        attempts: 1,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: Some("provider identity was not persisted".into()),
+    };
+    insert_job(&db, &failed_stop).await.unwrap();
+
+    assert_eq!(reconcile_archived_runtime_resources(&db).await.unwrap(), 1);
+    assert_eq!(reconcile_archived_runtime_resources(&db).await.unwrap(), 0);
+    let repair_id: String = sqlx::query_scalar(
+        "select id from jobs where sandbox_id = ? and kind = 'stop_sandbox' \
+         and status = 'queued' and archived_runtime_cleanup = true",
+    )
+    .bind(sandbox.id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let repair_job = fetch_job(
+        &db,
+        JobId(Uuid::parse_str(&repair_id).expect("repair job id is a UUID")),
+    )
+    .await
+    .unwrap();
+    let mount_count: i64 = sqlx::query_scalar(
+        "select count(*) from sandbox_home_mounts where home_id = ? and sandbox_id = ?",
+    )
+    .bind(home_id.to_string())
+    .bind(sandbox.id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        mount_count, 1,
+        "repair enqueue must not release the live mount"
+    );
+
+    let mut connection = db.pool.acquire().await.unwrap();
+    apply_completed_job_on_connection(
+        &db,
+        &mut connection,
+        &repair_job,
+        WorkerJobResult::StopSandbox {
+            provider: "cloudflare".into(),
+            sandbox_id: sandbox.id,
+            custody_receipt: None,
+        },
+    )
+    .await
+    .unwrap();
+    drop(connection);
+
+    assert_eq!(
+        fetch_sandbox(&db, sandbox.id).await.unwrap().state,
+        SandboxState::Archived
+    );
+    let mount_count: i64 =
+        sqlx::query_scalar("select count(*) from sandbox_home_mounts where home_id = ?")
+            .bind(home_id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        mount_count, 0,
+        "only provider-confirmed stop completion releases the home"
+    );
+}
+
+#[tokio::test]
+async fn database_fences_every_active_stop_job_to_one_per_sandbox() {
+    let db = test_sqlite_db().await;
+    let sandbox = seed_sandbox_with_state(&db, SandboxState::Archiving).await;
+    let now = Utc::now();
+    let stop_job = |id| Job {
+        id,
+        tenant_id: sandbox.tenant_id.clone(),
+        kind: JobKind::StopSandbox,
+        status: JobStatus::Queued,
+        payload: json!({ "sandboxId": sandbox.id }),
+        required_capability: WorkerCapability::ProvisionSandbox,
+        required_execution_class: sandbox.execution_class.clone(),
+        priority: 100,
+        attempts: 0,
+        max_attempts: 3,
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+    };
+
+    insert_job(&db, &stop_job(JobId::new())).await.unwrap();
+    let duplicate = insert_job(&db, &stop_job(JobId::new())).await;
+    assert!(
+        duplicate.is_err(),
+        "the database must close races between ordinary and repair stop enqueue paths"
+    );
+}
+
+#[tokio::test]
 async fn archived_runtime_reconciliation_skips_active_cleanup_backlog_before_batch_limit() {
     let db = test_sqlite_db().await;
 
