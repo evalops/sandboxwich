@@ -36,6 +36,26 @@ class ReleaseReadinessTest(unittest.TestCase):
         # never fired (e.g., tag pushed with GITHUB_TOKEN).
         self.assertIn("workflow_dispatch", workflow)
 
+    def test_release_waits_for_exact_sha_live_conformance(self) -> None:
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        verifier = ROOT / "scripts/verify-release-conformance.py"
+        self.assertTrue(verifier.exists())
+        self.assertIn("actions: read", workflow)
+        self.assertIn("conformance:\n", workflow)
+        self.assertIn("scripts/verify-release-conformance.py", workflow)
+        self.assertIn('--sha "${GITHUB_SHA}"', workflow)
+        self.assertIn("release-conformance-attestation.json", workflow)
+        self.assertEqual(workflow.count("needs: conformance"), 2)
+        verifier_text = verifier.read_text()
+        for marker in (
+            "sandboxwich.release-conformance.v1",
+            "head_sha",
+            "kubernetes-conformance.yml",
+            "workflowRunId",
+            "workflowRunUrl",
+        ):
+            self.assertIn(marker, verifier_text)
+
     def test_all_workflow_files_parse_as_yaml(self) -> None:
         # A workflow file that does not parse only fails when it next runs,
         # which is how an invalid release workflow once shipped to main.
