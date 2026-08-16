@@ -66,6 +66,9 @@ pub(crate) struct RuntimeResourceInventoryQuery {
     limit: Option<u32>,
     before: Option<String>,
     after: Option<String>,
+    sandbox_after: Option<String>,
+    include_resources: Option<bool>,
+    include_sandbox_ids: Option<bool>,
 }
 
 pub(crate) async fn runtime_resource_inventory(
@@ -82,13 +85,29 @@ pub(crate) async fn runtime_resource_inventory(
             "runtime resource namespace is required",
         ));
     }
-    let page = crate::pagination::PageParams {
-        limit: query.limit,
-        before: query.before,
-        after: query.after,
-    };
-    let limit = resolve_page_limit(page.limit)?;
-    let cursor = resolve_page_cursor(&page)?;
+    let include_resources = query.include_resources.unwrap_or(true);
+    let include_sandbox_ids = query.include_sandbox_ids.unwrap_or(true);
+    let limit = resolve_page_limit(query.limit)?;
+    let cursor = include_resources
+        .then(|| {
+            resolve_page_cursor(&crate::pagination::PageParams {
+                limit: query.limit,
+                before: query.before,
+                after: query.after,
+            })
+        })
+        .transpose()?
+        .flatten();
+    let sandbox_cursor = include_sandbox_ids
+        .then(|| {
+            resolve_page_cursor(&crate::pagination::PageParams {
+                limit: query.limit,
+                before: None,
+                after: query.sandbox_after,
+            })
+        })
+        .transpose()?
+        .flatten();
     // Reconciliation is a cluster/namespace authority boundary, not a tenant
     // boundary: this worker can already list and delete every resource in the
     // shared Kubernetes namespace. Its expected inventory must therefore span
@@ -150,21 +169,23 @@ pub(crate) async fn runtime_resource_inventory(
         .map(|index| state.db.placeholder(index))
         .collect::<Vec<_>>()
         .join(", ");
-    let sandbox_sql = "select id as sandbox_id
-         from sandboxes
-         where state != 'archived'
-         order by id asc limit 201";
-    let mut sandbox_ids = sqlx::query(sandbox_sql)
-        .fetch_all(state.db.read_pool())
+    let (sandbox_ids, sandbox_next_cursor) = if include_sandbox_ids {
+        fetch_keyset_page(
+            &state.db,
+            "select created_at, id from sandboxes where state != 'archived'",
+            &[],
+            limit,
+            &sandbox_cursor,
+            |row| {
+                let created_at: &str = row.try_get("created_at")?;
+                let id: &str = row.try_get("id")?;
+                Ok((PageCursor::new(created_at, id), SandboxId(parse_uuid(id)?)))
+            },
+        )
         .await?
-        .into_iter()
-        .map(|row| {
-            let value: String = row.try_get("sandbox_id")?;
-            Ok(SandboxId(parse_uuid(&value)?))
-        })
-        .collect::<Result<Vec<_>, ApiError>>()?;
-    let complete = sandbox_ids.len() <= 200 && scope_complete;
-    sandbox_ids.truncate(200);
+    } else {
+        (Vec::new(), None)
+    };
     let sql = format!(
         "select * from (
          select por.updated_at as created_at, por.resource_uid as id,
@@ -202,12 +223,13 @@ pub(crate) async fn runtime_resource_inventory(
             Uuid::parse_str(&value).map_err(|_| ApiError::internal("invalid resident lease"))
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
-    let complete = complete && active_resident_lease_ids.len() <= 200;
+    let complete =
+        scope_complete && active_resident_lease_ids.len() <= 200 && sandbox_next_cursor.is_none();
     active_resident_lease_ids.truncate(200);
     let mut fixed_binds = scope_worker_ids;
     fixed_binds.push(query.namespace.clone());
     let inventory_started = Instant::now();
-    let (resources, next_cursor) =
+    let (resources, next_cursor) = if include_resources {
         fetch_keyset_page(&state.db, &sql, &fixed_binds, limit, &cursor, |row| {
             // Keyset columns are aliased as created_at/id on the inventory subquery.
             let page_created_at: &str = row.try_get("created_at")?;
@@ -244,7 +266,10 @@ pub(crate) async fn runtime_resource_inventory(
                 },
             ))
         })
-        .await?;
+        .await?
+    } else {
+        (Vec::new(), None)
+    };
     let inventory_duration_ms = inventory_started.elapsed().as_millis() as u64;
     if inventory_duration_ms >= 500 {
         tracing::warn!(
@@ -278,6 +303,7 @@ pub(crate) async fn runtime_resource_inventory(
         complete,
         resources,
         active_resident_lease_ids,
+        sandbox_next_cursor,
         next_cursor,
     }))
 }

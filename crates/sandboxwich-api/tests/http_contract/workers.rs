@@ -1,4 +1,5 @@
 use crate::common::*;
+use crate::types::insert_sandbox_sql;
 use reqwest::StatusCode;
 use sandboxwich_core::*;
 use sqlx::any::AnyPoolOptions;
@@ -59,6 +60,132 @@ async fn create_execution_sandbox(
         .json()
         .await
         .unwrap()
+}
+
+#[tokio::test]
+pub(crate) async fn runtime_resource_inventory_paginates_all_live_sandbox_fences() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("worker-sandbox-fence-pages.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    let client = server.client();
+    let registered: WorkerResponse = client
+        .post(format!("{}/workers/register", server.base_url))
+        .json(&RegisterWorkerRequest {
+            name: "sandbox-fence-pagination-worker".to_string(),
+            provider: "kubernetes".to_string(),
+            capabilities: vec![WorkerCapability::ProvisionSandbox],
+            max_concurrent_jobs: Some(1),
+            labels: std::collections::BTreeMap::from([(
+                "cluster".to_string(),
+                "kind-sandbox-fence-pages".to_string(),
+            )]),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let worker = worker_client(&registered);
+
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&server.database_url)
+        .await
+        .unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut expected = std::collections::HashSet::new();
+    for index in 0..205 {
+        let sandbox_id = SandboxId::new();
+        expected.insert(sandbox_id);
+        sqlx::query(&insert_sandbox_sql(&server.database_url))
+            .bind(sandbox_id.to_string())
+            .bind(format!("sandbox-fence-{index}"))
+            .bind(if index == 0 { "archiving" } else { "ready" })
+            .bind("ubuntu-dev")
+            .bind("1g")
+            .bind("deny_all")
+            .bind("persistent")
+            .bind("development_container")
+            .bind(&now)
+            .bind(&now)
+            .bind(120_i64)
+            .bind(Option::<String>::None)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let archived = SandboxId::new();
+    sqlx::query(&insert_sandbox_sql(&server.database_url))
+        .bind(archived.to_string())
+        .bind("archived-sandbox-fence")
+        .bind("archived")
+        .bind("ubuntu-dev")
+        .bind("1g")
+        .bind("deny_all")
+        .bind("persistent")
+        .bind("development_container")
+        .bind(&now)
+        .bind(&now)
+        .bind(120_i64)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let mut cursor = None;
+    let mut seen = std::collections::HashSet::new();
+    let mut pages = 0;
+    let mut page_lengths = Vec::new();
+    loop {
+        let mut url = format!(
+            "{}/workers/{}/runtime-resource-inventory?namespace=sandboxwich-sandboxes&limit=73&include_resources=false",
+            server.base_url, registered.worker.id
+        );
+        if let Some(after) = cursor.as_deref() {
+            url.push_str("&sandbox_after=");
+            url.push_str(after);
+        }
+        let inventory: RuntimeResourceInventoryResponse = worker
+            .get(url)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        pages += 1;
+        page_lengths.push(inventory.sandbox_ids.len());
+        assert!(inventory.resources.is_empty());
+        assert!(inventory.next_cursor.is_none());
+        assert_eq!(inventory.complete, inventory.sandbox_next_cursor.is_none());
+        for sandbox_id in inventory.sandbox_ids {
+            assert!(
+                seen.insert(sandbox_id),
+                "sandbox fence repeated across pages"
+            );
+        }
+        cursor = inventory.sandbox_next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    assert_eq!(pages, 3, "sandbox page lengths: {page_lengths:?}");
+    assert_eq!(seen, expected);
+    assert!(!seen.contains(&archived));
 }
 
 async fn claim_execution_job(

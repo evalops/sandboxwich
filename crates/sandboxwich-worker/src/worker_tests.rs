@@ -2165,6 +2165,89 @@ fn reconcile_command_is_a_one_shot_path_separate_from_worker_claiming() {
     assert!(cli.is_ok(), "the out-of-band reconcile command must parse");
 }
 
+#[tokio::test]
+async fn runtime_inventory_fetch_exhausts_sandbox_pages_and_bounds_overflow() {
+    use axum::{Json, Router, extract::Request};
+
+    let sandbox_ids = (0..205).map(|_| SandboxId::new()).collect::<Vec<_>>();
+    let expected = sandbox_ids.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(
+        axum::serve(
+            listener,
+            Router::new().fallback(move |request: Request| {
+                let sandbox_ids = sandbox_ids.clone();
+                async move {
+                    let query = request.uri().query().unwrap_or_default();
+                    let resource_only = query.contains("include_sandbox_ids=false");
+                    let second_sandbox_page = query.contains("sandbox_after=next-sandbox-page");
+                    let (page_ids, complete, sandbox_next_cursor) = if resource_only {
+                        (Vec::new(), true, None)
+                    } else if second_sandbox_page {
+                        (sandbox_ids[200..].to_vec(), true, None)
+                    } else {
+                        (
+                            sandbox_ids[..200].to_vec(),
+                            false,
+                            Some("next-sandbox-page".to_string()),
+                        )
+                    };
+                    Json(RuntimeResourceInventoryResponse {
+                        ok: true,
+                        provider: "kubernetes".to_string(),
+                        cluster: Some("cluster-a".to_string()),
+                        namespace: "sandboxes".to_string(),
+                        sandbox_ids: page_ids,
+                        complete,
+                        resources: Vec::new(),
+                        active_resident_lease_ids: Vec::new(),
+                        sandbox_next_cursor,
+                        next_cursor: None,
+                    })
+                }
+            }),
+        )
+        .into_future(),
+    );
+
+    let inventory = fetch_runtime_resource_inventory(
+        &reqwest::Client::new(),
+        &format!("http://{address}"),
+        Uuid::new_v4(),
+        "sandboxes",
+        205,
+    )
+    .await
+    .expect("all independently paginated sandbox fences are aggregated");
+    assert!(inventory.complete);
+    assert!(inventory.next_cursor.is_none());
+    assert!(inventory.sandbox_next_cursor.is_none());
+    assert_eq!(
+        inventory
+            .sandbox_ids
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>(),
+        expected.into_iter().collect()
+    );
+
+    let error = fetch_runtime_resource_inventory(
+        &reqwest::Client::new(),
+        &format!("http://{address}"),
+        Uuid::new_v4(),
+        "sandboxes",
+        200,
+    )
+    .await
+    .expect_err("a remaining sandbox cursor at max_scanned must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("runtime sandbox inventory exceeded max_scanned=200")
+    );
+    server.abort();
+}
+
 #[test]
 fn reconcile_scope_validation_names_the_incomplete_boundary() {
     let mut inventory = RuntimeResourceInventoryResponse {
@@ -2176,6 +2259,7 @@ fn reconcile_scope_validation_names_the_incomplete_boundary() {
         complete: true,
         resources: Vec::new(),
         active_resident_lease_ids: Vec::new(),
+        sandbox_next_cursor: None,
         next_cursor: None,
     };
     validate_reconciliation_inventory_scope(&inventory, "cluster-a", "sandboxes")
