@@ -161,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
         maestro_observation_sink,
         resident_bootstraps,
         sandbox_lifetime: config.sandbox_lifetime,
+        sterile_pool: config.sterile_pool,
         sterile_cell_signing_key: config.sterile_cell_signing_key.map(Arc::<str>::from),
         sterile_resident_activation_enabled: config.sterile_resident_activation_enabled,
         #[cfg(test)]

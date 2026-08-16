@@ -86,6 +86,8 @@ pub(crate) struct ApiConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SterilePoolConfig {
     pub(crate) target: u32,
+    pub(crate) ready_floor: u32,
+    pub(crate) max_provisioning: u32,
     pub(crate) tenant_id: String,
     pub(crate) release: SterileCellReleaseTrustClassV1,
     pub(crate) sandbox_profile: SandboxRuntimeProfile,
@@ -223,8 +225,14 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
         sterile_resident_activation_enabled,
         bootstrap_handoff_key.as_ref(),
     )?;
+    let sterile_pool_target = parse_env_u32("SANDBOXWICH_STERILE_POOL_TARGET", 0)?;
     let sterile_pool = parse_sterile_pool_config(
-        parse_env_u32("SANDBOXWICH_STERILE_POOL_TARGET", 0)?,
+        sterile_pool_target,
+        parse_env_u32("SANDBOXWICH_STERILE_POOL_READY_FLOOR", 0)?,
+        parse_env_u32(
+            "SANDBOXWICH_STERILE_POOL_MAX_PROVISIONING",
+            sterile_pool_target.max(1),
+        )?,
         std::env::var("SANDBOXWICH_STERILE_POOL_TENANT_ID").ok(),
         std::env::var("SANDBOXWICH_STERILE_POOL_RELEASE_SET_ID").ok(),
         std::env::var("SANDBOXWICH_STERILE_POOL_RUNTIME_CLASS").ok(),
@@ -279,6 +287,8 @@ fn require_sterile_activation_handoff_key(
 #[allow(clippy::too_many_arguments)]
 fn parse_sterile_pool_config(
     target: u32,
+    ready_floor: u32,
+    max_provisioning: u32,
     tenant_id: Option<String>,
     release_set_id: Option<String>,
     runtime_class: Option<String>,
@@ -291,9 +301,17 @@ fn parse_sterile_pool_config(
     ready_ttl_seconds: u32,
     signing_key: Option<&str>,
 ) -> anyhow::Result<Option<SterilePoolConfig>> {
+    anyhow::ensure!(
+        target >= ready_floor,
+        "SANDBOXWICH_STERILE_POOL_TARGET must be greater than or equal to SANDBOXWICH_STERILE_POOL_READY_FLOOR"
+    );
     if target == 0 {
         return Ok(None);
     }
+    anyhow::ensure!(
+        max_provisioning > 0 && max_provisioning <= target,
+        "SANDBOXWICH_STERILE_POOL_MAX_PROVISIONING must be greater than zero and no greater than SANDBOXWICH_STERILE_POOL_TARGET"
+    );
     let required = |name: &'static str, value: Option<String>| -> anyhow::Result<String> {
         value
             .map(|value| value.trim().to_string())
@@ -347,6 +365,8 @@ fn parse_sterile_pool_config(
     };
     Ok(Some(SterilePoolConfig {
         target,
+        ready_floor,
+        max_provisioning,
         tenant_id: required("SANDBOXWICH_STERILE_POOL_TENANT_ID", tenant_id)?,
         release,
         sandbox_profile,
@@ -699,6 +719,8 @@ mod tests {
         assert!(
             parse_sterile_pool_config(
                 0,
+                0,
+                1,
                 Some("ignored".into()),
                 None,
                 None,
@@ -716,6 +738,8 @@ mod tests {
         );
         assert!(
             parse_sterile_pool_config(
+                1,
+                0,
                 1,
                 Some("default".into()),
                 None,
@@ -736,6 +760,8 @@ mod tests {
         let (digest, signature) = signed_pool_release(key);
         let config = parse_sterile_pool_config(
             2,
+            1,
+            2,
             Some("default".into()),
             Some("release-test".into()),
             Some("kata_microvm".into()),
@@ -751,9 +777,33 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(config.target, 2);
+        assert_eq!(config.ready_floor, 1);
+        assert_eq!(config.max_provisioning, 2);
         assert_eq!(
             config.release.runtime_class,
             SterileCellRuntimeClass::KataMicrovm
+        );
+    }
+
+    #[test]
+    fn sterile_pool_capacity_settings_fail_closed_when_out_of_bounds() {
+        assert!(
+            parse_sterile_pool_config(
+                1, 2, 1, None, None, None, None, None, None, None, None, None, 300, None,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_sterile_pool_config(
+                1, 0, 0, None, None, None, None, None, None, None, None, None, 300, None,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_sterile_pool_config(
+                1, 0, 2, None, None, None, None, None, None, None, None, None, 300, None,
+            )
+            .is_err()
         );
     }
 }

@@ -15,6 +15,21 @@ use uuid::Uuid;
 
 pub(crate) const POOL_JOB_MARKER: &str = "sterilePool";
 
+pub(crate) async fn lock_controller_on_connection(
+    db: &Database,
+    connection: &mut AnyConnection,
+) -> Result<(), ApiError> {
+    let lock_sql = format!(
+        "update sterile_pool_controller_lock set updated_at = {} where singleton = 1",
+        db.placeholder(1)
+    );
+    sqlx::query(&lock_sql)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *connection)
+        .await?;
+    Ok(())
+}
+
 pub(crate) fn spawn_sterile_pool_reconciler(
     db: Database,
     config: Option<SterilePoolConfig>,
@@ -42,14 +57,7 @@ pub(crate) async fn reconcile_sterile_pool(
 ) -> Result<u32, ApiError> {
     let mut tx = db.pool.begin().await?;
     let now = Utc::now();
-    let lock_sql = format!(
-        "update sterile_pool_controller_lock set updated_at = {} where singleton = 1",
-        db.placeholder(1)
-    );
-    sqlx::query(&lock_sql)
-        .bind(now.to_rfc3339())
-        .execute(&mut *tx)
-        .await?;
+    lock_controller_on_connection(db, &mut tx).await?;
 
     reconcile_sterile_pool_cleanup_on_connection(db, &mut tx, now).await?;
 
@@ -83,11 +91,14 @@ pub(crate) async fn reconcile_sterile_pool(
     enqueue_expired_leased_stops_on_connection(db, &mut tx, now).await?;
 
     let count_sql = format!(
-        "select count(*) from sterile_pool_memberships
+        "select
+             sum(case when state in ('provisioning', 'ready', 'leased', 'stopping', 'cleanup_pending') then 1 else 0 end) as live_count,
+             sum(case when state = 'provisioning' then 1 else 0 end) as provisioning_count
+         from sterile_pool_memberships
          where tenant_id = {} and release_set_id = {} and runtime_class = {}
            and policy_digest = {} and release_signature = {}
            and candidate_agent_image = {} and candidate_maestro_image = {}
-           and state in ('provisioning', 'ready')",
+           ",
         db.placeholder(1),
         db.placeholder(2),
         db.placeholder(3),
@@ -96,7 +107,7 @@ pub(crate) async fn reconcile_sterile_pool(
         db.placeholder(6),
         db.placeholder(7)
     );
-    let reserve: i64 = sqlx::query_scalar(&count_sql)
+    let counts = sqlx::query(&count_sql)
         .bind(&config.tenant_id)
         .bind(&config.release.release_set_id)
         .bind(config.release.runtime_class.as_db_str())
@@ -106,25 +117,31 @@ pub(crate) async fn reconcile_sterile_pool(
         .bind(&config.maestro_image)
         .fetch_one(&mut *tx)
         .await?;
-    let missing = i64::from(config.target).saturating_sub(reserve).max(0);
-    for _ in 0..missing {
+    let live_count = counts
+        .try_get::<Option<i64>, _>("live_count")?
+        .unwrap_or_default();
+    let provisioning_count = counts
+        .try_get::<Option<i64>, _>("provisioning_count")?
+        .unwrap_or_default();
+    let to_create = i64::from(config.target)
+        .saturating_sub(live_count)
+        .max(0)
+        .min(
+            i64::from(config.max_provisioning)
+                .saturating_sub(provisioning_count)
+                .max(0),
+        );
+    for _ in 0..to_create {
         insert_pool_member_on_connection(db, &mut tx, config, now).await?;
     }
     tx.commit().await?;
-    u32::try_from(missing).map_err(|_| ApiError::internal("sterile pool target exceeds range"))
+    u32::try_from(to_create).map_err(|_| ApiError::internal("sterile pool target exceeds range"))
 }
 
 pub(crate) async fn reconcile_sterile_pool_cleanup(db: &Database) -> Result<(), ApiError> {
     let mut tx = db.pool.begin().await?;
     let now = Utc::now();
-    let lock_sql = format!(
-        "update sterile_pool_controller_lock set updated_at = {} where singleton = 1",
-        db.placeholder(1)
-    );
-    sqlx::query(&lock_sql)
-        .bind(now.to_rfc3339())
-        .execute(&mut *tx)
-        .await?;
+    lock_controller_on_connection(db, &mut tx).await?;
     reconcile_sterile_pool_cleanup_on_connection(db, &mut tx, now).await?;
     enqueue_expired_ready_stops_on_connection(db, &mut tx, now).await?;
     enqueue_expired_leased_stops_on_connection(db, &mut tx, now).await?;
@@ -688,6 +705,10 @@ async fn enqueue_pool_stop_with_policy_on_connection(
     disposition: SterileCellDisposition,
     require_live_lease: bool,
 ) -> Result<bool, ApiError> {
+    // A release changes a live membership into another live state. Serialize
+    // that transition with reconciliation so a concurrent count cannot create
+    // a replacement before the stopping/cleanup_pending row is visible.
+    lock_controller_on_connection(db, connection).await?;
     let membership_sql = format!(
         "select provision_job_id, state, worker_id, lease_id, generation, requested_disposition
          from sterile_pool_memberships where sandbox_id = {}",
@@ -1279,6 +1300,8 @@ mod tests {
     fn pool_config(target: u32) -> SterilePoolConfig {
         SterilePoolConfig {
             target,
+            ready_floor: 0,
+            max_provisioning: target.max(1),
             tenant_id: "default".into(),
             release: SterileCellReleaseTrustClassV1 {
                 release_set_id: "release-test".into(),
@@ -1434,6 +1457,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hard_target_counts_every_nonterminal_membership_state() {
+        let db = test_db().await;
+        let config = pool_config(5);
+        reconcile_sterile_pool(&db, &config).await.unwrap();
+        let rows = sqlx::query(
+            "select sandbox_id, provision_job_id from sterile_pool_memberships order by sandbox_id",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 5);
+        let sandbox_ids: Vec<SandboxId> = rows
+            .iter()
+            .map(|row| SandboxId(Uuid::parse_str(row.try_get("sandbox_id").unwrap()).unwrap()))
+            .collect();
+        let worker_id = seed_worker_and_placement(&db, sandbox_ids[2]).await;
+        let expires = (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+
+        sqlx::query(
+            "update sterile_pool_memberships
+             set state = 'ready', worker_id = ?, generation = 1,
+                 candidate_pod_name = ?, candidate_pod_uid = ?, cell_expires_at = ?,
+                 lease_id = null, stop_job_id = null, requested_disposition = null
+             where sandbox_id = ?",
+        )
+        .bind(worker_id.to_string())
+        .bind("pool-ready-pod")
+        .bind("pool-ready-uid")
+        .bind(&expires)
+        .bind(sandbox_ids[1].to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let leased_id = Uuid::now_v7();
+        sqlx::query(
+            "update sterile_pool_memberships
+             set state = 'leased', worker_id = ?, generation = 2,
+                 candidate_pod_name = ?, candidate_pod_uid = ?, cell_expires_at = ?,
+                 lease_id = ?, stop_job_id = null, requested_disposition = null
+             where sandbox_id = ?",
+        )
+        .bind(worker_id.to_string())
+        .bind("pool-leased-pod")
+        .bind("pool-leased-uid")
+        .bind(&expires)
+        .bind(leased_id.to_string())
+        .bind(sandbox_ids[2].to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let stopping_id = Uuid::now_v7();
+        let stopping_job_id: String = rows[3].try_get("provision_job_id").unwrap();
+        sqlx::query(
+            "update sterile_pool_memberships
+             set state = 'stopping', worker_id = ?, generation = 2,
+                 candidate_pod_name = ?, candidate_pod_uid = ?, cell_expires_at = ?,
+                 lease_id = ?, stop_job_id = ?, requested_disposition = 'quarantined'
+             where sandbox_id = ?",
+        )
+        .bind(worker_id.to_string())
+        .bind("pool-stopping-pod")
+        .bind("pool-stopping-uid")
+        .bind(&expires)
+        .bind(stopping_id.to_string())
+        .bind(&stopping_job_id)
+        .bind(sandbox_ids[3].to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let cleanup_id = Uuid::now_v7();
+        sqlx::query(
+            "update sterile_pool_memberships
+             set state = 'cleanup_pending', worker_id = ?, generation = 2,
+                 candidate_pod_name = ?, candidate_pod_uid = ?, cell_expires_at = ?,
+                 lease_id = ?, stop_job_id = null, requested_disposition = 'quarantined'
+             where sandbox_id = ?",
+        )
+        .bind(worker_id.to_string())
+        .bind("pool-cleanup-pod")
+        .bind("pool-cleanup-uid")
+        .bind(&expires)
+        .bind(cleanup_id.to_string())
+        .bind(sandbox_ids[4].to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(reconcile_sterile_pool(&db, &config).await.unwrap(), 0);
+        let live_count: i64 = sqlx::query_scalar(
+            "select count(*) from sterile_pool_memberships
+             where state in ('provisioning', 'ready', 'leased', 'stopping', 'cleanup_pending')",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(live_count, 5, "reconcile must not exceed the hard target");
+    }
+
+    #[tokio::test]
+    async fn max_provisioning_caps_each_reconcile() {
+        let db = test_db().await;
+        let mut config = pool_config(5);
+        config.max_provisioning = 2;
+
+        assert_eq!(reconcile_sterile_pool(&db, &config).await.unwrap(), 2);
+        assert_eq!(reconcile_sterile_pool(&db, &config).await.unwrap(), 0);
+        let provisioning_count: i64 = sqlx::query_scalar(
+            "select count(*) from sterile_pool_memberships where state = 'provisioning'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(provisioning_count, 2);
+    }
+
+    #[tokio::test]
     async fn provider_ready_admission_claim_replenishment_and_stop_are_exactly_fenced() {
         let db = test_db().await;
         let (sandbox_id, _job, worker_id) = provision_one(&db).await;
@@ -1494,7 +1636,10 @@ mod tests {
         .fetch_one(&db.pool)
         .await
         .unwrap();
-        assert_eq!(reserve, 1, "leasing replenishes the reserve exactly once");
+        assert_eq!(
+            reserve, 0,
+            "a live lease remains part of the hard target until provider cleanup"
+        );
 
         let mut tx = db.pool.begin().await.unwrap();
         assert!(
@@ -1964,7 +2109,10 @@ mod tests {
         .fetch_one(&db.pool)
         .await
         .unwrap();
-        assert_eq!(replacement_count, 1);
+        assert_eq!(
+            replacement_count, 0,
+            "a stopping member remains part of the hard target until provider cleanup"
+        );
         let stop_job = fetch_job(&db, JobId(Uuid::parse_str(&original.1).unwrap()))
             .await
             .unwrap();
@@ -1980,5 +2128,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state, "quarantined");
+        reconcile_sterile_pool(&db, &pool_config(1)).await.unwrap();
+        let replacement_count: i64 = sqlx::query_scalar(
+            "select count(*) from sterile_pool_memberships where sandbox_id != ? and state = 'provisioning'",
+        )
+        .bind(sandbox_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(replacement_count, 1);
     }
 }

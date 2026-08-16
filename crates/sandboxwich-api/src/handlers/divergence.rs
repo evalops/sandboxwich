@@ -531,6 +531,7 @@ mod tests {
             apex_waiters: Default::default(),
             resident_bootstraps: Default::default(),
             sandbox_lifetime: Default::default(),
+            sterile_pool: None,
             sterile_cell_signing_key: None,
             sterile_resident_activation_enabled: false,
             apex_callback_test_hook: None,

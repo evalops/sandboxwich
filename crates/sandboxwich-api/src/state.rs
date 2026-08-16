@@ -1158,6 +1158,7 @@ pub(crate) struct AppState {
     pub(crate) apex_waiters: ApexInstructionWaiters,
     pub(crate) resident_bootstraps: ResidentBootstrapStore,
     pub(crate) sandbox_lifetime: SandboxLifetimeConfig,
+    pub(crate) sterile_pool: Option<SterilePoolConfig>,
     pub(crate) sterile_cell_signing_key: Option<Arc<str>>,
     pub(crate) sterile_resident_activation_enabled: bool,
     #[cfg(test)]

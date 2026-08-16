@@ -27,6 +27,13 @@ SANDBOXWICH_STERILE_POOL_AGENT_IMAGE
 SANDBOXWICH_STERILE_POOL_MAESTRO_IMAGE
 ```
 
+`SANDBOXWICH_STERILE_POOL_READY_FLOOR` defaults to `0` and protects that
+many ready cells from pool claims. `SANDBOXWICH_STERILE_POOL_MAX_PROVISIONING`
+defaults to the target and caps the number of pool members that may be in
+`provisioning` at once. The target must be at least the ready floor, and the
+maximum provisioning value must be greater than zero and no greater than the
+target.
+
 `SANDBOXWICH_STERILE_POOL_READY_TTL_SECONDS` defaults to `300`. Its clock
 starts when provider provisioning completes. The configured release signature
 must validate under `SANDBOXWICH_STERILE_CELL_SIGNING_KEY_FILE`, and the pool
@@ -38,8 +45,13 @@ contains no production pool values.
 Pool membership is stored by `sandbox_id`. The sandbox ID, sterile cell ID,
 and provider cell ID are identical. Provision completion inserts the ready
 cell and records its worker placement in one database transaction. A claim
-removes that member from the reserve count, so the next reconcile creates one
-replacement.
+is serialized with reconciliation by a durable controller lock and cannot
+consume the last `ready_floor` matching pool members. Reconciliation counts
+`provisioning`, `ready`, `leased`, `stopping`, and `cleanup_pending` members
+against the hard target, and creates at most
+`min(target - live_count, max_provisioning - provisioning_count)` replacements.
+Leased or stopping members therefore remain part of capacity until provider
+cleanup is confirmed.
 
 Pool sandboxes and their jobs are absent from ordinary tenant list, read, and
 mutation routes for the lifetime of their durable membership. Sterile
