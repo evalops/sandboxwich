@@ -288,7 +288,7 @@ impl ResidentBootstrapStore {
     pub(crate) fn reserve(
         &self,
         bootstrap: LiveResidentBootstrap,
-    ) -> Result<ResidentBootstrapReservation, ()> {
+    ) -> Result<ResidentBootstrapReservation, ResidentBootstrapReserveError> {
         self.reserve_inner(bootstrap, None)
     }
 
@@ -297,7 +297,7 @@ impl ResidentBootstrapStore {
         bootstrap: LiveResidentBootstrap,
         id: ResidentProcessId,
         expected_generation: u64,
-    ) -> Result<ResidentBootstrapReservation, ()> {
+    ) -> Result<ResidentBootstrapReservation, ResidentBootstrapReserveError> {
         self.reserve_inner(bootstrap, Some((id, expected_generation)))
     }
 
@@ -305,7 +305,7 @@ impl ResidentBootstrapStore {
         &self,
         bootstrap: LiveResidentBootstrap,
         replacement: Option<(ResidentProcessId, u64)>,
-    ) -> Result<ResidentBootstrapReservation, ()> {
+    ) -> Result<ResidentBootstrapReservation, ResidentBootstrapReserveError> {
         let mut inner = self
             .inner
             .lock()
@@ -318,14 +318,19 @@ impl ResidentBootstrapStore {
                 {
                     true
                 }
-                Some(_) => return Err(()),
+                // A live entry at any other generation means a concurrent
+                // successor already committed the durable generation CAS and
+                // published here: this replacement is stale, and the durable
+                // fence would reject it with a generation conflict too. That
+                // is not a capacity condition, so it gets its own error.
+                Some(_) => return Err(ResidentBootstrapReserveError::StaleGeneration),
                 None => false,
             },
             None => false,
         };
         if inner.values.len() + inner.reserved - usize::from(replaces_local_entry) >= inner.capacity
         {
-            return Err(());
+            return Err(ResidentBootstrapReserveError::Capacity);
         }
         let tenant_entries = inner
             .values
@@ -347,7 +352,7 @@ impl ResidentBootstrapStore {
         // the 256 slots per tenant.
         let per_tenant_capacity = (inner.capacity / 2).max(1);
         if tenant_entries + tenant_reservations >= per_tenant_capacity {
-            return Err(());
+            return Err(ResidentBootstrapReserveError::Capacity);
         }
         inner.reserved += 1;
         *inner
@@ -515,6 +520,18 @@ impl ResidentBootstrapStore {
             false
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResidentBootstrapReserveError {
+    /// The bounded store (globally, or this tenant's fair share of it) has no
+    /// slot for another admission right now; retrying later may succeed.
+    Capacity,
+    /// A newer generation is already live for this resident process, so the
+    /// replacement being reserved is stale. A concurrent successor committed
+    /// the durable generation CAS first; this maps to a 409 generation
+    /// conflict, not a retryable capacity 503.
+    StaleGeneration,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -943,6 +960,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(current.bootstrap().generation, 3);
+    }
+
+    #[test]
+    fn reserve_after_a_successor_published_is_stale_not_capacity() {
+        // Two concurrent replacements of the same terminal resident both read
+        // generation 1, but only one commits the durable generation CAS and
+        // publishes here. The loser must see its reservation rejected as
+        // stale -- the handler maps that to the same 409 generation conflict
+        // the durable fence returns -- never as exhausted capacity (503).
+        let store = ResidentBootstrapStore::with_capacity(6);
+        let id = ResidentProcessId::new();
+        store
+            .reserve(resident_bootstrap("tenant-a", 1))
+            .unwrap()
+            .publish(id);
+        store
+            .reserve_replacement(resident_bootstrap("tenant-a", 2), id, 1)
+            .unwrap()
+            .publish_replacement(id, 1)
+            .unwrap();
+
+        assert!(matches!(
+            store.reserve_replacement(resident_bootstrap("tenant-a", 2), id, 1),
+            Err(ResidentBootstrapReserveError::StaleGeneration)
+        ));
+        // The published successor is untouched by the rejected reservation.
+        let current = store
+            .begin_delivery(
+                &id,
+                ResidentBootstrapFence {
+                    generation: 2,
+                    lease_id: Uuid::now_v7(),
+                    sha256: "digest".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(current.bootstrap().generation, 2);
     }
 
     #[test]

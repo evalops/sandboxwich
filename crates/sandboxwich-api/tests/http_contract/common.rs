@@ -1160,7 +1160,14 @@ pub(crate) async fn try_spawn_once(
     // credential is needed here regardless of how the server was
     // configured above.
     let health_client = reqwest::Client::new();
-    for _ in 0..100 {
+    // A Postgres-backed server runs its full migration set against a freshly
+    // created per-test database before it binds and can answer /healthz, so
+    // under full-suite CI load -- many server processes migrating in parallel
+    // against one shared Postgres -- startup can take well over the old 5s
+    // budget (CI flake: "server did not become healthy" with empty stderr).
+    // Budget 30s; a genuine startup bug still fails fast because the child's
+    // early exit is caught below rather than riding out the budget.
+    for _ in 0..600 {
         if let Ok(response) = health_client
             .get(format!("{base_url}/healthz"))
             .send()
