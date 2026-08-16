@@ -31,7 +31,7 @@ steps:
   - label: ":postgres: Rust workspace tests"
     key: "tests"
     timeout_in_minutes: 90
-    concurrency: 2
+    concurrency: 3
     concurrency_group: "hetzner-linux-heavy-workloads"
     retry:
       automatic:
@@ -100,7 +100,7 @@ steps:
   - label: ":lint-roller: Clippy"
     key: "clippy"
     timeout_in_minutes: 90
-    concurrency: 2
+    concurrency: 3
     concurrency_group: "hetzner-linux-heavy-workloads"
     retry:
       automatic:

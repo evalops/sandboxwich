@@ -39,13 +39,13 @@ class RepositoryRulesTest(unittest.TestCase):
             self.assertIn(marker, pipeline)
         self.assertIn("docker rm -f", pipeline)
 
-    def test_buildkite_heavy_jobs_leave_shared_capacity_available(self) -> None:
+    def test_buildkite_heavy_jobs_use_all_connected_capacity(self) -> None:
         pipeline = (ROOT / ".buildkite/pipeline.yml").read_text()
         self.assertEqual(
             pipeline.count('concurrency_group: "hetzner-linux-heavy-workloads"'),
             2,
         )
-        self.assertEqual(pipeline.count("concurrency: 2"), 2)
+        self.assertEqual(pipeline.count("concurrency: 3"), 2)
 
     def test_buildkite_retries_only_agent_loss_or_stop(self) -> None:
         pipeline = (ROOT / ".buildkite/pipeline.yml").read_text()
