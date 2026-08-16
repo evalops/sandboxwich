@@ -1305,6 +1305,14 @@
       "MaestroHostedRunnerConnectionBindingResponse": {
         "description": "Non-secret connection and certificate binding for a live, tenant-scoped\nMaestro hosted runner. Callers use the exact URI SAN to authenticate the\nserver certificate issued by Identity; every component is fenced to the\nsame live provider placement and lease.",
         "properties": {
+          "agentImageDigest": {
+            "description": "Exact digest of the agent image leased with a sterile cell. Legacy\nnon-sterile bindings do not have a pool membership and leave this\ncompatibility field absent.",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "expectedServerUriSan": {
             "type": "string"
           },
