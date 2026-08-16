@@ -124,6 +124,20 @@ fn claim_request_digest(request: &ClaimSterileCellRequestV1) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()))
 }
 
+fn matching_pool_config<'a>(
+    state: &'a AppState,
+    ctx: &TenantContext,
+    request: &ClaimSterileCellRequestV1,
+) -> Option<&'a crate::config::SterilePoolConfig> {
+    state.sterile_pool.as_ref().filter(|config| {
+        config.tenant_id == ctx.tenant_id
+            && config.release.release_set_id == request.release.release_set_id
+            && config.release.runtime_class == request.release.runtime_class
+            && config.release.policy_digest == request.release.policy_digest
+            && config.release.signature == request.release.signature
+    })
+}
+
 fn release_from_row(row: &sqlx::any::AnyRow) -> Result<SterileCellReleaseTrustClassV1, ApiError> {
     Ok(SterileCellReleaseTrustClassV1 {
         release_set_id: row.try_get("release_set_id")?,
@@ -479,6 +493,7 @@ async fn claim_once(
     lease_expires_at: DateTime<Utc>,
 ) -> Result<ClaimAttempt, ApiError> {
     let mut transaction = state.db.pool.begin().await?;
+    crate::sterile_pool::lock_controller_on_connection(&state.db, &mut transaction).await?;
     let claim_fence = request
         .claim_id
         .map(|claim_id| (claim_id, claim_request_digest(request)));
@@ -512,11 +527,12 @@ async fn claim_once(
             return Ok(ClaimAttempt::Contended);
         }
     }
-    let select = format!(
+    let matching_pool = matching_pool_config(state, ctx, request);
+    let mut select = format!(
         "select id, cell_expires_at, generation from sterile_cells
          where tenant_id = {} and state = 'ready' and release_set_id = {}
          and runtime_class = {} and policy_digest = {} and release_signature = {}
-         and cell_expires_at > {} order by created_at asc, id asc limit 1",
+         and cell_expires_at > {}",
         state.db.placeholder(1),
         state.db.placeholder(2),
         state.db.placeholder(3),
@@ -524,16 +540,61 @@ async fn claim_once(
         state.db.placeholder(5),
         state.db.placeholder(6),
     );
-    let Some(row) = sqlx::query(&select)
+    if matching_pool.is_some() {
+        // Pool-created ready cells may only be consumed when the exact pool
+        // tuple remains above its protected ready floor. Cells prepared
+        // outside the pool remain available under the legacy claim contract.
+        select.push_str(&format!(
+            " and not exists (
+                 select 1 from sterile_pool_memberships member
+                 where member.sandbox_id = sterile_cells.id and member.state = 'ready'
+                   and member.tenant_id = {}
+                   and member.release_set_id = {}
+                   and member.runtime_class = {}
+                   and member.policy_digest = {}
+                   and member.release_signature = {}
+                   and member.candidate_agent_image = {}
+                   and member.candidate_maestro_image = {}
+                   and (select count(*) from sterile_pool_memberships reserve
+                        where reserve.tenant_id = member.tenant_id
+                          and reserve.release_set_id = member.release_set_id
+                          and reserve.runtime_class = member.runtime_class
+                          and reserve.policy_digest = member.policy_digest
+                          and reserve.release_signature = member.release_signature
+                          and reserve.candidate_agent_image = member.candidate_agent_image
+                          and reserve.candidate_maestro_image = member.candidate_maestro_image
+                          and reserve.state = 'ready') <= {}
+             )",
+            state.db.placeholder(7),
+            state.db.placeholder(8),
+            state.db.placeholder(9),
+            state.db.placeholder(10),
+            state.db.placeholder(11),
+            state.db.placeholder(12),
+            state.db.placeholder(13),
+            state.db.placeholder(14),
+        ));
+    }
+    select.push_str(" order by created_at asc, id asc limit 1");
+    let mut select_query = sqlx::query(&select)
         .bind(&ctx.tenant_id)
         .bind(&request.release.release_set_id)
         .bind(request.release.runtime_class.as_db_str())
         .bind(request.release.policy_digest.to_ascii_lowercase())
         .bind(&request.release.signature)
-        .bind(lease_expires_at.to_rfc3339())
-        .fetch_optional(&mut *transaction)
-        .await?
-    else {
+        .bind(lease_expires_at.to_rfc3339());
+    if let Some(config) = matching_pool {
+        select_query = select_query
+            .bind(&config.tenant_id)
+            .bind(&config.release.release_set_id)
+            .bind(config.release.runtime_class.as_db_str())
+            .bind(&config.release.policy_digest)
+            .bind(&config.release.signature)
+            .bind(&config.agent_image)
+            .bind(&config.maestro_image)
+            .bind(i64::from(config.ready_floor));
+    }
+    let Some(row) = select_query.fetch_optional(&mut *transaction).await? else {
         transaction.commit().await?;
         return Ok(ClaimAttempt::Empty);
     };
@@ -1167,4 +1228,227 @@ async fn quarantine_expired_state(
         .execute(&db.pool)
         .await?;
     Ok(result.rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AuthConfig, SandboxLifetimeConfig, SterilePoolConfig};
+    use crate::db::{Database, SqlDialect};
+    use crate::maestro_observation::ActivationObservationSink;
+    use crate::state::{ApexInstructionWaiters, Principal, ResidentBootstrapStore};
+    use crate::sterile_pool::reconcile_sterile_pool;
+    use sandboxwich_core::SterileCellReleaseTrustClassV1;
+    use sqlx::Row;
+    use sqlx::any::AnyPoolOptions;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    async fn test_db() -> Database {
+        sqlx::any::install_default_drivers();
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let db = Database::from_test_pool(pool, SqlDialect::Sqlite);
+        sqlx::migrate!("./migrations").run(&db.pool).await.unwrap();
+        db
+    }
+
+    fn pool_config() -> SterilePoolConfig {
+        SterilePoolConfig {
+            target: 2,
+            ready_floor: 1,
+            max_provisioning: 2,
+            tenant_id: "default".into(),
+            release: SterileCellReleaseTrustClassV1 {
+                release_set_id: "release-test".into(),
+                runtime_class: SterileCellRuntimeClass::KataMicrovm,
+                policy_digest: "a".repeat(64),
+                signature: "swrs1_test".into(),
+            },
+            sandbox_profile: SandboxRuntimeProfile::Unprivileged,
+            template: "ubuntu-dev@sha256:test".into(),
+            agent_image: format!("agent@sha256:{}", "b".repeat(64)),
+            maestro_image: format!("maestro@sha256:{}", "c".repeat(64)),
+            ready_ttl: std::time::Duration::from_secs(300),
+        }
+    }
+
+    fn test_state(db: Database, config: SterilePoolConfig, key: &str) -> AppState {
+        AppState {
+            db: db.clone(),
+            maestro_observation_sink: ActivationObservationSink::new(db),
+            auth: AuthConfig {
+                shared_token: None,
+                tenant_tokens: Vec::new(),
+                provider_routing_tokens: Vec::new(),
+                operator_token: None,
+                allow_insecure_no_auth: true,
+            },
+            default_tenant_id: "default".into(),
+            apex_callback_base_url: None,
+            placement_attestation_derivation_key: None,
+            apex_waiters: ApexInstructionWaiters::default(),
+            resident_bootstraps: ResidentBootstrapStore::default(),
+            sandbox_lifetime: SandboxLifetimeConfig::default(),
+            sterile_pool: Some(config),
+            sterile_cell_signing_key: Some(Arc::from(key)),
+            sterile_resident_activation_enabled: false,
+            apex_callback_test_hook: None,
+        }
+    }
+
+    async fn insert_worker(db: &Database) -> Worker {
+        let now = Utc::now();
+        let worker = Worker {
+            id: WorkerId::new(),
+            tenant_id: "default".into(),
+            name: "claim-test-worker".into(),
+            status: WorkerStatus::Online,
+            provider: "kubernetes".into(),
+            capabilities: vec![
+                WorkerCapability::ProvisionSandbox,
+                WorkerCapability::VirtualMachine,
+            ],
+            max_concurrent_jobs: 4,
+            labels: BTreeMap::new(),
+            resource_envelope: None,
+            registered_at: now,
+            last_heartbeat_at: Some(now),
+        };
+        crate::handlers::workers::insert_worker(db, &worker, "claim-test-token")
+            .await
+            .unwrap();
+        worker
+    }
+
+    async fn insert_ready_cell(
+        db: &Database,
+        cell_id: SterileCellId,
+        worker_id: WorkerId,
+        config: &SterilePoolConfig,
+    ) {
+        let now = Utc::now();
+        sqlx::query(
+            "insert into sterile_cells
+             (id, worker_id, provider_cell_id, state, generation, release_set_id, runtime_class,
+              policy_digest, release_signature, tenant_id, cell_expires_at, created_at, updated_at)
+             values (?, ?, ?, 'ready', 1, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(cell_id.to_string())
+        .bind(worker_id.to_string())
+        .bind(format!("provider-{cell_id}"))
+        .bind(&config.release.release_set_id)
+        .bind(config.release.runtime_class.as_db_str())
+        .bind(&config.release.policy_digest)
+        .bind(&config.release.signature)
+        .bind(&config.tenant_id)
+        .bind((now + chrono::Duration::minutes(5)).to_rfc3339())
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pool_ready_floor_leaves_non_pool_inventory_claimable_and_replays_empty() {
+        let db = test_db().await;
+        let config = pool_config();
+        reconcile_sterile_pool(&db, &config).await.unwrap();
+        let pool_row = sqlx::query(
+            "select sandbox_id from sterile_pool_memberships order by sandbox_id limit 1",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let pool_cell_id =
+            SterileCellId(Uuid::parse_str(pool_row.try_get("sandbox_id").unwrap()).unwrap());
+        let worker = insert_worker(&db).await;
+        let expires = (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+        sqlx::query(
+            "update sterile_pool_memberships
+             set state = 'ready', worker_id = ?, generation = 1,
+                 candidate_pod_name = 'pool-ready-pod', candidate_pod_uid = 'pool-ready-uid',
+                 cell_expires_at = ?, lease_id = null, stop_job_id = null,
+                 requested_disposition = null
+             where sandbox_id = ?",
+        )
+        .bind(worker.id.to_string())
+        .bind(&expires)
+        .bind(pool_cell_id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        insert_ready_cell(&db, pool_cell_id, worker.id, &config).await;
+
+        let external_cell_id = SterileCellId::new();
+        insert_ready_cell(&db, external_cell_id, worker.id, &config).await;
+
+        let state = test_state(db.clone(), config.clone(), "claim-test-signing-key");
+        let ctx = TenantContext {
+            tenant_id: "default".into(),
+            principal: Principal::Tenant,
+        };
+        let request = ClaimSterileCellRequestV1 {
+            claim_id: None,
+            release: config.release.clone(),
+            organization_id: "organization".into(),
+            workspace_id: "workspace".into(),
+            thread_id: "thread".into(),
+            runner_session_id: "runner".into(),
+            lease_seconds: Some(60),
+        };
+        let claimed = claim_once(
+            &state,
+            "claim-test-signing-key",
+            &ctx,
+            &request,
+            Utc::now() + chrono::Duration::seconds(60),
+        )
+        .await
+        .unwrap();
+        let ClaimAttempt::Claimed(lease, _) = claimed else {
+            panic!("external ready cell should remain claimable above the pool floor");
+        };
+        assert_eq!(lease.cell_id, external_cell_id);
+        let pool_state: String =
+            sqlx::query_scalar("select state from sterile_pool_memberships where sandbox_id = ?")
+                .bind(pool_cell_id.to_string())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(pool_state, "ready");
+
+        let fenced_request = ClaimSterileCellRequestV1 {
+            claim_id: Some(Uuid::now_v7()),
+            ..request
+        };
+        assert!(matches!(
+            claim_once(
+                &state,
+                "claim-test-signing-key",
+                &ctx,
+                &fenced_request,
+                Utc::now() + chrono::Duration::seconds(60),
+            )
+            .await
+            .unwrap(),
+            ClaimAttempt::Empty
+        ));
+        assert!(matches!(
+            claim_once(
+                &state,
+                "claim-test-signing-key",
+                &ctx,
+                &fenced_request,
+                Utc::now() + chrono::Duration::seconds(60),
+            )
+            .await
+            .unwrap(),
+            ClaimAttempt::Empty
+        ));
+    }
 }
