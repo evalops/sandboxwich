@@ -2025,6 +2025,30 @@ impl KubernetesDryRunProvider {
             .as_ref()
             .filter(|credentials| credentials.sandbox_id == sandbox_id)
             .context("candidate supervisor requires sandbox-scoped guest credentials")?;
+        self.render_sterile_pool_supervisor_pod_manifest(
+            sandbox_id,
+            credentials.worker_id,
+            candidate,
+            tenant_pod_name,
+            tenant_pod_uid,
+        )
+    }
+
+    /// Renders the supervisor Pod manifest with an explicitly supplied worker
+    /// identity. Split from `sterile_pool_candidate_supervisor_pod_manifest`
+    /// so the reconciler can rebuild a replacement supervisor for an
+    /// already-provisioned candidate: the guest-token Secret the manifest
+    /// mounts by name already exists in the cluster (provision created it, and
+    /// `plan_supervisor_revivals` verifies it is still present), so no token
+    /// participates here -- and none is rendered into the supervisor manifest.
+    fn render_sterile_pool_supervisor_pod_manifest(
+        &self,
+        sandbox_id: SandboxId,
+        worker_id: Uuid,
+        candidate: &SterilePoolCandidateV1,
+        tenant_pod_name: &str,
+        tenant_pod_uid: &str,
+    ) -> anyhow::Result<Value> {
         let labels = self.sterile_pool_supervisor_labels(sandbox_id, candidate);
         let marker = serde_json::to_string(candidate)?;
         let restricted = json!({
@@ -2083,7 +2107,7 @@ impl KubernetesDryRunProvider {
                     },
                         { "name": "SANDBOXWICH_GUEST_TOKEN_FILE", "value": "/run/sandboxwich/guest/api-token" },
                         { "name": "SANDBOXWICH_SANDBOX_ID", "value": sandbox_id.to_string() },
-                        { "name": "SANDBOXWICH_WORKER_ID", "value": credentials.worker_id.to_string() },
+                        { "name": "SANDBOXWICH_WORKER_ID", "value": worker_id.to_string() },
                         { "name": "SANDBOXWICH_STERILE_POOL_CANDIDATE_V1", "value": marker },
                         { "name": "SANDBOXWICH_PROVIDER_POD_NAME", "value": tenant_pod_name },
                         { "name": "SANDBOXWICH_PROVIDER_POD_UID", "value": tenant_pod_uid },
@@ -3540,6 +3564,31 @@ struct ObservedKubernetesResource {
     /// `status.phase` of an observed PersistentVolumeClaim; `None` for every
     /// other kind and for claims whose phase the API server did not report.
     volume_claim_phase: Option<VolumeClaimPhase>,
+    /// `status.phase` of an observed Pod, reduced to terminal-vs-live; `None`
+    /// for every other kind and for pods whose phase the API server did not
+    /// report.
+    pod_phase: Option<PodLifecyclePhase>,
+}
+
+/// Lifecycle phase of an observed Pod, reduced to the only distinction
+/// reconciliation acts on. Supervisor Pods run with `restartPolicy: Never`, so
+/// a terminal phase means the Pod object will never serve again and the only
+/// recovery is recreation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PodLifecyclePhase {
+    /// `Failed` or `Succeeded`: the Pod is finished and will never run again.
+    Terminal,
+    /// `Pending`/`Running`/`Unknown` and anything else the API server reports.
+    Live,
+}
+
+impl PodLifecyclePhase {
+    fn parse(phase: &str) -> Self {
+        match phase {
+            "Failed" | "Succeeded" => Self::Terminal,
+            _ => Self::Live,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3616,6 +3665,9 @@ fn parse_reconciliation_resource_rows(
                 volume_claim_phase: (kind == "PersistentVolumeClaim")
                     .then(|| reconciliation_optional_field(fields[7]).map(VolumeClaimPhase::parse))
                     .flatten(),
+                pod_phase: (kind == "Pod")
+                    .then(|| reconciliation_optional_field(fields[7]).map(PodLifecyclePhase::parse))
+                    .flatten(),
                 sandbox_id: reconciliation_optional_field(fields[1])
                     .and_then(|value| Uuid::parse_str(value).ok())
                     .map(SandboxId),
@@ -3666,6 +3718,10 @@ pub struct ReconciliationOutcome {
     pub(crate) decisions: Vec<ReconciliationDecision>,
     pub(crate) deleted: usize,
     pub(crate) apply: bool,
+    /// Terminated sterile-pool supervisor Pods selected for recreation. With
+    /// `apply` set they were deleted-and-recreated; in dry-run mode this only
+    /// counts what a live run would revive.
+    pub(crate) supervisor_revivals: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3684,6 +3740,10 @@ impl ReconciliationOutcome {
 
     pub fn deleted(&self) -> usize {
         self.deleted
+    }
+
+    pub fn supervisor_revivals(&self) -> usize {
+        self.supervisor_revivals
     }
 
     pub fn apply(&self) -> bool {
@@ -3850,6 +3910,92 @@ fn plan_orphan_reconciliation(
             })
             .collect(),
     }
+}
+
+/// One terminated sterile-pool supervisor Pod selected for recreation, paired
+/// with the live tenant Pod the replacement must bind to.
+#[derive(Clone, Copy, Debug)]
+struct SupervisorRevival<'a> {
+    supervisor: &'a ObservedKubernetesResource,
+    tenant_pod: &'a ObservedKubernetesResource,
+}
+
+/// Selects terminated sterile-pool supervisor Pods whose recreation is safe
+/// and useful. Supervisors are created once at candidate provision time with
+/// `restartPolicy: Never`, so one that exits (e.g. its first API contact hit a
+/// post-rollout network convergence window) used to strand the cell forever:
+/// the sandbox stayed Running and pool-ready with no supervisor to serve
+/// activation or resident claims, and nothing recreated it.
+///
+/// A revival is planned only when every guard holds, failing closed the same
+/// way orphan deletion does:
+///
+/// * the sandbox is still live in the control-plane inventory and still has
+///   an expected supervisor Pod resource there;
+/// * the tenant Pod is still live, so the replacement binds a real activation
+///   target;
+/// * the guest-token and activation-client Secrets the supervisor manifest
+///   mounts by name are still present, so the replacement can actually start.
+///
+/// Anything else -- an orphaned sandbox, a dead tenant Pod, missing Secrets --
+/// is a cell-level problem the pool stop/quarantine machinery owns, not a
+/// supervisor revival.
+fn plan_supervisor_revivals<'a>(
+    inventory: &ReconciliationInventory,
+    observed: &'a [ObservedKubernetesResource],
+) -> Vec<SupervisorRevival<'a>> {
+    let live_resource = |kind: RuntimeResourceKind, sandbox_id: SandboxId, name: String| {
+        observed.iter().find(|resource| {
+            resource.resource_kind == kind
+                && resource.sandbox_id == Some(sandbox_id)
+                && resource.name == name
+        })
+    };
+    observed
+        .iter()
+        .filter_map(|supervisor| {
+            if supervisor.resource_kind != RuntimeResourceKind::Pod
+                || !supervisor.name.starts_with(STERILE_SUPERVISOR_POD_PREFIX)
+                || supervisor.pod_phase != Some(PodLifecyclePhase::Terminal)
+            {
+                return None;
+            }
+            let sandbox_id = supervisor.sandbox_id?;
+            if !inventory.sandbox_ids.contains(&sandbox_id) {
+                return None;
+            }
+            let still_expected = inventory.resources.iter().any(|expected| {
+                expected.sandbox_id == sandbox_id
+                    && expected.resource_kind == RuntimeResourceKind::Pod
+                    && expected.name == supervisor.name
+            });
+            if !still_expected {
+                return None;
+            }
+            let tenant_pod = live_resource(
+                RuntimeResourceKind::Pod,
+                sandbox_id,
+                format!("sandboxwich-{sandbox_id}"),
+            )?;
+            if tenant_pod.pod_phase != Some(PodLifecyclePhase::Live) {
+                return None;
+            }
+            for prefix in [
+                GUEST_TOKEN_SECRET_NAME_PREFIX,
+                STERILE_ACTIVATION_CLIENT_SECRET_PREFIX,
+            ] {
+                live_resource(
+                    RuntimeResourceKind::Secret,
+                    sandbox_id,
+                    format!("{prefix}{sandbox_id}"),
+                )?;
+            }
+            Some(SupervisorRevival {
+                supervisor,
+                tenant_pod,
+            })
+        })
+        .collect()
 }
 
 fn kubernetes_delete_path(resource: &ObservedKubernetesResource) -> anyhow::Result<String> {
@@ -5765,6 +5911,7 @@ impl KubernetesApplyProvider {
                     decisions,
                     deleted: 0,
                     apply,
+                    supervisor_revivals: 0,
                 });
             }
         };
@@ -5805,6 +5952,46 @@ impl KubernetesApplyProvider {
                     .collect()
             })
             .unwrap_or_default();
+        // Revive terminated sterile-pool supervisors before reaping orphans: a
+        // dead supervisor strands a live, pool-ready cell, while orphan
+        // deletion is hygiene that tolerates starving until the next run. Like
+        // deletion, revival fails closed when the control-plane inventory is
+        // unavailable.
+        let mut supervisor_revivals = 0;
+        let revival_started = std::time::Instant::now();
+        if let Ok(inventory) = inventory.as_ref() {
+            let revivals = plan_supervisor_revivals(inventory, &observed);
+            if apply {
+                for revival in &revivals {
+                    if cancelled.is_cancelled() || revival_started.elapsed() >= limits.max_elapsed {
+                        break;
+                    }
+                    match self.revive_terminated_supervisor(revival, cancelled, &mut delete) {
+                        Ok(()) => {
+                            supervisor_revivals += 1;
+                            tracing::info!(
+                                sandbox_id = %revival
+                                    .supervisor
+                                    .sandbox_id
+                                    .map(|id| id.to_string())
+                                    .unwrap_or_default(),
+                                supervisor_pod = %revival.supervisor.name,
+                                "recreated terminated sterile-pool supervisor pod"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %format!("{error:#}"),
+                                supervisor_pod = %revival.supervisor.name,
+                                "sterile-pool supervisor revival failed"
+                            );
+                        }
+                    }
+                }
+            } else {
+                supervisor_revivals = revivals.len();
+            }
+        }
         let mut decisions = plan_orphan_reconciliation(inventory, &observed, &expired, Utc::now());
         decisions.truncate(limits.max_scanned);
         let mut deleted = 0;
@@ -5834,6 +6021,7 @@ impl KubernetesApplyProvider {
             decisions,
             deleted,
             apply,
+            supervisor_revivals,
         })
     }
 
@@ -5872,6 +6060,110 @@ impl KubernetesApplyProvider {
         serde_json::from_str(&output.stdout)
             .context("kubectl returned invalid optional resource JSON")
             .map(Some)
+    }
+
+    /// Recreates one terminated sterile-pool supervisor Pod selected by
+    /// `plan_supervisor_revivals`: rebuilds the manifest from the terminated
+    /// Pod's own env (candidate marker, worker identity) bound to the
+    /// *current* tenant Pod identity, deletes the terminated Pod through the
+    /// same UID-fenced path orphans use, waits for the API object to
+    /// disappear, and applies the replacement. A terminated
+    /// `restartPolicy: Never` Pod can never serve again and its spec is
+    /// immutable, so delete-and-recreate is the only revival.
+    fn revive_terminated_supervisor<F>(
+        &self,
+        revival: &SupervisorRevival,
+        cancelled: &CancelSignal,
+        delete: &mut F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(&ObservedKubernetesResource, Duration, &CancelSignal) -> anyhow::Result<()>,
+    {
+        let supervisor = revival.supervisor;
+        let pod = self
+            .read_optional_resource("Pod", &supervisor.name, cancelled)?
+            .context("terminated supervisor pod disappeared before revival")?;
+        anyhow::ensure!(
+            pod["metadata"]["uid"].as_str() == Some(supervisor.uid.as_str()),
+            "terminated supervisor pod was replaced concurrently"
+        );
+        let env_value = |key: &str| -> anyhow::Result<String> {
+            pod["spec"]["containers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|container| container["name"].as_str() == Some("sandboxwich-supervisor"))
+                .and_then(|container| container["env"].as_array())
+                .into_iter()
+                .flatten()
+                .find(|variable| variable["name"].as_str() == Some(key))
+                .and_then(|variable| variable["value"].as_str())
+                .map(str::to_string)
+                .with_context(|| format!("terminated supervisor pod is missing env {key}"))
+        };
+        let sandbox_id = supervisor
+            .sandbox_id
+            .context("terminated supervisor pod has no sandbox label")?;
+        anyhow::ensure!(
+            env_value("SANDBOXWICH_SANDBOX_ID")? == sandbox_id.to_string(),
+            "terminated supervisor pod env disagrees with its sandbox label"
+        );
+        let worker_id = Uuid::parse_str(&env_value("SANDBOXWICH_WORKER_ID")?)
+            .context("terminated supervisor pod has an invalid worker id")?;
+        let candidate: SterilePoolCandidateV1 =
+            serde_json::from_str(&env_value("SANDBOXWICH_STERILE_POOL_CANDIDATE_V1")?)
+                .context("terminated supervisor pod has an invalid candidate marker")?;
+        let manifest = self.dry_run.render_sterile_pool_supervisor_pod_manifest(
+            sandbox_id,
+            worker_id,
+            &candidate,
+            &revival.tenant_pod.name,
+            &revival.tenant_pod.uid,
+        )?;
+        delete(supervisor, self.kubectl_command_timeout, cancelled)?;
+        // A terminated Pod has no grace period to wait out, but deletion is
+        // still asynchronous: applying the same-named replacement before the
+        // API object is gone fails with AlreadyExists. Poll briefly for the
+        // object to disappear before applying.
+        let mut gone = false;
+        for _ in 0..30 {
+            if cancelled.is_cancelled() {
+                bail!("supervisor revival was cancelled while waiting for deletion");
+            }
+            if self
+                .read_optional_resource("Pod", &supervisor.name, cancelled)?
+                .is_none()
+            {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        anyhow::ensure!(
+            gone,
+            "terminated supervisor pod was still present 30s after deletion"
+        );
+        let apply = run_kubectl_documents(
+            &self.kubectl,
+            &self.kubectl_args("apply"),
+            std::slice::from_ref(&manifest),
+            "apply revived sterile supervisor pod",
+            self.kubectl_command_timeout,
+            Some(cancelled),
+            self.max_captured_output_bytes,
+        )?;
+        if !apply.success {
+            return Err(anyhow::Error::new(classified_kubectl_failure(
+                "kubectl apply revived sterile supervisor pod failed",
+                &apply.stderr,
+            )));
+        }
+        anyhow::ensure!(
+            self.read_optional_resource("Pod", &supervisor.name, cancelled)?
+                .is_some(),
+            "revived supervisor pod was not observable after apply"
+        );
+        Ok(())
     }
 
     fn sterile_activation_tls_for_staged(

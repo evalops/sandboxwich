@@ -197,8 +197,9 @@ reconcile` command every five minutes with `concurrencyPolicy: Forbid`. It
 compares labeled Pods, PVCs, Services, Secrets, and NetworkPolicies with
 `GET /workers/{worker_id}/runtime-resource-inventory`, then exits and marks its
 stable logical worker identity draining. Its separate ServiceAccount can only
-get, list, and UID-fenced-delete those resource kinds; it cannot create or
-patch workloads, exec into Pods, or read logs.
+get, list, and UID-fenced-delete those resource kinds plus create Pods (see
+the supervisor-revival paragraph below); it cannot update or patch workloads,
+exec into Pods, or read logs.
 
 Each run scans at most 20,000 resources, spends at most 120 seconds, and
 permits at most 500 deletes. Inventory, discovery, scope, UID, pagination, or
@@ -220,6 +221,18 @@ kubectl -n sandboxwich create job sandboxwich-reconcile-manual-$(date +%s) \
 The Job's final JSON record reports `reconcilerId`, `scanned`, `deleted`, and
 `apply`; failed runs retain their Job and logs according to the CronJob history
 limits.
+
+The same pass revives terminated sterile-pool supervisor Pods
+(`sandboxwich-supervisor-<sandbox-id>`). Supervisors run with
+`restartPolicy: Never`, so one that exits — for example when its first API
+contact lands in a post-rollout network convergence window — used to strand
+its pool-ready cell forever. When the control plane still lists the sandbox
+and its tenant Pod and mounted Secrets are live, the reconciler rebuilds the
+supervisor manifest from the terminated Pod's own env, UID-fenced-deletes the
+terminated Pod, and applies the replacement; the `supervisorRevivals` field
+of the final JSON record counts them (dry-run counts what a live run would
+revive). A supervisor whose tenant Pod or Secrets are gone is a cell-level
+problem and is left to the pool stop/quarantine machinery.
 
 Sandbox creation carries a typed provision spec: memory tier (`1g`, `4g`, `16g`, `64g`), network egress (`deny_all`, `allow_all`, or `allowlist`), and execution class (`development_container`, `sandboxed_container`, or `virtual_machine`). The Kubernetes provider maps tiers to CPU/memory requests and PVC size, renders deny-by-default egress with explicit CIDR allow rules, sets `runAsNonRoot`, drops all container capabilities, and uses `RuntimeDefault` seccomp.
 

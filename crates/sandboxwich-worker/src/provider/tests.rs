@@ -6014,6 +6014,7 @@ fn provision_staged_starts_runtime_before_waiting_for_gateway() {
         resident_lease_id: None,
         created_at: None,
         volume_claim_phase: None,
+        pod_phase: None,
     };
     assert_eq!(
         kubernetes_delete_path(&fqdn_observed).expect("GKE FQDN delete path"),
@@ -6499,6 +6500,7 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             resident_lease_id: None,
             created_at: None,
             volume_claim_phase: None,
+            pod_phase: None,
         },
         ObservedKubernetesResource {
             sandbox_id: Some(orphan_sandbox),
@@ -6509,6 +6511,7 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             resident_lease_id: None,
             created_at: None,
             volume_claim_phase: None,
+            pod_phase: None,
         },
         ObservedKubernetesResource {
             sandbox_id: Some(expired_sandbox),
@@ -6519,6 +6522,7 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             resident_lease_id: None,
             created_at: None,
             volume_claim_phase: None,
+            pod_phase: None,
         },
         ObservedKubernetesResource {
             sandbox_id: None,
@@ -6529,6 +6533,7 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             resident_lease_id: None,
             created_at: None,
             volume_claim_phase: None,
+            pod_phase: None,
         },
         ObservedKubernetesResource {
             sandbox_id: Some(live_sandbox),
@@ -6539,6 +6544,7 @@ fn orphan_reconciliation_classifies_expected_orphaned_expired_and_indeterminate(
             resident_lease_id: None,
             created_at: None,
             volume_claim_phase: None,
+            pod_phase: None,
         },
     ];
     let expired =
@@ -6601,6 +6607,7 @@ fn resident_resource_reconciliation_is_fenced_by_active_lease_not_live_sandbox()
         resident_lease_id: Some(lease_id),
         created_at: Some(created_at),
         volume_claim_phase: None,
+        pod_phase: None,
     };
     let decisions = classify_reconciliation(
         &inventory,
@@ -6729,6 +6736,7 @@ esac
         resident_lease_id: Some(resident_lease),
         created_at: Some(Utc::now() - chrono::Duration::minutes(6)),
         volume_claim_phase: None,
+        pod_phase: None,
     };
     assert_eq!(
         kubernetes_delete_path(&observed).expect("delete path"),
@@ -6891,6 +6899,304 @@ esac
             ..ReconciliationClassificationCounts::default()
         }
     );
+}
+
+fn observed_revival_pod(
+    sandbox_id: SandboxId,
+    name: String,
+    uid: &str,
+    phase: &str,
+) -> ObservedKubernetesResource {
+    ObservedKubernetesResource {
+        sandbox_id: Some(sandbox_id),
+        resource_kind: RuntimeResourceKind::Pod,
+        namespace: "sandboxwich-ci".to_string(),
+        name,
+        uid: uid.to_string(),
+        resident_lease_id: None,
+        created_at: None,
+        volume_claim_phase: None,
+        pod_phase: Some(PodLifecyclePhase::parse(phase)),
+    }
+}
+
+fn observed_revival_secret(sandbox_id: SandboxId, name: String) -> ObservedKubernetesResource {
+    ObservedKubernetesResource {
+        sandbox_id: Some(sandbox_id),
+        resource_kind: RuntimeResourceKind::Secret,
+        namespace: "sandboxwich-ci".to_string(),
+        name,
+        uid: "uid-secret".to_string(),
+        resident_lease_id: None,
+        created_at: None,
+        volume_claim_phase: None,
+        pod_phase: None,
+    }
+}
+
+fn revival_inventory(sandbox_id: SandboxId, supervisor_name: &str) -> ReconciliationInventory {
+    ReconciliationInventory {
+        sandbox_ids: [sandbox_id].into_iter().collect(),
+        resources: vec![ExpectedKubernetesResource {
+            sandbox_id,
+            resource_kind: RuntimeResourceKind::Pod,
+            namespace: "sandboxwich-ci".to_string(),
+            name: supervisor_name.to_string(),
+            uid: "uid-supervisor".to_string(),
+            expires_at: None,
+        }],
+        active_resident_lease_ids: Default::default(),
+    }
+}
+
+/// The full guard set: a terminal supervisor Pod of a live sandbox, with a
+/// live tenant Pod and both mounted Secrets present, is exactly one revival.
+fn revival_fixtures(sandbox_id: SandboxId) -> (String, Vec<ObservedKubernetesResource>) {
+    let supervisor_name = format!("sandboxwich-supervisor-{sandbox_id}");
+    let observed = vec![
+        observed_revival_pod(
+            sandbox_id,
+            supervisor_name.clone(),
+            "uid-supervisor",
+            "Failed",
+        ),
+        observed_revival_pod(
+            sandbox_id,
+            format!("sandboxwich-{sandbox_id}"),
+            "uid-tenant",
+            "Running",
+        ),
+        observed_revival_secret(sandbox_id, format!("sandboxwich-guest-token-{sandbox_id}")),
+        observed_revival_secret(
+            sandbox_id,
+            format!("sandboxwich-activation-client-{sandbox_id}"),
+        ),
+    ];
+    (supervisor_name, observed)
+}
+
+#[test]
+fn supervisor_revival_requires_a_terminal_supervisor_on_a_live_cell() {
+    let sandbox_id = SandboxId::new();
+    let (supervisor_name, observed) = revival_fixtures(sandbox_id);
+    let inventory = revival_inventory(sandbox_id, &supervisor_name);
+
+    let revivals = plan_supervisor_revivals(&inventory, &observed);
+    assert_eq!(revivals.len(), 1);
+    assert_eq!(revivals[0].supervisor.name, supervisor_name);
+    assert_eq!(revivals[0].tenant_pod.uid, "uid-tenant");
+}
+
+#[test]
+fn supervisor_revival_skips_live_supervisors_and_broken_cells() {
+    let sandbox_id = SandboxId::new();
+    let (supervisor_name, healthy) = revival_fixtures(sandbox_id);
+    let inventory = revival_inventory(sandbox_id, &supervisor_name);
+
+    // A supervisor that is merely starting (Pending) or still Running must
+    // never be recreated out from under itself.
+    let mut live_supervisor = healthy.clone();
+    live_supervisor[0].pod_phase = Some(PodLifecyclePhase::Live);
+    assert!(plan_supervisor_revivals(&inventory, &live_supervisor).is_empty());
+
+    // A dead tenant Pod is a cell-level failure, not a supervisor revival.
+    let mut dead_tenant = healthy.clone();
+    dead_tenant[1].pod_phase = Some(PodLifecyclePhase::Terminal);
+    assert!(plan_supervisor_revivals(&inventory, &dead_tenant).is_empty());
+
+    // A sandbox the control plane no longer lists is teardown, not revival.
+    let empty_inventory = ReconciliationInventory::default();
+    assert!(plan_supervisor_revivals(&empty_inventory, &healthy).is_empty());
+
+    // Without the guest-token Secret the replacement could never start.
+    let missing_secret = healthy[..3].to_vec();
+    assert!(plan_supervisor_revivals(&inventory, &missing_secret).is_empty());
+
+    // Without an expected supervisor resource the control plane has moved on.
+    let mut stale_inventory = revival_inventory(sandbox_id, &supervisor_name);
+    stale_inventory.resources.clear();
+    assert!(plan_supervisor_revivals(&stale_inventory, &healthy).is_empty());
+}
+
+#[test]
+fn reconcile_recreates_a_terminated_sterile_supervisor_pod() {
+    let dir = std::env::temp_dir().join(format!("sandboxwich-revival-{}", SandboxId::new()));
+    std::fs::create_dir_all(&dir).expect("create revival fake dir");
+    let log_path = dir.join("log.txt");
+    let script_path = dir.join("kubectl");
+    let sandbox_id = SandboxId::new();
+    let worker_id = Uuid::now_v7();
+    let supervisor_name = format!("sandboxwich-supervisor-{sandbox_id}");
+    let candidate = sterile_maestro_candidate(sandbox_id);
+    let dead_pod = serde_json::json!({
+        "metadata": { "uid": "uid-supervisor" },
+        "spec": { "containers": [{
+            "name": "sandboxwich-supervisor",
+            "env": [
+                { "name": "SANDBOXWICH_SANDBOX_ID", "value": sandbox_id.to_string() },
+                { "name": "SANDBOXWICH_WORKER_ID", "value": worker_id.to_string() },
+                {
+                    "name": "SANDBOXWICH_STERILE_POOL_CANDIDATE_V1",
+                    "value": serde_json::to_string(&candidate).unwrap(),
+                },
+            ],
+        }]},
+    });
+    std::fs::write(
+        dir.join("dead.json"),
+        serde_json::to_string(&dead_pod).unwrap(),
+    )
+    .expect("write dead supervisor fixture");
+    std::fs::write(
+        dir.join("alive.json"),
+        serde_json::to_string(&serde_json::json!({
+            "metadata": { "uid": "uid-supervisor-new" }
+        }))
+        .unwrap(),
+    )
+    .expect("write revived supervisor fixture");
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "{log}"
+case " $* " in
+  *" get pod --selector "*)
+    printf '%s\n' \
+      'Pod {sid} sandboxwich-ci sandboxwich-supervisor-{sid} uid-supervisor <none> 2020-01-01T00:00:00Z Failed' \
+      'Pod {sid} sandboxwich-ci sandboxwich-{sid} uid-tenant <none> 2020-01-01T00:00:00Z Running'
+    ;;
+  *" get secret --selector "*)
+    printf '%s\n' \
+      'Secret {sid} sandboxwich-ci sandboxwich-guest-token-{sid} uid-guest <none> 2020-01-01T00:00:00Z <none>' \
+      'Secret {sid} sandboxwich-ci sandboxwich-activation-client-{sid} uid-activation <none> 2020-01-01T00:00:00Z <none>'
+    ;;
+  *" get Pod "*)
+    if [ -f "{dir}/applied" ]; then
+      cat "{dir}/alive.json"
+    elif [ -f "{dir}/deleted" ]; then
+      :
+    else
+      cat "{dir}/dead.json"
+    fi
+    ;;
+  *" apply "*)
+    cat > "{dir}/applied.json"
+    touch "{dir}/applied"
+    ;;
+esac
+"#,
+        log = log_path.display(),
+        dir = dir.display(),
+        sid = sandbox_id,
+    );
+    std::fs::write(&script_path, script).expect("write revival fake kubectl");
+    {
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("stat revival fake kubectl")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).expect("chmod revival fake kubectl");
+    }
+    let provider = apply_provider_with_fake_kubectl(&script_path);
+    let inventory = RuntimeResourceInventoryResponse {
+        ok: true,
+        provider: "kubernetes".to_string(),
+        cluster: Some("k3s-ci".to_string()),
+        namespace: "sandboxwich-ci".to_string(),
+        sandbox_ids: vec![sandbox_id],
+        complete: true,
+        resources: [
+            (
+                RuntimeResourceKind::Pod,
+                supervisor_name.clone(),
+                "uid-supervisor",
+            ),
+            (
+                RuntimeResourceKind::Pod,
+                format!("sandboxwich-{sandbox_id}"),
+                "uid-tenant",
+            ),
+            (
+                RuntimeResourceKind::Secret,
+                format!("sandboxwich-guest-token-{sandbox_id}"),
+                "uid-guest",
+            ),
+            (
+                RuntimeResourceKind::Secret,
+                format!("sandboxwich-activation-client-{sandbox_id}"),
+                "uid-activation",
+            ),
+        ]
+        .into_iter()
+        .map(|(resource_kind, name, uid)| RuntimeResourceInventoryItem {
+            sandbox_id,
+            resource_kind,
+            namespace: "sandboxwich-ci".to_string(),
+            name,
+            uid: uid.to_string(),
+            expires_at: None,
+            cleanup_deadline: None,
+        })
+        .collect(),
+        active_resident_lease_ids: Vec::new(),
+        sandbox_next_cursor: None,
+        next_cursor: None,
+    };
+
+    let mut deleted_resources = Vec::new();
+    let outcome = provider
+        .reconcile_orphans_with_delete(
+            Ok(inventory),
+            ReconciliationLimits {
+                max_scanned: 20,
+                max_deleted: 5,
+                max_elapsed: Duration::from_secs(30),
+            },
+            true,
+            &CancelSignal::never_cancelled(),
+            |resource, _, _| {
+                deleted_resources.push(resource.clone());
+                std::fs::write(dir.join("deleted"), "").expect("mark supervisor deleted");
+                Ok(())
+            },
+        )
+        .expect("revival reconciliation");
+
+    // The terminated supervisor was revived; nothing was orphan-deleted (the
+    // only delete-closure invocation is the revival's own UID-fenced delete).
+    assert_eq!(outcome.supervisor_revivals, 1);
+    assert_eq!(outcome.deleted, 0);
+    assert_eq!(deleted_resources.len(), 1);
+    assert_eq!(deleted_resources[0].name, supervisor_name);
+    assert_eq!(deleted_resources[0].uid, "uid-supervisor");
+
+    let applied: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("applied.json")).expect("read applied revival manifest"),
+    )
+    .expect("applied revival manifest is valid JSON");
+    assert_eq!(
+        applied["metadata"]["name"].as_str(),
+        Some(supervisor_name.as_str())
+    );
+    let env = applied["spec"]["containers"][0]["env"]
+        .as_array()
+        .expect("revival manifest carries the supervisor env");
+    let env_value = |key: &str| {
+        env.iter()
+            .find(|variable| variable["name"].as_str() == Some(key))
+            .and_then(|variable| variable["value"].as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("revival manifest is missing env {key}"))
+    };
+    assert_eq!(env_value("SANDBOXWICH_SANDBOX_ID"), sandbox_id.to_string());
+    assert_eq!(env_value("SANDBOXWICH_WORKER_ID"), worker_id.to_string());
+    // The replacement binds the *current* tenant Pod identity, not the stale
+    // one the terminated Pod was rendered with.
+    assert_eq!(env_value("SANDBOXWICH_PROVIDER_POD_UID"), "uid-tenant");
+    let revived_candidate: SterilePoolCandidateV1 =
+        serde_json::from_str(&env_value("SANDBOXWICH_STERILE_POOL_CANDIDATE_V1"))
+            .expect("revival manifest carries a valid candidate marker");
+    assert_eq!(revived_candidate.cell_id.0, sandbox_id.0);
 }
 
 /// Stateful fake kubectl that rejects the `kubectl apply` of one lowercase kind
@@ -7060,6 +7366,7 @@ fn observed_claim(
         resident_lease_id: None,
         created_at: Some(created_at),
         volume_claim_phase: phase,
+        pod_phase: None,
     }
 }
 
