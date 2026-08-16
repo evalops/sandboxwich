@@ -3007,6 +3007,12 @@ pub struct MaestroHostedRunnerConnectionBindingResponse {
     pub placement_generation: u64,
     pub runner_session_id: String,
     pub runtime_image: String,
+    /// Exact digest of the agent image leased with a sterile cell. Legacy
+    /// non-sterile bindings do not have a pool membership and leave this
+    /// compatibility field absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(pattern = "^sha256:[0-9a-f]{64}$")]
+    pub agent_image_digest: Option<String>,
     pub service_namespace: String,
     pub service_name: String,
     pub service_host: String,

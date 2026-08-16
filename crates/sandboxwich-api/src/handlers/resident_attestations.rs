@@ -88,6 +88,110 @@ struct AttestationRecord {
     redeem_idempotency_key: Option<Uuid>,
 }
 
+fn digest_pinned_image(image: &str) -> Option<String> {
+    let digest = image.rsplit_once("@sha256:")?.1;
+    (digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then(|| format!("sha256:{digest}"))
+}
+
+struct SterileAgentImageAuthority<'a> {
+    tenant_id: &'a str,
+    process_id: ResidentProcessId,
+    resident_generation: u64,
+    active_lease_id: Uuid,
+    cell_id: Option<&'a str>,
+    lease_id: Option<&'a str>,
+    lease_generation: Option<i64>,
+}
+
+/// Resolve the exact agent image from the leased sterile-cell authority. A
+/// sterile resident must match one pool membership, one cell lease, one
+/// observed candidate Pod, and one signed release tuple; any missing or
+/// divergent row is deliberately treated as not live rather than exposing a
+/// best-effort digest.
+async fn sterile_agent_image_digest_on(
+    db: &Database,
+    connection: &mut AnyConnection,
+    authority: SterileAgentImageAuthority<'_>,
+) -> Result<Option<String>, ApiError> {
+    let SterileAgentImageAuthority {
+        tenant_id,
+        process_id,
+        resident_generation,
+        active_lease_id,
+        cell_id: sterile_cell_id,
+        lease_id: sterile_lease_id,
+        lease_generation: sterile_lease_generation,
+    } = authority;
+    let Some((sterile_cell_id, sterile_lease_id, sterile_lease_generation)) = sterile_cell_id
+        .zip(sterile_lease_id)
+        .zip(sterile_lease_generation)
+        .map(|((cell_id, lease_id), generation)| (cell_id, lease_id, generation))
+    else {
+        if sterile_cell_id.is_none()
+            && sterile_lease_id.is_none()
+            && sterile_lease_generation.is_none()
+        {
+            return Ok(None);
+        }
+        return Err(not_live("Maestro sterile resident binding is incomplete"));
+    };
+    let sql = format!(
+        "select p.candidate_agent_image
+         from resident_processes rp
+         join sterile_cells c on c.id = rp.sterile_cell_id
+         join sterile_pool_memberships p on p.sandbox_id = c.id
+         where rp.id = {} and rp.tenant_id = {} and rp.sandbox_id = c.id
+           and rp.generation = {} and rp.active_lease_id = {}
+           and rp.sterile_cell_id = {} and rp.sterile_lease_id = {}
+           and rp.sterile_lease_generation = {}
+           and c.id = p.sandbox_id and c.provider_cell_id = p.sandbox_id
+           and c.tenant_id = rp.tenant_id and p.tenant_id = rp.tenant_id
+           and c.state = 'leased' and p.state = 'leased'
+           and c.lease_id = rp.sterile_lease_id and c.lease_id = p.lease_id
+           and c.generation = rp.sterile_lease_generation
+           and c.generation = p.generation
+           and c.activated_resident_process_id = rp.id
+           and c.activated_resident_generation = rp.generation
+           and rp.provider_pod_name = p.candidate_pod_name
+           and rp.provider_pod_uid = p.candidate_pod_uid
+           and c.release_set_id = p.release_set_id
+           and c.runtime_class = p.runtime_class
+           and c.policy_digest = p.policy_digest
+           and c.release_signature = p.release_signature
+           and c.lease_expires_at > {}",
+        db.placeholder(1),
+        db.placeholder(2),
+        db.placeholder(3),
+        db.placeholder(4),
+        db.placeholder(5),
+        db.placeholder(6),
+        db.placeholder(7),
+        db.placeholder(8),
+    );
+    let candidate_agent_image = sqlx::query_scalar::<_, String>(&sql)
+        .bind(process_id.to_string())
+        .bind(tenant_id)
+        .bind(
+            i64::try_from(resident_generation)
+                .map_err(|_| ApiError::internal("resident generation exceeds database range"))?,
+        )
+        .bind(active_lease_id.to_string())
+        .bind(sterile_cell_id)
+        .bind(sterile_lease_id)
+        .bind(sterile_lease_generation)
+        .bind(Utc::now().to_rfc3339())
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| not_live("Maestro sterile cell image binding is stale"))?;
+    digest_pinned_image(&candidate_agent_image)
+        .map(Some)
+        .ok_or_else(|| not_live("Maestro sterile agent image is not digest-pinned"))
+}
+
 fn unavailable() -> ApiError {
     ApiError {
         status: StatusCode::NOT_FOUND,
@@ -508,7 +612,9 @@ pub(crate) async fn authoritative_maestro_connection_binding(
 ) -> Result<MaestroHostedRunnerConnectionBindingResponse, ApiError> {
     let sql = format!(
         "select rp.id, rp.generation, rp.active_lease_id, rp.env,
-                rp.desired_state, rp.observed_state, rp.provider_pod_uid,
+                rp.desired_state, rp.observed_state, rp.provider_pod_name,
+                rp.provider_pod_uid, rp.sterile_cell_id, rp.sterile_lease_id,
+                rp.sterile_lease_generation,
                 rp.last_error_class, rp.last_error_code, rp.last_error, w.labels
          from resident_processes rp
          join sandbox_placements sp on sp.sandbox_id = rp.sandbox_id
@@ -616,6 +722,23 @@ pub(crate) async fn authoritative_maestro_connection_binding(
     {
         return Err(not_live("Maestro provider Pod binding is stale"));
     }
+    let sterile_cell_id = row.try_get::<Option<String>, _>("sterile_cell_id")?;
+    let sterile_lease_id = row.try_get::<Option<String>, _>("sterile_lease_id")?;
+    let sterile_lease_generation = row.try_get::<Option<i64>, _>("sterile_lease_generation")?;
+    let agent_image_digest = sterile_agent_image_digest_on(
+        db,
+        connection,
+        SterileAgentImageAuthority {
+            tenant_id,
+            process_id,
+            resident_generation: process_generation,
+            active_lease_id: lease_id,
+            cell_id: sterile_cell_id.as_deref(),
+            lease_id: sterile_lease_id.as_deref(),
+            lease_generation: sterile_lease_generation,
+        },
+    )
+    .await?;
     let labels = parse_labels(&row.try_get::<String, _>("labels")?)?;
     let service_namespace = label(&labels, "sandbox_namespace")?.to_string();
     let service_name =
@@ -643,6 +766,7 @@ pub(crate) async fn authoritative_maestro_connection_binding(
         placement_generation,
         runner_session_id: runner_session_id.clone(),
         runtime_image: fence.runtime_image,
+        agent_image_digest,
         service_namespace,
         service_name,
         service_host,

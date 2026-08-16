@@ -2044,6 +2044,114 @@ async fn maestro_connection_binding_is_live_tenant_scoped_and_identity_exact() {
 }
 
 #[tokio::test]
+async fn maestro_connection_binding_reports_exact_sterile_agent_digest_and_fails_closed_on_release_drift()
+ {
+    sqlx::any::install_default_drivers();
+    let data_dir = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with_sterile_cells(
+        format!(
+            "sqlite://{}",
+            data_dir.path().join("maestro-sterile-digest.db").display()
+        ),
+        Some(data_dir),
+        false,
+    )
+    .await;
+    let (sandbox_id, worker, guest_client) =
+        provisioned_sandbox_with_guest(&server, "maestro-sterile-digest", true).await;
+    let claimed = claim_sterile_sandbox(&server, &worker, sandbox_id).await;
+    let lease = claimed.lease.as_ref().expect("sterile lease");
+    let pod_uid = Uuid::now_v7();
+    let pool = AnyPool::connect(&server.database_url).await.unwrap();
+    sqlx::query(
+        "update sterile_pool_memberships
+         set candidate_pod_uid = ? where sandbox_id = ?",
+    )
+    .bind(pod_uid.to_string())
+    .bind(sandbox_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut request =
+        maestro_hosted_runner_request(sandbox_id, &lease.workspace_id, &lease.runner_session_id);
+    request.sterile_activation = Some(sterile_activation_from_claim(&claimed));
+    let created: ResidentProcessResponse = server
+        .client()
+        .put(format!(
+            "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}",
+            server.base_url
+        ))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let resident_lease =
+        claim_resident_process_lease(&server, &worker, &guest_client, sandbox_id).await;
+    let pod_name = format!("sandboxwich-{sandbox_id}");
+    worker_client(&worker)
+        .post(format!(
+            "{}/resident-processes/{}/observations",
+            server.base_url, created.resident_process.id
+        ))
+        .json(&ResidentProcessObservationRequest {
+            generation: created.resident_process.generation,
+            lease_id: resident_lease.id.0,
+            observed_state: ResidentProcessObservedState::Starting,
+            pid: None,
+            exit_code: None,
+            error_code: None,
+            error_message: None,
+            provider_pod_name: Some(pod_name),
+            provider_pod_uid: Some(pod_uid.to_string()),
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let binding_url = format!(
+        "{}/sandboxes/{sandbox_id}/resident-processes/{MAESTRO_HOSTED_RUNNER_RESIDENT_PROCESS_NAME}/connection-binding",
+        server.base_url
+    );
+    let binding: MaestroHostedRunnerConnectionBindingResponse = server
+        .client()
+        .get(&binding_url)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        binding.agent_image_digest,
+        Some(format!("sha256:{}", "a".repeat(64)))
+    );
+
+    // The membership and leased cell must continue to carry one exact signed
+    // release tuple; changing only the membership release fence cannot make a
+    // binding return a digest from an unrelated cell.
+    sqlx::query(
+        "update sterile_pool_memberships
+         set release_signature = 'swrs1_forged' where sandbox_id = ?",
+    )
+    .bind(sandbox_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let drift = server.client().get(&binding_url).send().await.unwrap();
+    assert_eq!(drift.status(), reqwest::StatusCode::CONFLICT);
+}
+
+#[tokio::test]
 async fn maestro_connection_binding_reports_terminal_provider_capacity() {
     let data_dir = tempfile::tempdir().unwrap();
     let server = TestServer::start(
