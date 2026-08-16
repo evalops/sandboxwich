@@ -71,8 +71,9 @@ use resident_process_supervisor::{
 };
 
 const DEFAULT_HEARTBEAT_FAILURE_THRESHOLD: u32 = 12;
-/// Consecutive failures of the daemon's control-plane calls (lease claim, and the
-/// guest-health report posted after a failed lease) before the daemon gives up and exits.
+/// Consecutive failures of the daemon's control-plane calls (initial guest-health,
+/// lease claim, and the guest-health report posted after a failed lease) before the
+/// daemon gives up and exits.
 const DEFAULT_CLAIM_FAILURE_THRESHOLD: u32 = 12;
 /// Ceiling for the exponential backoff applied between retried control-plane calls.
 const MAX_CLAIM_BACKOFF: Duration = Duration::from_secs(30);
@@ -932,14 +933,10 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
 
     let mut iterations = 0_u64;
     let heartbeat_interval = Duration::from_millis(args.heartbeat_interval_ms.max(1));
-    // With a mounted guest token (`--guest-token-file`), resolve_guest_session
-    // above makes no network call, so this Ready report is the daemon's first
-    // API contact. It must ride out a brief post-rollout network convergence
-    // window: a single connect timeout here used to exit the daemon seconds
-    // after start, stranding restartPolicy=Never supervisor pods in Error
-    // until something recreated them. Recoverable transport/5xx/429 failures
-    // retry under the same bounded budget as claim; genuine 4xx contract
-    // errors still bail immediately.
+    // The first Ready report used to be a single shot. A TCP timeout to the
+    // API (NetworkPolicy hole, DNS blip) exited the daemon and left a
+    // restartPolicy=Never supervisor Failed. Claim and post-failure health
+    // already retry; the opening probe must too.
     with_retry(
         &mut claim_budget,
         &mut claim_backoff,
@@ -963,9 +960,10 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
         args.heartbeat_failure_threshold.max(1),
     ));
 
-    // Tracks consecutive failures across guest authentication, claim_lease,
-    // and the guest-health report posted after a failed lease: all require
-    // reachability of the control plane and use the same bounded backoff.
+    // Tracks consecutive failures across guest authentication, the opening
+    // guest-health probe, claim_lease, and the guest-health report posted
+    // after a failed lease: all require reachability of the control plane
+    // and use the same bounded backoff.
     let mut resident_processes = ResidentProcessSupervisor::new(args.max_resident_processes);
 
     let daemon_loop = async {
@@ -4098,7 +4096,8 @@ mod tests {
     use sandboxwich_core::{
         SterileCellId, SterileCellReleaseTrustClassV1, SterileCellRuntimeClass,
     };
-    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
     use tokio::net::TcpListener;
@@ -4186,6 +4185,42 @@ mod tests {
         )
         .await
         .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn opening_guest_health_retries_recoverable_api_failures() {
+        async fn guest_health(
+            State(attempts): State<Arc<AtomicU32>>,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"ok": false})),
+                );
+            }
+            (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+        }
+
+        let attempts = Arc::new(AtomicU32::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/sandboxes/{sandbox_id}/guest-health", post(guest_health))
+            .with_state(attempts.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut budget = HeartbeatFailureBudget::new(3);
+        let mut backoff = Backoff::new(Duration::from_millis(1));
+        let client = reqwest::Client::new();
+        let api = format!("http://{address}");
+        let sandbox_id = SandboxId::new();
+        with_retry(&mut budget, &mut backoff, "post_guest_health", || {
+            post_guest_health(&client, &api, sandbox_id, GuestStatus::Ready, None)
+        })
+        .await
+        .expect("one 503 must be retried");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
         server.abort();
     }
 
