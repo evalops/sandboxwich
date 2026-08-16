@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.1.17 - 2026-08-16
+### Added
+
+- *(sterile)* Attest exact agent image digest
+
+### Fixed
+
+- *(reconcile)* Paginate live sandbox inventory
+- Recover stale managed home teardown
+- *(api)* Terminalize exhausted sandbox provisioning
+- Harden managed home mount reclamation
+
 ## 0.1.16 - 2026-08-11
 ### Added
 
