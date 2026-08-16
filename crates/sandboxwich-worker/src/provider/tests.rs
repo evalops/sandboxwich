@@ -346,6 +346,22 @@ fn kubernetes_pod_marks_only_authoritative_sterile_pool_candidates() {
         json!(["/opt/sandboxwich/bin/sandboxwich-agent", "daemon"])
     );
     assert_eq!(
+        supervisor_pod["spec"]["initContainers"][0]["resources"],
+        json!({
+            "requests": { "cpu": "5m", "memory": "16Mi" },
+            "limits": { "cpu": "50m", "memory": "32Mi" }
+        }),
+        "the supervisor installer must satisfy namespace quota admission"
+    );
+    assert_eq!(
+        supervisor_pod["spec"]["containers"][0]["resources"],
+        json!({
+            "requests": { "cpu": "50m", "memory": "64Mi" },
+            "limits": { "cpu": "500m", "memory": "256Mi" }
+        }),
+        "the supervisor must match the production control-pod quota shape"
+    );
+    assert_eq!(
         pool_pod["spec"]["volumes"]
             .as_array()
             .unwrap()

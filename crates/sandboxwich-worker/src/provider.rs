@@ -2066,6 +2066,10 @@ impl KubernetesDryRunProvider {
                     "imagePullPolicy": "IfNotPresent",
                     "command": ["/bin/sh", "-c", "set -eu; cp /usr/local/bin/sandboxwich-agent /opt/sandboxwich/bin/sandboxwich-agent; chmod 0555 /opt/sandboxwich/bin/sandboxwich-agent"],
                     "securityContext": restricted,
+                    "resources": {
+                        "requests": { "cpu": "5m", "memory": "16Mi" },
+                        "limits": { "cpu": "50m", "memory": "32Mi" }
+                    },
                     "volumeMounts": [{ "name": "sandboxwich-agent-bin", "mountPath": "/opt/sandboxwich/bin" }]
                 }],
                 "containers": [{
@@ -2089,6 +2093,10 @@ impl KubernetesDryRunProvider {
                         { "name": "SANDBOXWICH_STERILE_ACTIVATION_SERVER_CA_FILE", "value": "/run/sandboxwich/activation-tls/ca.crt" }
                     ],
                     "securityContext": restricted,
+                    "resources": {
+                        "requests": { "cpu": "50m", "memory": "64Mi" },
+                        "limits": { "cpu": "500m", "memory": "256Mi" }
+                    },
                     "volumeMounts": [{
                         "name": "sandboxwich-agent-bin", "mountPath": "/opt/sandboxwich/bin", "readOnly": true
                     }, {
