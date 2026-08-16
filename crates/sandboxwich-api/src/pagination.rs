@@ -130,14 +130,18 @@ pub(crate) async fn fetch_keyset_page_from_pool<T>(
     // matching rows before it can apply the page boundary.  Comparing the
     // tuple components independently lets composite indexes seek directly to
     // the next page while preserving the exact same ordering semantics.
+    // Use a distinct placeholder for the repeated created-at comparison.
+    // PostgreSQL permits reusing `$N`, but SQLite's anonymous `?` consumes a
+    // new positional bind every time it appears.
     let first_cursor_placeholder = db.placeholder(fixed_binds.len() + 1);
-    let second_cursor_placeholder = db.placeholder(fixed_binds.len() + 2);
+    let repeated_cursor_placeholder = db.placeholder(fixed_binds.len() + 2);
+    let second_cursor_placeholder = db.placeholder(fixed_binds.len() + 3);
     let (predicate, order_dir, cursor_bind) = match cursor {
         None => (String::new(), "asc", None),
         Some((PageDirection::After, c)) => (
             format!(
                 " and (created_at > {first_cursor_placeholder}
-                       or (created_at = {first_cursor_placeholder}
+                       or (created_at = {repeated_cursor_placeholder}
                            and id > {second_cursor_placeholder}))"
             ),
             "asc",
@@ -146,7 +150,7 @@ pub(crate) async fn fetch_keyset_page_from_pool<T>(
         Some((PageDirection::Before, c)) => (
             format!(
                 " and (created_at < {first_cursor_placeholder}
-                       or (created_at = {first_cursor_placeholder}
+                       or (created_at = {repeated_cursor_placeholder}
                            and id < {second_cursor_placeholder}))"
             ),
             "desc",
@@ -165,7 +169,10 @@ pub(crate) async fn fetch_keyset_page_from_pool<T>(
         query = query.bind(bind.as_str());
     }
     if let Some((created_at, id)) = cursor_bind {
-        query = query.bind(created_at.as_str()).bind(id.as_str());
+        query = query
+            .bind(created_at.as_str())
+            .bind(created_at.as_str())
+            .bind(id.as_str());
     }
 
     let mut rows = query.fetch_all(pool).await?;

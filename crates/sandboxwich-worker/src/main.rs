@@ -2624,10 +2624,13 @@ async fn fetch_runtime_resource_inventory(
     let mut scope = None;
     let mut sandbox_ids = std::collections::HashSet::new();
     let mut complete = true;
+    // Resource rows and live sandbox fences are independently paginated. A
+    // large sandbox history must not make an otherwise small runtime-resource
+    // inventory permanently incomplete.
     while resources.len() < max_scanned {
         let page_limit = (max_scanned - resources.len()).min(200);
         let mut url = format!(
-            "{api}/workers/{worker_id}/runtime-resource-inventory?namespace={namespace}&limit={page_limit}"
+            "{api}/workers/{worker_id}/runtime-resource-inventory?namespace={namespace}&limit={page_limit}&include_sandbox_ids=false"
         );
         if let Some(after) = cursor.as_deref() {
             url.push_str("&after=");
@@ -2642,7 +2645,6 @@ async fn fetch_runtime_resource_inventory(
                 page.namespace.clone(),
             )
         });
-        sandbox_ids.extend(page.sandbox_ids);
         complete &= page.complete;
         resources.extend(page.resources);
         active_resident_lease_ids.extend(page.active_resident_lease_ids);
@@ -2651,11 +2653,41 @@ async fn fetch_runtime_resource_inventory(
             break;
         }
     }
-    let (provider, cluster, namespace) =
-        scope.unwrap_or_else(|| ("kubernetes".to_string(), None, namespace.to_string()));
     if cursor.is_some() {
         anyhow::bail!("runtime resource inventory exceeded max_scanned={max_scanned}");
     }
+    let mut sandbox_cursor = None;
+    while sandbox_ids.len() < max_scanned {
+        let page_limit = (max_scanned - sandbox_ids.len()).min(200);
+        let mut url = format!(
+            "{api}/workers/{worker_id}/runtime-resource-inventory?namespace={namespace}&limit={page_limit}&include_resources=false"
+        );
+        if let Some(after) = sandbox_cursor.as_deref() {
+            url.push_str("&sandbox_after=");
+            url.push_str(after);
+        }
+        let response = client.get(url).send().await?;
+        let page = decode_json::<RuntimeResourceInventoryResponse>(response).await?;
+        scope.get_or_insert_with(|| {
+            (
+                page.provider.clone(),
+                page.cluster.clone(),
+                page.namespace.clone(),
+            )
+        });
+        sandbox_ids.extend(page.sandbox_ids);
+        active_resident_lease_ids.extend(page.active_resident_lease_ids);
+        sandbox_cursor = page.sandbox_next_cursor;
+        if sandbox_cursor.is_none() {
+            complete &= page.complete;
+            break;
+        }
+    }
+    if sandbox_cursor.is_some() {
+        anyhow::bail!("runtime sandbox inventory exceeded max_scanned={max_scanned}");
+    }
+    let (provider, cluster, namespace) =
+        scope.unwrap_or_else(|| ("kubernetes".to_string(), None, namespace.to_string()));
     Ok(RuntimeResourceInventoryResponse {
         ok: true,
         provider,
@@ -2665,6 +2697,7 @@ async fn fetch_runtime_resource_inventory(
         complete,
         resources,
         active_resident_lease_ids: active_resident_lease_ids.into_iter().collect(),
+        sandbox_next_cursor: sandbox_cursor,
         next_cursor: cursor,
     })
 }

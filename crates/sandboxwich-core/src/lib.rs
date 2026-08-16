@@ -1674,6 +1674,8 @@ pub struct RuntimeResourceInventoryResponse {
     #[serde(default)]
     pub active_resident_lease_ids: Vec<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_next_cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
 }
 

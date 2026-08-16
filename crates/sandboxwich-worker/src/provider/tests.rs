@@ -6712,6 +6712,7 @@ esac
         complete: true,
         resources: Vec::new(),
         active_resident_lease_ids: vec![resident_lease],
+        sandbox_next_cursor: None,
         next_cursor: None,
     };
     let limits = ReconciliationLimits {
@@ -6848,6 +6849,7 @@ esac
             cleanup_deadline: None,
         }],
         active_resident_lease_ids: Vec::new(),
+        sandbox_next_cursor: None,
         next_cursor: None,
     };
 
@@ -7259,6 +7261,7 @@ esac
         complete: true,
         resources: Vec::new(),
         active_resident_lease_ids: Vec::new(),
+        sandbox_next_cursor: None,
         next_cursor: None,
     };
     let outcome = provider
@@ -7340,6 +7343,7 @@ esac
         complete: true,
         resources: Vec::new(),
         active_resident_lease_ids: Vec::new(),
+        sandbox_next_cursor: None,
         next_cursor: None,
     };
     let mut delete_budget = None;
