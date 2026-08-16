@@ -14,6 +14,13 @@ use std::time::Duration;
 use uuid::Uuid;
 
 pub(crate) const POOL_JOB_MARKER: &str = "sterilePool";
+/// Ready admission happens at provision completion, before the supervisor
+/// posts guest-health. Keep a short grace so a healthy first probe is not
+/// treated as a dead cell.
+const GUEST_HEALTH_READY_GRACE: Duration = Duration::from_secs(30);
+/// Supervisor heartbeat is 5s. Twelve missed probes matches the agent
+/// heartbeat failure threshold and means the supervisor is gone.
+const GUEST_HEALTH_PROBE_STALE: Duration = Duration::from_secs(60);
 
 pub(crate) async fn lock_controller_on_connection(
     db: &Database,
@@ -377,17 +384,45 @@ async fn enqueue_expired_ready_stops_on_connection(
     connection: &mut AnyConnection,
     now: chrono::DateTime<Utc>,
 ) -> Result<(), ApiError> {
+    let grace_cutoff = now
+        - chrono::Duration::from_std(GUEST_HEALTH_READY_GRACE)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+    let stale_cutoff = now
+        - chrono::Duration::from_std(GUEST_HEALTH_PROBE_STALE)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
     let sql = format!(
-        "select p.sandbox_id, p.worker_id, j.payload
+        "select p.sandbox_id, p.worker_id, j.payload,
+                case
+                  when p.cell_expires_at <= {now_ttl} or c.state = 'quarantined' then 'ready_ttl_expired'
+                  else 'guest_health_unready'
+                end as stop_reason
          from sterile_pool_memberships p
          join jobs j on j.id = p.provision_job_id
          join sterile_cells c on c.id = p.sandbox_id
-         where p.state = 'ready' and (p.cell_expires_at <= {} or c.state = 'quarantined')
+         where p.state = 'ready' and (
+           p.cell_expires_at <= {now_ready}
+           or c.state = 'quarantined'
+           or (
+             p.updated_at <= {grace}
+             and not exists (
+               select 1 from guest_health g
+               where g.sandbox_id = p.sandbox_id
+                 and g.status = 'ready'
+                 and g.last_probe_at > {stale}
+             )
+           )
+         )
          order by p.cell_expires_at asc, p.sandbox_id asc limit 100",
-        db.placeholder(1)
+        now_ttl = db.placeholder(1),
+        now_ready = db.placeholder(2),
+        grace = db.placeholder(3),
+        stale = db.placeholder(4),
     );
     let rows = sqlx::query(&sql)
         .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .bind(grace_cutoff.to_rfc3339())
+        .bind(stale_cutoff.to_rfc3339())
         .fetch_all(&mut *connection)
         .await?;
     for row in rows {
@@ -396,6 +431,11 @@ async fn enqueue_expired_ready_stops_on_connection(
                 .map_err(|error| ApiError::internal(error.to_string()))?,
         );
         let worker_id: String = row.try_get("worker_id")?;
+        let stop_reason: String = row.try_get("stop_reason")?;
+        let archive_reason = match stop_reason.as_str() {
+            "guest_health_unready" => "sterile_pool_guest_health_unready",
+            _ => "sterile_pool_ready_expired",
+        };
         let provision_payload: String = row.try_get("payload")?;
         let provision_payload: serde_json::Value = serde_json::from_str(&provision_payload)?;
         let provision_spec = provision_payload
@@ -409,7 +449,7 @@ async fn enqueue_expired_ready_stops_on_connection(
             sandbox_id,
             SandboxState::STOP_LEGAL_FROM,
             SandboxState::Archiving,
-            json!({"state": SandboxState::Archiving, "reason": "sterile_pool_ready_expired"}),
+            json!({"state": SandboxState::Archiving, "reason": archive_reason}),
         )
         .await?
         {
@@ -432,7 +472,7 @@ async fn enqueue_expired_ready_stops_on_connection(
                     "leaseId": null,
                     "generation": 1,
                     "disposition": SterileCellDisposition::Quarantined,
-                    "reason": "ready_ttl_expired",
+                    "reason": stop_reason,
                 }
             }),
             required_capability: WorkerCapability::ProvisionSandbox,
@@ -448,12 +488,13 @@ async fn enqueue_expired_ready_stops_on_connection(
         insert_job_on_connection(db, connection, &stop_job).await?;
         let update = format!(
             "update sterile_pool_memberships set state = 'stopping', stop_job_id = {}, generation = 1,
-             requested_disposition = 'quarantined', quarantine_reason = 'ready_ttl_expired', updated_at = {}
+             requested_disposition = 'quarantined', quarantine_reason = {}, updated_at = {}
              where sandbox_id = {} and worker_id = {} and state = 'ready' and generation = 1",
-            db.placeholder(1), db.placeholder(2), db.placeholder(3), db.placeholder(4)
+            db.placeholder(1), db.placeholder(2), db.placeholder(3), db.placeholder(4), db.placeholder(5)
         );
         let updated = sqlx::query(&update)
             .bind(stop_job.id.to_string())
+            .bind(&stop_reason)
             .bind(now.to_rfc3339())
             .bind(sandbox_id.to_string())
             .bind(worker_id)
@@ -2137,5 +2178,102 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(replacement_count, 1);
+    }
+
+    #[tokio::test]
+    async fn ready_cell_without_guest_health_is_replaced_after_grace() {
+        let db = test_db().await;
+        let (sandbox_id, _job, _worker_id) = provision_one(&db).await;
+        let aged = (Utc::now() - chrono::Duration::seconds(31)).to_rfc3339();
+        sqlx::query("update sterile_pool_memberships set updated_at = ? where sandbox_id = ?")
+            .bind(&aged)
+            .bind(sandbox_id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        reconcile_sterile_pool(&db, &pool_config(1)).await.unwrap();
+        let original: (String, String) = sqlx::query_as(
+            "select state, quarantine_reason from sterile_pool_memberships where sandbox_id = ?",
+        )
+        .bind(sandbox_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(original.0, "stopping");
+        assert_eq!(original.1, "guest_health_unready");
+    }
+
+    #[tokio::test]
+    async fn ready_cell_with_fresh_guest_health_is_kept() {
+        let db = test_db().await;
+        let (sandbox_id, _job, _worker_id) = provision_one(&db).await;
+        let aged = (Utc::now() - chrono::Duration::seconds(31)).to_rfc3339();
+        sqlx::query("update sterile_pool_memberships set updated_at = ? where sandbox_id = ?")
+            .bind(&aged)
+            .bind(sandbox_id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "insert into guest_health (sandbox_id, status, last_probe_at, agent_version, checks, message)
+             values (?, 'ready', ?, 'sandboxwich-agent/test', '{}', null)",
+        )
+        .bind(sandbox_id.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        reconcile_sterile_pool(&db, &pool_config(1)).await.unwrap();
+        let state: String =
+            sqlx::query_scalar("select state from sterile_pool_memberships where sandbox_id = ?")
+                .bind(sandbox_id.to_string())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "ready");
+        let replacement_count: i64 = sqlx::query_scalar(
+            "select count(*) from sterile_pool_memberships where sandbox_id != ?",
+        )
+        .bind(sandbox_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(replacement_count, 0);
+    }
+
+    #[tokio::test]
+    async fn ready_cell_with_stale_guest_health_is_replaced() {
+        let db = test_db().await;
+        let (sandbox_id, _job, _worker_id) = provision_one(&db).await;
+        let aged = (Utc::now() - chrono::Duration::seconds(31)).to_rfc3339();
+        let stale = (Utc::now() - chrono::Duration::seconds(61)).to_rfc3339();
+        sqlx::query("update sterile_pool_memberships set updated_at = ? where sandbox_id = ?")
+            .bind(&aged)
+            .bind(sandbox_id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "insert into guest_health (sandbox_id, status, last_probe_at, agent_version, checks, message)
+             values (?, 'ready', ?, 'sandboxwich-agent/test', '{}', null)",
+        )
+        .bind(sandbox_id.to_string())
+        .bind(&stale)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        reconcile_sterile_pool(&db, &pool_config(1)).await.unwrap();
+        let original: (String, String) = sqlx::query_as(
+            "select state, quarantine_reason from sterile_pool_memberships where sandbox_id = ?",
+        )
+        .bind(sandbox_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(original.0, "stopping");
+        assert_eq!(original.1, "guest_health_unready");
     }
 }
