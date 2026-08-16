@@ -11,7 +11,8 @@ use crate::handlers::secrets::fetch_sandbox_secret_mounts;
 use crate::rows::{parse_timestamp, row_to_job, row_to_resident_process};
 use crate::state::{
     AppState, LiveResidentBootstrap, Principal, ResidentBootstrapDelivery,
-    ResidentBootstrapDeliveryError, ResidentBootstrapFence, TenantContext,
+    ResidentBootstrapDeliveryError, ResidentBootstrapFence, ResidentBootstrapReserveError,
+    TenantContext,
 };
 use async_stream::stream;
 use axum::Json;
@@ -1285,11 +1286,23 @@ pub(crate) async fn put_resident_process(
         }),
     }
     .transpose()
-    .map_err(|_| ApiError {
-        status: StatusCode::SERVICE_UNAVAILABLE,
-        code: "resident_bootstrap_capacity",
-        message: "resident bootstrap capacity is exhausted".into(),
-        details: None,
+    .map_err(|error| match error {
+        // A newer generation is already live process-locally, which means a
+        // concurrent successor committed the durable generation CAS first.
+        // Fail closed with the same 409 the durable fence would have returned
+        // (see the `expected_generation != current.generation` check above);
+        // a 503 here would misreport a lost conflict as retryable capacity
+        // pressure.
+        ResidentBootstrapReserveError::StaleGeneration => ApiError::conflict_code(
+            "resident_process_generation_conflict",
+            "resident process generation changed",
+        ),
+        ResidentBootstrapReserveError::Capacity => ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "resident_bootstrap_capacity",
+            message: "resident bootstrap capacity is exhausted".into(),
+            details: None,
+        },
     })?;
 
     let handoff_bootstrap = bootstrap_reservation
