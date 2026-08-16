@@ -1476,6 +1476,7 @@ async fn main() -> anyhow::Result<()> {
                     "reconcilerId": worker_id,
                     "scanned": outcome.scanned(),
                     "deleted": outcome.deleted(),
+                    "supervisorRevivals": outcome.supervisor_revivals(),
                     "apply": outcome.apply(),
                     "classifications": {
                         "expected": counts.expected,

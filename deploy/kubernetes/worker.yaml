@@ -91,8 +91,11 @@ metadata:
     app.kubernetes.io/part-of: sandboxwich
 ---
 # Reconciliation is intentionally outside the worker Deployment. This role
-# can observe and UID-fenced-delete sandbox resources, but cannot create,
-# update, patch, exec into, or read logs from workloads.
+# can observe and UID-fenced-delete sandbox resources, but cannot update,
+# patch, exec into, or read logs from workloads. The single exception is
+# creating Pods: the reconciler recreates terminated restartPolicy=Never
+# sterile-pool supervisor Pods for live cells (see "Orphan reconciliation"
+# in docs/kubernetes.md).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -112,6 +115,9 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
