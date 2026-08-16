@@ -932,12 +932,27 @@ async fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
 
     let mut iterations = 0_u64;
     let heartbeat_interval = Duration::from_millis(args.heartbeat_interval_ms.max(1));
-    post_guest_health(
-        &guest_session.client,
-        &api,
-        sandbox_id,
-        GuestStatus::Ready,
-        None,
+    // With a mounted guest token (`--guest-token-file`), resolve_guest_session
+    // above makes no network call, so this Ready report is the daemon's first
+    // API contact. It must ride out a brief post-rollout network convergence
+    // window: a single connect timeout here used to exit the daemon seconds
+    // after start, stranding restartPolicy=Never supervisor pods in Error
+    // until something recreated them. Recoverable transport/5xx/429 failures
+    // retry under the same bounded budget as claim; genuine 4xx contract
+    // errors still bail immediately.
+    with_retry(
+        &mut claim_budget,
+        &mut claim_backoff,
+        "post_guest_health",
+        || {
+            post_guest_health(
+                &guest_session.client,
+                &api,
+                sandbox_id,
+                GuestStatus::Ready,
+                None,
+            )
+        },
     )
     .await?;
     let heartbeat_task = tokio::spawn(heartbeat_loop(
@@ -5006,6 +5021,90 @@ mod tests {
 
         assert_eq!(budget.max_consecutive_failures(), 1);
         assert!(budget.record_failure());
+    }
+
+    fn status_error(status: reqwest::StatusCode) -> AgentRequestError {
+        AgentRequestError::Status {
+            status,
+            body: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn with_retry_rides_out_recoverable_failures_then_succeeds() {
+        let mut budget = HeartbeatFailureBudget::new(3);
+        let mut backoff = Backoff::new(Duration::from_millis(1));
+        let attempts = std::cell::Cell::new(0_u32);
+
+        let value = with_retry(&mut budget, &mut backoff, "test_operation", || {
+            attempts.set(attempts.get() + 1);
+            async {
+                if attempts.get() < 3 {
+                    // Connect timeouts and 5xx are recoverable: a post-rollout
+                    // convergence window must not kill the caller.
+                    Err(status_error(reqwest::StatusCode::SERVICE_UNAVAILABLE))
+                } else {
+                    Ok(42_u32)
+                }
+            }
+        })
+        .await
+        .expect("recoverable failures within budget must eventually succeed");
+
+        assert_eq!(value, 42);
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(budget.consecutive_failures(), 0);
+    }
+
+    #[tokio::test]
+    async fn with_retry_fails_fast_on_a_contract_4xx() {
+        let mut budget = HeartbeatFailureBudget::new(12);
+        let mut backoff = Backoff::new(Duration::from_millis(1));
+        let attempts = std::cell::Cell::new(0_u32);
+
+        let error = with_retry(&mut budget, &mut backoff, "test_operation", || {
+            attempts.set(attempts.get() + 1);
+            async { Err::<(), _>(status_error(reqwest::StatusCode::UNPROCESSABLE_ENTITY)) }
+        })
+        .await
+        .expect_err("a genuine 4xx contract error must not be retried");
+
+        assert_eq!(attempts.get(), 1);
+        assert!(error.to_string().contains("non-recoverable"));
+    }
+
+    #[tokio::test]
+    async fn with_retry_fails_fast_on_terminal_auth_failure() {
+        let mut budget = HeartbeatFailureBudget::new(12);
+        let mut backoff = Backoff::new(Duration::from_millis(1));
+        let attempts = std::cell::Cell::new(0_u32);
+
+        let error = with_retry(&mut budget, &mut backoff, "test_operation", || {
+            attempts.set(attempts.get() + 1);
+            async { Err::<(), _>(status_error(reqwest::StatusCode::UNAUTHORIZED)) }
+        })
+        .await
+        .expect_err("a terminal auth failure must not be retried");
+
+        assert_eq!(attempts.get(), 1);
+        assert!(error.to_string().contains("terminal guest auth failure"));
+    }
+
+    #[tokio::test]
+    async fn with_retry_bails_once_the_budget_trips() {
+        let mut budget = HeartbeatFailureBudget::new(2);
+        let mut backoff = Backoff::new(Duration::from_millis(1));
+        let attempts = std::cell::Cell::new(0_u32);
+
+        let error = with_retry(&mut budget, &mut backoff, "test_operation", || {
+            attempts.set(attempts.get() + 1);
+            async { Err::<(), _>(status_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR)) }
+        })
+        .await
+        .expect_err("sustained recoverable failures must exhaust the budget");
+
+        assert_eq!(attempts.get(), 2);
+        assert!(error.to_string().contains("consecutive times"));
     }
 
     /// A throwaway directory under the OS temp dir, removed when dropped.
