@@ -19,6 +19,22 @@ apply mode runs a configured provider.
 | `sandboxwich-agent` | Experimental guest-side daemon and CLI. The starter Ubuntu runtime image does not include it yet. |
 | [`sdks/python`](sdks/python) | Typed Python client built with `httpx` and Pydantic v2. |
 
+## Architecture
+
+The API owns durable state and operations. Workers claim typed jobs and hand
+provider-specific work to the configured runtime backend.
+
+```mermaid
+flowchart LR
+    client["CLI, Python SDK, or HTTP client"] --> api["sandboxwich-api"]
+    guest["sandboxwich-agent"] --> api
+    api --> state[("SQLite or Postgres")]
+    api --> jobs["Durable jobs and operations"]
+    worker["sandboxwich-worker"] --> api
+    worker --> provider["Configured provider"]
+    provider --> runtime["Sandbox runtime"]
+```
+
 ## Quick start
 
 This walkthrough uses SQLite and a Kubernetes dry-run worker. It validates the
@@ -74,6 +90,22 @@ guide](docs/kubernetes.md). Apply mode requires both
 `SANDBOXWICH_K8S_ENABLE_MUTATION=1` and `--confirm-apply`. The guide covers
 worker RBAC, namespaces, storage, egress policy, RuntimeClass configuration,
 and secret delivery.
+
+### Request execution
+
+The API turns a typed request into a durable operation. The worker either
+returns a simulated result or calls the configured provider.
+
+```mermaid
+flowchart TD
+    request["CLI, SDK, or HTTP request"] --> api["sandboxwich-api"]
+    api --> operation["Operation and durable job"]
+    operation --> worker["sandboxwich-worker"]
+    worker --> mode{"provider_mode"}
+    mode -->|dry_run| simulated["Typed simulated result"]
+    mode -->|apply| provider["Configured provider"]
+    provider --> runtime["Pod, PVC, Service, or other runtime resource"]
+```
 
 ## Configuration
 
@@ -184,6 +216,30 @@ Sandbox creation, stop, and resume return `202` with an Operation. Commands can
 be observed through `GET /v1/operations/{id}` or its SSE event stream, and a
 queued command can be canceled with
 `POST /v1/operations/{id}/cancel`.
+
+### Sandbox lifecycle
+
+The diagram shows provisioning, retry, stop, and resume transitions:
+
+```mermaid
+stateDiagram-v2
+    [*] --> planning
+    planning --> provisioning: worker claims provision job
+    planning --> ready: provision job completes
+    planning --> error: permanent failure
+    provisioning --> planning: fork retry
+    provisioning --> ready: provider ready
+    provisioning --> error: permanent failure
+    provisioning --> archived: resume failure
+    planning --> archiving: stop requested
+    provisioning --> archiving: stop requested
+    ready --> archiving: stop requested
+    running --> archiving: stop requested
+    idle --> archiving: stop requested
+    error --> archiving: stop requested
+    archiving --> archived: provider confirms teardown
+    archived --> provisioning: resume requested
+```
 
 Managed persistent homes admit one live sandbox. A concurrent create returns
 `409 home_already_mounted`; callers should re-read the home, then adopt or
