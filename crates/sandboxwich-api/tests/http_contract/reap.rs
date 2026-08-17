@@ -3,8 +3,7 @@
 //! sweeper, and a sandbox with no lifetime knobs configured -- in particular
 //! a `workspace_mode: persistent` one, with no operator default configured
 //! either -- must never be touched. See `sandboxwich_api::reap` and the
-//! "Sandbox lifetime: three separate knobs" section of the README for the
-//! design this proves out.
+//! `docs/capabilities.md` for the design this proves out.
 
 use crate::common::*;
 use sandboxwich_core::*;

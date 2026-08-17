@@ -4,20 +4,20 @@ sandboxwich is a typed Rust control plane for self-hosted, policy-controlled
 development and agent-evaluation sandboxes.
 
 The project is pre-1.0. Kubernetes apply mode and provider capabilities are
-experimental. The [capability matrix](docs/capabilities.md) records the
-evidence for each provider path. Dry-run mode exercises control-plane behavior;
-apply mode runs a configured provider.
+experimental; the [capability matrix](docs/capabilities.md) records current
+evidence. Dry-run mode exercises control-plane behavior, while apply mode runs
+a configured provider.
 
 ## Components
 
 | Package | Purpose |
 | --- | --- |
-| `sandboxwich-api` | HTTP control plane with SQLite for local development and Postgres for shared deployments. |
-| `sandboxwich-cli` | CLI for creating, listing, stopping, resuming, forking, copying files, running commands, reading events, and inspecting runtime resources. |
+| `sandboxwich-api` | HTTP control plane. |
+| `sandboxwich-cli` | CLI for sandbox and worker operations. |
 | `sandboxwich-core` | Shared typed request, response, and event contracts. |
-| `sandboxwich-worker` | Worker registration, heartbeats, job claiming, and provider execution. |
-| `sandboxwich-agent` | Experimental guest-side daemon and CLI. The starter Ubuntu runtime image does not include it yet. |
-| [`sdks/python`](sdks/python) | Typed Python client built with `httpx` and Pydantic v2. |
+| `sandboxwich-worker` | Worker registration and provider execution. |
+| `sandboxwich-agent` | Experimental guest-side daemon and CLI. |
+| [`sdks/python`](sdks/python) | Typed Python client using `httpx` and Pydantic. |
 
 ## Architecture
 
@@ -40,20 +40,16 @@ flowchart LR
 This walkthrough uses SQLite and a Kubernetes dry-run worker. It validates the
 control-plane flow without creating a runtime in Kubernetes.
 
-Prerequisites:
+Prerequisites: Rust 1.95 or newer and [`just`](https://github.com/casey/just).
 
-- Rust 1.95 or newer
-- [`just`](https://github.com/casey/just) for the combined local process
-- Docker for the Postgres-backed contract tests
-
-In the first shell, start the API and dry-run worker:
+In the first shell:
 
 ```sh
 export SANDBOXWICH_API_TOKEN="local-development-token"
 just dev
 ```
 
-In a second shell, use the CLI:
+In a second shell:
 
 ```sh
 export SANDBOXWICH_API_TOKEN="local-development-token"
@@ -65,10 +61,13 @@ cargo run -p sandboxwich-cli -- exec <sandbox-id> --wait -- echo hello
 cargo run -p sandboxwich-cli -- events <sandbox-id>
 ```
 
+`just dev` uses `http://127.0.0.1:3217` and `sqlite://sandboxwich.db` by
+default. Press Ctrl-C in the first shell to stop the API and worker.
+
 ### HTTP smoke test
 
-Tenant tokens use the `Authorization: Bearer <token>` header. Check the probe
-endpoint, then create a sandbox through the versioned API:
+Tenant tokens use `Authorization: Bearer <token>`. Check the probe endpoint,
+then create a sandbox through the versioned API:
 
 ```sh
 curl -fsS http://127.0.0.1:3217/healthz
@@ -81,214 +80,70 @@ curl -fsS \
 ```
 
 The create response has HTTP status `202` and includes the sandbox and its
-provisioning operation. Use `sandboxwich events <sandbox-id>` or
-`GET /v1/operations/{id}` to observe that operation.
-
-`just dev` uses the API defaults: `http://127.0.0.1:3217` and
-`sqlite://sandboxwich.db`. Press Ctrl-C in the first shell to stop the API and
-worker.
-
-To run the API manually, prepare the schema and start the server:
-
-```sh
-cargo run -p sandboxwich-api -- migrate
-cargo run -p sandboxwich-api -- serve
-```
-
-Then start a dry-run worker with the same token:
-
-```sh
-cargo run -p sandboxwich-worker -- run \
-  --name local-dry-run \
-  --provider kubernetes \
-  --provider-mode dry-run
-```
+provisioning operation. Observe it with `sandboxwich events <sandbox-id>` or
+`GET /v1/operations/{id}`.
 
 For a real Kubernetes workflow, follow the [Kubernetes deployment
 guide](docs/kubernetes.md). Apply mode requires both
-`SANDBOXWICH_K8S_ENABLE_MUTATION=1` and `--confirm-apply`. The guide covers
-worker RBAC, namespaces, storage, egress policy, RuntimeClass configuration,
-and secret delivery.
-
-### Request execution
-
-The API turns a typed request into a durable operation. The worker either
-returns a simulated result or calls the configured provider.
-
-```mermaid
-flowchart TD
-    request["CLI, SDK, or HTTP request"] --> api["sandboxwich-api"]
-    api --> operation["Operation and durable job"]
-    operation --> worker["sandboxwich-worker"]
-    worker --> mode{"provider_mode"}
-    mode -->|dry_run| simulated["Typed simulated result"]
-    mode -->|apply| provider["Configured provider"]
-    provider --> runtime["Pod, PVC, Service, or other runtime resource"]
-```
+`SANDBOXWICH_K8S_ENABLE_MUTATION=1` and `--confirm-apply`.
 
 ## Configuration
 
 ### API and storage
 
-| Variable | Default or use |
+| Variable | Use |
 | --- | --- |
-| `SANDBOXWICH_API` | `http://127.0.0.1:3217`; the CLI and worker API address. |
-| `SANDBOXWICH_DATABASE_URL` | `sqlite://sandboxwich.db`; use a Postgres URL for shared deployments. |
-| `SANDBOXWICH_DATABASE_MAX_CONNECTIONS` | Sets the API database pool size. |
-| `SANDBOXWICH_AUTO_MIGRATE` | Leave enabled for local development. Set `false` when a deployment runs `migrate` as a separate job. |
+| `SANDBOXWICH_API` | API URL; default `http://127.0.0.1:3217`. |
+| `SANDBOXWICH_DATABASE_URL` | SQLite by default; Postgres for shared use. |
+| `SANDBOXWICH_AUTO_MIGRATE` | Disable when migrations run as a separate job. |
 
-The API exposes `/healthz`, `/readyz`, and `/metrics`. Health and readiness
-are probe-friendly. The metrics endpoint follows the API authentication
-configuration.
-
-### Worker and provider
-
-The worker has two provider names. `--provider` is the placement label sent to
-the API; `--runtime-provider` selects the backend that executes the job.
-
-| Setting | Use |
-| --- | --- |
-| `--provider` | Placement label sent to the API. Default: `kubernetes`. |
-| `--runtime-provider` / `SANDBOXWICH_RUNTIME_PROVIDER` | Execution backend. |
-| `--provider-mode` | `dry-run` simulates; `apply` executes. |
-| `SANDBOXWICH_RUNTIME_IMAGE` | Kubernetes runtime image. |
-| `SANDBOXWICH_RUNTIME_CLASS_NAME` | Kubernetes RuntimeClass. |
-
-`SANDBOXWICH_RUNTIME_PROVIDER` accepts `kubernetes`, `agent-sandbox`, and
-`cloudflare`; it defaults to `kubernetes`.
-`--provider-mode` defaults to `dry-run`.
-
-Cloudflare workers require `--provider-mode apply`. Kubernetes apply mode
-also requires `SANDBOXWICH_K8S_ENABLE_MUTATION=1` and `--confirm-apply`.
+The API exposes `/healthz`, `/readyz`, and `/metrics`. Probe routes are
+unauthenticated; metrics follow the API authentication configuration.
 
 ### Authentication
 
-Choose shared-token mode or scoped-token mode:
+Use `SANDBOXWICH_API_TOKEN` for one tenant or
+`SANDBOXWICH_TENANT_TOKENS` for scoped credentials such as
+`acme=abc123,globex=def456`. A shared token always maps to
+`SANDBOXWICH_DEFAULT_TENANT`; the client tenant header cannot change it.
 
-- `SANDBOXWICH_API_TOKEN` selects shared-token mode for a single-tenant
-  deployment. Requests using it belong to `SANDBOXWICH_DEFAULT_TENANT`, which
-  defaults to `default`; the `x-sandboxwich-tenant` header cannot change that
-  identity.
-- `SANDBOXWICH_TENANT_TOKENS` selects scoped-token mode with a
-  comma-separated list such as
-  `acme=abc123,globex=def456`. The token that matches a request determines its
-  tenant.
-- `SANDBOXWICH_PROVIDER_ROUTING_TOKENS` adds trusted provisioning credentials
-  to scoped-token mode. Its comma-separated `tenant_id=service_token` entries
-  bind a Cloudflare `organization:workspace` routing scope. Ordinary tenant
-  credentials cannot set `x-sandboxwich-provider-routing-scope`.
+Requests fail closed when neither token mode is configured. The explicit
+`SANDBOXWICH_ALLOW_INSECURE_NO_AUTH=true` override is for local development
+only. `SANDBOXWICH_PROVIDER_ROUTING_TOKENS` and
+`SANDBOXWICH_OPERATOR_TOKEN` are separate trusted credentials; do not reuse a
+tenant token for either role.
 
-If neither mode is configured, non-probe requests fail closed. The explicit
-local-development override `SANDBOXWICH_ALLOW_INSECURE_NO_AUTH=true` trusts
-the client-supplied tenant header and must not be used in a shared deployment.
-Do not use a shared token for multiple tenants.
+### Workers and providers
 
-`SANDBOXWICH_OPERATOR_TOKEN` is a separate credential for operator routes such
-as `POST /snapshots/cleanup`. Send it in the
-`x-sandboxwich-operator-token` header.
+Workers use `--provider` for the placement label and
+`--runtime-provider` (or `SANDBOXWICH_RUNTIME_PROVIDER`) for the execution
+backend. `--provider-mode` defaults to `dry-run`; `apply` executes provider
+work. Supported runtime providers are `kubernetes`, `agent-sandbox`, and
+`cloudflare`.
 
-### Sandbox lifetime
+Cloudflare requires apply mode. Kubernetes apply also requires
+`SANDBOXWICH_K8S_ENABLE_MUTATION=1` and `--confirm-apply`. Runtime image,
+RuntimeClass, RBAC, storage, egress, secret delivery, and provider-specific
+settings are in the [Kubernetes guide](docs/kubernetes.md).
 
-The three lifetime fields control different events:
-
-| Field | Behavior |
-| --- | --- |
-| `ttl_seconds` | Retains an already-`archived` sandbox record until cleanup removes it. It does not stop a live sandbox. |
-| `max_lifetime_seconds` | Stops a live sandbox after the configured duration from creation. |
-| `idle_ttl_seconds` | Stops a live sandbox after no observed activity. Activity includes lifecycle transitions, queued guest commands, SSH access, desktop access, and resident-process observation. |
-
-Set the fields with `sandboxwich new` or `sandboxwich fork`:
-
-```sh
-cargo run -p sandboxwich-cli -- new \
-  --name demo \
-  --max-lifetime-seconds 3600 \
-  --idle-ttl-seconds 900
-```
-
-Operators can set defaults and ceilings with:
-
-- `SANDBOXWICH_DEFAULT_MAX_LIFETIME_SECONDS`
-- `SANDBOXWICH_MAX_MAX_LIFETIME_SECONDS`
-- `SANDBOXWICH_DEFAULT_IDLE_TTL_SECONDS`
-- `SANDBOXWICH_MAX_IDLE_TTL_SECONDS`
-
-These variables are unset by default. A persistent workspace has no active
-lifetime cap unless the caller or operator configures one.
-
-### Security-sensitive features
-
-Guest agents use credentials minted by the owning worker. A guest credential is
-bound to one tenant, worker, sandbox, and expiry; it cannot call worker
-administration routes. Do not copy a worker credential into a guest.
-
-For API replica failover, set `SANDBOXWICH_BOOTSTRAP_HANDOFF_KEY` on every API
-replica. Its value is standard base64 for exactly 32 bytes. Pending resident
-bootstrap bytes are then sealed in an ephemeral database row. The variable is
-required when `SANDBOXWICH_STERILE_RESIDENT_ACTIVATION_ENABLED=true`.
-
-`/v1/secret-refs` stores locators for long-lived credentials in an
-operator-owned external store. The Kubernetes provider delivers them through a
-read-only Secrets Store CSI volume at
-`/run/sandboxwich/secrets/<name>` and exposes the path through
-`SANDBOXWICH_SECRET_<NAME>_FILE`. Credential material does not pass through the
-control plane or a Kubernetes `Secret`. Secret delivery requires an operator
-configured CSI driver.
+Sandbox lifetime fields, persistent homes, sterile cells, secret references,
+and other experimental capabilities are summarized in the [capability
+matrix](docs/capabilities.md).
 
 ## Public API contract
 
-The stable HTTP surface is versioned under `/v1`. Unversioned routes are
-temporary compatibility aliases. The runtime-generated OpenAPI document is
-served at `http://127.0.0.1:3217/v1/openapi.json`, and the committed contract
-is [`contracts/openapi.v1.json`](contracts/openapi.v1.json).
+The stable HTTP surface is versioned under `/v1`. The runtime-generated
+OpenAPI document is served at `http://127.0.0.1:3217/v1/openapi.json`; the
+committed contract is [`contracts/openapi.v1.json`](contracts/openapi.v1.json).
 
-Responses include `x-request-id`. Errors use the stable envelope
-`{ "ok": false, "code", "message" }`; clients should branch on `code`.
+- Responses include `x-request-id`.
+- Errors use `{ "ok": false, "code", "message" }`; branch on `code`.
+- Mutating routes accept an optional tenant-scoped `Idempotency-Key`.
+- Sandbox creation, stop, resume, and commands are asynchronous operations.
+  Observe them with `GET /v1/operations/{id}` or its SSE event stream.
 
-Mutating `/v1` routes accept an optional `Idempotency-Key`. Keys are scoped to
-the authenticated tenant and retained for 24 hours. Repeating the same method,
-URI, query, and body replays the original response. Reusing a key for a
-different request returns `409 idempotency_key_reused`; a request still in
-progress returns `409 idempotency_in_progress` with `Retry-After: 1`.
-
-Sandbox creation, stop, and resume return `202` with an Operation. Commands can
-be observed through `GET /v1/operations/{id}` or its SSE event stream, and a
-queued command can be canceled with
-`POST /v1/operations/{id}/cancel`.
-
-### Sandbox lifecycle
-
-The diagram shows provisioning, retry, stop, and resume transitions:
-
-```mermaid
-stateDiagram-v2
-    [*] --> planning
-    planning --> provisioning: worker claims provision job
-    planning --> ready: provision job completes
-    planning --> error: permanent failure
-    provisioning --> planning: fork retry
-    provisioning --> ready: provider ready
-    provisioning --> error: permanent failure
-    provisioning --> archived: resume failure
-    planning --> archiving: stop requested
-    provisioning --> archiving: stop requested
-    ready --> archiving: stop requested
-    running --> archiving: stop requested
-    idle --> archiving: stop requested
-    error --> archiving: stop requested
-    archiving --> archived: provider confirms teardown
-    archived --> provisioning: resume requested
-```
-
-Managed persistent homes admit one live sandbox. A concurrent create returns
-`409 home_already_mounted`; callers should re-read the home, then adopt or
-wait for the authoritative sandbox. See the [persistent home lifecycle
-contract](docs/persistent-home-lifecycle.md).
-
-Operators can configure fixed-window tenant request and mutation limits with
-`PUT /v1/operator/tenant-policies/{tenant_id}`. Exhausted budgets return
-`429` with `tenant_rate_limit_exceeded` or
-`tenant_mutation_quota_exceeded`.
+See the [documentation map](docs/README.md) for lifecycle, persistent-home,
+provider, contract, and performance details.
 
 ## Development
 
@@ -298,16 +153,9 @@ Run the repository gate with:
 just gate
 ```
 
-It runs `cargo fmt --all -- --check`, workspace Clippy with warnings denied,
-and `cargo test --workspace`.
-
-The Postgres-backed contract tests run when
-`SANDBOXWICH_TEST_POSTGRES_URL` is set. `just pg` starts a local Postgres 17
-container and prints the export command. Stop it with:
-
-```sh
-docker stop sandboxwich-dev-postgres
-```
+It checks formatting, workspace Clippy with warnings denied, and the full Rust
+test suite. Set `SANDBOXWICH_TEST_POSTGRES_URL` to run Postgres-backed contract
+tests; `just pg` starts a local Postgres 17 container.
 
 Run the Python SDK tests with:
 
@@ -316,39 +164,12 @@ just py-test
 ```
 
 See [`sdks/python/README.md`](sdks/python/README.md) for SDK setup and
-examples.
-
-## Benchmarks
-
-Build the benchmark binaries and run the default HTTP and sandbox TTFT suite:
-
-```sh
-cargo build -p sandboxwich-api -p sandboxwich-worker -p sandboxwich-bench
-cargo run -p sandboxwich-bench -- all \
-  --api-bin target/debug/sandboxwich-api \
-  --worker-bin target/debug/sandboxwich-worker \
-  --runs 5 \
-  --ttft-runs 10 \
-  --requests 300 \
-  --seed-sandboxes 250
-```
-
-Run only the sandbox TTFT path with:
-
-```sh
-cargo run -p sandboxwich-bench -- sandbox-ttft \
-  --api-bin target/debug/sandboxwich-api \
-  --worker-bin target/debug/sandboxwich-worker \
-  --runs 20
-```
+examples. Benchmark commands live in the [performance harness
+guide](docs/perf-harness.md).
 
 ## Further reading
 
 - [Documentation map](docs/README.md)
-- [Capability maturity matrix](docs/capabilities.md)
-- [Kubernetes deployment guide](docs/kubernetes.md)
-- [Persistent home lifecycle contract](docs/persistent-home-lifecycle.md)
-- [Sterile-cell contract](docs/sterile-cells.md)
 - [Roadmap](ROADMAP.md)
 - [Changelog](CHANGELOG.md)
 - [Security policy](SECURITY.md)
