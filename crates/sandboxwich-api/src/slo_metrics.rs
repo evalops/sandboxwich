@@ -24,8 +24,10 @@ const METRICS_ROLLUP_AGE: ChronoDuration = ChronoDuration::hours(1);
 const METRICS_ROLLUP_BATCH: i64 = 5_000;
 /// Hard safety cap on rows examined per observation family for families that
 /// still load individual samples (claim join, provisioning stages). Terminal
-/// families aggregate in SQL and never pull one row per event.
-const METRICS_MAX_ROWS_PER_FAMILY: i64 = 50_000;
+/// families aggregate in SQL and never pull one row per event. 50k/family
+/// examined ~250k rows per scrape in prod (0.6–1.4s) without flipping
+/// `truncated`; 5k keeps the scrape under the SLO warn.
+const METRICS_MAX_ROWS_PER_FAMILY: i64 = 5_000;
 
 /// PostgreSQL promotes `sum(bigint)` to `numeric`, which `sqlx::Any` cannot
 /// decode. Keep every Prometheus aggregate on the i64 boundary explicitly;
