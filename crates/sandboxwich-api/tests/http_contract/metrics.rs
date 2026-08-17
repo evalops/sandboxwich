@@ -365,6 +365,104 @@ async fn metrics_available_capacity_excludes_resident_process_leases() {
 }
 
 #[tokio::test]
+async fn worker_claim_histogram_aggregates_first_lease_in_sql() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir
+            .path()
+            .join("sandboxwich-claim-metrics.db")
+            .display()
+    );
+    let server = TestServer::start(database_url, Some(data_dir)).await;
+    sqlx::any::install_default_drivers();
+    let pool = AnyPool::connect(&server.database_url).await.unwrap();
+    let now = Utc::now();
+    let scheduled_at = (now - Duration::minutes(30)).to_rfc3339();
+    let first_lease_at = (now - Duration::minutes(20)).to_rfc3339();
+    let retry_lease_at = (now - Duration::minutes(10)).to_rfc3339();
+    let expires_at = (now + Duration::minutes(10)).to_rfc3339();
+    let worker_id = Uuid::now_v7().to_string();
+    let job_id = Uuid::now_v7().to_string();
+
+    sqlx::query(&insert_worker_sql(&server.database_url))
+        .bind(&worker_id)
+        .bind("claim-metrics-worker")
+        .bind("online")
+        .bind("kubernetes")
+        .bind("[\"provision_sandbox\"]")
+        .bind("{}")
+        .bind(&scheduled_at)
+        .bind(&scheduled_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(&insert_job_sql(&server.database_url))
+        .bind(&job_id)
+        .bind("provision_sandbox")
+        .bind("leased")
+        .bind("{}")
+        .bind("provision_sandbox")
+        .bind("development_container")
+        .bind(0_i64)
+        .bind(2_i64)
+        .bind(3_i64)
+        .bind(&scheduled_at)
+        .bind(&scheduled_at)
+        .bind(&scheduled_at)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (lease_id, leased_at, attempt) in [
+        (Uuid::now_v7().to_string(), &first_lease_at, 1_i64),
+        (Uuid::now_v7().to_string(), &retry_lease_at, 2_i64),
+    ] {
+        sqlx::query(&insert_job_lease_sql(&server.database_url))
+            .bind(lease_id)
+            .bind(&job_id)
+            .bind(&worker_id)
+            .bind("active")
+            .bind(attempt)
+            .bind(leased_at)
+            .bind(&expires_at)
+            .bind(Option::<String>::None)
+            .bind(Option::<String>::None)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let metrics = server
+        .client()
+        .get(format!("{}/metrics", server.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics
+            .contains("sandboxwich_worker_claim_seconds_count{job_kind=\"provision_sandbox\"} 1\n")
+    );
+    let sum = metrics
+        .lines()
+        .find(|line| {
+            line.starts_with("sandboxwich_worker_claim_seconds_sum{job_kind=\"provision_sandbox\"}")
+        })
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse::<f64>().ok())
+        .expect("claim histogram sum");
+    assert!(
+        (sum - 600.0).abs() < 0.001,
+        "unexpected metrics:\n{metrics}"
+    );
+}
+
+#[tokio::test]
 async fn recent_event_metrics_use_event_time_not_retained_row_counts() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!(
