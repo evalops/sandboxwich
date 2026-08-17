@@ -65,6 +65,25 @@ cargo run -p sandboxwich-cli -- exec <sandbox-id> --wait -- echo hello
 cargo run -p sandboxwich-cli -- events <sandbox-id>
 ```
 
+### HTTP smoke test
+
+Tenant tokens use the `Authorization: Bearer <token>` header. Check the probe
+endpoint, then create a sandbox through the versioned API:
+
+```sh
+curl -fsS http://127.0.0.1:3217/healthz
+
+curl -fsS \
+  -H "Authorization: Bearer ${SANDBOXWICH_API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"api-demo","memory_limit":"4g","workspace_mode":"persistent"}' \
+  http://127.0.0.1:3217/v1/sandboxes
+```
+
+The create response has HTTP status `202` and includes the sandbox and its
+provisioning operation. Use `sandboxwich events <sandbox-id>` or
+`GET /v1/operations/{id}` to observe that operation.
+
 `just dev` uses the API defaults: `http://127.0.0.1:3217` and
 `sqlite://sandboxwich.db`. Press Ctrl-C in the first shell to stop the API and
 worker.
@@ -121,6 +140,26 @@ flowchart TD
 The API exposes `/healthz`, `/readyz`, and `/metrics`. Health and readiness
 are probe-friendly. The metrics endpoint follows the API authentication
 configuration.
+
+### Worker and provider
+
+The worker has two provider names. `--provider` is the placement label sent to
+the API; `--runtime-provider` selects the backend that executes the job.
+
+| Setting | Use |
+| --- | --- |
+| `--provider` | Placement label sent to the API. Default: `kubernetes`. |
+| `--runtime-provider` / `SANDBOXWICH_RUNTIME_PROVIDER` | Execution backend. |
+| `--provider-mode` | `dry-run` simulates; `apply` executes. |
+| `SANDBOXWICH_RUNTIME_IMAGE` | Kubernetes runtime image. |
+| `SANDBOXWICH_RUNTIME_CLASS_NAME` | Kubernetes RuntimeClass. |
+
+`SANDBOXWICH_RUNTIME_PROVIDER` accepts `kubernetes`, `agent-sandbox`, and
+`cloudflare`; it defaults to `kubernetes`.
+`--provider-mode` defaults to `dry-run`.
+
+Cloudflare workers require `--provider-mode apply`. Kubernetes apply mode
+also requires `SANDBOXWICH_K8S_ENABLE_MUTATION=1` and `--confirm-apply`.
 
 ### Authentication
 
@@ -305,6 +344,7 @@ cargo run -p sandboxwich-bench -- sandbox-ttft \
 
 ## Further reading
 
+- [Documentation map](docs/README.md)
 - [Capability maturity matrix](docs/capabilities.md)
 - [Kubernetes deployment guide](docs/kubernetes.md)
 - [Persistent home lifecycle contract](docs/persistent-home-lifecycle.md)
