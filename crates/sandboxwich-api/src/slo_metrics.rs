@@ -101,7 +101,7 @@ pub(crate) async fn append_slo_metrics(
         fetch_creation_rollups(db, tenant_id, &history_since, &raw_since),
         fetch_simple_terminal_rollups(db, tenant_id, "command", &history_since, &raw_since),
         fetch_simple_terminal_rollups(db, tenant_id, "cleanup", &history_since, &raw_since),
-        fetch_claim_observations(db, tenant_id, &sample_since),
+        fetch_claim_histogram(db, tenant_id, &sample_since),
         fetch_stage_observations(db, tenant_id, &sample_since),
         fetch_activation_histogram(db, tenant_id, false),
         fetch_activation_histogram(db, tenant_id, true),
@@ -138,12 +138,12 @@ pub(crate) async fn append_slo_metrics(
         &["outcome"],
         &cleanup.series,
     );
-    append_histogram(
+    append_histogram_series(
         body,
         "sandboxwich_worker_claim_seconds",
         "Delay from job scheduling to the first worker lease.",
         &["job_kind"],
-        &claim.observations,
+        &claim.series,
     );
     append_histogram(
         body,
@@ -413,21 +413,41 @@ fn map_histogram_rows(
     })
 }
 
-async fn fetch_claim_observations(
+fn claim_duration_ms(db: &Database) -> &'static str {
+    match db.dialect {
+        crate::db::SqlDialect::Postgres => {
+            "greatest((extract(epoch from (min(l.leased_at)::timestamptz - j.scheduled_at::timestamptz)) * 1000)::bigint, 0)"
+        }
+        crate::db::SqlDialect::Sqlite => {
+            "max(cast(round((julianday(min(l.leased_at)) - julianday(j.scheduled_at)) * 86400000) as integer), 0)"
+        }
+    }
+}
+
+async fn fetch_claim_histogram(
     db: &Database,
     tenant_id: Option<&str>,
     since: &str,
-) -> Result<ObservationBatch, ApiError> {
+) -> Result<HistogramBatch, ApiError> {
+    let duration_ms = claim_duration_ms(db);
+    let buckets = duration_bucket_selects(db);
+    let sum_ms = coalesced_sum_i64(db, "duration_ms");
     let (sql, binds) = if let Some(tenant_id) = tenant_id {
         (
             format!(
-                "select j.kind, j.scheduled_at, min(l.leased_at) as leased_at
-                 from jobs j join job_leases l on l.job_id = j.id
-                 where j.tenant_id = {}
-                   and l.leased_at >= {}
-                 group by j.id, j.kind, j.scheduled_at
-                 order by min(l.leased_at) desc
-                 limit {}",
+                "with recent_claims as (
+                     select j.kind, {duration_ms} as duration_ms,
+                            min(l.leased_at) as leased_at
+                     from jobs j join job_leases l on l.job_id = j.id
+                     where j.tenant_id = {}
+                       and l.leased_at >= {}
+                     group by j.id, j.kind, j.scheduled_at
+                     order by min(l.leased_at) desc
+                     limit {}
+                 )
+                 select kind, count(*) as n, {sum_ms} as sum_ms, {buckets}
+                 from recent_claims
+                 group by kind",
                 db.placeholder(1),
                 db.placeholder(2),
                 db.placeholder(3)
@@ -437,12 +457,18 @@ async fn fetch_claim_observations(
     } else {
         (
             format!(
-                "select j.kind, j.scheduled_at, min(l.leased_at) as leased_at
-                 from jobs j join job_leases l on l.job_id = j.id
-                 where l.leased_at >= {}
-                 group by j.id, j.kind, j.scheduled_at
-                 order by min(l.leased_at) desc
-                 limit {}",
+                "with recent_claims as (
+                     select j.kind, {duration_ms} as duration_ms,
+                            min(l.leased_at) as leased_at
+                     from jobs j join job_leases l on l.job_id = j.id
+                     where l.leased_at >= {}
+                     group by j.id, j.kind, j.scheduled_at
+                     order by min(l.leased_at) desc
+                     limit {}
+                 )
+                 select kind, count(*) as n, {sum_ms} as sum_ms, {buckets}
+                 from recent_claims
+                 group by kind",
                 db.placeholder(1),
                 db.placeholder(2)
             ),
@@ -450,25 +476,9 @@ async fn fetch_claim_observations(
         )
     };
     let rows = fetch_rows_with_limit(db, &sql, &binds).await?;
-    let truncated = rows.len() as i64 >= METRICS_MAX_ROWS_PER_FAMILY;
-    let rows_examined = rows.len() as u64;
-    let observations = rows
-        .into_iter()
-        .map(|row| {
-            Ok(Observation {
-                labels: vec![row.try_get("kind")?],
-                seconds: elapsed_seconds(
-                    timestamp(&row, "scheduled_at")?,
-                    timestamp(&row, "leased_at")?,
-                ),
-            })
-        })
-        .collect::<Result<Vec<_>, ApiError>>()?;
-    Ok(ObservationBatch {
-        observations,
-        rows_examined,
-        truncated,
-    })
+    let mut batch = map_histogram_rows(rows, &["kind"], &["kind"])?;
+    batch.truncated = batch.rows_examined >= METRICS_MAX_ROWS_PER_FAMILY as u64;
+    Ok(batch)
 }
 
 async fn fetch_stage_observations(
