@@ -77,8 +77,22 @@ restore. Because the hard cap is still measured from the original
 sweep would immediately stop again -- restore that snapshot into a new
 sandbox with `POST /snapshots/{id}/fork` if a fresh clock is what you want.
 
-See the README's "Sandbox lifetime: three separate knobs" section for the
-full config surface (env vars and CLI flags).
+Configure these fields with `sandboxwich new` or `sandboxwich fork`:
+
+```sh
+cargo run -p sandboxwich-cli -- new \
+  --name demo \
+  --max-lifetime-seconds 3600 \
+  --idle-ttl-seconds 900
+```
+
+Operators can set defaults and ceilings with
+`SANDBOXWICH_DEFAULT_MAX_LIFETIME_SECONDS`,
+`SANDBOXWICH_MAX_MAX_LIFETIME_SECONDS`,
+`SANDBOXWICH_DEFAULT_IDLE_TTL_SECONDS`, and
+`SANDBOXWICH_MAX_IDLE_TTL_SECONDS`. These variables are unset by default; a
+persistent workspace has no active lifetime cap unless the caller or operator
+configures one.
 
 ## Execution class ownership
 
