@@ -66,13 +66,20 @@ class RepositoryRulesTest(unittest.TestCase):
     def test_protected_workflows_cancel_superseded_runs(self) -> None:
         for relative in (
             ".github/workflows/ci.yml",
-            ".github/workflows/containers.yml",
             ".github/workflows/kubernetes-conformance.yml",
         ):
             text = (ROOT / relative).read_text()
             self.assertIn("concurrency:", text, relative)
             self.assertIn("cancel-in-progress: true", text, relative)
             self.assertIn("github.event.pull_request.number || github.ref", text, relative)
+        containers = (ROOT / ".github/workflows/containers.yml").read_text()
+        self.assertIn("concurrency:", containers)
+        self.assertIn("github.event.pull_request.number || github.ref", containers)
+        self.assertIn(
+            "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+            containers,
+        )
+        self.assertNotIn("cancel-in-progress: true", containers)
 
     def test_kubernetes_conformance_runs_after_merge(self) -> None:
         workflow = (
