@@ -14,7 +14,10 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Never cancel a main publish. A second push or workflow_dispatch used to
+  # abort an in-flight GHCR push and leave the later index job without
+  # amd64/arm64 tags (2026-08-18: sha-8bdd831 worker push denied / not found).
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   REGISTRY: ghcr.io
