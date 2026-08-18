@@ -3,6 +3,7 @@
 ## Unreleased
 ### Fixed
 
+- *(deps)* Bump `h2` to 0.4.16 (RUSTSEC-2026-0258)
 - *(api)* Expire queued jobs older than `SANDBOXWICH_QUEUED_JOB_MAX_AGE_SECONDS` (default 86400) so abandoned rows cannot pin `sandboxwich_job_queue_oldest_seconds`
 
 ## 0.1.17 - 2026-08-16
