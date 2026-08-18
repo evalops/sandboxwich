@@ -15,12 +15,13 @@ use crate::rows::*;
 use crate::state::*;
 use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use sandboxwich_core::*;
 use serde_json::json;
 use sha2::Digest;
 use sqlx::AnyConnection;
 use sqlx::Row;
+use std::time::Duration;
 use uuid::Uuid;
 
 pub(crate) async fn create_job(
@@ -833,6 +834,62 @@ pub(crate) async fn insert_job(db: &Database, job: &Job) -> Result<(), ApiError>
         .execute(&db.pool)
         .await?;
     Ok(())
+}
+
+/// Terminalize queued jobs that have waited longer than `max_age`.
+///
+/// Workers skip jobs they cannot claim (missing sandbox, capability, fence).
+/// Those rows stay `queued` forever and pin `sandboxwich_job_queue_oldest_seconds`.
+/// Prod 2026-08-18 had 51 such rows, oldest 13.6 days, while workers still
+/// had free slots. A job that remains queued this long is abandoned work, not
+/// a retry.
+///
+/// `max_age == 0` is a no-op so operators can disable the sweep.
+pub(crate) async fn expire_stale_queued_jobs(
+    db: &Database,
+    max_age: Duration,
+) -> Result<u64, ApiError> {
+    if max_age.is_zero() {
+        return Ok(0);
+    }
+    const BATCH_SIZE: u32 = 1_000;
+    let now = Utc::now();
+    let max_age_secs = i64::try_from(max_age.as_secs()).unwrap_or(i64::MAX);
+    let cutoff = now - ChronoDuration::seconds(max_age_secs);
+    let select_sql = format!(
+        "select id from jobs
+         where status = 'queued' and scheduled_at <= {}
+         order by scheduled_at asc, id asc
+         limit {BATCH_SIZE}",
+        db.placeholder(1)
+    );
+    let rows = sqlx::query(&select_sql)
+        .bind(cutoff.to_rfc3339())
+        .fetch_all(&db.pool)
+        .await?;
+    let mut expired = 0_u64;
+    let error = "queued job exceeded max age";
+    for row in rows {
+        let id: String = row.try_get("id")?;
+        let update_sql = format!(
+            "update jobs
+             set status = {}, last_error = {}, updated_at = {}
+             where id = {} and status = 'queued'",
+            db.placeholder(1),
+            db.placeholder(2),
+            db.placeholder(3),
+            db.placeholder(4)
+        );
+        let result = sqlx::query(&update_sql)
+            .bind(job_status_to_str(&JobStatus::Dead))
+            .bind(error)
+            .bind(now.to_rfc3339())
+            .bind(id)
+            .execute(&db.pool)
+            .await?;
+        expired += result.rows_affected();
+    }
+    Ok(expired)
 }
 
 pub(crate) async fn insert_job_on_connection(

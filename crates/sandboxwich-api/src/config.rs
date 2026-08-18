@@ -67,6 +67,8 @@ pub(crate) struct ApiConfig {
     pub(crate) default_tenant_id: String,
     pub(crate) sweep_interval_ms: u64,
     pub(crate) disable_expiry_sweeper: bool,
+    /// Queued jobs older than this become `dead`. Zero disables the sweep.
+    pub(crate) queued_job_max_age: Duration,
     pub(crate) apex_callback_base_url: Option<String>,
     pub(crate) placement_attestation_derivation_key: Option<String>,
     /// Sealing key for the shared ephemeral resident-bootstrap handoff.
@@ -171,6 +173,10 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
         .unwrap_or_else(|| "default".to_string());
     let sweep_interval_ms = u64::from(parse_env_u32("SANDBOXWICH_SWEEP_INTERVAL_MS", 1000)?.max(1));
     let disable_expiry_sweeper = parse_env_bool("SANDBOXWICH_DISABLE_EXPIRY_SWEEPER", false)?;
+    let queued_job_max_age = Duration::from_secs(u64::from(parse_env_u32(
+        "SANDBOXWICH_QUEUED_JOB_MAX_AGE_SECONDS",
+        86_400,
+    )?));
     let apex_callback_base_url =
         parse_apex_callback_base_url(std::env::var("SANDBOXWICH_APEX_CALLBACK_BASE_URL").ok())?;
     let placement_attestation_derivation_key =
@@ -260,6 +266,7 @@ pub(crate) fn load_api_config() -> anyhow::Result<ApiConfig> {
         default_tenant_id,
         sweep_interval_ms,
         disable_expiry_sweeper,
+        queued_job_max_age,
         apex_callback_base_url,
         placement_attestation_derivation_key,
         bootstrap_handoff_key,

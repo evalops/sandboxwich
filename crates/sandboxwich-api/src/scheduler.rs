@@ -2,6 +2,7 @@ use crate::bootstrap_handoff::expire_due_bootstrap_handoffs;
 use crate::cleanup::reconcile_archived_runtime_resources;
 use crate::db::*;
 use crate::handlers::desktop::*;
+use crate::handlers::jobs::expire_stale_queued_jobs;
 use crate::handlers::leases::*;
 use crate::handlers::snapshots::*;
 use crate::handlers::sterile_cells::quarantine_expired_sterile_cells;
@@ -42,6 +43,7 @@ pub(crate) fn spawn_expiry_sweeper(
     resident_bootstraps: ResidentBootstrapStore,
     interval: Duration,
     sterile_cells_enabled: bool,
+    queued_job_max_age: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -57,6 +59,18 @@ pub(crate) fn spawn_expiry_sweeper(
             ticker.tick().await;
             if let Err(error) = expire_due_leases(&db).await {
                 tracing::warn!(?error, "lease expiry sweep failed");
+            }
+            match expire_stale_queued_jobs(&db, queued_job_max_age).await {
+                Ok(expired) if expired > 0 => {
+                    tracing::warn!(
+                        expired,
+                        "terminalized queued jobs that exceeded SANDBOXWICH_QUEUED_JOB_MAX_AGE_SECONDS"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(?error, "stale queued job expiry sweep failed");
+                }
             }
             if let Err(error) = reconcile_due_worker_drain_fences(&db).await {
                 tracing::warn!(?error, "worker drain fence reconciliation failed");

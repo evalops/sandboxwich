@@ -130,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
             resident_bootstraps.clone(),
             Duration::from_millis(config.sweep_interval_ms),
             config.sterile_cell_signing_key.is_some(),
+            config.queued_job_max_age,
         );
     }
     spawn_sterile_pool_reconciler(

@@ -25,6 +25,7 @@ use crate::rows::*;
 use crate::state::{Principal, ResidentBootstrapStore, TenantContext};
 use sandboxwich_core::*;
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 #[test]
 fn materialization_job_input_is_ref_only_and_exact() {
@@ -711,6 +712,65 @@ async fn transient_authority_refresh_error_leaves_queued_job_retryable() {
         .try_get("status")
         .expect("status");
     assert_eq!(status, "queued");
+}
+
+#[tokio::test]
+async fn stale_queued_jobs_expire_and_fresh_queued_jobs_do_not() {
+    let db = test_sqlite_db().await;
+    let sandbox = seed_sandbox_with_state(&db, SandboxState::Ready).await;
+    let now = Utc::now();
+    let stale = Job {
+        id: JobId::new(),
+        tenant_id: sandbox.tenant_id.clone(),
+        kind: JobKind::ProvisionSandbox,
+        status: JobStatus::Queued,
+        payload: json!({"sandboxId": sandbox.id}),
+        required_capability: WorkerCapability::ProvisionSandbox,
+        priority: 0,
+        attempts: 0,
+        max_attempts: 3,
+        scheduled_at: now - chrono::Duration::hours(25),
+        created_at: now - chrono::Duration::hours(25),
+        updated_at: now - chrono::Duration::hours(25),
+        last_error: None,
+        required_execution_class: ExecutionClass::DevelopmentContainer,
+    };
+    let fresh = Job {
+        id: JobId::new(),
+        scheduled_at: now,
+        created_at: now,
+        updated_at: now,
+        ..stale.clone()
+    };
+    insert_job(&db, &stale).await.expect("insert stale job");
+    insert_job(&db, &fresh).await.expect("insert fresh job");
+
+    let expired = expire_stale_queued_jobs(&db, Duration::from_secs(86_400))
+        .await
+        .expect("expire stale queued jobs");
+    assert_eq!(expired, 1);
+
+    let stale_status: String = sqlx::query("select status from jobs where id = ?")
+        .bind(stale.id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read stale job")
+        .try_get("status")
+        .expect("status");
+    let fresh_status: String = sqlx::query("select status from jobs where id = ?")
+        .bind(fresh.id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read fresh job")
+        .try_get("status")
+        .expect("status");
+    assert_eq!(stale_status, "dead");
+    assert_eq!(fresh_status, "queued");
+
+    let disabled = expire_stale_queued_jobs(&db, Duration::ZERO)
+        .await
+        .expect("zero max age disables the sweep");
+    assert_eq!(disabled, 0);
 }
 
 #[test]
