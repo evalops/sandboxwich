@@ -141,6 +141,13 @@ committed contract is [`contracts/openapi.v1.json`](contracts/openapi.v1.json).
 - Mutating routes accept an optional tenant-scoped `Idempotency-Key`.
 - Sandbox creation, stop, resume, and commands are asynchronous operations.
   Observe them with `GET /v1/operations/{id}` or its SSE event stream.
+- Agents can use the same tenant bearer against `POST /mcp` (also
+  `POST /v1/mcp`). The catalog is `box_create`, `box_list`, `box_get`,
+  `box_exec`, `box_snapshot`, `box_fork`, `box_sleep`, `box_wake`,
+  `box_destroy`, and `box_sizes`. `box_create` always uses a persistent
+  workspace and requires `max_lifetime_seconds` or `idle_ttl_seconds`
+  unless the operator set a default lifetime env var. `box_destroy`
+  requires `confirm=true`.
 
 See the [documentation map](docs/README.md) for lifecycle, persistent-home,
 provider, contract, and performance details.

@@ -863,6 +863,7 @@ pub(crate) const AUTHORIZATION_ROUTE_MANIFEST: &[&str] = &[
     "/readyz",
     "/openapi.json",
     "/metrics",
+    "/mcp",
     "/homes",
     "/homes/*",
     "/homes/*/sandboxes",

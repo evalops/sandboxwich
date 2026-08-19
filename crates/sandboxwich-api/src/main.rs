@@ -14,6 +14,7 @@ mod identity_mtls;
 mod lifecycle_contract;
 mod limits;
 mod maestro_observation;
+mod mcp;
 mod pagination;
 mod reap;
 mod reconcile;

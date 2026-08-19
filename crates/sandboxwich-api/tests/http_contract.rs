@@ -30,6 +30,8 @@ mod idle_activity;
 mod jobs;
 #[path = "http_contract/limits.rs"]
 mod limits;
+#[path = "http_contract/mcp.rs"]
+mod mcp;
 #[path = "http_contract/metrics.rs"]
 mod metrics;
 #[path = "http_contract/public_api.rs"]
