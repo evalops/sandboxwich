@@ -22,6 +22,7 @@ use crate::health::*;
 use crate::idempotency::enforce_idempotency;
 use crate::lifecycle_contract::attach_lifecycle_contract;
 use crate::limits::*;
+use crate::mcp::mcp_post;
 use crate::reconcile::*;
 use crate::rejection_log::log_mutation_rejections;
 use crate::request_id::{attach_request_id, normalize_framework_errors};
@@ -49,6 +50,7 @@ pub(crate) fn app(state: AppState) -> Router {
         .route("/homes", post(create_home))
         .route("/homes/{home_id}", get(get_home).delete(delete_home))
         .route("/homes/{home_id}/sandboxes", post(create_home_sandbox))
+        .route("/mcp", post(mcp_post))
         .route("/sandboxes", get(list_sandboxes).post(create_sandbox))
         .route("/sandboxes/{sandbox_id}", get(get_sandbox))
         .route(

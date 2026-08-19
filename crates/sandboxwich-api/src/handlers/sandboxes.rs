@@ -436,6 +436,16 @@ pub(crate) async fn list_sandboxes(
     Extension(ctx): Extension<TenantContext>,
     Query(page): Query<PageParams>,
 ) -> Result<Response, ApiError> {
+    Ok(sandbox_list_response(
+        list_sandboxes_payload(state, ctx, Query(page)).await?,
+    ))
+}
+
+pub(crate) async fn list_sandboxes_payload(
+    state: AppState,
+    ctx: TenantContext,
+    Query(page): Query<PageParams>,
+) -> Result<SandboxListResponse, ApiError> {
     let limit = resolve_page_limit(page.limit)?;
     let cursor = resolve_page_cursor(&page)?;
 
@@ -463,11 +473,11 @@ pub(crate) async fn list_sandboxes(
     )
     .await?;
 
-    Ok(sandbox_list_response(SandboxListResponse {
+    Ok(SandboxListResponse {
         ok: true,
         sandboxes,
         next_cursor,
-    }))
+    })
 }
 
 const SANDBOX_LIST_JSON_BYTES_PER_ITEM: usize = 512;

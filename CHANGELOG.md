@@ -1,6 +1,10 @@
 # Changelog
 
 ## Unreleased
+
+### Added
+
+- *(api)* Tenant MCP facade at `POST /mcp` with `box_*` tools
 ### Fixed
 
 - *(deps)* Bump `h2` to 0.4.16 (RUSTSEC-2026-0258)
