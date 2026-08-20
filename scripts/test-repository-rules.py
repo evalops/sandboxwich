@@ -60,8 +60,9 @@ class RepositoryRulesTest(unittest.TestCase):
             ".github/workflows/containers.yml",
         ):
             text = (ROOT / relative).read_text()
-            pull_request = text.split("pull_request:", 1)[1].split("push:", 1)[0]
-            self.assertNotIn("paths:", pull_request, relative)
+            self.assertIn("pull_request:", text, relative)
+            self.assertNotIn("\n  push:", text, relative)
+            self.assertNotIn("\n  workflow_dispatch:", text, relative)
 
     def test_protected_workflows_cancel_superseded_runs(self) -> None:
         for relative in (
@@ -75,11 +76,7 @@ class RepositoryRulesTest(unittest.TestCase):
         containers = (ROOT / ".github/workflows/containers.yml").read_text()
         self.assertIn("concurrency:", containers)
         self.assertIn("github.event.pull_request.number || github.ref", containers)
-        self.assertIn(
-            "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
-            containers,
-        )
-        self.assertNotIn("cancel-in-progress: true", containers)
+        self.assertIn("cancel-in-progress: true", containers)
 
     def test_kubernetes_conformance_runs_after_merge(self) -> None:
         workflow = (
@@ -88,10 +85,7 @@ class RepositoryRulesTest(unittest.TestCase):
         triggers = workflow.split("permissions:", 1)[0]
         self.assertNotIn("pull_request:", triggers)
         self.assertNotIn("push:", triggers)
-        self.assertIn("workflow_run:", triggers)
-        self.assertIn("workflows: [containers]", triggers)
-        self.assertIn("types: [completed]", triggers)
-        self.assertIn("branches: [main]", triggers)
+        self.assertNotIn("workflow_run:", triggers)
         self.assertIn("workflow_dispatch:", triggers)
         self.assertIn("kind:", workflow)
 
@@ -215,10 +209,11 @@ class RepositoryRulesTest(unittest.TestCase):
             "provenance-summary.json",
         ):
             self.assertIn(marker, workflow)
-        self.assertEqual(workflow.count("mode=max,version=v1"), 2)
-        self.assertEqual(
-            workflow.count("sbom: ${{ github.event_name != 'pull_request' }}"), 2
-        )
+        self.assertEqual(workflow.count("push: false"), 2)
+        self.assertEqual(workflow.count("provenance: false"), 2)
+        self.assertEqual(workflow.count("sbom: false"), 2)
+        self.assertNotIn("packages: write", workflow)
+        self.assertNotIn("id-token: write", workflow)
         for marker in (
             "{{json .Provenance}}",
             "{{json .SBOM}}",
@@ -237,6 +232,23 @@ class RepositoryRulesTest(unittest.TestCase):
         self.assertIn("name: ci scope", ci)
         self.assertIn("name: container scope", containers)
         self.assertIn("if: github.event_name != 'pull_request'", ci)
+
+    def test_mono_is_the_only_release_and_publication_authority(self) -> None:
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn("evalops/mono", readme)
+        self.assertIn("must not publish artifacts", readme)
+        for relative in (
+            ".github/workflows/release-plz.yml",
+            ".github/workflows/release.yml",
+        ):
+            workflow = (ROOT / relative).read_text()
+            self.assertIn("retired", workflow.lower(), relative)
+            self.assertIn("workflow_dispatch:", workflow, relative)
+            self.assertIn("exit 1", workflow, relative)
+            self.assertNotIn("contents: write", workflow, relative)
+            self.assertNotIn("id-token: write", workflow, relative)
+        self.assertNotIn("release-plz/action@", (ROOT / ".github/workflows/release-plz.yml").read_text())
+        self.assertNotIn("softprops/action-gh-release@", (ROOT / ".github/workflows/release.yml").read_text())
 
 
 if __name__ == "__main__":

@@ -1,23 +1,15 @@
-name: containers
+name: containers (validation only)
 
 on:
   pull_request:
-  push:
-    branches:
-      - main
-  workflow_dispatch:
 
 permissions:
   contents: read
-  packages: write
-  id-token: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  # Never cancel a main publish. A second push or workflow_dispatch used to
-  # abort an in-flight GHCR push and leave the later index job without
-  # amd64/arm64 tags (2026-08-18: sha-8bdd831 worker push denied / not found).
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # This public checkout validates pull requests only. Mono owns publication.
+  cancel-in-progress: true
 
 env:
   REGISTRY: ghcr.io
@@ -109,7 +101,8 @@ jobs:
           context: .
           file: Dockerfile
           platforms: ${{ matrix.platform }}
-          push: ${{ github.event_name != 'pull_request' }}
+          # Keep this explicit so a future trigger cannot silently restore pushes.
+          push: false
           build-args: BIN=${{ matrix.bin }}
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:sha-${{ github.sha }}-${{ matrix.arch }}
           labels: |
@@ -120,8 +113,8 @@ jobs:
             dev.sandboxwich.build.dependency-lock-digest=${{ steps.build-definition.outputs.dependency_lock_digest }}
           cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.arch }}
-          provenance: ${{ github.event_name != 'pull_request' && 'mode=max,version=v1' || 'false' }}
-          sbom: ${{ github.event_name != 'pull_request' }}
+          provenance: false
+          sbom: false
 
   service-images:
     name: service image (${{ matrix.bin }})
@@ -263,7 +256,7 @@ jobs:
           context: .
           file: deploy/runtime/ubuntu-dev/Dockerfile
           platforms: ${{ matrix.platform }}
-          push: ${{ github.event_name != 'pull_request' }}
+          push: false
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/sandboxwich-ubuntu-dev:sha-${{ github.sha }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=https://github.com/evalops/sandboxwich
@@ -273,8 +266,8 @@ jobs:
             dev.sandboxwich.build.dependency-lock-digest=${{ steps.build-definition.outputs.dependency_lock_digest }}
           cache-from: type=gha,scope=sandboxwich-ubuntu-dev-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=sandboxwich-ubuntu-dev-${{ matrix.arch }}
-          provenance: ${{ github.event_name != 'pull_request' && 'mode=max,version=v1' || 'false' }}
-          sbom: ${{ github.event_name != 'pull_request' }}
+          provenance: false
+          sbom: false
 
   runtime-image:
     name: runtime image (ubuntu-dev)

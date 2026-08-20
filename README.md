@@ -1,5 +1,12 @@
 # sandboxwich
 
+> Source-of-truth notice: this public repository is a compatibility snapshot.
+> The authoritative source is [`evalops/mono`](https://github.com/evalops/mono)
+> at `platform/execution/sandboxwich`; Mono's
+> `.github/workflows/sandboxwich-publish.yml` is the only workflow allowed to
+> publish Sandboxwich images or releases. Pull-request validation remains
+> available here, but this repository must not publish artifacts.
+
 sandboxwich is a typed Rust control plane for self-hosted, policy-controlled
 development and agent-evaluation sandboxes.
 

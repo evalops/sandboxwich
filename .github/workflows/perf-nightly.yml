@@ -1,19 +1,16 @@
-# Nightly performance regression gate (#259).
+# On-demand performance regression gate (#259).
 #
 # Shared GitHub-hosted runners are noisy, so PR benchmarks stay non-blocking
 # (ci.yml). This scheduled job is the dependable lane: structured JSON via
 # perf-evaluate.py, absolute budgets + baseline comparison via perf-gate.py,
 # and an artifact baseline for the next run.
 #
-# When a self-hosted runner with a stable machine label becomes available,
-# switch runs-on and tighten ABSOLUTE_P95_BUDGETS / regression threshold.
+# This public checkout is a compatibility snapshot; scheduled work runs from
+# Mono-owned lanes instead of spending capacity on stale standalone source.
 
 name: perf-nightly
 
 on:
-  schedule:
-    # 06:15 UTC daily
-    - cron: "15 6 * * *"
   workflow_dispatch:
 
 permissions:
