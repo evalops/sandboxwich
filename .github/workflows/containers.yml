@@ -218,7 +218,11 @@ jobs:
 
   runtime-build:
     needs: container-scope
-    if: needs.container-scope.outputs.required == 'true'
+    # The public compatibility snapshot cannot read the private Orb executor
+    # base. Mono owns the authoritative runtime build and publication, so do
+    # not make standalone PRs depend on a private package or a long-lived
+    # registry credential.
+    if: github.event_name != 'pull_request' && needs.container-scope.outputs.required == 'true'
     name: runtime build (ubuntu-dev, ${{ matrix.arch }})
     # Same GitHub-hosted placement rationale as service-build above.
     runs-on: ${{ matrix.runner }}
@@ -275,8 +279,13 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: Record Mono-owned runtime validation
+        if: github.event_name == 'pull_request'
+        run: |
+          echo 'Standalone runtime publication and validation are retired.'
+          echo 'Authoritative runtime validation runs from evalops/mono.'
       - name: Require native builds
-        if: needs.container-scope.outputs.required == 'true'
+        if: needs.container-scope.outputs.required == 'true' && github.event_name != 'pull_request'
         env:
           BUILD_RESULT: ${{ needs.runtime-build.result }}
         run: test "${BUILD_RESULT}" = success

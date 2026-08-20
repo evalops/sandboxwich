@@ -196,6 +196,16 @@ class RepositoryRulesTest(unittest.TestCase):
         self.assertIn("name: service image (${{ matrix.bin }})", workflow)
         self.assertIn("name: runtime image (ubuntu-dev)", workflow)
 
+    def test_standalone_runtime_validation_is_owned_by_mono(self) -> None:
+        workflow = (ROOT / ".github/workflows/containers.yml").read_text()
+        self.assertIn(
+            "if: github.event_name != 'pull_request' && "
+            "needs.container-scope.outputs.required == 'true'",
+            workflow,
+        )
+        self.assertIn("Standalone runtime publication and validation are retired.", workflow)
+        self.assertIn("Authoritative runtime validation runs from evalops/mono.", workflow)
+
     def test_container_workflow_verifies_and_signs_platform_provenance(self) -> None:
         workflow = (ROOT / ".github/workflows/containers.yml").read_text()
         verifier = (ROOT / "scripts/verify-image-provenance.sh").read_text()
