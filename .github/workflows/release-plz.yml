@@ -1,81 +1,18 @@
-name: release-plz
+name: release-plz (retired)
 
 "on":
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
-# Both jobs authenticate release-plz with a short-lived GitHub App
-# installation token minted from RELEASE_BOT_APP_ID +
-# RELEASE_BOT_APP_PRIVATE_KEY, scoped to this repository with only
-# contents + pull-requests permissions. The default GITHUB_TOKEN cannot do
-# this job: the org disallows Actions-created pull requests, and events it
-# causes trigger no workflows (the release PR would get no CI and the tag
-# push would not start release.yml). App-caused events have neither
-# problem. See RELEASING.md.
+permissions:
+  contents: read
 
 jobs:
-  release-plz-release:
-    name: release
+  retired:
+    name: release automation retired
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
-      # persist-credentials must stay off: release-plz authenticates its git
-      # and API operations with GITHUB_TOKEN from the env below, and checkout's
-      # persisted credentials would shadow the app token.
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-      # Request only the permissions release-plz needs; requesting a
-      # permission the app installation lacks fails the whole mint.
-      - name: Mint release-bot token
-        id: bot-token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
-        with:
-          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
-          private-key: ${{ secrets.RELEASE_BOT_APP_PRIVATE_KEY }}
-          permission-contents: write
-          permission-pull-requests: write
-      - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
-        with:
-          command: release
-        env:
-          GITHUB_TOKEN: ${{ steps.bot-token.outputs.token }}
-
-  release-plz-pr:
-    name: release-pr
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    # One release PR update per branch at a time. Not cancelled in progress:
-    # a superseded run must finish rather than leave a half-updated PR.
-    concurrency:
-      group: release-plz-${{ github.ref }}
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-      - name: Mint release-bot token
-        id: bot-token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
-        with:
-          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
-          private-key: ${{ secrets.RELEASE_BOT_APP_PRIVATE_KEY }}
-          permission-contents: write
-          permission-pull-requests: write
-      - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
-        with:
-          command: release-pr
-        env:
-          GITHUB_TOKEN: ${{ steps.bot-token.outputs.token }}
-          # Git-only baselines use isolated worktrees, but each packages the
-          # same workspace. Share compiled artifacts outside every worktree;
-          # keeping this under runner.temp also keeps packaged manifests from
-          # inheriting the live Cargo workspace.
-          CARGO_TARGET_DIR: ${{ runner.temp }}/release-plz-target
+      - name: Fail closed
+        run: |
+          echo "Sandboxwich releases are owned by evalops/mono." >&2
+          echo "Use .github/workflows/sandboxwich-publish.yml in Mono." >&2
+          exit 1

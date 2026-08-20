@@ -1,15 +1,8 @@
 name: kubernetes-conformance
 
-# This live suite is intentionally post-merge only: it is too slow to run on
-# every pull request, and the protected PR checks remain in ci.yml/containers.yml.
+# This live suite is intentionally manual-only. The public checkout no longer
+# publishes images or runs a post-merge release pipeline; Mono owns that path.
 on:
-  # The containers workflow publishes the exact commit's signed images. Wait
-  # for that workflow so this suite can pull those images instead of rebuilding
-  # the same four images a second time on a separate runner.
-  workflow_run:
-    workflows: [containers]
-    types: [completed]
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -32,27 +25,13 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
       - name: Require a successful container build
         id: scope
         shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
         run: |
           set -euo pipefail
-          if [[ "${EVENT_NAME}" == "workflow_run" && "${CONCLUSION}" != "success" ]]; then
-            echo "required=false" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
-            echo "required=true" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-          # workflow_run is intentionally fed by a successful main-branch
-          # container build. A main commit is the unit of conformance here;
-          # the image pull below is keyed to this exact HEAD_SHA.
           echo "required=true" >> "${GITHUB_OUTPUT}"
 
   kind:
@@ -70,7 +49,7 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.sha }}
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         # The exact commit's service/runtime images were published by the
         # completed containers workflow immediately before this run.
@@ -88,7 +67,7 @@ jobs:
           sudo install -m 0755 kind /usr/local/bin/kind
       - name: Pull published images and build the conformance binary
         env:
-          CONTAINER_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          CONTAINER_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           # This debug binary runs directly on the runner (see
@@ -124,7 +103,7 @@ jobs:
           --config deploy/kubernetes/kind-conformance.yaml --wait 120s
       - name: Publish digest-pinned runtime images to the disposable registry
         env:
-          CONTAINER_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          CONTAINER_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           short_sha="${CONTAINER_SHA::12}"
@@ -237,7 +216,7 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.sha }}
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Install pinned kind

@@ -28,33 +28,20 @@ class ReleaseReadinessTest(unittest.TestCase):
         changelog = (ROOT / "CHANGELOG.md").read_text()
         self.assertIn("## 0.1.0 - 2026-07-11", changelog)
 
-    def test_release_publishes_machine_contracts(self) -> None:
+    def test_release_workflow_is_retired(self) -> None:
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
-        self.assertIn("sandboxwich-openapi.json", workflow)
-        self.assertIn("sandboxwich-image-digests.txt", workflow)
-        # Manual escape hatch for when a tag exists but the tag-push trigger
-        # never fired (e.g., tag pushed with GITHUB_TOKEN).
+        self.assertIn("name: release (retired)", workflow)
         self.assertIn("workflow_dispatch", workflow)
+        self.assertIn("Sandboxwich releases are owned by evalops/mono", workflow)
+        self.assertIn("exit 1", workflow)
+        self.assertNotIn("softprops/action-gh-release@", workflow)
 
-    def test_release_waits_for_exact_sha_live_conformance(self) -> None:
+    def test_release_no_longer_has_mutating_permissions(self) -> None:
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
-        verifier = ROOT / "scripts/verify-release-conformance.py"
-        self.assertTrue(verifier.exists())
-        self.assertIn("actions: read", workflow)
-        self.assertIn("conformance:\n", workflow)
-        self.assertIn("scripts/verify-release-conformance.py", workflow)
-        self.assertIn('--sha "${GITHUB_SHA}"', workflow)
-        self.assertIn("release-conformance-attestation.json", workflow)
-        self.assertEqual(workflow.count("needs: conformance"), 2)
-        verifier_text = verifier.read_text()
-        for marker in (
-            "sandboxwich.release-conformance.v1",
-            "head_sha",
-            "kubernetes-conformance.yml",
-            "workflowRunId",
-            "workflowRunUrl",
-        ):
-            self.assertIn(marker, verifier_text)
+        self.assertIn("contents: read", workflow)
+        self.assertNotIn("contents: write", workflow)
+        self.assertNotIn("id-token: write", workflow)
+        self.assertNotIn("attestations: write", workflow)
 
     def test_all_workflow_files_parse_as_yaml(self) -> None:
         # A workflow file that does not parse only fails when it next runs,
@@ -66,40 +53,21 @@ class ReleaseReadinessTest(unittest.TestCase):
                 yaml.safe_load(fh)
 
     def test_cargo_release_machinery_removed(self) -> None:
-        # Releases are driven by release-plz now; the cargo-release workflow,
-        # tag-after-merge workflow, and changelog hook must not come back.
+        # The compatibility snapshot must not regain an independent release
+        # workflow, cargo-release workflow, or tag-after-merge hook.
         self.assertFalse((ROOT / ".github/workflows/bump-version.yml").exists())
         self.assertFalse((ROOT / ".github/workflows/tag-release.yml").exists())
         self.assertFalse((ROOT / "scripts/bump-changelog.sh").exists())
         self.assertNotIn("workspace.metadata.release]", (ROOT / "Cargo.toml").read_text())
 
-    def test_release_plz_workflow_and_config(self) -> None:
+    def test_release_plz_workflow_is_retired_and_config_is_historical(self) -> None:
         workflow = (ROOT / ".github/workflows/release-plz.yml").read_text()
-        self.assertIn("release-plz/action@", workflow)
-        self.assertIn("command: release", workflow)
-        self.assertIn("command: release-pr", workflow)
-        # The release PR and the tag push must trigger downstream workflows
-        # and the org disallows Actions-created PRs; GITHUB_TOKEN can do
-        # neither, so both jobs must mint a scoped GitHub App token and hand
-        # it to release-plz.
-        self.assertEqual(workflow.count("uses: actions/create-github-app-token@"), 2)
-        self.assertEqual(
-            workflow.count("app-id: ${{ secrets.RELEASE_BOT_APP_ID }}"), 2
-        )
-        self.assertEqual(
-            workflow.count(
-                "private-key: ${{ secrets.RELEASE_BOT_APP_PRIVATE_KEY }}"
-            ),
-            2,
-        )
-        self.assertEqual(
-            workflow.count("GITHUB_TOKEN: ${{ steps.bot-token.outputs.token }}"), 2
-        )
-        self.assertIn(
-            "CARGO_TARGET_DIR: ${{ runner.temp }}/release-plz-target",
-            workflow.split("name: release-pr", 1)[1],
-        )
-        self.assertNotIn("GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}", workflow)
+        self.assertIn("name: release-plz (retired)", workflow)
+        self.assertIn("workflow_dispatch", workflow)
+        self.assertIn("Sandboxwich releases are owned by evalops/mono", workflow)
+        self.assertIn("exit 1", workflow)
+        self.assertNotIn("release-plz/action@", workflow)
+        self.assertNotIn("contents: write", workflow)
 
         with (ROOT / "release-plz.toml").open("rb") as fh:
             config = tomllib.load(fh)
