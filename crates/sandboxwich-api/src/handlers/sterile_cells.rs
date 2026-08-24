@@ -407,8 +407,14 @@ async fn fetch_worker_cell(
 enum ClaimAttempt {
     Claimed(Box<SterileCellLeaseV1>, String),
     Contended,
-    Empty,
+    Empty(Option<Box<NoLeaseDiagnosis>>),
     NoLongerLive,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NoLeaseDiagnosis {
+    reason: SterileCellNoLeaseReasonV1,
+    claimability: SterileCellClaimabilityEvidenceV1,
 }
 
 async fn recover_claim(
@@ -421,6 +427,7 @@ async fn recover_claim(
 ) -> Result<Option<ClaimAttempt>, ApiError> {
     let select = format!(
         "select claims.request_sha256, claims.cell_id as claim_cell_id,
+         claims.no_lease_reason, claims.claimability_evidence,
          claims.lease_id as claim_lease_id, cells.*
          from sterile_cell_claims claims
          left join sterile_cells cells on cells.id = claims.cell_id
@@ -443,7 +450,22 @@ async fn recover_claim(
         ));
     }
     if row.try_get::<Option<String>, _>("claim_cell_id")?.is_none() {
-        return Ok(Some(ClaimAttempt::Empty));
+        let reason: Option<String> = row.try_get("no_lease_reason")?;
+        let claimability: Option<String> = row.try_get("claimability_evidence")?;
+        let diagnosis = match (reason, claimability) {
+            (Some(reason), Some(claimability)) => Some(Box::new(NoLeaseDiagnosis {
+                reason: SterileCellNoLeaseReasonV1::parse_db_str(&reason)
+                    .map_err(|error| ApiError::internal(error.to_string()))?,
+                claimability: serde_json::from_str(&claimability)?,
+            })),
+            (None, None) => None,
+            _ => {
+                return Err(ApiError::internal(
+                    "sterile-cell empty claim has incomplete diagnosis",
+                ));
+            }
+        };
+        return Ok(Some(ClaimAttempt::Empty(diagnosis)));
     }
     let lease = lease_from_row(&row)?;
     let claim_lease_id: &str = row.try_get("claim_lease_id")?;
@@ -483,6 +505,196 @@ async fn recover_claim(
         ));
     }
     Ok(Some(ClaimAttempt::Claimed(Box::new(lease), token)))
+}
+
+async fn diagnose_no_lease(
+    state: &AppState,
+    transaction: &mut Transaction<'_, Any>,
+    ctx: &TenantContext,
+    request: &ClaimSterileCellRequestV1,
+    lease_expires_at: DateTime<Utc>,
+) -> Result<NoLeaseDiagnosis, ApiError> {
+    let inventory_sql = format!(
+        "with claim_params as (
+           select {tenant} as tenant_id, {release_set} as release_set_id,
+                  {runtime_class} as runtime_class, {policy_digest} as policy_digest,
+                  {signature} as release_signature, {lease_expiry} as lease_expiry
+         )
+         select
+           coalesce(sum(case when cells.state = 'ready'
+             and cells.release_set_id = params.release_set_id
+             and cells.runtime_class = params.runtime_class
+             and cells.policy_digest = params.policy_digest
+             and cells.release_signature = params.release_signature then 1 else 0 end), 0)
+             as ready_cells,
+           coalesce(sum(case when cells.state = 'leased'
+             and cells.release_set_id = params.release_set_id
+             and cells.runtime_class = params.runtime_class
+             and cells.policy_digest = params.policy_digest
+             and cells.release_signature = params.release_signature then 1 else 0 end), 0)
+             as leased_cells,
+           coalesce(sum(case when state in ('ready', 'leased') and not (
+             cells.release_set_id = params.release_set_id
+             and cells.runtime_class = params.runtime_class
+             and cells.policy_digest = params.policy_digest
+             and cells.release_signature = params.release_signature
+           ) then 1 else 0 end), 0) as mismatched_active_cells,
+           coalesce(sum(case when cells.state = 'ready'
+             and cells.release_set_id = params.release_set_id
+             and cells.runtime_class = params.runtime_class
+             and cells.policy_digest = params.policy_digest
+             and cells.release_signature = params.release_signature
+             and cells.cell_expires_at > params.lease_expiry then 1 else 0 end), 0)
+             as eligible_ready_cells
+         from sterile_cells cells cross join claim_params params
+         where cells.tenant_id = params.tenant_id",
+        tenant = state.db.placeholder(1),
+        release_set = state.db.placeholder(2),
+        runtime_class = state.db.placeholder(3),
+        policy_digest = state.db.placeholder(4),
+        signature = state.db.placeholder(5),
+        lease_expiry = state.db.placeholder(6),
+    );
+    let inventory = sqlx::query(&inventory_sql)
+        .bind(&ctx.tenant_id)
+        .bind(&request.release.release_set_id)
+        .bind(request.release.runtime_class.as_db_str())
+        .bind(request.release.policy_digest.to_ascii_lowercase())
+        .bind(&request.release.signature)
+        .bind(lease_expires_at.to_rfc3339())
+        .fetch_one(&mut **transaction)
+        .await?;
+    let ready_cells = count_from_i64(inventory.try_get("ready_cells")?)?;
+    let leased_cells = count_from_i64(inventory.try_get("leased_cells")?)?;
+    let mismatched_active_cells = count_from_i64(inventory.try_get("mismatched_active_cells")?)?;
+    let eligible_ready_cells = count_from_i64(inventory.try_get("eligible_ready_cells")?)?;
+
+    let grace_cutoff = Utc::now()
+        - Duration::from_std(crate::sterile_pool::GUEST_HEALTH_READY_GRACE)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+    let stale_cutoff = Utc::now()
+        - Duration::from_std(crate::sterile_pool::GUEST_HEALTH_PROBE_STALE)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+    let pool_sql = format!(
+        "with health_params as (
+           select {tenant} as tenant_id, {release_set} as release_set_id,
+                  {runtime_class} as runtime_class, {policy_digest} as policy_digest,
+                  {signature} as release_signature, {grace} as grace_cutoff,
+                  {stale} as stale_cutoff
+         )
+         select
+           coalesce(sum(case when p.state = 'ready' then 1 else 0 end), 0) as pool_ready_cells,
+           coalesce(sum(case when p.state = 'ready' and p.updated_at <= params.grace_cutoff
+             and not exists (select 1 from guest_health g where g.sandbox_id = p.sandbox_id
+               and g.status = 'ready' and g.last_probe_at > params.stale_cutoff)
+             then 1 else 0 end), 0) as unhealthy_pool_ready_cells
+         from sterile_pool_memberships p cross join health_params params
+         where p.tenant_id = params.tenant_id and p.release_set_id = params.release_set_id
+           and p.runtime_class = params.runtime_class and p.policy_digest = params.policy_digest
+           and p.release_signature = params.release_signature",
+        tenant = state.db.placeholder(1),
+        release_set = state.db.placeholder(2),
+        runtime_class = state.db.placeholder(3),
+        policy_digest = state.db.placeholder(4),
+        signature = state.db.placeholder(5),
+        grace = state.db.placeholder(6),
+        stale = state.db.placeholder(7),
+    );
+    let pool = sqlx::query(&pool_sql)
+        .bind(&ctx.tenant_id)
+        .bind(&request.release.release_set_id)
+        .bind(request.release.runtime_class.as_db_str())
+        .bind(request.release.policy_digest.to_ascii_lowercase())
+        .bind(&request.release.signature)
+        .bind(grace_cutoff.to_rfc3339())
+        .bind(stale_cutoff.to_rfc3339())
+        .fetch_one(&mut **transaction)
+        .await?;
+    let pool_ready_cells = count_from_i64(pool.try_get("pool_ready_cells")?)?;
+    let unhealthy_pool_ready_cells = count_from_i64(pool.try_get("unhealthy_pool_ready_cells")?)?;
+
+    let protected_ready_cells = if let Some(config) = matching_pool_config(state, ctx, request) {
+        let protected_sql = format!(
+            "select count(*) as protected_ready_cells
+             from sterile_cells cells join sterile_pool_memberships member
+               on member.sandbox_id = cells.id
+             where cells.tenant_id = {tenant} and cells.state = 'ready'
+               and cells.release_set_id = {release_set} and cells.runtime_class = {runtime_class}
+               and cells.policy_digest = {policy_digest} and cells.release_signature = {signature}
+               and cells.cell_expires_at > {lease_expiry} and member.state = 'ready'
+               and member.candidate_agent_image = {agent_image}
+               and member.candidate_maestro_image = {maestro_image}
+               and (select count(*) from sterile_pool_memberships reserve
+                    where reserve.tenant_id = member.tenant_id
+                      and reserve.release_set_id = member.release_set_id
+                      and reserve.runtime_class = member.runtime_class
+                      and reserve.policy_digest = member.policy_digest
+                      and reserve.release_signature = member.release_signature
+                      and reserve.candidate_agent_image = member.candidate_agent_image
+                      and reserve.candidate_maestro_image = member.candidate_maestro_image
+                      and reserve.state = 'ready') <= {ready_floor}",
+            tenant = state.db.placeholder(1),
+            release_set = state.db.placeholder(2),
+            runtime_class = state.db.placeholder(3),
+            policy_digest = state.db.placeholder(4),
+            signature = state.db.placeholder(5),
+            lease_expiry = state.db.placeholder(6),
+            agent_image = state.db.placeholder(7),
+            maestro_image = state.db.placeholder(8),
+            ready_floor = state.db.placeholder(9),
+        );
+        let protected: i64 = sqlx::query_scalar(&protected_sql)
+            .bind(&ctx.tenant_id)
+            .bind(&request.release.release_set_id)
+            .bind(request.release.runtime_class.as_db_str())
+            .bind(request.release.policy_digest.to_ascii_lowercase())
+            .bind(&request.release.signature)
+            .bind(lease_expires_at.to_rfc3339())
+            .bind(&config.agent_image)
+            .bind(&config.maestro_image)
+            .bind(i64::from(config.ready_floor))
+            .fetch_one(&mut **transaction)
+            .await?;
+        count_from_i64(protected)?
+    } else {
+        0
+    };
+    let claimable_cells = eligible_ready_cells
+        .checked_sub(protected_ready_cells)
+        .ok_or_else(|| ApiError::internal("protected sterile-cell count exceeds ready capacity"))?;
+    let claimability = SterileCellClaimabilityEvidenceV1 {
+        pool_ready_cells,
+        ready_cells,
+        unhealthy_pool_ready_cells,
+        claimable_cells,
+        protected_ready_cells,
+        leased_cells,
+        mismatched_active_cells,
+    };
+    let reason = if protected_ready_cells > 0 && claimable_cells == 0 {
+        SterileCellNoLeaseReasonV1::ReadyFloorProtected
+    } else if ready_cells == 0 && leased_cells > 0 {
+        SterileCellNoLeaseReasonV1::AlreadyLeased
+    } else if ready_cells == 0 && leased_cells == 0 && mismatched_active_cells > 0 {
+        SterileCellNoLeaseReasonV1::ReleaseMismatch
+    } else if pool_ready_cells > 0
+        && unhealthy_pool_ready_cells == pool_ready_cells
+        && claimable_cells == 0
+    {
+        SterileCellNoLeaseReasonV1::Unhealthy
+    } else if ready_cells == 0 && leased_cells == 0 && pool_ready_cells == 0 {
+        SterileCellNoLeaseReasonV1::CapacityAbsent
+    } else {
+        SterileCellNoLeaseReasonV1::NotClaimable
+    };
+    Ok(NoLeaseDiagnosis {
+        reason,
+        claimability,
+    })
+}
+
+fn count_from_i64(value: i64) -> Result<u64, ApiError> {
+    u64::try_from(value).map_err(|_| ApiError::internal("sterile-cell count is invalid"))
 }
 
 async fn claim_once(
@@ -595,8 +807,34 @@ async fn claim_once(
             .bind(i64::from(config.ready_floor));
     }
     let Some(row) = select_query.fetch_optional(&mut *transaction).await? else {
+        let diagnosis =
+            diagnose_no_lease(state, &mut transaction, ctx, request, lease_expires_at).await?;
+        if let Some((claim_id, request_digest)) = &claim_fence {
+            let update_claim = format!(
+                "update sterile_cell_claims set no_lease_reason = {}, claimability_evidence = {}
+                 where tenant_id = {} and claim_id = {} and request_sha256 = {}
+                   and cell_id is null and lease_id is null",
+                state.db.placeholder(1),
+                state.db.placeholder(2),
+                state.db.placeholder(3),
+                state.db.placeholder(4),
+                state.db.placeholder(5),
+            );
+            let updated = sqlx::query(&update_claim)
+                .bind(diagnosis.reason.as_db_str())
+                .bind(serde_json::to_string(&diagnosis.claimability)?)
+                .bind(&ctx.tenant_id)
+                .bind(claim_id.to_string())
+                .bind(request_digest)
+                .execute(&mut *transaction)
+                .await?;
+            if updated.rows_affected() != 1 {
+                transaction.rollback().await?;
+                return Ok(ClaimAttempt::Contended);
+            }
+        }
         transaction.commit().await?;
-        return Ok(ClaimAttempt::Empty);
+        return Ok(ClaimAttempt::Empty(Some(Box::new(diagnosis))));
     };
     let cell_id = SterileCellId(parse_uuid(row.try_get("id")?)?);
     let cell_expiry = parse_timestamp(row.try_get("cell_expires_at")?)?;
@@ -760,14 +998,14 @@ pub(crate) async fn claim_sterile_cell(
                     ok: true,
                     lease: Some(*lease),
                     lease_attestation: Some(token),
+                    no_lease_reason: None,
+                    claimability: None,
                 }));
             }
-            ClaimAttempt::Empty => {
-                return Ok(secret_claim_response(ClaimSterileCellResponseV1 {
-                    ok: true,
-                    lease: None,
-                    lease_attestation: None,
-                }));
+            ClaimAttempt::Empty(diagnosis) => {
+                return Ok(secret_claim_response(empty_claim_response(
+                    diagnosis.as_deref(),
+                )));
             }
             ClaimAttempt::Contended => {}
             ClaimAttempt::NoLongerLive => unreachable!("claim_once returns an error instead"),
@@ -779,11 +1017,25 @@ pub(crate) async fn claim_sterile_cell(
             "sterile-cell claim is contended; retry with the same claim_id",
         ))
     } else {
-        Ok(secret_claim_response(ClaimSterileCellResponseV1 {
-            ok: true,
-            lease: None,
-            lease_attestation: None,
-        }))
+        let mut transaction = state.db.pool.begin().await?;
+        crate::sterile_pool::lock_controller_on_connection(&state.db, &mut transaction).await?;
+        let mut diagnosis =
+            diagnose_no_lease(&state, &mut transaction, &ctx, &request, lease_expires_at).await?;
+        transaction.commit().await?;
+        diagnosis.reason = SterileCellNoLeaseReasonV1::ClaimContended;
+        Ok(secret_claim_response(empty_claim_response(Some(
+            &diagnosis,
+        ))))
+    }
+}
+
+fn empty_claim_response(diagnosis: Option<&NoLeaseDiagnosis>) -> ClaimSterileCellResponseV1 {
+    ClaimSterileCellResponseV1 {
+        ok: false,
+        lease: None,
+        lease_attestation: None,
+        no_lease_reason: diagnosis.map(|diagnosis| diagnosis.reason.clone()),
+        claimability: diagnosis.map(|diagnosis| diagnosis.claimability.clone()),
     }
 }
 
@@ -1436,7 +1688,12 @@ mod tests {
             )
             .await
             .unwrap(),
-            ClaimAttempt::Empty
+            ClaimAttempt::Empty(Some(diagnosis))
+                if diagnosis.reason == SterileCellNoLeaseReasonV1::ReadyFloorProtected
+                    && diagnosis.claimability.pool_ready_cells == 1
+                    && diagnosis.claimability.ready_cells == 1
+                    && diagnosis.claimability.protected_ready_cells == 1
+                    && diagnosis.claimability.claimable_cells == 0
         ));
         assert!(matches!(
             claim_once(
@@ -1448,7 +1705,69 @@ mod tests {
             )
             .await
             .unwrap(),
-            ClaimAttempt::Empty
+            ClaimAttempt::Empty(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn pool_reported_ready_without_a_claimable_cell_is_explicit() {
+        let db = test_db().await;
+        let config = pool_config();
+        reconcile_sterile_pool(&db, &config).await.unwrap();
+        let pool_row = sqlx::query(
+            "select sandbox_id from sterile_pool_memberships order by sandbox_id limit 1",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let pool_cell_id: String = pool_row.try_get("sandbox_id").unwrap();
+        let worker = insert_worker(&db).await;
+        let expires = (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+        sqlx::query(
+            "update sterile_pool_memberships
+             set state = 'ready', worker_id = ?, generation = 1,
+                 candidate_pod_name = 'pool-ready-pod', candidate_pod_uid = 'pool-ready-uid',
+                 cell_expires_at = ?, updated_at = ?
+             where sandbox_id = ?",
+        )
+        .bind(worker.id.to_string())
+        .bind(&expires)
+        .bind((Utc::now() - chrono::Duration::minutes(2)).to_rfc3339())
+        .bind(pool_cell_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let state = test_state(db, config.clone(), "claim-test-signing-key");
+        let request = ClaimSterileCellRequestV1 {
+            claim_id: Some(Uuid::now_v7()),
+            release: config.release,
+            organization_id: "organization".into(),
+            workspace_id: "workspace".into(),
+            thread_id: "thread".into(),
+            runner_session_id: "runner".into(),
+            lease_seconds: Some(60),
+        };
+        let ctx = TenantContext {
+            tenant_id: "default".into(),
+            principal: Principal::Tenant,
+        };
+        let attempt = claim_once(
+            &state,
+            "claim-test-signing-key",
+            &ctx,
+            &request,
+            Utc::now() + chrono::Duration::seconds(60),
+        )
+        .await
+        .unwrap();
+        let ClaimAttempt::Empty(Some(diagnosis)) = attempt else {
+            panic!("reported-ready membership without a cell must not be claimable");
+        };
+        assert_eq!(diagnosis.reason, SterileCellNoLeaseReasonV1::Unhealthy);
+        assert_eq!(diagnosis.claimability.pool_ready_cells, 1);
+        assert_eq!(diagnosis.claimability.unhealthy_pool_ready_cells, 1);
+        assert_eq!(diagnosis.claimability.ready_cells, 0);
+        assert_eq!(diagnosis.claimability.claimable_cells, 0);
     }
 }

@@ -220,6 +220,16 @@
       },
       "ClaimSterileCellResponseV1": {
         "properties": {
+          "claimability": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SterileCellClaimabilityEvidenceV1"
+              }
+            ]
+          },
           "lease": {
             "oneOf": [
               {
@@ -234,6 +244,16 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "no_lease_reason": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SterileCellNoLeaseReasonV1"
+              }
             ]
           },
           "ok": {
@@ -3206,6 +3226,56 @@
         ],
         "type": "object"
       },
+      "SterileCellClaimabilityEvidenceV1": {
+        "description": "Tenant-scoped aggregate evidence captured when a sterile-cell claim cannot\nissue a lease. Counts contain no cell, worker, provider, or lease locators.",
+        "properties": {
+          "claimable_cells": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "leased_cells": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "mismatched_active_cells": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pool_ready_cells": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "protected_ready_cells": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ready_cells": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "unhealthy_pool_ready_cells": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pool_ready_cells",
+          "ready_cells",
+          "unhealthy_pool_ready_cells",
+          "claimable_cells",
+          "protected_ready_cells",
+          "leased_cells",
+          "mismatched_active_cells"
+        ],
+        "type": "object"
+      },
       "SterileCellDisposition": {
         "enum": [
           "destroyed",
@@ -3324,6 +3394,18 @@
           "expires_at"
         ],
         "type": "object"
+      },
+      "SterileCellNoLeaseReasonV1": {
+        "enum": [
+          "capacity_absent",
+          "release_mismatch",
+          "unhealthy",
+          "already_leased",
+          "ready_floor_protected",
+          "not_claimable",
+          "claim_contended"
+        ],
+        "type": "string"
       },
       "SterileCellReleaseTrustClassV1": {
         "properties": {

@@ -134,7 +134,7 @@ the Sandboxwich API.
 | Worker token | `POST /workers/{worker_id}/sterile-cells/prepare` | Registers a never-used provider cell under a signed trust class. |
 | Worker token | `GET /workers/{worker_id}/sterile-cells/{cell_id}` | Reconciles an ambiguous prepare or claim response with the cell and an optional non-secret claim locator. |
 | Worker token | `POST /workers/{worker_id}/sterile-cells/{cell_id}/retire` | Quarantines an unexposed `ready(generation=1)` cell under an exact generation fence. |
-| Tenant token | `POST /sterile-cells/claim` | Atomically leases one exact matching cell. Fenced claims durably record `lease: null`; legacy unfenced claims retain the original one-shot behavior. |
+| Tenant token | `POST /sterile-cells/claim` | Atomically leases one exact matching cell. Fenced claims durably record an empty result and its diagnosis; legacy unfenced claims retain the original one-shot behavior. |
 | Tenant, worker, or guest token plus lease attestation | `POST /sterile-cell-leases/{lease_id}/validate` | Returns the live tuple only when token, tenant, generation, tuple, state, and expiry match. |
 | Tenant token | `POST /sterile-cell-leases/{lease_id}/release` | Accepts provider teardown under the exact attestation, generation, and organization/workspace/thread/session tuple; returns `202` while teardown runs. |
 | Tenant token | `GET /sterile-cell-leases/{lease_id}` | Returns the tenant-scoped cell ID, lease ID, generation, state, and disposition without provider locators or attestation data. |
@@ -145,10 +145,21 @@ New controllers supply the optional UUID `claim_id`. While its lease remains
 live, an exact fenced retry returns the same lease and deterministically
 regenerates the same `lease_attestation`; reuse with any different release,
 binding, or requested TTL fails with `409`. A retry of a durably empty fenced
-claim stays empty, even if inventory arrives later. Exhausted fenced claim
-contention is a non-success `409`, so callers retry the same fence instead of
-treating an unfenced empty response as authoritative. Expired or terminal
-leases never regenerate authority.
+claim stays empty with the same diagnosis, even if inventory arrives later.
+Exhausted fenced claim contention is a non-success `409`, so callers retry the
+same fence instead of treating an unfenced empty response as authoritative.
+Expired or terminal leases never regenerate authority.
+
+A successful claim has `ok: true`, a lease, and an attestation. An empty claim
+keeps the V1-compatible HTTP `200` and nullable lease fields, but has `ok:
+false`, a typed `no_lease_reason`, and tenant-scoped aggregate `claimability`
+evidence. Reasons distinguish absent capacity, a release mismatch, unhealthy
+pool-ready reports, already-leased capacity, ready-floor protection, mixed
+non-claimability, and legacy unfenced contention. Evidence reports only counts
+of pool-ready, unhealthy pool-ready, ready, claimable, protected, leased, and
+mismatched active cells. It contains no cell, worker, provider, lease, tenant,
+or attestation locators. Successful responses omit both diagnosis fields so
+existing clients retain their original response shape.
 
 For V1 compatibility, omitting `claim_id` retains the original unfenced,
 one-shot semantics: each request is a new claim attempt, including after an

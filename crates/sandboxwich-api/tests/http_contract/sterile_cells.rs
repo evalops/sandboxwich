@@ -496,6 +496,83 @@ async fn signed_exact_trust_class_is_required_for_prepare_and_claim() {
 }
 
 #[tokio::test]
+async fn no_lease_diagnosis_distinguishes_mismatched_and_already_leased_capacity() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        data_dir.path().join("claim-diagnosis.db").display()
+    );
+    let server = TestServer::start_with_sterile_cells(database_url, Some(data_dir), false).await;
+    let client = server.client();
+    let worker = register_worker(&server, &client).await;
+    let kata_release = signed_release(SterileCellRuntimeClass::KataMicrovm);
+    prepare(&server, &worker, SterileCellId::new(), kata_release.clone()).await;
+
+    let mismatched: ClaimSterileCellResponseV1 = client
+        .post(format!("{}/sterile-cells/claim", server.base_url))
+        .json(&claim_request(signed_release(
+            SterileCellRuntimeClass::GvisorLowerRisk,
+        )))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!mismatched.ok);
+    assert!(mismatched.lease.is_none());
+    assert!(mismatched.lease_attestation.is_none());
+    assert_eq!(
+        mismatched.no_lease_reason,
+        Some(SterileCellNoLeaseReasonV1::ReleaseMismatch)
+    );
+    let evidence = mismatched.claimability.unwrap();
+    assert_eq!(evidence.ready_cells, 0);
+    assert_eq!(evidence.claimable_cells, 0);
+    assert_eq!(evidence.mismatched_active_cells, 1);
+
+    let claimed: ClaimSterileCellResponseV1 = client
+        .post(format!("{}/sterile-cells/claim", server.base_url))
+        .json(&claim_request(kata_release.clone()))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(claimed.ok);
+    assert!(claimed.lease.is_some());
+    assert!(claimed.lease_attestation.is_some());
+    assert!(claimed.no_lease_reason.is_none());
+    assert!(claimed.claimability.is_none());
+
+    let already_leased: ClaimSterileCellResponseV1 = client
+        .post(format!("{}/sterile-cells/claim", server.base_url))
+        .json(&claim_request(kata_release))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!already_leased.ok);
+    assert_eq!(
+        already_leased.no_lease_reason,
+        Some(SterileCellNoLeaseReasonV1::AlreadyLeased)
+    );
+    let evidence = already_leased.claimability.unwrap();
+    assert_eq!(evidence.ready_cells, 0);
+    assert_eq!(evidence.leased_cells, 1);
+    assert_eq!(evidence.claimable_cells, 0);
+}
+
+#[tokio::test]
 async fn atomic_claim_binds_identity_and_a_cell_is_never_reused() {
     let data_dir = tempfile::tempdir().unwrap();
     let database_url = format!("sqlite://{}", data_dir.path().join("claim.db").display());
@@ -536,6 +613,9 @@ async fn atomic_claim_binds_identity_and_a_cell_is_never_reused() {
         .into_iter()
         .find(|claim| claim.lease.is_some())
         .unwrap();
+    assert!(claimed.ok);
+    assert!(claimed.no_lease_reason.is_none());
+    assert!(claimed.claimability.is_none());
     let lease = claimed.lease.unwrap();
     let attestation = claimed.lease_attestation.unwrap();
     assert_eq!(lease.cell_id, cell_id);
@@ -798,7 +878,13 @@ async fn an_empty_claim_id_replays_empty_instead_of_consuming_later_inventory() 
         .json()
         .await
         .unwrap();
+    assert!(!empty.ok);
     assert!(empty.lease.is_none());
+    assert_eq!(
+        empty.no_lease_reason,
+        Some(SterileCellNoLeaseReasonV1::CapacityAbsent)
+    );
+    assert_eq!(empty.claimability.as_ref().unwrap().claimable_cells, 0);
     prepare(&server, &worker, SterileCellId::new(), release.clone()).await;
     let replay: ClaimSterileCellResponseV1 = client
         .post(&url)
