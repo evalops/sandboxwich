@@ -1031,7 +1031,10 @@ pub(crate) async fn claim_sterile_cell(
 
 fn empty_claim_response(diagnosis: Option<&NoLeaseDiagnosis>) -> ClaimSterileCellResponseV1 {
     ClaimSterileCellResponseV1 {
-        ok: false,
+        // V1 clients interpret `ok` as request acceptance and branch on the
+        // nullable lease pair for capacity misses. Keep that rollout contract;
+        // `no_lease_reason` is the typed claim outcome for upgraded clients.
+        ok: true,
         lease: None,
         lease_attestation: None,
         no_lease_reason: diagnosis.map(|diagnosis| diagnosis.reason.clone()),

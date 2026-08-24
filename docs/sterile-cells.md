@@ -151,15 +151,17 @@ same fence instead of treating an unfenced empty response as authoritative.
 Expired or terminal leases never regenerate authority.
 
 A successful claim has `ok: true`, a lease, and an attestation. An empty claim
-keeps the V1-compatible HTTP `200` and nullable lease fields, but has `ok:
-false`, a typed `no_lease_reason`, and tenant-scoped aggregate `claimability`
-evidence. Reasons distinguish absent capacity, a release mismatch, unhealthy
-pool-ready reports, already-leased capacity, ready-floor protection, mixed
-non-claimability, and legacy unfenced contention. Evidence reports only counts
-of pool-ready, unhealthy pool-ready, ready, claimable, protected, leased, and
-mismatched active cells. It contains no cell, worker, provider, lease, tenant,
-or attestation locators. Successful responses omit both diagnosis fields so
-existing clients retain their original response shape.
+keeps the V1-compatible HTTP `200`, `ok: true` envelope acknowledgement, and
+nullable lease fields, but adds a typed `no_lease_reason` and tenant-scoped
+aggregate `claimability` evidence. The reason, not the legacy `ok` field, is
+the machine-readable claim outcome. Reasons distinguish absent capacity, a
+release mismatch, unhealthy pool-ready reports, already-leased capacity,
+ready-floor protection, mixed non-claimability, and legacy unfenced contention.
+Evidence reports only counts of pool-ready, unhealthy pool-ready, ready,
+claimable, protected, leased, and mismatched active cells. It contains no cell,
+worker, provider, lease, tenant, or attestation locators. Successful responses
+omit both diagnosis fields so existing clients retain their original response
+shape.
 
 For V1 compatibility, omitting `claim_id` retains the original unfenced,
 one-shot semantics: each request is a new claim attempt, including after an

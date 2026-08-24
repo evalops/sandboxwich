@@ -521,7 +521,7 @@ async fn no_lease_diagnosis_distinguishes_mismatched_and_already_leased_capacity
         .json()
         .await
         .unwrap();
-    assert!(!mismatched.ok);
+    assert!(mismatched.ok);
     assert!(mismatched.lease.is_none());
     assert!(mismatched.lease_attestation.is_none());
     assert_eq!(
@@ -561,7 +561,7 @@ async fn no_lease_diagnosis_distinguishes_mismatched_and_already_leased_capacity
         .json()
         .await
         .unwrap();
-    assert!(!already_leased.ok);
+    assert!(already_leased.ok);
     assert_eq!(
         already_leased.no_lease_reason,
         Some(SterileCellNoLeaseReasonV1::AlreadyLeased)
@@ -878,7 +878,7 @@ async fn an_empty_claim_id_replays_empty_instead_of_consuming_later_inventory() 
         .json()
         .await
         .unwrap();
-    assert!(!empty.ok);
+    assert!(empty.ok);
     assert!(empty.lease.is_none());
     assert_eq!(
         empty.no_lease_reason,
