@@ -5,7 +5,9 @@
 > at `platform/execution/sandboxwich`; Mono's
 > `.github/workflows/sandboxwich-publish.yml` is the only workflow allowed to
 > publish Sandboxwich images or releases. Pull-request validation remains
-> available here, but this repository must not publish artifacts.
+> available here for snapshot maintenance only. This repository must not publish artifacts
+> or accept product development. `v0.1.17` was the final
+> standalone release; current changes belong in Mono.
 
 sandboxwich is a typed Rust control plane for self-hosted, policy-controlled
 development and agent-evaluation sandboxes.

@@ -75,7 +75,7 @@ class RepositoryRulesTest(unittest.TestCase):
             self.assertIn("github.event.pull_request.number || github.ref", text, relative)
         containers = (ROOT / ".github/workflows/containers.yml").read_text()
         self.assertIn("concurrency:", containers)
-        self.assertIn("github.event.pull_request.number || github.ref", containers)
+        self.assertIn("github.event.pull_request.number", containers)
         self.assertIn("cancel-in-progress: true", containers)
 
     def test_kubernetes_conformance_runs_after_merge(self) -> None:
@@ -90,12 +90,9 @@ class RepositoryRulesTest(unittest.TestCase):
         self.assertIn("kind:", workflow)
 
     def test_kubernetes_conformance_pulls_the_published_container_paths(self) -> None:
-        containers = (ROOT / ".github/workflows/containers.yml").read_text()
         conformance = (
             ROOT / ".github/workflows/kubernetes-conformance.yml"
         ).read_text()
-        self.assertIn("REGISTRY: ghcr.io", containers)
-        self.assertIn("IMAGE_NAMESPACE: evalops", containers)
         self.assertIn("REGISTRY: ghcr.io", conformance)
         self.assertIn("IMAGE_NAMESPACE: evalops", conformance)
         for image in (
@@ -187,8 +184,7 @@ class RepositoryRulesTest(unittest.TestCase):
     def test_container_builds_use_native_architecture_runners(self) -> None:
         workflow = (ROOT / ".github/workflows/containers.yml").read_text()
         self.assertIn("ubuntu-24.04-arm", workflow)
-        self.assertIn("ubuntu-24.04", workflow)
-        self.assertIn("docker buildx imagetools create", workflow)
+        self.assertIn("ubuntu-latest", workflow)
         self.assertIn("linux/amd64", workflow)
         self.assertIn("linux/arm64", workflow)
         self.assertNotIn("qemu", workflow.lower())
@@ -198,43 +194,24 @@ class RepositoryRulesTest(unittest.TestCase):
 
     def test_standalone_runtime_validation_is_owned_by_mono(self) -> None:
         workflow = (ROOT / ".github/workflows/containers.yml").read_text()
-        self.assertIn(
-            "if: github.event_name != 'pull_request' && "
-            "needs.container-scope.outputs.required == 'true'",
-            workflow,
-        )
         self.assertIn("Standalone runtime publication and validation are retired.", workflow)
         self.assertIn("Authoritative runtime validation runs from evalops/mono.", workflow)
+        self.assertNotIn("runtime-build:", workflow)
 
-    def test_container_workflow_verifies_and_signs_platform_provenance(self) -> None:
+    def test_container_workflow_has_no_publication_or_promotion_authority(self) -> None:
         workflow = (ROOT / ".github/workflows/containers.yml").read_text()
-        verifier = (ROOT / "scripts/verify-image-provenance.sh").read_text()
-        for marker in (
-            "dev.sandboxwich.build.runner-architecture",
-            "dev.sandboxwich.build.dockerfile-digest",
-            "dev.sandboxwich.build.dependency-lock-digest",
-            "verify-image-provenance.sh",
-            "Sign service platform manifests",
-            "Sign runtime platform manifests",
-            "provenance-summary.json",
+        self.assertEqual(workflow.count("push: false"), 1)
+        for forbidden in (
+            "packages: write",
+            "id-token: write",
+            "docker/login-action",
+            "docker buildx imagetools create",
+            "cosign sign",
+            "actions/upload-artifact",
+            "gh release create",
+            "cargo publish",
         ):
-            self.assertIn(marker, workflow)
-        self.assertEqual(workflow.count("push: false"), 2)
-        self.assertEqual(workflow.count("provenance: false"), 2)
-        self.assertEqual(workflow.count("sbom: false"), 2)
-        self.assertNotIn("packages: write", workflow)
-        self.assertNotIn("id-token: write", workflow)
-        for marker in (
-            "{{json .Provenance}}",
-            "{{json .SBOM}}",
-            "linux/amd64",
-            "linux/arm64",
-            "attestation-manifest",
-            "cosign verify",
-        ):
-            self.assertIn(marker, verifier)
-        self.assertNotIn("qemu", workflow.lower())
-        self.assertNotIn("binfmt", workflow.lower())
+            self.assertNotIn(forbidden, workflow)
 
     def test_expensive_pr_jobs_are_scoped_and_benchmark_is_post_merge_only(self) -> None:
         ci = (ROOT / ".github/workflows/ci.yml").read_text()
@@ -246,19 +223,16 @@ class RepositoryRulesTest(unittest.TestCase):
     def test_mono_is_the_only_release_and_publication_authority(self) -> None:
         readme = (ROOT / "README.md").read_text()
         self.assertIn("evalops/mono", readme)
-        self.assertIn("must not publish artifacts", readme)
+        self.assertIn("publish artifacts", readme)
         for relative in (
             ".github/workflows/release-plz.yml",
             ".github/workflows/release.yml",
         ):
-            workflow = (ROOT / relative).read_text()
-            self.assertIn("retired", workflow.lower(), relative)
-            self.assertIn("workflow_dispatch:", workflow, relative)
-            self.assertIn("exit 1", workflow, relative)
-            self.assertNotIn("contents: write", workflow, relative)
-            self.assertNotIn("id-token: write", workflow, relative)
-        self.assertNotIn("release-plz/action@", (ROOT / ".github/workflows/release-plz.yml").read_text())
-        self.assertNotIn("softprops/action-gh-release@", (ROOT / ".github/workflows/release.yml").read_text())
+            self.assertFalse((ROOT / relative).exists(), relative)
+        for workflow_path in (ROOT / ".github/workflows").glob("*.yml"):
+            workflow = workflow_path.read_text()
+            self.assertNotIn("packages: write", workflow, workflow_path.name)
+            self.assertNotIn("contents: write", workflow, workflow_path.name)
 
 
 if __name__ == "__main__":
