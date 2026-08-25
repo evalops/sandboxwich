@@ -53,6 +53,46 @@ against the hard target, and creates at most
 Leased or stopping members therefore remain part of capacity until provider
 cleanup is confirmed.
 
+## Cohort expiry spread
+
+A pool that fills in one replenishment cycle admits every member within
+seconds of the others. Without a spread each member's ready TTL then starts at
+the same instant, the whole cohort is enqueued for stop together, and claims
+fail until replacements finish provisioning. Each member therefore records
+`expiry_spread_seconds`, the integer quotient of
+`SANDBOXWICH_STERILE_POOL_READY_TTL_SECONDS` and
+`SANDBOXWICH_STERILE_POOL_TARGET`, when the controller creates it. At
+admission its expiry is placed one slot after the latest expiry held by a live
+`ready` member of the same tenant, release tuple, and candidate image pair,
+then clamped:
+
+```text
+expires_at = clamp(latest_ready_peer_expiry + spread, now + ttl, now + 2 * ttl)
+```
+
+For a cohort admitted back to back that resolves to `now + ttl * (1 + index /
+target)` for the index-th member, so consecutive expiries are `ttl / target`
+apart and no member outlives twice its TTL. A target of `6` with a
+`600`-second TTL retires one member every `100` seconds instead of six at
+once. A member with no live ready peer expires at exactly `now + ttl`, which
+is also what memberships written before this column existed do. No new
+environment variable is involved; the spread is derived from the existing
+target and TTL settings, so an unchanged configuration still staggers.
+
+Two effects of the spread are load-bearing. Reconciliation keeps counting
+`stopping` and `cleanup_pending` against the hard target, so a refresh removes
+one member at a time and the other `target - 1` members stay claimable
+throughout. The claim route also requires `cell_expires_at` to be later than
+the requested lease expiry; a staggered pool always holds members with more
+remaining life than its oldest member, so a claim that arrives at a slot
+boundary is not restricted to the cell that is about to be retired.
+
+The controller does not start a replacement before its predecessor's provider
+teardown is confirmed. Live pool members must not exceed the target, because
+the target is sized to the Kubernetes ResourceQuota for guest pods, and a
+successor created while its predecessor is still `stopping` would put
+`target + 1` members on the cluster.
+
 Pool sandboxes and their jobs are absent from ordinary tenant list, read, and
 mutation routes for the lifetime of their durable membership. Sterile
 activation uses the exact lease ID and generation lookup instead. The

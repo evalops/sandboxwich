@@ -94,6 +94,10 @@ fn is_mutating(method: &Method) -> bool {
     )
 }
 
+// The Err variant is the built axum rejection that the rate-limit middleware
+// returns to the caller verbatim; boxing it would change both call sites and
+// the middleware's own return type for no runtime benefit.
+#[allow(clippy::result_large_err)]
 async fn consume(
     db: &Database,
     tenant: &str,
