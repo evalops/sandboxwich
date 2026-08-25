@@ -70,7 +70,7 @@ pub(crate) async fn enforce_tenant_limits(
     )
     .await
     {
-        return response;
+        return *response;
     }
     if is_mutating(request.method())
         && let Err(response) = consume(
@@ -82,7 +82,7 @@ pub(crate) async fn enforce_tenant_limits(
         )
         .await
     {
-        return response;
+        return *response;
     }
     next.run(request).await
 }
@@ -104,7 +104,7 @@ async fn consume(
     kind: CounterKind,
     limit: u32,
     window_seconds: u32,
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     let now = Utc::now();
     let expires = now + ChronoDuration::seconds(i64::from(window_seconds));
     let sql = format!(
@@ -129,7 +129,7 @@ async fn consume(
         .bind(i64::from(limit))
         .fetch_optional(&db.pool)
         .await
-        .map_err(|error| ApiError::from(error).into_response())?;
+        .map_err(|error| Box::new(ApiError::from(error).into_response()))?;
     if row.is_some() {
         return Ok(());
     }
@@ -154,7 +154,7 @@ async fn consume(
         HeaderValue::from_str(&retry_after.to_string())
             .expect("positive seconds are a valid header"),
     );
-    Err(response)
+    Err(Box::new(response))
 }
 
 async fn counter_retry_after(db: &Database, tenant: &str, kind: CounterKind) -> Option<i64> {
