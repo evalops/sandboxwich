@@ -1,5 +1,11 @@
 # Contributing
 
+This repository is a historical compatibility snapshot, not Sandboxwich's
+source authority. Open source changes and issue reports against
+[`evalops/mono`](https://github.com/evalops/mono/tree/main/platform/execution/sandboxwich).
+Pull requests here are limited to snapshot-maintenance changes and cannot
+publish or promote artifacts.
+
 Run the required local gates before opening a pull request:
 
 ```sh
