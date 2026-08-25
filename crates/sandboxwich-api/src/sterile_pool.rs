@@ -22,6 +22,43 @@ pub(crate) const GUEST_HEALTH_READY_GRACE: Duration = Duration::from_secs(30);
 /// heartbeat failure threshold and means the supervisor is gone.
 pub(crate) const GUEST_HEALTH_PROBE_STALE: Duration = Duration::from_secs(60);
 
+/// Slot width, in seconds, between the ready-TTL expiries of one pool cohort.
+///
+/// A pool that fills in a single replenishment cycle admits every member
+/// within seconds of the others, so an unstaggered ready TTL retires the whole
+/// cohort at one instant. One slot per configured member spreads the cohort
+/// evenly across one TTL.
+pub(crate) fn expiry_spread_seconds(ready_ttl: Duration, target: u32) -> i64 {
+    let ttl = i64::try_from(ready_ttl.as_secs()).unwrap_or(i64::MAX);
+    ttl / i64::from(target.max(1))
+}
+
+/// Ready-TTL expiry for a pool member at admission.
+///
+/// The member is placed one slot after the latest expiry already held by a
+/// live ready peer of its own cohort, clamped to `[now + ttl, now + 2 * ttl]`.
+/// For a cohort of `target` members admitted back to back that yields
+/// `now + ttl * (1 + index / target)` for the index-th member: expiries land
+/// `ttl / target` apart and no member outlives twice its TTL. A spread of zero
+/// keeps the previous behaviour, so memberships written before the spread
+/// column existed still expire at exactly `now + ttl`.
+pub(crate) fn staggered_ready_expiry(
+    now: chrono::DateTime<Utc>,
+    ready_ttl_seconds: i64,
+    expiry_spread_seconds: i64,
+    latest_ready_peer_expiry: Option<chrono::DateTime<Utc>>,
+) -> chrono::DateTime<Utc> {
+    let floor = now + chrono::Duration::seconds(ready_ttl_seconds);
+    if expiry_spread_seconds <= 0 {
+        return floor;
+    }
+    let Some(peer) = latest_ready_peer_expiry else {
+        return floor;
+    };
+    let ceiling = now + chrono::Duration::seconds(ready_ttl_seconds.saturating_mul(2));
+    (peer + chrono::Duration::seconds(expiry_spread_seconds)).clamp(floor, ceiling)
+}
+
 pub(crate) async fn lock_controller_on_connection(
     db: &Database,
     connection: &mut AnyConnection,
@@ -250,9 +287,10 @@ async fn insert_pool_member_on_connection(
         "insert into sterile_pool_memberships
          (sandbox_id, tenant_id, state, provision_job_id, release_set_id, runtime_class,
           policy_digest, release_signature, candidate_agent_image, candidate_maestro_image,
-          candidate_service_name, ready_ttl_seconds, created_at, updated_at)
+          candidate_service_name, ready_ttl_seconds, expiry_spread_seconds,
+          created_at, updated_at)
          values ({})",
-        db.placeholders(14)
+        db.placeholders(15)
     );
     sqlx::query(&sql)
         .bind(sandbox_id.to_string())
@@ -272,6 +310,7 @@ async fn insert_pool_member_on_connection(
             i64::try_from(config.ready_ttl.as_secs())
                 .map_err(|_| ApiError::internal("sterile pool ready TTL exceeds range"))?,
         )
+        .bind(expiry_spread_seconds(config.ready_ttl, config.target))
         .bind(now.to_rfc3339())
         .bind(now.to_rfc3339())
         .execute(&mut *connection)
@@ -579,16 +618,18 @@ pub(crate) async fn admit_provisioned_cell_on_connection(
         .fetch_one(&mut *connection)
         .await?;
     let membership_sql = format!(
-        "select ready_ttl_seconds from sterile_pool_memberships
+        "select ready_ttl_seconds, expiry_spread_seconds from sterile_pool_memberships
          where sandbox_id = {} and provision_job_id = {} and state = 'provisioning'",
         db.placeholder(1),
         db.placeholder(2)
     );
-    let ready_ttl_seconds: i64 = sqlx::query_scalar(&membership_sql)
+    let membership = sqlx::query(&membership_sql)
         .bind(sandbox_id.to_string())
         .bind(job.id.to_string())
         .fetch_one(&mut *connection)
         .await?;
+    let ready_ttl_seconds: i64 = membership.try_get("ready_ttl_seconds")?;
+    let cohort_spread_seconds: i64 = membership.try_get("expiry_spread_seconds")?;
     let pod_identity_sql = format!(
         "select resource_name, resource_uid
          from provisioning_operation_resources
@@ -615,7 +656,42 @@ pub(crate) async fn admit_provisioned_cell_on_connection(
             "sterile pool candidate completion reported an empty Pod UID",
         ));
     }
-    let expires_at = Utc::now() + chrono::Duration::seconds(ready_ttl_seconds);
+    // Cohort expiry spread. The latest live ready peer of this member's own
+    // cohort sets the reference point, so a pool running more than one
+    // release/image tuple staggers each tuple independently. Timestamps are
+    // stored as RFC 3339 UTC text, which compares and aggregates in
+    // chronological order, the same way the expiry sweep already orders them.
+    let peer_sql = format!(
+        "select max(peer.cell_expires_at) as latest_expiry
+         from sterile_pool_memberships peer, sterile_pool_memberships admitted
+         where admitted.sandbox_id = {}
+           and peer.sandbox_id <> admitted.sandbox_id
+           and peer.state = 'ready'
+           and peer.cell_expires_at is not null
+           and peer.tenant_id = admitted.tenant_id
+           and peer.release_set_id = admitted.release_set_id
+           and peer.runtime_class = admitted.runtime_class
+           and peer.policy_digest = admitted.policy_digest
+           and peer.release_signature = admitted.release_signature
+           and peer.candidate_agent_image = admitted.candidate_agent_image
+           and peer.candidate_maestro_image = admitted.candidate_maestro_image",
+        db.placeholder(1)
+    );
+    let latest_peer_expiry: Option<String> = sqlx::query_scalar(&peer_sql)
+        .bind(sandbox_id.to_string())
+        .fetch_one(&mut *connection)
+        .await?;
+    let latest_peer_expiry = latest_peer_expiry
+        .as_deref()
+        .map(crate::rows::parse_timestamp)
+        .transpose()?;
+    let admitted_at = Utc::now();
+    let expires_at = staggered_ready_expiry(
+        admitted_at,
+        ready_ttl_seconds,
+        cohort_spread_seconds,
+        latest_peer_expiry,
+    );
     let sql = format!(
         "insert into sterile_cells
          (id, worker_id, provider_cell_id, state, generation, release_set_id, runtime_class,
@@ -632,7 +708,7 @@ pub(crate) async fn admit_provisioned_cell_on_connection(
         db.placeholder(5),
         db.placeholder(6)
     );
-    let now = Utc::now().to_rfc3339();
+    let now = admitted_at.to_rfc3339();
     let inserted = sqlx::query(&sql)
         .bind(&worker_id)
         .bind(expires_at.to_rfc3339())
@@ -1363,7 +1439,9 @@ mod tests {
         let worker = Worker {
             id: WorkerId::new(),
             tenant_id: "default".into(),
-            name: "pool-worker".into(),
+            // workers is unique on (tenant_id, name, provider), so a cohort
+            // needs one distinctly named worker per member.
+            name: format!("pool-worker-{sandbox_id}"),
             status: WorkerStatus::Online,
             provider: "kubernetes".into(),
             capabilities: vec![
@@ -1376,9 +1454,15 @@ mod tests {
             registered_at: now,
             last_heartbeat_at: Some(now),
         };
-        insert_worker(db, &worker, &hash_worker_token("pool-worker-token"))
-            .await
-            .unwrap();
+        // One worker per pool member: the token digest is unique per worker,
+        // so a cohort cannot share a single seeded token.
+        insert_worker(
+            db,
+            &worker,
+            &hash_worker_token(&format!("pool-worker-token-{}", worker.id)),
+        )
+        .await
+        .unwrap();
         sqlx::query(
             "insert into sandbox_placements
              (sandbox_id, worker_id, provider, cluster, generation, created_at, updated_at)
@@ -1405,6 +1489,13 @@ mod tests {
         let sandbox_id = SandboxId(Uuid::parse_str(row.try_get("sandbox_id").unwrap()).unwrap());
         let job_id = JobId(Uuid::parse_str(row.try_get("provision_job_id").unwrap()).unwrap());
         let job = fetch_job(db, job_id).await.unwrap();
+        let worker_id = complete_provision(db, sandbox_id, &job).await;
+        (sandbox_id, job, worker_id)
+    }
+
+    /// Drives one queued provision job to provider completion, which is the
+    /// transition that admits the member and stamps its ready expiry.
+    async fn complete_provision(db: &Database, sandbox_id: SandboxId, job: &Job) -> WorkerId {
         let worker_id = seed_worker_and_placement(db, sandbox_id).await;
         let lease_id = LeaseId::new();
         let now = Utc::now();
@@ -1453,7 +1544,7 @@ mod tests {
         apply_completed_job_on_connection(
             db,
             &mut tx,
-            &job,
+            job,
             WorkerJobResult::ProvisionSandbox {
                 handle: ProviderSandboxHandle {
                     provider: "kubernetes".into(),
@@ -1466,7 +1557,285 @@ mod tests {
         .await
         .unwrap();
         tx.commit().await.unwrap();
-        (sandbox_id, job, worker_id)
+        worker_id
+    }
+
+    /// Admits every member currently in `provisioning`, in the order the
+    /// controller created them.
+    async fn admit_provisioning_members(db: &Database) -> Vec<SandboxId> {
+        let rows = sqlx::query(
+            "select sandbox_id, provision_job_id from sterile_pool_memberships
+             where state = 'provisioning' order by created_at asc, sandbox_id asc",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        let mut admitted = Vec::new();
+        for row in rows {
+            let sandbox_id =
+                SandboxId(Uuid::parse_str(row.try_get("sandbox_id").unwrap()).unwrap());
+            let job_id = JobId(Uuid::parse_str(row.try_get("provision_job_id").unwrap()).unwrap());
+            let job = fetch_job(db, job_id).await.unwrap();
+            complete_provision(db, sandbox_id, &job).await;
+            admitted.push(sandbox_id);
+        }
+        admitted
+    }
+
+    async fn provision_cohort(db: &Database, config: &SterilePoolConfig) -> Vec<SandboxId> {
+        reconcile_sterile_pool(db, config).await.unwrap();
+        admit_provisioning_members(db).await
+    }
+
+    async fn member_count(db: &Database, states: &str) -> i64 {
+        sqlx::query_scalar(&format!(
+            "select count(*) from sterile_pool_memberships where state in ({states})"
+        ))
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    }
+
+    async fn live_member_count(db: &Database) -> i64 {
+        member_count(
+            db,
+            "'provisioning', 'ready', 'leased', 'stopping', 'cleanup_pending'",
+        )
+        .await
+    }
+
+    async fn ready_expiries(db: &Database) -> Vec<chrono::DateTime<Utc>> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "select cell_expires_at from sterile_pool_memberships
+             where state = 'ready' order by cell_expires_at asc",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        rows.iter()
+            .map(|value| crate::rows::parse_timestamp(value).unwrap())
+            .collect()
+    }
+
+    /// Moves every recorded expiry back by `seconds`, leaving `updated_at`
+    /// alone so the guest-health sweep does not fire.
+    async fn wind_expiries_back(db: &Database, seconds: i64) {
+        let memberships: Vec<(String, String)> = sqlx::query_as(
+            "select sandbox_id, cell_expires_at from sterile_pool_memberships
+             where cell_expires_at is not null",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        for (sandbox_id, expiry) in memberships {
+            let wound = (crate::rows::parse_timestamp(&expiry).unwrap()
+                - chrono::Duration::seconds(seconds))
+            .to_rfc3339();
+            sqlx::query(
+                "update sterile_pool_memberships set cell_expires_at = ? where sandbox_id = ?",
+            )
+            .bind(&wound)
+            .bind(&sandbox_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            sqlx::query("update sterile_cells set cell_expires_at = ? where id = ?")
+                .bind(&wound)
+                .bind(&sandbox_id)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_fresh_cohort_gets_one_slot_between_every_expiry() {
+        let now = Utc::now();
+        let target = 6_u32;
+        let ttl = Duration::from_secs(600);
+        let spread = expiry_spread_seconds(ttl, target);
+        assert_eq!(spread, 100);
+        let ttl_seconds = i64::try_from(ttl.as_secs()).unwrap();
+
+        let mut expiries = Vec::new();
+        let mut latest_peer = None;
+        for _ in 0..target {
+            let expiry = staggered_ready_expiry(now, ttl_seconds, spread, latest_peer);
+            latest_peer = Some(expiry);
+            expiries.push(expiry);
+        }
+
+        for (index, expiry) in expiries.iter().enumerate() {
+            let index = i64::try_from(index).unwrap();
+            assert_eq!(
+                *expiry,
+                now + chrono::Duration::seconds(ttl_seconds + spread * index),
+                "the index-th cohort member expires at ttl * (1 + index / target)"
+            );
+        }
+        let distinct: std::collections::BTreeSet<_> = expiries.iter().collect();
+        assert_eq!(distinct.len(), usize::try_from(target).unwrap());
+        assert!(
+            *expiries.last().unwrap() <= now + chrono::Duration::seconds(2 * ttl_seconds),
+            "no member outlives twice its ready TTL"
+        );
+    }
+
+    #[test]
+    fn expiry_stagger_is_bounded_and_degrades_to_the_plain_ttl() {
+        let now = Utc::now();
+        let ttl_seconds = 600;
+        assert_eq!(
+            staggered_ready_expiry(now, ttl_seconds, 0, Some(now + chrono::Duration::days(1))),
+            now + chrono::Duration::seconds(ttl_seconds),
+            "a zero spread reproduces the unstaggered expiry"
+        );
+        assert_eq!(
+            staggered_ready_expiry(now, ttl_seconds, 100, None),
+            now + chrono::Duration::seconds(ttl_seconds),
+            "the first member of a cohort has no peer to follow"
+        );
+        assert_eq!(
+            staggered_ready_expiry(
+                now,
+                ttl_seconds,
+                100,
+                Some(now - chrono::Duration::seconds(400)),
+            ),
+            now + chrono::Duration::seconds(ttl_seconds),
+            "a peer that expires sooner never shortens the new member's TTL"
+        );
+        assert_eq!(
+            staggered_ready_expiry(
+                now,
+                ttl_seconds,
+                100,
+                Some(now + chrono::Duration::seconds(5_000)),
+            ),
+            now + chrono::Duration::seconds(2 * ttl_seconds),
+            "a far-ahead peer is capped at twice the ready TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn cohort_admission_staggers_every_recorded_expiry() {
+        let db = test_db().await;
+        let config = pool_config(4);
+        let admitted = provision_cohort(&db, &config).await;
+        assert_eq!(admitted.len(), 4);
+
+        let spread = expiry_spread_seconds(config.ready_ttl, config.target);
+        assert_eq!(spread, 75);
+        let expiries = ready_expiries(&db).await;
+        assert_eq!(expiries.len(), 4);
+        let distinct: std::collections::BTreeSet<_> = expiries.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            4,
+            "a cohort admitted in one cycle must not share one expiry instant"
+        );
+        for pair in expiries.windows(2) {
+            assert_eq!(
+                (pair[1] - pair[0]).num_seconds(),
+                spread,
+                "consecutive cohort expiries are exactly one slot apart"
+            );
+        }
+        let earliest = expiries.first().copied().unwrap();
+        let latest = expiries.last().copied().unwrap();
+        let ttl = i64::try_from(config.ready_ttl.as_secs()).unwrap();
+        assert!(latest - earliest < chrono::Duration::seconds(ttl));
+
+        // The cell rows carry the same staggered expiry the claim route reads.
+        let cell_expiries: Vec<String> = sqlx::query_scalar(
+            "select cell_expires_at from sterile_cells order by cell_expires_at",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        let cell_expiries: Vec<chrono::DateTime<Utc>> = cell_expiries
+            .iter()
+            .map(|value| crate::rows::parse_timestamp(value).unwrap())
+            .collect();
+        assert_eq!(cell_expiries, expiries);
+    }
+
+    #[tokio::test]
+    async fn staggered_refresh_retires_one_member_at_a_time_within_the_target() {
+        let db = test_db().await;
+        let config = pool_config(4);
+        let target = i64::from(config.target);
+        let spread = expiry_spread_seconds(config.ready_ttl, config.target);
+        provision_cohort(&db, &config).await;
+        assert_eq!(live_member_count(&db).await, target);
+        assert_eq!(member_count(&db, "'ready'").await, target);
+
+        // Wind the cohort forward past the first slot boundary: the earliest
+        // member has expired and every other member still holds its remainder.
+        let ttl = i64::try_from(config.ready_ttl.as_secs()).unwrap();
+        wind_expiries_back(&db, ttl + 1).await;
+        let expired = ready_expiries(&db)
+            .await
+            .into_iter()
+            .filter(|expiry| *expiry <= Utc::now())
+            .count();
+        assert_eq!(expired, 1, "one slot boundary retires one member");
+
+        reconcile_sterile_pool(&db, &config).await.unwrap();
+        assert_eq!(
+            member_count(&db, "'stopping'").await,
+            1,
+            "only the member past its own expiry is stopped"
+        );
+        assert_eq!(
+            member_count(&db, "'ready'").await,
+            target - 1,
+            "the rest of the cohort stays claimable through the refresh"
+        );
+        assert_eq!(
+            live_member_count(&db).await,
+            target,
+            "a stopping member still occupies its slot"
+        );
+
+        // Provider cleanup frees the slot; the controller then refills it.
+        let stop_job_id: String = sqlx::query_scalar(
+            "select stop_job_id from sterile_pool_memberships where state = 'stopping'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let stop_job = fetch_job(&db, JobId(Uuid::parse_str(&stop_job_id).unwrap()))
+            .await
+            .unwrap();
+        let mut tx = db.pool.begin().await.unwrap();
+        complete_pool_stop_on_connection(&db, &mut tx, &stop_job)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(live_member_count(&db).await, target - 1);
+
+        reconcile_sterile_pool(&db, &config).await.unwrap();
+        assert_eq!(member_count(&db, "'provisioning'").await, 1);
+        assert_eq!(live_member_count(&db).await, target);
+        assert_eq!(member_count(&db, "'ready'").await, target - 1);
+
+        admit_provisioning_members(&db).await;
+        assert_eq!(live_member_count(&db).await, target);
+        let expiries = ready_expiries(&db).await;
+        assert_eq!(expiries.len(), target as usize);
+        let distinct: std::collections::BTreeSet<_> = expiries.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            target as usize,
+            "the replacement joins the rotation instead of rejoining a cohort"
+        );
+        for pair in expiries.windows(2) {
+            assert!(
+                (pair[1] - pair[0]).num_seconds() >= spread,
+                "consecutive expiries stay at least one slot apart after a refresh"
+            );
+        }
     }
 
     #[tokio::test]
