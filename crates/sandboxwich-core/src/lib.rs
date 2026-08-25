@@ -932,12 +932,41 @@ pub struct RetireSterileCellRequestV1 {
     pub generation: u64,
 }
 
+db_variant_enum! {
+pub enum SterileCellNoLeaseReasonV1 {
+    CapacityAbsent => "capacity_absent",
+    ReleaseMismatch => "release_mismatch",
+    Unhealthy => "unhealthy",
+    AlreadyLeased => "already_leased",
+    ReadyFloorProtected => "ready_floor_protected",
+    NotClaimable => "not_claimable",
+    ClaimContended => "claim_contended",
+}
+}
+
+/// Tenant-scoped aggregate evidence captured when a sterile-cell claim cannot
+/// issue a lease. Counts contain no cell, worker, provider, or lease locators.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SterileCellClaimabilityEvidenceV1 {
+    pub pool_ready_cells: u64,
+    pub ready_cells: u64,
+    pub unhealthy_pool_ready_cells: u64,
+    pub claimable_cells: u64,
+    pub protected_ready_cells: u64,
+    pub leased_cells: u64,
+    pub mismatched_active_cells: u64,
+}
+
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ClaimSterileCellResponseV1 {
     pub ok: bool,
     pub lease: Option<SterileCellLeaseV1>,
     #[schema(value_type = Option<String>)]
     pub lease_attestation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_lease_reason: Option<SterileCellNoLeaseReasonV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimability: Option<SterileCellClaimabilityEvidenceV1>,
 }
 
 impl fmt::Debug for ClaimSterileCellResponseV1 {
@@ -950,6 +979,8 @@ impl fmt::Debug for ClaimSterileCellResponseV1 {
                 "lease_attestation",
                 &self.lease_attestation.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("no_lease_reason", &self.no_lease_reason)
+            .field("claimability", &self.claimability)
             .finish()
     }
 }

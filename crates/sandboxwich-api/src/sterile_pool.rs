@@ -17,10 +17,10 @@ pub(crate) const POOL_JOB_MARKER: &str = "sterilePool";
 /// Ready admission happens at provision completion, before the supervisor
 /// posts guest-health. Keep a short grace so a healthy first probe is not
 /// treated as a dead cell.
-const GUEST_HEALTH_READY_GRACE: Duration = Duration::from_secs(30);
+pub(crate) const GUEST_HEALTH_READY_GRACE: Duration = Duration::from_secs(30);
 /// Supervisor heartbeat is 5s. Twelve missed probes matches the agent
 /// heartbeat failure threshold and means the supervisor is gone.
-const GUEST_HEALTH_PROBE_STALE: Duration = Duration::from_secs(60);
+pub(crate) const GUEST_HEALTH_PROBE_STALE: Duration = Duration::from_secs(60);
 
 /// Slot width, in seconds, between the ready-TTL expiries of one pool cohort.
 ///

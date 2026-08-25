@@ -122,6 +122,8 @@ use sandboxwich_core::{
         ,sandboxwich_core::SterileCellResponseV1
         ,sandboxwich_core::ClaimSterileCellRequestV1
         ,sandboxwich_core::ClaimSterileCellResponseV1
+        ,sandboxwich_core::SterileCellNoLeaseReasonV1
+        ,sandboxwich_core::SterileCellClaimabilityEvidenceV1
         ,sandboxwich_core::SterileCellClaimLocatorV1
         ,sandboxwich_core::WorkerSterileCellLookupResponseV1
         ,sandboxwich_core::RetireSterileCellRequestV1
