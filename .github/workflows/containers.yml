@@ -7,13 +7,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  # This public checkout validates pull requests only. Mono owns publication.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
   cancel-in-progress: true
-
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAMESPACE: evalops
 
 jobs:
   container-scope:
@@ -29,17 +24,12 @@ jobs:
         id: scope
         shell: bash
         env:
-          EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          if [[ "${EVENT_NAME}" != "pull_request" ]]; then
-            echo "required=true" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
           git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" > "${RUNNER_TEMP}/changed-files"
-          if grep -Eq '^(\.dockerignore$|Dockerfile$|Cargo\.(toml|lock)$|rust-toolchain(\.toml)?$|\.cargo/|crates/|deploy/runtime/ubuntu-dev/|\.github/workflows/containers\.yml$)' "${RUNNER_TEMP}/changed-files"; then
+          if grep -Eq '^(\.dockerignore$|Dockerfile$|Cargo\.(toml|lock)$|rust-toolchain(\.toml)?$|\.cargo/|crates/|\.github/workflows/containers\.yml$)' "${RUNNER_TEMP}/changed-files"; then
             echo "required=true" >> "${GITHUB_OUTPUT}"
           else
             echo "required=false" >> "${GITHUB_OUTPUT}"
@@ -49,10 +39,6 @@ jobs:
     needs: container-scope
     if: needs.container-scope.outputs.required == 'true'
     name: service build (${{ matrix.bin }}, ${{ matrix.arch }})
-    # GitHub-hosted (Blacksmith dropped org-wide 2026-07-20): amd64 legs run
-    # on ubuntu-latest, arm64 legs run on the native-arm ubuntu-24.04-arm
-    # hosted label so both legs build natively, with no cross-architecture
-    # emulation.
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
@@ -60,59 +46,33 @@ jobs:
       matrix:
         include:
           - bin: sandboxwich-api
-            image: sandboxwich-api
             arch: amd64
             platform: linux/amd64
             runner: ubuntu-latest
           - bin: sandboxwich-api
-            image: sandboxwich-api
             arch: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
           - bin: sandboxwich-worker
-            image: sandboxwich-worker
             arch: amd64
             platform: linux/amd64
             runner: ubuntu-latest
           - bin: sandboxwich-worker
-            image: sandboxwich-worker
             arch: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Record service build definition
-        id: build-definition
-        shell: bash
-        run: |
-          echo "dockerfile_digest=sha256:$(sha256sum Dockerfile | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
-          echo "dependency_lock_digest=sha256:$(sha256sum Cargo.lock | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build native service image
+      - name: Build native service image without publication
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: Dockerfile
           platforms: ${{ matrix.platform }}
-          # Keep this explicit so a future trigger cannot silently restore pushes.
           push: false
           build-args: BIN=${{ matrix.bin }}
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:sha-${{ github.sha }}-${{ matrix.arch }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/evalops/sandboxwich
-            org.opencontainers.image.revision=${{ github.sha }}
-            dev.sandboxwich.build.runner-architecture=${{ matrix.arch }}
-            dev.sandboxwich.build.dockerfile-digest=${{ steps.build-definition.outputs.dockerfile_digest }}
-            dev.sandboxwich.build.dependency-lock-digest=${{ steps.build-definition.outputs.dependency_lock_digest }}
-          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.arch }}
+          tags: sandboxwich-validation/${{ matrix.bin }}:${{ github.sha }}-${{ matrix.arch }}
           provenance: false
           sbom: false
 
@@ -124,13 +84,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - bin: sandboxwich-api
-            image: sandboxwich-api
-          - bin: sandboxwich-worker
-            image: sandboxwich-worker
+        bin: [sandboxwich-api, sandboxwich-worker]
     steps:
-      - name: Require native builds
+      - name: Require native validation builds
         if: needs.container-scope.outputs.required == 'true'
         env:
           BUILD_RESULT: ${{ needs.service-build.result }}
@@ -141,231 +97,15 @@ jobs:
       - name: Skip native builds for unrelated changes
         if: needs.container-scope.outputs.required == 'false'
         run: echo 'image build not required for this pull request'
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        if: needs.container-scope.outputs.required == 'true'
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-        if: needs.container-scope.outputs.required == 'true' && github.event_name != 'pull_request'
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        if: needs.container-scope.outputs.required == 'true' && github.event_name != 'pull_request'
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Assemble OCI image index
-        if: needs.container-scope.outputs.required == 'true' && github.event_name != 'pull_request'
-        id: index
-        shell: bash
-        env:
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
-        run: |
-          set -euo pipefail
-          short_sha="${GITHUB_SHA::12}"
-          docker buildx imagetools create \
-            --tag "${IMAGE}:sha-${short_sha}" \
-            --tag "${IMAGE}:latest" \
-            "${IMAGE}:sha-${GITHUB_SHA}-amd64" \
-            "${IMAGE}:sha-${GITHUB_SHA}-arm64"
-          digest="$(docker buildx imagetools inspect "${IMAGE}:sha-${short_sha}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
-          test -n "${digest}"
-          printf 'digest=%s\n' "${digest}" >> "${GITHUB_OUTPUT}"
-          printf '%s@%s\n' "${IMAGE}" "${digest}" > "${{ matrix.image }}.image-digest"
-      - uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9 # v3
-        if: needs.container-scope.outputs.required == 'true' && github.event_name != 'pull_request'
-      - name: Verify service platform SBOM and provenance
-        if: needs.container-scope.outputs.required == 'true' && github.event_name != 'pull_request'
-        env:
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
-          DIGEST: ${{ steps.index.outputs.digest }}
-        run: |
-          dockerfile_digest="sha256:$(sha256sum Dockerfile | cut -d' ' -f1)"
-          dependency_lock_digest="sha256:$(sha256sum Cargo.lock | cut -d' ' -f1)"
-          scripts/verify-image-provenance.sh \
-            "${IMAGE}@${DIGEST}" "${GITHUB_SHA}" "${dockerfile_digest}" "${dependency_lock_digest}" \
-            "${{ matrix.image }}.provenance-summary.json"
-      - name: Sign service platform manifests
-        if: needs.container-scope.outputs.required == 'true' && github.event_name != 'pull_request'
-        env:
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
-        run: |
-          jq -r '.platforms[].digest' "${{ matrix.image }}.provenance-summary.json" | while read -r digest; do
-            cosign sign --yes "${IMAGE}@${digest}"
-          done
-      - name: Sign service image index
-        if: needs.container-scope.outputs.required == 'true' && github.event_name != 'pull_request'
-        env:
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
-          DIGEST: ${{ steps.index.outputs.digest }}
-        run: cosign sign --yes "${IMAGE}@${DIGEST}"
-      - name: Verify service signatures and provenance closure
-        if: github.event_name != 'pull_request'
-        env:
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
-          DIGEST: ${{ steps.index.outputs.digest }}
-          VERIFY_SIGNATURES: "true"
-        run: |
-          dockerfile_digest="sha256:$(sha256sum Dockerfile | cut -d' ' -f1)"
-          dependency_lock_digest="sha256:$(sha256sum Cargo.lock | cut -d' ' -f1)"
-          scripts/verify-image-provenance.sh \
-            "${IMAGE}@${DIGEST}" "${GITHUB_SHA}" "${dockerfile_digest}" "${dependency_lock_digest}" \
-            "${{ matrix.image }}.provenance-summary.json"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: github.event_name != 'pull_request'
-        with:
-          name: ${{ matrix.image }}-image-digest
-          path: |
-            ${{ matrix.image }}.image-digest
-            ${{ matrix.image }}.provenance-summary.json
-
-  runtime-build:
-    needs: container-scope
-    # The public compatibility snapshot cannot read the private Orb executor
-    # base. Mono owns the authoritative runtime build and publication, so do
-    # not make standalone PRs depend on a private package or a long-lived
-    # registry credential.
-    if: github.event_name != 'pull_request' && needs.container-scope.outputs.required == 'true'
-    name: runtime build (ubuntu-dev, ${{ matrix.arch }})
-    # Same GitHub-hosted placement rationale as service-build above.
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Record runtime build definition
-        id: build-definition
-        shell: bash
-        run: |
-          echo "dockerfile_digest=sha256:$(sha256sum deploy/runtime/ubuntu-dev/Dockerfile | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
-          echo "dependency_lock_digest=sha256:$(sha256sum Cargo.lock | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        # Same-repository PRs need authenticated read access to the private,
-        # digest-pinned Orb executor base. Never expose that package to forks.
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build native runtime image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          file: deploy/runtime/ubuntu-dev/Dockerfile
-          platforms: ${{ matrix.platform }}
-          push: false
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/sandboxwich-ubuntu-dev:sha-${{ github.sha }}-${{ matrix.arch }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/evalops/sandboxwich
-            org.opencontainers.image.revision=${{ github.sha }}
-            dev.sandboxwich.build.runner-architecture=${{ matrix.arch }}
-            dev.sandboxwich.build.dockerfile-digest=${{ steps.build-definition.outputs.dockerfile_digest }}
-            dev.sandboxwich.build.dependency-lock-digest=${{ steps.build-definition.outputs.dependency_lock_digest }}
-          cache-from: type=gha,scope=sandboxwich-ubuntu-dev-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=sandboxwich-ubuntu-dev-${{ matrix.arch }}
-          provenance: false
-          sbom: false
 
   runtime-image:
     name: runtime image (ubuntu-dev)
-    needs: [container-scope, runtime-build]
+    needs: container-scope
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Record Mono-owned runtime validation
-        if: github.event_name == 'pull_request'
         run: |
+          test "${{ needs.container-scope.result }}" = success
           echo 'Standalone runtime publication and validation are retired.'
           echo 'Authoritative runtime validation runs from evalops/mono.'
-      - name: Require native builds
-        if: needs.container-scope.outputs.required == 'true' && github.event_name != 'pull_request'
-        env:
-          BUILD_RESULT: ${{ needs.runtime-build.result }}
-        run: test "${BUILD_RESULT}" = success
-      - name: Fail closed when scope detection failed
-        if: needs.container-scope.result != 'success'
-        run: exit 1
-      - name: Skip native builds for unrelated changes
-        if: needs.container-scope.outputs.required == 'false'
-        run: echo 'image build not required for this pull request'
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        if: needs.container-scope.outputs.required == 'true'
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-        if: needs.container-scope.outputs.required == 'true' && github.event_name != 'pull_request'
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        if: needs.container-scope.outputs.required == 'true' && github.event_name != 'pull_request'
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Assemble OCI image index
-        if: needs.container-scope.outputs.required == 'true' && github.event_name != 'pull_request'
-        id: index
-        shell: bash
-        env:
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/sandboxwich-ubuntu-dev
-        run: |
-          set -euo pipefail
-          short_sha="${GITHUB_SHA::12}"
-          docker buildx imagetools create \
-            --tag "${IMAGE}:sha-${short_sha}" \
-            --tag "${IMAGE}:latest" \
-            "${IMAGE}:sha-${GITHUB_SHA}-amd64" \
-            "${IMAGE}:sha-${GITHUB_SHA}-arm64"
-          digest="$(docker buildx imagetools inspect "${IMAGE}:sha-${short_sha}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
-          test -n "${digest}"
-          printf 'digest=%s\n' "${digest}" >> "${GITHUB_OUTPUT}"
-          printf '%s@%s\n' "${IMAGE}" "${digest}" > sandboxwich-ubuntu-dev.image-digest
-      - uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9 # v3
-        if: needs.container-scope.outputs.required == 'true' && github.event_name != 'pull_request'
-      - name: Verify runtime platform SBOM and provenance
-        if: needs.container-scope.outputs.required == 'true' && github.event_name != 'pull_request'
-        env:
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/sandboxwich-ubuntu-dev
-          DIGEST: ${{ steps.index.outputs.digest }}
-        run: |
-          dockerfile_digest="sha256:$(sha256sum deploy/runtime/ubuntu-dev/Dockerfile | cut -d' ' -f1)"
-          dependency_lock_digest="sha256:$(sha256sum Cargo.lock | cut -d' ' -f1)"
-          scripts/verify-image-provenance.sh \
-            "${IMAGE}@${DIGEST}" "${GITHUB_SHA}" "${dockerfile_digest}" "${dependency_lock_digest}" \
-            sandboxwich-ubuntu-dev.provenance-summary.json
-      - name: Sign runtime platform manifests
-        if: needs.container-scope.outputs.required == 'true' && github.event_name != 'pull_request'
-        env:
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/sandboxwich-ubuntu-dev
-        run: |
-          jq -r '.platforms[].digest' sandboxwich-ubuntu-dev.provenance-summary.json | while read -r digest; do
-            cosign sign --yes "${IMAGE}@${digest}"
-          done
-      - name: Sign runtime image index
-        if: needs.container-scope.outputs.required == 'true' && github.event_name != 'pull_request'
-        env:
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/sandboxwich-ubuntu-dev
-          DIGEST: ${{ steps.index.outputs.digest }}
-        run: cosign sign --yes "${IMAGE}@${DIGEST}"
-      - name: Verify runtime signatures and provenance closure
-        if: needs.container-scope.outputs.required == 'true' && github.event_name != 'pull_request'
-        env:
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/sandboxwich-ubuntu-dev
-          DIGEST: ${{ steps.index.outputs.digest }}
-          VERIFY_SIGNATURES: "true"
-        run: |
-          dockerfile_digest="sha256:$(sha256sum deploy/runtime/ubuntu-dev/Dockerfile | cut -d' ' -f1)"
-          dependency_lock_digest="sha256:$(sha256sum Cargo.lock | cut -d' ' -f1)"
-          scripts/verify-image-provenance.sh \
-            "${IMAGE}@${DIGEST}" "${GITHUB_SHA}" "${dockerfile_digest}" "${dependency_lock_digest}" \
-            sandboxwich-ubuntu-dev.provenance-summary.json
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: github.event_name != 'pull_request'
-        with:
-          name: sandboxwich-ubuntu-dev-image-digest
-          path: |
-            sandboxwich-ubuntu-dev.image-digest
-            sandboxwich-ubuntu-dev.provenance-summary.json

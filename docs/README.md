@@ -1,5 +1,9 @@
 # Documentation
 
+> Historical snapshot: these documents describe the last standalone
+> Sandboxwich checkout. Current source, documentation, and issue ownership live
+> in [`evalops/mono/platform/execution/sandboxwich`](https://github.com/evalops/mono/tree/main/platform/execution/sandboxwich).
+
 The root [README](../README.md) contains the local quick start, configuration
 reference, API overview, and development commands.
 

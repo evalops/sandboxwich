@@ -29,19 +29,16 @@ class ReleaseReadinessTest(unittest.TestCase):
         self.assertIn("## 0.1.0 - 2026-07-11", changelog)
 
     def test_release_workflow_is_retired(self) -> None:
-        workflow = (ROOT / ".github/workflows/release.yml").read_text()
-        self.assertIn("name: release (retired)", workflow)
-        self.assertIn("workflow_dispatch", workflow)
-        self.assertIn("Sandboxwich releases are owned by evalops/mono", workflow)
-        self.assertIn("exit 1", workflow)
-        self.assertNotIn("softprops/action-gh-release@", workflow)
+        self.assertFalse((ROOT / ".github/workflows/release.yml").exists())
 
     def test_release_no_longer_has_mutating_permissions(self) -> None:
-        workflow = (ROOT / ".github/workflows/release.yml").read_text()
-        self.assertIn("contents: read", workflow)
-        self.assertNotIn("contents: write", workflow)
-        self.assertNotIn("id-token: write", workflow)
-        self.assertNotIn("attestations: write", workflow)
+        workflows = "\n".join(
+            path.read_text() for path in (ROOT / ".github/workflows").glob("*.yml")
+        )
+        self.assertNotIn("contents: write", workflows)
+        self.assertNotIn("packages: write", workflows)
+        self.assertNotIn("id-token: write", workflows)
+        self.assertNotIn("attestations: write", workflows)
 
     def test_all_workflow_files_parse_as_yaml(self) -> None:
         # A workflow file that does not parse only fails when it next runs,
@@ -61,13 +58,7 @@ class ReleaseReadinessTest(unittest.TestCase):
         self.assertNotIn("workspace.metadata.release]", (ROOT / "Cargo.toml").read_text())
 
     def test_release_plz_workflow_is_retired_and_config_is_historical(self) -> None:
-        workflow = (ROOT / ".github/workflows/release-plz.yml").read_text()
-        self.assertIn("name: release-plz (retired)", workflow)
-        self.assertIn("workflow_dispatch", workflow)
-        self.assertIn("Sandboxwich releases are owned by evalops/mono", workflow)
-        self.assertIn("exit 1", workflow)
-        self.assertNotIn("release-plz/action@", workflow)
-        self.assertNotIn("contents: write", workflow)
+        self.assertFalse((ROOT / ".github/workflows/release-plz.yml").exists())
 
         with (ROOT / "release-plz.toml").open("rb") as fh:
             config = tomllib.load(fh)
