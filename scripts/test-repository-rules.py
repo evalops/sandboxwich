@@ -39,8 +39,12 @@ class RepositoryRulesTest(unittest.TestCase):
             self.assertIn(marker, pipeline)
         self.assertIn("docker rm -f", pipeline)
 
-    def test_buildkite_heavy_jobs_use_all_connected_capacity(self) -> None:
+    def test_buildkite_jobs_route_to_the_connected_v6_heavy_pool(self) -> None:
         pipeline = (ROOT / ".buildkite/pipeline.yml").read_text()
+        self.assertEqual(pipeline.count('queue: "hetzner-linux-heavy"'), 3)
+        self.assertEqual(pipeline.count('image: "evalops-platform-ci-v6"'), 3)
+        self.assertNotIn("hetzner-linux-medium", pipeline)
+        self.assertNotIn("evalops-platform-ci-v3", pipeline)
         self.assertEqual(
             pipeline.count('concurrency_group: "hetzner-linux-heavy-workloads"'),
             2,
