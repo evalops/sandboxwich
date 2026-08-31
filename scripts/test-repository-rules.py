@@ -45,6 +45,8 @@ class RepositoryRulesTest(unittest.TestCase):
         self.assertEqual(pipeline.count('image: "evalops-platform-ci-v6"'), 3)
         self.assertNotIn("hetzner-linux-medium", pipeline)
         self.assertNotIn("evalops-platform-ci-v3", pipeline)
+        self.assertGreaterEqual(pipeline.count('.buildkite/run-with-mise "rust@1.95.0"'), 5)
+        self.assertTrue((ROOT / ".buildkite/run-with-mise").is_file())
         self.assertEqual(
             pipeline.count('concurrency_group: "hetzner-linux-heavy-workloads"'),
             2,
