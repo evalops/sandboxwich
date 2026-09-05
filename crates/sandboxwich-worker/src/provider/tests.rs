@@ -315,6 +315,24 @@ fn kubernetes_pod_marks_only_authoritative_sterile_pool_candidates() {
         serde_json::from_str(marker["value"].as_str().unwrap()).unwrap();
     assert_eq!(decoded, candidate);
 
+    // The supervisor is a plain Pod; it must be able to follow the tenant onto
+    // the RuntimeClass-tainted sandbox pool instead of competing for the
+    // general-purpose pools.
+    assert_eq!(
+        supervisor_pod["spec"]["tolerations"],
+        serde_json::json!([{
+            "key": "sandbox.gke.io/runtime",
+            "operator": "Equal",
+            "value": "kata",
+            "effect": "NoSchedule"
+        }])
+    );
+    assert_eq!(
+        supervisor_pod["spec"]["affinity"]["nodeAffinity"]["preferredDuringSchedulingIgnoredDuringExecution"]
+            [0]["preference"]["matchExpressions"][0]["values"],
+        serde_json::json!(["kata"])
+    );
+
     assert_eq!(
         manifests
             .iter()
