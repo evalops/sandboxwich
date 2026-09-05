@@ -261,6 +261,9 @@ const STERILE_ACTIVATION_TLS_DIRECTORY: &str = "/run/sandboxwich/activation-tls"
 const STERILE_ACTIVATION_SERVER_SECRET_PREFIX: &str = "sandboxwich-activation-server-";
 const STERILE_ACTIVATION_CLIENT_SECRET_PREFIX: &str = "sandboxwich-activation-client-";
 const STERILE_SUPERVISOR_POD_PREFIX: &str = "sandboxwich-supervisor-";
+/// Taint and node label key managed sandbox node pools use for their
+/// RuntimeClass (`sandbox.gke.io/runtime=<class>`).
+const SANDBOX_RUNTIME_POOL_TAINT_KEY: &str = "sandbox.gke.io/runtime";
 
 /// Name prefix of the per-sandbox workspace PersistentVolumeClaim
 /// (`sandboxwich-pvc-<sandbox id>`). Managed home claims are named
@@ -2076,6 +2079,8 @@ impl KubernetesDryRunProvider {
                 "hostIPC": false,
                 "restartPolicy": "Never",
                 "terminationGracePeriodSeconds": 30,
+                "tolerations": self.sandbox_runtime_pool_tolerations(),
+                "affinity": self.sandbox_runtime_pool_affinity(),
                 "securityContext": {
                     "runAsNonRoot": true,
                     "runAsUser": MAESTRO_HOSTED_RUNNER_UID,
@@ -2152,6 +2157,54 @@ impl KubernetesDryRunProvider {
                 }]
             }
         }))
+    }
+
+    /// Tolerations that let a plain (non-sandboxed) helper Pod land on the
+    /// node pool reserved for the configured sandbox RuntimeClass.
+    ///
+    /// Managed sandbox pools (GKE Sandbox, and the same convention on kata
+    /// pools) taint their nodes `sandbox.gke.io/runtime=<runtime class>`.
+    /// The tenant Pod tolerates that taint through its RuntimeClass, but the
+    /// sterile supervisor is an ordinary Pod, so without this it can only be
+    /// placed on the general-purpose pools. On 2026-09-05 those pools sat at
+    /// 93-99% CPU requests while the sandbox pool had headroom; every sterile
+    /// provision then waited on a node scale-up and timed out with
+    /// `kubernetes_provider_transient`, and Dex turns never got a sandbox.
+    /// The toleration is a no-op on clusters without the taint.
+    fn sandbox_runtime_pool_tolerations(&self) -> Value {
+        match self.runtime_class_name.as_deref() {
+            Some(runtime_class) => json!([{
+                "key": SANDBOX_RUNTIME_POOL_TAINT_KEY,
+                "operator": "Equal",
+                "value": runtime_class,
+                "effect": "NoSchedule"
+            }]),
+            None => json!([]),
+        }
+    }
+
+    /// Prefers, without requiring, the sandbox pool for helper Pods so the
+    /// supervisor follows the tenant Pod's capacity instead of competing with
+    /// the general-purpose pools. Managed sandbox pools carry the taint key as
+    /// a node label with the same value.
+    fn sandbox_runtime_pool_affinity(&self) -> Value {
+        match self.runtime_class_name.as_deref() {
+            Some(runtime_class) => json!({
+                "nodeAffinity": {
+                    "preferredDuringSchedulingIgnoredDuringExecution": [{
+                        "weight": 100,
+                        "preference": {
+                            "matchExpressions": [{
+                                "key": SANDBOX_RUNTIME_POOL_TAINT_KEY,
+                                "operator": "In",
+                                "values": [runtime_class]
+                            }]
+                        }
+                    }]
+                }
+            }),
+            None => json!({}),
+        }
     }
 
     /// Ephemeral (root filesystem) storage limit for the sandbox container.
